@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -88,6 +89,20 @@ test('JSON unset accepts only a supported key and cannot reuse revision or null 
   const unset = configCommand(paths, { operation: 'unset', key: 'default_agent' }).config;
   assert.equal(unset.default_agent, null);
   assert.equal(unset.revision, 2);
+});
+
+test('concurrent config writers serialize revision and preserve both updates', async () => {
+  const { paths } = fixture();
+  const script = `import { configCommand } from './cli/commands/config.mjs'; configCommand(${JSON.stringify(paths)}, JSON.parse(process.argv[1]));`;
+  const run = (patch) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, JSON.stringify({ operation: 'set', patch })], { cwd: path.resolve('.') });
+    child.on('error', reject); child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)));
+  });
+  await Promise.all([run({ default_agent: 'zcode' }), run({ agents: { dsh: { enabled: true } } })]);
+  const final = readConfig(paths.config);
+  assert.equal(final.revision, 2);
+  assert.equal(final.default_agent, 'zcode');
+  assert.equal(final.agents.dsh.enabled, true);
 });
 
 test('unknown config fields and operations fail closed', () => {

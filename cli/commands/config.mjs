@@ -1,5 +1,5 @@
 import { readConfig } from '../config/read.mjs';
-import { writeConfig } from '../config/write.mjs';
+import { updateConfig, writeConfig } from '../config/write.mjs';
 import { AGENT_IDS } from '../config/schema.mjs';
 import { CliError } from '../errors.mjs';
 
@@ -98,7 +98,7 @@ export function configCommand(paths, input = {}) {
     for (const [agent, value] of Object.entries(input.patch.agents || {})) {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new CliError('CONFIG_INVALID', `agents.${agent} must be an object`, 2);
     }
-    return { config: writeConfig(paths.config, mergePatch(current, input.patch)) };
+    return { config: updateConfig(paths.config, (latest) => mergePatch(latest, input.patch)) };
   }
   if (operation === 'show') {
     if (input.patch !== undefined || input.key !== undefined) throw new CliError('INVALID_ARGUMENT', 'config show does not accept key or patch', 2);
@@ -106,7 +106,7 @@ export function configCommand(paths, input = {}) {
   }
   if (operation === 'unset') {
     if (input.patch !== undefined || typeof input.key !== 'string') throw new CliError('INVALID_ARGUMENT', 'config unset requires exactly one supported key', 2);
-    return { config: writeConfig(paths.config, mergePatch(current, unsetPatch(input.key))) };
+    return { config: updateConfig(paths.config, (latest) => mergePatch(latest, unsetPatch(input.key))) };
   }
   if (operation === 'get') {
     if (input.patch !== undefined) throw new CliError('INVALID_ARGUMENT', 'config get does not accept patch', 2);
