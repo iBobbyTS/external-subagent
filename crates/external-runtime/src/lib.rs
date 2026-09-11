@@ -939,12 +939,20 @@ fn wait_for_persisted_group_death(pgid: i32, timeout: Duration) -> io::Result<bo
 }
 
 fn ensure_group_empty(pgid: i32) -> io::Result<()> {
-    if observe_process_group(pgid)?.is_empty() {
-        Ok(())
-    } else {
-        Err(io::Error::other(
-            "process leader exited while descendants remain; refusing unproven cleanup",
-        ))
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match observe_process_group(pgid) {
+            Ok(members) if members.is_empty() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "process leader exited while descendants remain; refusing unproven cleanup",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
