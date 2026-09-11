@@ -9,7 +9,7 @@ import { platform, productPaths } from './paths.mjs';
 import { startService, stopService } from './service.mjs';
 import { callDaemon, parseDaemonInput } from './rpc.mjs';
 
-const HELP = `zas ${VERSION}\n\nUsage: zas <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] Install and configure the local service\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration\n  status, diagnose            Inspect local service and runtime state\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
+const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] Install and configure the local service\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration\n  status, diagnose            Inspect local service and runtime state\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
 const DAEMON_HELP = `  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function value(args, name) {
@@ -284,7 +284,7 @@ async function diagnose(paths, args) {
 export async function main(args) {
   const command = args[0] || 'help';
   if (command === 'help' || command === '--help' || command === '-h') {
-    process.stdout.write(HELP.replaceAll('zas', 'external-subagent').replace('install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration', 'install-plugin [--dry-run|--uninstall] Install or remove the Codex plugin (MCP + skill)') + DAEMON_HELP); return;
+    process.stdout.write(HELP.replace('install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration', 'install-plugin [--dry-run|--uninstall] Install or remove the Codex plugin (MCP + skill)') + DAEMON_HELP); return;
   }
   if (command === 'version' || command === '--version' || command === '-v') {
     process.stdout.write(`${VERSION}\n`); return;

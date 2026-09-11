@@ -1,0 +1,17 @@
+{
+  "name": "external-subagent",
+  "version": "0.1.0",
+  "description": "Manage bounded external agent tasks from Codex.",
+  "author": { "name": "external-subagent maintainers" },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "External Subagent",
+    "shortDescription": "Run bounded local external agent tasks.",
+    "longDescription": "Connects Codex to the external-subagent lifecycle service for repository-scoped tasks.",
+    "developerName": "external-subagent maintainers",
+    "category": "Productivity",
+    "capabilities": ["Local MCP", "Durable tasks", "Agent tasks"],
+    "defaultPrompt": ["Check external-subagent status.", "Spawn a repository-scoped task.", "Review a complete task result."]
+  },
+  "mcpServers": "./.mcp.json"
+}
