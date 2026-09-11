@@ -27,6 +27,7 @@ const DSH_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 const DSH_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DSH_MAX_MODELS: usize = 256;
 const DSH_MAX_MODEL_TOKEN_BYTES: usize = 512;
+const VERSION_STREAM_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -652,39 +653,104 @@ fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> Sc
 
 fn executable_version(path: &Path) -> Result<String, String> {
     let mut command = runtime_command(path, true);
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
-    let deadline = Instant::now() + LOCAL_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|_| "transport".to_owned())?;
-                if !status.success() {
-                    return Err("version".into());
-                }
-                let text = String::from_utf8_lossy(&output.stdout);
-                let diagnostic = String::from_utf8_lossy(&output.stderr);
-                let version = text
-                    .lines()
-                    .chain(diagnostic.lines())
-                    .map(str::trim)
-                    .find(|line| !line.is_empty());
-                return version
-                    .filter(|value| value.len() <= 128 && !value.contains('\0'))
-                    .map(str::to_owned)
-                    .or_else(|| package_version(path))
-                    .ok_or_else(|| "version".into());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let process_group = child.id() as i32;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+        return Err("transport".into());
+    };
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || read_version_stream(stdout, stdout_tx));
+    thread::spawn(move || read_version_stream(stderr, stderr_tx));
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let deadline = Instant::now() + LOCAL_PROBE_TIMEOUT;
+    let status = loop {
+        if drain_version_stream(&stdout_rx, &mut stdout_bytes).is_err()
+            || drain_version_stream(&stderr_rx, &mut stderr_bytes).is_err()
+        {
+            cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+            return Err("oversized".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
                 return Err("transport".into());
             }
-            Err(_) => return Err("transport".into()),
+            Err(_) => {
+                cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+                return Err("transport".into());
+            }
+        }
+    };
+    // The leader is reaped above. Do not wait for pipe EOF: a descendant may
+    // have inherited the descriptors. Drain only already-delivered chunks.
+    let _ = drain_version_stream(&stdout_rx, &mut stdout_bytes);
+    let _ = drain_version_stream(&stderr_rx, &mut stderr_bytes);
+    cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+    if !status.success() {
+        return Err("version".into());
+    }
+    let text = String::from_utf8_lossy(&stdout_bytes);
+    let diagnostic = String::from_utf8_lossy(&stderr_bytes);
+    let version = text
+        .lines()
+        .chain(diagnostic.lines())
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    version
+        .filter(|value| value.len() <= 128 && !value.contains('\0'))
+        .map(str::to_owned)
+        .or_else(|| package_version(path))
+        .ok_or_else(|| "version".into())
+}
+
+fn read_version_stream(mut stream: impl Read, sender: mpsc::Sender<Result<Vec<u8>, String>>) {
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(read) => {
+                if sender.send(Ok(buffer[..read].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                let _ = sender.send(Err("transport".into()));
+                return;
+            }
+        }
+    }
+}
+
+fn drain_version_stream(
+    receiver: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    loop {
+        match receiver.try_recv() {
+            Ok(Ok(chunk)) => {
+                if output.len().saturating_add(chunk.len()) > VERSION_STREAM_CAP {
+                    return Err("oversized".into());
+                }
+                output.extend_from_slice(&chunk);
+            }
+            Ok(Err(reason)) => return Err(reason),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
     }
 }
@@ -1261,6 +1327,45 @@ mod tests {
         assert_eq!(result.state, EvidenceState::Ready);
         assert_eq!(result.version.as_deref(), Some("fixture-9.9.9"));
         assert_eq!(result.checked_at_ms, 42);
+    }
+
+    #[test]
+    fn version_probe_reaps_descendant_inheriting_output_pipes_after_leader_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("version-descendant");
+        let descendant_pid = directory.path().join("descendant.pid");
+        let source = format!(
+            "#!/bin/sh\n(sleep 20) &\nprintf '%s\\n' $! > '{}'\nprintf 'fixture-9.9.9\\n'\nexit 0\n",
+            descendant_pid.display()
+        );
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let version = executable_version(&executable).unwrap();
+        assert_eq!(version, "fixture-9.9.9");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert!(wait_process_gone(
+            pid,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn version_probe_rejects_unterminated_oversized_stream_without_waiting_for_eof() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("version-oversized");
+        let source = "#!/bin/sh\nprintf '%*s' 70000 x\nsleep 20\n";
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let error = executable_version(&executable).unwrap_err();
+        assert_eq!(error, "oversized");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     fn fake_hi_runtime(
