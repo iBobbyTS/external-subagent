@@ -479,15 +479,20 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let next: i64 = transaction.query_row(
-            "SELECT next_id FROM task_id_allocator WHERE id=1", [], |row| row.get(0))?;
+            "SELECT next_id FROM task_id_allocator WHERE id=1",
+            [],
+            |row| row.get(0),
+        )?;
         if !(10_000_000..=99_999_999).contains(&next) {
             return Err(StoreError::Conflict("task id allocator exhausted".into()));
         }
-        transaction.execute("UPDATE task_id_allocator SET next_id=?1 WHERE id=1", [next + 1])?;
+        transaction.execute(
+            "UPDATE task_id_allocator SET next_id=?1 WHERE id=1",
+            [next + 1],
+        )?;
         transaction.commit()?;
         Ok(next.to_string())
     }
-
 
     pub fn journal_mode(&self) -> StoreResult<String> {
         let connection = self.connection.lock().unwrap();
@@ -2184,11 +2189,23 @@ mod tests {
         assert_eq!(reopened.reserve_task_id().unwrap(), "10000002");
         {
             let connection = Connection::open(&path).unwrap();
-            connection.execute("UPDATE task_id_allocator SET next_id=99999999 WHERE id=1", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE task_id_allocator SET next_id=99999999 WHERE id=1",
+                    [],
+                )
+                .unwrap();
         }
         assert_eq!(reopened.reserve_task_id().unwrap(), "99999999");
         assert!(reopened.reserve_task_id().is_err());
-        let next: i64 = Connection::open(&path).unwrap().query_row("SELECT next_id FROM task_id_allocator WHERE id=1", [], |r| r.get(0)).unwrap();
+        let next: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT next_id FROM task_id_allocator WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(next, 100000000);
     }
 
@@ -2199,9 +2216,14 @@ mod tests {
         let mut workers = Vec::new();
         for _ in 0..8 {
             let path = std::sync::Arc::clone(&path);
-            workers.push(std::thread::spawn(move || Store::open(&*path).unwrap().reserve_task_id().unwrap()));
+            workers.push(std::thread::spawn(move || {
+                Store::open(&*path).unwrap().reserve_task_id().unwrap()
+            }));
         }
-        let ids: std::collections::HashSet<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let ids: std::collections::HashSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
         assert_eq!(ids.len(), 8);
         assert!(ids.contains("10000000"));
     }

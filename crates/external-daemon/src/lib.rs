@@ -1,3 +1,20 @@
+use external_contract::{
+    event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
+    CreateSessionParams, LifecycleOrder, ResumeSessionParams, RuntimePreferences, SendParams,
+    SessionCreateProjection, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage,
+    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
+    SESSION_SUBSCRIBE,
+};
+use external_runtime::{
+    observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
+    Driver, Inbound, ProcessIdentity, RequestError, StopOutcome,
+};
+use external_store::{
+    LifecycleWrite, MessageState, NewTask, PendingRequestState, PendingResponseClaimDisposition,
+    Store, StoreError, StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase,
+    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState,
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt, fs, io,
@@ -13,36 +30,22 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use external_store::{
-    LifecycleWrite, MessageState, NewTask, PendingRequestState, PendingResponseClaimDisposition,
-    Store, StoreError, StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase,
-    TaskRecord, TaskResult, TaskSubmissionDisposition, TurnState,
-};
-use external_runtime::{
-    observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
-    Driver, Inbound, ProcessIdentity, RequestError, StopOutcome,
-};
-use external_contract::{
-    event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
-    CreateSessionParams, LifecycleOrder, ResumeSessionParams, RuntimePreferences, SendParams,
-    SessionCreateProjection, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage,
-    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
-    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
-    SESSION_SUBSCRIBE,
-};
 
 pub mod mcp;
 pub mod observation;
 pub mod rpc;
 mod scheduler;
-pub use scheduler::{SchedulerConfig, SchedulerError};
-use scheduler::{bounded_error, bounded_prefix, runtime_failure_record, update_latest_failure, DIAGNOSTIC_QUEUE_CAPACITY, DIAGNOSTIC_RECORD_BYTES, DIAGNOSTIC_FILE_BYTES};
-pub use scheduler::configure_diagnostic_log;
 use external_core::{
     general_launch_prompt, CompletionOutcome, GeneralCompletion, GeneralFinalizer,
     GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask,
     ValidatedPermissionDenial,
 };
+pub use scheduler::configure_diagnostic_log;
+use scheduler::{
+    bounded_error, bounded_prefix, runtime_failure_record, update_latest_failure,
+    DIAGNOSTIC_FILE_BYTES, DIAGNOSTIC_QUEUE_CAPACITY, DIAGNOSTIC_RECORD_BYTES,
+};
+pub use scheduler::{SchedulerConfig, SchedulerError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeLoss {

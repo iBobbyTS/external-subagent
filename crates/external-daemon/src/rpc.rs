@@ -3,6 +3,11 @@ use crate::{
     MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
     ResponseDisposition, Scheduler, SchedulerError,
 };
+use external_core::{canonical_general_repository, GeneralTaskManifest, PreparedGeneralTask};
+use external_store::{
+    PendingRequestState, Store, StoreError, StoredPendingRequest, StoredTaskResult, TaskOutcome,
+    TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,13 +20,6 @@ use std::{
     sync::Arc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-use external_core::{
-    canonical_general_repository, GeneralTaskManifest, PreparedGeneralTask,
-};
-use external_store::{
-    PendingRequestState, Store, StoreError, StoredPendingRequest, StoredTaskResult, TaskOutcome,
-    TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
 };
 
 pub const RPC_VERSION: u16 = 13;
@@ -1173,8 +1171,8 @@ fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
 pub(crate) mod wait_tests {
     use super::*;
     use crate::{CommandRuntimeFactory, SchedulerConfig};
-    use std::process::Command;
     use external_store::TaskResult;
+    use std::process::Command;
 
     pub(crate) fn fixture() -> (tempfile::TempDir, Arc<RpcService>, String) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");

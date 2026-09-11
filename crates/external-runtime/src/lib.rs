@@ -1,3 +1,7 @@
+use external_contract::{
+    classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
+    ResponseEnvelope, WireId, WireMessage,
+};
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(unix)]
@@ -16,10 +20,6 @@ use std::{
     },
     thread,
     time::{Duration, Instant},
-};
-use external_contract::{
-    classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
-    ResponseEnvelope, WireId, WireMessage,
 };
 
 pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
