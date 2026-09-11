@@ -14,5 +14,5 @@ export function startService(paths, uid = process.getuid()) {
 }
 
 export function stopService(_paths, uid = process.getuid()) {
-  return launchctl(['bootout', `gui/${uid}/com.zcode-as-subagent.daemon`]);
+  return launchctl(['bootout', `gui/${uid}/com.external-subagent.daemon`]);
 }

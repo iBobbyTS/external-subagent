@@ -21,7 +21,7 @@ async fn main() -> io::Result<()> {
     // endpoint when it is present while retaining the explicit socket for
     // isolated process tests and non-standard deployments.
     let endpoint =
-        if socket.file_name().and_then(|name| name.to_str()) == Some("zcode-as-subagent.sock") {
+        if socket.file_name().and_then(|name| name.to_str()) == Some("external-subagent.sock") {
             socket.with_extension("mcp")
         } else {
             socket

@@ -32,7 +32,7 @@ export function backupData(destination, paths = productPaths()) {
   fs.mkdirSync(resolved, { recursive: false, mode: 0o700 });
   const records = [];
   copyTree(paths.data, path.join(resolved, 'data'), records);
-  const manifest = { schema_version: 1, product: 'zcode-as-subagent', files: records.sort((a, b) => a.path.localeCompare(b.path)) };
+  const manifest = { schema_version: 1, product: 'external-subagent', files: records.sort((a, b) => a.path.localeCompare(b.path)) };
   fs.writeFileSync(path.join(resolved, 'manifest.json'), jsonBytes(manifest), { mode: 0o600 });
   return { destination: resolved, files: records.length };
 }
@@ -40,7 +40,7 @@ export function backupData(destination, paths = productPaths()) {
 export function restoreData(source, paths = productPaths()) {
   const resolved = path.resolve(source);
   const manifest = JSON.parse(fs.readFileSync(path.join(resolved, 'manifest.json'), 'utf8'));
-  if (manifest.product !== 'zcode-as-subagent' || !Array.isArray(manifest.files)) throw new CliError('BACKUP_INVALID', 'backup manifest is invalid');
+  if (manifest.product !== 'external-subagent' || !Array.isArray(manifest.files)) throw new CliError('BACKUP_INVALID', 'backup manifest is invalid');
   for (const record of manifest.files) {
     if (path.isAbsolute(record.path) || record.path.split(path.sep).includes('..')) throw new CliError('BACKUP_INVALID', 'backup contains an unsafe path');
     const bytes = fs.readFileSync(path.join(resolved, 'data', record.path));

@@ -479,16 +479,16 @@ mod server {
     }
 
     pub const PUBLIC_TOOLS: [&str; 10] = [
-        "zcode_subagent_cancel",
-        "zcode_subagent_close",
-        "zcode_subagent_list",
-        "zcode_subagent_observe",
-        "zcode_subagent_respond",
-        "zcode_subagent_result",
-        "zcode_subagent_send",
-        "zcode_subagent_spawn",
-        "zcode_subagent_status",
-        "zcode_subagent_wait",
+        "external_subagent_cancel",
+        "external_subagent_close",
+        "external_subagent_list",
+        "external_subagent_observe",
+        "external_subagent_respond",
+        "external_subagent_result",
+        "external_subagent_send",
+        "external_subagent_spawn",
+        "external_subagent_status",
+        "external_subagent_wait",
     ];
 
     const MAX_ID_BYTES: usize = 512;
@@ -1543,7 +1543,7 @@ mod server {
     #[tool_router(router = tool_router)]
     impl SubagentMcp {
         #[tool(
-        name = "zcode_subagent_status",
+        name = "external_subagent_status",
         output_schema = tool_output_schema::<SystemStatusOutput>(),
         description = "Read daemon/runtime readiness, protocol version, component states, and capability limits. Read-only.",
         annotations(
@@ -1567,7 +1567,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_spawn",
+        name = "external_subagent_spawn",
         output_schema = tool_output_schema::<AgentSpawnOutput>(),
         description = "Start one durable Agent in an absolute repository workspace. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
         annotations(
@@ -1601,7 +1601,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_wait",
+        name = "external_subagent_wait",
         output_schema = tool_output_schema::<AgentWaitOutput>(),
         description = "Wait up to 290 seconds by default for terminal completion or any respondable pending request (state pending and respondable true), regardless of tool kind or name. The ordered pending-request projection is capped at 100 records, so a qualifying request beyond that projection does not wake this wait. Set wait_time manually when other work or subagents need attention; avoid unnecessarily short waits across multiple tasks; use 0 for current status.",
         annotations(
@@ -1674,7 +1674,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_observe",
+        name = "external_subagent_observe",
         output_schema = tool_output_schema::<AgentObserveOutput>(),
         description = "仅在怀疑 zcode subagent 陷入无意义循环时才调用，检查最近公开推理和工具调用过程；不要用于健康任务的例行轮询。只读已捕获的本 Agent 数据，不启动模型或工具。默认按本 Agent 任务生命周期内的调用次数选最多的 3 类工具，每类返回最近最多 5 次调用（名称、ID、参数，不含结果），并返回已验证公开 reasoning delta 合并后的最新 200 个 Unicode 字符。encrypted_content 始终排除。ZAS 不判断循环、不返回进展标签、不自动取消。调用方结合当前任务与这些事实判断：PROGRESSING（新增事实或有效推进）；EXPECTED_WAIT（有目的的计算、权限或外部等待）；NEEDS_CLARIFICATION（具体输入或决定缺失）；NO_PROGRESS_LOOP（无新信息的等价行动循环，且合理重读、等待、状态变化等解释已排除）；INSUFFICIENT_OBSERVABILITY（截断、缺口或缺少上下文，不能断言循环）。相同文本、重复 read 或 true/echo 本身不是循环；没有工具结果也不能推断工具成功、文件未变化或任务失败。判断和取消由调用方独立决定。",
         annotations(
@@ -1707,7 +1707,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_list",
+        name = "external_subagent_list",
         output_schema = tool_output_schema::<AgentListOutput>(),
         description = "List tasks within an explicit daemon-enforced scope",
         annotations(
@@ -1750,7 +1750,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_send",
+        name = "external_subagent_send",
         output_schema = tool_output_schema::<AgentSendOutput>(),
         description = "Queue a bounded message for a running task",
         annotations(
@@ -1808,7 +1808,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_respond",
+        name = "external_subagent_respond",
         output_schema = tool_output_schema::<AgentRespondOutput>(),
         description = "Respond idempotently to a typed respondable pending request",
         annotations(
@@ -1849,7 +1849,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_cancel",
+        name = "external_subagent_cancel",
         output_schema = tool_output_schema::<AgentStateOutput>(),
         description = "Cancel a task without removing durable history",
         annotations(
@@ -1878,7 +1878,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_result",
+        name = "external_subagent_result",
         output_schema = tool_output_schema::<AgentResultOutput>(),
         description = "Read a terminal task result with stable outcome, partial status, reason code, and bounded final-text segments. Returns null result while the task is non-terminal.",
         annotations(
@@ -1899,7 +1899,7 @@ mod server {
         }
 
         #[tool(
-        name = "zcode_subagent_close",
+        name = "external_subagent_close",
         output_schema = tool_output_schema::<AgentStateOutput>(),
         description = "Close a task and reap runtime resources while preserving durable history",
         annotations(
@@ -2083,7 +2083,7 @@ mod server {
                 .unwrap();
             let call = serde_json::json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "zcode_subagent_wait", "arguments": {
+                "params": {"name": "external_subagent_wait", "arguments": {
                     "agent_id": super::super::public_task_id(&id).unwrap(), "wait_time": 299
                 }}
             });
@@ -2165,7 +2165,7 @@ mod server {
                 .unwrap();
             let call = serde_json::json!({
                 "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                "params": {"name": "zcode_subagent_wait", "arguments": {
+                "params": {"name": "external_subagent_wait", "arguments": {
                     "agent_id": super::super::public_task_id(&id).unwrap(), "wait_time": 299
                 }}
             });
@@ -2328,7 +2328,7 @@ mod server {
             );
             let observe = tools
                 .iter()
-                .find(|tool| tool.name == "zcode_subagent_observe")
+                .find(|tool| tool.name == "external_subagent_observe")
                 .unwrap();
             let description = observe.description.as_deref().unwrap();
             assert_eq!(
@@ -2406,34 +2406,34 @@ mod server {
                 "latest_progress":null,"result":null,"instruction":null,"timed_out":false
             });
             let successes = BTreeMap::from([
-                ("zcode_subagent_status", status),
+                ("external_subagent_status", status),
                 (
-                    "zcode_subagent_spawn",
+                    "external_subagent_spawn",
                     serde_json::json!({"agent_id":10000001,"submission_disposition":"created","phase":"RUNNING"}),
                 ),
-                ("zcode_subagent_wait", wait),
-                ("zcode_subagent_observe", observation),
+                ("external_subagent_wait", wait),
+                ("external_subagent_observe", observation),
                 (
-                    "zcode_subagent_list",
+                    "external_subagent_list",
                     serde_json::json!({"tasks":[],"next_cursor":null}),
                 ),
                 (
-                    "zcode_subagent_send",
+                    "external_subagent_send",
                     serde_json::json!({"message_id":"message-1","disposition":"queued"}),
                 ),
                 (
-                    "zcode_subagent_respond",
+                    "external_subagent_respond",
                     serde_json::json!({"disposition":"responded","requested_decision":"allow","effective_decision":"allow","policy_overrode":false,"policy_reason_code":null}),
                 ),
                 (
-                    "zcode_subagent_cancel",
+                    "external_subagent_cancel",
                     serde_json::json!({"task":task.clone()}),
                 ),
                 (
-                    "zcode_subagent_result",
+                    "external_subagent_result",
                     serde_json::json!({"task":task.clone(),"result":null}),
                 ),
-                ("zcode_subagent_close", serde_json::json!({"task":task})),
+                ("external_subagent_close", serde_json::json!({"task":task})),
             ]);
             let error = serde_json::json!({"error":{
                 "code":"not_found","message":"agent task was not found","component":"daemon",
@@ -2450,7 +2450,7 @@ mod server {
                     tool.name,
                     validator.iter_errors(success).collect::<Vec<_>>()
                 );
-                if tool.name == "zcode_subagent_status" {
+                if tool.name == "external_subagent_status" {
                     let mut legacy_status = success.clone();
                     legacy_status["identity"]
                         .as_object_mut()

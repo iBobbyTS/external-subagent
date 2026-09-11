@@ -16,7 +16,7 @@ export function nativeBinary(name) {
 }
 
 const CODEX_MCP_SECTION = 'mcp_servers.zcode_as_subagent';
-const PLUGIN_NAME = 'zcode-as-subagent';
+const PLUGIN_NAME = 'external-subagent';
 
 function pluginSourceRoot() { return path.join(packageRoot, 'plugins', PLUGIN_NAME); }
 
@@ -58,7 +58,7 @@ function stagePlugin(source, staging, paths) {
     // Keep the ownership check above, then replace its contents from the current source.
     const priorMcp = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
     const priorServer = priorMcp.mcpServers?.zcode_as_subagent;
-    if (!priorServer || priorServer.command !== nativeBinary('zcode-as-subagent-mcp') || priorServer.env?.ZCODE_AGENTD_SOCKET !== paths.socket) {
+    if (!priorServer || priorServer.command !== nativeBinary('external-subagent-mcp') || priorServer.env?.ZCODE_AGENTD_SOCKET !== paths.socket) {
       throw new CliError('PLUGIN_STAGING_CONFLICT', 'staging MCP binding differs from the managed product endpoint');
     }
   }
@@ -68,7 +68,7 @@ function stagePlugin(source, staging, paths) {
   const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
   const server = mcp.mcpServers?.zcode_as_subagent;
   if (!server) throw new CliError('INVALID_PLUGIN_SOURCE', 'plugin MCP server is missing');
-  server.command = nativeBinary('zcode-as-subagent-mcp');
+  server.command = nativeBinary('external-subagent-mcp');
   server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };
   fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
 }
@@ -89,7 +89,7 @@ function updateMarketplace(file, staging) {
     const currentPath = current?.source?.path;
     const resolved = currentPath ? path.resolve(root, currentPath) : null;
     const manifest = resolved && fs.existsSync(path.join(resolved, '.codex-plugin', 'plugin.json')) ? JSON.parse(fs.readFileSync(path.join(resolved, '.codex-plugin', 'plugin.json'), 'utf8')) : null;
-    if (currentPath !== entry.source.path || !manifest || manifest.name !== PLUGIN_NAME) throw new CliError('PLUGIN_MARKETPLACE_CONFLICT', 'marketplace entry is not a managed zcode-as-subagent source');
+    if (currentPath !== entry.source.path || !manifest || manifest.name !== PLUGIN_NAME) throw new CliError('PLUGIN_MARKETPLACE_CONFLICT', 'marketplace entry is not a managed external-subagent source');
     return { marketplace: file, marketplace_name: doc.name, entry: currentPath };
   }
   doc.plugins.push(entry);
@@ -106,11 +106,11 @@ export function installPlugin(paths = productPaths(), options = {}) {
   // Never overwrite it; use a private local marketplace root in that case.
   if (!options.marketplacePath && fs.existsSync(marketplace)) {
     try { if (!Array.isArray(JSON.parse(fs.readFileSync(marketplace, 'utf8')).plugins)) {
-      const root = path.join(home, '.zcode-as-subagent-marketplace');
+      const root = path.join(home, '.external-subagent-marketplace');
       staging = path.join(root, 'plugins', PLUGIN_NAME);
       marketplace = path.join(root, '.agents', 'plugins', 'marketplace.json');
     } } catch {
-      const root = path.join(home, '.zcode-as-subagent-marketplace');
+      const root = path.join(home, '.external-subagent-marketplace');
       staging = path.join(root, 'plugins', PLUGIN_NAME);
       marketplace = path.join(root, '.agents', 'plugins', 'marketplace.json');
     }
@@ -148,8 +148,8 @@ export function installPlugin(paths = productPaths(), options = {}) {
 }
 
 function codexMcpConfig(paths) {
-  const command = nativeBinary('zcode-as-subagent-mcp');
-  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n  "zcode_subagent_cancel",\n  "zcode_subagent_close",\n  "zcode_subagent_list",\n  "zcode_subagent_wait",\n  "zcode_subagent_respond",\n  "zcode_subagent_result",\n  "zcode_subagent_send",\n  "zcode_subagent_spawn",\n  "zcode_subagent_status",\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nZCODE_AGENTD_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.zcode_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.zcode_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.zcode_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.zcode_subagent_result]\napproval_mode = "auto"\n`;
+  const command = nativeBinary('external-subagent-mcp');
+  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n  "external_subagent_cancel",\n  "external_subagent_close",\n  "external_subagent_list",\n  "external_subagent_wait",\n  "external_subagent_respond",\n  "external_subagent_result",\n  "external_subagent_send",\n  "external_subagent_spawn",\n  "external_subagent_status",\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nZCODE_AGENTD_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
 }
 
 function removeTomlSection(text, section) {
@@ -166,7 +166,7 @@ function removeTomlSection(text, section) {
 
 export function installMcp(paths = productPaths(), options = {}) {
   const config = options.configPath || codexConfigPath(paths.home);
-  const command = nativeBinary('zcode-as-subagent-mcp');
+  const command = nativeBinary('external-subagent-mcp');
   if (options.dryRun) {
     return { dry_run: true, operation: options.uninstall ? 'uninstall' : 'install', platform: 'codex', config, command, socket: paths.socket };
   }
@@ -208,7 +208,7 @@ export function installHooks(paths = productPaths(), options = {}) {
 }
 
 function plist(paths) {
-  const daemon = nativeBinary('zcode-as-subagentd');
+  const daemon = nativeBinary('external-subagentd');
   const esc = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>\n<key>ProgramArguments</key><array><string>${esc(daemon)}</string><string>--database</string><string>${esc(paths.database)}</string><string>--socket</string><string>${esc(paths.socket)}</string><string>--runtime</string><string>${esc(ZCODE_RUNTIME)}</string><string>--diagnostic-log</string><string>${esc(path.join(paths.logs, 'daemon-error.log'))}</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${esc(path.join(paths.logs, 'daemon.log'))}</string>\n<key>StandardErrorPath</key><string>${esc(path.join(paths.logs, 'daemon-error.log'))}</string>\n</dict></plist>\n`);
 }
@@ -243,7 +243,7 @@ export function runInit(options = {}) {
   if (!fs.existsSync(ZCODE_RUNTIME) && !options.skipRuntimeProbe) {
     throw new CliError('ZCODE_RUNTIME_NOT_FOUND', `required ZCode runtime is missing: ${ZCODE_RUNTIME}`);
   }
-  if (!fs.existsSync(nativeBinary('zcode-as-subagentd')) && !options.skipNativeProbe) {
+  if (!fs.existsSync(nativeBinary('external-subagentd')) && !options.skipNativeProbe) {
     throw new CliError('NATIVE_BINARY_NOT_FOUND', 'npm package does not contain the macOS daemon binary');
   }
   const prior = {

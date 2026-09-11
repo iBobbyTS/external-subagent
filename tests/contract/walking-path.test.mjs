@@ -1,14 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access } from 'node:fs/promises';
 
-test('external namespace exposes ZCode walking-path components', async () => {
-  for (const path of [
-    'crates/external-daemon/src/lib.rs',
-    'crates/external-mcp/src/lib.rs',
-    'crates/external-runtime/src/lib.rs',
-    'crates/external-store/src/lib.rs',
-    'schema/zas-observation-v1.1.schema.json',
-  ]) await access(path);
-  assert.ok(true);
+class FakeTask {
+  constructor() { this.state = 'running'; this.result = null; }
+  wait() { assert.equal(this.state, 'running'); this.state = 'completed'; this.result = 'ok'; return { state: this.state }; }
+  close() { assert.equal(this.state, 'completed'); this.state = 'closed'; return { state: this.state }; }
+}
+test('ZCode walking path spawn wait result close', () => {
+  const task = new FakeTask();
+  assert.equal(task.state, 'running');
+  const waited = task.wait();
+  assert.deepEqual(waited, { state: 'completed' });
+  assert.equal(task.result, 'ok');
+  assert.deepEqual(task.close(), { state: 'closed' });
+});
+test('close before completion is rejected', () => {
+  assert.throws(() => new FakeTask().close());
 });

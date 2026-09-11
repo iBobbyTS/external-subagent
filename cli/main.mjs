@@ -227,7 +227,7 @@ async function diagnose(paths, args) {
     facade: {
       running_identity: null,
       running_identity_source: 'not_observed_by_cli',
-      packaged_artifact: fileArtifact(nativeBinary('zcode-as-subagent-mcp'), 'distributed_payload'),
+      packaged_artifact: fileArtifact(nativeBinary('external-subagent-mcp'), 'distributed_payload'),
     },
     daemon: { socket, socket_exists: fs.existsSync(socket), query_status: 'unqueried', available: null },
     logs: diagnosticLogs(paths.logs),
@@ -317,7 +317,7 @@ export async function main(args) {
     const report = await diagnose(paths, args.slice(1));
     output({
       ...report,
-      daemon_packaged_artifact: fileArtifact(nativeBinary('zcode-as-subagentd'), 'distributed_payload'),
+      daemon_packaged_artifact: fileArtifact(nativeBinary('external-subagentd'), 'distributed_payload'),
     }); return;
   }
   if (command === 'backup') { output(backupData(value(args, '--output'), paths)); return; }

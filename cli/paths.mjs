@@ -7,16 +7,16 @@ export function platform() {
 }
 
 export function productPaths(home = os.homedir()) {
-  const data = path.join(home, 'Library', 'Application Support', 'zcode-as-subagent');
+  const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
   return {
     home,
     data,
     config: path.join(data, 'config.json'),
     state: path.join(data, 'install-state.json'),
     hookProvenance: path.join(data, 'zcode-agent-hook-provenance.json'),
-    database: path.join(data, 'zcode-as-subagent.sqlite3'),
-    socket: path.join(data, 'zcode-as-subagent.sock'),
-    logs: path.join(home, 'Library', 'Logs', 'zcode-as-subagent'),
+    database: path.join(data, 'external-subagent.sqlite3'),
+    socket: path.join(data, 'external-subagent.sock'),
+    logs: path.join(home, 'Library', 'Logs', 'external-subagent'),
     launchAgent: path.join(home, 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`),
     zcodeConfig: path.join(home, '.zcode', 'cli', 'config.json'),
   };
