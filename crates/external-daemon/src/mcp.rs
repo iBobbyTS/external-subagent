@@ -228,6 +228,14 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
         RpcErrorCode::Malformed | RpcErrorCode::Validation => {
             ("validation", "request validation failed")
         }
+        RpcErrorCode::AgentRequired => ("agent_required", "agent is required"),
+        RpcErrorCode::AgentUnknown => ("agent_unknown", "agent is unknown"),
+        RpcErrorCode::AgentDisabled => ("agent_disabled", "agent is disabled"),
+        RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
+        RpcErrorCode::ModelSelectionUnsupported => (
+            "model_selection_unsupported",
+            "model selection is unsupported for zcode",
+        ),
         RpcErrorCode::Oversized => ("oversized", "bounded response or request was too large"),
         RpcErrorCode::UnsupportedVersion => {
             ("protocol_version_mismatch", "incompatible subagent daemon")
@@ -261,7 +269,13 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
         format!("{code}: {message} (active_agent_id={agent_id})")
     } else if matches!(
         error.code,
-        RpcErrorCode::Validation | RpcErrorCode::Malformed
+        RpcErrorCode::Validation
+            | RpcErrorCode::Malformed
+            | RpcErrorCode::AgentRequired
+            | RpcErrorCode::AgentUnknown
+            | RpcErrorCode::AgentDisabled
+            | RpcErrorCode::AgentUnsupported
+            | RpcErrorCode::ModelSelectionUnsupported
     ) && detail != message
         && detail.len() <= 512
     {
@@ -426,12 +440,12 @@ mod tests {
 mod server {
     use super::internal_task_id;
     use crate::rpc::{
-        AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
-        MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView, RpcClient, RpcMethod,
-        RpcOutcome, RpcRequest, RpcService, RpcSuccess, SubmissionDispositionView,
-        SystemStatusView, TaskActivityStateView, TaskActivityView, TaskListQuery,
-        TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery,
-        TelemetryStatusView, RPC_VERSION,
+        AgentCapabilitiesView, AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
+        ComponentStateView, GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision,
+        ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess,
+        SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
+        TaskListQuery, TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView,
+        TaskWaitQuery, TelemetryStatusView, RPC_VERSION,
     };
     use external_core::{GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
     use external_store::TaskOutcome;
@@ -755,7 +769,54 @@ mod server {
     pub struct SystemStatusOutput {
         pub components: BTreeMap<String, PublicComponentState>,
         pub capabilities: PublicAgentCapabilities,
+        pub agents: Vec<PublicAgentStatus>,
         pub identity: PublicDeploymentIdentity,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct PublicAgentStatus {
+        pub agent: String,
+        pub config_revision: u64,
+        pub enabled: bool,
+        pub spawn_supported: bool,
+        pub local: PublicAgentScopeStatus,
+        pub auth: PublicAgentScopeStatus,
+        pub hi: PublicAgentScopeStatus,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct PublicAgentScopeStatus {
+        pub status: PublicComponentState,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub checked_at_ms: Option<u64>,
+    }
+
+    impl From<AgentScopeStatusView> for PublicAgentScopeStatus {
+        fn from(value: AgentScopeStatusView) -> Self {
+            Self {
+                status: value.status.into(),
+                version: value.version,
+                checked_at_ms: value.checked_at_ms,
+            }
+        }
+    }
+
+    impl From<AgentStatusView> for PublicAgentStatus {
+        fn from(value: AgentStatusView) -> Self {
+            Self {
+                agent: value.agent,
+                config_revision: value.config_revision,
+                enabled: value.enabled,
+                spawn_supported: value.spawn_supported,
+                local: value.local.into(),
+                auth: value.auth.into(),
+                hi: value.hi.into(),
+            }
+        }
     }
 
     impl SystemStatusOutput {
@@ -776,6 +837,7 @@ mod server {
                     .map(|(name, state)| (name, state.into()))
                     .collect(),
                 capabilities: value.capabilities.into(),
+                agents: value.agents.into_iter().map(Into::into).collect(),
                 identity: PublicDeploymentIdentity {
                     daemon,
                     facade,
@@ -1476,14 +1538,7 @@ mod server {
 
     fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, ToolError> {
         match input.agent {
-            None => {
-                return Err(ToolError::new(
-                    "agent_required",
-                    "agent is required; choose zcode",
-                    "agent_required: agent is required; choose zcode",
-                    "facade",
-                ))
-            }
+            None => {}
             Some(PublicAgent::Dsh) => {
                 return Err(ToolError::new(
                     "agent_unsupported",
@@ -1495,7 +1550,7 @@ mod server {
             }
             Some(PublicAgent::Zcode) => {}
         }
-        if input.model.is_some() {
+        if matches!(input.agent, Some(PublicAgent::Zcode)) && input.model.is_some() {
             return Err(ToolError::new(
                 "model_selection_unsupported",
                 "model selection is unsupported for zcode",
@@ -1631,7 +1686,14 @@ mod server {
             let manifest =
                 general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
             let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral {
-                input: GeneralSubmitInput { manifest },
+                input: GeneralSubmitInput {
+                    agent: input.agent.map(|agent| match agent {
+                        PublicAgent::Zcode => "zcode".into(),
+                        PublicAgent::Dsh => "dsh".into(),
+                    }),
+                    model: input.model.clone(),
+                    manifest,
+                },
             })? {
                 RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
                 _ => return Err(protocol_error().with_operation("spawn")),
@@ -2307,8 +2369,7 @@ mod server {
                 "prompt": "test"
             });
             let omitted: AgentSpawnInput = serde_json::from_value(base.clone()).unwrap();
-            let error = general_manifest(&omitted).unwrap_err();
-            assert_eq!(error.body.code, "agent_required");
+            assert!(general_manifest(&omitted).is_ok());
 
             let dsh: AgentSpawnInput = serde_json::from_value(
                 serde_json::json!({"agent":"dsh","repository":"/tmp/repository","prompt":"test"}),
@@ -2332,6 +2393,8 @@ mod server {
         fn spawn_rpc_context_omits_the_preallocation_placeholder() {
             let method = RpcMethod::SubmitGeneral {
                 input: GeneralSubmitInput {
+                    agent: Some("zcode".into()),
+                    model: None,
                     manifest: external_core::GeneralTaskManifest {
                         schema: external_core::GENERAL_TASK_SCHEMA.into(),
                         agent_id: "daemon-prepared".into(),
@@ -2368,6 +2431,7 @@ mod server {
                         },
                     },
                 },
+                agents: Vec::new(),
                 identity: None,
             };
             let facade = PublicComponentIdentity {
@@ -2475,6 +2539,7 @@ mod server {
                 "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
                     "maturity":{},"observation":{"public_reasoning_default":true,
                         "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
+                "agents":[],
                 "identity":{"daemon":{"artifact":artifact.clone()},
                     "facade":{"artifact":artifact},
                     "models":{}}

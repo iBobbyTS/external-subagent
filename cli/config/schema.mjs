@@ -48,9 +48,13 @@ export function validateSpawnSelection(config, input) {
   if (!agent) throw new CliError('agent_required', 'agent is required when no default_agent is configured', 2);
   if (!AGENT_IDS.includes(agent)) throw new CliError('agent_unknown', `unknown agent: ${agent}`, 2);
   const record = config.agents[agent];
+  if (!record.spawn_supported) {
+    const error = new CliError('agent_unsupported', `agent is not spawn-supported: ${agent}; prompt_count=0`, 2);
+    error.promptCount = 0;
+    throw error;
+  }
   if (!record.enabled) throw new CliError('agent_disabled', `agent is disabled: ${agent}`, 2);
   rejectModel(agent, input?.model, 'model');
   rejectModel(agent, record.default_model, 'default_model');
-  if (!record.spawn_supported) throw new CliError('agent_unsupported', `agent is not spawn-supported: ${agent}`, 2);
   return agent;
 }

@@ -23,6 +23,7 @@ struct Config {
     socket: PathBuf,
     runtime: Option<PathBuf>,
     diagnostic_log: Option<PathBuf>,
+    agent_config: Option<PathBuf>,
 }
 
 const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -33,6 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
     let config = parse_config()?;
+    if let Some(path) = config.agent_config.as_ref() {
+        env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
+    }
     configure_diagnostic_log(config.diagnostic_log.clone());
     wait_for_startup_test_gate(&shutdown_requested)?;
     if shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
@@ -114,6 +118,7 @@ fn parse_config() -> io::Result<Config> {
     let mut socket = env::var_os("ZCODE_AGENTD_SOCKET").map(PathBuf::from);
     let mut runtime = env::var_os("ZCODE_RUNTIME_PATH").map(PathBuf::from);
     let mut diagnostic_log = None;
+    let mut agent_config = env::var_os("EXTERNAL_SUBAGENT_CONFIG").map(PathBuf::from);
     let mut arguments = env::args_os().skip(1);
     while let Some(argument) = arguments.next() {
         let value = arguments.next().ok_or_else(|| {
@@ -127,6 +132,7 @@ fn parse_config() -> io::Result<Config> {
             "--socket" => socket = Some(PathBuf::from(value)),
             "--runtime" => runtime = Some(PathBuf::from(value)),
             "--diagnostic-log" => diagnostic_log = Some(absolute_path(PathBuf::from(value))?),
+            "--agent-config" => agent_config = Some(absolute_path(PathBuf::from(value))?),
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -141,6 +147,8 @@ fn parse_config() -> io::Result<Config> {
             "ZCODE_AGENTD_STORE or --database is required",
         )
     })?)?;
+    let agent_config =
+        agent_config.or_else(|| database.parent().map(|parent| parent.join("config.json")));
     let socket = absolute_path(socket.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -159,6 +167,7 @@ fn parse_config() -> io::Result<Config> {
         socket,
         runtime,
         diagnostic_log,
+        agent_config,
     })
 }
 
