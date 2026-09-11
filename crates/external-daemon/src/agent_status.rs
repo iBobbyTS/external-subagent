@@ -492,12 +492,19 @@ fn request_with_runtime_preferences(
         let _ = sender.send(pending.wait(budget));
     });
     loop {
+        if let Some(ProbeTerminal::Failed(reason)) = events.terminal.as_ref() {
+            return Err(reason.clone());
+        }
         match receiver.try_recv() {
             Ok(result) => {
-                return result
-                    .map_err(|error| classify_request_error(&error, &driver.diagnostic_tail()))
+                return result.map_err(|error| {
+                    let fallback = classify_request_error(&error, &driver.diagnostic_tail());
+                    events.failure_reason_or(fallback)
+                })
             }
-            Err(mpsc::TryRecvError::Disconnected) => return Err("transport".into()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(events.failure_reason_or("transport".into()))
+            }
             Err(mpsc::TryRecvError::Empty) => {}
         }
         let wait = remaining(deadline)?.min(Duration::from_millis(20));
@@ -566,9 +573,10 @@ impl ProbeEventCache {
                             }
                         }
                         Some("turn.failed") => {
-                            self.terminal = Some(ProbeTerminal::Failed(
-                                classify_provider_failure(&event.params, diagnostic).into(),
-                            ));
+                            let reason =
+                                classify_provider_failure(&event.params, diagnostic).to_owned();
+                            self.diagnostic_reason = Some(reason.clone());
+                            self.terminal = Some(ProbeTerminal::Failed(reason));
                         }
                         _ => self.capture_diagnostic(&event.params, diagnostic),
                     }
@@ -609,6 +617,13 @@ impl ProbeEventCache {
         let reason = classify_provider_failure(value, diagnostic);
         if reason != "transport" {
             self.diagnostic_reason = Some(reason.into());
+        }
+    }
+
+    fn failure_reason_or(&self, fallback: String) -> String {
+        match self.terminal.as_ref() {
+            Some(ProbeTerminal::Failed(reason)) => reason.clone(),
+            _ => self.diagnostic_reason.clone().unwrap_or(fallback),
         }
     }
 }
@@ -815,6 +830,7 @@ mod tests {
         failure: Value,
         emit_tool: bool,
         terminal_before_response: bool,
+        after_terminal: &str,
     ) -> (PathBuf, PathBuf) {
         let executable = directory.join(format!("fixture-{terminal}.mjs"));
         let log = directory.join(format!("fixture-{terminal}.jsonl"));
@@ -826,6 +842,7 @@ const terminal = __TERMINAL__;
 const failure = __FAILURE__;
 const emitTool = __EMIT_TOOL__;
 const terminalBeforeResponse = __TERMINAL_BEFORE_RESPONSE__;
+const afterTerminal = __AFTER_TERMINAL__;
 let pendingCreate = null;
 let buffer = '';
 function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -856,7 +873,10 @@ process.stdin.on('data', (chunk) => {
       const tool = { method: 'session/event', params: { eventId: 'tool', sessionId: 'probe-session', seq: 2, timestamp: 2, type: 'tool.updated', payload: { toolName: 'Bash' } } };
       const ended = { method: 'session/event', params: { eventId: 'end', sessionId: 'probe-session', seq: 3, timestamp: 3, type: terminal, payload: failure } };
       if (terminalBeforeResponse) {
-        write(started); if (emitTool) write(tool); write(ended); setTimeout(() => write(response), 25);
+        write(started); if (emitTool) write(tool); write(ended);
+        if (afterTerminal === 'rpc_error') setTimeout(() => write({ id: value.id, error: { code: -32000, message: 'generic transport error' } }), 25);
+        else if (afterTerminal === 'exit') setTimeout(() => process.exit(7), 25);
+        else setTimeout(() => write(response), 25);
       } else {
         write(response); write(started); if (emitTool) write(tool); write(ended);
       }
@@ -873,6 +893,10 @@ process.stdin.on('data', (chunk) => {
         .replace(
             "__TERMINAL_BEFORE_RESPONSE__",
             if terminal_before_response { "true" } else { "false" },
+        )
+        .replace(
+            "__AFTER_TERMINAL__",
+            &serde_json::to_string(after_terminal).unwrap(),
         );
         fs::write(&executable, source).unwrap();
         (executable, log)
@@ -892,6 +916,22 @@ process.stdin.on('data', (chunk) => {
         emit_tool: bool,
         terminal_before_response: bool,
     ) -> (AgentProbeEvidence, Vec<Value>) {
+        run_fixture_probe_after_terminal(
+            terminal,
+            failure,
+            emit_tool,
+            terminal_before_response,
+            "success",
+        )
+    }
+
+    fn run_fixture_probe_after_terminal(
+        terminal: &str,
+        failure: Value,
+        emit_tool: bool,
+        terminal_before_response: bool,
+        after_terminal: &str,
+    ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, log) = fake_hi_runtime(
             directory.path(),
@@ -899,6 +939,7 @@ process.stdin.on('data', (chunk) => {
             failure,
             emit_tool,
             terminal_before_response,
+            after_terminal,
         );
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
@@ -1002,6 +1043,44 @@ process.stdin.on('data', (chunk) => {
             assert_eq!(evidence.hi.state, state);
             assert_eq!(evidence.auth.state, state);
             assert_eq!(evidence.hi.reason.as_deref(), reason);
+        }
+    }
+
+    #[test]
+    fn cached_failure_reason_beats_later_rpc_error_or_process_exit() {
+        for (failure, after_terminal, reason, state) in [
+            (
+                serde_json::json!({"error":{"code":401,"message":"unauthorized"}}),
+                "rpc_error",
+                "auth_401",
+                EvidenceState::Unavailable,
+            ),
+            (
+                serde_json::json!({"error":{"code":429,"message":"rate limit"}}),
+                "exit",
+                "rate_limit",
+                EvidenceState::Degraded,
+            ),
+            (
+                serde_json::json!({"error":{"message":"network connection failed"}}),
+                "rpc_error",
+                "network",
+                EvidenceState::Unavailable,
+            ),
+        ] {
+            let started = Instant::now();
+            let (evidence, _) = run_fixture_probe_after_terminal(
+                "turn.failed",
+                failure,
+                false,
+                true,
+                after_terminal,
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(evidence.auth.reason.as_deref(), Some(reason));
+            assert_eq!(evidence.hi.reason.as_deref(), Some(reason));
+            assert_eq!(evidence.auth.state, state);
+            assert_eq!(evidence.hi.state, state);
         }
     }
 }
