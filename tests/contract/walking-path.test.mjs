@@ -8,6 +8,13 @@ import { spawn } from 'node:child_process';
 
 const root = path.resolve(import.meta.dirname, '../..');
 const cli = path.join(root, 'bin/zas.mjs');
+
+test('public schema matches the external MCP tool namespace', async () => {
+  const schema = JSON.parse(await fs.readFile(path.join(root, 'schema/zcode-subagent-public-api.json'), 'utf8'));
+  const names = schema.properties.tools.const;
+  assert.equal(names.every((name) => name.startsWith('external_subagent_')), true);
+  assert.equal(JSON.stringify(schema).includes('zcode_subagent_'), false);
+});
 function task(phase = 'running') { return { agent_id: 10000001, phase, outcome: phase === 'completed' ? 'completed' : null, stop_requested: false, close_requested: phase === 'closed', closed: phase === 'closed', reaped: phase === 'closed' }; }
 async function fixtureServer(socketPath) {
   let phase = 'running';
