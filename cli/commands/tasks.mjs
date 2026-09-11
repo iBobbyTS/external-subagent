@@ -1,6 +1,40 @@
 import { CliError } from '../errors.mjs';
 
 const SPAWN_FIELDS = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
+const FLAG_FIELDS = new Map([
+  ['--agent', 'agent'],
+  ['--repository', 'repository'],
+  ['--prompt', 'prompt'],
+  ['--permission-mode', 'permission_mode'],
+  ['--model', 'model'],
+]);
+
+function flagValue(args, option) {
+  const value = args.shift();
+  if (value === undefined || value === '' || value === 'null' || value.startsWith('--')) {
+    throw new CliError('INVALID_ARGUMENT', `${option} requires a non-null value`, 2);
+  }
+  return value;
+}
+
+export function parseSpawnArgs(args) {
+  const input = {};
+  const remaining = [...args];
+  while (remaining.length > 0) {
+    const option = remaining.shift();
+    if (option === '--write-manifest') {
+      (input.write_manifest ||= []).push(flagValue(remaining, option));
+      continue;
+    }
+    const field = FLAG_FIELDS.get(option);
+    if (!field) throw new CliError('INVALID_ARGUMENT', `unsupported spawn option: ${option}`, 2);
+    if (Object.hasOwn(input, field)) throw new CliError('INVALID_ARGUMENT', `${option} may be provided only once`, 2);
+    input[field] = flagValue(remaining, option);
+  }
+  if (!Object.hasOwn(input, 'repository')) throw new CliError('INVALID_ARGUMENT', '--repository is required', 2);
+  if (!Object.hasOwn(input, 'prompt')) throw new CliError('INVALID_ARGUMENT', '--prompt is required', 2);
+  return prepareSpawnInput(input);
+}
 
 export function prepareSpawnInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CliError('INVALID_ARGUMENT', 'spawn input must be an object', 2);

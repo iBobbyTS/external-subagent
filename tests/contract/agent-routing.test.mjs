@@ -48,6 +48,48 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   assert.equal(Object.hasOwn(fixture.observed().params.input, 'model'), false);
 });
 
+test('spawn and create flags produce the same daemon DTO as JSON', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-flags-'));
+  const jsonInput = {
+    agent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
+    model: 'catalog-token', write_manifest: ['src/**', 'tests/**'],
+  };
+  const invocations = [
+    ['spawn', '--json', JSON.stringify(jsonInput)],
+    ['spawn', '--agent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build', '--model', 'catalog-token', '--write-manifest', 'src/**', '--write-manifest', 'tests/**'],
+    ['create', '--agent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build', '--model', 'catalog-token', '--write-manifest', 'src/**', '--write-manifest', 'tests/**'],
+  ];
+  const captured = [];
+  for (let index = 0; index < invocations.length; index += 1) {
+    const socket = path.join(os.tmpdir(), `es-f-${process.pid}-${index}-${Date.now()}.sock`);
+    const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
+      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
+    } }), () => runCli(home, socket, invocations[index]));
+    assert.equal(fixture.result.code, 0, fixture.result.stderr);
+    const input = structuredClone(fixture.observed().params.input);
+    input.manifest.agent_id = '<request-id>';
+    captured.push(input);
+  }
+  assert.deepEqual(captured[1], captured[0]);
+  assert.deepEqual(captured[2], captured[0]);
+});
+
+test('spawn flags reject unknown, missing, and null-like values before transport', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-invalid-flags-'));
+  const socket = path.join(home, 'missing.sock');
+  for (const args of [
+    ['spawn', '--repository', '/repo'],
+    ['spawn', '--repository', '/repo', '--prompt'],
+    ['spawn', '--repository', '/repo', '--prompt', 'null'],
+    ['spawn', '--repository', '/repo', '--prompt', 'hi', '--model', 'null'],
+    ['spawn', '--repository', '/repo', '--prompt', 'hi', '--unknown', 'x'],
+  ]) {
+    const result = await runCli(home, socket, args);
+    assert.equal(result.code, 2);
+    assert.notEqual(JSON.parse(result.stderr).error.code, 'SOCKET_UNAVAILABLE');
+  }
+});
+
 test('disabled-agent result comes from daemon canonical admission', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-disabled-'));
   const paths = productPaths(home);
