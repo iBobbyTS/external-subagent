@@ -203,7 +203,11 @@ export function installHooks(paths = productPaths(), options = {}) {
   if (options.dryRun) return { dry_run: true, plan: [{ id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance }] };
   const result = spawnSync(process.execPath, [hookInstaller, '--config', paths.zcodeConfig, '--provenance', paths.hookProvenance], { encoding: 'utf8' });
   if (result.error) throw result.error;
-  if (result.status !== 0) throw new CliError('HOOK_INSTALL_FAILED', (result.stderr || 'hook installation failed').trim());
+  if (result.status !== 0) {
+    let failure;
+    try { failure = JSON.parse((result.stderr || '').trim()); } catch {}
+    throw new CliError(failure?.code || 'HOOK_INSTALL_FAILED', failure?.error || (result.stderr || 'hook installation failed').trim());
+  }
   try { return JSON.parse(result.stdout); } catch { throw new CliError('HOOK_INSTALL_FAILED', 'hook installer returned invalid JSON'); }
 }
 
