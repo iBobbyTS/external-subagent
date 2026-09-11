@@ -77,7 +77,7 @@ HANDOFF 包只需要真实来源/version、该 section 的输入输出片段与�
 
 顺序：**S01 → S02（A→B）→ S03 → S04（A→B）→ S05 → S06**，全程串行。同一 parent 的子项只在前一 checkpoint 关闭后推进；parent fully accepted、集成通过后才可启下个 parent。没有并行授权，不新增开发 worktree。
 
-固定角色（具体实际模型是否可用、是否暴露 observed model，均由本机执行时核验）：impl_nano=luna/xhigh；impl_mini=terra/high；impl_std=sol/medium；impl_large=astra/medium；code_reviewer=astra/high；plan_reviewer=astra/xhigh；code_explorer=luna/xhigh，完整模型名以附件 `model-routing.md` 为准。下方每个单元已冻结一个 role/profile 与 task_features；role 链接不是已 dispatch 的证据。
+固定角色（具体实际模型是否可用、是否暴露 observed model，均由本机执行时核验）：已完成的 S01/S02/S03 保留实际 native 执行记录；自本次 owner override 起，所有未来 `impl_nano`、`impl_mini`、`impl_std` 单元改由 [@Zcode As Subagent](plugin://zcode-as-subagent@personal) 执行；`impl_large`=astra/medium、code_reviewer=astra/high、plan_reviewer=astra/xhigh、code_explorer=luna/xhigh 保持不变。ZCode worker 直接 spawn 并保存真实 agent_id，不做例行 status/list 预检，不盲目重试；完成后分页读取完整 result 并 close 终态任务。下方 role 链接不是已 dispatch 的证据。
 
 **PLAN barrier**：机械 validator 后，先 fresh native `@plan_reviewer` 只读审查持久化完整计划；主控读完、持久化并收敛必要改动。该 feature 同时命中公共协议、进程/并发、权限/凭据、schema、多个 owner 与至少3产品节，故再**直接**调用现有 `zcode_subagent_spawn` 做第二独立 PLAN review，不向它提供第一位 reviewer 的结论。两条真实路径都返回并完成 admission，必要 delta 关闭，才解锁 S01；第二ZCode PLAN review后最多一次有界delta验证，不扩成第三次独立设计评审。没有第三个独立 PLAN reviewer。
 
@@ -244,6 +244,7 @@ ONE 初次干净可按skill接受；若有修复，仍按skill取得必要fresh 
 
 ### S04.A — DSH build、模型与审批的贯通任务
 - Implementer: [@impl_std](subagent://impl_std)
+- Execution provider: [@Zcode As Subagent](plugin://zcode-as-subagent@personal)；`impl_std` 仅为 SFD validator 的复杂度 profile，不得派发 native impl_std。
 - Depends on: none
 
 **Outcome / authority / owner**：U01/U04、P01—P03/P06；primary owner DSH ACP session，把S01已观测形状接到S03已冻结route与S02已成熟core。
@@ -260,7 +261,7 @@ ONE 初次干净可按skill接受；若有修复，仍按skill取得必要fresh 
 
 **Review**：HIGH_RISK；assurance **TWO（父级联合；本child无独立FINAL）**，A触发parent primary。
 
-**Routing**：profile `impl_std`；analogue=S01wirefixtures+S02adaptertrait/requestqueue；ambiguity=boundedmapping，不再选择protocol；semantic_hops=ACP model/prompt/update→existingstore/request→projection；state_coupling=共享请求/队列，owner已给；oracle_strength=decisivewire与countingfake；novel_reasoning=no新生产架构，需多表示映射；context_scope=DSHadapter与少数coreevent接缝；false_clean=错误模型/错结果/权限deadlock，Sol非机械tier。
+**Routing**：provider `Zcode As Subagent`，permission_mode=`build`，不传 `write_manifest`；analogue=S01wirefixtures+S02adaptertrait/requestqueue；ambiguity=boundedmapping，不再选择protocol；semantic_hops=ACP model/prompt/update→existingstore/request→projection；state_coupling=共享请求/队列，owner已给；oracle_strength=decisivewire与countingfake；novel_reasoning=no新生产架构，需多表示映射；context_scope=DSHadapter与少数coreevent接缝；false_clean=错误模型/错结果/权限deadlock。dispatch 后保存 agent_id，wait/respond/result/close 严格按 ZAS lifecycle 执行。
 
 ### S04.B — 严格 plan、取消回收与多 provider 同一合同
 - Implementer: [@impl_large](subagent://impl_large)
@@ -284,6 +285,7 @@ ONE 初次干净可按skill接受；若有修复，仍按skill取得必要fresh 
 
 ## S05 — npm 全新安装后 Codex 能实际调用两种 agent
 - Implementer: [@impl_std](subagent://impl_std)
+- Execution provider: [@Zcode As Subagent](plugin://zcode-as-subagent@personal)；`impl_std` 仅为 SFD validator 的复杂度 profile，不得派发 native impl_std。
 - Depends on: S04
 
 ### 业务合同
@@ -306,7 +308,7 @@ ONE 初次干净可按skill接受；若有修复，仍按skill取得必要fresh 
 
 **Review**：HIGH_RISK；assurance **TWO**。影响用户配置、服务与发布artifact；虽然很多有旧installer范例，错误ownership会损害非本产品配置。
 
-**Routing**：profile `impl_std`；analogue=旧cli/installer.mjs、bin、launchd、plugins与已恢复installtests；ambiguity=bounded官方Codex版本接口，通过probe收敛；semantic_hops=npm→payload/layout→service→Codexregistration/cache→MCP→task；state_coupling=本地多文件安装+既有daemon，升级并发另节；oracle_strength=fixtureFS+真实pack/host工具发现；novel_reasoning=no新生命周期架构，需installer跨环境推理；context_scope=installer/manifest/launchfacade及少数bootstrap；false_clean=PATH不可用/覆盖配置/只安装未可调用。
+**Routing**：provider `Zcode As Subagent`，permission_mode=`build`，不传 `write_manifest`；analogue=旧cli/installer.mjs、bin、launchd、plugins与已恢复installtests；ambiguity=bounded官方Codex版本接口，通过probe收敛；semantic_hops=npm→payload/layout→service→Codexregistration/cache→MCP→task；state_coupling=本地多文件安装+既有daemon，升级并发另节；oracle_strength=fixtureFS+真实pack/host工具发现；novel_reasoning=no新生命周期架构，需installer跨环境推理；context_scope=installer/manifest/launchfacade及少数bootstrap；false_clean=PATH不可用/覆盖配置/只安装未可调用。dispatch 后保存 agent_id，wait/respond/result/close 严格按 ZAS lifecycle 执行。
 
 ## S06 — 更新自动完成安全排空、daemon 激活和受管 Codex 同步
 - Implementer: [@impl_large](subagent://impl_large)
