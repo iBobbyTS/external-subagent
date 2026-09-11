@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "external_subagent": {
+      "command": "__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__",
+      "args": [],
+      "env": { "ZCODE_AGENTD_SOCKET": "__EXTERNAL_SUBAGENT_SOCKET__" }
+    }
+  }
+}

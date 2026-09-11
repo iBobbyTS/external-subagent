@@ -9,13 +9,13 @@ import { atomicWrite, jsonBytes, readOptional, restoreOptional, sha256 } from '.
 import { codexConfigPath, productPaths } from './paths.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const hookInstaller = path.join(packageRoot, 'plugins', 'zcode-subagent-mcp', 'scripts', 'install-agent-hooks.mjs');
+const hookInstaller = path.join(packageRoot, 'plugins', 'codex', 'external-subagent', 'scripts', 'install-agent-hooks.mjs');
 
 export function nativeBinary(name) {
   return path.join(packageRoot, 'npm', 'native', 'darwin-arm64', name);
 }
 
-const CODEX_MCP_SECTION = 'mcp_servers.zcode_as_subagent';
+const CODEX_MCP_SECTION = 'mcp_servers.external_subagent';
 const PLUGIN_NAME = 'external-subagent';
 
 function pluginSourceRoot() { return path.join(packageRoot, 'plugins', PLUGIN_NAME); }
@@ -57,7 +57,7 @@ function stagePlugin(source, staging, paths) {
     // Managed staging is refreshable: skill/docs may have changed since the last install.
     // Keep the ownership check above, then replace its contents from the current source.
     const priorMcp = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
-    const priorServer = priorMcp.mcpServers?.zcode_as_subagent;
+    const priorServer = priorMcp.mcpServers?.external_subagent;
     if (!priorServer || priorServer.command !== nativeBinary('external-subagent-mcp') || priorServer.env?.ZCODE_AGENTD_SOCKET !== paths.socket) {
       throw new CliError('PLUGIN_STAGING_CONFLICT', 'staging MCP binding differs from the managed product endpoint');
     }
@@ -66,7 +66,7 @@ function stagePlugin(source, staging, paths) {
   fs.cpSync(source, staging, { recursive: true, force: true });
   const mcpPath = path.join(staging, '.mcp.json');
   const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
-  const server = mcp.mcpServers?.zcode_as_subagent;
+  const server = mcp.mcpServers?.external_subagent;
   if (!server) throw new CliError('INVALID_PLUGIN_SOURCE', 'plugin MCP server is missing');
   server.command = nativeBinary('external-subagent-mcp');
   server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };

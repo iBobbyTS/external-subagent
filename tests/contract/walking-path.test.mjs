@@ -7,7 +7,7 @@ import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 
 const root = path.resolve(import.meta.dirname, '../..');
-const cli = path.join(root, 'bin/zas.mjs');
+const cli = path.join(root, 'bin/external-subagent.mjs');
 
 test('public schema matches the external MCP tool namespace', async () => {
   const schema = JSON.parse(await fs.readFile(path.join(root, 'schema/zcode-subagent-public-api.json'), 'utf8'));
