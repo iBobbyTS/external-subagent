@@ -351,7 +351,7 @@ export async function main(args) {
   let input;
   if (command === 'create' || command === 'spawn') {
     const spawnArgs = args.slice(1);
-    input = spawnArgs.some((arg) => arg === '--json' || arg.startsWith('--json='))
+    input = spawnArgs.length === 0 || spawnArgs.some((arg) => arg === '--json' || arg.startsWith('--json='))
       ? prepareSpawnInput(parseDaemonInput(spawnArgs))
       : parseSpawnArgs(spawnArgs);
   } else input = parseDaemonInput(args.slice(1));
