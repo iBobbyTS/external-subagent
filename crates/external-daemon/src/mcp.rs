@@ -786,19 +786,36 @@ mod server {
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct PublicAgentScopeStatus {
-        pub status: PublicComponentState,
+        pub state: PublicComponentState,
+        pub scope: PublicProbeScope,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub version: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub checked_at_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct PublicProbeScope {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub workspace: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub home: Option<String>,
     }
 
     impl From<AgentScopeStatusView> for PublicAgentScopeStatus {
         fn from(value: AgentScopeStatusView) -> Self {
             Self {
-                status: value.status.into(),
+                state: value.state.into(),
+                scope: PublicProbeScope {
+                    workspace: value.scope.workspace,
+                    home: value.scope.home,
+                },
                 version: value.version,
                 checked_at_ms: value.checked_at_ms,
+                reason: value.reason,
             }
         }
     }
@@ -1557,6 +1574,7 @@ mod server {
     fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {
         match method {
             RpcMethod::SystemStatus => ("status", None),
+            RpcMethod::AgentProbe { .. } => ("agent_probe", None),
             RpcMethod::SubmitGeneral { .. } => ("spawn", None),
             RpcMethod::TaskList(_) => ("list", None),
             RpcMethod::TaskWait(input) => ("wait", Some(input.agent_id.clone())),

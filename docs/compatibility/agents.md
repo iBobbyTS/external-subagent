@@ -1,0 +1,18 @@
+# Agent discovery, probe, and status
+
+Agent status is a passive projection of configuration plus the latest evidence produced by an explicit probe. Reading `system_status` does not inspect an executable, start a provider, authenticate, or send a prompt. An agent with no explicit probe therefore reports `UNKNOWN`, `checked_at_ms` omitted, and reason `not_probed` for `local`, `auth`, and `hi`.
+
+The daemon RPC method `agent_probe` accepts an agent (`zcode` or `dsh`), a `through` layer (`local`, `auth`, or `hi`), and an exact scope containing optional absolute `workspace` and `home` paths. Each returned layer contains `state`, the exact `scope`, `version`, `checked_at_ms`, and `reason`. Scoped evidence remains attached to the workspace/home that produced it; callers must not treat it as evidence for another workspace or home.
+
+The stable failure reasons are:
+
+- `missing`: no configured executable or the configured path is not a file.
+- `version`: the executable exists but its version cannot be established.
+- `transport`: the runtime cannot start, speak the pinned protocol, or settle a valid session.
+- `auth_401`: the provider rejected the production route as unauthorized.
+- `network`: the production route timed out or reported a network failure.
+- `rate_limit`: the provider reported a rate limit; this is degraded evidence rather than valid authentication.
+
+For ZCode, a `local` probe establishes executable/version evidence only. An `auth` probe remains `UNKNOWN` with `auth_requires_hi`, because the pinned runtime does not expose an independent credential check. A `hi` probe uses the same app-server session route as production, sends the bounded prompt `Reply with exactly hi.`, and records auth/hi evidence from that run.
+
+For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, but this release has no accepted production adapter. Auth and hi remain `UNKNOWN` with `dsh_production_adapter_unavailable`, and `spawn_supported` is always `false`. The S01 fixture is protocol evidence only and is never promoted to live auth or hi evidence.

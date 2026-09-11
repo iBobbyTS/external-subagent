@@ -1,0 +1,35 @@
+{
+  "agent": "zcode",
+  "config_revision": 7,
+  "enabled": true,
+  "spawn_supported": true,
+  "local": {
+    "state": "READY",
+    "scope": {
+      "workspace": "/fixtures/workspace-a",
+      "home": "/fixtures/home-a"
+    },
+    "version": "3.8.1",
+    "checked_at_ms": 1234
+  },
+  "auth": {
+    "state": "UNAVAILABLE",
+    "scope": {
+      "workspace": "/fixtures/workspace-a",
+      "home": "/fixtures/home-a"
+    },
+    "version": "3.8.1",
+    "checked_at_ms": 1234,
+    "reason": "auth_401"
+  },
+  "hi": {
+    "state": "UNAVAILABLE",
+    "scope": {
+      "workspace": "/fixtures/workspace-a",
+      "home": "/fixtures/home-a"
+    },
+    "version": "3.8.1",
+    "checked_at_ms": 1234,
+    "reason": "auth_401"
+  }
+}
