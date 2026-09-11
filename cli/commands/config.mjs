@@ -79,7 +79,8 @@ export function parseConfigArgs(args) {
   }
   if (operation === 'unset') {
     if (rest.length !== 1) throw new CliError('INVALID_ARGUMENT', 'usage: config unset <key>', 2);
-    return { operation, patch: unsetPatch(rest[0]) };
+    unsetPatch(rest[0]);
+    return { operation, key: rest[0] };
   }
   throw new CliError('INVALID_ARGUMENT', `unsupported config operation: ${operation}`, 2);
 }
@@ -104,8 +105,8 @@ export function configCommand(paths, input = {}) {
     return { config: current };
   }
   if (operation === 'unset') {
-    if (!input.patch || typeof input.patch !== 'object' || Array.isArray(input.patch)) throw new CliError('INVALID_ARGUMENT', 'config unset requires a supported key', 2);
-    return { config: writeConfig(paths.config, mergePatch(current, input.patch)) };
+    if (input.patch !== undefined || typeof input.key !== 'string') throw new CliError('INVALID_ARGUMENT', 'config unset requires exactly one supported key', 2);
+    return { config: writeConfig(paths.config, mergePatch(current, unsetPatch(input.key))) };
   }
   if (operation === 'get') {
     if (input.patch !== undefined) throw new CliError('INVALID_ARGUMENT', 'config get does not accept patch', 2);

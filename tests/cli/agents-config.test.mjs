@@ -79,6 +79,17 @@ test('config set cannot override revision or merge an agent null patch', () => {
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { revision: first.revision } }), /managed by the writer/u);
 });
 
+test('JSON unset accepts only a supported key and cannot reuse revision or null agent patches', () => {
+  const { paths } = fixture();
+  const first = configCommand(paths, { operation: 'set', patch: { default_agent: 'zcode' } }).config;
+  assert.equal(first.revision, 1);
+  assert.throws(() => configCommand(paths, { operation: 'unset', patch: { revision: 0, default_agent: null } }), /exactly one supported key/u);
+  assert.throws(() => configCommand(paths, { operation: 'unset', patch: { agents: { zcode: null } } }), /exactly one supported key/u);
+  const unset = configCommand(paths, { operation: 'unset', key: 'default_agent' }).config;
+  assert.equal(unset.default_agent, null);
+  assert.equal(unset.revision, 2);
+});
+
 test('unknown config fields and operations fail closed', () => {
   const { paths } = fixture();
   assert.throws(() => configCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');
