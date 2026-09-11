@@ -273,7 +273,8 @@ fn allocate_submission(
             let _ = source.read_exact(&mut entropy);
         }
         let scratch_name = format!(
-            "{}-{}", manifest_agent_id,
+            "{}-{}",
+            manifest_agent_id,
             hash(&serde_json::to_vec(&(
                 repository,
                 manifest_agent_id,
@@ -284,7 +285,12 @@ fn allocate_submission(
         );
         let scratch_root = parent.join(&scratch_name);
         match fs::create_dir(&scratch_root) {
-            Ok(()) => return Ok((manifest_agent_id.to_owned(), fs::canonicalize(scratch_root)?)),
+            Ok(()) => {
+                return Ok((
+                    manifest_agent_id.to_owned(),
+                    fs::canonicalize(scratch_root)?,
+                ))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
@@ -558,14 +564,26 @@ mod tests {
     fn allocated_public_id_is_preserved_in_prepared_digest_and_runtime_identity() {
         let repository = tempfile::tempdir().expect("repository");
         let manifest = GeneralTaskManifest {
-            schema: GENERAL_TASK_SCHEMA.into(), agent_id: "10000000".into(),
-            repository: repository.path().to_path_buf(), permission_mode: PermissionMode::Plan,
-            prompt: "inspect".into(), write_manifest: Vec::new(),
+            schema: GENERAL_TASK_SCHEMA.into(),
+            agent_id: "10000000".into(),
+            repository: repository.path().to_path_buf(),
+            permission_mode: PermissionMode::Plan,
+            prompt: "inspect".into(),
+            write_manifest: Vec::new(),
         };
-        let prepared = GeneralTaskPreparer::new(Vec::new()).unwrap().prepare(&manifest).unwrap();
+        let prepared = GeneralTaskPreparer::new(Vec::new())
+            .unwrap()
+            .prepare(&manifest)
+            .unwrap();
         assert_eq!(prepared.agent_id, "10000000");
         assert!(prepared.validate_digest().is_ok());
-        assert!(prepared.workspace.scratch_root.file_name().unwrap().to_string_lossy().starts_with("10000000-"));
+        assert!(prepared
+            .workspace
+            .scratch_root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("10000000-"));
         assert!(prepared.launcher().is_ok());
     }
 

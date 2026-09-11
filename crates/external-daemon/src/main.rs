@@ -1,3 +1,8 @@
+use external_daemon::{
+    configure_diagnostic_log, rpc::ServerOptions, CommandRuntimeFactory, Daemon, RuntimeFactory,
+    Scheduler, SchedulerConfig,
+};
+use external_store::Store;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
     env, fs, io,
@@ -11,11 +16,6 @@ use std::{
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
-};
-use external_store::Store;
-use external_daemon::{
-    configure_diagnostic_log, rpc::ServerOptions, CommandRuntimeFactory, Daemon, RuntimeFactory,
-    Scheduler, SchedulerConfig,
 };
 
 struct Config {

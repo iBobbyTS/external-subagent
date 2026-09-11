@@ -425,6 +425,8 @@ mod server {
         TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery,
         TelemetryStatusView, RPC_VERSION,
     };
+    use external_core::{GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
+    use external_store::TaskOutcome;
     use rmcp::{
         handler::server::{router::tool::ToolRouter, tool::schema_for_type, wrapper::Parameters},
         model::{Implementation, JsonObject, ServerCapabilities, ServerInfo},
@@ -444,8 +446,6 @@ mod server {
         time::Duration,
     };
     use uuid::Uuid;
-    use external_core::{GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
-    use external_store::TaskOutcome;
 
     use super::{
         protocol_error, public_error, public_transport_error, validation_error, PublicDecision,
@@ -1943,9 +1943,9 @@ mod server {
     #[cfg(test)]
     mod contract_default_tests {
         use super::{
-            default_result_limit, rpc_context, AgentListInput, AgentObserveOutput, AgentWaitInput,
-            AgentResultInput, AgentSendInput, PublicArtifactIdentity, PublicComponentIdentity,
-            SubagentMcp, SystemStatusOutput, PUBLIC_TOOLS,
+            default_result_limit, rpc_context, AgentListInput, AgentObserveOutput,
+            AgentResultInput, AgentSendInput, AgentWaitInput, PublicArtifactIdentity,
+            PublicComponentIdentity, SubagentMcp, SystemStatusOutput, PUBLIC_TOOLS,
         };
         use crate::{
             observation::ObservationSnapshot,
@@ -1982,7 +1982,9 @@ mod server {
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
             assert_eq!(wait.after_revision, 0);
             assert_eq!(wait.wait_time, 290);
-            let immediate: AgentWaitInput = serde_json::from_value(serde_json::json!({"agent_id": 10000000, "wait_time": 0})).unwrap();
+            let immediate: AgentWaitInput =
+                serde_json::from_value(serde_json::json!({"agent_id": 10000000, "wait_time": 0}))
+                    .unwrap();
             assert_eq!(immediate.wait_time, 0);
 
             let result: AgentResultInput =
