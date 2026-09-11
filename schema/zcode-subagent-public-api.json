@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://zcode-as-subagent.invalid/schema/public-api.json",
-  "title": "zcode-as-subagent MCP public API",
-  "description": "The intentionally small zcode_subagent_* wire catalog.",
+  "$id": "https://external-subagent.invalid/schema/public-api.json",
+  "title": "external-subagent MCP public API",
+  "description": "The intentionally small external_subagent_* wire catalog.",
   "type": "object",
   "required": ["tools"],
   "properties": {

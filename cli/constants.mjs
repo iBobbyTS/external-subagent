@@ -1,5 +1,5 @@
 export const PRODUCT_NAME = 'external-subagent';
-export const PRODUCT_ID = 'zcode_as_subagent';
+export const PRODUCT_ID = 'external_subagent';
 export const VERSION = '0.1.0';
 export const LAUNCH_AGENT_LABEL = 'com.external-subagent.daemon';
 export const ZCODE_RUNTIME = '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs';
