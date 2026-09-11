@@ -852,6 +852,8 @@ mod server {
         pub prompt: String,
         #[serde(default)]
         pub write_manifest: Vec<String>,
+        #[serde(default)]
+        pub model: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -1492,6 +1494,14 @@ mod server {
                 .with_prompt_count(0))
             }
             Some(PublicAgent::Zcode) => {}
+        }
+        if input.model.is_some() {
+            return Err(ToolError::new(
+                "model_selection_unsupported",
+                "model selection is unsupported for zcode",
+                "model_selection_unsupported: model selection is unsupported for zcode",
+                "facade",
+            ));
         }
         for (field, value, max) in [
             ("repository", input.repository.as_str(), MAX_PATH_BYTES),

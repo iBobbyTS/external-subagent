@@ -49,7 +49,7 @@ function readJsonInput(args) {
 function requestId() { return `cli-${process.pid}-${crypto.randomUUID()}`; }
 
 function manifest(input) {
-  const allowed = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'write_manifest']);
+  const allowed = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
@@ -62,6 +62,7 @@ function manifest(input) {
     error.promptCount = 0;
     throw error;
   }
+  if (input.model !== undefined) throw new CliError('model_selection_unsupported', 'model selection is unsupported for zcode', 2);
   if (!input.repository || !input.prompt) throw new CliError('INVALID_ARGUMENT', 'create requires repository and prompt', 2);
   return {
     schema: 'zcode-general-task/v1', agent_id: requestId(), repository: input.repository,
