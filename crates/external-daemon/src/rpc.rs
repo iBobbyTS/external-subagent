@@ -1,7 +1,7 @@
 use crate::{
     agent_status::{
-        AgentEvidenceStore, AgentProbeEvidence, AgentProbeInput, EvidenceState, ProbeScope,
-        ScopeEvidence,
+        AgentEvidenceStore, AgentModelsInput, AgentModelsOutput, AgentProbeEvidence,
+        AgentProbeInput, EvidenceState, ProbeScope, ScopeEvidence,
     },
     observation::{ObservationCoverage, ObservedReasoning, ObservedTool, OBSERVATION_SCHEMA},
     MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
@@ -68,6 +68,9 @@ pub enum RpcMethod {
     AgentProbe {
         input: AgentProbeInput,
     },
+    AgentModels {
+        input: AgentModelsInput,
+    },
     SubmitGeneral {
         input: GeneralSubmitInput,
     },
@@ -99,6 +102,7 @@ impl RpcMethod {
             name,
             "system_status"
                 | "agent_probe"
+                | "agent_models"
                 | "submit_general"
                 | "task_list"
                 | "task_wait"
@@ -279,6 +283,9 @@ pub enum RpcSuccess {
     AgentProbed {
         evidence: AgentProbeEvidence,
         status: AgentStatusView,
+    },
+    AgentModels {
+        catalog: AgentModelsOutput,
     },
     GeneralSubmitted {
         task: TaskView,
@@ -966,6 +973,13 @@ impl RpcService {
                     .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
                 Ok(RpcSuccess::AgentProbed { evidence, status })
             }
+            RpcMethod::AgentModels { input } => {
+                validate_agent_models_input(&input)?;
+                let config = read_agent_config_snapshot()?;
+                Ok(RpcSuccess::AgentModels {
+                    catalog: self.agent_evidence.models(&input, config.revision),
+                })
+            }
             RpcMethod::SubmitGeneral { input } => {
                 let config = read_agent_config_snapshot()?;
                 let admission = resolve_admission(&input, &config)?;
@@ -1492,6 +1506,14 @@ fn validate_agent_probe_input(input: &AgentProbeInput) -> Result<(), RpcError> {
         }
     }
     Ok(())
+}
+
+fn validate_agent_models_input(input: &AgentModelsInput) -> Result<(), RpcError> {
+    validate_agent_probe_input(&AgentProbeInput {
+        agent: input.agent.clone(),
+        through: crate::agent_status::ProbeLayer::Local,
+        scope: input.scope.clone(),
+    })
 }
 
 fn resolve_admission(
@@ -3279,5 +3301,29 @@ mod agent_probe_tests {
         ] {
             assert!(service.dispatch(RpcMethod::AgentProbe { input }).is_err());
         }
+    }
+
+    #[test]
+    fn agent_models_rpc_preserves_native_only_result_and_config_identity() {
+        let (_directory, service) = service();
+        let RpcSuccess::AgentModels { catalog } = service
+            .dispatch(RpcMethod::AgentModels {
+                input: AgentModelsInput {
+                    agent: "zcode".into(),
+                    scope: ProbeScope::default(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected models result")
+        };
+        assert!(!catalog.supported);
+        assert!(catalog.models.is_empty());
+        assert_eq!(catalog.reason.as_deref(), Some("native_only"));
+        assert_eq!(catalog.evidence.source, "zcode_native_model");
+        assert_eq!(
+            catalog.config_revision,
+            AgentConfigSnapshot::default().revision
+        );
     }
 }
