@@ -1474,18 +1474,23 @@ mod server {
 
     fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, ToolError> {
         match input.agent {
-            None => return Err(ToolError::new(
-                "agent_required",
-                "agent is required; choose zcode",
-                "agent_required: agent is required; choose zcode",
-                "facade",
-            )),
-            Some(PublicAgent::Dsh) => return Err(ToolError::new(
-                "agent_unsupported",
-                "agent dsh is unsupported",
-                "agent_unsupported: agent dsh is unsupported (prompt_count=0)",
-                "facade",
-            ).with_prompt_count(0)),
+            None => {
+                return Err(ToolError::new(
+                    "agent_required",
+                    "agent is required; choose zcode",
+                    "agent_required: agent is required; choose zcode",
+                    "facade",
+                ))
+            }
+            Some(PublicAgent::Dsh) => {
+                return Err(ToolError::new(
+                    "agent_unsupported",
+                    "agent dsh is unsupported",
+                    "agent_unsupported: agent dsh is unsupported (prompt_count=0)",
+                    "facade",
+                )
+                .with_prompt_count(0))
+            }
             Some(PublicAgent::Zcode) => {}
         }
         for (field, value, max) in [
@@ -1974,12 +1979,13 @@ mod server {
 
     #[cfg(test)]
     mod contract_default_tests {
+        use super::general_manifest;
         use super::{
             default_result_limit, rpc_context, AgentListInput, AgentObserveOutput,
-            AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, PublicArtifactIdentity,
-            PublicComponentIdentity, SubagentMcp, SystemStatusOutput, PUBLIC_TOOLS,
+            AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput,
+            PublicArtifactIdentity, PublicComponentIdentity, SubagentMcp, SystemStatusOutput,
+            PUBLIC_TOOLS,
         };
-        use super::general_manifest;
         use crate::{
             observation::ObservationSnapshot,
             rpc::{
@@ -2296,14 +2302,16 @@ mod server {
 
             let dsh: AgentSpawnInput = serde_json::from_value(
                 serde_json::json!({"agent":"dsh","repository":"/tmp/repository","prompt":"test"}),
-            ).unwrap();
+            )
+            .unwrap();
             let error = general_manifest(&dsh).unwrap_err();
             assert_eq!(error.body.code, "agent_unsupported");
             assert!(error.legacy_text.contains("prompt_count=0"));
 
             let zcode: AgentSpawnInput = serde_json::from_value(
                 serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test"}),
-            ).unwrap();
+            )
+            .unwrap();
             assert!(general_manifest(&zcode).is_ok());
             assert!(serde_json::from_value::<AgentSpawnInput>(
                 serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test","extra":true})

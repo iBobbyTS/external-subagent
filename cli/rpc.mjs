@@ -53,12 +53,12 @@ function manifest(input) {
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
-  if (input.agent === undefined) throw new CliError('AGENT_REQUIRED', 'agent is required; choose zcode', 2);
+  if (input.agent === undefined) throw new CliError('agent_required', 'agent is required; choose zcode', 2);
   if (input.agent !== 'zcode' && input.agent !== 'dsh') {
     throw new CliError('INVALID_ARGUMENT', 'agent must be one of: zcode, dsh', 2);
   }
   if (input.agent === 'dsh') {
-    const error = new CliError('AGENT_UNSUPPORTED', 'agent dsh is unsupported; prompt_count=0', 2);
+    const error = new CliError('agent_unsupported', 'agent dsh is unsupported; prompt_count=0', 2);
     error.promptCount = 0;
     throw error;
   }
