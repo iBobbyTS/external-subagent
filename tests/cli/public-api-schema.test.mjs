@@ -28,6 +28,9 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'native_only', 'catalog_token',
   ]);
   assert.deepEqual(schema.properties.spawn.properties.write_manifest.items.type, 'string');
+  assert.equal(schema.properties.spawn.properties.prompt.type, 'string');
+  assert.equal(schema.properties.spawn.properties.model.type, 'string');
+  assert.equal(schema.properties.spawn.properties.agent.type, 'string');
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.after_revision.default, 0);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
