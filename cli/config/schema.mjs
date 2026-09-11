@@ -67,21 +67,3 @@ export function validateConfig(input) {
   if (config.default_agent && !config.agents[config.default_agent].enabled) throw new CliError('CONFIG_INVALID', 'default_agent must be enabled', 2);
   return config;
 }
-
-export function validateSpawnSelection(config, input) {
-  if (Object.prototype.hasOwnProperty.call(input || {}, 'agent') && input.agent === null) throw new CliError('agent_required', 'agent must be omitted or a supported agent id; null is invalid', 2);
-  if (Object.prototype.hasOwnProperty.call(input || {}, 'model') && input.model === null) throw new CliError('model_selection_unsupported', 'model must be omitted for zcode; null is not a model selection', 2);
-  const agent = input?.agent ?? config.default_agent;
-  if (!agent) throw new CliError('agent_required', 'agent is required when no default_agent is configured', 2);
-  if (!AGENT_IDS.includes(agent)) throw new CliError('agent_unknown', `unknown agent: ${agent}`, 2);
-  const record = config.agents[agent];
-  if (!record.enabled) throw new CliError('agent_disabled', `agent is disabled: ${agent}`, 2);
-  if (!record.spawn_supported) {
-    const error = new CliError('agent_unsupported', `agent is not spawn-supported: ${agent}; prompt_count=0`, 2);
-    error.promptCount = 0;
-    throw error;
-  }
-  rejectModel(agent, input?.model, 'model');
-  rejectModel(agent, record.default_model, 'default_model');
-  return agent;
-}

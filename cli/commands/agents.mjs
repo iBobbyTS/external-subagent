@@ -1,5 +1,4 @@
 import { readConfig } from '../config/read.mjs';
-import { AGENT_IDS } from '../config/schema.mjs';
 import { CliError } from '../errors.mjs';
 
 const INPUT_FIELDS = new Set(['operation', 'agent', 'through', 'workspace', 'home']);
@@ -11,14 +10,42 @@ function validateInput(input) {
   }
   if (Object.prototype.hasOwnProperty.call(input, 'agent')) {
     if (input.agent === null) throw new CliError('INVALID_ARGUMENT', 'agent must be omitted or a supported agent id; null is invalid', 2);
-    if (!AGENT_IDS.includes(input.agent)) throw new CliError('agent_unknown', `unknown agent: ${input.agent}`, 2);
+    if (typeof input.agent !== 'string' || input.agent.length === 0) throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
   }
+}
+
+function parseProbeArgs(rest) {
+  const agent = rest.shift();
+  if (!agent || agent.startsWith('--')) throw new CliError('agent_required', 'agents probe requires an agent', 2);
+  let through = 'local';
+  let selectedLayer = false;
+  const input = { operation: 'probe', agent };
+  while (rest.length > 0) {
+    const option = rest.shift();
+    if (['--local', '--auth', '--hi'].includes(option)) {
+      if (selectedLayer) throw new CliError('INVALID_ARGUMENT', 'agents probe accepts exactly one of --local, --auth, or --hi', 2);
+      through = option.slice(2);
+      selectedLayer = true;
+      continue;
+    }
+    if (option === '--workspace' || option === '--home') {
+      const name = option.slice(2);
+      const value = rest.shift();
+      if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', `${option} requires a value`, 2);
+      if (input[name] !== undefined) throw new CliError('INVALID_ARGUMENT', `${option} may be provided only once`, 2);
+      input[name] = value;
+      continue;
+    }
+    throw new CliError('INVALID_ARGUMENT', `unsupported agents probe option: ${option}`, 2);
+  }
+  return { ...input, through };
 }
 
 export function parseAgentsArgs(args) {
   if (args.length === 0) return { operation: 'list' };
   const [operation, ...rest] = args;
   if (!['list', 'status', 'probe', 'models'].includes(operation)) throw new CliError('INVALID_ARGUMENT', `unsupported agents operation: ${operation}`, 2);
+  if (operation === 'probe') return parseProbeArgs(rest);
   if (operation === 'list' && rest.length !== 0) throw new CliError('INVALID_ARGUMENT', 'usage: agents list', 2);
   if (operation !== 'list' && rest.length > 1) throw new CliError('INVALID_ARGUMENT', `usage: agents ${operation} [agent]`, 2);
   return { operation, ...(rest[0] ? { agent: rest[0] } : {}) };

@@ -34,7 +34,7 @@ async function withServer(socket, respond, body) {
   finally { await new Promise((resolve) => server.close(resolve)); }
 }
 
-test('spawn resolves only the configured default locally and delegates enabled admission to daemon', async () => {
+test('spawn omits implicit agent and model so daemon owns default admission', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-'));
   const paths = productPaths(home);
   const socket = path.join(os.tmpdir(), `es-r-${process.pid}-${Date.now()}.sock`);
@@ -44,7 +44,8 @@ test('spawn resolves only the configured default locally and delegates enabled a
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'submit_general');
-  assert.equal(fixture.observed().params.input.agent, 'zcode');
+  assert.equal(Object.hasOwn(fixture.observed().params.input, 'agent'), false);
+  assert.equal(Object.hasOwn(fixture.observed().params.input, 'model'), false);
 });
 
 test('disabled-agent result comes from daemon canonical admission', async () => {
@@ -57,6 +58,27 @@ test('disabled-agent result comes from daemon canonical admission', async () => 
   assert.equal(fixture.observed().method, 'submit_general');
   assert.equal(fixture.result.code, 1);
   assert.equal(JSON.parse(fixture.result.stderr).error.code, 'agent_disabled');
+});
+
+test('unknown agent, dsh support, and model decisions all come from daemon', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-semantics-'));
+  const cases = [
+    [{ agent: 'future-provider', repository: '/repo', prompt: 'hi' }, 'agent_unknown'],
+    [{ agent: 'dsh', repository: '/repo', prompt: 'hi' }, 'agent_unsupported'],
+    [{ agent: 'zcode', model: 'provider-token', repository: '/repo', prompt: 'hi' }, 'model_selection_unsupported'],
+  ];
+  for (let index = 0; index < cases.length; index += 1) {
+    const [input, code] = cases[index];
+    const socket = path.join(os.tmpdir(), `es-s-${process.pid}-${index}-${Date.now()}.sock`);
+    const fixture = await withServer(socket, (request) => {
+      assert.equal(request.params.input.agent, input.agent);
+      if (input.model === undefined) assert.equal(Object.hasOwn(request.params.input, 'model'), false);
+      else assert.equal(request.params.input.model, input.model);
+      return { outcome: 'error', error: { code, message: code } };
+    }, () => runCli(home, socket, ['spawn', '--json', JSON.stringify(input)]));
+    assert.equal(fixture.result.code, 1);
+    assert.equal(JSON.parse(fixture.result.stderr).error.code, code);
+  }
 });
 
 test('null and unknown spawn fields fail before transport', async () => {
@@ -100,7 +122,10 @@ test('human config and agents forms execute instead of falling through to JSON d
 
   const probe = await withServer(socket, (request) => ({ outcome: 'success', result: {
     kind: 'agent_probed', evidence: { agent: 'zcode' }, status: { agent: 'zcode' },
-  } }), () => runCli(home, socket, ['agents', 'probe', 'zcode']));
+  } }), () => runCli(home, socket, ['agents', 'probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']));
   assert.equal(probe.result.code, 0, probe.result.stderr);
   assert.equal(probe.observed().method, 'agent_probe');
+  assert.deepEqual(probe.observed().params.input, {
+    agent: 'zcode', through: 'hi', scope: { workspace: '/workspace', home: '/home' },
+  });
 });

@@ -7,7 +7,6 @@ import { agentsCommand } from '../../cli/commands/agents.mjs';
 import { parseAgentsArgs } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
-import { validateSpawnSelection } from '../../cli/config/schema.mjs';
 import { prepareSpawnInput } from '../../cli/commands/tasks.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
@@ -18,14 +17,14 @@ test('config has no default and lists layered agent support', async () => {
   const listed = await agentsCommand(paths);
   assert.equal(listed.default_agent, null);
   assert.deepEqual(listed.agents.map((agent) => [agent.agent, agent.spawn_supported]), [['zcode', true], ['dsh', false]]);
-  assert.throws(() => validateSpawnSelection(readConfig(paths.config), {}), (error) => error.code === 'agent_required');
 });
 
 test('zcode model is rejected before prompt and dsh remains discovery-only', () => {
   const { paths } = fixture();
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { default_agent: 'zcode', agents: { zcode: { default_model: 'glm-4' } } } }), (error) => error.code === 'model_selection_unsupported');
   const config = configCommand(paths, { operation: 'set', patch: { agents: { dsh: { enabled: true } } } }).config;
-  assert.throws(() => validateSpawnSelection(config, { agent: 'dsh' }), (error) => error.code === 'agent_unsupported');
+  assert.equal(config.agents.dsh.enabled, true);
+  assert.equal(config.agents.dsh.spawn_supported, false);
 });
 
 test('config writes a revision and keeps existing task snapshots independent', () => {
@@ -79,6 +78,10 @@ test('agents human operations are strict and unsupported actions are explicit', 
   const { paths } = fixture();
   assert.deepEqual(parseAgentsArgs([]), { operation: 'list' });
   assert.deepEqual(parseAgentsArgs(['status', 'zcode']), { operation: 'status', agent: 'zcode' });
+  assert.deepEqual(parseAgentsArgs(['probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']), {
+    operation: 'probe', agent: 'zcode', through: 'hi', workspace: '/workspace', home: '/home',
+  });
+  assert.deepEqual(parseAgentsArgs(['probe', 'future-provider', '--local']), { operation: 'probe', agent: 'future-provider', through: 'local' });
   const probed = await agentsCommand(paths, { operation: 'probe', agent: 'zcode', through: 'hi', workspace: '/workspace' }, {
     socket: '/socket',
     callDaemon: async (socket, command, input) => {
@@ -93,6 +96,9 @@ test('agents human operations are strict and unsupported actions are explicit', 
   await assert.rejects(() => agentsCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');
   await assert.rejects(() => agentsCommand(paths, { operation: 'list', unknown: true }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => parseAgentsArgs(['list', 'zcode']), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => parseAgentsArgs(['probe', 'zcode', '--auth', '--hi']), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => parseAgentsArgs(['probe', 'zcode', '--workspace']), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => parseAgentsArgs(['probe', 'zcode', '--unknown']), (error) => error.code === 'INVALID_ARGUMENT');
 });
 
 test('agents status projects daemon evidence and rejects absent identities', async () => {
@@ -108,10 +114,10 @@ test('agents status projects daemon evidence and rejects absent identities', asy
   await assert.rejects(() => agentsCommand(paths, { operation: 'status', agent: 'dsh' }, options), (error) => error.code === 'agent_unknown');
 });
 
-test('explicit null spawn selection is rejected and omission may use the configured default', () => {
-  const config = { default_agent: 'zcode' };
-  assert.throws(() => prepareSpawnInput(config, { agent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'agent_required');
-  assert.throws(() => prepareSpawnInput(config, { agent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
-  assert.equal(prepareSpawnInput(config, { repository: '/repo', prompt: 'hi' }).agent, 'zcode');
-  assert.throws(() => validateSpawnSelection({ ...readConfig('/definitely/missing'), default_agent: 'zcode' }, { agent: null }), (error) => error.code === 'agent_required');
+test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {
+  assert.throws(() => prepareSpawnInput({ agent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'agent_required');
+  assert.throws(() => prepareSpawnInput({ agent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
+  assert.equal(Object.hasOwn(omitted, 'agent'), false);
+  assert.equal(Object.hasOwn(omitted, 'model'), false);
 });
