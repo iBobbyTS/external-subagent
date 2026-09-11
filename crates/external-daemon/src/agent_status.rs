@@ -1,4 +1,10 @@
-use crate::{LifecycleRecord, LifecycleSink, RuntimeCommandError, RuntimeOwner, TurnBoundary};
+use external_contract::{
+    event_type, CreateSessionParams, RuntimePreferences, SendParams, SessionCreateProjection,
+    SessionParams, SubscribeParams, WireMessage, WorkspaceRef, INTERACTION_REQUEST_PERMISSION,
+    SESSION_CLOSE, SESSION_CREATE, SESSION_EVENT, SESSION_REQUEST_RUNTIME_PREFERENCES,
+    SESSION_SEND, SESSION_SUBSCRIBE,
+};
+use external_runtime::{Driver, Inbound, RequestError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -6,7 +12,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -131,7 +137,26 @@ struct ProcessProbeBackend {
 impl AgentProbeBackend for ProcessProbeBackend {
     fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
         let checked_at_ms = wall_now_millis();
-        let scope = input.scope.clone();
+        let mut scope = input.scope.clone();
+        let disposable_workspace = if input.agent == "zcode"
+            && input.through == ProbeLayer::Hi
+            && scope.workspace.is_none()
+        {
+            tempfile::Builder::new()
+                .prefix("external-subagent-probe-")
+                .tempdir()
+                .ok()
+        } else {
+            None
+        };
+        if let Some(workspace) = disposable_workspace.as_ref() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700));
+            }
+            scope.workspace = Some(workspace.path().to_string_lossy().into_owned());
+        }
         let executable = match input.agent.as_str() {
             "zcode" => self.runtime_source.clone(),
             "dsh" => env::var_os("DSH_RUNTIME_PATH").map(PathBuf::from),
@@ -321,83 +346,284 @@ fn probe_zcode_hi(
     if let Some(home) = scope.home.as_deref() {
         command.env("ZCODE_HOME", home);
     }
-    let owner = match RuntimeOwner::spawn(command, Arc::new(DiscardLifecycle)) {
-        Ok(owner) => owner,
+    command
+        .env("ZCODE_AGENT_POLICY", "1")
+        .env("ZCODE_AGENT_PERMISSION_MODE", "plan")
+        .env("ZCODE_AGENT_WORKSPACE_ROOT", workspace)
+        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
+        .env("ZCODE_AGENT_WRITE_MANIFEST", "[]");
+    let driver = match Driver::spawn(command) {
+        Ok(driver) => Arc::new(driver),
         Err(_) => {
             let evidence = unavailable(scope, version, checked_at_ms, "transport");
             return (evidence.clone(), evidence);
         }
     };
-    let ready = owner.bootstrap_session(workspace, "Reply with exactly hi.", RUNTIME_PROBE_TIMEOUT);
-    let (auth, hi) = match ready {
-        Ok(session) => {
-            let auth = ScopeEvidence {
+    let result = run_read_only_hi(Arc::clone(&driver), workspace);
+    let (auth, hi) = match result {
+        Ok(session_id) => {
+            let _ = driver.request(
+                SESSION_CLOSE,
+                serde_json::to_value(SessionParams {
+                    session_id: &session_id,
+                })
+                .unwrap_or(Value::Null),
+                RUNTIME_STOP_GRACE,
+            );
+            let evidence = ScopeEvidence {
                 state: EvidenceState::Ready,
                 scope: scope.clone(),
-                version: version.clone(),
+                version,
                 checked_at_ms,
                 reason: None,
             };
-            let deadline = Instant::now() + RUNTIME_PROBE_TIMEOUT;
-            let hi = loop {
-                let snapshot = owner.turn_snapshot();
-                match snapshot.boundary {
-                    Some(TurnBoundary::Completed) => {
-                        let _ = owner.close_session(&session.session_id, RUNTIME_STOP_GRACE);
-                        break ScopeEvidence {
-                            state: EvidenceState::Ready,
-                            scope: scope.clone(),
-                            version: version.clone(),
-                            checked_at_ms,
-                            reason: None,
-                        };
-                    }
-                    Some(TurnBoundary::Failed) => {
-                        break unavailable(scope, version.clone(), checked_at_ms, "transport")
-                    }
-                    None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                    None => break unavailable(scope, version.clone(), checked_at_ms, "network"),
-                }
-            };
-            (auth, hi)
+            (evidence.clone(), evidence)
         }
-        Err(error) => {
-            let reason = classify_runtime_error(&error);
-            let evidence = unavailable(scope, version, checked_at_ms, reason);
+        Err(reason) => {
+            let evidence = unavailable(scope, version, checked_at_ms, &reason);
             (evidence.clone(), evidence)
         }
     };
-    let _ = owner.stop(RUNTIME_STOP_GRACE);
+    let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
     (auth, hi)
 }
 
-fn classify_runtime_error(error: &RuntimeCommandError) -> &'static str {
-    match error {
-        RuntimeCommandError::Timeout => "network",
-        RuntimeCommandError::Transport(_) => "transport",
-        RuntimeCommandError::Remote(value) => {
-            let code = value.get("code").and_then(Value::as_i64);
-            let message = value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if code == Some(401) || message.contains("401") || message.contains("unauthorized") {
-                "auth_401"
-            } else if code == Some(429) || message.contains("429") || message.contains("rate limit")
+fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, String> {
+    let deadline = Instant::now() + RUNTIME_PROBE_TIMEOUT;
+    let workspace_ref = WorkspaceRef {
+        workspace_key: workspace,
+        workspace_path: workspace,
+    };
+    let created = request_with_runtime_preferences(
+        Arc::clone(&driver),
+        SESSION_CREATE,
+        serde_json::to_value(CreateSessionParams {
+            workspace: workspace_ref,
+            mode: Some("plan"),
+            mcp_servers: &[],
+        })
+        .map_err(|_| "transport".to_owned())?,
+        deadline,
+    )?;
+    let projection = created
+        .result
+        .as_ref()
+        .ok_or_else(|| "transport".to_owned())
+        .and_then(|result| {
+            SessionCreateProjection::from_result(result).map_err(|_| "transport".to_owned())
+        })?;
+    let session_id = projection.session_id;
+    request_with_runtime_preferences(
+        Arc::clone(&driver),
+        SESSION_SUBSCRIBE,
+        serde_json::to_value(SubscribeParams {
+            session_id: &session_id,
+            delivery_kind: "desktop-continuous",
+            include_snapshot: true,
+        })
+        .map_err(|_| "transport".to_owned())?,
+        deadline,
+    )?;
+    request_with_runtime_preferences(
+        Arc::clone(&driver),
+        SESSION_SEND,
+        serde_json::to_value(SendParams {
+            session_id: &session_id,
+            content: "Do not call tools. Reply with exactly hi.",
+        })
+        .map_err(|_| "transport".to_owned())?,
+        deadline,
+    )?;
+
+    loop {
+        let wait = remaining(deadline)?.min(Duration::from_millis(50));
+        match driver.recv_timeout(wait) {
+            Ok(Inbound::Message(WireMessage::Event(event)))
+                if event.method == SESSION_EVENT
+                    && event_type(&event) == Some("turn.completed") =>
             {
-                "rate_limit"
-            } else if message.contains("network")
-                || message.contains("dns")
-                || message.contains("connect")
-            {
-                "network"
-            } else {
-                "transport"
+                return Ok(session_id)
             }
+            Ok(Inbound::Message(WireMessage::Event(event)))
+                if event.method == SESSION_EVENT && event_type(&event) == Some("turn.failed") =>
+            {
+                return Err(
+                    classify_provider_failure(&event.params, &driver.diagnostic_tail()).into(),
+                )
+            }
+            Ok(Inbound::Message(WireMessage::Event(event)))
+                if event
+                    .params
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind.starts_with("tool.") || kind == "permission.requested"
+                    }) =>
+            {
+                return Err("policy_violation".into())
+            }
+            Ok(Inbound::Message(WireMessage::Event(_))) => {}
+            Ok(Inbound::Message(WireMessage::Request(request))) => {
+                if request.method == INTERACTION_REQUEST_PERMISSION {
+                    let _ = driver.respond_error(
+                        request.id,
+                        serde_json::json!({"code":-32003,"message":"probe policy forbids tools"}),
+                    );
+                    return Err("policy_violation".into());
+                }
+                let _ = driver.respond_error(
+                    request.id,
+                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
+                );
+                return Err("transport".into());
+            }
+            Ok(Inbound::Message(WireMessage::UnknownEvent { raw, .. })) => {
+                if contains_tool_signal(&raw) {
+                    return Err("policy_violation".into());
+                }
+            }
+            Ok(Inbound::Message(WireMessage::Response(_))) => {}
+            Ok(Inbound::Malformed(_) | Inbound::OversizedLine { .. }) => {
+                return Err("transport".into())
+            }
+            Ok(Inbound::ChildExited(_)) => {
+                return Err(
+                    classify_provider_failure(&Value::Null, &driver.diagnostic_tail()).into(),
+                )
+            }
+            Ok(Inbound::UnmatchedResponse { .. }) => return Err("transport".into()),
+            Ok(Inbound::Lifecycle { .. }) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
         }
-        RuntimeCommandError::Unsupported | RuntimeCommandError::InvalidSession(_) => "transport",
     }
+}
+
+fn request_with_runtime_preferences(
+    driver: Arc<Driver>,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<external_contract::ResponseEnvelope, String> {
+    let pending = driver
+        .begin_request(method, params)
+        .map_err(|error| classify_request_error(&error, &driver.diagnostic_tail()))?;
+    let (sender, receiver) = mpsc::channel();
+    let budget = remaining(deadline)?;
+    thread::spawn(move || {
+        let _ = sender.send(pending.wait(budget));
+    });
+    loop {
+        match receiver.try_recv() {
+            Ok(result) => {
+                return result
+                    .map_err(|error| classify_request_error(&error, &driver.diagnostic_tail()))
+            }
+            Err(mpsc::TryRecvError::Disconnected) => return Err("transport".into()),
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let wait = remaining(deadline)?.min(Duration::from_millis(20));
+        match driver.recv_timeout(wait) {
+            Ok(Inbound::Message(WireMessage::Request(request)))
+                if request.method == SESSION_REQUEST_RUNTIME_PREFERENCES =>
+            {
+                driver
+                    .respond(
+                        request.id,
+                        serde_json::to_value(RuntimePreferences::default())
+                            .map_err(|_| "transport".to_owned())?,
+                    )
+                    .map_err(|_| "transport".to_owned())?;
+            }
+            Ok(Inbound::Message(WireMessage::Request(request))) => {
+                if request.method == INTERACTION_REQUEST_PERMISSION {
+                    let _ = driver.respond_error(
+                        request.id,
+                        serde_json::json!({"code":-32003,"message":"probe policy forbids tools"}),
+                    );
+                    return Err("policy_violation".into());
+                }
+                let _ = driver.respond_error(
+                    request.id,
+                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
+                );
+                return Err("transport".into());
+            }
+            Ok(Inbound::Message(WireMessage::Event(event)))
+                if event
+                    .params
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind.starts_with("tool.") || kind == "permission.requested"
+                    }) =>
+            {
+                return Err("policy_violation".into())
+            }
+            Ok(Inbound::Message(WireMessage::UnknownEvent { raw, .. }))
+                if contains_tool_signal(&raw) =>
+            {
+                return Err("policy_violation".into())
+            }
+            Ok(Inbound::Malformed(_) | Inbound::OversizedLine { .. }) => {
+                return Err("transport".into())
+            }
+            Ok(Inbound::ChildExited(_)) => {
+                return Err(
+                    classify_provider_failure(&Value::Null, &driver.diagnostic_tail()).into(),
+                )
+            }
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
+        }
+    }
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, String> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "network".into())
+}
+
+fn classify_request_error(error: &RequestError, diagnostic: &str) -> String {
+    match error {
+        RequestError::Timeout => "network".into(),
+        RequestError::Remote(value) => classify_provider_failure(value, diagnostic).into(),
+        RequestError::Cancelled
+        | RequestError::ChildExited(_)
+        | RequestError::StreamClosed
+        | RequestError::WriteFailed(_) => {
+            classify_provider_failure(&Value::Null, diagnostic).into()
+        }
+    }
+}
+
+fn classify_provider_failure(value: &Value, diagnostic: &str) -> &'static str {
+    let mut text = value.to_string().to_ascii_lowercase();
+    text.push_str(&diagnostic.to_ascii_lowercase());
+    if text.contains("401") || text.contains("unauthorized") || text.contains("unauthenticated") {
+        "auth_401"
+    } else if text.contains("429") || text.contains("rate limit") || text.contains("rate_limit") {
+        "rate_limit"
+    } else if text.contains("network")
+        || text.contains("dns")
+        || text.contains("connect")
+        || text.contains("timed out")
+        || text.contains("timeout")
+    {
+        "network"
+    } else {
+        "transport"
+    }
+}
+
+fn contains_tool_signal(value: &Value) -> bool {
+    let text = value.to_string().to_ascii_lowercase();
+    text.contains("tool.")
+        || text.contains("tool_call")
+        || text.contains("permission.requested")
+        || text.contains("requestpermission")
 }
 
 fn unavailable(
@@ -436,12 +662,6 @@ fn wall_now_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
-}
-
-struct DiscardLifecycle;
-
-impl LifecycleSink for DiscardLifecycle {
-    fn emit(&self, _record: LifecycleRecord) {}
 }
 
 #[cfg(test)]
@@ -498,23 +718,22 @@ mod tests {
     #[test]
     fn failure_classifier_keeps_auth_network_and_rate_limit_distinct() {
         assert_eq!(
-            classify_runtime_error(&RuntimeCommandError::Remote(
-                serde_json::json!({"code":401,"message":"unauthorized"})
-            )),
+            classify_provider_failure(
+                &serde_json::json!({"code":401,"message":"unauthorized"}),
+                ""
+            ),
             "auth_401"
         );
         assert_eq!(
-            classify_runtime_error(&RuntimeCommandError::Remote(
-                serde_json::json!({"code":429,"message":"rate limit"})
-            )),
+            classify_provider_failure(&serde_json::json!({"code":429,"message":"rate limit"}), ""),
             "rate_limit"
         );
         assert_eq!(
-            classify_runtime_error(&RuntimeCommandError::Timeout),
+            classify_provider_failure(&Value::Null, "network timeout"),
             "network"
         );
         assert_eq!(
-            classify_runtime_error(&RuntimeCommandError::Transport("closed".into())),
+            classify_provider_failure(&Value::Null, "closed"),
             "transport"
         );
     }
@@ -549,5 +768,144 @@ mod tests {
         assert_eq!(result.state, EvidenceState::Ready);
         assert_eq!(result.version.as_deref(), Some("fixture-9.9.9"));
         assert_eq!(result.checked_at_ms, 42);
+    }
+
+    fn fake_hi_runtime(
+        directory: &Path,
+        terminal: &str,
+        failure: Value,
+        emit_tool: bool,
+    ) -> (PathBuf, PathBuf) {
+        let executable = directory.join(format!("fixture-{terminal}.mjs"));
+        let log = directory.join(format!("fixture-{terminal}.jsonl"));
+        let source = r#"
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('3.8.1\n'); process.exit(0); }
+const log = __LOG__;
+const terminal = __TERMINAL__;
+const failure = __FAILURE__;
+const emitTool = __EMIT_TOOL__;
+let pendingCreate = null;
+let buffer = '';
+function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const value = JSON.parse(line);
+    const rootMode = process.env.ZCODE_AGENT_WORKSPACE_ROOT ? (fs.statSync(process.env.ZCODE_AGENT_WORKSPACE_ROOT).mode & 0o777).toString(8) : null;
+    fs.appendFileSync(log, JSON.stringify({ value, policy: process.env.ZCODE_AGENT_POLICY, mode: process.env.ZCODE_AGENT_PERMISSION_MODE, manifest: process.env.ZCODE_AGENT_WRITE_MANIFEST, root: process.env.ZCODE_AGENT_WORKSPACE_ROOT, rootMode }) + '\n');
+    if (value.method === 'session/create') {
+      if (value.params.mode !== 'plan' || process.env.ZCODE_AGENT_POLICY !== '1' || process.env.ZCODE_AGENT_PERMISSION_MODE !== 'plan' || process.env.ZCODE_AGENT_WRITE_MANIFEST !== '[]') {
+        write({ id: value.id, error: { code: -32602, message: 'unsafe probe policy' } }); continue;
+      }
+      pendingCreate = value.id;
+      write({ id: 'preferences', method: 'session/requestRuntimePreferences', params: { scope: 'session', sessionId: 'probe-session' } });
+    } else if (value.id === 'preferences' && value.result) {
+      write({ id: pendingCreate, result: { session: { sessionId: 'probe-session' }, settings: { model: { current: { modelId: 'fixture-model' } } } } });
+    } else if (value.method === 'session/subscribe') {
+      write({ id: value.id, result: { subscribed: true } });
+    } else if (value.method === 'session/send') {
+      write({ id: value.id, result: { turnId: 'probe-turn' } });
+      write({ method: 'session/event', params: { eventId: 'start', sessionId: 'probe-session', seq: 1, timestamp: 1, type: 'turn.started', payload: {} } });
+      if (emitTool) write({ method: 'session/event', params: { eventId: 'tool', sessionId: 'probe-session', seq: 2, timestamp: 2, type: 'tool.updated', payload: { toolName: 'Bash' } } });
+      write({ method: 'session/event', params: { eventId: 'end', sessionId: 'probe-session', seq: 3, timestamp: 3, type: terminal, payload: failure } });
+    } else if (value.method === 'session/close') {
+      write({ id: value.id, result: { closed: true } });
+    }
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(&log).unwrap())
+        .replace("__TERMINAL__", &serde_json::to_string(terminal).unwrap())
+        .replace("__FAILURE__", &failure.to_string())
+        .replace("__EMIT_TOOL__", if emit_tool { "true" } else { "false" });
+        fs::write(&executable, source).unwrap();
+        (executable, log)
+    }
+
+    fn run_fixture_probe(
+        terminal: &str,
+        failure: Value,
+        emit_tool: bool,
+    ) -> (AgentProbeEvidence, Vec<Value>) {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, log) = fake_hi_runtime(directory.path(), terminal, failure, emit_tool);
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+        };
+        let evidence = backend.probe(&AgentProbeInput {
+            agent: "zcode".into(),
+            through: ProbeLayer::Hi,
+            scope: ProbeScope::default(),
+        });
+        let records = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        (evidence, records)
+    }
+
+    #[test]
+    fn hi_probe_uses_plan_policy_no_tools_and_a_restricted_disposable_workspace() {
+        let (evidence, records) = run_fixture_probe("turn.completed", serde_json::json!({}), false);
+        assert_eq!(evidence.auth.state, EvidenceState::Ready);
+        assert_eq!(evidence.hi.state, EvidenceState::Ready);
+        let workspace = evidence.hi.scope.workspace.as_deref().unwrap();
+        assert!(workspace.contains("external-subagent-probe-"));
+        assert!(!Path::new(workspace).exists());
+        let create = records
+            .iter()
+            .find(|record| record["value"]["method"] == "session/create")
+            .unwrap();
+        assert_eq!(create["value"]["params"]["mode"], "plan");
+        assert_eq!(create["policy"], "1");
+        assert_eq!(create["mode"], "plan");
+        assert_eq!(create["manifest"], "[]");
+        assert_eq!(create["root"], workspace);
+        assert_eq!(create["rootMode"], "700");
+        assert!(records.iter().all(|record| {
+            let method = record["value"]["method"].as_str().unwrap_or_default();
+            !method.contains("tool") && !method.contains("permission")
+        }));
+    }
+
+    #[test]
+    fn async_terminal_failures_classify_auth_rate_limit_and_network() {
+        for (failure, reason, state) in [
+            (
+                serde_json::json!({"error":{"code":401,"message":"unauthorized"}}),
+                "auth_401",
+                EvidenceState::Unavailable,
+            ),
+            (
+                serde_json::json!({"error":{"code":429,"message":"rate limit"}}),
+                "rate_limit",
+                EvidenceState::Degraded,
+            ),
+            (
+                serde_json::json!({"error":{"message":"network connection failed"}}),
+                "network",
+                EvidenceState::Unavailable,
+            ),
+        ] {
+            let (evidence, _) = run_fixture_probe("turn.failed", failure, false);
+            assert_eq!(evidence.auth.reason.as_deref(), Some(reason));
+            assert_eq!(evidence.hi.reason.as_deref(), Some(reason));
+            assert_eq!(evidence.auth.state, state);
+            assert_eq!(evidence.hi.state, state);
+        }
+    }
+
+    #[test]
+    fn any_tool_signal_fails_the_read_only_probe() {
+        let (evidence, _) = run_fixture_probe("turn.completed", serde_json::json!({}), true);
+        assert_eq!(evidence.auth.state, EvidenceState::Unavailable);
+        assert_eq!(evidence.hi.reason.as_deref(), Some("policy_violation"));
     }
 }
