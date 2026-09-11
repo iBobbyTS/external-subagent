@@ -1,7 +1,7 @@
 # Requirements Contract — external-subagent
 
 - Feature: `external-subagent-v1-20260910`
-- Status: **DRAFT — U 已明确；B 为当前源码继承边界；P 待采纳**。
+- Status: **DRAFT — U/B/P 已明确；待实施与验收**。
 - 原始权威：`ORIGINAL-REQUEST.md`；代码证据：`SOURCE-EVIDENCE.md`；提议选择：`DECISIONS.md`。
 - 本文不是实施／安装／发布授权。涉及网络 hi、用户配置、服务启停、registry 发布须在实际执行时具备相应授权。
 - Source snapshot：`bb45d562671ddbd99637c5680449bc75aedb378b`，分支 `codex/wait-respondable-20260910`。不是旧 main，也不是记忆中的 Bash-only wait 版本。
@@ -120,7 +120,7 @@ P03. permission request 持久化公共 request_id 与私有 upstream correlatio
 
 P04. DSH 原生 ACP 没有 mode／elicitation 接口。plan 权限用已验证受管组合实现，而不是调用不存在的 ACP mode 方法。**read-only 不等于禁止 Bash**。严格 plan 必须覆盖 fs write/edit、shell、终端、jobs、PTC/Cordis code、嵌套 agent/MCP 等实际启用入口，未知执行入口 fail closed。不能仅隐藏工具说明；须验证不可通过底层 dispatch 绕过。
 
-P05. DSH v1 必需 build（workspace-write＋可响应权限）与严格 plan；未证明的 edit/yolo、非空精确 write_manifest 显式拒绝，并反映在能力状态。ZCode 的这些既有能力不削减。所有 unsupported 必须在发出任务 prompt 前被发现；严格 plan 不通过则不发布 DSH 支持。
+P05. DSH v1 必需 build（workspace-write＋可响应权限）与严格 plan；未证明的 edit/yolo、非空精确 write_manifest 显式拒绝，并反映在能力状态。ZCode 的这些既有能力不削减。所有 unsupported 必须在发出任务 prompt 前被发现；严格 plan 不通过则不发布 DSH spawn 支持，首发只能保留 discovery/status/probe 能力。
 
 P06. 文本／thought／tool update 分开处理。最终文本按本次 prompt 的已验证 messageId 分组，在协议 settlement 后选最后有文本的 committed assistant message；完整保留该消息各文本块顺序，不拼入前面的进度、thought 或工具结果。没有可辨认 messageId 的上游版本不得冒充此保证，须限制版本或另作明确选择。上游 end_turn 不声称“代码已通过验收”，被折叠的内部 aborted/blocked 不凭空还原；结果注明 upstream stop reason。max_tokens、refusal、wire error、transport loss 与本地取消各有明确 reason，不统一映射为成功。
 
@@ -134,7 +134,7 @@ P09. npm `bin` 提供 CLI/MCP 入口；Unix 的 npm 全局 bin 路径和 GUI/lau
 
 P10. own executable/native payload 可随 npm 更新；ZCode.app、DSH、Codex 本体以及其账号／凭据不在自动升级范围。native payload 在发布时构建／校验，支持平台安装不能依赖用户装 Rust。
 
-P11. 正常 npm 安装脚本开启时，已初始化机器的更新自动进入同一个 reconcile 路径；显式 `update` 也复用该 owner。npm `--ignore-scripts` 或宿主不运行脚本时，无法保证安装时重启，必须显示 pending 并在下次 CLI 启动执行版本协调／提示，不伪称零例外自动更新。
+P11. 首次 `npm install` 只安装并暂存 payload，不启动 daemon、不写 Codex 配置、不执行真实 hi；这些动作必须由显式 `init`（及其显式选项）触发。正常 npm 安装脚本开启时，已初始化机器的更新自动进入同一个 reconcile 路径；显式 `update` 也复用该 owner。npm `--ignore-scripts` 或宿主不运行脚本时，无法保证安装时重启，必须显示 pending 并在下次 CLI 启动执行版本协调／提示，不伪称零例外自动更新。
 
 P12. 原子性仅限已知本地文件；升级阶段至少区分 staged、draining、activating、healthy、partial/failed。并发 upgrade/init 用一个安装锁；daemon 的任务生命周期没有第二 owner。候选版本不完整时不切 active；活跃任务默认安全排空；draining 拒绝新 spawn／新 send，但已接收入队消息仍按原合同处理，wait/respond/cancel/result/close 保持可用。只显式强制命令可取消活跃任务。进程实际运行版本、安装包版本、plugin 安装副本版本均须验证。
 
@@ -167,3 +167,20 @@ P17. 实际接受证据覆盖 fake transport、生产序列化边界、真正两
 | B08/P04/P05，observe与严格plan | S01/S04 | 公开thought字段、200字符；所有已启用写入／执行入口拒绝与越权回复测试 |
 | U06/P09—P14，完整npm升级 | S05/S06 | 全新prefix、GUI PATH、多home、忙任务排空、启动失败／plugin冲突／ignore-scripts |
 | U02/P15，文件结构 | S02—S06 | owner依赖、文件规模清单、入口薄化、独立测试；不复制巨大旧lib |
+
+## 9. 已确认的人类决策
+
+- D01、D02、D03、D07、D09、D10：采用 `DECISIONS.md` 推荐值。
+- D04：采用能力显式化方案；DSH 首发必须先证明严格 plan，未证明时仅保留 discovery/status/probe，不开启 DSH spawn。
+- D05：ZCode 不设置模型；初始化时配置 provider 默认值，遵循各 agent 原生模型选择。
+- D06：允许调用；若 agent 为 ZCode，显式 model 直接返回错误。
+- D08：增加全局已安装过的 Codex home 目录 JSON，并只更新已登记且由本产品认领的 homes。
+- 首次安装：`npm install` 只安装并暂存 payload；显式 `init` 才启动 daemon、写 Codex 配置或执行真实 hi。
+
+## 10. 规划者裁量
+
+实现层面的 crate/module 划分、进程监督、存储 schema、测试组织和具体官方接口调用方式交由规划与实现阶段决定，前提是不改变以上用户可见合同。
+
+## 11. 未解决阻断
+
+无。真实 runtime、认证、Codex 安装和发布凭据仍属于实施阶段的环境前置条件，不是需求决策阻断。

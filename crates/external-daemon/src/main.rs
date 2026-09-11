@@ -13,7 +13,7 @@ use std::{
     os::unix::net::UnixStream,
 };
 use external_store::Store;
-use zcode_agentd::{
+use external_daemon::{
     configure_diagnostic_log, rpc::ServerOptions, CommandRuntimeFactory, Daemon, RuntimeFactory,
     Scheduler, SchedulerConfig,
 };
