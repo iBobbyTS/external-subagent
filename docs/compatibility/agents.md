@@ -24,4 +24,6 @@ Auth is not promoted when the turn merely starts. Both auth and hi become `READY
 
 Lifecycle and diagnostic events received while a command response is still pending are retained by the probe. After the response arrives, terminal classification consumes those retained events first; a provider that emits `turn.completed` or `turn.failed` before the matching send response therefore settles immediately with the original success or failure reason.
 
+If a failed terminal event is followed by a generic RPC error or process exit, the cached provider classification wins. An observed `auth_401`, `rate_limit`, `network`, or `policy_violation` is never replaced by a later generic `transport` outcome.
+
 For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, but this release has no accepted production adapter. Auth and hi remain `UNKNOWN` with `dsh_production_adapter_unavailable`, and `spawn_supported` is always `false`. The S01 fixture is protocol evidence only and is never promoted to live auth or hi evidence.
