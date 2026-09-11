@@ -31,13 +31,26 @@ test('Codex MCP installer writes canonical external_subagent section', () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('hook installer targets the shipped external-subagent plugin', () => {
+test('hook installer fails closed without changing an existing policy', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hooks-'));
   const paths = { zcodeConfig: path.join(home, 'zcode.json'), hookProvenance: path.join(home, 'hooks.json') };
-  const result = installHooks(paths);
-  assert.equal(result.config, path.resolve(paths.zcodeConfig));
-  const config = JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
-  assert.equal(config.hooks.enabled, true);
-  assert.match(JSON.stringify(config), /external-subagent/u);
+  const original = Buffer.from('{"hooks":{"enabled":false,"events":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"process","command":"existing"}]}]}}}\n');
+  fs.writeFileSync(paths.zcodeConfig, original);
+  assert.throws(() => installHooks(paths), (error) => error.code === 'HOOK_POLICY_UNSUPPORTED');
+  assert.deepEqual(fs.readFileSync(paths.zcodeConfig), original);
+  assert.equal(fs.existsSync(paths.hookProvenance), false);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('hook installer reports provenance mismatch before unsupported policy', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hooks-provenance-'));
+  const paths = { zcodeConfig: path.join(home, 'zcode.json'), hookProvenance: path.join(home, 'hooks.json') };
+  const original = Buffer.from('{"hooks":{}}\n');
+  const provenance = Buffer.from('{"schema_version":1,"product":"external-subagent","effective_config_path":"wrong"}\n');
+  fs.writeFileSync(paths.zcodeConfig, original);
+  fs.writeFileSync(paths.hookProvenance, provenance);
+  assert.throws(() => installHooks(paths), (error) => error.code === 'HOOK_PROVENANCE_INVALID' && /effective_config_path/u.test(error.message));
+  assert.deepEqual(fs.readFileSync(paths.zcodeConfig), original);
+  assert.deepEqual(fs.readFileSync(paths.hookProvenance), provenance);
   fs.rmSync(home, { recursive: true, force: true });
 });
