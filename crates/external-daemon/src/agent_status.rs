@@ -7,12 +7,14 @@ use external_contract::{
 use external_runtime::{Driver, Inbound, RequestError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -399,18 +401,30 @@ fn run_dsh_catalog(
     if let Some(home) = scope.home.as_deref() {
         command.env("DSH_HOME", home);
     }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
-    let mut input = child.stdin.take().ok_or_else(|| "transport".to_owned())?;
-    let output = child.stdout.take().ok_or_else(|| "transport".to_owned())?;
-    let diagnostic = child.stderr.take().ok_or_else(|| "transport".to_owned())?;
+    let process_group = child.id() as i32;
+    let (Some(mut input), Some(output), Some(diagnostic)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+        return Err("transport".into());
+    };
     let (frames_tx, frames_rx) = mpsc::channel();
     thread::spawn(move || read_dsh_frames(output, frames_tx));
-    let diagnostic_tail = Arc::new(Mutex::new(String::new()));
-    let diagnostic_target = Arc::clone(&diagnostic_tail);
-    let diagnostic_thread = thread::spawn(move || {
+    let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+    thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = diagnostic.take(64 * 1024).read_to_end(&mut bytes);
-        *diagnostic_target.lock().unwrap() = String::from_utf8_lossy(&bytes).into_owned();
+        let _ = diagnostic_tx.send(String::from_utf8_lossy(&bytes).into_owned());
     });
     let deadline = Instant::now() + timeout;
     let result = (|| {
@@ -454,13 +468,13 @@ fn run_dsh_catalog(
         parse_opaque_model_tokens(&catalog)
     })();
     drop(input);
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = diagnostic_thread.join();
+    cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+    let diagnostic_tail = diagnostic_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
     if let Err(reason) = result {
         if reason == "transport" {
-            let classified =
-                classify_provider_failure(&Value::Null, &diagnostic_tail.lock().unwrap());
+            let classified = classify_provider_failure(&Value::Null, &diagnostic_tail);
             return Err(classified.into());
         }
         return Err(reason);
@@ -468,26 +482,56 @@ fn run_dsh_catalog(
     result
 }
 
+fn cleanup_catalog_process(child: &mut Child, process_group: i32, grace: Duration) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-process_group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    // Kill the whole group even when the leader already exited: descendants
+    // may still own inherited stdout/stderr descriptors.
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-process_group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 fn read_dsh_frames(output: impl Read, sender: mpsc::Sender<Result<Value, String>>) {
-    let mut reader = BufReader::new(output);
+    let mut output = output;
+    let mut frame = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
     loop {
-        let mut frame = Vec::new();
-        match reader.read_until(b'\n', &mut frame) {
+        match output.read(&mut chunk) {
             Ok(0) => return,
-            Ok(_) if frame.len() > DSH_MAX_FRAME_BYTES => {
-                let _ = sender.send(Err("oversized".into()));
-                return;
-            }
-            Ok(_) => {
-                while matches!(frame.last(), Some(b'\n' | b'\r')) {
-                    frame.pop();
-                }
-                if frame.is_empty() {
-                    continue;
-                }
-                let parsed = serde_json::from_slice(&frame).map_err(|_| "protocol".into());
-                if sender.send(parsed).is_err() {
-                    return;
+            Ok(read) => {
+                for byte in &chunk[..read] {
+                    if *byte == b'\n' {
+                        if matches!(frame.last(), Some(b'\r')) {
+                            frame.pop();
+                        }
+                        if !frame.is_empty() {
+                            let parsed =
+                                serde_json::from_slice(&frame).map_err(|_| "protocol".into());
+                            if sender.send(parsed).is_err() {
+                                return;
+                            }
+                            frame.clear();
+                        }
+                    } else {
+                        if frame.len() == DSH_MAX_FRAME_BYTES {
+                            let _ = sender.send(Err("oversized".into()));
+                            return;
+                        }
+                        frame.push(*byte);
+                    }
                 }
             }
             Err(_) => {
@@ -1557,5 +1601,103 @@ process.stdin.on('data', (chunk) => {
         assert!(output.models.is_empty());
         assert_eq!(output.reason.as_deref(), Some("native_only"));
         assert_eq!(output.evidence.source, "zcode_native_model");
+    }
+
+    fn wait_process_gone(pid: i32, deadline: Instant) -> bool {
+        loop {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn dsh_catalog_reaps_descendant_that_inherits_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("dsh-descendant-fixture");
+        let descendant_pid = directory.path().join("descendant.pid");
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+import { spawn } from 'node:child_process';
+if (process.argv.includes('--version')) { process.stdout.write('dsh-fixture-1\n'); process.exit(0); }
+const descendant = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio:['ignore','ignore','inherit'] });
+fs.writeFileSync(__PID__, String(descendant.pid));
+let buffer = '';
+const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n'); if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue;
+    const request = JSON.parse(line);
+    if (request.method === 'initialize') write({jsonrpc:'2.0',id:request.id,result:{protocolVersion:1}});
+    else if (request.method === 'session/new') write({jsonrpc:'2.0',id:request.id,result:{sessionId:'s'}});
+    else if (request.method === 'models/list') write({jsonrpc:'2.0',id:request.id,result:{models:[{id:'opaque'}]}});
+  }
+});
+"#
+        .replace("__PID__", &serde_json::to_string(&descendant_pid).unwrap());
+        fs::write(&runtime, source).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let output = probe_dsh_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "dsh".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(output.supported);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(wait_process_gone(
+            pid,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn dsh_catalog_rejects_unterminated_oversized_frame_and_reaps_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("dsh-oversized-fixture");
+        let runtime_pid = directory.path().join("runtime.pid");
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('dsh-fixture-1\n'); process.exit(0); }
+fs.writeFileSync(__PID__, String(process.pid));
+process.stdout.write('x'.repeat(1024 * 1024 + 1));
+setInterval(() => {}, 1000);
+"#
+        .replace("__PID__", &serde_json::to_string(&runtime_pid).unwrap());
+        fs::write(&runtime, source).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        let output = probe_dsh_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "dsh".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("oversized"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(runtime_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(wait_process_gone(
+            pid,
+            Instant::now() + Duration::from_secs(1)
+        ));
     }
 }
