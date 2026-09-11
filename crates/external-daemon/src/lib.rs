@@ -3224,6 +3224,166 @@ sleep 0.1
 "#;
 
     #[test]
+    fn scheduler_queue_drains_once_through_driver_and_persists_receipt() {
+        let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        let directory = workspace.path().to_owned();
+        let script = format!(
+            r#"{RUNNING_PROTOCOL}
+while [ ! -f release-turn ]; do sleep 0.01; done
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+read request
+printf '%s\n' "$request" >> deliveries.jsonl
+printf '%s\n' '{{"id":4,"result":{{"turnId":"queued-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
+while [ ! -f finish-turn ]; do sleep 0.01; done
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"queued answer","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
+"#
+        );
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory =
+            Arc::new(CommandRuntimeFactory::new(move |_: &TaskRecord| {
+                let mut command = Command::new("sh");
+                command.args(["-c", &script]).current_dir(&directory);
+                Ok(command)
+            }));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        for _ in 0..2 {
+            assert_eq!(
+                scheduler
+                    .queue_message(&agent_id, "counted", "queue", "follow-up")
+                    .unwrap(),
+                MessageDisposition::Queued
+            );
+        }
+        fs::write(workspace.path().join("release-turn"), "").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let receipt = loop {
+            let receipt = scheduler.store().message("counted").unwrap().unwrap();
+            if receipt.state == MessageState::Delivered {
+                break receipt;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queue was not delivered: {receipt:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(receipt.target_turn_id.as_deref(), Some("queued-turn"));
+        assert!(receipt.delivered_at.is_some());
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "counted", "queue", "follow-up")
+                .unwrap(),
+            MessageDisposition::AlreadyDelivered
+        );
+        fs::write(workspace.path().join("finish-turn"), "").unwrap();
+        assert_eq!(
+            await_result(&scheduler, &agent_id).result.final_text,
+            "queued answer"
+        );
+        let deliveries = fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+        let sends: Vec<serde_json::Value> = deliveries
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|v: &serde_json::Value| v["method"] == "session/send")
+            .collect();
+        assert_eq!(sends.len(), 1, "duplicate queue delivery: {deliveries}");
+        assert!(sends[0].to_string().contains("follow-up"));
+        assert_eq!(
+            scheduler.store().message("counted").unwrap().unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn scheduler_restart_reaps_runtime_without_replaying_unknown_sending() {
+        for cancelled in [false, true] {
+            let (workspace, scheduler, agent_id) = diagnostic_scheduler("unused");
+            let store = scheduler.store();
+            let claim = store.claim_next("old-daemon", 1, 1).unwrap().unwrap();
+            // An actual isolated child supplies the persisted identity. No monitor is
+            // attached: this models loss of the daemon after claiming delivery.
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            let driver = Driver::spawn(command).unwrap();
+            let identity = driver.identity();
+            assert!(store
+                .mark_session_running(
+                    &agent_id,
+                    claim.owner_epoch,
+                    "old-runtime",
+                    Some(&StoredProcessIdentity {
+                        pid: identity.pid,
+                        process_group_id: identity.pgid,
+                        uid: identity.uid,
+                        start_token: identity.start_token.clone(),
+                    }),
+                    Some("old-session"),
+                    Some(TurnState::Active)
+                )
+                .unwrap());
+            scheduler
+                .queue_message(&agent_id, "unknown", "queue", "never replay")
+                .unwrap();
+            assert_eq!(
+                store.claim_next_message(&agent_id).unwrap().unwrap().state,
+                MessageState::Sending
+            );
+            if cancelled {
+                store.request_stop(&agent_id).unwrap();
+            }
+            drop(scheduler);
+            drop(store);
+            let reopened = Arc::new(Store::open(workspace.path().join("state.sqlite")).unwrap());
+            let spawns = Arc::new(AtomicU64::new(0));
+            let count = Arc::clone(&spawns);
+            let factory = CommandRuntimeFactory::new(move |_: &TaskRecord| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::other("recovery must not spawn or replay"))
+            });
+            let recovered = Scheduler::new(
+                "new-daemon",
+                Arc::clone(&reopened),
+                Arc::new(factory),
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let expected = if cancelled {
+                TaskOutcome::Cancelled
+            } else {
+                TaskOutcome::RuntimeLost
+            };
+            assert_eq!(
+                recovered.reconcile_startup().unwrap(),
+                vec![(agent_id.clone(), expected)]
+            );
+            let task = reopened.get_task(&agent_id).unwrap().unwrap();
+            assert_eq!(task.phase, TaskPhase::Terminal);
+            assert_eq!(task.outcome, Some(expected));
+            assert!(task.reaped_at.is_some());
+            assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+            driver.wait().unwrap();
+            let receipt = reopened.message("unknown").unwrap().unwrap();
+            assert_eq!(receipt.state, MessageState::Failed);
+            assert!(receipt.delivered_at.is_none());
+            assert!(!reopened
+                .complete_message("unknown", Some("late-turn"))
+                .unwrap());
+            assert!(recovered.start_ready().unwrap().is_empty());
+            assert!(recovered.reconcile_startup().unwrap().is_empty());
+            assert_eq!(spawns.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                reopened
+                    .task_result(&agent_id)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .outcome,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn abnormal_exit_records_correlated_tail_and_preserves_runtime_lost_outcome() {
         let script = format!("{RUNNING_PROTOCOL}\nprintf abnormal-exit-tail >&2; exit 7");
         let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&script);
