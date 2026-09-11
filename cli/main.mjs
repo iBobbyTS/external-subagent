@@ -284,7 +284,7 @@ async function diagnose(paths, args) {
 export async function main(args) {
   const command = args[0] || 'help';
   if (command === 'help' || command === '--help' || command === '-h') {
-    process.stdout.write(HELP.replace('install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration', 'install-plugin [--dry-run|--uninstall] Install or remove the Codex plugin (MCP + skill)') + DAEMON_HELP); return;
+    process.stdout.write(HELP.replaceAll('zas', 'external-subagent').replace('install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration', 'install-plugin [--dry-run|--uninstall] Install or remove the Codex plugin (MCP + skill)') + DAEMON_HELP); return;
   }
   if (command === 'version' || command === '--version' || command === '-v') {
     process.stdout.write(`${VERSION}\n`); return;
