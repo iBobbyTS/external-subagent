@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { validateConfig } from './schema.mjs';
 import { readConfig } from './read.mjs';
@@ -14,36 +15,25 @@ export function writeConfig(file, value) {
 export function updateConfig(file, updater) {
   const lock = `${path.resolve(file)}.lock`;
   fs.mkdirSync(path.dirname(lock), { recursive: true, mode: 0o700 });
+  const ready = `${lock}.${process.pid}.${Date.now()}.ready`;
+  const helper = spawn('/usr/bin/lockf', ['-t', '2', lock, '/bin/sh', '-c',
+    'ready="$1"; parent="$2"; printf ready > "$ready"; while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done',
+    'external-subagent-lock', ready, String(process.pid)], { stdio: 'ignore', detached: true });
   const wait = new Int32Array(new SharedArrayBuffer(4));
-  let descriptor;
-  const deadline = Date.now() + 2000;
-  while (!descriptor) {
-    try {
-      descriptor = fs.openSync(lock, 'wx', 0o600);
-      fs.writeFileSync(descriptor, `${process.pid}\n`);
+  const deadline = Date.now() + 2500;
+  while (!fs.existsSync(ready)) {
+    if (helper.exitCode !== null || Date.now() >= deadline) {
+      try { process.kill(-helper.pid, 'SIGTERM'); } catch {}
+      throw new Error('CONFIG_LOCK_TIMEOUT');
     }
-    catch (error) {
-      if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
-      let stale = false;
-      try {
-        const owner = fs.readFileSync(lock, 'utf8').trim();
-        if (owner && /^\d+$/u.test(owner)) {
-          try { process.kill(Number(owner), 0); } catch (probeError) { stale = probeError.code === 'ESRCH'; }
-        } else {
-          const stat = fs.statSync(lock);
-          stale = stat.size === 0 && Date.now() - stat.mtimeMs > 2000;
-        }
-      } catch (probeError) { stale = probeError.code === 'ENOENT'; }
-      if (stale) { try { fs.unlinkSync(lock); } catch {} continue; }
-      Atomics.wait(wait, 0, 0, 5);
-    }
+    Atomics.wait(wait, 0, 0, 5);
   }
   try {
     const current = readConfig(file);
     const next = updater(current);
     return writeConfig(file, next);
   } finally {
-    fs.closeSync(descriptor);
-    fs.unlinkSync(lock);
+    try { process.kill(-helper.pid, 'SIGTERM'); } catch {}
+    try { fs.unlinkSync(ready); } catch {}
   }
 }
