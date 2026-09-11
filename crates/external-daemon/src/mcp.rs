@@ -283,7 +283,19 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
     } else {
         format!("{code}: {message}")
     };
-    ToolError::new(code, message, legacy_text, "daemon").with_agent_id(agent_id)
+    let projected = ToolError::new(code, message, legacy_text, "daemon").with_agent_id(agent_id);
+    if matches!(
+        error.code,
+        RpcErrorCode::AgentRequired
+            | RpcErrorCode::AgentUnknown
+            | RpcErrorCode::AgentDisabled
+            | RpcErrorCode::AgentUnsupported
+            | RpcErrorCode::ModelSelectionUnsupported
+    ) {
+        projected.with_prompt_count(0)
+    } else {
+        projected
+    }
 }
 
 pub(crate) fn public_transport_error(error: std::io::Error) -> ToolError {
@@ -483,13 +495,6 @@ mod server {
         Yolo,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    pub enum PublicAgent {
-        Zcode,
-        Dsh,
-    }
-
     impl Default for PublicPermissionMode {
         fn default() -> Self {
             Self::Build
@@ -520,9 +525,6 @@ mod server {
         "external_subagent_wait",
     ];
 
-    const MAX_ID_BYTES: usize = 512;
-    const MAX_PATH_BYTES: usize = 4096;
-    const MAX_PROMPT_BYTES: usize = 256 * 1024;
     const MAX_MESSAGE_BYTES: usize = 16 * 1024;
     const MAX_REASON_BYTES: usize = 2048;
 
@@ -547,10 +549,6 @@ mod server {
         } else {
             Ok(())
         }
-    }
-
-    fn validate_path(value: &str, field: &str) -> Result<(), ToolError> {
-        validate_text(value, field, MAX_PATH_BYTES)
     }
 
     #[derive(JsonSchema)]
@@ -906,15 +904,17 @@ mod server {
     #[serde(deny_unknown_fields)]
     #[schemars(deny_unknown_fields)]
     pub struct AgentSpawnInput {
-        #[serde(default)]
-        pub agent: Option<PublicAgent>,
+        #[serde(default, deserialize_with = "optional_non_null")]
+        #[schemars(with = "String")]
+        pub agent: Option<String>,
         pub repository: String,
         #[serde(default)]
         pub permission_mode: PublicPermissionMode,
         pub prompt: String,
         #[serde(default)]
         pub write_manifest: Vec<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "optional_non_null")]
+        #[schemars(with = "String")]
         pub model: Option<String>,
     }
 
@@ -959,6 +959,11 @@ mod server {
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     pub struct PublicInputIdentity {
+        pub agent: Option<String>,
+        pub config_revision: Option<u64>,
+        pub adapter_version: Option<String>,
+        pub model: Option<String>,
+        pub model_source: Option<String>,
         pub workspace_path: Option<String>,
         pub permission_mode: Option<String>,
     }
@@ -977,6 +982,31 @@ mod server {
                 closed: value.closed,
                 resources_reaped: value.reaped,
                 input_identity: Some(PublicInputIdentity {
+                    agent: value
+                        .input_identity
+                        .admission
+                        .as_ref()
+                        .map(|v| v.agent.clone()),
+                    config_revision: value
+                        .input_identity
+                        .admission
+                        .as_ref()
+                        .map(|v| v.config_revision),
+                    adapter_version: value
+                        .input_identity
+                        .admission
+                        .as_ref()
+                        .map(|v| v.adapter_version.clone()),
+                    model: value
+                        .input_identity
+                        .admission
+                        .as_ref()
+                        .and_then(|v| v.model.clone()),
+                    model_source: value
+                        .input_identity
+                        .admission
+                        .as_ref()
+                        .map(|v| v.model_source.clone()),
                     workspace_path: value.input_identity.workspace_path,
                     permission_mode: value.input_identity.permission_mode,
                 }),
@@ -1039,6 +1069,9 @@ mod server {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentListInput {
+        #[serde(default, deserialize_with = "optional_non_null")]
+        #[schemars(with = "String")]
+        pub agent: Option<String>,
         #[serde(default, deserialize_with = "optional_non_null")]
         pub repository: Option<String>,
         #[serde(default, deserialize_with = "optional_non_null")]
@@ -1537,64 +1570,9 @@ mod server {
     }
 
     fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, ToolError> {
-        match input.agent {
-            None => {}
-            Some(PublicAgent::Dsh) => {
-                return Err(ToolError::new(
-                    "agent_unsupported",
-                    "agent dsh is unsupported",
-                    "agent_unsupported: agent dsh is unsupported (prompt_count=0)",
-                    "facade",
-                )
-                .with_prompt_count(0))
-            }
-            Some(PublicAgent::Zcode) => {}
-        }
-        if matches!(input.agent, Some(PublicAgent::Zcode)) && input.model.is_some() {
-            return Err(ToolError::new(
-                "model_selection_unsupported",
-                "model selection is unsupported for zcode",
-                "model_selection_unsupported: model selection is unsupported for zcode",
-                "facade",
-            ));
-        }
-        for (field, value, max) in [
-            ("repository", input.repository.as_str(), MAX_PATH_BYTES),
-            ("prompt", input.prompt.as_str(), MAX_PROMPT_BYTES),
-        ] {
-            validate_text(value, field, max)?;
-        }
         let repository = PathBuf::from(&input.repository);
-        if !repository.is_absolute() {
-            return Err(validation_error("repository must be absolute"));
-        }
         let agent_id = "daemon-prepared".to_owned();
-        let mut write_manifest = Vec::with_capacity(input.write_manifest.len());
-        for value in &input.write_manifest {
-            validate_path(value, "write_manifest")?;
-            let path = PathBuf::from(value);
-            if path.is_absolute()
-                || path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::ParentDir
-                            | std::path::Component::Prefix(_)
-                            | std::path::Component::RootDir
-                    )
-                })
-            {
-                return Err(validation_error(
-                    "write_manifest paths must be relative to repository",
-                ));
-            }
-            write_manifest.push(path);
-        }
-        if matches!(input.permission_mode, PublicPermissionMode::Plan) && !write_manifest.is_empty()
-        {
-            return Err(validation_error(
-                "write_manifest is only valid for write permission modes",
-            ));
-        }
+        let write_manifest = input.write_manifest.iter().map(PathBuf::from).collect();
         Ok(GeneralTaskManifest {
             schema: GENERAL_TASK_SCHEMA.into(),
             agent_id: agent_id.clone(),
@@ -1671,7 +1649,7 @@ mod server {
         #[tool(
         name = "external_subagent_spawn",
         output_schema = tool_output_schema::<AgentSpawnOutput>(),
-        description = "Start one durable ZCode Agent in an absolute repository workspace. The agent field is required and must be zcode; dsh is explicitly unsupported until its adapter is accepted. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
+        description = "Start one durable agent in an absolute repository workspace. Specify agent unless default_agent is configured. ZCode uses its initialized native model and rejects model selection; dsh production spawn remains unsupported until its adapter is accepted. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1687,10 +1665,7 @@ mod server {
                 general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
             let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral {
                 input: GeneralSubmitInput {
-                    agent: input.agent.map(|agent| match agent {
-                        PublicAgent::Zcode => "zcode".into(),
-                        PublicAgent::Dsh => "dsh".into(),
-                    }),
+                    agent: input.agent.clone(),
                     model: input.model.clone(),
                     manifest,
                 },
@@ -1841,6 +1816,7 @@ mod server {
                 );
             }
             match self.rpc(RpcMethod::TaskList(TaskListQuery {
+                agent: input.agent,
                 repository: input.repository,
                 phase: input.phase.map(Into::into),
                 outcome: input.outcome.map(Into::into),
@@ -2375,9 +2351,13 @@ mod server {
                 serde_json::json!({"agent":"dsh","repository":"/tmp/repository","prompt":"test"}),
             )
             .unwrap();
-            let error = general_manifest(&dsh).unwrap_err();
-            assert_eq!(error.body.code, "agent_unsupported");
-            assert!(error.legacy_text.contains("prompt_count=0"));
+            // Admission is owned by daemon, including disabled versus unsupported order.
+            assert!(general_manifest(&dsh).is_ok());
+            for field in ["agent", "model"] {
+                let mut null_input = base.clone();
+                null_input[field] = serde_json::Value::Null;
+                assert!(serde_json::from_value::<AgentSpawnInput>(null_input).is_err());
+            }
 
             let zcode: AgentSpawnInput = serde_json::from_value(
                 serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test"}),
@@ -2387,6 +2367,36 @@ mod server {
             assert!(serde_json::from_value::<AgentSpawnInput>(
                 serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test","extra":true})
             ).is_err());
+        }
+
+        #[tokio::test]
+        async fn spawn_routes_admission_errors_through_daemon_before_manifest_preparation() {
+            let (_directory, service, id) = crate::rpc::wait_tests::fixture();
+            let store = service.store_for_wait_test();
+            let before = store.get_task(&id).unwrap();
+            let facade = SubagentMcp::from_service(service);
+            for (agent, model, expected) in [
+                ("unknown", None, "agent_unknown"),
+                ("dsh", None, "agent_disabled"),
+                ("zcode", Some("chosen"), "model_selection_unsupported"),
+            ] {
+                let input = AgentSpawnInput {
+                    agent: Some(agent.into()),
+                    model: model.map(str::to_owned),
+                    repository: "invalid-relative-path".into(),
+                    prompt: "".into(),
+                    permission_mode: super::PublicPermissionMode::Plan,
+                    write_manifest: vec![],
+                };
+                let error = facade
+                    .agent_spawn(rmcp::handler::server::wrapper::Parameters(input))
+                    .await
+                    .err()
+                    .expect("admission must reject");
+                assert_eq!(error.body.code, expected);
+                assert_eq!(error.body.prompt_count, Some(0));
+            }
+            assert_eq!(before, store.get_task(&id).unwrap());
         }
 
         #[test]

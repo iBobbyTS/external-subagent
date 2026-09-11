@@ -107,6 +107,12 @@ impl RpcMethod {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskListQuery {
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub agent: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
     #[serde(default)]
@@ -145,11 +151,27 @@ impl From<TaskPhaseFilter> for TaskPhase {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneralSubmitInput {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub agent: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<String>,
     pub manifest: GeneralTaskManifest,
+}
+
+fn optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +539,8 @@ pub struct TaskView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputIdentityView {
+    #[serde(default)]
+    pub admission: Option<external_core::AdmissionIdentity>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
     pub caller_prompt_sha256: Option<String>,
@@ -862,58 +886,11 @@ impl RpcService {
             }),
             RpcMethod::SubmitGeneral { input } => {
                 let config = read_agent_config_snapshot()?;
-                let agent = input
-                    .agent
-                    .as_deref()
-                    .or(config.default_agent.as_deref())
-                    .ok_or_else(|| {
-                        RpcError::new(
-                            RpcErrorCode::AgentRequired,
-                            "agent is required when no default_agent is configured",
-                        )
-                    })?;
-                let configured = config
-                    .agents
-                    .get(agent)
-                    .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
-                if !configured.enabled {
-                    return Err(RpcError::new(
-                        RpcErrorCode::AgentDisabled,
-                        "agent is disabled",
-                    ));
-                }
-                if !configured.spawn_supported {
-                    return Err(RpcError::new(
-                        RpcErrorCode::AgentUnsupported,
-                        format!("agent {agent} is unsupported; prompt_count=0"),
-                    ));
-                }
-                match agent {
-                    "zcode" => {
-                        if input.model.is_some() || configured.default_model.is_some() {
-                            return Err(RpcError::new(
-                                RpcErrorCode::ModelSelectionUnsupported,
-                                "model selection is unsupported for zcode",
-                            ));
-                        }
-                    }
-                    "dsh" => {
-                        return Err(RpcError::new(
-                            RpcErrorCode::AgentUnsupported,
-                            "agent_unsupported: dsh; prompt_count=0",
-                        ));
-                    }
-                    _ => {
-                        return Err(RpcError::new(
-                            RpcErrorCode::AgentUnknown,
-                            "agent is unknown",
-                        ));
-                    }
-                }
+                let admission = resolve_admission(&input, &config)?;
                 let manifest = input.manifest;
                 let submitted = self
                     .scheduler
-                    .enqueue_general(&manifest)
+                    .enqueue_general_with_admission(&manifest, Some(admission))
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted.task),
@@ -921,6 +898,14 @@ impl RpcService {
                 })
             }
             RpcMethod::TaskList(query) => {
+                if let Some(agent) = query.agent.as_deref() {
+                    if !matches!(agent, "zcode" | "dsh") {
+                        return Err(RpcError::new(
+                            RpcErrorCode::AgentUnknown,
+                            "agent is unknown",
+                        ));
+                    }
+                }
                 if query.limit == 0 || query.limit > MAX_LIST_TASKS {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
@@ -958,6 +943,7 @@ impl RpcService {
                             repository: canonical_repository.as_deref(),
                         },
                         TaskPageFilter {
+                            agent: query.agent.clone(),
                             phase: query.phase.map(Into::into),
                             outcome: query.outcome,
                         },
@@ -1318,6 +1304,65 @@ fn configured_agent_statuses(runtime_path: Option<PathBuf>) -> Vec<AgentStatusVi
         },
     };
     vec![zcode, dsh]
+}
+
+fn resolve_admission(
+    input: &GeneralSubmitInput,
+    config: &AgentConfigSnapshot,
+) -> Result<external_core::AdmissionIdentity, RpcError> {
+    for (field, value) in [
+        ("agent", input.agent.as_deref()),
+        ("model", input.model.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_text(value.trim(), field, 4096)?;
+        }
+    }
+    let agent = input
+        .agent
+        .as_deref()
+        .or(config.default_agent.as_deref())
+        .ok_or_else(|| {
+            RpcError::new(
+                RpcErrorCode::AgentRequired,
+                "agent is required when no default_agent is configured",
+            )
+        })?;
+    let configured = config
+        .agents
+        .get(agent)
+        .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
+    if !configured.enabled {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentDisabled,
+            "agent is disabled",
+        ));
+    }
+    if agent == "zcode" && (input.model.is_some() || configured.default_model.is_some()) {
+        return Err(RpcError::new(
+            RpcErrorCode::ModelSelectionUnsupported,
+            "model selection is unsupported for zcode; prompt_count=0",
+        ));
+    }
+    if !configured.spawn_supported {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            format!("agent {agent} is unsupported; prompt_count=0"),
+        ));
+    }
+    if agent == "dsh" {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            "agent_unsupported: dsh; prompt_count=0",
+        ));
+    }
+    Ok(external_core::AdmissionIdentity {
+        agent: agent.to_owned(),
+        config_revision: config.revision,
+        adapter_version: env!("CARGO_PKG_VERSION").into(),
+        model: None,
+        model_source: "native".into(),
+    })
 }
 
 fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
@@ -2116,6 +2161,10 @@ fn task_view(task: TaskRecord) -> TaskView {
         closed: task.closed_at.is_some(),
         reaped: task.reaped_at.is_some(),
         input_identity: InputIdentityView {
+            admission: prepared
+                .as_ref()
+                .and_then(|v| v.get("admission"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
             workspace_path,
             permission_mode,
             caller_prompt_sha256,
@@ -2370,6 +2419,7 @@ mod result_paging_tests {
             closed: false,
             reaped: true,
             input_identity: InputIdentityView {
+                admission: None,
                 workspace_path: None,
                 permission_mode: None,
                 caller_prompt_sha256: None,
@@ -2759,5 +2809,136 @@ mod identity_tests {
         assert_eq!(status.service_generation, "legacy-generation");
         assert_eq!(status.components["daemon"], ComponentStateView::Ready);
         assert_eq!(status.identity, None);
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn input(repository: &Path) -> GeneralSubmitInput {
+        GeneralSubmitInput {
+            agent: Some("zcode".into()),
+            model: None,
+            manifest: GeneralTaskManifest {
+                schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                agent_id: "daemon-prepared".into(),
+                repository: repository.into(),
+                permission_mode: external_core::PermissionMode::Plan,
+                prompt: "identity fixture".into(),
+                write_manifest: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn null_is_rejected_but_omission_round_trips() {
+        let mut value = serde_json::to_value(input(Path::new("/repository"))).unwrap();
+        value.as_object_mut().unwrap().remove("agent");
+        assert!(value.get("model").is_none());
+        let omitted: GeneralSubmitInput = serde_json::from_value(value.clone()).unwrap();
+        assert!(omitted.agent.is_none() && omitted.model.is_none());
+        assert_eq!(serde_json::to_value(omitted).unwrap(), value);
+        for field in ["agent", "model"] {
+            let mut invalid = value.clone();
+            invalid[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<GeneralSubmitInput>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_admission_precedence_and_dsh_gate() {
+        let mut input = input(Path::new("/repository"));
+        let mut config = AgentConfigSnapshot::default();
+        input.agent = None;
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::AgentRequired
+        );
+        input.agent = Some("unknown".into());
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::AgentUnknown
+        );
+        input.agent = Some("dsh".into());
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::AgentDisabled
+        );
+        config.agents.get_mut("dsh").unwrap().enabled = true;
+        config.agents.get_mut("dsh").unwrap().spawn_supported = true;
+        let error = resolve_admission(&input, &config).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
+        assert!(error.message.contains("prompt_count=0"));
+        input.agent = Some("zcode".into());
+        input.model = Some("model".into());
+        config.agents.get_mut("zcode").unwrap().spawn_supported = false;
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::ModelSelectionUnsupported
+        );
+        input.model = Some(" ".into());
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::Validation
+        );
+    }
+
+    #[test]
+    fn admission_snapshot_survives_config_change_reopen_and_filtered_pagination() {
+        let (directory, service, previous_id) = wait_tests::fixture();
+        service
+            .store
+            .store_task_result(
+                &previous_id,
+                &external_store::TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "done".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let input = input(directory.path());
+        let mut config = AgentConfigSnapshot::default();
+        config.revision = 41;
+        let identity = resolve_admission(&input, &config).unwrap();
+        let task = service
+            .scheduler
+            .enqueue_general_with_admission(&input.manifest, Some(identity.clone()))
+            .unwrap()
+            .task;
+        config.revision = 42;
+        config.agents.get_mut("zcode").unwrap().enabled = false;
+        assert!(resolve_admission(&input, &config).is_err());
+        let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
+        let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
+        let prepared: external_core::PreparedGeneralTask =
+            serde_json::from_str(&stored.prepared_launch_json).unwrap();
+        prepared.validate_digest().unwrap();
+        assert_eq!(prepared.admission.as_ref(), Some(&identity));
+        assert_eq!(task_view(stored).input_identity.admission, Some(identity));
+        let query = |agent: &str| TaskListQuery {
+            agent: Some(agent.into()),
+            repository: Some(directory.path().to_string_lossy().into_owned()),
+            phase: None,
+            outcome: None,
+            cursor: None,
+            limit: 1,
+        };
+        let RpcSuccess::TaskListed { tasks, next_cursor } = service
+            .dispatch(RpcMethod::TaskList(query("zcode")))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].agent_id, task.agent_id);
+        assert!(next_cursor.is_none()); // Unclassified older task does not occupy a filtered page.
+        let RpcSuccess::TaskListed { tasks, .. } =
+            service.dispatch(RpcMethod::TaskList(query("dsh"))).unwrap()
+        else {
+            panic!()
+        };
+        assert!(tasks.is_empty());
     }
 }

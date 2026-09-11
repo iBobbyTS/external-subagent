@@ -250,7 +250,7 @@ mod provenance_tests {
 
 pub use general::{
     canonical_general_repository, general_control_header, general_launch_prompt, AccessMode,
-    CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
+    AdmissionIdentity, CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PreparedGeneralTask, PreparedWorkspace, GENERAL_CONTROL_SCHEMA,
     GENERAL_TASK_SCHEMA,
 };

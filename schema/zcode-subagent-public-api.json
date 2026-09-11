@@ -13,9 +13,9 @@
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
     "spawn": {
       "type": "object",
-      "required": ["agent", "repository", "prompt"],
+      "required": ["repository", "prompt"],
       "properties": {
-        "agent": { "type": "string", "minLength": 1, "description": "Provider route key; zcode is supported, dsh is explicitly gated, and unknown keys fail closed." },
+        "agent": { "type": "string", "minLength": 1, "description": "Provider route key; omission uses configured default_agent or returns agent_required. Null is invalid; dsh production spawn remains gated." },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode" },
         "prompt": { "type": "string", "minLength": 1 },
@@ -32,6 +32,7 @@
       "type": "object",
       "required": ["repository"],
       "properties": {
+        "agent": { "type": "string", "minLength": 1 },
         "repository": { "type": "string", "minLength": 1 },
         "phase": { "type": ["string", "null"], "default": null },
         "outcome": { "type": ["string", "null"], "default": null },
@@ -114,7 +115,7 @@
         "external_subagent_spawn": { "input": ["agent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "after_revision", "wait_time", "message_id"], "output": ["task", "revision", "next_revision", "pending_requests", "command_pending_approval", "result_available", "activity", "latest_progress", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
-        "external_subagent_list": { "input": ["repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
+        "external_subagent_list": { "input": ["agent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
         "external_subagent_send": { "input": ["agent_id", "message_id", "content"], "output": ["message_id", "disposition"] },
         "external_subagent_respond": { "input": ["agent_id", "request_id", "decision", "reason"], "output": ["disposition", "requested_decision", "effective_decision", "policy_overrode", "policy_reason_code"] },
         "external_subagent_cancel": { "input": ["agent_id"], "output": ["task"] },

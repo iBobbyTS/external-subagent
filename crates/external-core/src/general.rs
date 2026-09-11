@@ -72,9 +72,22 @@ pub struct PreparedWorkspace {
     pub scratch_root: PathBuf,
 }
 
+/// Immutable admission facts, persisted with and covered by the launch digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionIdentity {
+    pub agent: String,
+    pub config_revision: u64,
+    pub adapter_version: String,
+    pub model: Option<String>,
+    pub model_source: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedGeneralTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionIdentity>,
     pub schema: String,
     pub agent_id: String,
     pub repository: PathBuf,
@@ -99,6 +112,14 @@ struct GeneralControlContract {
 }
 
 impl PreparedGeneralTask {
+    pub fn with_admission(mut self, identity: AdmissionIdentity) -> PreparationResult<Self> {
+        self.admission = Some(identity);
+        self.prepared_sha256.clear();
+        self.prepared_sha256 = hash(&serde_json::to_vec(&self)?);
+        self.validate_digest()?;
+        Ok(self)
+    }
+
     pub fn validate_digest(&self) -> PreparationResult<()> {
         let expected = self.prepared_sha256.clone();
         let mut unsigned = self.clone();
@@ -236,6 +257,7 @@ impl GeneralTaskPreparer {
         atomic_write(&prompt_path, manifest.prompt.as_bytes())?;
         let prompt_path = fs::canonicalize(prompt_path)?;
         let mut prepared = PreparedGeneralTask {
+            admission: None,
             schema: manifest.schema.clone(),
             agent_id,
             repository: repository.clone(),

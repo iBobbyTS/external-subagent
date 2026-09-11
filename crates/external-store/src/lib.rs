@@ -306,6 +306,7 @@ pub struct TaskQueryScope<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPageFilter {
+    pub agent: Option<String>,
     pub phase: Option<TaskPhase>,
     pub outcome: Option<TaskOutcome>,
 }
@@ -609,6 +610,7 @@ impl Store {
                AND (?2 IS NULL OR phase=?2)
                AND (?3 IS NULL OR outcome=?3)
                AND (?4 IS NULL OR rowid < ?4)
+               AND (?6 IS NULL OR CASE WHEN json_valid(prepared_launch_json) THEN json_extract(prepared_launch_json, '$.admission.agent') END = ?6)
              ORDER BY rowid DESC LIMIT ?5",
         )?;
         let rows = statement
@@ -619,6 +621,7 @@ impl Store {
                     filter.outcome.map(TaskOutcome::as_str),
                     cursor.map(u64_to_i64).transpose()?,
                     usize_to_i64(limit.saturating_add(1))?,
+                    filter.agent,
                 ],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )?
