@@ -28,10 +28,13 @@ function rpcResult(requestId, result) {
 
 async function lifecycleServer(socketPath) {
   let phase = 'running';
+  let revision = 7;
   let respondCount = 0;
+  // This is a wire-level fixture for CLI/RPC mapping evidence. It does not
+  // claim to be a real daemon or to exercise a provider runtime.
   const pending = Array.from({ length: 101 }, (_, index) => ({
     request_id: `request-${index + 1}`,
-    kind: 'permission', state: 'pending', respondable: true,
+    kind: 'permission', state: 'pending', respondable: index === 0 || index === 100,
     tool_name: 'Read', operation: 'read', summary: `read ${index + 1}`,
     policy_preview: 'allow_once',
   }));
@@ -50,22 +53,31 @@ async function lifecycleServer(socketPath) {
         assert.equal(phase, 'running');
         result = { message_id: request.params.message_id, disposition: 'queued', task: task() };
       } else if (request.method === 'task_wait') {
-        // The public projection is capped at 100; the 101st request must not
-        // wake this wait and must remain undisclosed.
+        // The public projection is capped at 100. Initially request-1 is a
+        // respondable Read, so this wait wakes positively. Once request-1 is
+        // answered, request-101 remains outside the projection and cannot
+        // wake it.
+        const projected = pending.slice(0, 100);
+        const commandPendingApproval = projected.some((item) => item.state === 'pending' && item.respondable);
+        const timedOut = !commandPendingApproval;
         result = {
-          task: task(), revision: 7, next_revision: 7, pending_requests: pending.slice(0, 100),
-          command_pending_approval: false, result_available: false,
+          task: task(), revision, next_revision: revision, pending_requests: projected,
+          command_pending_approval: commandPendingApproval, result_available: false,
           activity: { state: 'active', latest_text_tail: '', latest_text_updated_at: null,
             latest_text_truncated: false, active_tools: [], window_60s: {}, telemetry_status: 'healthy' },
           latest_progress: null, result: null,
-          instruction: 'Not finished yet, call wait again', timed_out: true,
+          instruction: timedOut ? 'Not finished yet, call wait again' : null, timed_out: timedOut,
         };
       } else if (request.method === 'task_respond') {
         respondCount += 1;
-        if (phase === 'cancelling' || respondCount > 1) {
+        const target = pending.find((item) => item.request_id === request.params.request_id);
+        if (phase === 'cancelling' || !target || target.state !== 'pending' || !target.respondable) {
           socket.end(`${JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'error', error: { code: 'REQUEST_NOT_PENDING', message: 'late or duplicate response' } })}\n`);
           return;
         }
+        target.state = 'responded';
+        target.respondable = false;
+        revision += 1;
         result = { outcome: { disposition: 'accepted', policy_reason_code: 'allow_once' }, task: task() };
       } else if (request.method === 'task_cancel') {
         phase = 'cancelling';
@@ -114,9 +126,21 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     assert.equal(sent.result.disposition, 'queued');
     const waited = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
     assert.equal(waited.result.pending_requests.length, 100);
-    assert.equal(waited.result.command_pending_approval, false);
+    assert.equal(waited.result.command_pending_approval, true);
+    assert.equal(waited.result.timed_out, false);
+    assert.deepEqual(waited.result.pending_requests[0], {
+      request_id: 'request-1', kind: 'permission', state: 'pending', respondable: true,
+      tool_name: 'Read', operation: 'read', summary: 'read 1', policy_preview: 'allow_once',
+    });
     const response = await runCli(socket, 'respond', { agent_id: agentId, request_id: 'request-1', decision: 'allow' });
     assert.equal(response.result.disposition, 'accepted');
+    const afterResponse = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
+    assert.equal(afterResponse.result.revision, 8);
+    assert.equal(afterResponse.result.command_pending_approval, false);
+    assert.equal(afterResponse.result.timed_out, true);
+    assert.equal(afterResponse.result.pending_requests[0].state, 'responded');
+    assert.equal(afterResponse.result.pending_requests[0].respondable, false);
+    assert.equal(afterResponse.result.pending_requests.some(({ request_id }) => request_id === 'request-101'), false);
     await assert.rejects(() => runCli(socket, 'respond', { agent_id: agentId, request_id: 'request-1', decision: 'allow' }), /late or duplicate|REQUEST_NOT_PENDING/);
     await runCli(socket, 'cancel', { agent_id: agentId });
     await assert.rejects(() => runCli(socket, 'respond', { agent_id: agentId, request_id: 'request-2', decision: 'deny' }), /late or duplicate|REQUEST_NOT_PENDING/);
