@@ -267,11 +267,25 @@ impl Scheduler {
         &self,
         manifest: &GeneralTaskManifest,
     ) -> Result<SubmittedTask, SchedulerError> {
+        self.enqueue_general_with_admission(manifest, None)
+    }
+
+    pub fn enqueue_general_with_admission(
+        &self,
+        manifest: &GeneralTaskManifest,
+        admission: Option<external_core::AdmissionIdentity>,
+    ) -> Result<SubmittedTask, SchedulerError> {
         let mut manifest = manifest.clone();
         manifest.agent_id = self.inner.store.reserve_task_id()?;
         let prepared = GeneralTaskPreparer::new(Vec::new())
             .and_then(|preparer| preparer.prepare_direct_submission(&manifest))
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
+        let prepared = match admission {
+            Some(identity) => prepared
+                .with_admission(identity)
+                .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?,
+            None => prepared,
+        };
         let prepared_json = serde_json::to_string(&prepared)
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
         let initial_prompt = general_initial_prompt(&prepared)?;
