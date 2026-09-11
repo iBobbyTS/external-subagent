@@ -85,11 +85,9 @@ test('human config and agents forms execute instead of falling through to JSON d
   const list = await runCli(home, socket, ['agents', 'list']);
   assert.equal(list.code, 0, list.stderr);
   assert.deepEqual(JSON.parse(list.stdout).agents.map((agent) => agent.agent), ['zcode', 'dsh']);
-  for (const operation of ['probe', 'models']) {
-    const unsupported = await runCli(home, socket, ['agents', operation, 'zcode']);
-    assert.equal(unsupported.code, 2);
-    assert.equal(JSON.parse(unsupported.stderr).error.code, 'agent_operation_unsupported');
-  }
+  const unsupported = await runCli(home, socket, ['agents', 'models', 'zcode']);
+  assert.equal(unsupported.code, 2);
+  assert.equal(JSON.parse(unsupported.stderr).error.code, 'agent_operation_unsupported');
   const status = {
     service_generation: 'generation-cli',
     agents: [{ agent: 'zcode', enabled: true, spawn_supported: true, local: { status: 'ready', version: '1.0.0', checked_at_ms: 10 }, auth: { status: 'unknown' }, hi: { status: 'unknown' } }],
@@ -99,4 +97,10 @@ test('human config and agents forms execute instead of falling through to JSON d
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'system_status');
   assert.deepEqual(JSON.parse(fixture.result.stdout).agents, status.agents);
+
+  const probe = await withServer(socket, (request) => ({ outcome: 'success', result: {
+    kind: 'agent_probed', evidence: { agent: 'zcode' }, status: { agent: 'zcode' },
+  } }), () => runCli(home, socket, ['agents', 'probe', 'zcode']));
+  assert.equal(probe.result.code, 0, probe.result.stderr);
+  assert.equal(probe.observed().method, 'agent_probe');
 });
