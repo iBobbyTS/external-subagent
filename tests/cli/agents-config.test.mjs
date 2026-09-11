@@ -105,6 +105,16 @@ test('concurrent config writers serialize revision and preserve both updates', a
   assert.equal(final.agents.dsh.enabled, true);
 });
 
+test('config writer recovers a stale lock from a dead owner', () => {
+  const { paths } = fixture();
+  fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 1, revision: 4, default_agent: null, agents: { zcode: { enabled: true, spawn_supported: true, default_model: null }, dsh: { enabled: false, spawn_supported: false, default_model: null } } }));
+  fs.writeFileSync(`${paths.config}.lock`, '999999\n');
+  const result = configCommand(paths, { operation: 'set', patch: { default_agent: 'zcode' } }).config;
+  assert.equal(result.revision, 5);
+  assert.equal(result.default_agent, 'zcode');
+});
+
 test('unknown config fields and operations fail closed', () => {
   const { paths } = fixture();
   assert.throws(() => configCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');

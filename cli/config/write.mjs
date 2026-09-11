@@ -18,9 +18,23 @@ export function updateConfig(file, updater) {
   let descriptor;
   const deadline = Date.now() + 2000;
   while (!descriptor) {
-    try { descriptor = fs.openSync(lock, 'wx', 0o600); }
+    try {
+      descriptor = fs.openSync(lock, 'wx', 0o600);
+      fs.writeFileSync(descriptor, `${process.pid}\n`);
+    }
     catch (error) {
       if (error.code !== 'EEXIST' || Date.now() >= deadline) throw error;
+      let stale = false;
+      try {
+        const owner = fs.readFileSync(lock, 'utf8').trim();
+        if (owner && /^\d+$/u.test(owner)) {
+          try { process.kill(Number(owner), 0); } catch (probeError) { stale = probeError.code === 'ESRCH'; }
+        } else {
+          const stat = fs.statSync(lock);
+          stale = stat.size === 0 && Date.now() - stat.mtimeMs > 2000;
+        }
+      } catch (probeError) { stale = probeError.code === 'ENOENT'; }
+      if (stale) { try { fs.unlinkSync(lock); } catch {} continue; }
       Atomics.wait(wait, 0, 0, 5);
     }
   }
