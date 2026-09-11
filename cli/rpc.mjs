@@ -29,7 +29,7 @@ export function waitTransportTimeoutMs(waitTime = 290) {
 
 export function daemonTransportTimeoutMs(command, params = {}) {
   if (command === 'wait') return waitTransportTimeoutMs(params.wait_time);
-  if (command === 'agent-probe') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
+  if (command === 'agent-probe' || command === 'agent-models') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
   return 6000;
 }
 
@@ -76,6 +76,7 @@ function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
     case 'agent-probe': return { method: 'agent_probe', params: { input } };
+    case 'agent-models': return { method: 'agent_models', params: { input } };
     case 'create': case 'spawn': return {
       method: 'submit_general',
       params: { input: {
@@ -156,6 +157,7 @@ export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
+    case 'agent-models': return result;
     case 'create': case 'spawn':
       return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, phase: result.task.phase };
     case 'wait': {

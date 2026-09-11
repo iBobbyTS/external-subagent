@@ -92,7 +92,16 @@ test('agents human operations are strict and unsupported actions are explicit', 
     },
   });
   assert.equal(probed.status.agent, 'zcode');
-  await assert.rejects(() => agentsCommand(paths, { operation: 'models', agent: 'dsh' }), (error) => error.code === 'agent_operation_unsupported');
+  const models = await agentsCommand(paths, { operation: 'models', agent: 'dsh' }, {
+    socket: '/socket',
+    callDaemon: async (socket, command, input) => {
+      assert.equal(socket, '/socket');
+      assert.equal(command, 'agent-models');
+      assert.deepEqual(input, { agent: 'dsh', scope: {} });
+      return { agent: 'dsh', scope: {}, models: [] };
+    },
+  });
+  assert.deepEqual(models.models, []);
   await assert.rejects(() => agentsCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');
   await assert.rejects(() => agentsCommand(paths, { operation: 'list', unknown: true }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => parseAgentsArgs(['list', 'zcode']), (error) => error.code === 'INVALID_ARGUMENT');
@@ -123,7 +132,7 @@ test('agents status projects daemon evidence and rejects absent identities', asy
 });
 
 test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {
-  assert.throws(() => prepareSpawnInput({ agent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'agent_required');
+  assert.throws(() => prepareSpawnInput({ agent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => prepareSpawnInput({ agent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
   assert.equal(Object.hasOwn(omitted, 'agent'), false);
@@ -140,8 +149,8 @@ test('spawn flags build the shared DTO and reject malformed values', () => {
   });
   assert.throws(() => parseSpawnArgs(['--repository', '/repo']), /--prompt is required/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt']), /requires a non-null value/u);
-  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'null']), /requires a non-null value/u);
-  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--agent', 'null']), /requires a non-null value/u);
+  assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'null']).prompt, 'null');
+  assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--model', 'null']).model, 'null');
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--unknown', 'x']), /unsupported spawn option/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--repository', '/other', '--prompt', 'hi']), /only once/u);
 });

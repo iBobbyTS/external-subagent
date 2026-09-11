@@ -13,6 +13,7 @@ test('wait transport timeout covers maximum wait without sleeping', () => {
 
 test('probe transport timeout covers local, two runtime deadlines, and cleanup', () => {
   assert.equal(daemonTransportTimeoutMs('agent-probe'), AGENT_PROBE_TRANSPORT_TIMEOUT_MS);
+  assert.equal(daemonTransportTimeoutMs('agent-models'), AGENT_PROBE_TRANSPORT_TIMEOUT_MS);
   assert.ok(AGENT_PROBE_TRANSPORT_TIMEOUT_MS >= 187000);
 });
 import { CliError } from '../../cli/errors.mjs';

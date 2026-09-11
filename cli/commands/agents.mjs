@@ -59,7 +59,12 @@ export async function agentsCommand(paths, input = {}, options = {}) {
     return { default_agent: config.default_agent, config_revision: config.revision, agents: Object.entries(config.agents).map(([id, value]) => ({ agent: id, ...value })) };
   }
   if (operation === 'models') {
-    throw new CliError('agent_operation_unsupported', 'agents models requires a provider catalog implementation', 2);
+    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents models requires a daemon connection');
+    if (!input.agent) throw new CliError('agent_required', 'agents models requires an agent', 2);
+    const scope = {};
+    if (input.workspace !== undefined) scope.workspace = input.workspace;
+    if (input.home !== undefined) scope.home = input.home;
+    return options.callDaemon(options.socket, 'agent-models', { agent: input.agent, scope });
   }
   if (operation === 'probe') {
     if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents probe requires a daemon connection');

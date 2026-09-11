@@ -108,19 +108,38 @@ test('spawn and create JSON stdin preserve the same daemon wire DTO', async () =
   assert.deepEqual(captured[1], captured[0]);
 });
 
-test('spawn flags reject unknown, missing, and null-like values before transport', async () => {
+test('spawn flags reject unknown and missing values before transport', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-invalid-flags-'));
   const socket = path.join(home, 'missing.sock');
   for (const args of [
     ['spawn', '--repository', '/repo'],
     ['spawn', '--repository', '/repo', '--prompt'],
-    ['spawn', '--repository', '/repo', '--prompt', 'null'],
-    ['spawn', '--repository', '/repo', '--prompt', 'hi', '--model', 'null'],
     ['spawn', '--repository', '/repo', '--prompt', 'hi', '--unknown', 'x'],
   ]) {
     const result = await runCli(home, socket, args);
     assert.equal(result.code, 2);
     assert.notEqual(JSON.parse(result.stderr).error.code, 'SOCKET_UNAVAILABLE');
+  }
+});
+
+test('literal null flag strings reach daemon while structured JSON null is rejected', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-null-'));
+  const socket = path.join(os.tmpdir(), `es-n-${process.pid}-${Date.now()}.sock`);
+  const fixture = await withServer(socket, (request) => {
+    assert.equal(request.params.input.agent, 'zcode');
+    assert.equal(request.params.input.model, 'null');
+    assert.equal(request.params.input.manifest.prompt, 'null');
+    return { outcome: 'error', error: { code: 'model_selection_unsupported', message: 'model selection is unsupported' } };
+  }, () => runCli(home, socket, ['spawn', '--agent', 'zcode', '--model', 'null', '--repository', '/repo', '--prompt', 'null']));
+  assert.equal(fixture.result.code, 1);
+  assert.equal(JSON.parse(fixture.result.stderr).error.code, 'model_selection_unsupported');
+  for (const input of [
+    { agent: null, repository: '/repo', prompt: 'hi' },
+    { agent: 'zcode', model: null, repository: '/repo', prompt: 'hi' },
+  ]) {
+    const rejected = await runCli(home, '/missing/socket', ['spawn', '--json', JSON.stringify(input)]);
+    assert.equal(rejected.code, 2);
+    assert.equal(JSON.parse(rejected.stderr).error.code, 'INVALID_ARGUMENT');
   }
 });
 
@@ -183,9 +202,12 @@ test('human config and agents forms execute instead of falling through to JSON d
   const list = await runCli(home, socket, ['agents', 'list']);
   assert.equal(list.code, 0, list.stderr);
   assert.deepEqual(JSON.parse(list.stdout).agents.map((agent) => agent.agent), ['zcode', 'dsh']);
-  const unsupported = await runCli(home, socket, ['agents', 'models', 'zcode']);
-  assert.equal(unsupported.code, 2);
-  assert.equal(JSON.parse(unsupported.stderr).error.code, 'agent_operation_unsupported');
+  const models = await withServer(socket, () => ({ outcome: 'success', result: {
+    kind: 'agent_models', agent: 'zcode', scope: {}, models: [],
+  } }), () => runCli(home, socket, ['agents', 'models', 'zcode']));
+  assert.equal(models.result.code, 0, models.result.stderr);
+  assert.equal(models.observed().method, 'agent_models');
+  assert.deepEqual(models.observed().params.input, { agent: 'zcode', scope: {} });
   const status = {
     service_generation: 'generation-cli',
     agents: [{

@@ -11,7 +11,7 @@ const FLAG_FIELDS = new Map([
 
 function flagValue(args, option) {
   const value = args.shift();
-  if (value === undefined || value === '' || value === 'null' || value.startsWith('--')) {
+  if (value === undefined || value === '' || value.startsWith('--')) {
     throw new CliError('INVALID_ARGUMENT', `${option} requires a non-null value`, 2);
   }
   return value;
@@ -42,7 +42,7 @@ export function prepareSpawnInput(input) {
     if (!SPAWN_FIELDS.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
   if (Object.prototype.hasOwnProperty.call(input, 'agent') && input.agent === null) {
-    throw new CliError('agent_required', 'agent must be omitted or a supported agent id; null is invalid', 2);
+    throw new CliError('INVALID_ARGUMENT', 'agent must be omitted or a supported agent id; null is invalid', 2);
   }
   if (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0)) {
     throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
