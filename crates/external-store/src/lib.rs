@@ -2384,4 +2384,90 @@ mod tests {
         assert_eq!(delivered.target_turn_id.as_deref(), Some("turn-1"));
         assert!(delivered.delivered_at.unwrap() >= delivered.created_at);
     }
+
+    #[test]
+    fn pending_projection_is_bounded_and_nonrespondable_tail_does_not_change_state() {
+        let (_directory, _path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("agent", "/repo", None))
+            .unwrap();
+        running(&store, "agent");
+        for index in 0..101 {
+            store
+                .insert_pending_request(
+                    &format!("request-{index}"),
+                    "agent",
+                    &format!("correlation-{index}"),
+                    "permission",
+                    "{\"toolName\":\"Read\"}",
+                )
+                .unwrap();
+        }
+        let projection = store.pending_requests_bounded("agent", 100).unwrap();
+        assert_eq!(projection.len(), 100);
+        assert_eq!(projection[0].request_id, "request-0");
+        assert_eq!(projection[99].request_id, "request-99");
+        assert!(store.completion_blockers("agent").unwrap().0);
+        assert_eq!(store.get_task("agent").unwrap().unwrap().phase, TaskPhase::WaitingInput);
+    }
+
+    #[test]
+    fn cancellation_fences_queue_and_late_or_duplicate_responses() {
+        let (_directory, _path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("agent", "/repo", None))
+            .unwrap();
+        running(&store, "agent");
+        store
+            .insert_message("message", "agent", "queue", "follow-up")
+            .unwrap();
+        store
+            .insert_pending_request("request", "agent", "corr", "permission", "{}")
+            .unwrap();
+        let decision = store.request_stop("agent").unwrap();
+        assert!(decision.needs_runtime_stop);
+        assert_eq!(decision.phase, TaskPhase::Cancelling);
+        assert!(matches!(
+            store.claim_pending_response_if_accepting("agent", "request", "allow", None)
+                .unwrap(),
+            PendingResponseClaimDisposition::NotFound
+                | PendingResponseClaimDisposition::TaskStopping
+        ));
+        assert!(store.pending_requests("agent").unwrap().is_empty());
+        assert_eq!(store.message("message").unwrap().unwrap().state, MessageState::Failed);
+        assert!(matches!(
+            store.store_task_result("agent", &result(TaskOutcome::Completed)),
+            Err(StoreError::Conflict(_))
+        ));
+        store
+            .store_task_result("agent", &result(TaskOutcome::Cancelled))
+            .unwrap();
+        assert!(matches!(
+            store.claim_pending_response_if_accepting("agent", "request", "deny", None)
+                .unwrap(),
+            PendingResponseClaimDisposition::NotFound
+        ));
+    }
+
+    #[test]
+    fn recovery_inventory_does_not_replay_or_mutate_unknown_runtime_delivery() {
+        let (_directory, path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("agent", "/repo", None))
+            .unwrap();
+        running(&store, "agent");
+        store
+            .insert_message("message", "agent", "queue", "once")
+            .unwrap();
+        let first_claim = store.claim_next_message("agent").unwrap().unwrap();
+        assert_eq!(first_claim.state, MessageState::Sending);
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        let inventory = reopened.startup_recovery_tasks().unwrap();
+        assert_eq!(inventory.len(), 1);
+        let recovered_message = reopened.message("message").unwrap().unwrap();
+        assert_eq!(recovered_message.state, MessageState::Sending);
+        assert!(reopened.claim_next_message("agent").unwrap().is_none());
+        assert!(reopened.complete_message("message", Some("replayed-turn")).unwrap());
+    }
 }
