@@ -948,7 +948,9 @@ fn ensure_group_empty(pgid: i32) -> io::Result<()> {
                     "process leader exited while descendants remain; refusing unproven cleanup",
                 ));
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline => {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error),

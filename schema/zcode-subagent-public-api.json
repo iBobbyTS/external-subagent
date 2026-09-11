@@ -15,10 +15,11 @@
       "type": "object",
       "required": ["agent", "repository", "prompt"],
       "properties": {
-        "agent": { "enum": ["zcode", "dsh"] },
+        "agent": { "type": "string", "minLength": 1, "description": "Provider route key; zcode is supported, dsh is explicitly gated, and unknown keys fail closed." },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode" },
         "prompt": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1 },
         "write_manifest": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       },
       "allOf": [
@@ -110,7 +111,7 @@
       "additionalProperties": false,
       "properties": {
         "external_subagent_status": { "input": [], "output": ["components", "capabilities", "identity"] },
-        "external_subagent_spawn": { "input": ["repository", "permission_mode", "prompt", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
+        "external_subagent_spawn": { "input": ["agent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "after_revision", "wait_time", "message_id"], "output": ["task", "revision", "next_revision", "pending_requests", "command_pending_approval", "result_available", "activity", "latest_progress", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
