@@ -23,6 +23,20 @@ function runCli(home, socket, args) {
   });
 }
 
+function runCliWithStdin(home, socket, command, input) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [cli, command], {
+      env: { ...process.env, HOME: home, ZCODE_AS_SUBAGENT_TEST_PLATFORM: 'darwin', ZCODE_AGENTD_SOCKET: socket },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = ''; let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+    child.stdin.end(JSON.stringify(input));
+  });
+}
+
 async function withServer(socket, respond, body) {
   let observed = null;
   const server = net.createServer((connection) => connection.once('data', (chunk) => {
@@ -72,6 +86,26 @@ test('spawn and create flags produce the same daemon DTO as JSON', async () => {
   }
   assert.deepEqual(captured[1], captured[0]);
   assert.deepEqual(captured[2], captured[0]);
+});
+
+test('spawn and create JSON stdin preserve the same daemon wire DTO', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-stdin-'));
+  const jsonInput = {
+    agent: 'future-provider', repository: '/repo', prompt: 'stdin hi', permission_mode: 'edit',
+    model: 'catalog-token', write_manifest: ['src/**'],
+  };
+  const captured = [];
+  for (const [index, command] of ['spawn', 'create'].entries()) {
+    const socket = path.join(os.tmpdir(), `es-i-${process.pid}-${index}-${Date.now()}.sock`);
+    const fixture = await withServer(socket, () => ({ outcome: 'success', result: {
+      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
+    } }), () => runCliWithStdin(home, socket, command, jsonInput));
+    assert.equal(fixture.result.code, 0, fixture.result.stderr);
+    const input = structuredClone(fixture.observed().params.input);
+    input.manifest.agent_id = '<request-id>';
+    captured.push(input);
+  }
+  assert.deepEqual(captured[1], captured[0]);
 });
 
 test('spawn flags reject unknown, missing, and null-like values before transport', async () => {
