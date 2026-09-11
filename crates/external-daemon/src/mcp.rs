@@ -1658,6 +1658,7 @@ mod server {
         match method {
             RpcMethod::SystemStatus => ("status", None),
             RpcMethod::AgentProbe { .. } => ("agent_probe", None),
+            RpcMethod::AgentModels { .. } => ("agent_models", None),
             RpcMethod::SubmitGeneral { .. } => ("spawn", None),
             RpcMethod::TaskList(_) => ("list", None),
             RpcMethod::TaskWait(input) => ("wait", Some(input.agent_id.clone())),

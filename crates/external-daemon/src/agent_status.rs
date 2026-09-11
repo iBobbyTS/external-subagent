@@ -10,8 +10,9 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -20,6 +21,10 @@ use std::{
 const LOCAL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 const RUNTIME_STOP_GRACE: Duration = Duration::from_secs(1);
+const DSH_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
+const DSH_MAX_FRAME_BYTES: usize = 1024 * 1024;
+const DSH_MAX_MODELS: usize = 256;
+const DSH_MAX_MODEL_TOKEN_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,8 +102,40 @@ pub struct AgentProbeEvidence {
     pub hi: ScopeEvidence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentModelsInput {
+    pub agent: String,
+    #[serde(default)]
+    pub scope: ProbeScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogEvidence {
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub scope: ProbeScope,
+    pub checked_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelsOutput {
+    pub agent: String,
+    pub config_revision: u64,
+    pub supported: bool,
+    pub models: Vec<String>,
+    pub evidence: ModelCatalogEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 pub trait AgentProbeBackend: Send + Sync + 'static {
     fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence;
+
+    fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
+        unsupported_models(input, "native_only")
+    }
 }
 
 #[derive(Clone)]
@@ -131,6 +168,12 @@ impl AgentEvidenceStore {
 
     pub fn latest(&self, agent: &str) -> Option<AgentProbeEvidence> {
         self.latest.lock().unwrap().get(agent).cloned()
+    }
+
+    pub fn models(&self, input: &AgentModelsInput, config_revision: u64) -> AgentModelsOutput {
+        let mut output = self.backend.models(input);
+        output.config_revision = config_revision;
+        output
     }
 }
 
@@ -213,6 +256,317 @@ impl AgentProbeBackend for ProcessProbeBackend {
             hi,
         }
     }
+
+    fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
+        if input.agent == "zcode" {
+            return unsupported_models(input, "native_only");
+        }
+        probe_dsh_models(
+            env::var_os("DSH_RUNTIME_PATH")
+                .map(PathBuf::from)
+                .as_deref(),
+            input,
+        )
+    }
+}
+
+fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutput {
+    AgentModelsOutput {
+        agent: input.agent.clone(),
+        config_revision: 0,
+        supported: false,
+        models: Vec::new(),
+        evidence: ModelCatalogEvidence {
+            source: if input.agent == "zcode" {
+                "zcode_native_model".into()
+            } else {
+                "dsh_acp_models_list".into()
+            },
+            version: None,
+            scope: input.scope.clone(),
+            checked_at_ms: wall_now_millis(),
+        },
+        reason: Some(reason.into()),
+    }
+}
+
+fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
+    let checked_at_ms = wall_now_millis();
+    let mut scope = input.scope.clone();
+    let disposable_workspace = if scope.workspace.is_none() {
+        tempfile::Builder::new()
+            .prefix("external-subagent-dsh-catalog-")
+            .tempdir()
+            .ok()
+    } else {
+        None
+    };
+    if let Some(workspace) = disposable_workspace.as_ref() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700));
+        }
+        scope.workspace = Some(workspace.path().to_string_lossy().into_owned());
+    }
+    let local = probe_local(path, scope.clone(), checked_at_ms);
+    let evidence = ModelCatalogEvidence {
+        source: "dsh_acp_models_list".into(),
+        version: local.version.clone(),
+        scope: scope.clone(),
+        checked_at_ms,
+    };
+    if local.state != EvidenceState::Ready {
+        return AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: local.reason,
+        };
+    }
+    let Some(workspace) = scope.workspace.as_deref() else {
+        return AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: Some("workspace_required".into()),
+        };
+    };
+    if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
+        return AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: Some("workspace_missing".into()),
+        };
+    }
+    let result = run_dsh_catalog(
+        path.expect("ready local evidence has a runtime path"),
+        &scope,
+        DSH_CATALOG_TIMEOUT,
+    );
+    match result {
+        Ok(models) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: true,
+            models,
+            evidence,
+            reason: None,
+        },
+        Err(reason) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: Some(reason),
+        },
+    }
+}
+
+fn run_dsh_catalog(
+    executable: &Path,
+    scope: &ProbeScope,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let workspace = scope
+        .workspace
+        .as_deref()
+        .ok_or_else(|| "workspace_required".to_owned())?;
+    let mut command = if matches!(
+        executable.extension().and_then(|value| value.to_str()),
+        Some("js" | "cjs" | "mjs")
+    ) {
+        let mut command = Command::new("node");
+        command.arg(executable);
+        command
+    } else {
+        Command::new(executable)
+    };
+    command
+        .current_dir(workspace)
+        .env("DSH_ACP_PROBE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(home) = scope.home.as_deref() {
+        command.env("DSH_HOME", home);
+    }
+    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let mut input = child.stdin.take().ok_or_else(|| "transport".to_owned())?;
+    let output = child.stdout.take().ok_or_else(|| "transport".to_owned())?;
+    let diagnostic = child.stderr.take().ok_or_else(|| "transport".to_owned())?;
+    let (frames_tx, frames_rx) = mpsc::channel();
+    thread::spawn(move || read_dsh_frames(output, frames_tx));
+    let diagnostic_tail = Arc::new(Mutex::new(String::new()));
+    let diagnostic_target = Arc::clone(&diagnostic_tail);
+    let diagnostic_thread = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = diagnostic.take(64 * 1024).read_to_end(&mut bytes);
+        *diagnostic_target.lock().unwrap() = String::from_utf8_lossy(&bytes).into_owned();
+    });
+    let deadline = Instant::now() + timeout;
+    let result = (|| {
+        let initialized = dsh_call(
+            &mut input,
+            &frames_rx,
+            1,
+            "initialize",
+            serde_json::json!({
+                "protocolVersion": 1,
+                "clientInfo": {"name":"external-subagent-dsh-probe","version":env!("CARGO_PKG_VERSION")}
+            }),
+            deadline,
+        )?;
+        if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+            return Err("protocol_version".into());
+        }
+        let session = dsh_call(
+            &mut input,
+            &frames_rx,
+            2,
+            "session/new",
+            serde_json::json!({"cwd": workspace}),
+            deadline,
+        )?;
+        if session
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.is_empty() || value.len() > 512)
+        {
+            return Err("protocol".into());
+        }
+        let catalog = dsh_call(
+            &mut input,
+            &frames_rx,
+            3,
+            "models/list",
+            serde_json::json!({}),
+            deadline,
+        )?;
+        parse_opaque_model_tokens(&catalog)
+    })();
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = diagnostic_thread.join();
+    if let Err(reason) = result {
+        if reason == "transport" {
+            let classified =
+                classify_provider_failure(&Value::Null, &diagnostic_tail.lock().unwrap());
+            return Err(classified.into());
+        }
+        return Err(reason);
+    }
+    result
+}
+
+fn read_dsh_frames(output: impl Read, sender: mpsc::Sender<Result<Value, String>>) {
+    let mut reader = BufReader::new(output);
+    loop {
+        let mut frame = Vec::new();
+        match reader.read_until(b'\n', &mut frame) {
+            Ok(0) => return,
+            Ok(_) if frame.len() > DSH_MAX_FRAME_BYTES => {
+                let _ = sender.send(Err("oversized".into()));
+                return;
+            }
+            Ok(_) => {
+                while matches!(frame.last(), Some(b'\n' | b'\r')) {
+                    frame.pop();
+                }
+                if frame.is_empty() {
+                    continue;
+                }
+                let parsed = serde_json::from_slice(&frame).map_err(|_| "protocol".into());
+                if sender.send(parsed).is_err() {
+                    return;
+                }
+            }
+            Err(_) => {
+                let _ = sender.send(Err("transport".into()));
+                return;
+            }
+        }
+    }
+}
+
+fn dsh_call(
+    input: &mut impl Write,
+    frames: &mpsc::Receiver<Result<Value, String>>,
+    id: u64,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value, String> {
+    let mut request = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc":"2.0", "id":id, "method":method, "params":params
+    }))
+    .map_err(|_| "protocol".to_owned())?;
+    request.push(b'\n');
+    if request.len() > DSH_MAX_FRAME_BYTES {
+        return Err("oversized".into());
+    }
+    input
+        .write_all(&request)
+        .map_err(|_| "transport".to_owned())?;
+    input.flush().map_err(|_| "transport".to_owned())?;
+    for _ in 0..256 {
+        let frame = frames
+            .recv_timeout(remaining(deadline)?)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => "network".to_owned(),
+                mpsc::RecvTimeoutError::Disconnected => "transport".to_owned(),
+            })??;
+        if frame.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if frame.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err("protocol".into());
+        }
+        if let Some(error) = frame.get("error") {
+            return Err(classify_provider_failure(error, "").into());
+        }
+        return frame
+            .get("result")
+            .filter(|result| !result.is_null())
+            .cloned()
+            .ok_or_else(|| "protocol".into());
+    }
+    Err("protocol".into())
+}
+
+fn parse_opaque_model_tokens(catalog: &Value) -> Result<Vec<String>, String> {
+    let models = catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "protocol".to_owned())?;
+    if models.len() > DSH_MAX_MODELS {
+        return Err("oversized".into());
+    }
+    let mut tokens = Vec::with_capacity(models.len());
+    for model in models {
+        let token = model
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|token| {
+                !token.is_empty()
+                    && token.len() <= DSH_MAX_MODEL_TOKEN_BYTES
+                    && !token.contains('\0')
+            })
+            .ok_or_else(|| "protocol".to_owned())?;
+        if !tokens.iter().any(|existing| existing == token) {
+            tokens.push(token.to_owned());
+        }
+    }
+    Ok(tokens)
 }
 
 fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> ScopeEvidence {
@@ -1123,5 +1477,85 @@ process.stdin.on('data', (chunk) => {
             assert_eq!(evidence.auth.state, state);
             assert_eq!(evidence.hi.state, state);
         }
+    }
+
+    #[test]
+    fn dsh_catalog_uses_bounded_acp_sequence_and_keeps_tokens_opaque() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("fake-dsh");
+        let log = directory.path().join("requests.jsonl");
+        let opaque = "provider://future:model@2027?variant=a/b+c";
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('dsh-fixture-1.2.3\n'); process.exit(0); }
+const log = __LOG__;
+let buffer = '';
+const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    fs.appendFileSync(log, JSON.stringify(request) + '\n');
+    if (request.method === 'initialize') write({ jsonrpc:'2.0', id:request.id, result:{ protocolVersion:1, capabilities:{ models:true } } });
+    else if (request.method === 'session/new') write({ jsonrpc:'2.0', id:request.id, result:{ sessionId:'catalog-session' } });
+    else if (request.method === 'models/list') write({ jsonrpc:'2.0', id:request.id, result:{ models:[{ id:__OPAQUE__, name:'Future Model' }, { id:__OPAQUE__, name:'duplicate' }] } });
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(&log).unwrap())
+        .replace("__OPAQUE__", &serde_json::to_string(opaque).unwrap());
+        fs::write(&runtime, source).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = probe_dsh_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "dsh".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(output.supported);
+        assert_eq!(output.models, vec![opaque]);
+        assert_eq!(output.evidence.source, "dsh_acp_models_list");
+        assert_eq!(
+            output.evidence.version.as_deref(),
+            Some("dsh-fixture-1.2.3")
+        );
+        let workspace = output.evidence.scope.workspace.as_deref().unwrap();
+        assert!(workspace.contains("external-subagent-dsh-catalog-"));
+        assert!(!Path::new(workspace).exists());
+        let requests = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "session/new", "models/list"]
+        );
+        assert!(requests.iter().all(|request| request["jsonrpc"] == "2.0"));
+    }
+
+    #[test]
+    fn zcode_catalog_is_explicitly_native_only_without_runtime_start() {
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(PathBuf::from("/must-not-run")),
+        };
+        let output = backend.models(&AgentModelsInput {
+            agent: "zcode".into(),
+            scope: ProbeScope::default(),
+        });
+        assert!(!output.supported);
+        assert!(output.models.is_empty());
+        assert_eq!(output.reason.as_deref(), Some("native_only"));
+        assert_eq!(output.evidence.source, "zcode_native_model");
     }
 }
