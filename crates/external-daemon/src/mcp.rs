@@ -125,6 +125,8 @@ pub struct PublicToolErrorBody {
     pub agent_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +151,7 @@ impl ToolError {
                 request_id: None,
                 agent_id: None,
                 cleanup: None,
+                prompt_count: None,
             },
             legacy_text: legacy_text.into(),
         }
@@ -168,6 +171,11 @@ impl ToolError {
         if self.body.agent_id.is_none() {
             self.body.agent_id = agent_id.and_then(|value| public_task_id(&value).ok());
         }
+        self
+    }
+
+    pub(crate) fn with_prompt_count(mut self, prompt_count: u64) -> Self {
+        self.body.prompt_count = Some(prompt_count);
         self
     }
 }
@@ -1477,7 +1485,7 @@ mod server {
                 "agent dsh is unsupported",
                 "agent_unsupported: agent dsh is unsupported (prompt_count=0)",
                 "facade",
-            )),
+            ).with_prompt_count(0)),
             Some(PublicAgent::Zcode) => {}
         }
         for (field, value, max) in [
@@ -1968,9 +1976,10 @@ mod server {
     mod contract_default_tests {
         use super::{
             default_result_limit, rpc_context, AgentListInput, AgentObserveOutput,
-            AgentResultInput, AgentSendInput, AgentWaitInput, PublicArtifactIdentity,
+            AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, PublicArtifactIdentity,
             PublicComponentIdentity, SubagentMcp, SystemStatusOutput, PUBLIC_TOOLS,
         };
+        use super::general_manifest;
         use crate::{
             observation::ObservationSnapshot,
             rpc::{
