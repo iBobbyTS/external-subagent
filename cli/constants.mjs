@@ -7,6 +7,6 @@ export const ZCODE_RUNTIME = '/Applications/ZCode.app/Contents/Resources/glm/zco
 export const BUSINESS_COMMANDS = new Set([
   'init', 'hooks', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop',
   'uninstall', 'purge', 'cleanup-legacy', 'install-plugin', 'create', 'spawn', 'wait', 'list', 'send',
-  'respond', 'cancel', 'result', 'close',
+  'respond', 'cancel', 'result', 'close', 'config', 'agents',
   'observe',
 ]);

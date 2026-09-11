@@ -8,6 +8,10 @@ import { backupData, cleanupLegacy, purge, restoreData, uninstall } from './main
 import { platform, productPaths } from './paths.mjs';
 import { startService, stopService } from './service.mjs';
 import { callDaemon, parseDaemonInput } from './rpc.mjs';
+import { configCommand } from './commands/config.mjs';
+import { agentsCommand } from './commands/agents.mjs';
+import { readConfig } from './config/read.mjs';
+import { validateSpawnSelection } from './config/schema.mjs';
 
 const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] Install and configure the local service\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration\n  status, diagnose            Inspect local service and runtime state\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
 const DAEMON_HELP = `  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
@@ -313,6 +317,11 @@ export async function main(args) {
     }
     return;
   }
+  if (command === 'config' || command === 'agents') {
+    const input = parseDaemonInput(args.slice(1));
+    output(command === 'config' ? configCommand(paths, input) : agentsCommand(paths, input));
+    return;
+  }
   if (command === 'diagnose') {
     const report = await diagnose(paths, args.slice(1));
     output({
@@ -334,6 +343,10 @@ export async function main(args) {
     output(cleanupLegacy(paths.home)); return;
   }
   const input = parseDaemonInput(args.slice(1));
+  if (command === 'create' || command === 'spawn') {
+    const config = readConfig(paths.config);
+    input.agent = validateSpawnSelection(config, input);
+  }
   const result = await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, command, input);
   output({ command, result });
 }
