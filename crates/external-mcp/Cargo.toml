@@ -1,0 +1,13 @@
+[package]
+name = "external-mcp"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+autobins = false
+
+[[bin]]
+name = "zcode-as-subagent-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread"] }
