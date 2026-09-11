@@ -56,6 +56,29 @@ test('human config forms parse typed values and get one key', () => {
   assert.throws(() => parseConfigArgs(['set', 'agents.other.enabled', 'true']), (error) => error.code === 'INVALID_ARGUMENT');
 });
 
+test('config show and unset use the same validated revision path', () => {
+  const { paths } = fixture();
+  configCommand(paths, parseConfigArgs(['set', 'default_agent', 'zcode']));
+  const shown = configCommand(paths, parseConfigArgs(['show']));
+  assert.equal(shown.config.default_agent, 'zcode');
+  assert.equal(shown.config.revision, 1);
+  const unset = configCommand(paths, parseConfigArgs(['unset', 'default_agent']));
+  assert.equal(unset.config.default_agent, null);
+  assert.equal(unset.config.revision, 2);
+  assert.equal(configCommand(paths, parseConfigArgs(['unset', 'agents.zcode.enabled'])).config.agents.zcode.enabled, true);
+  assert.throws(() => parseConfigArgs(['unset', 'revision']), /unsupported config key/u);
+});
+
+test('config set cannot override revision or merge an agent null patch', () => {
+  const { paths } = fixture();
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { revision: 999, default_agent: 'zcode' } }), /managed by the writer/u);
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { agents: { zcode: null } } }), /must be an object/u);
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { agents: { zcode: ['bad'] } } }), /must be an object/u);
+  const first = configCommand(paths, { operation: 'set', patch: { default_agent: 'zcode' } }).config;
+  assert.equal(first.revision, 1);
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { revision: first.revision } }), /managed by the writer/u);
+});
+
 test('unknown config fields and operations fail closed', () => {
   const { paths } = fixture();
   assert.throws(() => configCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');
