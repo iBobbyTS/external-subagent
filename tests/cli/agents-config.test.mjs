@@ -79,7 +79,16 @@ test('agents human operations are strict and unsupported actions are explicit', 
   const { paths } = fixture();
   assert.deepEqual(parseAgentsArgs([]), { operation: 'list' });
   assert.deepEqual(parseAgentsArgs(['status', 'zcode']), { operation: 'status', agent: 'zcode' });
-  await assert.rejects(() => agentsCommand(paths, { operation: 'probe', agent: 'zcode' }), (error) => error.code === 'agent_operation_unsupported');
+  const probed = await agentsCommand(paths, { operation: 'probe', agent: 'zcode', through: 'hi', workspace: '/workspace' }, {
+    socket: '/socket',
+    callDaemon: async (socket, command, input) => {
+      assert.equal(socket, '/socket');
+      assert.equal(command, 'agent-probe');
+      assert.deepEqual(input, { agent: 'zcode', through: 'hi', scope: { workspace: '/workspace' } });
+      return { evidence: { agent: 'zcode' }, status: { agent: 'zcode' } };
+    },
+  });
+  assert.equal(probed.status.agent, 'zcode');
   await assert.rejects(() => agentsCommand(paths, { operation: 'models', agent: 'dsh' }), (error) => error.code === 'agent_operation_unsupported');
   await assert.rejects(() => agentsCommand(paths, { operation: 'wat' }), (error) => error.code === 'INVALID_ARGUMENT');
   await assert.rejects(() => agentsCommand(paths, { operation: 'list', unknown: true }), (error) => error.code === 'INVALID_ARGUMENT');

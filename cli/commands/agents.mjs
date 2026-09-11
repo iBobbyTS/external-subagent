@@ -2,7 +2,7 @@ import { readConfig } from '../config/read.mjs';
 import { AGENT_IDS } from '../config/schema.mjs';
 import { CliError } from '../errors.mjs';
 
-const INPUT_FIELDS = new Set(['operation', 'agent']);
+const INPUT_FIELDS = new Set(['operation', 'agent', 'through', 'workspace', 'home']);
 
 function validateInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CliError('INVALID_ARGUMENT', 'agents input must be an object', 2);
@@ -31,8 +31,16 @@ export async function agentsCommand(paths, input = {}, options = {}) {
   if (operation === 'list') {
     return { default_agent: config.default_agent, config_revision: config.revision, agents: Object.entries(config.agents).map(([id, value]) => ({ agent: id, ...value })) };
   }
-  if (operation === 'probe' || operation === 'models') {
-    throw new CliError('agent_operation_unsupported', `agents ${operation} is not implemented by this version`, 2);
+  if (operation === 'models') {
+    throw new CliError('agent_operation_unsupported', 'agents models requires a provider catalog implementation', 2);
+  }
+  if (operation === 'probe') {
+    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents probe requires a daemon connection');
+    if (!input.agent) throw new CliError('agent_required', 'agents probe requires an agent', 2);
+    const scope = {};
+    if (input.workspace !== undefined) scope.workspace = input.workspace;
+    if (input.home !== undefined) scope.home = input.home;
+    return options.callDaemon(options.socket, 'agent-probe', { agent: input.agent, through: input.through ?? 'local', scope });
   }
   if (operation !== 'status') throw new CliError('INVALID_ARGUMENT', `unsupported agents operation: ${operation}`, 2);
   if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents status requires a daemon connection');
