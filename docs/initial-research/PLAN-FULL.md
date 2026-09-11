@@ -2,14 +2,14 @@
 
 - Feature: `external-subagent-v1-20260910`
 - Skill: **sectioned-feature-development 4.5.1**，来自本次附件；本文件采用其分段、模型路由、边界 handoff、有限修复与双路径独立 review 规则。
-- Status: **DRAFT / OWNER_DECISIONS_PENDING / PLAN_REVIEW_NOT_RUN**。
+- Status: **DRAFT / OWNER_DECISIONS_ACCEPTED / PLAN_REVIEW_NOT_REQUIRED_BY_USER**。
 - Invocation: `USER_EXPLICIT`，本次仅要求研究与计划；没有开始产品实现、用户机器安装或 npm 发布。
 - Requirements: [REQUIREMENTS.md](REQUIREMENTS.md)；原始请求 [ORIGINAL-REQUEST.md](ORIGINAL-REQUEST.md)；待决策 [DECISIONS.md](DECISIONS.md)。
 - Source repository snapshot: `zcode-as-subagent`，`codex/wait-respondable-20260910`，HEAD `bb45d562671ddbd99637c5680449bc75aedb378b`。
 - Target repository / feature base / current branch: **NOT_CREATED / UNKNOWN**；实际新目录由用户提供或主控在获准创建时记录，不能写旧项目绝对路径冒充新路径。
 - Execution mode: 本次 `PLAN_ONLY`；后续实施／本地验证／commit 权限由真实 invocation 决定。不默认 merge、push、npm publish、删除旧仓库或修改全局 provider 配置。
 - Product support baseline proposed: macOS arm64；ZCode app-server 与官方 DSH ACP；Node/Rust；见 D01—D10。
-- Independent PLAN review: native `@plan_reviewer` **NOT_RUN**；第二独立 ZAS/ZCode **NOT_RUN**；当前没有实际 reviewer ID 或 verdict。
+- Independent PLAN review: native `@plan_reviewer` 与第二独立 ZAS/ZCode review 均按用户明确要求不执行；当前没有 reviewer ID 或 verdict。
 
 ## 目标、权威与最小充分范围
 
@@ -23,11 +23,11 @@
 
 ## 前置状态与实施准入
 
-D01—D10 必须被明确采纳或修订；主控只更新受影响的合同／未实施 section，不把读到计划视为默认批准。后续获准实施时依SFD创建独立feature branch并逐section提交，不在旧仓库修改分支；实际base/head和权限写入FEATURE-STATE。S01 的真实 hi、credentials 使用和指定 workspace 配置读取应有对应授权；缺失环境只能记录阻断，不伪称测试通过。
+D01—D10 已按用户确认记录在 REQUIREMENTS.md；本次不执行额外 PLAN review。主控只更新受影响的合同／未实施 section。后续获准实施时依SFD创建独立feature branch并逐section提交，不在旧仓库修改分支；实际base/head和权限写入FEATURE-STATE。S01 的真实 hi、credentials 使用和指定 workspace 配置读取应有对应授权；缺失环境只能记录阻断，不伪称测试通过。
 
 上传工作树的 97 个现存 tracked 文件与固定 HEAD 一致，但缺少 40 个已跟踪 tests 文件；Git 对象可恢复。新仓库从该固定 HEAD 导出所需源码与测试，保留 LICENSE/来源，不复制旧 `.git`、工作日志、凭据或旧 `.agent-work` 历史。旧仓库 inspect-only；不执行 reset/clean/gc 或分支修复。新项目采用单主工作树、串行 writer，AGENTS 记录新路径及新授权，不照抄旧绝对路径。
 
-当前只完成源码／文档研究与计划文本检查。尚未运行任何新产品命令、真实 DSH/ZCode 测试、Codex plugin 安装、npm 安装／升级或 macOS LaunchAgent 验证。S01 与后续所有 AC 均是待执行。
+当前只完成源码／文档研究与计划文本检查。尚未运行任何新产品命令、真实 DSH/ZCode 测试、Codex plugin 安装、npm 安装／升级或 macOS LaunchAgent 验证。S01 与后续所有 AC 均是待执行；这不影响本次需求确认和计划交付。
 
 ## 规划知识路由与版本限制
 
