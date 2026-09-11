@@ -397,6 +397,7 @@ fn probe_zcode_hi(
 
 fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, String> {
     let deadline = Instant::now() + RUNTIME_PROBE_TIMEOUT;
+    let mut events = ProbeEventCache::default();
     let workspace_ref = WorkspaceRef {
         workspace_key: workspace,
         workspace_path: workspace,
@@ -411,6 +412,7 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
         })
         .map_err(|_| "transport".to_owned())?,
         deadline,
+        &mut events,
     )?;
     let projection = created
         .result
@@ -430,6 +432,7 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
         })
         .map_err(|_| "transport".to_owned())?,
         deadline,
+        &mut events,
     )?;
     request_with_runtime_preferences(
         Arc::clone(&driver),
@@ -440,36 +443,18 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
         })
         .map_err(|_| "transport".to_owned())?,
         deadline,
+        &mut events,
     )?;
 
     loop {
+        if let Some(terminal) = events.terminal.take() {
+            return match terminal {
+                ProbeTerminal::Completed => Ok(session_id),
+                ProbeTerminal::Failed(reason) => Err(reason),
+            };
+        }
         let wait = remaining(deadline)?.min(Duration::from_millis(50));
         match driver.recv_timeout(wait) {
-            Ok(Inbound::Message(WireMessage::Event(event)))
-                if event.method == SESSION_EVENT
-                    && event_type(&event) == Some("turn.completed") =>
-            {
-                return Ok(session_id)
-            }
-            Ok(Inbound::Message(WireMessage::Event(event)))
-                if event.method == SESSION_EVENT && event_type(&event) == Some("turn.failed") =>
-            {
-                return Err(
-                    classify_provider_failure(&event.params, &driver.diagnostic_tail()).into(),
-                )
-            }
-            Ok(Inbound::Message(WireMessage::Event(event)))
-                if event
-                    .params
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| {
-                        kind.starts_with("tool.") || kind == "permission.requested"
-                    }) =>
-            {
-                return Err("policy_violation".into())
-            }
-            Ok(Inbound::Message(WireMessage::Event(_))) => {}
             Ok(Inbound::Message(WireMessage::Request(request))) => {
                 if request.method == INTERACTION_REQUEST_PERMISSION {
                     let _ = driver.respond_error(
@@ -484,22 +469,7 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
                 );
                 return Err("transport".into());
             }
-            Ok(Inbound::Message(WireMessage::UnknownEvent { raw, .. })) => {
-                if contains_tool_signal(&raw) {
-                    return Err("policy_violation".into());
-                }
-            }
-            Ok(Inbound::Message(WireMessage::Response(_))) => {}
-            Ok(Inbound::Malformed(_) | Inbound::OversizedLine { .. }) => {
-                return Err("transport".into())
-            }
-            Ok(Inbound::ChildExited(_)) => {
-                return Err(
-                    classify_provider_failure(&Value::Null, &driver.diagnostic_tail()).into(),
-                )
-            }
-            Ok(Inbound::UnmatchedResponse { .. }) => return Err("transport".into()),
-            Ok(Inbound::Lifecycle { .. }) => {}
+            Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
         }
@@ -511,6 +481,7 @@ fn request_with_runtime_preferences(
     method: &str,
     params: Value,
     deadline: Instant,
+    events: &mut ProbeEventCache,
 ) -> Result<external_contract::ResponseEnvelope, String> {
     let pending = driver
         .begin_request(method, params)
@@ -556,32 +527,88 @@ fn request_with_runtime_preferences(
                 );
                 return Err("transport".into());
             }
-            Ok(Inbound::Message(WireMessage::Event(event)))
+            Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeTerminal {
+    Completed,
+    Failed(String),
+}
+
+#[derive(Debug, Default)]
+struct ProbeEventCache {
+    terminal: Option<ProbeTerminal>,
+    diagnostic_reason: Option<String>,
+}
+
+impl ProbeEventCache {
+    fn observe(&mut self, inbound: &Inbound, diagnostic: &str) -> Result<(), String> {
+        match inbound {
+            Inbound::Message(WireMessage::Event(event)) => {
                 if event
                     .params
                     .get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|kind| {
-                        kind.starts_with("tool.") || kind == "permission.requested"
-                    }) =>
-            {
-                return Err("policy_violation".into())
+                    .is_some_and(|kind| kind.starts_with("tool.") || kind == "permission.requested")
+                {
+                    return Err("policy_violation".into());
+                }
+                if event.method == SESSION_EVENT {
+                    match event_type(event) {
+                        Some("turn.completed") => {
+                            if self.terminal.is_none() {
+                                self.terminal = Some(ProbeTerminal::Completed);
+                            }
+                        }
+                        Some("turn.failed") => {
+                            self.terminal = Some(ProbeTerminal::Failed(
+                                classify_provider_failure(&event.params, diagnostic).into(),
+                            ));
+                        }
+                        _ => self.capture_diagnostic(&event.params, diagnostic),
+                    }
+                }
             }
-            Ok(Inbound::Message(WireMessage::UnknownEvent { raw, .. }))
-                if contains_tool_signal(&raw) =>
-            {
-                return Err("policy_violation".into())
+            Inbound::Message(WireMessage::UnknownEvent { raw, .. }) => {
+                if contains_tool_signal(raw) {
+                    return Err("policy_violation".into());
+                }
+                self.capture_diagnostic(raw, diagnostic);
             }
-            Ok(Inbound::Malformed(_) | Inbound::OversizedLine { .. }) => {
-                return Err("transport".into())
+            Inbound::Lifecycle { method, .. } if method == "turn.completed" => {
+                if self.terminal.is_none() {
+                    self.terminal = Some(ProbeTerminal::Completed);
+                }
             }
-            Ok(Inbound::ChildExited(_)) => {
-                return Err(
-                    classify_provider_failure(&Value::Null, &driver.diagnostic_tail()).into(),
-                )
+            Inbound::Lifecycle { method, .. } if method == "turn.failed" => {
+                // The driver publishes the lifecycle marker before the matching
+                // event body. Keep the boundary, but wait for that body so an
+                // asynchronous 401/429/network reason is not collapsed.
             }
-            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
+            Inbound::Malformed(_) | Inbound::OversizedLine { .. } => return Err("transport".into()),
+            Inbound::ChildExited(_) => {
+                self.terminal = Some(ProbeTerminal::Failed(
+                    self.diagnostic_reason.clone().unwrap_or_else(|| {
+                        classify_provider_failure(&Value::Null, diagnostic).into()
+                    }),
+                ));
+            }
+            Inbound::UnmatchedResponse { .. } => return Err("transport".into()),
+            Inbound::Message(WireMessage::Request(_) | WireMessage::Response(_))
+            | Inbound::Lifecycle { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn capture_diagnostic(&mut self, value: &Value, diagnostic: &str) {
+        let reason = classify_provider_failure(value, diagnostic);
+        if reason != "transport" {
+            self.diagnostic_reason = Some(reason.into());
         }
     }
 }
@@ -787,6 +814,7 @@ mod tests {
         terminal: &str,
         failure: Value,
         emit_tool: bool,
+        terminal_before_response: bool,
     ) -> (PathBuf, PathBuf) {
         let executable = directory.join(format!("fixture-{terminal}.mjs"));
         let log = directory.join(format!("fixture-{terminal}.jsonl"));
@@ -797,6 +825,7 @@ const log = __LOG__;
 const terminal = __TERMINAL__;
 const failure = __FAILURE__;
 const emitTool = __EMIT_TOOL__;
+const terminalBeforeResponse = __TERMINAL_BEFORE_RESPONSE__;
 let pendingCreate = null;
 let buffer = '';
 function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -822,10 +851,15 @@ process.stdin.on('data', (chunk) => {
     } else if (value.method === 'session/subscribe') {
       write({ id: value.id, result: { subscribed: true } });
     } else if (value.method === 'session/send') {
-      write({ id: value.id, result: { turnId: 'probe-turn' } });
-      write({ method: 'session/event', params: { eventId: 'start', sessionId: 'probe-session', seq: 1, timestamp: 1, type: 'turn.started', payload: {} } });
-      if (emitTool) write({ method: 'session/event', params: { eventId: 'tool', sessionId: 'probe-session', seq: 2, timestamp: 2, type: 'tool.updated', payload: { toolName: 'Bash' } } });
-      write({ method: 'session/event', params: { eventId: 'end', sessionId: 'probe-session', seq: 3, timestamp: 3, type: terminal, payload: failure } });
+      const response = { id: value.id, result: { turnId: 'probe-turn' } };
+      const started = { method: 'session/event', params: { eventId: 'start', sessionId: 'probe-session', seq: 1, timestamp: 1, type: 'turn.started', payload: {} } };
+      const tool = { method: 'session/event', params: { eventId: 'tool', sessionId: 'probe-session', seq: 2, timestamp: 2, type: 'tool.updated', payload: { toolName: 'Bash' } } };
+      const ended = { method: 'session/event', params: { eventId: 'end', sessionId: 'probe-session', seq: 3, timestamp: 3, type: terminal, payload: failure } };
+      if (terminalBeforeResponse) {
+        write(started); if (emitTool) write(tool); write(ended); setTimeout(() => write(response), 25);
+      } else {
+        write(response); write(started); if (emitTool) write(tool); write(ended);
+      }
     } else if (value.method === 'session/close') {
       write({ id: value.id, result: { closed: true } });
     }
@@ -835,7 +869,11 @@ process.stdin.on('data', (chunk) => {
         .replace("__LOG__", &serde_json::to_string(&log).unwrap())
         .replace("__TERMINAL__", &serde_json::to_string(terminal).unwrap())
         .replace("__FAILURE__", &failure.to_string())
-        .replace("__EMIT_TOOL__", if emit_tool { "true" } else { "false" });
+        .replace("__EMIT_TOOL__", if emit_tool { "true" } else { "false" })
+        .replace(
+            "__TERMINAL_BEFORE_RESPONSE__",
+            if terminal_before_response { "true" } else { "false" },
+        );
         fs::write(&executable, source).unwrap();
         (executable, log)
     }
@@ -845,8 +883,23 @@ process.stdin.on('data', (chunk) => {
         failure: Value,
         emit_tool: bool,
     ) -> (AgentProbeEvidence, Vec<Value>) {
+        run_fixture_probe_ordered(terminal, failure, emit_tool, false)
+    }
+
+    fn run_fixture_probe_ordered(
+        terminal: &str,
+        failure: Value,
+        emit_tool: bool,
+        terminal_before_response: bool,
+    ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
-        let (runtime, log) = fake_hi_runtime(directory.path(), terminal, failure, emit_tool);
+        let (runtime, log) = fake_hi_runtime(
+            directory.path(),
+            terminal,
+            failure,
+            emit_tool,
+            terminal_before_response,
+        );
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
         };
@@ -919,5 +972,36 @@ process.stdin.on('data', (chunk) => {
         let (evidence, _) = run_fixture_probe("turn.completed", serde_json::json!({}), true);
         assert_eq!(evidence.auth.state, EvidenceState::Unavailable);
         assert_eq!(evidence.hi.reason.as_deref(), Some("policy_violation"));
+    }
+
+    #[test]
+    fn terminal_events_seen_before_send_response_are_cached_without_timeout() {
+        for (terminal, failure, reason, state) in [
+            (
+                "turn.completed",
+                serde_json::json!({}),
+                None,
+                EvidenceState::Ready,
+            ),
+            (
+                "turn.failed",
+                serde_json::json!({"error":{"code":401,"message":"unauthorized"}}),
+                Some("auth_401"),
+                EvidenceState::Unavailable,
+            ),
+            (
+                "turn.failed",
+                serde_json::json!({"error":{"code":429,"message":"rate limit"}}),
+                Some("rate_limit"),
+                EvidenceState::Degraded,
+            ),
+        ] {
+            let started = Instant::now();
+            let (evidence, _) = run_fixture_probe_ordered(terminal, failure, false, true);
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(evidence.hi.state, state);
+            assert_eq!(evidence.auth.state, state);
+            assert_eq!(evidence.hi.reason.as_deref(), reason);
+        }
     }
 }

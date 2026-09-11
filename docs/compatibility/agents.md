@@ -22,4 +22,6 @@ For ZCode, a `local` probe establishes executable/version evidence only. An `aut
 
 Auth is not promoted when the turn merely starts. Both auth and hi become `READY` only after the terminal `turn.completed` event. A terminal failure, child exit, or diagnostic tail is classified after settlement, so asynchronous 401, rate-limit, and network failures update both layers. If the caller omits workspace for a hi probe, the daemon creates a mode-0700 disposable workspace, records that generated absolute path as the evidence scope, and removes the directory after the probe. Evidence from that disposable path cannot be reused for another workspace.
 
+Lifecycle and diagnostic events received while a command response is still pending are retained by the probe. After the response arrives, terminal classification consumes those retained events first; a provider that emits `turn.completed` or `turn.failed` before the matching send response therefore settles immediately with the original success or failure reason.
+
 For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, but this release has no accepted production adapter. Auth and hi remain `UNKNOWN` with `dsh_production_adapter_unavailable`, and `spawn_supported` is always `false`. The S01 fixture is protocol evidence only and is never promoted to live auth or hi evidence.
