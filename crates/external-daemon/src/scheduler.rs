@@ -1533,43 +1533,10 @@ impl Scheduler {
             .get_task(agent_id)?
             .is_some_and(|task| task.phase == TaskPhase::Terminal)
         {
-            let original = self
-                .inner
-                .store
-                .get_task(agent_id)?
-                .ok_or_else(|| StoreError::InvalidState("resume task disappeared".into()))?;
-            let original_result = self.inner.store.task_result(agent_id)?;
-            self.inner
-                .store
-                .requeue_task_for_resume_with_message(agent_id, message_id, content)?;
-            let started = match self.start_ready() {
-                Ok(started) => started,
-                Err(error) => {
-                    if self
-                        .inner
-                        .store
-                        .get_task(agent_id)?
-                        .is_some_and(|task| task.phase == TaskPhase::Terminal)
-                    {
-                        self.inner.store.restore_terminal_after_resume_failure(
-                            &original,
-                            original_result.as_ref().map(|stored| &stored.result),
-                        )?;
-                    }
-                    return Err(error);
-                }
-            };
-            if !started.iter().any(|started_id| started_id == agent_id) {
-                self.inner.store.restore_terminal_after_resume_failure(
-                    &original,
-                    original_result.as_ref().map(|stored| &stored.result),
-                )?;
-                return Err(SchedulerError::RuntimeCommand {
-                    agent_id: agent_id.into(),
-                    message: "session resume was not started".into(),
-                });
-            }
-            return Ok(MessageDisposition::Queued);
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "TERMINAL_SEND_UNSUPPORTED".into(),
+            });
         }
         let active = self.active_session(agent_id);
         let operation = active

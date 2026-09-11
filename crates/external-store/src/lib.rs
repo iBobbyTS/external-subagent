@@ -2408,7 +2408,10 @@ mod tests {
         assert_eq!(projection[0].request_id, "request-0");
         assert_eq!(projection[99].request_id, "request-99");
         assert!(store.completion_blockers("agent").unwrap().0);
-        assert_eq!(store.get_task("agent").unwrap().unwrap().phase, TaskPhase::WaitingInput);
+        assert_eq!(
+            store.get_task("agent").unwrap().unwrap().phase,
+            TaskPhase::WaitingInput
+        );
     }
 
     #[test]
@@ -2428,13 +2431,17 @@ mod tests {
         assert!(decision.needs_runtime_stop);
         assert_eq!(decision.phase, TaskPhase::Cancelling);
         assert!(matches!(
-            store.claim_pending_response_if_accepting("agent", "request", "allow", None)
+            store
+                .claim_pending_response_if_accepting("agent", "request", "allow", None)
                 .unwrap(),
             PendingResponseClaimDisposition::NotFound
                 | PendingResponseClaimDisposition::TaskStopping
         ));
         assert!(store.pending_requests("agent").unwrap().is_empty());
-        assert_eq!(store.message("message").unwrap().unwrap().state, MessageState::Failed);
+        assert_eq!(
+            store.message("message").unwrap().unwrap().state,
+            MessageState::Failed
+        );
         assert!(matches!(
             store.store_task_result("agent", &result(TaskOutcome::Completed)),
             Err(StoreError::Conflict(_))
@@ -2443,7 +2450,8 @@ mod tests {
             .store_task_result("agent", &result(TaskOutcome::Cancelled))
             .unwrap();
         assert!(matches!(
-            store.claim_pending_response_if_accepting("agent", "request", "deny", None)
+            store
+                .claim_pending_response_if_accepting("agent", "request", "deny", None)
                 .unwrap(),
             PendingResponseClaimDisposition::NotFound
         ));
@@ -2468,6 +2476,8 @@ mod tests {
         let recovered_message = reopened.message("message").unwrap().unwrap();
         assert_eq!(recovered_message.state, MessageState::Sending);
         assert!(reopened.claim_next_message("agent").unwrap().is_none());
-        assert!(reopened.complete_message("message", Some("replayed-turn")).unwrap());
+        assert!(reopened
+            .complete_message("message", Some("replayed-turn"))
+            .unwrap());
     }
 }

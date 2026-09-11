@@ -1646,6 +1646,41 @@ pub(crate) mod wait_tests {
         assert_eq!(receipt.content, "continue with the requested work");
     }
 
+    #[test]
+    fn terminal_task_rejects_message_without_deleting_result() {
+        let (_directory, service, id) = fixture();
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "terminal result".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let before = service.store.task_result(&id).unwrap().unwrap();
+        let response = service.dispatch(RpcMethod::TaskMessage(MessageInput {
+            agent_id: id.clone(),
+            message_id: "terminal-message".into(),
+            mode: "queue".into(),
+            content: "must not resume".into(),
+        }));
+        assert!(matches!(
+            response,
+            Err(RpcError {
+                code: RpcErrorCode::Validation,
+                ..
+            })
+        ));
+        assert_eq!(
+            service.store.task_result(&id).unwrap().unwrap().result,
+            before.result
+        );
+        assert!(service.store.message("terminal-message").unwrap().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn wait_socket_disconnect_and_shutdown_release_workers_without_task_mutation() {
@@ -2288,7 +2323,15 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
             RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed")
         }
         SchedulerError::RuntimeCommand { .. } => {
-            RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
+            let message = match &error {
+                SchedulerError::RuntimeCommand { message, .. } => message.as_str(),
+                _ => unreachable!(),
+            };
+            if message == "TERMINAL_SEND_UNSUPPORTED" {
+                RpcError::new(RpcErrorCode::Validation, message)
+            } else {
+                RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
+            }
         }
     }
 }
