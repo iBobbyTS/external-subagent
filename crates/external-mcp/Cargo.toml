@@ -6,7 +6,7 @@ license.workspace = true
 autobins = false
 
 [[bin]]
-name = "zcode-as-subagent-mcp"
+name = "external-subagent-mcp"
 path = "src/main.rs"
 
 [dependencies]

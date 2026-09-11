@@ -6,7 +6,7 @@ license.workspace = true
 autobins = false
 
 [[bin]]
-name = "zcode-as-subagentd"
+name = "external-subagentd"
 path = "src/main.rs"
 
 [dependencies]

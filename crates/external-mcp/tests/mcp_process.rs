@@ -30,7 +30,7 @@ fn forwards_bytes_and_exits_when_daemon_closes() {
         stream.write_all(b"pong").unwrap();
         thread::sleep(Duration::from_millis(500));
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-as-subagent-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
         .env("ZCODE_AGENTD_SOCKET", &path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -53,7 +53,7 @@ fn forwards_bytes_and_exits_when_daemon_closes() {
 #[test]
 fn connection_failure_is_nonzero_and_explains_socket() {
     let path = socket();
-    let output = Command::new(env!("CARGO_BIN_EXE_zcode-as-subagent-mcp"))
+    let output = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
         .env("ZCODE_AGENTD_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -81,7 +81,7 @@ fn stdin_eof_half_closes_without_hanging() {
         assert_eq!(stream.read(&mut buf).unwrap(), 0);
         thread::sleep(Duration::from_millis(100));
     });
-    let output = Command::new(env!("CARGO_BIN_EXE_zcode-as-subagent-mcp"))
+    let output = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
         .env("ZCODE_AGENTD_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -106,7 +106,7 @@ fn stdin_eof_exits_while_daemon_keeps_session_open() {
         assert_eq!(stream.read(&mut buf).unwrap(), 0);
         thread::sleep(Duration::from_millis(500));
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-as-subagent-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
         .env("ZCODE_AGENTD_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -137,7 +137,7 @@ fn daemon_eof_is_transport_failure_with_nonzero_exit() {
         let (stream, _) = listener.accept().unwrap();
         drop(stream);
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zcode-as-subagent-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
         .env("ZCODE_AGENTD_SOCKET", &path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
