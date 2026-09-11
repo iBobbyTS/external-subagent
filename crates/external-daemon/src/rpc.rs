@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env,
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
     sync::Arc,
@@ -145,6 +145,10 @@ impl From<TaskPhaseFilter> for TaskPhase {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneralSubmitInput {
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub manifest: GeneralTaskManifest,
 }
 
@@ -337,8 +341,75 @@ pub struct SystemStatusView {
     pub service_generation: String,
     pub components: BTreeMap<String, ComponentStateView>,
     pub capabilities: AgentCapabilitiesView,
+    #[serde(default)]
+    pub agents: Vec<AgentStatusView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<DaemonIdentityView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatusView {
+    pub agent: String,
+    pub config_revision: u64,
+    pub enabled: bool,
+    pub spawn_supported: bool,
+    pub local: AgentScopeStatusView,
+    pub auth: AgentScopeStatusView,
+    pub hi: AgentScopeStatusView,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentConfigSnapshot {
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    default_agent: Option<String>,
+    #[serde(default)]
+    agents: BTreeMap<String, AgentConfigEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AgentConfigEntry {
+    enabled: bool,
+    spawn_supported: bool,
+    #[serde(default)]
+    default_model: Option<String>,
+}
+
+impl Default for AgentConfigSnapshot {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            default_agent: None,
+            agents: BTreeMap::from([
+                (
+                    "zcode".into(),
+                    AgentConfigEntry {
+                        enabled: true,
+                        spawn_supported: true,
+                        default_model: None,
+                    },
+                ),
+                (
+                    "dsh".into(),
+                    AgentConfigEntry {
+                        enabled: false,
+                        spawn_supported: false,
+                        default_model: None,
+                    },
+                ),
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScopeStatusView {
+    pub status: ComponentStateView,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +611,11 @@ pub enum RpcErrorCode {
     UnsupportedVersion,
     UnknownMethod,
     Validation,
+    AgentRequired,
+    AgentUnknown,
+    AgentDisabled,
+    AgentUnsupported,
+    ModelSelectionUnsupported,
     NotFound,
     Conflict,
     Persistence,
@@ -785,6 +861,55 @@ impl RpcService {
                 status: self.system_status(),
             }),
             RpcMethod::SubmitGeneral { input } => {
+                let config = read_agent_config_snapshot()?;
+                let agent = input
+                    .agent
+                    .as_deref()
+                    .or(config.default_agent.as_deref())
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            RpcErrorCode::AgentRequired,
+                            "agent is required when no default_agent is configured",
+                        )
+                    })?;
+                let configured = config
+                    .agents
+                    .get(agent)
+                    .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
+                if !configured.enabled {
+                    return Err(RpcError::new(
+                        RpcErrorCode::AgentDisabled,
+                        "agent is disabled",
+                    ));
+                }
+                if !configured.spawn_supported {
+                    return Err(RpcError::new(
+                        RpcErrorCode::AgentUnsupported,
+                        format!("agent {agent} is unsupported; prompt_count=0"),
+                    ));
+                }
+                match agent {
+                    "zcode" => {
+                        if input.model.is_some() || configured.default_model.is_some() {
+                            return Err(RpcError::new(
+                                RpcErrorCode::ModelSelectionUnsupported,
+                                "model selection is unsupported for zcode",
+                            ));
+                        }
+                    }
+                    "dsh" => {
+                        return Err(RpcError::new(
+                            RpcErrorCode::AgentUnsupported,
+                            "agent_unsupported: dsh; prompt_count=0",
+                        ));
+                    }
+                    _ => {
+                        return Err(RpcError::new(
+                            RpcErrorCode::AgentUnknown,
+                            "agent is unknown",
+                        ));
+                    }
+                }
                 let manifest = input.manifest;
                 let submitted = self
                     .scheduler
@@ -1003,6 +1128,7 @@ impl RpcService {
             service_generation: self.service_generation.clone(),
             components,
             capabilities: agent_capabilities(self.scheduler.runtime_source_verified()),
+            agents: configured_agent_statuses(self.scheduler.configured_runtime_source()),
             identity: Some(DaemonIdentityView {
                 daemon: self.daemon_identity.clone(),
                 runtime: configured_runtime_identity(self.scheduler.configured_runtime_source()),
@@ -1126,6 +1252,141 @@ impl RpcService {
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
     }
+}
+
+fn configured_agent_statuses(runtime_path: Option<PathBuf>) -> Vec<AgentStatusView> {
+    // Status is deliberately side-effect free: it reports configuration and
+    // preserves auth/hi as unknown until an explicitly authorized probe has
+    // produced scoped evidence.
+    let zcode_local = runtime_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .map(|_path| AgentScopeStatusView {
+            status: ComponentStateView::Ready,
+            version: None,
+            checked_at_ms: Some(wall_now_millis()),
+        })
+        .unwrap_or(AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        });
+    let config = read_agent_config_snapshot().unwrap_or_else(|_| {
+        let mut snapshot = AgentConfigSnapshot::default();
+        for entry in snapshot.agents.values_mut() {
+            entry.enabled = false;
+            entry.spawn_supported = false;
+        }
+        snapshot
+    });
+    let zcode = AgentStatusView {
+        agent: "zcode".into(),
+        config_revision: config.revision,
+        enabled: config.agents["zcode"].enabled,
+        spawn_supported: config.agents["zcode"].spawn_supported,
+        local: zcode_local,
+        auth: AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        },
+        hi: AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        },
+    };
+    let dsh = AgentStatusView {
+        agent: "dsh".into(),
+        config_revision: config.revision,
+        enabled: config.agents["dsh"].enabled,
+        spawn_supported: false,
+        local: AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        },
+        auth: AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        },
+        hi: AgentScopeStatusView {
+            status: ComponentStateView::Unknown,
+            version: None,
+            checked_at_ms: None,
+        },
+    };
+    vec![zcode, dsh]
+}
+
+fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
+    let Some(path) =
+        env::var_os("EXTERNAL_SUBAGENT_CONFIG").or_else(|| env::var_os("ZCODE_AGENT_CONFIG"))
+    else {
+        return Ok(AgentConfigSnapshot::default());
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentConfigSnapshot::default())
+        }
+        Err(_) => {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "agent config is unreadable",
+            ))
+        }
+    };
+    let mut snapshot: AgentConfigSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
+    if snapshot
+        .agents
+        .keys()
+        .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh"))
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "agent config contains an unknown agent",
+        ));
+    }
+    let defaults = AgentConfigSnapshot::default();
+    for (name, entry) in defaults.agents {
+        snapshot.agents.entry(name).or_insert(entry);
+    }
+    if snapshot
+        .default_agent
+        .as_deref()
+        .is_some_and(|agent| !snapshot.agents.contains_key(agent))
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentUnknown,
+            "default_agent is unknown",
+        ));
+    }
+    if snapshot
+        .default_agent
+        .as_deref()
+        .is_some_and(|agent| !snapshot.agents[agent].enabled)
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentDisabled,
+            "default_agent is disabled",
+        ));
+    }
+    snapshot
+        .agents
+        .get_mut("dsh")
+        .expect("dsh default inserted")
+        .spawn_supported = false;
+    Ok(snapshot)
+}
+
+fn wall_now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 fn respondable_pending_request(request: &PendingRequestView) -> bool {
@@ -2469,6 +2730,7 @@ mod identity_tests {
                     service_generation: "legacy-generation".into(),
                     components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
                     capabilities: agent_capabilities(false),
+                    agents: Vec::new(),
                     identity: Some(DaemonIdentityView {
                         daemon: running_component_identity_from(
                             "daemon", "0.1.0", None, None, None, UNIX_EPOCH,

@@ -74,7 +74,7 @@ function manifest(input) {
 function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
-    case 'create': case 'spawn': return { method: 'submit_general', params: { input: { manifest: manifest(input) } } };
+    case 'create': case 'spawn': return { method: 'submit_general', params: { input: { agent: input.agent, model: input.model ?? null, manifest: manifest(input) } } };
     case 'wait': return { method: 'task_wait', params: { agent_id: daemonTaskId(input.agent_id), after_revision: input.after_revision ?? 0, wait_time: input.wait_time ?? 290, ...(input.message_id ? { message_id: input.message_id } : {}) } };
     case 'list': {
       const repository = input.repository ?? input.workspace;
