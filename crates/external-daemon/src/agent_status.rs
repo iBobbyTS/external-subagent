@@ -854,6 +854,10 @@ fn probe_zcode_hi(
         };
         return (evidence.clone(), evidence);
     }
+    if !verified_read_only_policy(scope, workspace) {
+        let evidence = unavailable(scope, version, checked_at_ms, "policy_unverified");
+        return (evidence.clone(), evidence);
+    }
     let mut command = runtime_command(executable, false);
     if let Some(home) = scope.home.as_deref() {
         command.env("ZCODE_HOME", home);
@@ -898,6 +902,33 @@ fn probe_zcode_hi(
     };
     let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
     (auth, hi)
+}
+
+fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
+    #[cfg(test)]
+    if env::var_os("EXTERNAL_SUBAGENT_TEST_POLICY_VERIFIED").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+    {
+        return true;
+    }
+    let Some(home) = scope.home.as_deref() else {
+        return false;
+    };
+    let path = Path::new(home).join("external-subagent-policy.json");
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    value.get("product").and_then(Value::as_str) == Some("external-subagent")
+        && value.get("verified").and_then(Value::as_bool) == Some(true)
+        && value.get("workspace").and_then(Value::as_str) == Some(workspace)
+        && value.get("permission_mode").and_then(Value::as_str) == Some("plan")
+        && value
+            .get("write_manifest")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
 }
 
 fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, String> {
@@ -1518,6 +1549,7 @@ process.stdin.on('data', (chunk) => {
         after_terminal: &str,
     ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
+        std::env::set_var("EXTERNAL_SUBAGENT_TEST_POLICY_VERIFIED", "1");
         let (runtime, log) = fake_hi_runtime(
             directory.path(),
             terminal,
