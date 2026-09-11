@@ -7,6 +7,7 @@ export const RPC_VERSION = 13;
 export const MAX_FRAME_BYTES = 512 * 1024;
 export const MAX_RESPONSE_FRAME_BYTES = 2 * 1024 * 1024;
 export const MAX_RESULT_CHUNK_BYTES = 256 * 1024;
+export const AGENT_PROBE_TRANSPORT_TIMEOUT_MS = 200_000;
 export const MIN_TASK_ID = 10_000_000;
 export const MAX_TASK_ID = 99_999_999;
 
@@ -24,6 +25,12 @@ export function waitTransportTimeoutMs(waitTime = 290) {
     throw new CliError('INVALID_ARGUMENT', 'wait_time must be an integer between 0 and 299', 2);
   }
   return waitTime * 1000 + 5000;
+}
+
+export function daemonTransportTimeoutMs(command, params = {}) {
+  if (command === 'wait') return waitTransportTimeoutMs(params.wait_time);
+  if (command === 'agent-probe') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
+  return 6000;
 }
 
 function publicTaskId(value) {
@@ -53,17 +60,11 @@ function manifest(input) {
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
-  if (input.agent === undefined) throw new CliError('agent_required', 'agent is required; choose an agent', 2);
-  if (input.agent !== 'zcode' && input.agent !== 'dsh') {
-    throw new CliError('INVALID_ARGUMENT', 'agent must be one of: zcode, dsh', 2);
-  }
-  if (input.agent === 'dsh') {
-    const error = new CliError('agent_unsupported', 'agent dsh is unsupported; prompt_count=0', 2);
-    error.promptCount = 0;
-    throw error;
-  }
-  if (input.model !== undefined) throw new CliError('model_selection_unsupported', 'model selection is unsupported for zcode', 2);
-  if (!input.repository || !input.prompt) throw new CliError('INVALID_ARGUMENT', 'create requires repository and prompt', 2);
+  if (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0)) throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
+  if (input.model !== undefined && (typeof input.model !== 'string' || input.model.length === 0)) throw new CliError('INVALID_ARGUMENT', 'model must be a non-empty string', 2);
+  if (typeof input.repository !== 'string' || input.repository.length === 0 || typeof input.prompt !== 'string' || input.prompt.length === 0) throw new CliError('INVALID_ARGUMENT', 'create requires non-empty repository and prompt strings', 2);
+  if (input.permission_mode !== undefined && (typeof input.permission_mode !== 'string' || input.permission_mode.length === 0)) throw new CliError('INVALID_ARGUMENT', 'permission_mode must be a non-empty string', 2);
+  if (input.write_manifest !== undefined && (!Array.isArray(input.write_manifest) || input.write_manifest.some((value) => typeof value !== 'string' || value.length === 0))) throw new CliError('INVALID_ARGUMENT', 'write_manifest must contain non-empty strings', 2);
   return {
     schema: 'zcode-general-task/v1', agent_id: requestId(), repository: input.repository,
     permission_mode: input.permission_mode || 'build', prompt: input.prompt,
@@ -75,12 +76,33 @@ function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
     case 'agent-probe': return { method: 'agent_probe', params: { input } };
-    case 'create': case 'spawn': return { method: 'submit_general', params: { input: { agent: input.agent, model: input.model ?? null, manifest: manifest(input) } } };
+    case 'create': case 'spawn': return {
+      method: 'submit_general',
+      params: { input: {
+        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        manifest: manifest(input),
+      } },
+    };
     case 'wait': return { method: 'task_wait', params: { agent_id: daemonTaskId(input.agent_id), after_revision: input.after_revision ?? 0, wait_time: input.wait_time ?? 290, ...(input.message_id ? { message_id: input.message_id } : {}) } };
     case 'list': {
+      const allowed = new Set(['agent', 'repository', 'workspace', 'phase', 'outcome', 'cursor', 'limit']);
+      for (const key of Object.keys(input)) {
+        if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `list contains unsupported field: ${key}`, 2);
+      }
+      if (input.agent === null || (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0))) {
+        throw new CliError('INVALID_ARGUMENT', 'list agent must be omitted or a non-empty string', 2);
+      }
       const repository = input.repository ?? input.workspace;
       if (!repository) throw new CliError('INVALID_ARGUMENT', 'list requires repository or workspace scope', 2);
-      return { method: 'task_list', params: { repository, phase: input.phase ?? null, outcome: input.outcome ?? null, cursor: input.cursor ?? null, limit: input.limit ?? 100 } };
+      return { method: 'task_list', params: {
+        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        repository,
+        phase: input.phase ?? null,
+        outcome: input.outcome ?? null,
+        cursor: input.cursor ?? null,
+        limit: input.limit ?? 100,
+      } };
     }
     case 'send': return { method: 'task_message', params: { agent_id: daemonTaskId(input.agent_id), message_id: input.message_id || requestId(), mode: input.mode || 'queue', content: input.content } };
     case 'respond': return { method: 'task_respond', params: { agent_id: daemonTaskId(input.agent_id), request_id: input.request_id, decision: input.decision, content: input.reason ?? input.content ?? null } };
@@ -93,6 +115,7 @@ function methodFor(command, input) {
 }
 
 function publicTask(task) {
+  const admission = task.input_identity?.admission;
   return {
     agent_id: publicTaskId(task.agent_id),
     session_id: task.session_id ?? null,
@@ -104,6 +127,15 @@ function publicTask(task) {
     close_requested: task.close_requested,
     closed: task.closed,
     resources_reaped: task.reaped,
+    input_identity: task.input_identity ? {
+      agent: admission?.agent ?? null,
+      config_revision: admission?.config_revision ?? null,
+      adapter_version: admission?.adapter_version ?? null,
+      model: admission?.model ?? null,
+      model_source: admission?.model_source ?? null,
+      workspace_path: task.input_identity.workspace_path ?? null,
+      permission_mode: task.input_identity.permission_mode ?? null,
+    } : null,
   };
 }
 
@@ -143,7 +175,7 @@ export function projectDaemonResult(command, result) {
 
 export function callDaemon(socketPath, command, input, timeoutMs) {
   const { method, params } = methodFor(command, input);
-  const effectiveTimeoutMs = timeoutMs ?? (command === 'wait' ? waitTransportTimeoutMs(params.wait_time) : 6000);
+  const effectiveTimeoutMs = timeoutMs ?? daemonTransportTimeoutMs(command, params);
   const request_id = requestId();
   const request = JSON.stringify({ version: RPC_VERSION, request_id, method, params }) + '\n';
   if (Buffer.byteLength(request, 'utf8') > MAX_FRAME_BYTES) {
