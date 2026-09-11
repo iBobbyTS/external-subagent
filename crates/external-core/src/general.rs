@@ -260,7 +260,7 @@ fn allocate_submission(
     repository: &Path,
     manifest_agent_id: &str,
 ) -> PreparationResult<(String, PathBuf)> {
-    let parent = std::env::temp_dir().join("zcode-as-subagent");
+    let parent = std::env::temp_dir().join("external-subagent");
     fs::create_dir_all(&parent)?;
     for _ in 0..32 {
         let nonce = SUBMISSION_NONCE.fetch_add(1, Ordering::Relaxed);
