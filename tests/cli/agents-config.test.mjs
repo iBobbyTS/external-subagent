@@ -7,7 +7,7 @@ import { agentsCommand } from '../../cli/commands/agents.mjs';
 import { parseAgentsArgs } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
-import { prepareSpawnInput } from '../../cli/commands/tasks.mjs';
+import { parseSpawnArgs, prepareSpawnInput } from '../../cli/commands/tasks.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 function fixture() { const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-')); return { home, paths: productPaths(home) }; }
@@ -128,4 +128,20 @@ test('explicit null spawn selection is rejected while omitted route fields stay 
   const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
   assert.equal(Object.hasOwn(omitted, 'agent'), false);
   assert.equal(Object.hasOwn(omitted, 'model'), false);
+});
+
+test('spawn flags build the shared DTO and reject malformed values', () => {
+  assert.deepEqual(parseSpawnArgs([
+    '--agent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build',
+    '--model', 'catalog-token', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
+  ]), {
+    agent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
+    model: 'catalog-token', write_manifest: ['src/**', 'tests/**'],
+  });
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo']), /--prompt is required/u);
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt']), /requires a non-null value/u);
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'null']), /requires a non-null value/u);
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--agent', 'null']), /requires a non-null value/u);
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--unknown', 'x']), /unsupported spawn option/u);
+  assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--repository', '/other', '--prompt', 'hi']), /only once/u);
 });
