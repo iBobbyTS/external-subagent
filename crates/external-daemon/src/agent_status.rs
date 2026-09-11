@@ -492,15 +492,19 @@ fn request_with_runtime_preferences(
         let _ = sender.send(pending.wait(budget));
     });
     loop {
+        drain_probe_events(&driver, events)?;
         if let Some(ProbeTerminal::Failed(reason)) = events.terminal.as_ref() {
             return Err(reason.clone());
         }
         match receiver.try_recv() {
             Ok(result) => {
+                if result.is_err() {
+                    drain_probe_events(&driver, events)?;
+                }
                 return result.map_err(|error| {
                     let fallback = classify_request_error(&error, &driver.diagnostic_tail());
                     events.failure_reason_or(fallback)
-                })
+                });
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(events.failure_reason_or("transport".into()))
@@ -537,6 +541,43 @@ fn request_with_runtime_preferences(
             Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
+        }
+    }
+}
+
+fn drain_probe_events(driver: &Driver, events: &mut ProbeEventCache) -> Result<(), String> {
+    loop {
+        match driver.recv_timeout(Duration::ZERO) {
+            Ok(Inbound::Message(WireMessage::Request(request)))
+                if request.method == SESSION_REQUEST_RUNTIME_PREFERENCES =>
+            {
+                driver
+                    .respond(
+                        request.id,
+                        serde_json::to_value(RuntimePreferences::default())
+                            .map_err(|_| "transport".to_owned())?,
+                    )
+                    .map_err(|_| "transport".to_owned())?;
+            }
+            Ok(Inbound::Message(WireMessage::Request(request))) => {
+                if request.method == INTERACTION_REQUEST_PERMISSION {
+                    let _ = driver.respond_error(
+                        request.id,
+                        serde_json::json!({"code":-32003,"message":"probe policy forbids tools"}),
+                    );
+                    return Err("policy_violation".into());
+                }
+                let _ = driver.respond_error(
+                    request.id,
+                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
+                );
+                return Err("transport".into());
+            }
+            Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(events.failure_reason_or("transport".into()))
+            }
         }
     }
 }
@@ -874,9 +915,9 @@ process.stdin.on('data', (chunk) => {
       const ended = { method: 'session/event', params: { eventId: 'end', sessionId: 'probe-session', seq: 3, timestamp: 3, type: terminal, payload: failure } };
       if (terminalBeforeResponse) {
         write(started); if (emitTool) write(tool); write(ended);
-        if (afterTerminal === 'rpc_error') setTimeout(() => write({ id: value.id, error: { code: -32000, message: 'generic transport error' } }), 25);
-        else if (afterTerminal === 'exit') setTimeout(() => process.exit(7), 25);
-        else setTimeout(() => write(response), 25);
+        if (afterTerminal === 'rpc_error') setTimeout(() => write({ id: value.id, error: { code: -32000, message: 'generic transport error' } }), 0);
+        else if (afterTerminal === 'exit') setTimeout(() => process.exit(7), 0);
+        else setTimeout(() => write(response), 0);
       } else {
         write(response); write(started); if (emitTool) write(tool); write(ended);
       }
