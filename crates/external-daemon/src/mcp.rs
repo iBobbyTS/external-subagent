@@ -461,6 +461,13 @@ mod server {
         Yolo,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PublicAgent {
+        Zcode,
+        Dsh,
+    }
+
     impl Default for PublicPermissionMode {
         fn default() -> Self {
             Self::Build
@@ -829,6 +836,8 @@ mod server {
     #[serde(deny_unknown_fields)]
     #[schemars(deny_unknown_fields)]
     pub struct AgentSpawnInput {
+        #[serde(default)]
+        pub agent: Option<PublicAgent>,
         pub repository: String,
         #[serde(default)]
         pub permission_mode: PublicPermissionMode,
@@ -1456,6 +1465,21 @@ mod server {
     }
 
     fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, ToolError> {
+        match input.agent {
+            None => return Err(ToolError::new(
+                "agent_required",
+                "agent is required; choose zcode",
+                "agent_required: agent is required; choose zcode",
+                "facade",
+            )),
+            Some(PublicAgent::Dsh) => return Err(ToolError::new(
+                "agent_unsupported",
+                "agent dsh is unsupported",
+                "agent_unsupported: agent dsh is unsupported (prompt_count=0)",
+                "facade",
+            )),
+            Some(PublicAgent::Zcode) => {}
+        }
         for (field, value, max) in [
             ("repository", input.repository.as_str(), MAX_PATH_BYTES),
             ("prompt", input.prompt.as_str(), MAX_PROMPT_BYTES),
@@ -1569,7 +1593,7 @@ mod server {
         #[tool(
         name = "external_subagent_spawn",
         output_schema = tool_output_schema::<AgentSpawnOutput>(),
-        description = "Start one durable Agent in an absolute repository workspace. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
+        description = "Start one durable ZCode Agent in an absolute repository workspace. The agent field is required and must be zcode; dsh is explicitly unsupported until its adapter is accepted. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2249,6 +2273,32 @@ mod server {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 1
             );
+        }
+
+        #[test]
+        fn spawn_agent_contract_is_explicit_and_fail_closed() {
+            let base = serde_json::json!({
+                "repository": "/tmp/repository",
+                "prompt": "test"
+            });
+            let omitted: AgentSpawnInput = serde_json::from_value(base.clone()).unwrap();
+            let error = general_manifest(&omitted).unwrap_err();
+            assert_eq!(error.body.code, "agent_required");
+
+            let dsh: AgentSpawnInput = serde_json::from_value(
+                serde_json::json!({"agent":"dsh","repository":"/tmp/repository","prompt":"test"}),
+            ).unwrap();
+            let error = general_manifest(&dsh).unwrap_err();
+            assert_eq!(error.body.code, "agent_unsupported");
+            assert!(error.legacy_text.contains("prompt_count=0"));
+
+            let zcode: AgentSpawnInput = serde_json::from_value(
+                serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test"}),
+            ).unwrap();
+            assert!(general_manifest(&zcode).is_ok());
+            assert!(serde_json::from_value::<AgentSpawnInput>(
+                serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test","extra":true})
+            ).is_err());
         }
 
         #[test]

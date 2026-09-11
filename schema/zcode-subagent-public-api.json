@@ -13,8 +13,9 @@
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
     "spawn": {
       "type": "object",
-      "required": ["repository", "prompt"],
+      "required": ["agent", "repository", "prompt"],
       "properties": {
+        "agent": { "enum": ["zcode", "dsh"] },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode" },
         "prompt": { "type": "string", "minLength": 1 },
