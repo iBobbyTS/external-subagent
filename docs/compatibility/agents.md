@@ -30,4 +30,6 @@ For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, bu
 
 `agent_models` is a separate explicit operation. For DSH it starts only the configured `DSH_RUNTIME_PATH`, uses the bounded S01 JSON-RPC sequence `initialize` → `session/new` → `models/list`, then terminates the process. The result records source `dsh_acp_models_list`, executable version, exact workspace/home scope, check time, and at most 256 opaque model tokens. Tokens are deduplicated by exact string equality; the daemon does not split, normalize, infer, or validate provider-specific token syntax. This discovery operation never changes `spawn_supported`.
 
+The catalog process runs in its own process group. Every success, protocol error, oversized frame, and deadline path sends TERM and then KILL to that group and waits for the leader, so descendants cannot retain protocol or diagnostic pipes. Stdout is parsed incrementally with a hard 1 MiB frame limit; an unterminated frame is rejected as soon as byte 1 MiB+1 arrives. Stderr collection is capped at 64 KiB and observed through a bounded channel rather than an unbounded reader-thread join.
+
 ZCode model selection remains native. `agent_models` returns an empty catalog with `supported=false`, source `zcode_native_model`, and reason `native_only`; it does not start the ZCode runtime.
