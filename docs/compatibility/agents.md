@@ -12,7 +12,10 @@ The stable failure reasons are:
 - `auth_401`: the provider rejected the production route as unauthorized.
 - `network`: the production route timed out or reported a network failure.
 - `rate_limit`: the provider reported a rate limit; this is degraded evidence rather than valid authentication.
+- `policy_violation`: the probe runtime emitted a tool or permission request despite the read-only probe policy.
 
-For ZCode, a `local` probe establishes executable/version evidence only. An `auth` probe remains `UNKNOWN` with `auth_requires_hi`, because the pinned runtime does not expose an independent credential check. A `hi` probe uses the same app-server session route as production, sends the bounded prompt `Reply with exactly hi.`, and records auth/hi evidence from that run.
+For ZCode, a `local` probe establishes executable/version evidence only. An `auth` probe remains `UNKNOWN` with `auth_requires_hi`, because the pinned runtime does not expose an independent credential check. A `hi` probe uses the same app-server protocol as production with an explicit `plan` session mode, an empty write manifest, and the daemon policy environment bound to the probe workspace. The bounded prompt also tells the model not to call tools. Any tool lifecycle or permission request fails the probe rather than being approved.
+
+Auth is not promoted when the turn merely starts. Both auth and hi become `READY` only after the terminal `turn.completed` event. A terminal failure, child exit, or diagnostic tail is classified after settlement, so asynchronous 401, rate-limit, and network failures update both layers. If the caller omits workspace for a hi probe, the daemon creates a mode-0700 disposable workspace, records that generated absolute path as the evidence scope, and removes the directory after the probe. Evidence from that disposable path cannot be reused for another workspace.
 
 For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, but this release has no accepted production adapter. Auth and hi remain `UNKNOWN` with `dsh_production_adapter_unavailable`, and `spawn_supported` is always `false`. The S01 fixture is protocol evidence only and is never promoted to live auth or hi evidence.
