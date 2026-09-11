@@ -1621,6 +1621,31 @@ pub(crate) mod wait_tests {
         assert_eq!(before, service.store.get_task(&id).unwrap());
     }
 
+    #[test]
+    fn assembled_service_queues_message_and_exposes_receipt() {
+        let (_directory, service, id) = fixture();
+        let response = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: "assembled-message".into(),
+                mode: "queue".into(),
+                content: "continue with the requested work".into(),
+            }))
+            .unwrap();
+        let RpcSuccess::Message { disposition, .. } = response else {
+            panic!("expected message response");
+        };
+        assert_eq!(disposition, MessageDispositionView::Queued);
+        let receipt = service
+            .store
+            .message("assembled-message")
+            .unwrap()
+            .expect("queued message receipt");
+        assert_eq!(receipt.message_id, "assembled-message");
+        assert_eq!(receipt.mode, "queue");
+        assert_eq!(receipt.content, "continue with the requested work");
+    }
+
     #[cfg(unix)]
     #[test]
     fn wait_socket_disconnect_and_shutdown_release_workers_without_task_mutation() {
