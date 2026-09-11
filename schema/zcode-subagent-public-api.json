@@ -97,7 +97,8 @@
             "operation": { "type": "string", "minLength": 1 },
             "request_id": { "type": "string", "minLength": 1 },
             "agent_id": { "type": "integer", "minimum": 10000000, "maximum": 99999999 },
-            "cleanup": { "type": "string", "minLength": 1 }
+            "cleanup": { "type": "string", "minLength": 1 },
+            "prompt_count": { "type": "integer", "minimum": 0 }
           },
           "additionalProperties": false
         }
