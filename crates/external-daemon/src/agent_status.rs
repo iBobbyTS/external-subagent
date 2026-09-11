@@ -697,11 +697,14 @@ fn executable_version(path: &Path) -> Result<String, String> {
             }
         }
     };
-    // The leader is reaped above. Do not wait for pipe EOF: a descendant may
-    // have inherited the descriptors. Drain only already-delivered chunks.
-    let _ = drain_version_stream(&stdout_rx, &mut stdout_bytes);
-    let _ = drain_version_stream(&stderr_rx, &mut stderr_bytes);
     cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+    finish_version_streams(
+        &stdout_rx,
+        &stderr_rx,
+        &mut stdout_bytes,
+        &mut stderr_bytes,
+        Instant::now() + Duration::from_millis(250),
+    )?;
     if !status.success() {
         return Err("version".into());
     }
@@ -717,6 +720,44 @@ fn executable_version(path: &Path) -> Result<String, String> {
         .map(str::to_owned)
         .or_else(|| package_version(path))
         .ok_or_else(|| "version".into())
+}
+
+fn finish_version_streams(
+    stdout: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    stderr: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    stdout_bytes: &mut Vec<u8>,
+    stderr_bytes: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut stdout_closed = false;
+    let mut stderr_closed = false;
+    while !(stdout_closed && stderr_closed) && Instant::now() < deadline {
+        stdout_closed |= drain_version_stream_until_empty(stdout, stdout_bytes)?;
+        stderr_closed |= drain_version_stream_until_empty(stderr, stderr_bytes)?;
+        if !(stdout_closed && stderr_closed) {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    Ok(())
+}
+
+fn drain_version_stream_until_empty(
+    receiver: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    output: &mut Vec<u8>,
+) -> Result<bool, String> {
+    loop {
+        match receiver.try_recv() {
+            Ok(Ok(chunk)) => {
+                if output.len().saturating_add(chunk.len()) > VERSION_STREAM_CAP {
+                    return Err("oversized".into());
+                }
+                output.extend_from_slice(&chunk);
+            }
+            Ok(Err(reason)) => return Err(reason),
+            Err(mpsc::TryRecvError::Disconnected) => return Ok(true),
+            Err(mpsc::TryRecvError::Empty) => return Ok(false),
+        }
+    }
 }
 
 fn read_version_stream(mut stream: impl Read, sender: mpsc::Sender<Result<Vec<u8>, String>>) {
