@@ -34,6 +34,9 @@ use external_contract::{
 pub mod mcp;
 pub mod observation;
 pub mod rpc;
+mod scheduler;
+pub use scheduler::{SchedulerConfig, SchedulerError};
+use scheduler::ControlDeadline;
 use external_core::{
     general_launch_prompt, CompletionOutcome, GeneralCompletion, GeneralFinalizer,
     GeneralTaskManifest, GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask,
@@ -2211,8 +2214,8 @@ fn general_initial_prompt(prepared: &PreparedGeneralTask) -> Result<String, Sche
         .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SchedulerConfig {
+/* scheduler configuration and error ownership lives in scheduler.rs */
+/*
     pub global_max_agents: usize,
     pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
@@ -2305,6 +2308,7 @@ impl From<StoreError> for SchedulerError {
         Self::Store(value)
     }
 }
+*/
 
 #[derive(Clone)]
 pub struct Scheduler {
