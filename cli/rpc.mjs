@@ -49,6 +49,19 @@ function readJsonInput(args) {
 function requestId() { return `cli-${process.pid}-${crypto.randomUUID()}`; }
 
 function manifest(input) {
+  const allowed = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'write_manifest']);
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
+  }
+  if (input.agent === undefined) throw new CliError('AGENT_REQUIRED', 'agent is required; choose zcode', 2);
+  if (input.agent !== 'zcode' && input.agent !== 'dsh') {
+    throw new CliError('INVALID_ARGUMENT', 'agent must be one of: zcode, dsh', 2);
+  }
+  if (input.agent === 'dsh') {
+    const error = new CliError('AGENT_UNSUPPORTED', 'agent dsh is unsupported; prompt_count=0', 2);
+    error.promptCount = 0;
+    throw error;
+  }
   if (!input.repository || !input.prompt) throw new CliError('INVALID_ARGUMENT', 'create requires repository and prompt', 2);
   return {
     schema: 'zcode-general-task/v1', agent_id: requestId(), repository: input.repository,
