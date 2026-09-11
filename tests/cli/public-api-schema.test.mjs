@@ -31,7 +31,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'tools', 'reasoning', 'coverage',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_status.output, [
-    'components', 'capabilities', 'identity',
+    'components', 'capabilities', 'agents', 'identity',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.output, [
     'task', 'revision', 'next_revision', 'pending_requests', 'command_pending_approval',

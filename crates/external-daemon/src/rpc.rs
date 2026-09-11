@@ -1,4 +1,8 @@
 use crate::{
+    agent_status::{
+        AgentEvidenceStore, AgentProbeEvidence, AgentProbeInput, EvidenceState, ProbeScope,
+        ScopeEvidence,
+    },
     observation::{ObservationCoverage, ObservedReasoning, ObservedTool, OBSERVATION_SCHEMA},
     MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
     ResponseDisposition, Scheduler, SchedulerError,
@@ -61,6 +65,9 @@ pub struct RpcRequest {
 #[allow(clippy::large_enum_variant)]
 pub enum RpcMethod {
     SystemStatus,
+    AgentProbe {
+        input: AgentProbeInput,
+    },
     SubmitGeneral {
         input: GeneralSubmitInput,
     },
@@ -91,6 +98,7 @@ impl RpcMethod {
         matches!(
             name,
             "system_status"
+                | "agent_probe"
                 | "submit_general"
                 | "task_list"
                 | "task_wait"
@@ -268,6 +276,10 @@ pub enum RpcSuccess {
     SystemStatus {
         status: SystemStatusView,
     },
+    AgentProbed {
+        evidence: AgentProbeEvidence,
+        status: AgentStatusView,
+    },
     GeneralSubmitted {
         task: TaskView,
         disposition: SubmissionDispositionView,
@@ -427,11 +439,14 @@ impl Default for AgentConfigSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentScopeStatusView {
-    pub status: ComponentStateView,
+    pub state: ComponentStateView,
+    pub scope: ProbeScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -756,6 +771,7 @@ pub struct RpcService {
     store: Arc<Store>,
     service_generation: String,
     daemon_identity: ComponentIdentityView,
+    agent_evidence: AgentEvidenceStore,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -780,10 +796,26 @@ impl RpcService {
         store: Arc<Store>,
         service_generation: String,
     ) -> Result<Self, RpcServiceConfigError> {
+        let evidence = AgentEvidenceStore::new(scheduler.configured_runtime_source());
+        Self::new_with_service_generation_and_evidence(
+            scheduler,
+            store,
+            service_generation,
+            evidence,
+        )
+    }
+
+    fn new_with_service_generation_and_evidence(
+        scheduler: Scheduler,
+        store: Arc<Store>,
+        service_generation: String,
+        agent_evidence: AgentEvidenceStore,
+    ) -> Result<Self, RpcServiceConfigError> {
         if !Arc::ptr_eq(&scheduler.store(), &store) {
             return Err(RpcServiceConfigError::MismatchedStore);
         }
         Ok(Self {
+            agent_evidence,
             scheduler,
             store,
             service_generation,
@@ -884,6 +916,16 @@ impl RpcService {
             RpcMethod::SystemStatus => Ok(RpcSuccess::SystemStatus {
                 status: self.system_status(),
             }),
+            RpcMethod::AgentProbe { input } => {
+                validate_agent_probe_input(&input)?;
+                let evidence = self.agent_evidence.probe(&input);
+                let config = read_agent_config_snapshot()?;
+                let status = configured_agent_statuses(&config, &self.agent_evidence)
+                    .into_iter()
+                    .find(|status| status.agent == input.agent)
+                    .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
+                Ok(RpcSuccess::AgentProbed { evidence, status })
+            }
             RpcMethod::SubmitGeneral { input } => {
                 let config = read_agent_config_snapshot()?;
                 let admission = resolve_admission(&input, &config)?;
@@ -1114,7 +1156,9 @@ impl RpcService {
             service_generation: self.service_generation.clone(),
             components,
             capabilities: agent_capabilities(self.scheduler.runtime_source_verified()),
-            agents: configured_agent_statuses(self.scheduler.configured_runtime_source()),
+            agents: read_agent_config_snapshot()
+                .map(|config| configured_agent_statuses(&config, &self.agent_evidence))
+                .unwrap_or_else(|_| unavailable_agent_statuses()),
             identity: Some(DaemonIdentityView {
                 daemon: self.daemon_identity.clone(),
                 runtime: configured_runtime_identity(self.scheduler.configured_runtime_source()),
@@ -1240,70 +1284,99 @@ impl RpcService {
     }
 }
 
-fn configured_agent_statuses(runtime_path: Option<PathBuf>) -> Vec<AgentStatusView> {
-    // Status is deliberately side-effect free: it reports configuration and
-    // preserves auth/hi as unknown until an explicitly authorized probe has
-    // produced scoped evidence.
-    let zcode_local = runtime_path
-        .as_ref()
-        .filter(|path| path.is_file())
-        .map(|_path| AgentScopeStatusView {
-            status: ComponentStateView::Ready,
-            version: None,
-            checked_at_ms: Some(wall_now_millis()),
+fn configured_agent_statuses(
+    config: &AgentConfigSnapshot,
+    evidence: &AgentEvidenceStore,
+) -> Vec<AgentStatusView> {
+    ["zcode", "dsh"]
+        .into_iter()
+        .map(|agent| {
+            let entry = &config.agents[agent];
+            let observed = evidence.latest(agent);
+            AgentStatusView {
+                agent: agent.into(),
+                config_revision: config.revision,
+                enabled: entry.enabled,
+                spawn_supported: agent == "zcode" && entry.spawn_supported,
+                local: observed
+                    .as_ref()
+                    .map(|evidence| scope_status_view(&evidence.local))
+                    .unwrap_or_else(unprobed_scope),
+                auth: observed
+                    .as_ref()
+                    .map(|evidence| scope_status_view(&evidence.auth))
+                    .unwrap_or_else(unprobed_scope),
+                hi: observed
+                    .as_ref()
+                    .map(|evidence| scope_status_view(&evidence.hi))
+                    .unwrap_or_else(unprobed_scope),
+            }
         })
-        .unwrap_or(AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        });
-    let config = read_agent_config_snapshot().unwrap_or_else(|_| {
-        let mut snapshot = AgentConfigSnapshot::default();
-        for entry in snapshot.agents.values_mut() {
-            entry.enabled = false;
-            entry.spawn_supported = false;
+        .collect()
+}
+
+fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
+    ["zcode", "dsh"]
+        .into_iter()
+        .map(|agent| AgentStatusView {
+            agent: agent.into(),
+            config_revision: 0,
+            enabled: false,
+            spawn_supported: false,
+            local: unprobed_scope(),
+            auth: unprobed_scope(),
+            hi: unprobed_scope(),
+        })
+        .collect()
+}
+
+fn unprobed_scope() -> AgentScopeStatusView {
+    AgentScopeStatusView {
+        state: ComponentStateView::Unknown,
+        scope: ProbeScope::default(),
+        version: None,
+        checked_at_ms: None,
+        reason: Some("not_probed".into()),
+    }
+}
+
+fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
+    AgentScopeStatusView {
+        state: match value.state {
+            EvidenceState::Ready => ComponentStateView::Ready,
+            EvidenceState::Degraded => ComponentStateView::Degraded,
+            EvidenceState::Unavailable => ComponentStateView::Unavailable,
+            EvidenceState::Unknown => ComponentStateView::Unknown,
+        },
+        scope: value.scope.clone(),
+        version: value.version.clone(),
+        checked_at_ms: Some(value.checked_at_ms),
+        reason: value.reason.clone(),
+    }
+}
+
+fn validate_agent_probe_input(input: &AgentProbeInput) -> Result<(), RpcError> {
+    if !matches!(input.agent.as_str(), "zcode" | "dsh") {
+        return Err(RpcError::new(
+            RpcErrorCode::AgentUnknown,
+            "agent is unknown",
+        ));
+    }
+    for (name, value) in [
+        ("workspace", input.scope.workspace.as_deref()),
+        ("home", input.scope.home.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_text(value, name, 4096)?;
+            if !Path::new(value).is_absolute() {
+                return Err(RpcError::new(
+                    RpcErrorCode::Validation,
+                    format!("{name} must be absolute"),
+                ));
+            }
         }
-        snapshot
-    });
-    let zcode = AgentStatusView {
-        agent: "zcode".into(),
-        config_revision: config.revision,
-        enabled: config.agents["zcode"].enabled,
-        spawn_supported: config.agents["zcode"].spawn_supported,
-        local: zcode_local,
-        auth: AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        },
-        hi: AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        },
-    };
-    let dsh = AgentStatusView {
-        agent: "dsh".into(),
-        config_revision: config.revision,
-        enabled: config.agents["dsh"].enabled,
-        spawn_supported: false,
-        local: AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        },
-        auth: AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        },
-        hi: AgentScopeStatusView {
-            status: ComponentStateView::Unknown,
-            version: None,
-            checked_at_ms: None,
-        },
-    };
-    vec![zcode, dsh]
+    }
+    Ok(())
 }
 
 fn resolve_admission(
@@ -1425,13 +1498,6 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
         .expect("dsh default inserted")
         .spawn_supported = false;
     Ok(snapshot)
-}
-
-fn wall_now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
 }
 
 fn respondable_pending_request(request: &PendingRequestView) -> bool {
@@ -2940,5 +3006,129 @@ mod admission_tests {
             panic!()
         };
         assert!(tasks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod agent_probe_tests {
+    use super::*;
+    use crate::{agent_status::AgentProbeBackend, CommandRuntimeFactory, SchedulerConfig};
+    use std::process::Command;
+
+    struct FixtureProbe;
+
+    impl AgentProbeBackend for FixtureProbe {
+        fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
+            let ready = ScopeEvidence {
+                state: EvidenceState::Ready,
+                scope: input.scope.clone(),
+                version: Some("3.8.1".into()),
+                checked_at_ms: 123,
+                reason: None,
+            };
+            AgentProbeEvidence {
+                agent: input.agent.clone(),
+                local: ready.clone(),
+                auth: ready.clone(),
+                hi: ready,
+            }
+        }
+    }
+
+    fn service() -> (tempfile::TempDir, RpcService) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let factory = CommandRuntimeFactory::new(|_: &TaskRecord| -> std::io::Result<Command> {
+            panic!("probe fixture must use its dedicated backend")
+        });
+        let scheduler = Scheduler::new(
+            "agent-probe-test",
+            store.clone(),
+            Arc::new(factory),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let evidence = AgentEvidenceStore::with_backend(Arc::new(FixtureProbe));
+        let service = RpcService::new_with_service_generation_and_evidence(
+            scheduler,
+            store,
+            "probe-generation".into(),
+            evidence,
+        )
+        .unwrap();
+        (directory, service)
+    }
+
+    #[test]
+    fn status_is_passive_and_explicit_probe_records_scoped_evidence() {
+        let (_directory, service) = service();
+        let RpcSuccess::SystemStatus { status } =
+            service.dispatch(RpcMethod::SystemStatus).unwrap()
+        else {
+            panic!("expected status")
+        };
+        assert_eq!(status.agents[0].local.state, ComponentStateView::Unknown);
+        assert_eq!(status.agents[0].local.reason.as_deref(), Some("not_probed"));
+
+        let scope = ProbeScope {
+            workspace: Some("/workspace-a".into()),
+            home: Some("/home-a".into()),
+        };
+        let RpcSuccess::AgentProbed { evidence, status } = service
+            .dispatch(RpcMethod::AgentProbe {
+                input: AgentProbeInput {
+                    agent: "zcode".into(),
+                    through: crate::agent_status::ProbeLayer::Hi,
+                    scope: scope.clone(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("expected probe")
+        };
+        assert_eq!(evidence.hi.scope, scope);
+        assert_eq!(status.hi.state, ComponentStateView::Ready);
+        assert_eq!(status.hi.checked_at_ms, Some(123));
+
+        let RpcSuccess::SystemStatus { status } =
+            service.dispatch(RpcMethod::SystemStatus).unwrap()
+        else {
+            panic!("expected status")
+        };
+        let zcode = status
+            .agents
+            .iter()
+            .find(|status| status.agent == "zcode")
+            .unwrap();
+        assert_eq!(zcode.hi.scope.workspace.as_deref(), Some("/workspace-a"));
+        let dsh = status
+            .agents
+            .iter()
+            .find(|status| status.agent == "dsh")
+            .unwrap();
+        assert!(!dsh.spawn_supported);
+        assert_eq!(dsh.hi.state, ComponentStateView::Unknown);
+    }
+
+    #[test]
+    fn probe_rejects_unknown_agent_and_relative_scopes_before_execution() {
+        let (_directory, service) = service();
+        for input in [
+            AgentProbeInput {
+                agent: "other".into(),
+                through: crate::agent_status::ProbeLayer::Local,
+                scope: ProbeScope::default(),
+            },
+            AgentProbeInput {
+                agent: "zcode".into(),
+                through: crate::agent_status::ProbeLayer::Hi,
+                scope: ProbeScope {
+                    workspace: Some("relative".into()),
+                    home: None,
+                },
+            },
+        ] {
+            assert!(service.dispatch(RpcMethod::AgentProbe { input }).is_err());
+        }
     }
 }

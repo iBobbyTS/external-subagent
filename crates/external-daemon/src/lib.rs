@@ -31,6 +31,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub mod agent_status;
 pub mod mcp;
 pub mod observation;
 pub mod rpc;
