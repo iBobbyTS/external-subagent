@@ -112,7 +112,15 @@ test('human config and agents forms execute instead of falling through to JSON d
   assert.equal(JSON.parse(unsupported.stderr).error.code, 'agent_operation_unsupported');
   const status = {
     service_generation: 'generation-cli',
-    agents: [{ agent: 'zcode', enabled: true, spawn_supported: true, local: { status: 'ready', version: '1.0.0', checked_at_ms: 10 }, auth: { status: 'unknown' }, hi: { status: 'unknown' } }],
+    agents: [{
+      agent: 'zcode', config_revision: 1, configured: true, enabled: true, spawn_supported: true,
+      transport_support: { transport: 'zcode_app_server', probe: true, spawn: true },
+      permission_modes: ['build', 'edit', 'plan', 'yolo'],
+      model_selection: { supported: false, mode: 'native_only' },
+      local: { state: 'READY', version: '1.0.0', checked_at_ms: 10, scope: {} },
+      auth: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
+      hi: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
+    }],
   };
   const fixture = await withServer(socket, () => ({ outcome: 'success', result: { kind: 'system_status', status } }),
     () => runCli(home, socket, ['agents', 'status', 'zcode']));

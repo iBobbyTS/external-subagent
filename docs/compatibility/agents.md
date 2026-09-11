@@ -2,7 +2,11 @@
 
 Agent status is a passive projection of configuration plus the latest evidence produced by an explicit probe. Reading `system_status` does not inspect an executable, start a provider, authenticate, or send a prompt. An agent with no explicit probe therefore reports `UNKNOWN`, `checked_at_ms` omitted, and reason `not_probed` for `local`, `auth`, and `hi`.
 
+Every per-agent status entry also exposes the current configuration revision and capability identity. `configured` says that the provider has a configuration entry; `transport_support` names the wire protocol and separately states whether probe and production spawn are available; `permission_modes` lists the modes currently admitted for spawn; and `model_selection` distinguishes native-only model choice from opaque catalog-token selection. ZCode reports `zcode_app_server`, all four permission modes, and `{supported:false,mode:"native_only"}`. DSH reports `dsh_acp` with probe support, no currently admitted spawn permission modes, and `{supported:false,mode:"catalog_token"}`; its model selection, production `spawn`, and top-level `spawn_supported` remain gated until S04 accepts the adapter.
+
 The daemon RPC method `agent_probe` accepts an agent (`zcode` or `dsh`), a `through` layer (`local`, `auth`, or `hi`), and an exact scope containing optional absolute `workspace` and `home` paths. Each returned layer contains `state`, the exact `scope`, `version`, `checked_at_ms`, and `reason`. Scoped evidence remains attached to the workspace/home that produced it; callers must not treat it as evidence for another workspace or home.
+
+Probe evidence records the configuration revision read immediately before probe execution. Status only projects it as current when that revision still matches the active configuration. After any configuration revision change, the old layers become `UNKNOWN` with reason `stale_config_revision` until the caller explicitly probes again.
 
 The stable failure reasons are:
 

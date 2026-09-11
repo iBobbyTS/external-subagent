@@ -385,11 +385,51 @@ pub struct SystemStatusView {
 pub struct AgentStatusView {
     pub agent: String,
     pub config_revision: u64,
+    pub configured: bool,
     pub enabled: bool,
     pub spawn_supported: bool,
+    pub transport_support: AgentTransportSupportView,
+    pub permission_modes: Vec<AgentPermissionModeView>,
+    pub model_selection: AgentModelSelectionCapabilityView,
     pub local: AgentScopeStatusView,
     pub auth: AgentScopeStatusView,
     pub hi: AgentScopeStatusView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTransportView {
+    ZcodeAppServer,
+    DshAcp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTransportSupportView {
+    pub transport: AgentTransportView,
+    pub probe: bool,
+    pub spawn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPermissionModeView {
+    Build,
+    Edit,
+    Plan,
+    Yolo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentModelSelectionModeView {
+    NativeOnly,
+    CatalogToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelSelectionCapabilityView {
+    pub supported: bool,
+    pub mode: AgentModelSelectionModeView,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -918,8 +958,8 @@ impl RpcService {
             }),
             RpcMethod::AgentProbe { input } => {
                 validate_agent_probe_input(&input)?;
-                let evidence = self.agent_evidence.probe(&input);
                 let config = read_agent_config_snapshot()?;
+                let evidence = self.agent_evidence.probe(&input, config.revision);
                 let status = configured_agent_statuses(&config, &self.agent_evidence)
                     .into_iter()
                     .find(|status| status.agent == input.agent)
@@ -1296,20 +1336,15 @@ fn configured_agent_statuses(
             AgentStatusView {
                 agent: agent.into(),
                 config_revision: config.revision,
+                configured: true,
                 enabled: entry.enabled,
                 spawn_supported: agent == "zcode" && entry.spawn_supported,
-                local: observed
-                    .as_ref()
-                    .map(|evidence| scope_status_view(&evidence.local))
-                    .unwrap_or_else(unprobed_scope),
-                auth: observed
-                    .as_ref()
-                    .map(|evidence| scope_status_view(&evidence.auth))
-                    .unwrap_or_else(unprobed_scope),
-                hi: observed
-                    .as_ref()
-                    .map(|evidence| scope_status_view(&evidence.hi))
-                    .unwrap_or_else(unprobed_scope),
+                transport_support: transport_support(agent, entry),
+                permission_modes: permission_modes(agent, entry),
+                model_selection: model_selection(agent, entry),
+                local: current_scope(&observed, config.revision, |evidence| &evidence.local),
+                auth: current_scope(&observed, config.revision, |evidence| &evidence.auth),
+                hi: current_scope(&observed, config.revision, |evidence| &evidence.hi),
             }
         })
         .collect()
@@ -1321,13 +1356,93 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
         .map(|agent| AgentStatusView {
             agent: agent.into(),
             config_revision: 0,
+            configured: false,
             enabled: false,
             spawn_supported: false,
+            transport_support: transport_support(
+                agent,
+                &AgentConfigEntry {
+                    enabled: false,
+                    spawn_supported: false,
+                    default_model: None,
+                },
+            ),
+            permission_modes: Vec::new(),
+            model_selection: model_selection(
+                agent,
+                &AgentConfigEntry {
+                    enabled: false,
+                    spawn_supported: false,
+                    default_model: None,
+                },
+            ),
             local: unprobed_scope(),
             auth: unprobed_scope(),
             hi: unprobed_scope(),
         })
         .collect()
+}
+
+fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {
+    AgentTransportSupportView {
+        transport: if agent == "zcode" {
+            AgentTransportView::ZcodeAppServer
+        } else {
+            AgentTransportView::DshAcp
+        },
+        probe: true,
+        spawn: agent == "zcode" && entry.spawn_supported,
+    }
+}
+
+fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
+    if agent != "zcode" || !entry.spawn_supported {
+        return Vec::new();
+    }
+    vec![
+        AgentPermissionModeView::Build,
+        AgentPermissionModeView::Edit,
+        AgentPermissionModeView::Plan,
+        AgentPermissionModeView::Yolo,
+    ]
+}
+
+fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelectionCapabilityView {
+    if agent == "zcode" {
+        AgentModelSelectionCapabilityView {
+            supported: false,
+            mode: AgentModelSelectionModeView::NativeOnly,
+        }
+    } else {
+        AgentModelSelectionCapabilityView {
+            supported: entry.spawn_supported,
+            mode: AgentModelSelectionModeView::CatalogToken,
+        }
+    }
+}
+
+fn current_scope(
+    evidence: &Option<AgentProbeEvidence>,
+    config_revision: u64,
+    select: impl FnOnce(&AgentProbeEvidence) -> &ScopeEvidence,
+) -> AgentScopeStatusView {
+    match evidence {
+        Some(evidence) if evidence.config_revision == config_revision => {
+            scope_status_view(select(evidence))
+        }
+        Some(evidence) => stale_scope(select(evidence)),
+        None => unprobed_scope(),
+    }
+}
+
+fn stale_scope(value: &ScopeEvidence) -> AgentScopeStatusView {
+    AgentScopeStatusView {
+        state: ComponentStateView::Unknown,
+        scope: value.scope.clone(),
+        version: value.version.clone(),
+        checked_at_ms: Some(value.checked_at_ms),
+        reason: Some("stale_config_revision".into()),
+    }
 }
 
 fn unprobed_scope() -> AgentScopeStatusView {
@@ -3028,6 +3143,7 @@ mod agent_probe_tests {
             };
             AgentProbeEvidence {
                 agent: input.agent.clone(),
+                config_revision: 0,
                 local: ready.clone(),
                 auth: ready.clone(),
                 hi: ready,
@@ -3087,6 +3203,7 @@ mod agent_probe_tests {
             panic!("expected probe")
         };
         assert_eq!(evidence.hi.scope, scope);
+        assert_eq!(evidence.config_revision, status.config_revision);
         assert_eq!(status.hi.state, ComponentStateView::Ready);
         assert_eq!(status.hi.checked_at_ms, Some(123));
 
@@ -3108,6 +3225,38 @@ mod agent_probe_tests {
             .unwrap();
         assert!(!dsh.spawn_supported);
         assert_eq!(dsh.hi.state, ComponentStateView::Unknown);
+        assert!(dsh.configured);
+        assert_eq!(dsh.transport_support.transport, AgentTransportView::DshAcp);
+        assert!(!dsh.transport_support.spawn);
+        assert!(dsh.permission_modes.is_empty());
+        assert_eq!(
+            dsh.model_selection.mode,
+            AgentModelSelectionModeView::CatalogToken
+        );
+        assert!(!dsh.model_selection.supported);
+    }
+
+    #[test]
+    fn config_revision_change_marks_previous_probe_evidence_stale() {
+        let (_directory, service) = service();
+        let input = AgentProbeInput {
+            agent: "zcode".into(),
+            through: crate::agent_status::ProbeLayer::Hi,
+            scope: ProbeScope::default(),
+        };
+        let evidence = service.agent_evidence.probe(&input, 7);
+        assert_eq!(evidence.config_revision, 7);
+        let mut config = AgentConfigSnapshot::default();
+        config.revision = 8;
+        let status = configured_agent_statuses(&config, &service.agent_evidence)
+            .into_iter()
+            .find(|status| status.agent == "zcode")
+            .unwrap();
+        assert_eq!(status.config_revision, 8);
+        for layer in [&status.local, &status.auth, &status.hi] {
+            assert_eq!(layer.state, ComponentStateView::Unknown);
+            assert_eq!(layer.reason.as_deref(), Some("stale_config_revision"));
+        }
     }
 
     #[test]

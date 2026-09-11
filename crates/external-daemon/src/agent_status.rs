@@ -89,6 +89,9 @@ impl ScopeEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProbeEvidence {
     pub agent: String,
+    /// Configuration identity used when this probe was admitted. Evidence is
+    /// only current while the daemon projects the same revision.
+    pub config_revision: u64,
     pub local: ScopeEvidence,
     pub auth: ScopeEvidence,
     pub hi: ScopeEvidence,
@@ -116,8 +119,9 @@ impl AgentEvidenceStore {
         }
     }
 
-    pub fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
-        let evidence = self.backend.probe(input);
+    pub fn probe(&self, input: &AgentProbeInput, config_revision: u64) -> AgentProbeEvidence {
+        let mut evidence = self.backend.probe(input);
+        evidence.config_revision = config_revision;
         self.latest
             .lock()
             .unwrap()
@@ -201,6 +205,9 @@ impl AgentProbeBackend for ProcessProbeBackend {
 
         AgentProbeEvidence {
             agent: input.agent.clone(),
+            // The store replaces this sentinel with the revision read by the
+            // RPC owner immediately before the probe starts.
+            config_revision: 0,
             local,
             auth,
             hi,
@@ -683,6 +690,7 @@ mod tests {
     fn evidence(scope: ProbeScope) -> AgentProbeEvidence {
         AgentProbeEvidence {
             agent: "zcode".into(),
+            config_revision: 0,
             local: ScopeEvidence {
                 state: EvidenceState::Ready,
                 scope: scope.clone(),
@@ -705,11 +713,15 @@ mod tests {
             evidence: evidence(scope.clone()),
         }));
         assert_eq!(store.latest("zcode"), None);
-        let observed = store.probe(&AgentProbeInput {
-            agent: "zcode".into(),
-            through: ProbeLayer::Auth,
-            scope: scope.clone(),
-        });
+        let observed = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Auth,
+                scope: scope.clone(),
+            },
+            7,
+        );
+        assert_eq!(observed.config_revision, 7);
         assert_eq!(observed.local.scope, scope);
         assert_eq!(store.latest("zcode"), Some(observed));
         assert_eq!(store.latest("dsh"), None);

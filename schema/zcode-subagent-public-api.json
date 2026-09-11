@@ -11,6 +11,64 @@
       "const": ["external_subagent_cancel", "external_subagent_close", "external_subagent_list", "external_subagent_observe", "external_subagent_wait", "external_subagent_respond", "external_subagent_result", "external_subagent_send", "external_subagent_spawn", "external_subagent_status"]
     },
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
+    "agent_status": {
+      "type": "object",
+      "required": ["agent", "config_revision", "configured", "enabled", "spawn_supported", "transport_support", "permission_modes", "model_selection", "local", "auth", "hi"],
+      "properties": {
+        "agent": { "enum": ["zcode", "dsh"] },
+        "config_revision": { "type": "integer", "minimum": 0 },
+        "configured": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
+        "spawn_supported": { "type": "boolean" },
+        "transport_support": {
+          "type": "object",
+          "required": ["transport", "probe", "spawn"],
+          "properties": {
+            "transport": { "enum": ["zcode_app_server", "dsh_acp"] },
+            "probe": { "type": "boolean" },
+            "spawn": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "permission_modes": {
+          "type": "array",
+          "items": { "enum": ["build", "edit", "plan", "yolo"] },
+          "uniqueItems": true
+        },
+        "model_selection": {
+          "type": "object",
+          "required": ["supported", "mode"],
+          "properties": {
+            "supported": { "type": "boolean" },
+            "mode": { "enum": ["native_only", "catalog_token"] }
+          },
+          "additionalProperties": false
+        },
+        "local": { "$ref": "#/properties/agent_scope_status" },
+        "auth": { "$ref": "#/properties/agent_scope_status" },
+        "hi": { "$ref": "#/properties/agent_scope_status" }
+      },
+      "additionalProperties": false
+    },
+    "agent_scope_status": {
+      "type": "object",
+      "required": ["state", "scope"],
+      "properties": {
+        "state": { "enum": ["READY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"] },
+        "scope": {
+          "type": "object",
+          "properties": {
+            "workspace": { "type": "string", "minLength": 1 },
+            "home": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "version": { "type": "string", "minLength": 1 },
+        "checked_at_ms": { "type": "integer", "minimum": 0 },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
     "spawn": {
       "type": "object",
       "required": ["repository", "prompt"],
