@@ -1,8 +1,19 @@
 {
   "agent": "zcode",
   "config_revision": 7,
+  "configured": true,
   "enabled": true,
   "spawn_supported": true,
+  "transport_support": {
+    "transport": "zcode_app_server",
+    "probe": true,
+    "spawn": true
+  },
+  "permission_modes": ["build", "edit", "plan", "yolo"],
+  "model_selection": {
+    "supported": false,
+    "mode": "native_only"
+  },
   "local": {
     "state": "READY",
     "scope": {

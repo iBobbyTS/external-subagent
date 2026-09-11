@@ -17,6 +17,16 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     assert.equal(serialized.includes(forbidden), false, `public schema exposes ${forbidden}`);
   }
   assert.deepEqual(schema.properties.spawn.additionalProperties, false);
+  assert.deepEqual(schema.properties.agent_status.required, [
+    'agent', 'config_revision', 'configured', 'enabled', 'spawn_supported',
+    'transport_support', 'permission_modes', 'model_selection', 'local', 'auth', 'hi',
+  ]);
+  assert.deepEqual(schema.properties.agent_status.properties.transport_support.properties.transport.enum, [
+    'zcode_app_server', 'dsh_acp',
+  ]);
+  assert.deepEqual(schema.properties.agent_status.properties.model_selection.properties.mode.enum, [
+    'native_only', 'catalog_token',
+  ]);
   assert.deepEqual(schema.properties.spawn.properties.write_manifest.items.type, 'string');
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.after_revision.default, 0);

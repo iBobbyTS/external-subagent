@@ -452,7 +452,8 @@ mod tests {
 mod server {
     use super::internal_task_id;
     use crate::rpc::{
-        AgentCapabilitiesView, AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
+        AgentCapabilitiesView, AgentModelSelectionModeView, AgentPermissionModeView,
+        AgentScopeStatusView, AgentStatusView, AgentTransportView, CapabilityMaturityView,
         ComponentStateView, GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision,
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess,
         SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
@@ -776,11 +777,82 @@ mod server {
     pub struct PublicAgentStatus {
         pub agent: String,
         pub config_revision: u64,
+        pub configured: bool,
         pub enabled: bool,
         pub spawn_supported: bool,
+        pub transport_support: PublicAgentTransportSupport,
+        pub permission_modes: Vec<PublicAgentPermissionMode>,
+        pub model_selection: PublicAgentModelSelectionCapability,
         pub local: PublicAgentScopeStatus,
         pub auth: PublicAgentScopeStatus,
         pub hi: PublicAgentScopeStatus,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PublicAgentTransport {
+        ZcodeAppServer,
+        DshAcp,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct PublicAgentTransportSupport {
+        pub transport: PublicAgentTransport,
+        pub probe: bool,
+        pub spawn: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PublicAgentPermissionMode {
+        Build,
+        Edit,
+        Plan,
+        Yolo,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum PublicAgentModelSelectionMode {
+        NativeOnly,
+        CatalogToken,
+    }
+
+    #[derive(Debug, Clone, Serialize, JsonSchema)]
+    #[schemars(deny_unknown_fields)]
+    pub struct PublicAgentModelSelectionCapability {
+        pub supported: bool,
+        pub mode: PublicAgentModelSelectionMode,
+    }
+
+    impl From<AgentTransportView> for PublicAgentTransport {
+        fn from(value: AgentTransportView) -> Self {
+            match value {
+                AgentTransportView::ZcodeAppServer => Self::ZcodeAppServer,
+                AgentTransportView::DshAcp => Self::DshAcp,
+            }
+        }
+    }
+
+    impl From<AgentPermissionModeView> for PublicAgentPermissionMode {
+        fn from(value: AgentPermissionModeView) -> Self {
+            match value {
+                AgentPermissionModeView::Build => Self::Build,
+                AgentPermissionModeView::Edit => Self::Edit,
+                AgentPermissionModeView::Plan => Self::Plan,
+                AgentPermissionModeView::Yolo => Self::Yolo,
+            }
+        }
+    }
+
+    impl From<AgentModelSelectionModeView> for PublicAgentModelSelectionMode {
+        fn from(value: AgentModelSelectionModeView) -> Self {
+            match value {
+                AgentModelSelectionModeView::NativeOnly => Self::NativeOnly,
+                AgentModelSelectionModeView::CatalogToken => Self::CatalogToken,
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -825,8 +897,19 @@ mod server {
             Self {
                 agent: value.agent,
                 config_revision: value.config_revision,
+                configured: value.configured,
                 enabled: value.enabled,
                 spawn_supported: value.spawn_supported,
+                transport_support: PublicAgentTransportSupport {
+                    transport: value.transport_support.transport.into(),
+                    probe: value.transport_support.probe,
+                    spawn: value.transport_support.spawn,
+                },
+                permission_modes: value.permission_modes.into_iter().map(Into::into).collect(),
+                model_selection: PublicAgentModelSelectionCapability {
+                    supported: value.model_selection.supported,
+                    mode: value.model_selection.mode.into(),
+                },
                 local: value.local.into(),
                 auth: value.auth.into(),
                 hi: value.hi.into(),

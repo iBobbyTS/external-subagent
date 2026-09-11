@@ -105,7 +105,15 @@ test('agents status projects daemon evidence and rejects absent identities', asy
   const { paths } = fixture();
   const status = {
     service_generation: 'generation-1',
-    agents: [{ agent: 'zcode', enabled: true, spawn_supported: true, local: { status: 'ready', version: '1.2.3', checked_at_ms: 10 }, auth: { status: 'unknown' }, hi: { status: 'unknown' } }],
+    agents: [{
+      agent: 'zcode', config_revision: 7, configured: true, enabled: true, spawn_supported: true,
+      transport_support: { transport: 'zcode_app_server', probe: true, spawn: true },
+      permission_modes: ['build', 'edit', 'plan', 'yolo'],
+      model_selection: { supported: false, mode: 'native_only' },
+      local: { state: 'READY', version: '1.2.3', checked_at_ms: 10, scope: {} },
+      auth: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
+      hi: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
+    }],
   };
   const options = { socket: '/socket', callDaemon: async (socket, command, input) => {
     assert.equal(socket, '/socket'); assert.equal(command, 'status'); assert.deepEqual(input, {}); return status;
