@@ -13,6 +13,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const yes = args.includes('--yes');
   if (cancelActive && !yes) throw new Error('--cancel-active requires --yes');
   const prior = (() => { try { return JSON.parse(fs.readFileSync(receiptPath(paths), 'utf8')); } catch { return null; } })();
+  const priorStateBytes = (() => { try { return fs.readFileSync(paths.state); } catch { return null; } })();
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
@@ -49,7 +50,12 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
     return result;
   } catch (error) {
-    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message }));
+    let rollback = { attempted: false, restored: false };
+    if (priorStateBytes && paths.state) {
+      rollback.attempted = true;
+      try { atomicWrite(paths.state, priorStateBytes); rollback.restored = true; } catch (restoreError) { rollback.error = restoreError.message; }
+    }
+    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
     throw error;
   }
 }
