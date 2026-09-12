@@ -610,6 +610,28 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                     {
                         return Err(format!("unknown enabled DSH entry: {id:?}"));
                     }
+                    if matches!(id, "sandbox-policy" | "approval") {
+                        let config = m.get(serde_yaml::Value::String("config".into()));
+                        let mode = config.and_then(|v| v.get("mode")).and_then(|v| v.as_str());
+                        if id == "sandbox-policy" && config.is_some() && mode != Some("read-only") {
+                            return Err("sandbox-policy must be read-only".into());
+                        }
+                    }
+                }
+                for key in ["runnerCommand", "executor", "executors"] {
+                    if m.contains_key(serde_yaml::Value::String(key.into())) {
+                        return Err(format!("strict DSH dump contains unmanaged {key}"));
+                    }
+                }
+                if id == Some("settings") && disabled != Some(true) {
+                    if let Some(config) = m.get(serde_yaml::Value::String("config".into())) {
+                        if !config
+                            .as_mapping()
+                            .is_some_and(serde_yaml::Mapping::is_empty)
+                        {
+                            return Err("strict DSH settings drift is not allowed".into());
+                        }
+                    }
                 }
                 for val in m.values() {
                     walk(val, saw)?;
