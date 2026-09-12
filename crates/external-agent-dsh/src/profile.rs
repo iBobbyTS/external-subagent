@@ -295,12 +295,16 @@ pub fn build_profile() -> Result<Value, String> {
 }
 
 pub fn validate_build_profile(profile: &Value) -> Result<(), String> {
+    let Some(obj) = profile.as_object() else { return Err("managed dsh build profile must be an object".into()) };
+    if obj.keys().any(|k| !matches!(k.as_str(), "agent" | "composition" | "notes")) { return Err("managed dsh build profile contains unknown fields".into()); }
     if profile.get("agent").and_then(Value::as_str) != Some(crate::DSH_AGENT_NAME) {
         return Err("managed dsh build profile must declare agent=dsh".into());
     }
     let composition = profile
         .get("composition")
         .ok_or_else(|| "managed dsh build profile is missing the composition object".to_string())?;
+    let Some(cobj) = composition.as_object() else { return Err("managed dsh composition must be an object".into()) };
+    if cobj.keys().any(|k| !matches!(k.as_str(), "sandbox" | "respondable_permissions" | "prompt_scope")) { return Err("managed dsh composition contains unknown fields".into()); }
     if composition.get("sandbox").and_then(Value::as_str) != Some("workspace-write") {
         return Err("managed dsh build profile must pin sandbox=workspace-write".into());
     }

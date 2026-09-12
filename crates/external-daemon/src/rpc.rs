@@ -1488,7 +1488,7 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
         }
     } else {
         AgentModelSelectionCapabilityView {
-            supported: entry.spawn_supported,
+            supported: agent == "zcode" && entry.enabled && entry.spawn_supported,
             mode: AgentModelSelectionModeView::CatalogToken,
         }
     }
