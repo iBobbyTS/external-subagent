@@ -17,7 +17,8 @@ export function machoArch(bytes) {
 
 export function readPayloadManifest(options = {}) {
   const platform = options.platform || nativePlatform();
-  const file = payloadManifestPath(platform);
+  const root = options.root || undefined;
+  const file = root ? path.join(root, 'npm', 'native', platform || '', 'payload.json') : payloadManifestPath(platform);
   if (file === null || !fs.existsSync(file)) {
     throw new CliError('PAYLOAD_MANIFEST_MISSING', `the ${platform || 'current'} platform payload manifest is missing from this package`);
   }
@@ -42,15 +43,20 @@ export function verifyPayload(options = {}) {
   if (platform === null) {
     throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${process.platform}-${process.arch}; supported platforms: ${NATIVE_PLATFORM}`);
   }
-  const manifest = readPayloadManifest({ platform });
+  const manifest = readPayloadManifest({ platform, root: options.root });
   if (manifest.platform !== platform) {
     throw new CliError('PAYLOAD_PLATFORM_MISMATCH', `payload manifest declares ${manifest.platform}, expected ${platform}`);
   }
-  const versions = { package: packageVersion(), cli: cliVersion(), payload: manifest.version };
+  let candidatePackage = packageVersion();
+  if (options.root) {
+    try { candidatePackage = JSON.parse(fs.readFileSync(path.join(options.root, 'package.json'), 'utf8')).version; }
+    catch (error) { throw new CliError('PAYLOAD_PACKAGE_INVALID', `candidate package manifest is unavailable: ${error.message}`); }
+  }
+  const versions = { package: candidatePackage, cli: options.root ? candidatePackage : cliVersion(), payload: manifest.version };
   if (versions.package !== versions.cli || versions.payload !== versions.cli) {
     throw new CliError('PAYLOAD_VERSION_MISMATCH', `payload ${versions.payload}, package ${versions.package}, and CLI ${versions.cli} versions disagree`);
   }
-  const dir = nativePayloadDir(platform);
+  const dir = options.root ? path.join(options.root, 'npm', 'native', platform) : nativePayloadDir(platform);
   const files = manifest.files.map((record) => {
     const target = path.join(dir, record.name);
     let stat;
