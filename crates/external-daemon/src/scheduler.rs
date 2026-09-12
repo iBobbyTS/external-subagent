@@ -281,6 +281,13 @@ impl Scheduler {
         manifest: &GeneralTaskManifest,
         admission: Option<external_core::AdmissionIdentity>,
     ) -> Result<SubmittedTask, SchedulerError> {
+        // Serialize admission with begin_drain so the draining check and the
+        // authoritative enqueue form one linearizable operation.
+        let _admission = self.inner.admission.lock().unwrap();
+        #[cfg(test)]
+        if let Some(hook) = self.inner.admission_hook.lock().unwrap().clone() {
+            hook();
+        }
         if self.inner.draining.load(Ordering::Acquire) {
             return Err(SchedulerError::InvalidConfig("daemon_draining".into()));
         }
