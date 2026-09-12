@@ -20,6 +20,8 @@
   disabled: true
 - id: tool-subagent-fork
   disabled: true
+- id: subagent
+  disabled: true
 - id: tool-workflow
   disabled: true
 - id: tool-goal
