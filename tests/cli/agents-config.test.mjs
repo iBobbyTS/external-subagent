@@ -10,6 +10,7 @@ import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from '../../cli/commands/tasks.mjs';
 import { productPaths } from '../../cli/paths.mjs';
+import { launchAgentPlist } from '../../cli/install/service-macos.mjs';
 
 function fixture() { const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-')); return { home, paths: productPaths(home) }; }
 
@@ -26,6 +27,32 @@ test('zcode model is rejected before prompt and dsh remains discovery-only', () 
   const config = configCommand(paths, { operation: 'set', patch: { agents: { dsh: { enabled: true } } } }).config;
   assert.equal(config.agents.dsh.enabled, true);
   assert.equal(config.agents.dsh.spawn_supported, false);
+});
+
+test('explicit dsh spawn support survives config validation', () => {
+  const { paths } = fixture();
+  const config = configCommand(paths, { operation: 'set', patch: { agents: { dsh: { enabled: true, spawn_supported: true } } } }).config;
+  assert.equal(config.agents.dsh.enabled, true);
+  assert.equal(config.agents.dsh.spawn_supported, true);
+  assert.equal(readConfig(paths.config).agents.dsh.spawn_supported, true);
+});
+
+test('LaunchAgent captures configured DSH runtime and home for GUI services', () => {
+  const { paths } = fixture();
+  const previousRuntime = process.env.DSH_RUNTIME_PATH;
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_RUNTIME_PATH = '/opt/dsh/runtime with spaces';
+  process.env.DSH_HOME = '/var/lib/dsh profile';
+  try {
+    const plist = launchAgentPlist(paths).toString('utf8');
+    assert.match(plist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/runtime with spaces<\/string>/u);
+    assert.match(plist, /<key>DSH_HOME<\/key><string>\/var\/lib\/dsh profile<\/string>/u);
+  } finally {
+    if (previousRuntime === undefined) delete process.env.DSH_RUNTIME_PATH;
+    else process.env.DSH_RUNTIME_PATH = previousRuntime;
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+  }
 });
 
 test('config writes a revision and keeps existing task snapshots independent', () => {

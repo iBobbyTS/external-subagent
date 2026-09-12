@@ -63,7 +63,6 @@ export function validateConfig(input) {
     rejectModel(agent, value.default_model, 'default_model');
     config.agents[agent] = { ...config.agents[agent], ...value };
   }
-  config.agents.dsh.spawn_supported = false;
   if (config.default_agent && !config.agents[config.default_agent].enabled) throw new CliError('CONFIG_INVALID', 'default_agent must be enabled', 2);
   return config;
 }
