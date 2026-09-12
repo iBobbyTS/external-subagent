@@ -4,12 +4,12 @@ import { spawnSync } from 'node:child_process';
 import { ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
-import { codexHomeFor, installPlugin } from './codex.mjs';
+import { codexHomeFor, installPlugin, resolveStaging } from './codex.mjs';
 import { verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
 import { packageRoot } from './layout.mjs';
 import { registerCodexHome } from './reconcile.mjs';
-import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
+import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackCodexArtifacts, rollbackFiles, snapshotFile } from './recovery.mjs';
 import { bootstrapService, installLaunchAgent } from './service-macos.mjs';
 
 // Fresh-install coordination (S05).  A plain npm install only stages the
@@ -25,8 +25,11 @@ import { bootstrapService, installLaunchAgent } from './service-macos.mjs';
 //   start-service      launchctl bootstrap (best-effort, reported)
 //   install-codex-plugin managed staging + official codex add
 //   claim-codex-home   D08 registry claim after a successful binding
-// Failures roll tracked files back through recovery.mjs; a resumable journal
-// lets `init --resume` continue after environmental failures.
+// Failures roll tracked files back through recovery.mjs, including the
+// product-owned Codex artifacts (staging tree, marketplace manifest, and
+// directories this run created) — the official codex cache is never rolled
+// back; a resumable journal lets `init --resume` continue after environmental
+// failures.
 
 const HOOK_INSTALLER = ['plugins', 'codex', 'external-subagent', 'scripts', 'install-agent-hooks.mjs'];
 
@@ -96,6 +99,29 @@ export function runInit(options = {}) {
 
   let service = { action: 'bootstrap', skipped: true, reason: 'not attempted' };
   const codexHome = codexHomeFor({ codexHome: options.codexHome }, paths);
+  // Product-owned Codex artifacts the init may create, snapshotted before any
+  // step runs so a later failure can restore them (see rollbackCodexArtifacts).
+  const stagingSite = resolveStaging(paths.home, {});
+  const codexArtifactDirectories = (target) => {
+    const stop = path.resolve(paths.home);
+    const levels = [];
+    let current = path.resolve(target);
+    while (current.startsWith(`${stop}${path.sep}`)) { levels.push(current); current = path.dirname(current); }
+    return levels;
+  };
+  const codexArtifactDirs = new Set([
+    path.resolve(codexHome),
+    ...codexArtifactDirectories(codexHome),
+    ...codexArtifactDirectories(stagingSite.staging),
+    ...codexArtifactDirectories(stagingSite.marketplace),
+  ]);
+  const codexArtifacts = {
+    staging: { path: stagingSite.staging, existed: fs.existsSync(stagingSite.staging) },
+    marketplace: { file: stagingSite.marketplace, snapshot: snapshotFile(stagingSite.marketplace) },
+    directories: [...codexArtifactDirs],
+    preexisting: new Set([...codexArtifactDirs].filter((directory) => fs.existsSync(directory))),
+    productRoot: path.resolve(path.join(paths.home, '.external-subagent-marketplace')),
+  };
   let codex = { status: 'skipped', codex_home: codexHome, reason: options.skipCodexPlugin ? 'skipped by request' : 'not attempted' };
   try {
     if (!completed.has('probe-runtime')) mark('probe-runtime');
@@ -122,13 +148,13 @@ export function runInit(options = {}) {
     }
     if (!completed.has('install-codex-plugin') && !options.skipCodexPlugin) {
       const install = installPlugin(paths, { codexCli: options.codexCli, codexHome });
-      codex = { status: 'installed', codex_home: codexHome, cache: install.cache || null, marketplace: install.marketplace_name };
+      codex = { status: 'installed', codex_home: codexHome, cache: install.cache || null, marketplace: install.marketplace_name, digest: install.digest || null };
       failAt('install-codex-plugin');
       mark('install-codex-plugin');
     }
     const pluginDone = completed.has('install-codex-plugin');
     if (!completed.has('claim-codex-home') && (codex.status === 'installed' || (pluginDone && !options.skipCodexPlugin))) {
-      const claim = registerCodexHome(paths, codexHome, { version: payload.version, digest: codex.marketplace });
+      const claim = registerCodexHome(paths, codexHome, { version: payload.version, digest: codex.digest });
       codex = { ...codex, claim: { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes } };
       failAt('claim-codex-home');
       mark('claim-codex-home');
@@ -138,7 +164,11 @@ export function runInit(options = {}) {
       mark('install-hooks');
     }
   } catch (error) {
-    const rollbackErrors = [...rollbackFiles(tracked), ...removeCreatedDirectories(directories)];
+    const rollbackErrors = [
+      ...rollbackFiles(tracked),
+      ...rollbackCodexArtifacts(codexArtifacts),
+      ...removeCreatedDirectories(directories),
+    ];
     if (rollbackErrors.length > 0) error.rollbackErrors = rollbackErrors;
     throw error;
   }

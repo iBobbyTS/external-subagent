@@ -35,7 +35,9 @@ private data/log directories, write the product config, install the
 LaunchAgent, bootstrap the service, stage and register the managed Codex
 plugin, and claim the Codex home in the D08 registry. `--resume` continues
 after an environmental failure using the step journal; failures roll tracked
-files back so a partial install never looks complete.
+files back — including the product-owned Codex artifacts (staging tree,
+marketplace manifest, and directories the run created) while never undoing
+the official codex cache — so a partial install never looks complete.
 
 Missing DSH never blocks installation; `agents status` reports it explicitly
 (`enabled=false`, `spawn_supported=false`, scope states `UNKNOWN`) and the

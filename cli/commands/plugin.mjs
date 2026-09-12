@@ -32,18 +32,19 @@ function flagName(flag) {
 
 export function pluginCommand(paths, args) {
   const options = parseCommon(args, ['--dry-run', '--uninstall']);
+  const installerOptions = withInstallerFlags(options);
   if (options.uninstall) {
-    const result = uninstallPlugin(paths, options);
+    const result = uninstallPlugin(paths, installerOptions);
     if (!options.dry_run && result.uninstalled) {
       const claim = unregisterCodexHome(paths, result.codex_home);
       result.claim_released = claim.unregistered;
     }
     return result;
   }
-  const result = installPlugin(paths, options);
+  const result = installPlugin(paths, installerOptions);
   if (!options.dry_run && result.installed) {
     const payload = safePayloadVersion();
-    const claim = registerCodexHome(paths, result.codex_home, { version: payload, digest: result.marketplace_name });
+    const claim = registerCodexHome(paths, result.codex_home, { version: payload, digest: result.digest });
     result.claim = { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes };
   }
   return result;
@@ -51,7 +52,14 @@ export function pluginCommand(paths, args) {
 
 export function mcpCommand(paths, args) {
   const options = parseCommon(args, ['--dry-run', '--uninstall']);
-  return installMcp(paths, options);
+  return installMcp(paths, withInstallerFlags(options));
+}
+
+// The install layer speaks camelCase (dryRun); CLI parsing produces snake_case
+// flags.  Normalize at the boundary so --dry-run actually holds the installers
+// back instead of running a real install/uninstall.
+function withInstallerFlags(options) {
+  return { ...options, dryRun: Boolean(options.dry_run) };
 }
 
 function safePayloadVersion() {
