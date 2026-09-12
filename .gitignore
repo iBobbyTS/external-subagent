@@ -22,3 +22,7 @@ target
 
 # System Junk
 *.DS_Store
+
+# S05 release artifacts (built/verified by scripts/release/build-native-payload.mjs)
+npm/native/darwin-arm64/
+*.tgz

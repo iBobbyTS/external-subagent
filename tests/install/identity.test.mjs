@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { installMcp, installHooks } from '../../cli/installer.mjs';
+import { installMcp } from '../../cli/install/codex.mjs';
+import { installHooks } from '../../cli/install/init.mjs';
 
 test('canonical CLI and plugin assets use external-subagent identity', () => {
   const root = path.resolve(import.meta.dirname, '../..');
