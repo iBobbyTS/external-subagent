@@ -22,14 +22,17 @@ if (config?.hooks?.enabled !== true || !events || !Array.isArray(events.PreToolU
 const pre = events.PreToolUse.find((entry) => entry?.matcher === '^(Read|Grep|Glob|Write|Edit|Delete|Move)$');
 const hook = pre?.hooks?.find((entry) => entry?.type === 'process' && Array.isArray(entry.args));
 const script = hook?.args?.find((candidate) => typeof candidate === 'string' && candidate.endsWith('/hooks/check-agent-files.mjs'));
+const guard = events.PreToolUse.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
 const audit = events.PostToolUse?.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
-if (!script || !fs.statSync(script).isFile() || hook.command !== process.execPath || !audit || !fs.statSync(audit).isFile()) process.exit(2);
+if (!script || !fs.statSync(script).isFile() || hook.command !== process.execPath || !guard || !fs.statSync(guard).isFile() || !audit || !fs.statSync(audit).isFile()) process.exit(2);
 const provenancePath = path.join(home, 'Library', 'Application Support', 'external-subagent', 'zcode-agent-hook-provenance.json');
 if (!fs.existsSync(provenancePath)) process.exit(2);
 const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
 const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 if (provenance.effective_config_path !== path.resolve(configPath)
   || provenance.hook_activation_verified !== true
+  || provenance.effective_guard_wrapper_path !== path.resolve(guard)
+  || provenance.effective_guard_wrapper_sha256 !== hash(guard)
   || provenance.effective_file_wrapper_path !== path.resolve(script)
   || provenance.effective_file_wrapper_sha256 !== hash(script)
   || provenance.effective_audit_wrapper_path !== path.resolve(audit)
