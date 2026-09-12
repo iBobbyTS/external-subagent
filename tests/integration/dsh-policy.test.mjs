@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 // DSH remains discovery-only until the S04 gate is explicitly opened.
 test('dsh policy is fail-closed for unsupported spawn modes', async () => {
@@ -15,6 +16,6 @@ test('dsh policy is fail-closed for unsupported spawn modes', async () => {
 });
 
 test('strictplan rejects non-empty manifests before dispatch', () => {
-  const manifest = ['src/**', ''];
-  assert.equal(manifest.some((entry) => entry.length === 0), true);
+  const output = execFileSync('cargo', ['test', '-p', 'external-core', 'plan_mode_rejects_write_manifest', '--', '--exact', '--nocapture'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname), encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
 });
