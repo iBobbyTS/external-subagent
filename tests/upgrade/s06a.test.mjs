@@ -124,3 +124,14 @@ test('partial update is recorded as failed receipt and never reports success', a
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.equal(receipt.status, 'failed');
 });
+
+test('service activation failure restores prior state and records rollback evidence', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rollback-state-')); const state = path.join(dir, 'state.json');
+  fs.writeFileSync(state, JSON.stringify({ phase: 'active', active: { version: '1.0.0' } }));
+  const p = { data: dir, state, socket: path.join(dir, 'sock') };
+  const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'rollback-1', ready_for_activation: true } : { ready_for_activation: true };
+  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'new-entry'), entry_sha256: 'new' } }), hasInstalledService: () => true, activateService: async () => { throw new Error('bootstrap failed'); } }), /bootstrap failed/);
+  assert.equal(JSON.parse(fs.readFileSync(state)).active.version, '1.0.0');
+  assert.equal(JSON.parse(fs.readFileSync(`${state}.activation.json`)).rollback.restored, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -39,8 +39,10 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (result?.phase && result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result.phase})`);
     }
-    if (result?.active?.entry && hasInstalledService(paths) && !daemon.skipServiceActivation) {
-      result.service = await activateService(paths, {
+    const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
+    if (result?.active?.entry && serviceInstalled && !daemon.skipServiceActivation) {
+      const activate = daemon.activateService || activateService;
+      result.service = await activate(paths, {
         path: result.active.entry,
         sha256: result.active.entry_sha256,
         version: result.active.version,
