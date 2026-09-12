@@ -49,12 +49,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zcode = CommandRuntimeFactory::new_prepared(move |_task: &external_store::TaskRecord| {
         runtime_command(runtime.as_deref())
     });
-    // Production composition registers the DSH adapter behind a closed spawn
-    // gate: admission can know about the agent while spawn stays refused until
-    // the S04 parent is accepted.
+    let dsh_factory = if dsh_production_enabled(config.agent_config.as_deref()) {
+        DshRuntimeFactory::enabled()
+    } else {
+        DshRuntimeFactory::closed()
+    };
     let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::new(
         zcode,
-        DshRuntimeFactory::closed(),
+        dsh_factory,
     ));
     let scheduler = Scheduler::new(
         format!("agentd-{}", std::process::id()),
@@ -83,6 +85,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     daemon.shutdown();
     Ok(())
+}
+
+fn dsh_production_enabled(path: Option<&Path>) -> bool {
+    let Some(path) = path else { return false };
+    let Ok(bytes) = fs::read(path) else { return false };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    let configured = value.pointer("/agents/dsh");
+    configured
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && configured
+            .and_then(|entry| entry.get("spawn_supported"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && env::var_os("DSH_RUNTIME_PATH").is_some()
 }
 
 fn production_scheduler_config(runtime_source: Option<PathBuf>) -> SchedulerConfig {
