@@ -1408,11 +1408,35 @@ fn classify_dsh_session_error(
         SessionError::Timeout => "timeout",
         SessionError::Shape(_) => "shape",
         SessionError::Remote(value) => {
-            let code = value.get("code").and_then(Value::as_i64);
+            let code = value.get("code").and_then(|code| {
+                code.as_i64().or_else(|| {
+                    code.as_str()
+                        .filter(|code| code.len() <= 16)
+                        .and_then(|code| code.parse::<i64>().ok())
+                })
+            });
             match code {
                 Some(-32001) | Some(401) | Some(403) => "auth",
                 Some(-32002) | Some(429) => "rate_limit",
-                _ => "remote",
+                _ => {
+                    // Inspect only a bounded message, never arbitrary remote data
+                    // or numeric substrings that may merely be request IDs.
+                    let message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .chars()
+                        .take(512)
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if message.contains("unauthorized") || message.contains("unauthenticated") {
+                        "auth"
+                    } else if message.contains("rate limit") || message.contains("rate_limit") {
+                        "rate_limit"
+                    } else {
+                        "remote"
+                    }
+                }
             }
         }
         SessionError::Transport(_) => "network",
@@ -1552,6 +1576,67 @@ mod tests {
         assert_eq!(observed.local.scope, scope);
         assert_eq!(store.latest("zcode"), Some(observed));
         assert_eq!(store.latest("dsh"), None);
+    }
+
+    #[test]
+    fn dsh_session_errors_classify_codes_and_bounded_messages() {
+        use external_agent_dsh::acp::session::SessionError;
+        for (code, expected) in [
+            (401, "auth"),
+            (403, "auth"),
+            (429, "rate_limit"),
+            (-32001, "auth"),
+            (-32002, "rate_limit"),
+        ] {
+            for code in [serde_json::json!(code), serde_json::json!(code.to_string())] {
+                assert_eq!(
+                    classify_dsh_session_error(&SessionError::Remote(
+                        serde_json::json!({"code": code, "message": "provider failed"})
+                    )),
+                    expected
+                );
+            }
+        }
+        for (value, expected) in [
+            (serde_json::json!({"message": "Unauthorized"}), "auth"),
+            (
+                serde_json::json!({"code": -32603, "message": "Unauthenticated"}),
+                "auth",
+            ),
+            (
+                serde_json::json!({"message": "Rate limit exceeded"}),
+                "rate_limit",
+            ),
+            (serde_json::json!({"message": "RATE_LIMIT"}), "rate_limit"),
+            (
+                serde_json::json!({"code": "401x", "message": "request 429 failed"}),
+                "remote",
+            ),
+            (serde_json::json!({"data": "unauthorized"}), "remote"),
+            (
+                serde_json::json!({"message": format!("{}unauthorized", "x".repeat(512))}),
+                "remote",
+            ),
+            (serde_json::json!({"message": "未知错误"}), "remote"),
+            (serde_json::json!({"message": 401}), "remote"),
+            (
+                serde_json::json!({"code": 429, "message": "unauthorized"}),
+                "rate_limit",
+            ),
+        ] {
+            assert_eq!(
+                classify_dsh_session_error(&SessionError::Remote(value)),
+                expected
+            );
+        }
+        assert_eq!(
+            classify_dsh_session_error(&SessionError::Timeout),
+            "timeout"
+        );
+        assert_eq!(
+            classify_dsh_session_error(&SessionError::Transport("closed".into())),
+            "network"
+        );
     }
 
     #[test]
