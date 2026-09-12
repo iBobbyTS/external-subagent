@@ -161,3 +161,58 @@ fn runtime_loss_redaction(loss: &RuntimeLoss) -> &'static str {
         "allowlisted"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use external_contract::{RequestEnvelope, WireId};
+
+    #[test]
+    fn lifecycle_mapping_preserves_sequence_and_order() {
+        let event = RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence: 7,
+            method: "turn.started".into(),
+            order: LifecycleOrder::InOrder,
+        });
+        let projection = lifecycle_projection(&event, None);
+        assert_eq!(projection.event_type, "driver.lifecycle");
+        assert_eq!(projection.redaction_level, "allowlisted");
+        let payload: serde_json::Value = serde_json::from_str(&projection.payload_json).unwrap();
+        assert_eq!(payload["sequence"], 7);
+        assert_eq!(payload["order"], "in_order");
+    }
+
+    #[test]
+    fn request_projection_redacts_params_and_keeps_pending_id() {
+        let request = RequestEnvelope::new(
+            WireId::String("secret-id".into()),
+            "session/send",
+            serde_json::json!({"secret": "value"}),
+        );
+        let projection = lifecycle_projection(
+            &RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))),
+            Some("pending-42"),
+        );
+        assert_eq!(projection.redaction_level, "redacted");
+        assert!(!projection.payload_json.contains("secret"));
+        assert!(projection.payload_json.contains("pending-42"));
+    }
+
+    #[test]
+    fn stop_failure_is_redacted_but_safe_losses_are_allowlisted() {
+        let failed = lifecycle_projection(
+            &RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(RuntimeLoss::StopFailed(
+                "private detail".into(),
+            ))),
+            None,
+        );
+        assert_eq!(failed.redaction_level, "redacted");
+        assert!(!failed.payload_json.contains("private detail"));
+        let safe = lifecycle_projection(
+            &RuntimeEvent::Terminal(RuntimeTerminal::Orphaned(RuntimeLoss::SessionLost)),
+            None,
+        );
+        assert_eq!(safe.redaction_level, "allowlisted");
+        assert!(safe.payload_json.contains("session_lost"));
+    }
+}
