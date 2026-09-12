@@ -16,7 +16,7 @@ test('dsh policy is fail-closed for unsupported spawn modes', async () => {
 });
 
 test('strictplan rejects non-empty manifests before dispatch', () => {
-  const output = execFileSync('cargo', ['test', '-p', 'external-core', 'general::tests::strict_plan_admission_rejects_non_empty_write_manifest', '--', '--exact', '--nocapture'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname), encoding: 'utf8' });
+  const output = execFileSync('cargo', ['test', '-p', 'external-core', 'strict_plan_admission_rejects_non_empty_write_manifest', '--', '--nocapture'], { cwd: path.resolve(new URL('../..', import.meta.url).pathname), encoding: 'utf8' });
   assert.match(output, /test result: ok/);
   assert.match(output, /1 passed/);
 });
