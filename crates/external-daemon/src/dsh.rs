@@ -121,12 +121,29 @@ impl RuntimeFactory for DshRuntimeFactory {
                     prepared.permission_mode,
                     external_core::PermissionMode::Plan
                 );
-                let patch = std::env::var_os("DSH_STRICT_PLAN_PATCH").map(PathBuf::from);
-                if plan && patch.is_none() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "DSH_STRICT_PLAN_PATCH is unavailable",
-                    ));
+                let managed_patch = if plan && std::env::var_os("DSH_STRICT_PLAN_PATCH").is_none() {
+                    Some(
+                        tempfile::Builder::new()
+                            .prefix("external-dsh-strict-")
+                            .tempdir()
+                            .map_err(|e| io::Error::other(e.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                let patch = std::env::var_os("DSH_STRICT_PLAN_PATCH")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        managed_patch
+                            .as_ref()
+                            .map(|d| d.path().join("strict-plan.patch.yml"))
+                    });
+                if let Some(dir) = managed_patch.as_ref() {
+                    std::fs::write(
+                        dir.path().join("strict-plan.patch.yml"),
+                        external_agent_dsh::profile::STRICT_PLAN_PATCH_YAML,
+                    )
+                    .map_err(|e| io::Error::other(e.to_string()))?;
                 }
                 let mut launch = external_agent_dsh::profile::DshLaunch::new(
                     Some(executable),
@@ -134,20 +151,21 @@ impl RuntimeFactory for DshRuntimeFactory {
                     std::env::var_os("DSH_HOME").map(PathBuf::from),
                 );
                 if plan {
-                    external_agent_dsh::profile::preflight(
-                        &launch.executable.clone().unwrap(),
-                        patch.as_ref().unwrap(),
-                    )
-                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                     launch.permission_mode = Some("read-only".into());
                     launch.patch = patch;
+                    external_agent_dsh::profile::preflight(&launch)
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                 } else {
                     launch.permission_mode = Some("workspace-write".into());
                     external_agent_dsh::profile::preflight_build(&launch)
                         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                 }
                 let command = external_agent_dsh::profile::resolve_launch(&launch)?;
-                Ok(Arc::new(DshRuntimeOwner::spawn(command, _sink)?))
+                Ok(Arc::new(DshRuntimeOwner::spawn_with_patch(
+                    command,
+                    _sink,
+                    managed_patch,
+                )?))
             }
             #[cfg(test)]
             DshSpawnGate::TestHarness => {
@@ -319,12 +337,21 @@ pub struct DshRuntimeOwner {
     shared: Arc<DshRuntimeShared>,
     session: Mutex<AcpSession>,
     shutdown: Arc<AtomicBool>,
+    _patch_directory: Option<tempfile::TempDir>,
 }
 
 const MAX_TRACKED_TOOLS: usize = 128;
 
 impl DshRuntimeOwner {
     pub fn spawn(command: Command, sink: Arc<dyn LifecycleSink>) -> io::Result<Self> {
+        Self::spawn_with_patch(command, sink, None)
+    }
+
+    fn spawn_with_patch(
+        command: Command,
+        sink: Arc<dyn LifecycleSink>,
+        patch_directory: Option<tempfile::TempDir>,
+    ) -> io::Result<Self> {
         let driver = Arc::new(Driver::spawn_with_codec(command, FrameCodec::JsonRpc2)?);
         AcpSession::codec_check(&driver).map_err(|error| io::Error::other(error.to_string()))?;
         let publisher = Arc::new(Publisher::new(sink));
@@ -352,6 +379,7 @@ impl DshRuntimeOwner {
             shared,
             session: Mutex::new(session),
             shutdown,
+            _patch_directory: patch_directory,
         })
     }
 

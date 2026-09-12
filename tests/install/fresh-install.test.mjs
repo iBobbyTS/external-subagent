@@ -249,12 +249,21 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
   const logs = path.join(home, 'Library', 'Logs', 'external-subagent');
   fs.mkdirSync(logs, { recursive: true, mode: 0o700 });
   const socket = path.join(data, 'external-subagent.sock');
+  const providerHome = path.join(home, 'provider');
+  const workspace = path.join(home, 'workspace');
+  fs.mkdirSync(providerHome);
+  fs.mkdirSync(workspace);
+  const runtime = path.join(home, 'dsh-fixture.mjs');
+  fs.copyFileSync(path.join(repoRoot, 'tests/fixtures/dsh-hi-probe.mjs'), runtime);
+  assert.equal(fs.existsSync(path.join(ctx.packageRoot, 'crates')), false);
+  assert.equal(fs.existsSync(path.join(ctx.packageRoot, 'profiles')), false);
+
   const daemon = spawn(ctx.daemon, [
     '--database', path.join(data, 'external-subagent.sqlite3'),
     '--socket', socket,
     '--runtime', '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs',
     '--diagnostic-log', path.join(logs, 'daemon-error.log'),
-  ], { env: fixtureEnv(home), stdio: ['ignore', 'pipe', 'pipe'] });
+  ], { cwd: ctx.packageRoot, env: fixtureEnv(home, { env: { DSH_RUNTIME_PATH: runtime } }), stdio: ['ignore', 'pipe', 'pipe'] });
   let daemonStderr = '';
   let daemonExited = false;
   daemon.on('exit', () => { daemonExited = true; });
@@ -277,6 +286,26 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     assert.equal(byAgent.dsh.enabled, false, 'DSH stays explicitly missing without any auto-install');
     assert.equal(byAgent.dsh.spawn_supported, false);
     assert.equal(byAgent.dsh.local.state, 'UNKNOWN', 'missing DSH must surface as unknown, never as valid');
+
+
+    // Exercise the installed native binary with no source/resources in its
+    // package tree. The provider rejects build-tree patch paths explicitly.
+    const authProbe = jsonOutput(run(ctx.cli, ['agents', 'probe', 'dsh', '--auth', '--workspace', workspace, '--home', providerHome], { env }), 'DSH auth');
+    assert.equal(fs.existsSync(path.join(providerHome, 'probe.jsonl')), false, 'auth-only must not start ACP or prompt');
+    const hiProbe = jsonOutput(run(ctx.cli, ['agents', 'probe', 'dsh', '--hi', '--workspace', workspace, '--home', providerHome], { env }), 'DSH hi');
+    assert.equal(hiProbe.hi.state, 'READY');
+    assert.equal(authProbe.auth.state, 'UNKNOWN');
+    const events = fs.readFileSync(path.join(providerHome, 'probe.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(events[0].kind, 'dump');
+    assert.equal(events.filter((event) => event.method === 'session/prompt').length, 1);
+    for (const event of events.filter((event) => event.kind)) {
+      assert.equal(event.cwd, workspace);
+      assert.equal(event.home, providerHome);
+      assert.equal(event.mode, 'read-only');
+      assert.equal(fs.existsSync(event.patch), false, 'probe patch must be reaped');
+      assert.equal(event.patch.startsWith(repoRoot), false);
+    }
+    assert.deepEqual(fs.readdirSync(workspace), []);
 
     const facade = spawn(ctx.mcpFacade, [], {
       env: fixtureEnv(home, { env: { ZCODE_AGENTD_SOCKET: socket } }),
