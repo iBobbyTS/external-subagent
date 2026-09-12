@@ -55,3 +55,25 @@ test('update command requires yes for active cancellation', async () => {
   fs.mkdirSync(p.data, { recursive: true });
   await assert.rejects(() => updateCommand(p, ['--cancel-active']), /--yes/);
 });
+
+test('update activation calls daemon in order and runs updater once', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  const calls = []; let updates = 0;
+  const rpc = async (_s, command) => { calls.push(command); return command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'c1' } : { ready_for_activation: true }; };
+  await updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
+  assert.deepEqual(calls, ['drain', 'activate-ready']); assert.equal(updates, 1);
+});
+
+test('missing activation claim does not run updater', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true }); let updates = 0;
+  const rpc = async () => ({ ready_for_activation: true, activation_claim: null });
+  const result = await updateCommand(p, [], { callDaemon: rpc, updateInstallation: () => { updates += 1; } });
+  assert.equal(result.update, 'not_activated'); assert.equal(updates, 0);
+});
+
+test('matching activation receipt is idempotent', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true }); let updates = 0;
+  const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'same' } : { ready_for_activation: true };
+  const run = () => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
+  await run(); await run(); assert.equal(updates, 1);
+});
