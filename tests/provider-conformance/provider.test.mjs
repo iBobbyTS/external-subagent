@@ -20,7 +20,6 @@ for (const provider of providers) {
 }
 
 test('provider adapters do not share a workspace concurrently', () => {
-  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'cross_provider_shared_scheduler_contract', '--', '--nocapture'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' });
-  assert.match(output, /test result: ok/);
-  assert.match(output, /1 passed/);
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh::tests::cross_provider_shared_scheduler_contract', '--', '--exact', '--nocapture'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' });
+  assert.match(output, /test result: ok\. 1 passed/);
 });
