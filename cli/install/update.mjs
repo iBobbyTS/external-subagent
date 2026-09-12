@@ -24,8 +24,9 @@ export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
     const version = options.version || 'current';
-    const state = { schema_version: SCHEMA_VERSION, candidate: { version }, active: { version }, phase: 'active', updated_at_ms: Date.now() };
-    state.candidate = null;
+    const prior = readState(paths);
+    const failed = Array.isArray(options.failedHomes) && options.failedHomes.length > 0;
+    const state = { schema_version: SCHEMA_VERSION, candidate: failed ? { version } : null, active: failed ? prior.active : { version }, phase: failed ? (options.failedHomes.length === 1 ? 'partial' : 'failed') : 'active', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     return state;
   });
