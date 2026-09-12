@@ -292,6 +292,8 @@ pub enum RpcSuccess {
         resources_reaped: bool,
         ready_for_activation: bool,
         updater_fired: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        activation_claim: Option<String>,
     },
     AgentProbed {
         evidence: AgentProbeEvidence,
@@ -998,6 +1000,7 @@ impl RpcService {
                     resources_reaped: self.scheduler.resources_reaped(),
                     ready_for_activation: self.scheduler.ready_for_activation(),
                     updater_fired: self.scheduler.updater_fired(),
+                    activation_claim: None,
                 })
             }
             RpcMethod::DaemonDrainStatus => Ok(RpcSuccess::DaemonDrainStatus {
@@ -1006,15 +1009,17 @@ impl RpcService {
                 resources_reaped: self.scheduler.resources_reaped(),
                 ready_for_activation: self.scheduler.ready_for_activation(),
                 updater_fired: self.scheduler.updater_fired(),
+                activation_claim: None,
             }),
             RpcMethod::DaemonActivateReady => {
-                let fired = self.scheduler.fire_updater_once();
+                let claim = self.scheduler.claim_activation();
                 Ok(RpcSuccess::DaemonDrainStatus {
                     is_draining: self.scheduler.is_draining(),
                     active_count: self.scheduler.active_count(),
                     resources_reaped: self.scheduler.resources_reaped(),
                     ready_for_activation: self.scheduler.ready_for_activation(),
-                    updater_fired: fired || self.scheduler.updater_fired(),
+                    updater_fired: self.scheduler.updater_fired(),
+                    activation_claim: claim,
                 })
             }
             RpcMethod::AgentProbe { input } => {

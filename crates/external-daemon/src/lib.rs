@@ -2263,6 +2263,7 @@ struct SchedulerInner {
     state: Mutex<SchedulerState>,
     draining: AtomicBool,
     updater_fired: AtomicBool,
+    activation_claim: Mutex<Option<String>>,
 }
 
 #[cfg(test)]

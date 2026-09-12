@@ -26,7 +26,6 @@ export function updateInstallation(paths, options = {}) {
   return withLock(paths, () => {
     const version = options.version || 'current';
     const prior = readState(paths);
-    const failed = Array.isArray(options.failedHomes) && options.failedHomes.length > 0;
     const state = { schema_version: SCHEMA_VERSION, candidate: { version }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const sync = reconcileCodexHomes(paths, options);
