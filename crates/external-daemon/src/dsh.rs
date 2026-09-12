@@ -49,6 +49,8 @@ use crate::{
 pub enum DshSpawnGate {
     /// S04.A production state: the adapter exists but spawn is refused.
     Closed,
+    /// Production launch after the managed strict-plan preflight succeeds.
+    Enabled,
     /// Controlled test harness only; never constructed by the production
     /// composition root.
     #[cfg(test)]
@@ -67,6 +69,17 @@ impl DshRuntimeFactory {
     pub fn closed() -> Self {
         Self {
             gate: DshSpawnGate::Closed,
+            #[cfg(test)]
+            executable: None,
+        }
+    }
+
+    /// Construct the production factory.  The strict patch is resolved from
+    /// an explicit environment override so packaged binaries cannot depend on
+    /// their current working directory.
+    pub fn enabled() -> Self {
+        Self {
+            gate: DshSpawnGate::Enabled,
             #[cfg(test)]
             executable: None,
         }
@@ -92,6 +105,38 @@ impl RuntimeFactory for DshRuntimeFactory {
                 io::ErrorKind::PermissionDenied,
                 "dsh spawn gate is closed; production DSH spawn is not enabled",
             )),
+            DshSpawnGate::Enabled => {
+                let prepared = match task_route(_task) {
+                    Ok(crate::TaskRoute::General(prepared)) => prepared,
+                    Err(message) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, message))
+                    }
+                };
+                let executable = std::env::var_os("DSH_RUNTIME_PATH")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "DSH_RUNTIME_PATH is unavailable")
+                    })?;
+                let patch = std::env::var_os("DSH_STRICT_PLAN_PATCH")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "DSH_STRICT_PLAN_PATCH is unavailable",
+                        )
+                    })?;
+                external_agent_dsh::profile::preflight(&executable, &patch)
+                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                let mut launch = external_agent_dsh::profile::DshLaunch::new(
+                    Some(executable),
+                    prepared.workspace.path.clone(),
+                    std::env::var_os("DSH_HOME").map(PathBuf::from),
+                );
+                launch.permission_mode = Some("read-only".into());
+                launch.patch = Some(patch);
+                let command = external_agent_dsh::profile::resolve_launch(&launch)?;
+                Ok(Arc::new(DshRuntimeOwner::spawn(command, _sink)?))
+            }
             #[cfg(test)]
             DshSpawnGate::TestHarness => {
                 let prepared = match task_route(_task) {
