@@ -54,10 +54,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         DshRuntimeFactory::closed()
     };
-    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::new(
-        zcode,
-        dsh_factory,
-    ));
+    let runtime_factory: Arc<dyn RuntimeFactory> =
+        Arc::new(RoutingRuntimeFactory::new(zcode, dsh_factory));
     let scheduler = Scheduler::new(
         format!("agentd-{}", std::process::id()),
         store,
@@ -89,8 +87,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn dsh_production_enabled(path: Option<&Path>) -> bool {
     let Some(path) = path else { return false };
-    let Ok(bytes) = fs::read(path) else { return false };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
     let configured = value.pointer("/agents/dsh");
     configured
         .and_then(|entry| entry.get("enabled"))
