@@ -350,6 +350,16 @@ impl Scheduler {
     }
 
     fn recover_startup_task(&self, task: &TaskRecord) -> Result<(), SchedulerError> {
+        // Drain fences survive process exit. They never owned a runtime, so
+        // settle them through the same unstarted cancellation owner as RPC.
+        if task.phase == TaskPhase::Queued
+            && task.stop_requested
+            && task.runtime_agent_id.is_none()
+            && task.process_identity.is_none()
+        {
+            self.cancel_task(&task.agent_id)?;
+            return Ok(());
+        }
         match (&task.runtime_agent_id, &task.process_identity) {
             (Some(_), Some(identity)) => {
                 stop_and_reap_persisted_process_group(
@@ -2312,4 +2322,93 @@ pub fn configure_diagnostic_log(path: Option<PathBuf>) {
         Some(path) => DiagnosticLogger::start(RotatingDiagnosticWriter { path }).ok(),
         None => DiagnosticLogger::start(io::stderr()).ok(),
     });
+}
+
+#[cfg(test)]
+mod queued_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn fenced_queue_reopen_recovers_cancelled_without_spawn_and_becomes_ready() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&base).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("queued-recovery-")
+            .tempdir_in(base)
+            .unwrap();
+        let database = directory.path().join("state.sqlite");
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> io::Result<Command> {
+                panic!("startup recovery must never spawn a provider");
+            },
+        ));
+        let scheduler = Scheduler::new(
+            "before-exit",
+            Arc::new(Store::open(&database).unwrap()),
+            factory.clone(),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let task = scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: String::new(),
+                repository: directory.path().canonicalize().unwrap(),
+                permission_mode: external_core::PermissionMode::Build,
+                prompt: "never execute this fenced queue".into(),
+                write_manifest: vec![],
+            })
+            .unwrap()
+            .task;
+        scheduler.begin_drain();
+        scheduler.store().fence_queued_cancellation().unwrap();
+        assert_eq!(
+            scheduler
+                .store()
+                .get_task(&task.agent_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            TaskPhase::Queued
+        );
+        assert!(!scheduler.ready_for_activation());
+        drop(scheduler); // Exit before the asynchronous cancellation worker runs.
+
+        let reopened = Scheduler::new(
+            "after-exit",
+            Arc::new(Store::open(&database).unwrap()),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.reconcile_startup().unwrap(),
+            vec![(task.agent_id.clone(), TaskOutcome::Cancelled)]
+        );
+        let recovered = reopened.store().get_task(&task.agent_id).unwrap().unwrap();
+        assert_eq!(recovered.phase, TaskPhase::Terminal);
+        assert_eq!(recovered.outcome, Some(TaskOutcome::Cancelled));
+        assert!(recovered.reaped_at.is_some());
+        assert_eq!(recovered.owner_epoch, 0);
+        let result = reopened
+            .store()
+            .task_result(&task.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
+        assert!(reopened.start_ready().unwrap().is_empty());
+        assert!(reopened.reconcile_startup().unwrap().is_empty());
+        assert_eq!(
+            reopened
+                .store()
+                .task_result(&task.agent_id)
+                .unwrap()
+                .unwrap(),
+            result
+        );
+        reopened.begin_drain();
+        assert!(reopened.ready_for_activation());
+        assert!(reopened.claim_activation().is_some());
+    }
 }
