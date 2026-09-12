@@ -19,6 +19,7 @@ use std::process::Command;
 /// byte-equivalent (a drift test pins this) so a missing file never widens the
 /// composition at runtime.
 pub const BUILD_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/build.json");
+pub const STRICT_PLAN_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/strict-plan.json");
 
 /// Launch inputs for one DSH child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +135,29 @@ pub fn validate_build_profile(profile: &Value) -> Result<(), String> {
     Ok(())
 }
 
+pub fn strict_plan_profile() -> Result<Value, String> {
+    let profile: Value = serde_json::from_str(STRICT_PLAN_PROFILE_JSON)
+        .map_err(|error| format!("managed dsh strict profile is invalid: {error}"))?;
+    validate_strict_plan_profile(&profile)?;
+    Ok(profile)
+}
+
+pub fn validate_strict_plan_profile(profile: &Value) -> Result<(), String> {
+    if profile.get("agent").and_then(Value::as_str) != Some(crate::DSH_AGENT_NAME) {
+        return Err("strict dsh profile must declare agent=dsh".into());
+    }
+    let c = profile.get("composition").ok_or("strict dsh profile missing composition")?;
+    if c.get("sandbox").and_then(Value::as_str) != Some("read-only")
+        || c.get("permission_mode").and_then(Value::as_str) != Some("read-only")
+        || c.get("unknown_entry_policy").and_then(Value::as_str) != Some("fail-closed")
+        || c.get("write_manifest").and_then(Value::as_array).is_none()
+    { return Err("strict dsh profile must pin read-only fail-closed composition".into()); }
+    if c["write_manifest"].as_array().is_some_and(|v| !v.is_empty()) {
+        return Err("strict dsh profile cannot declare write_manifest entries".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +252,15 @@ mod tests {
         wrong_agent["agent"] = Value::String("zcode".into());
         assert!(validate_build_profile(&wrong_agent).is_err());
         assert!(validate_build_profile(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn strict_plan_profile_is_read_only_and_fail_closed() {
+        let profile = strict_plan_profile().unwrap();
+        assert_eq!(profile["composition"]["sandbox"], "read-only");
+        assert!(profile["composition"]["write_manifest"].as_array().unwrap().is_empty());
+        let mut widened = profile.clone();
+        widened["composition"]["write_manifest"] = serde_json::json!(["src/**"]);
+        assert!(validate_strict_plan_profile(&widened).is_err());
     }
 }
