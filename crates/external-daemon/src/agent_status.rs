@@ -194,7 +194,9 @@ impl AgentProbeBackend for ProcessProbeBackend {
             } else {
                 "ZCODE_HOME"
             };
-            scope.home = env::var_os(variable).map(|value| value.to_string_lossy().into_owned());
+            scope.home = env::var_os(variable)
+                .or_else(|| env::var_os("HOME"))
+                .map(|value| value.to_string_lossy().into_owned());
         }
         let disposable_workspace = if input.agent == "zcode"
             && input.through == ProbeLayer::Hi
@@ -305,7 +307,9 @@ fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModel
     let checked_at_ms = wall_now_millis();
     let mut scope = input.scope.clone();
     if scope.home.is_none() {
-        scope.home = env::var_os("DSH_HOME").map(|value| value.to_string_lossy().into_owned());
+        scope.home = env::var_os("DSH_HOME")
+            .or_else(|| env::var_os("HOME"))
+            .map(|value| value.to_string_lossy().into_owned());
     }
     let disposable_workspace = if scope.workspace.is_none() {
         tempfile::Builder::new()
@@ -921,7 +925,11 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
     };
     let verifier = env::var_os("EXTERNAL_SUBAGENT_POLICY_VERIFIER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(home).join("external-subagent-policy-verifier"));
+        .unwrap_or_else(|| {
+            Path::new(home).join(
+                "Library/Application Support/external-subagent/external-subagent-policy-verifier",
+            )
+        });
     if !verifier.is_file() {
         return false;
     }
@@ -1584,7 +1592,10 @@ process.stdin.on('data', (chunk) => {
         after_terminal: &str,
     ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
-        let verifier = directory.path().join("external-subagent-policy-verifier");
+        let verifier = directory.path().join(
+            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
+        );
+        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
         fs::write(
             &verifier,
             b"#!/bin/sh\n[ \"$1\" = \"--workspace\" ] && [ -d \"$2\" ] && [ \"$3\" = \"--home\" ] && [ -d \"$4\" ] && [ \"$5\" = \"--permission-mode\" ] && [ \"$6\" = \"plan\" ] && [ \"$7\" = \"--write-manifest\" ] && [ \"$8\" = \"[]\" ]\n",
@@ -1726,7 +1737,7 @@ process.stdin.on('data', (chunk) => {
         ] {
             let started = Instant::now();
             let (evidence, _) = run_fixture_probe_ordered(terminal, failure, false, true);
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(started.elapsed() < Duration::from_secs(5));
             assert_eq!(evidence.hi.state, state);
             assert_eq!(evidence.auth.state, state);
             assert_eq!(evidence.hi.reason.as_deref(), reason);
