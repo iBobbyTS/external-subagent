@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
+import { reconcileCodexHomes } from './reconcile.mjs';
 
 const SCHEMA_VERSION = 2;
 const lockPath = (paths) => path.join(paths.data, 'install.lock');
@@ -26,7 +27,12 @@ export function updateInstallation(paths, options = {}) {
     const version = options.version || 'current';
     const prior = readState(paths);
     const failed = Array.isArray(options.failedHomes) && options.failedHomes.length > 0;
-    const state = { schema_version: SCHEMA_VERSION, candidate: failed ? { version } : null, active: failed ? prior.active : { version }, phase: failed ? (options.failedHomes.length === 1 ? 'partial' : 'failed') : 'active', updated_at_ms: Date.now() };
+    const state = { schema_version: SCHEMA_VERSION, candidate: { version }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
+    atomicWrite(paths.state, jsonBytes(state));
+    const sync = reconcileCodexHomes(paths, options);
+    const ok = sync.homes.length === 0 || sync.all_updated;
+    state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
+    if (ok) { state.active = state.candidate; state.candidate = null; }
     atomicWrite(paths.state, jsonBytes(state));
     return state;
   });
