@@ -1,0 +1,12 @@
+{
+  "agent": "dsh",
+  "composition": {
+    "sandbox": "read-only",
+    "permission_mode": "read-only",
+    "unknown_entry_policy": "fail-closed",
+    "write_manifest": [],
+    "overlay": "managed-patch",
+    "allowed_tools": ["Read", "Glob", "Grep", "Observe"],
+    "denied_tools": ["Bash", "Pwsh", "Jobs", "FsWrite", "Cordis", "Workflow", "Subagent", "Skills", "Ralph", "Unknown"]
+  }
+}
