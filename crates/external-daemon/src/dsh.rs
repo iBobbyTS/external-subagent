@@ -1237,4 +1237,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
         assert!(scheduler.last_error(&agent_id).is_some());
     }
+
+    #[test]
+    fn dsh_pending_task_cancel_is_terminal_and_non_resurrecting() {
+        let workspace = dsh_workspace();
+        let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
+        let phase = scheduler.cancel_task(&agent_id).expect("cancel pending task");
+        assert_eq!(phase, TaskPhase::Cancelled);
+        assert_eq!(scheduler.cancel_task(&agent_id).unwrap(), TaskPhase::Cancelled);
+    }
 }
