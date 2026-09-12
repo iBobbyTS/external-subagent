@@ -16,11 +16,10 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const rpc = daemon.callDaemon || callDaemon;
   const begin = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
   let status = begin;
-  for (let i = 0; i < 30 && !status.ready_for_activation; i += 1) {
+  while (!status.ready_for_activation) {
     await new Promise((resolve) => setTimeout(resolve, 50));
     status = await rpc(socket, 'drain-status', {});
   }
-  if (!status.ready_for_activation) throw new Error('daemon drain timed out before activation readiness');
   const activation = await rpc(socket, 'activate-ready', {});
   if (!activation.activation_claim) return { ...status, activation_claim: null, update: 'not_activated' };
   if (prior?.status === 'success' && prior.claim === activation.activation_claim && prior.version === requestedVersion) return prior.result;

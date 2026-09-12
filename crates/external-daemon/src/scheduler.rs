@@ -226,6 +226,7 @@ impl Scheduler {
                 #[cfg(test)]
                 admission_hook: Mutex::new(None),
                 draining: AtomicBool::new(false),
+                drain_cancel_running: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
                 activation_claim: Mutex::new(None),
             }),
@@ -2007,6 +2008,46 @@ impl Scheduler {
         let _admission = self.inner.admission.lock().unwrap();
         self.inner.draining.store(true, Ordering::Release);
     }
+    /// Admission is already closed. A single worker uses the ordinary cancel
+    /// owner so uncooperative providers cannot hold the management RPC open.
+    pub(crate) fn cancel_draining_tasks(&self) -> Result<(), SchedulerError> {
+        if self.inner.drain_cancel_running.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let ids = match self.inner.store.nonterminal_task_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.inner
+                    .drain_cancel_running
+                    .store(false, Ordering::Release);
+                return Err(error.into());
+            }
+        };
+        let scheduler = self.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("drain-cancel".into())
+            .spawn(move || {
+                for agent_id in ids {
+                    if let Err(error) = scheduler.cancel_task(&agent_id) {
+                        scheduler.record_failure(&agent_id, error.to_string());
+                    }
+                }
+                scheduler
+                    .inner
+                    .drain_cancel_running
+                    .store(false, Ordering::Release);
+            })
+        {
+            self.inner
+                .drain_cancel_running
+                .store(false, Ordering::Release);
+            return Err(SchedulerError::InvalidConfig(format!(
+                "cannot start drain cancellation: {error}"
+            )));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn set_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.admission_hook.lock().unwrap() = Some(hook);
@@ -2016,6 +2057,7 @@ impl Scheduler {
     }
     pub fn ready_for_activation(&self) -> bool {
         self.is_draining()
+            && !self.inner.drain_cancel_running.load(Ordering::Acquire)
             && self.active_count() == 0
             && self.inner.store.active_count().unwrap_or(1) == 0
             && self

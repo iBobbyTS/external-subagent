@@ -75,7 +75,7 @@ function manifest(input) {
 function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
-    case 'drain': return { method: 'daemon_begin_drain' };
+    case 'drain': return { method: 'daemon_begin_drain', params: { cancel_active: input.cancel_active ?? false } };
     case 'drain-status': return { method: 'daemon_drain_status' };
     case 'activate-ready': return { method: 'daemon_activate_ready' };
     case 'agent-probe': return { method: 'agent_probe', params: { input } };

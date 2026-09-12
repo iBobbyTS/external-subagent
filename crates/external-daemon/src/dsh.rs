@@ -1659,4 +1659,208 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         );
         assert!(scheduler.store().task_result(&agent_id).unwrap().is_some());
     }
+    #[test]
+    fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
+        use crate::rpc::{MessageInput, RpcMethod, RpcOutcome, RpcService, RpcSuccess, TaskWaitQuery};
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // This child never finishes a prompt itself. Only the real cancellation
+        // and process-group reap path can make activation ready.
+        let child = scripted_child(
+            workspace.path(),
+            &BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        );
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let _request = await_pending_permission(&scheduler, &agent_id);
+        let queued_workspace = dsh_workspace();
+        let queued_id = enqueue_dsh(&scheduler, queued_workspace.path(), Some("fixture-model"));
+        let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
+        let passive = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": crate::rpc::RPC_VERSION, "request_id": "passive-upgrade",
+                "method": "daemon_begin_drain"
+            }))
+            .unwrap(),
+        );
+        let RpcOutcome::Success { result: passive } = passive.outcome else {
+            panic!("legacy drain request failed")
+        };
+        assert!(matches!(
+            *passive,
+            RpcSuccess::DaemonDrainStatus {
+                active_count: 1,
+                resources_reaped: false,
+                ready_for_activation: false,
+                ..
+            }
+        ));
+        assert!(!request_methods(&wire_frames(workspace.path())).contains(&"session/cancel"));
+        assert!(matches!(
+            service.dispatch(RpcMethod::DaemonActivateReady).unwrap(),
+            RpcSuccess::DaemonDrainStatus {
+                activation_claim: None,
+                ..
+            }
+        ));
+        // The gate is the existing scheduler admission owner, not a provider-
+        // specific spawn shortcut. Existing task operations remain real RPCs.
+        assert!(matches!(scheduler.enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "new spawn rejected"),
+            Some(dsh_admission(Some("fixture-model")))),
+            Err(SchedulerError::InvalidConfig(ref message)) if message == "daemon_draining"));
+        let send = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: agent_id.clone(),
+                message_id: "after-drain".into(),
+                mode: "queue".into(),
+                content: "must not run".into(),
+            }))
+            .unwrap_err();
+        assert_eq!(send.message, "daemon_draining");
+        assert!(scheduler.store().message("after-drain").unwrap().is_none());
+        service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                after_revision: 0,
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap();
+        service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: 0,
+                limit: 1024,
+            })
+            .unwrap();
+
+        // Use the wire decoder, so an ignored/unknown cancel_active parameter
+        // cannot pass even if a direct scheduler cancel test already passes.
+        let began = Instant::now();
+        let response = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": crate::rpc::RPC_VERSION, "request_id": "cancel-upgrade",
+                "method": "daemon_begin_drain", "params": { "cancel_active": true }
+            }))
+            .unwrap(),
+        );
+        assert!(
+            matches!(response.outcome, RpcOutcome::Success { .. }),
+            "{response:?}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "management RPC waited on provider control"
+        );
+        let mut callers = Vec::new();
+        for _ in 0..4 {
+            let service = Arc::clone(&service);
+            callers.push(thread::spawn(move || {
+                service
+                    .dispatch(RpcMethod::DaemonBeginDrain {
+                        cancel_active: true,
+                    })
+                    .unwrap()
+            }));
+        }
+        for caller in callers {
+            caller.join().unwrap();
+        }
+        let unreaped = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap();
+        assert!(matches!(
+            unreaped,
+            RpcSuccess::DaemonDrainStatus {
+                active_count: 1,
+                resources_reaped: false,
+                ready_for_activation: false,
+                ..
+            }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let status = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap();
+            if matches!(
+                status,
+                RpcSuccess::DaemonDrainStatus {
+                    active_count: 0,
+                    resources_reaped: true,
+                    ready_for_activation: true,
+                    ..
+                }
+            ) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "drain did not wait for runtime reap: {status:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            began.elapsed() > Duration::from_secs(6),
+            "fixture must outlast the CLI RPC deadline"
+        );
+        let queued = scheduler.store().get_task(&queued_id).unwrap().unwrap();
+        assert_eq!(queued.phase, TaskPhase::Terminal);
+        assert_eq!(queued.outcome, Some(TaskOutcome::Cancelled));
+        assert!(!queued_workspace.path().join("wire.jsonl").exists());
+        let frames = wait_for_frames(workspace.path(), 5);
+        assert_eq!(
+            request_methods(&frames)
+                .iter()
+                .filter(|m| **m == "session/cancel")
+                .count(),
+            1
+        );
+        let stored = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(stored.phase, TaskPhase::Terminal);
+        assert_eq!(stored.outcome, Some(TaskOutcome::Cancelled));
+        let result = scheduler.store().task_result(&agent_id).unwrap().unwrap();
+        service
+            .dispatch(RpcMethod::TaskCancel {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                after_revision: 0,
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap();
+        service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: 0,
+                limit: 1024,
+            })
+            .unwrap();
+        service
+            .dispatch(RpcMethod::TaskClose {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        assert!(scheduler.start_ready().unwrap().is_empty());
+        assert_eq!(
+            scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+            result
+        );
+        assert_eq!(scheduler.active_count(), 0);
+        assert!(matches!(
+            service.dispatch(RpcMethod::DaemonDrainStatus).unwrap(),
+            RpcSuccess::DaemonDrainStatus {
+                resources_reaped: true,
+                ready_for_activation: true,
+                ..
+            }
+        ));
+    }
+
+
 }

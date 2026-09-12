@@ -1175,6 +1175,20 @@ impl Store {
         Ok(())
     }
 
+    /// Daemon management snapshot after admission closes. Unlike startup
+    /// recovery this includes queued tasks which explicit drain cancellation
+    /// must settle without starting a provider.
+    pub fn nonterminal_task_ids(&self) -> StoreResult<Vec<String>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT agent_id FROM tasks WHERE phase != 'TERMINAL' ORDER BY created_at,rowid",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
     pub fn startup_recovery_tasks(&self) -> StoreResult<Vec<TaskRecord>> {
         let connection = self.connection.lock().unwrap();
         let mut statement = connection.prepare(
@@ -2136,6 +2150,31 @@ mod tests {
             final_text: "terminal text".into(),
             partial: outcome != TaskOutcome::Completed,
         }
+    }
+
+    #[test]
+    fn management_nonterminal_ids_include_queued_and_running_but_not_terminal() {
+        let (_directory, _path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("10000001", "/one", None))
+            .unwrap();
+        store
+            .enqueue_task_authoritative(&task("10000002", "/two", None))
+            .unwrap();
+        running(&store, "10000001");
+        assert_eq!(
+            store.nonterminal_task_ids().unwrap(),
+            vec!["10000001", "10000002"]
+        );
+        store.request_stop("10000002").unwrap();
+        assert_eq!(
+            store.nonterminal_task_ids().unwrap(),
+            vec!["10000001", "10000002"]
+        );
+        store
+            .store_task_result("10000002", &result(TaskOutcome::Cancelled))
+            .unwrap();
+        assert_eq!(store.nonterminal_task_ids().unwrap(), vec!["10000001"]);
     }
 
     #[test]
