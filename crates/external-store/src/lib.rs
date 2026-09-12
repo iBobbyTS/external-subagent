@@ -1586,6 +1586,17 @@ impl Store {
         )?;
         i64_to_u64(count)
     }
+
+    /// Returns whether every terminal task has a durable runtime cleanup receipt.
+    pub fn terminal_resources_reaped(&self) -> StoreResult<bool> {
+        let connection = self.connection.lock().unwrap();
+        let pending: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE phase='TERMINAL' AND reaped_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(pending == 0)
+    }
 }
 
 fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
