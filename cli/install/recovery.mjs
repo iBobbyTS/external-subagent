@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional, sha256 } from '../fs-atomic.mjs';
 
@@ -48,6 +49,37 @@ export function removeCreatedDirectories(directories) {
   for (const [name, directory] of Object.entries(directories)) {
     if (!directory.existed && fs.existsSync(directory.path)) {
       try { fs.rmSync(directory.path, { recursive: true, force: true }); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+  }
+  return rollbackErrors;
+}
+
+// Roll back the product-owned half of the Codex binding after a failed init:
+// the marketplace manifest returns to its prior bytes, a staging tree this
+// init created is removed, and directories this init created disappear while
+// they are empty.  Directories that already existed — a pre-created
+// CODEX_HOME, or one codex populated with its official cache — are never
+// emptied or deleted; the codex-owned cache is not ours to roll back.  The
+// product-namespaced marketplace root is the one exception: it is pruned
+// whenever codex left it empty.
+export function rollbackCodexArtifacts(artifacts) {
+  const rollbackErrors = [];
+  try {
+    restoreSnapshotFile(artifacts.marketplace.file, artifacts.marketplace.snapshot);
+  } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+  if (!artifacts.staging.existed && fs.existsSync(artifacts.staging.path)) {
+    try { fs.rmSync(artifacts.staging.path, { recursive: true, force: true }); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+  }
+  const prunable = (directory) => directory === artifacts.productRoot
+    || directory.startsWith(`${artifacts.productRoot}${path.sep}`)
+    || !artifacts.preexisting.has(directory);
+  const deepestFirst = [...artifacts.directories].sort((a, b) => b.length - a.length);
+  for (const directory of deepestFirst) {
+    if (!prunable(directory)) continue;
+    try { fs.rmdirSync(directory); } catch (error) {
+      // ENOTEMPTY means codex or the user owns the remaining content; ENOENT
+      // means nothing was created there.  Neither is a rollback failure.
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTEMPTY') rollbackErrors.push(error);
     }
   }
   return rollbackErrors;

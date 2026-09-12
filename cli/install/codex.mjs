@@ -5,7 +5,6 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, readOptional } from '../fs-atomic.mjs';
-import { codexConfigPath } from '../paths.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
 
 // Managed Codex binding.  The staging tree plus a local source marketplace are
@@ -64,7 +63,7 @@ function pluginManifest(source) {
   return manifest;
 }
 
-function treeDigest(root) {
+export function treeDigest(root) {
   const hash = crypto.createHash('sha256');
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).forEach((entry) => {
     const target = path.join(dir, entry.name);
@@ -130,7 +129,7 @@ function updateMarketplace(file, staging) {
   return { marketplace: file, marketplace_name: doc.name || MARKETPLACE_NAME, entry: rel, digest: treeDigest(staging) };
 }
 
-function resolveStaging(home, options) {
+export function resolveStaging(home, options) {
   let staging = options.stagingPath || path.join(home, 'plugins', PLUGIN_NAME);
   let marketplace = options.marketplacePath || path.join(home, '.agents', 'plugins', 'marketplace.json');
   // The default ~/.agents file can be an installed-registry projection, not a
@@ -228,7 +227,9 @@ function removeTomlSection(text, section) {
 }
 
 export function installMcp(paths, options = {}) {
-  const config = options.configPath || codexConfigPath(paths.home);
+  // The TOML binding lives inside the Codex home, so an explicit --codex-home
+  // (then CODEX_HOME) selects the config file for install and removal alike.
+  const config = options.configPath || path.join(codexHomeFor(options, paths), 'config.toml');
   const command = nativeBinary('external-subagent-mcp');
   if (options.dryRun) {
     return { dry_run: true, operation: options.uninstall ? 'uninstall' : 'install', platform: 'codex', config, command, socket: paths.socket };
