@@ -45,12 +45,18 @@ export function updateInstallation(paths, options = {}) {
     }
     const prior = readState(paths);
     const verifiedVersion = payload?.version || version;
+    if (payload && version !== verifiedVersion) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${verifiedVersion}`);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const sync = reconcileCodexHomes(paths, options);
     const ok = sync.homes.length === 0 || sync.all_updated;
     state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
-    if (ok) { state.active = state.candidate; state.candidate = null; if (candidateRoot) state.active.entry = path.join(candidateRoot, 'bin', 'external-subagent.mjs'); }
+    if (ok && candidateRoot) {
+      const entry = path.join(candidateRoot, 'bin', 'external-subagent.mjs');
+      let stat; try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_ENTRY_MISSING', 'candidate stable entry is missing'); }
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be a regular file');
+      state.active = state.candidate; state.candidate = null; state.active.entry = entry;
+    } else if (ok) { state.active = state.candidate; state.candidate = null; }
     atomicWrite(paths.state, jsonBytes(state));
     return state;
   });
