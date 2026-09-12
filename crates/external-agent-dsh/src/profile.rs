@@ -196,20 +196,41 @@ pub fn preflight(executable: &std::path::Path, patch: &std::path::Path) -> Resul
 
 fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
     const DANGEROUS: &[&str] = &[
-        "tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-skill",
-        "tool-subagent", "tool-subagent-fork", "tool-subagent-control",
-        "tool-subagent-list-agents", "subagent", "subagent-spawn-in-process",
-        "subagent-fork-in-process", "tool-workflow", "tool-goal", "tool-ralph",
-        "subprocess", "bash-sandbox", "pwsh-sandbox", "skill-filesystem",
-        "workflow-worker-thread", "goal-round-driver",
+        "tool-bash",
+        "tool-pwsh",
+        "tool-jobs",
+        "tool-fs",
+        "tool-skill",
+        "tool-subagent",
+        "tool-subagent-fork",
+        "tool-subagent-control",
+        "tool-subagent-list-agents",
+        "subagent",
+        "subagent-spawn-in-process",
+        "subagent-fork-in-process",
+        "tool-workflow",
+        "tool-goal",
+        "tool-ralph",
+        "subprocess",
+        "bash-sandbox",
+        "pwsh-sandbox",
+        "skill-filesystem",
+        "workflow-worker-thread",
+        "goal-round-driver",
     ];
     let mut saw_policy = false;
     fn walk(v: &serde_yaml::Value, saw: &mut bool) -> Result<(), String> {
         match v {
             serde_yaml::Value::Mapping(m) => {
-                let id = m.get(serde_yaml::Value::String("id".into())).and_then(|v| v.as_str());
-                let disabled = m.get(serde_yaml::Value::String("disabled".into())).and_then(|v| v.as_bool());
-                if matches!(id, Some("sandbox-policy" | "approval")) { *saw = true; }
+                let id = m
+                    .get(serde_yaml::Value::String("id".into()))
+                    .and_then(|v| v.as_str());
+                let disabled = m
+                    .get(serde_yaml::Value::String("disabled".into()))
+                    .and_then(|v| v.as_bool());
+                if matches!(id, Some("sandbox-policy" | "approval")) {
+                    *saw = true;
+                }
                 if id.is_some_and(|id| DANGEROUS.contains(&id)) && disabled != Some(true) {
                     return Err(format!("dangerous DSH entry is enabled: {id:?}"));
                 }
