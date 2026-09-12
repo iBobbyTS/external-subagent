@@ -21,7 +21,7 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -3338,6 +3338,11 @@ mod admission_tests {
         }
     }
 
+    fn static_env_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn canonical_admission_precedence_and_dsh_gate() {
         let mut input = input(Path::new("/repository"));
@@ -3360,10 +3365,21 @@ mod admission_tests {
         config.agents.get_mut("dsh").unwrap().enabled = true;
         config.agents.get_mut("dsh").unwrap().spawn_supported = true;
         input.model = Some("opaque-token".into());
+        let env_guard = static_env_guard().lock().unwrap();
+        let previous_runtime = env::var_os("DSH_RUNTIME_PATH");
+        env::set_var("DSH_RUNTIME_PATH", "relative/runtime");
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentUnsupported
         );
+        let runtime = tempfile::NamedTempFile::new().unwrap();
+        env::set_var("DSH_RUNTIME_PATH", runtime.path());
+        let identity = resolve_admission(&input, &config).unwrap();
+        assert_eq!(identity.agent, "dsh");
+        assert_eq!(identity.model.as_deref(), Some("opaque-token"));
+        assert_eq!(identity.model_source, "catalog");
+        match previous_runtime { Some(value) => env::set_var("DSH_RUNTIME_PATH", value), None => env::remove_var("DSH_RUNTIME_PATH") }
+        drop(env_guard);
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
         config.agents.get_mut("zcode").unwrap().spawn_supported = false;
