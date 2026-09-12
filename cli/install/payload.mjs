@@ -58,12 +58,15 @@ export function verifyPayload(options = {}) {
   }
   const dir = options.root ? path.join(options.root, 'npm', 'native', platform) : nativePayloadDir(platform);
   const files = manifest.files.map((record) => {
+    if (!record || typeof record.name !== 'string' || path.basename(record.name) !== record.name || record.name.includes('..')) {
+      throw new CliError('PAYLOAD_MANIFEST_INVALID', 'payload file name must be a direct child');
+    }
     const target = path.join(dir, record.name);
     let stat;
     try { stat = fs.statSync(target); } catch (error) {
       throw new CliError('PAYLOAD_FILE_MISSING', `native payload file is missing: ${record.name} (${error.code})`);
     }
-    if (!stat.isFile() || (stat.mode & 0o777) !== 0o755) {
+    if (!stat.isFile() || fs.lstatSync(target).isSymbolicLink() || (stat.mode & 0o777) !== 0o755) {
       throw new CliError('PAYLOAD_PERMISSIONS_INVALID', `native payload file ${record.name} must be a regular file with mode 755`);
     }
     const bytes = fs.readFileSync(target);

@@ -44,12 +44,13 @@ export function updateInstallation(paths, options = {}) {
       throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
     }
     const prior = readState(paths);
-    const state = { schema_version: SCHEMA_VERSION, candidate: { version, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
+    const verifiedVersion = payload?.version || version;
+    const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const sync = reconcileCodexHomes(paths, options);
     const ok = sync.homes.length === 0 || sync.all_updated;
     state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
-    if (ok) { state.active = state.candidate; state.candidate = null; if (candidateRoot) state.active.entry = path.join(candidateRoot, 'bin', 'external-subagent'); }
+    if (ok) { state.active = state.candidate; state.candidate = null; if (candidateRoot) state.active.entry = path.join(candidateRoot, 'bin', 'external-subagent.mjs'); }
     atomicWrite(paths.state, jsonBytes(state));
     return state;
   });
