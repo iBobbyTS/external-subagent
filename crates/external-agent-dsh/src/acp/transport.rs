@@ -57,15 +57,15 @@ pub fn initialize_params() -> Value {
 }
 
 pub fn session_new_params(cwd: &Path) -> Value {
-    json!({ "cwd": cwd.to_string_lossy() })
+    json!({ "cwd": cwd.to_string_lossy(), "mcpServers": [] })
 }
 
-pub fn set_config_option_params(config_id: &str, value: &str) -> Value {
-    json!({ "configId": config_id, "value": value })
+pub fn set_config_option_params(session_id: &str, config_id: &str, value: &str) -> Value {
+    json!({ "sessionId": session_id, "configId": config_id, "value": value })
 }
 
-pub fn prompt_params(prompt: &str) -> Value {
-    json!({ "prompt": prompt })
+pub fn prompt_params(session_id: &str, prompt: &str) -> Value {
+    json!({ "sessionId": session_id, "prompt": [{"type":"text", "text": prompt}] })
 }
 
 pub fn cancel_params(session_id: &str) -> Value {
@@ -100,7 +100,8 @@ pub fn parse_initialize_result(result: &Value) -> Result<InitializeResult, Shape
             "initialize returned unsupported protocolVersion {protocol_version}"
         )));
     }
-    let capabilities = result.get("capabilities").cloned().unwrap_or(Value::Null);
+    let capabilities = result.get("agentCapabilities").or_else(|| result.get("capabilities"))
+        .cloned().unwrap_or(Value::Null);
     let flag = |key: &str| {
         capabilities
             .get(key)

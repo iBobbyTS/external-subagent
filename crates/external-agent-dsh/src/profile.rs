@@ -87,6 +87,7 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
     } else {
         Command::new(executable)
     };
+    command.arg("--profile").arg("acp");
     command.current_dir(&launch.workspace);
     if let Some(home) = launch.home.as_deref() {
         if !home.is_absolute() {
