@@ -15,3 +15,8 @@ The shared executable-version check applies the same process-group and increment
 S04 live status (2026-09-12): **PARTIALLY VERIFIED** against DSH `0.1.5-rc.1` in a disposable workspace. Real ACP `initialize`, `session/new`, and `session/prompt` completed; the default-model prompt returned `LIVE_OK` with `end_turn`. Under the strict patch profile, shell/write probing exposed only the expected `glob`/`grep` operations and created no target file.
 
 These observations validate the ACP wire path and the bounded strict-plan probe. Production daemon routing is implemented behind the explicit `enabled + spawn_supported + DSH_RUNTIME_PATH` gate; an isolated daemon smoke completed `spawn → wait → result → close` with `DAEMON_LIVE_OK`, `COMPLETED`, and `resources_reaped=true`. Provider `hi`/authentication, cancellation/restart, and Codex/ZCode host integration remain **NOT_RUN**. The default configuration remains closed; this document does not claim that an unconfigured deployment is enabled.
+
+An isolated strict-plan daemon submission later failed closed during managed
+preflight on the installed `subagent` entry; the task was reaped and the
+workspace remained empty. This confirms the safety refusal path, but not a
+successful strict-plan prompt.
