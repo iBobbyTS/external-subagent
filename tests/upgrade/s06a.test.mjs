@@ -77,3 +77,11 @@ test('matching activation receipt is idempotent', async () => {
   const run = () => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
   await run(); await run(); assert.equal(updates, 1);
 });
+
+test('failed update preserves a failed activation receipt', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'bad' } : { ready_for_activation: true };
+  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => { throw new Error('boom'); } }), /boom/);
+  const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+  assert.deepEqual({ claim: receipt.claim, version: receipt.version, status: receipt.status, error: receipt.error }, { claim: 'bad', version: '2', status: 'failed', error: 'boom' });
+});
