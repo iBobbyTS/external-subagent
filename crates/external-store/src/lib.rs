@@ -1206,6 +1206,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT agent_id FROM tasks
              WHERE phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
+                OR (phase='QUEUED' AND stop_requested=1)
                 OR (phase='TERMINAL' AND reaped_at IS NULL)
              ORDER BY created_at,rowid",
         )?;
@@ -2436,6 +2437,28 @@ mod tests {
         let task = store.get_task("agent").unwrap().unwrap();
         assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
         assert!(task.closed_at.is_some());
+    }
+
+    #[test]
+    fn startup_recovery_includes_fenced_queue_but_preserves_unfenced_queue() {
+        let (_directory, path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("fenced", "/one", None))
+            .unwrap();
+        store.fence_queued_cancellation().unwrap();
+        store
+            .enqueue_task_authoritative(&task("ordinary", "/two", None))
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(path).unwrap();
+        let recovery = reopened.startup_recovery_tasks().unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].agent_id, "fenced");
+        assert_eq!(recovery[0].phase, TaskPhase::Queued);
+        assert!(recovery[0].stop_requested);
+        assert!(reopened.task_result("fenced").unwrap().is_none());
+        let ordinary = reopened.claim_next("claim-loop", 10, 1).unwrap().unwrap();
+        assert_eq!(ordinary.task.agent_id, "ordinary");
     }
 
     #[test]
