@@ -105,6 +105,21 @@ pub fn parse_initialize_result(result: &Value) -> Result<InitializeResult, Shape
         .or_else(|| result.get("capabilities"))
         .cloned()
         .unwrap_or(Value::Null);
+    let official_nested = result.get("agentCapabilities").is_some()
+        && capabilities
+            .get("mcpCapabilities")
+            .is_some_and(Value::is_object)
+        && capabilities
+            .get("promptCapabilities")
+            .is_some_and(Value::is_object)
+        && capabilities
+            .get("sessionCapabilities")
+            .and_then(Value::as_object)
+            .is_some_and(|session| {
+                ["close", "list", "resume"]
+                    .iter()
+                    .all(|key| session.get(*key).is_some_and(Value::is_object))
+            });
     let flag = |key: &str| {
         capabilities
             .get(key)
@@ -115,8 +130,12 @@ pub fn parse_initialize_result(result: &Value) -> Result<InitializeResult, Shape
         protocol_version,
         capabilities: AcpCapabilities {
             models: flag("models"),
-            cancel: flag("cancel"),
-            permission: flag("permission"),
+            // Official DSH ACP 0.1.5-rc.1 nests these session methods and
+            // relies on its managed permission plugin rather than advertising
+            // a flat permission flag. The profile preflight verifies that
+            // plugin's effective workspace-write/ask composition.
+            cancel: flag("cancel") || official_nested,
+            permission: flag("permission") || official_nested,
         },
     })
 }
@@ -223,6 +242,39 @@ mod tests {
             permission: true
         })
         .is_err());
+    }
+
+    #[test]
+    fn official_nested_agent_capabilities_are_accepted() {
+        let result = parse_initialize_result(&json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "mcpCapabilities": {"http": true},
+                "promptCapabilities": {"image": false, "audio": false},
+                "sessionCapabilities": {"close": {}, "list": {}, "resume": {}}
+            }
+        }))
+        .unwrap();
+        assert!(result.capabilities.cancel);
+        assert!(result.capabilities.permission);
+        assert!(require_build_capabilities(&result.capabilities).is_ok());
+    }
+
+    #[test]
+    fn incomplete_nested_capabilities_remain_fail_closed() {
+        for capabilities in [
+            json!({}),
+            json!({"mcpCapabilities": {}, "promptCapabilities": {}, "sessionCapabilities": {"close": null, "list": {}, "resume": {}}}),
+            json!({"sessionCapabilities": {"close": {}, "list": {}, "resume": {}}}),
+            json!({"sessionCapabilities": {"close": {}, "list": {}}}),
+            json!({"mcpCapabilities": {}, "promptCapabilities": {}}),
+        ] {
+            let parsed = parse_initialize_result(
+                &json!({"protocolVersion": 1, "agentCapabilities": capabilities}),
+            )
+            .unwrap();
+            assert!(require_build_capabilities(&parsed.capabilities).is_err());
+        }
     }
 
     #[test]
