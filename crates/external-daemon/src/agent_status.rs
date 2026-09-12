@@ -5,6 +5,7 @@ use external_contract::{
     SESSION_SEND, SESSION_SUBSCRIBE,
 };
 use external_runtime::{Driver, Inbound, RequestError};
+use external_agent_dsh::{acp::session::AcpSession, profile::{resolve_launch, DshLaunch}};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
@@ -227,16 +228,9 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let mut hi = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "hi_not_probed");
 
         if input.agent == "dsh" && input.through != ProbeLayer::Local {
-            auth = ScopeEvidence::unknown(
-                scope.clone(),
-                checked_at_ms,
-                "dsh_production_adapter_unavailable",
-            );
-            hi = ScopeEvidence::unknown(
-                scope.clone(),
-                checked_at_ms,
-                "dsh_production_adapter_unavailable",
-            );
+            let (a, h) = probe_dsh_hi(executable.as_deref(), &scope, local.version.clone(), checked_at_ms);
+            auth = a;
+            hi = h;
         } else if input.agent == "zcode" && input.through != ProbeLayer::Local {
             if local.state != EvidenceState::Ready {
                 auth = derived_failure(&local, scope.clone(), checked_at_ms);
@@ -281,6 +275,20 @@ impl AgentProbeBackend for ProcessProbeBackend {
             input,
         )
     }
+}
+
+fn probe_dsh_hi(path: Option<&Path>, scope: &ProbeScope, version: Option<String>, checked: u64) -> (ScopeEvidence, ScopeEvidence) {
+    let unavailable = |reason: &str| { let e = ScopeEvidence { state: EvidenceState::Unavailable, scope: scope.clone(), version: version.clone(), checked_at_ms: checked, reason: Some(reason.into()) }; (e.clone(), e) };
+    let Some(workspace) = scope.workspace.as_deref() else { return unavailable("workspace_missing"); };
+    let launch = DshLaunch::new(path.map(PathBuf::from), workspace, scope.home.as_ref().map(PathBuf::from));
+    let mut command = match resolve_launch(&launch) { Ok(c) => c, Err(_) => return unavailable("auth_hi_unavailable") };
+    command.current_dir(workspace);
+    let driver = match Driver::spawn_with_codec(command, external_runtime::FrameCodec::JsonRpc2) { Ok(d) => Arc::new(d), Err(_) => return unavailable("network") };
+    let mut session = AcpSession::new(Arc::clone(&driver));
+    let result = (|| { session.initialize(LOCAL_PROBE_TIMEOUT)?; session.new_session(Path::new(workspace), LOCAL_PROBE_TIMEOUT)?; let (_, pending) = session.prompt("Reply with exactly hi. Do not call tools.")?; pending.wait(LOCAL_PROBE_TIMEOUT).map_err(external_agent_dsh::acp::session::SessionError::from)?; Ok::<(), external_agent_dsh::acp::session::SessionError>(()) })();
+    let _ = session.close(LOCAL_PROBE_TIMEOUT);
+    let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
+    match result { Ok(()) => { let e = ScopeEvidence { state: EvidenceState::Ready, scope: scope.clone(), version, checked_at_ms: checked, reason: None }; (e.clone(), e) }, Err(e) => unavailable(if e.to_string().contains("auth") { "auth unavailable" } else { "hi unavailable" }) }
 }
 
 fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutput {
