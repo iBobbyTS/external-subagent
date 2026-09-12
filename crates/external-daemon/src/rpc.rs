@@ -1674,7 +1674,7 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
     }
     for field in ["runtime", "database", "socket"] {
         if let Some(value) = object.get(field) {
-            if !value.is_string() {
+            if !value.as_str().is_some_and(|value| !value.is_empty()) {
                 return Err(RpcError::new(
                     RpcErrorCode::Validation,
                     "agent config path fields must be non-null strings",
@@ -1706,6 +1706,25 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
             .entry("spawn_supported")
             .or_insert(Value::Bool(default_enabled));
         entry.entry("default_model").or_insert(Value::Null);
+        if !entry.get("enabled").is_some_and(Value::is_boolean)
+            || !entry.get("spawn_supported").is_some_and(Value::is_boolean)
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "agent config flags must be booleans",
+            ));
+        }
+        if let Some(model) = entry.get("default_model") {
+            if model.as_str().is_some_and(str::is_empty)
+                || (name == "zcode" && !model.is_null())
+                || (!model.is_null() && !model.is_string())
+            {
+                return Err(RpcError::new(
+                    RpcErrorCode::Validation,
+                    "agent config model selection is invalid",
+                ));
+            }
+        }
     }
     Ok(())
 }

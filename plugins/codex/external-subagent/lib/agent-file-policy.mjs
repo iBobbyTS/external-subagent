@@ -165,9 +165,11 @@ function pathAllowedForRead(state, value) {
 }
 
 function withinManifest(root, value, manifest) {
-  const candidate = path.normalize(path.isAbsolute(value) ? value : path.join(root, value));
+  const candidate = resolveCanonicalPath(root, value);
+  if (!candidate) return false;
   return manifest.some((entry) => {
-    const target = path.normalize(path.join(root, entry));
+    const target = resolveCanonicalPath(root, entry);
+    if (!target) return false;
     return candidate === target || candidate.startsWith(`${target}${path.sep}`);
   });
 }
