@@ -24,6 +24,15 @@ test('upgrade writes versioned candidate and active pointer atomically', () => {
   assert.equal(state.candidate, null);
 });
 
+test('stale install lock is recovered with evidence from dead pid', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  fs.writeFileSync(path.join(p.data, 'install.lock'), JSON.stringify({ pid: 2147483647, started_at_ms: 1 }));
+  const result = updateInstallation(p, { version: packageVersion() });
+  assert.equal(result.phase, 'active');
+  assert.equal(fs.existsSync(path.join(p.data, 'install.lock')), false);
+});
+
 test('upgrade rejects unavailable payload versions before publishing active state', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-'));
   const p = paths(root);
