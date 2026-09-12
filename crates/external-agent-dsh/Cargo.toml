@@ -9,3 +9,6 @@ external-contract = { path = "../external-contract" }
 external-runtime = { path = "../external-runtime" }
 serde_json = "1"
 serde_yaml = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
