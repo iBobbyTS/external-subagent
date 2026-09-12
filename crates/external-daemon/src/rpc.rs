@@ -1468,7 +1468,7 @@ fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSup
     }
 }
 
-fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
+fn permission_modes(_agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
     if !entry.enabled || !entry.spawn_supported {
         return Vec::new();
     }

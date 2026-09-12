@@ -219,6 +219,18 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         "goal-round-driver",
     ];
     const ALLOWED_ENABLED: &[&str] = &[
+        "timer", "llm", "deepseek-llm-api-extensions", "session",
+        "session-log-deepseek", "typert", "typert-loader", "typert-gateway",
+        "session-title", "user-questions", "agent", "plugin-package-inventory-deepseek",
+        "agent-default-model", "llm-retry", "settings", "credentials", "llm-pi-ai",
+        "attachment-local", "session-query-sqlite", "session-projection", "storage",
+        "storage-json", "storage-domain", "session-projection-cache", "session-telemetry-otel",
+        "permission", "shell-env", "fs-observation-policy", "agent-instructions", "commands",
+        "command-feedback", "goal", "command-goal", "plan-mode", "token-meter",
+        "compaction-basic", "command-compact", "timeout-policy", "spill-local", "spill-policy",
+        "session-checkpoint-policy", "tool-result-pruner", "tool-todo", "repeat-tool-reminder",
+        "web", "web-search-deepseek", "web-fetch-http", "tool-web", "tools", "system-prompt",
+        "agent-loop", "fs-sandbox", "llm-deepseek", "acp-app-startup", "acp",
         "observe",
         "tool-observe",
         "tool-read",
