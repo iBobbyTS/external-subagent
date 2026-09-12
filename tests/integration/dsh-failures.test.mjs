@@ -36,6 +36,18 @@ test('runtime observes bounded oversized and reap failure paths', () => {
   assert.match(output, /test result: ok/);
 });
 
+test('daemon DSH lifecycle oracle covers cancellation, max_tokens and reap', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'build_task_flows_model_permission_and_result_through_the_shared_lifecycle', '--nocapture'], { cwd, encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
+});
+
+test('daemon DSH max_tokens oracle preserves failed settlement', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'max_tokens_settlement_fails_the_task_without_faking_completion', '--nocapture'], { cwd, encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
+});
+
 test('runtime executes malformed, EOF and oversized frame or cancellation oracles', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
   const output = execFileSync('cargo', ['test', '-p', 'external-runtime'], { cwd, encoding: 'utf8' });
