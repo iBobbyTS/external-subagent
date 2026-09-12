@@ -551,6 +551,16 @@ mod tests {
     }
 
     #[test]
+    fn strict_plan_admission_rejects_non_empty_write_manifest() {
+        let error = super::validate_write_scope(
+            PermissionMode::Plan,
+            &[std::path::PathBuf::from("src/main.rs")],
+        )
+        .expect_err("plan admission must reject writes");
+        assert!(error.to_string().contains("plan mode does not accept"));
+    }
+
+    #[test]
     fn permission_mode_maps_to_internal_policy() {
         assert_eq!(
             PermissionMode::Plan.access_mode(),
