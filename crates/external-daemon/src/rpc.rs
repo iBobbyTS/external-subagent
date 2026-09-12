@@ -1619,12 +1619,17 @@ fn resolve_admission(
             format!("agent {agent} is unsupported; prompt_count=0"),
         ));
     }
+    let (model, model_source) = if agent == "dsh" {
+        (input.model.clone(), "catalog")
+    } else {
+        (None, "native")
+    };
     Ok(external_core::AdmissionIdentity {
         agent: agent.to_owned(),
         config_revision: config.revision,
         adapter_version: env!("CARGO_PKG_VERSION").into(),
-        model: None,
-        model_source: "native".into(),
+        model,
+        model_source: model_source.into(),
     })
 }
 
@@ -3345,8 +3350,11 @@ mod admission_tests {
         );
         config.agents.get_mut("dsh").unwrap().enabled = true;
         config.agents.get_mut("dsh").unwrap().spawn_supported = true;
+        input.model = Some("opaque-token".into());
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
+        assert_eq!(identity.model.as_deref(), Some("opaque-token"));
+        assert_eq!(identity.model_source, "catalog");
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
         config.agents.get_mut("zcode").unwrap().spawn_supported = false;
