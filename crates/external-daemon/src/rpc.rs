@@ -3423,4 +3423,10 @@ mod agent_probe_tests {
             AgentConfigSnapshot::default().revision
         );
     }
+
+    #[test]
+    fn draining_management_methods_are_public_rpc_names() {
+        assert!(RpcMethod::is_known("daemon_begin_drain"));
+        assert!(RpcMethod::is_known("daemon_drain_status"));
+    }
 }
