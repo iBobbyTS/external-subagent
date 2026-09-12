@@ -2917,6 +2917,9 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
     match error {
         SchedulerError::Store(error) => map_store(error),
         SchedulerError::InvalidConfig(message) => {
+            if message == "daemon_draining" {
+                return RpcError::new(RpcErrorCode::Unavailable, "daemon_draining");
+            }
             // Preserve the bounded, actionable preparation reason. The MCP
             // facade may still redact it for callers, but RPC diagnostics
             // must distinguish repository, path, budget, and state errors.
@@ -2935,6 +2938,8 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
             };
             if message == "TERMINAL_SEND_UNSUPPORTED" {
                 RpcError::new(RpcErrorCode::Validation, message)
+            } else if message == "daemon_draining" {
+                RpcError::new(RpcErrorCode::Unavailable, message)
             } else {
                 RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
             }
