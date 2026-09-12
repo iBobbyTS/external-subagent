@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
 import { reconcileCodexHomes } from './reconcile.mjs';
@@ -32,6 +33,19 @@ function readState(paths) {
   try { return JSON.parse(fs.readFileSync(paths.state, 'utf8')); } catch { return { schema_version: SCHEMA_VERSION, candidate: null, active: null, phase: 'idle' }; }
 }
 
+function verifyStableEntry(candidateRoot) {
+  const root = fs.realpathSync(candidateRoot);
+  const entry = path.join(root, 'bin', 'external-subagent.mjs');
+  let stat;
+  try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_ENTRY_MISSING', 'candidate stable entry is missing'); }
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be a regular file');
+  if ((stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be executable');
+  const resolved = fs.realpathSync(entry);
+  if (resolved !== entry || !resolved.startsWith(`${root}${path.sep}`)) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry escapes candidate root');
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
+  return { entry, digest };
+}
+
 export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
@@ -52,10 +66,10 @@ export function updateInstallation(paths, options = {}) {
     const ok = sync.homes.length === 0 || sync.all_updated;
     state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
     if (ok && candidateRoot) {
-      const entry = path.join(candidateRoot, 'bin', 'external-subagent.mjs');
-      let stat; try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_ENTRY_MISSING', 'candidate stable entry is missing'); }
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be a regular file');
-      state.active = state.candidate; state.candidate = null; state.active.entry = entry;
+      const stable = verifyStableEntry(candidateRoot);
+      state.active = state.candidate; state.candidate = null;
+      state.active.entry = stable.entry;
+      state.active.entry_sha256 = stable.digest;
     } else if (ok) { state.active = state.candidate; state.candidate = null; }
     atomicWrite(paths.state, jsonBytes(state));
     return state;
