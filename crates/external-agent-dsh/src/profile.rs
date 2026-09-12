@@ -218,6 +218,7 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         "workflow-worker-thread",
         "goal-round-driver",
     ];
+    const ALLOWED_ENABLED: &[&str] = &["observe", "tool-observe", "tool-read", "tool-glob", "tool-grep", "tool-cordis", "telemetry", "logging"];
     let mut saw_policy = false;
     fn walk(v: &serde_yaml::Value, saw: &mut bool) -> Result<(), String> {
         match v {
@@ -231,8 +232,13 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                 if matches!(id, Some("sandbox-policy" | "approval")) {
                     *saw = true;
                 }
-                if id.is_some_and(|id| DANGEROUS.contains(&id)) && disabled != Some(true) {
-                    return Err(format!("dangerous DSH entry is enabled: {id:?}"));
+                if let Some(id) = id {
+                    if DANGEROUS.contains(&id) && disabled != Some(true) {
+                        return Err(format!("dangerous DSH entry is enabled: {id:?}"));
+                    }
+                    if disabled != Some(true) && !ALLOWED_ENABLED.contains(&id) && id.starts_with("tool-") {
+                        return Err(format!("unknown enabled DSH entry: {id:?}"));
+                    }
                 }
                 for val in m.values() {
                     walk(val, saw)?;
@@ -411,6 +417,12 @@ mod tests {
         wrong_agent["agent"] = Value::String("zcode".into());
         assert!(validate_build_profile(&wrong_agent).is_err());
         assert!(validate_build_profile(&Value::Null).is_err());
+    }
+
+    #[test]
+    fn dump_policy_rejects_unknown_enabled_tool() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>("- id: sandbox-policy\n  disabled: true\n- id: approval\n  disabled: true\n- id: tool-unknown\n  disabled: false").unwrap();
+        assert!(validate_dump_policy(&yaml).unwrap_err().contains("unknown enabled"));
     }
 
     #[test]
