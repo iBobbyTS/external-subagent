@@ -40,5 +40,5 @@ test('runtime executes malformed, EOF and oversized frame or cancellation oracle
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
   const output = execFileSync('cargo', ['test', '-p', 'external-runtime'], { cwd, encoding: 'utf8' });
   assert.match(output, /test result: ok/);
-  assert.doesNotMatch(output, /0 passed/);
+  assert.match(output, /test result: ok\. 29 passed/);
 });
