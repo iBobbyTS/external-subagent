@@ -1,8 +1,12 @@
-use crate::{RuntimeLoss, RuntimeEvent, RuntimeTerminal};
+use crate::{RuntimeEvent, RuntimeLoss, RuntimeTerminal};
 use external_contract::{event_type, LifecycleOrder, WireMessage};
 use external_runtime::{ChildExit, Inbound, StopOutcome};
 
-pub(crate) struct LifecycleProjection { pub(crate) event_type: &'static str, pub(crate) payload_json: String, pub(crate) redaction_level: &'static str }
+pub(crate) struct LifecycleProjection {
+    pub(crate) event_type: &'static str,
+    pub(crate) payload_json: String,
+    pub(crate) redaction_level: &'static str,
+}
 
 pub(crate) fn lifecycle_projection(
     event: &RuntimeEvent,

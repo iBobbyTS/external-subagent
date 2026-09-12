@@ -2599,7 +2599,8 @@ impl StoreLifecycleSink {
         let source_sequence = state
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
-        let projection = projection::lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
+        let projection =
+            projection::lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
         self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -2822,7 +2823,8 @@ impl LifecycleSink for StoreLifecycleSink {
             }
             _ => None,
         };
-        let projection = projection::lifecycle_projection(&record.event, pending_request_id.as_deref());
+        let projection =
+            projection::lifecycle_projection(&record.event, pending_request_id.as_deref());
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -2848,8 +2850,6 @@ impl LifecycleSink for StoreLifecycleSink {
         }
     }
 }
-
-
 
 struct DiagnosticLogger {
     sender: SyncSender<String>,
