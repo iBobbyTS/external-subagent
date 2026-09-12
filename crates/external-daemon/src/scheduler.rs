@@ -1998,9 +1998,20 @@ impl Scheduler {
         self.is_draining()
             && self.active_count() == 0
             && self.inner.store.active_count().unwrap_or(1) == 0
+            && self
+                .inner
+                .store
+                .terminal_resources_reaped()
+                .unwrap_or(false)
     }
     pub fn resources_reaped(&self) -> bool {
-        self.active_count() == 0 && self.inner.store.active_count().unwrap_or(1) == 0
+        self.active_count() == 0
+            && self.inner.store.active_count().unwrap_or(1) == 0
+            && self
+                .inner
+                .store
+                .terminal_resources_reaped()
+                .unwrap_or(false)
     }
     pub fn updater_fired(&self) -> bool {
         self.inner.updater_fired.load(Ordering::Acquire)
