@@ -304,11 +304,13 @@ fn probe_dsh_hi(
     let Some(workspace) = scope.workspace.as_deref() else {
         return unavailable("workspace_missing");
     };
-    let launch = DshLaunch::new(
+    let mut launch = DshLaunch::new(
         path.map(PathBuf::from),
         workspace,
         scope.home.as_ref().map(PathBuf::from),
     );
+    launch.permission_mode = Some("read-only".into());
+    launch.patch = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles/dsh/strict-plan.patch.yml"));
     let mut command = match resolve_launch(&launch) {
         Ok(c) => c,
         Err(_) => return unavailable("auth_hi_unavailable"),
