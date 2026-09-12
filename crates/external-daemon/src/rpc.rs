@@ -101,6 +101,8 @@ impl RpcMethod {
         matches!(
             name,
             "system_status"
+                | "daemon_begin_drain"
+                | "daemon_drain_status"
                 | "agent_probe"
                 | "agent_models"
                 | "submit_general"
