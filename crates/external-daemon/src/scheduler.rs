@@ -1528,7 +1528,10 @@ impl Scheduler {
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
         if self.inner.draining.load(Ordering::Acquire) {
-            return Err(SchedulerError::RuntimeCommand { agent_id: agent_id.into(), message: "daemon_draining".into() });
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "daemon_draining".into(),
+            });
         }
         if mode != "queue" {
             return Err(SchedulerError::InvalidConfig(
@@ -1984,10 +1987,22 @@ impl Scheduler {
         self.inner.state.lock().unwrap().active.len()
     }
 
-    pub fn begin_drain(&self) { self.inner.draining.store(true, Ordering::Release); }
-    pub fn is_draining(&self) -> bool { self.inner.draining.load(Ordering::Acquire) }
+    pub fn begin_drain(&self) {
+        self.inner.draining.store(true, Ordering::Release);
+    }
+    pub fn is_draining(&self) -> bool {
+        self.inner.draining.load(Ordering::Acquire)
+    }
     pub fn ready_for_activation(&self) -> bool {
-        self.is_draining() && self.active_count() == 0 && self.inner.store.active_count().unwrap_or(1) == 0
+        self.is_draining()
+            && self.active_count() == 0
+            && self.inner.store.active_count().unwrap_or(1) == 0
+    }
+    pub fn resources_reaped(&self) -> bool {
+        self.active_count() == 0 && self.inner.store.active_count().unwrap_or(1) == 0
+    }
+    pub fn updater_fired(&self) -> bool {
+        self.inner.updater_fired.load(Ordering::Acquire)
     }
     pub fn fire_updater_once(&self) -> bool {
         self.ready_for_activation() && !self.inner.updater_fired.swap(true, Ordering::AcqRel)
