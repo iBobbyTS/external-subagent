@@ -195,7 +195,11 @@ impl DshRuntimeShared {
 
     fn begin_turn(&self, prompt_id: u64) {
         *self.current_prompt.lock().unwrap() = Some(format!("dsh-prompt-{prompt_id}"));
-        let started = self.canonical_event(serde_json::json!({"type": "turn.started"}));
+        let params = serde_json::json!({"type": "turn.started"});
+        let started = self.canonical_event(params.clone());
+        // The canonical start event opens the shared tracker's per-turn
+        // terminal text before any of the turn's streaming can arrive.
+        self.emit_canonical(params);
         self.turn_tracker.observe(&started);
         self.emit_lifecycle("turn.started");
     }
@@ -215,19 +219,20 @@ impl DshRuntimeShared {
             TurnBoundary::Completed => "turn.completed",
             TurnBoundary::Failed => "turn.failed",
         };
-        let boundary_event = self.canonical_event(serde_json::json!({
+        let params = serde_json::json!({
             "type": event_type,
             "eventId": event_id,
             "turnId": turn_id,
             "payload": payload,
-        }));
+        });
+        let boundary_event = self.canonical_event(params.clone());
+        // The sink must observe the settlement's authoritative payload before
+        // the tracker exposes the boundary: the scheduler reacts to the
+        // tracker (delivering the next prompt or terminalizing the task), and
+        // events admitted after terminalization are dropped, which would
+        // strand the turn's final text.
+        self.emit_canonical(params);
         self.turn_tracker.observe(&boundary_event);
-        self.emit_canonical(serde_json::json!({
-            "type": event_type,
-            "eventId": event_id,
-            "turnId": turn_id,
-            "payload": payload,
-        }));
         self.emit_lifecycle(event_type);
     }
 
