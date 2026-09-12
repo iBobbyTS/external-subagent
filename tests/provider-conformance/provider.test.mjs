@@ -20,7 +20,7 @@ for (const provider of providers) {
 }
 
 test('provider adapters do not share a workspace concurrently', () => {
-  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'mcp::tests::workspace_busy_preserves_code_message_and_active_agent', '--', '--exact'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' });
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'cross_provider_shared_scheduler_contract', '--', '--nocapture'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' });
   assert.match(output, /test result: ok/);
   assert.match(output, /1 passed/);
 });
