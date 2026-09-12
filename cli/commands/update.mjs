@@ -33,7 +33,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   }
   const activation = await rpc(socket, 'activate-ready', {});
   if (!activation.activation_claim) return { ...status, activation_claim: null, update: 'not_activated' };
-  if (prior?.status === 'success' && prior.claim === activation.activation_claim && prior.version === requestedVersion) return prior.result;
+  if (prior?.status === 'success' && prior.claim === activation.activation_claim
+    && (requestedVersion === 'current' || prior.version === requestedVersion)) return prior.result;
   let result;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
@@ -72,6 +73,9 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       } catch (restoreError) {
         rollback.registry_error = restoreError.message;
       }
+    }
+    if (result?.service?.rollback) {
+      try { await result.service.rollback(); rollback.service_restored = true; } catch (restoreError) { rollback.service_error = restoreError.message; }
     }
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
     throw error;
