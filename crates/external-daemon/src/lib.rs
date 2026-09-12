@@ -2262,6 +2262,8 @@ struct SchedulerInner {
     result_persist_hook: Mutex<Option<Arc<ResultPersistHook>>>,
     state: Mutex<SchedulerState>,
     admission: Mutex<()>,
+    #[cfg(test)]
+    admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     draining: AtomicBool,
     updater_fired: AtomicBool,
     activation_claim: Mutex<Option<String>>,

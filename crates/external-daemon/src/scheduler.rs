@@ -223,6 +223,8 @@ impl Scheduler {
                 result_persist_hook: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
                 admission: Mutex::new(()),
+                #[cfg(test)]
+                admission_hook: Mutex::new(None),
                 draining: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
                 activation_claim: Mutex::new(None),
@@ -1536,6 +1538,8 @@ impl Scheduler {
         }
         let deadline = self.control_deadline();
         let _admission = self.inner.admission.lock().unwrap();
+        #[cfg(test)]
+        if let Some(hook) = self.inner.admission_hook.lock().unwrap().clone() { hook(); }
         if let Some(existing) = self.inner.store.message(message_id)? {
             if existing.agent_id == agent_id && existing.mode == mode && existing.content == content
             {
@@ -1993,6 +1997,10 @@ impl Scheduler {
     pub fn begin_drain(&self) {
         let _admission = self.inner.admission.lock().unwrap();
         self.inner.draining.store(true, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(crate) fn set_admission_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.admission_hook.lock().unwrap() = Some(hook);
     }
     pub fn is_draining(&self) -> bool {
         self.inner.draining.load(Ordering::Acquire)
