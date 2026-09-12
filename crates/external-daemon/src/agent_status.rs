@@ -334,20 +334,16 @@ fn probe_dsh_hi(
     let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
     match result {
         Ok(()) => {
-            let e = ScopeEvidence {
-                state: EvidenceState::Ready,
-                scope: scope.clone(),
-                version,
-                checked_at_ms: checked,
-                reason: None,
-            };
-            (e.clone(), e)
+            let hi = ScopeEvidence { state: EvidenceState::Ready, scope: scope.clone(), version, checked_at_ms: checked, reason: None };
+            let auth = ScopeEvidence::unknown(scope.clone(), checked, "auth_not_probed");
+            (auth, hi)
         }
-        Err(e) => unavailable(if e.to_string().contains("auth") {
-            "auth unavailable"
-        } else {
-            "hi unavailable"
-        }),
+        Err(e) => {
+            let reason = classify_dsh_session_error(&e);
+            let hi = ScopeEvidence { state: EvidenceState::Unavailable, scope: scope.clone(), version, checked_at_ms: checked, reason: Some(reason.into()) };
+            let auth = ScopeEvidence::unknown(scope.clone(), checked, "auth_not_probed");
+            (auth, hi)
+        }
     }
 }
 
@@ -1383,6 +1379,20 @@ fn remaining(deadline: Instant) -> Result<Duration, String> {
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| "network".into())
+}
+
+fn classify_dsh_session_error(error: &external_agent_dsh::acp::session::SessionError) -> &'static str {
+    use external_agent_dsh::acp::session::SessionError;
+    match error {
+        SessionError::Timeout => "timeout",
+        SessionError::Shape(_) => "shape",
+        SessionError::Remote(value) => {
+            let code = value.get("code").and_then(Value::as_i64);
+            match code { Some(-32001) | Some(401) | Some(403) => "auth", Some(-32002) | Some(429) => "rate_limit", _ => "remote" }
+        }
+        SessionError::Transport(_) => "network",
+        SessionError::Model(_) => "shape",
+    }
 }
 
 fn classify_request_error(error: &RequestError, diagnostic: &str) -> String {
