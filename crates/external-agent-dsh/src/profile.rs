@@ -118,9 +118,8 @@ pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, Strin
     let normalized = input.replace("!!js", "");
     let value: serde_yaml::Value = serde_yaml::from_str(&normalized)
         .map_err(|e| format!("invalid dsh dump-config YAML: {e}"))?;
-    let root = value.as_mapping().ok_or("dump-config root must be a mapping")?;
-    if !root.contains_key(serde_yaml::Value::String("version".into())) {
-        return Err("dump-config missing pinned version".into());
+    if !value.is_sequence() && !value.is_mapping() {
+        return Err("dump-config root must be a structured sequence or mapping".into());
     }
     Ok(value)
 }
