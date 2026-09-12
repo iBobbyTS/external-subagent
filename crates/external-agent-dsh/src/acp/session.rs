@@ -114,7 +114,11 @@ impl AcpSession {
         }
         let response = self.driver.request(
             transport::SESSION_SET_CONFIG_OPTION,
-            transport::set_config_option_params(self.session_id.as_deref().unwrap_or(""), model::MODEL_CONFIG_ID, token),
+            transport::set_config_option_params(
+                self.session_id.as_deref().unwrap_or(""),
+                model::MODEL_CONFIG_ID,
+                token,
+            ),
             timeout,
         );
         match response {
