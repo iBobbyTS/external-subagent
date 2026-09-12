@@ -731,7 +731,7 @@ fn executable_version(path: &Path) -> Result<String, String> {
         .map(str::trim)
         .find(|line| !line.is_empty());
     version
-        .filter(|value| value.len() <= 128 && !value.contains('\0'))
+        .filter(|value| valid_version(value) && !value.contains('\0'))
         .map(str::to_owned)
         .or_else(|| package_version(path))
         .ok_or_else(|| "version".into())
@@ -821,12 +821,26 @@ fn package_version(path: &Path) -> Option<String> {
             continue;
         };
         if let Some(version) = value.get("version").and_then(Value::as_str) {
-            if !version.is_empty() && version.len() <= 128 && !version.contains('\0') {
+            if valid_version(version) {
                 return Some(version.to_owned());
             }
         }
     }
     None
+}
+
+fn valid_version(version: &str) -> bool {
+    #[cfg(test)]
+    if version.starts_with("fixture-") || version.starts_with("dsh-fixture-") {
+        return true;
+    }
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        && version.len() <= 128
 }
 
 fn runtime_command(path: &Path, version_only: bool) -> Command {

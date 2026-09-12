@@ -29,8 +29,12 @@ const provenancePath = path.join(home, 'Library', 'Application Support', 'extern
 if (!fs.existsSync(provenancePath)) process.exit(2);
 const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
 const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const policy = path.resolve(path.dirname(script), '../lib/agent-file-policy.mjs');
 if (provenance.effective_config_path !== path.resolve(configPath)
   || provenance.hook_activation_verified !== true
+  || provenance.effective_file_policy_version !== 'zcode-agent-file-policy/v1.0.0'
+  || provenance.effective_file_policy_path !== policy
+  || provenance.effective_file_policy_sha256 !== hash(policy)
   || provenance.effective_guard_wrapper_path !== path.resolve(guard)
   || provenance.effective_guard_wrapper_sha256 !== hash(guard)
   || provenance.effective_file_wrapper_path !== path.resolve(script)
