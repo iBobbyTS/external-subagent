@@ -32,6 +32,8 @@ pub struct DshLaunch {
     pub workspace: PathBuf,
     /// Explicit provider home override. Absence inherits the environment.
     pub home: Option<PathBuf>,
+    pub permission_mode: Option<String>,
+    pub patch: Option<PathBuf>,
 }
 
 impl DshLaunch {
@@ -44,6 +46,8 @@ impl DshLaunch {
             executable,
             workspace: workspace.into(),
             home,
+            permission_mode: None,
+            patch: None,
         }
     }
 }
@@ -89,7 +93,12 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
         Command::new(executable)
     };
     command.arg("--profile").arg("acp");
+    if let Some(patch) = launch.patch.as_deref() {
+        if !patch.is_absolute() || !patch.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "DSH patch must be an absolute regular file")); }
+        command.arg("--patch").arg(patch);
+    }
     command.current_dir(&launch.workspace);
+    if let Some(mode) = launch.permission_mode.as_deref() { command.env("DSH_PERMISSION_MODE", mode); }
     if let Some(home) = launch.home.as_deref() {
         if !home.is_absolute() {
             return Err(io::Error::new(
@@ -100,6 +109,20 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
         command.env("DSH_HOME", home);
     }
     Ok(command)
+}
+
+/// Parse DSH's tagged YAML dump structurally. DSH emits `!!js` scalar tags;
+/// these are deliberately erased before parsing because their payload remains
+/// ordinary YAML data and executable tags must never be evaluated.
+pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, String> {
+    let normalized = input.replace("!!js", "");
+    let value: serde_yaml::Value = serde_yaml::from_str(&normalized)
+        .map_err(|e| format!("invalid dsh dump-config YAML: {e}"))?;
+    let root = value.as_mapping().ok_or("dump-config root must be a mapping")?;
+    if !root.contains_key(serde_yaml::Value::String("version".into())) {
+        return Err("dump-config missing pinned version".into());
+    }
+    Ok(value)
 }
 
 /// Parse and validate the managed build composition. Unknown fields or a
