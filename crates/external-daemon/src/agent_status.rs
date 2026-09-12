@@ -905,30 +905,51 @@ fn probe_zcode_hi(
 }
 
 fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
-    #[cfg(test)]
-    if env::var_os("EXTERNAL_SUBAGENT_TEST_POLICY_VERIFIED").as_deref()
-        == Some(std::ffi::OsStr::new("1"))
-    {
-        return true;
-    }
     let Some(home) = scope.home.as_deref() else {
         return false;
     };
-    let path = Path::new(home).join("external-subagent-policy.json");
-    let Ok(bytes) = fs::read(path) else {
+    let verifier = env::var_os("EXTERNAL_SUBAGENT_POLICY_VERIFIER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(home).join("external-subagent-policy-verifier"));
+    if !verifier.is_file() {
+        return false;
+    }
+    let mut command = Command::new(&verifier);
+    command
+        .args([
+            "--workspace",
+            workspace,
+            "--permission-mode",
+            "plan",
+            "--write-manifest",
+            "[]",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let Ok(mut child) = command.spawn() else {
         return false;
     };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
-    };
-    value.get("product").and_then(Value::as_str) == Some("external-subagent")
-        && value.get("verified").and_then(Value::as_bool) == Some(true)
-        && value.get("workspace").and_then(Value::as_str) == Some(workspace)
-        && value.get("permission_mode").and_then(Value::as_str) == Some("plan")
-        && value
-            .get("write_manifest")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
+    let group = child.id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) | Err(_) => {
+                cleanup_catalog_process(&mut child, group, Duration::from_millis(100));
+                return false;
+            }
+        }
+    }
 }
 
 fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, String> {
@@ -1549,7 +1570,16 @@ process.stdin.on('data', (chunk) => {
         after_terminal: &str,
     ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
-        std::env::set_var("EXTERNAL_SUBAGENT_TEST_POLICY_VERIFIED", "1");
+        let verifier = directory.path().join("external-subagent-policy-verifier");
+        fs::write(
+            &verifier,
+            b"#!/bin/sh\n[ \"$1\" = \"--workspace\" ] && [ -d \"$2\" ] && [ \"$3\" = \"--permission-mode\" ] && [ \"$4\" = \"plan\" ] && [ \"$5\" = \"--write-manifest\" ] && [ \"$6\" = \"[]\" ]\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let (runtime, log) = fake_hi_runtime(
             directory.path(),
             terminal,
@@ -1564,7 +1594,10 @@ process.stdin.on('data', (chunk) => {
         let evidence = backend.probe(&AgentProbeInput {
             agent: "zcode".into(),
             through: ProbeLayer::Hi,
-            scope: ProbeScope::default(),
+            scope: ProbeScope {
+                home: Some(directory.path().to_string_lossy().into_owned()),
+                ..ProbeScope::default()
+            },
         });
         let records = fs::read_to_string(log)
             .unwrap()
@@ -1596,6 +1629,29 @@ process.stdin.on('data', (chunk) => {
             let method = record["value"]["method"].as_str().unwrap_or_default();
             !method.contains("tool") && !method.contains("permission")
         }));
+    }
+
+    #[test]
+    fn hi_probe_refuses_prompt_without_scope_policy_verifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, log) = fake_hi_runtime(
+            directory.path(),
+            "turn.completed",
+            serde_json::json!({}),
+            false,
+            false,
+            "success",
+        );
+        let evidence = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+        }
+        .probe(&AgentProbeInput {
+            agent: "zcode".into(),
+            through: ProbeLayer::Hi,
+            scope: ProbeScope::default(),
+        });
+        assert_eq!(evidence.hi.reason.as_deref(), Some("policy_unverified"));
+        assert!(!log.exists());
     }
 
     #[test]
@@ -1693,7 +1749,7 @@ process.stdin.on('data', (chunk) => {
                 true,
                 after_terminal,
             );
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(started.elapsed() < Duration::from_secs(5));
             assert_eq!(evidence.auth.reason.as_deref(), Some(reason));
             assert_eq!(evidence.hi.reason.as_deref(), Some(reason));
             assert_eq!(evidence.auth.state, state);
