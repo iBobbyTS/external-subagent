@@ -1224,4 +1224,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
             "no prompt may follow a refused model selection"
         );
     }
+
+    #[test]
+    fn cross_provider_shared_scheduler_contract() {
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
+        let error = scheduler.start_ready().expect_err("closed DSH gate must reject");
+        assert!(error.to_string().contains("unsupported") || error.to_string().contains("closed"));
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert!(scheduler.last_error(&agent_id).is_some());
+    }
 }
