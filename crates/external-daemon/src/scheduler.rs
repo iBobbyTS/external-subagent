@@ -1539,7 +1539,9 @@ impl Scheduler {
         let deadline = self.control_deadline();
         let _admission = self.inner.admission.lock().unwrap();
         #[cfg(test)]
-        if let Some(hook) = self.inner.admission_hook.lock().unwrap().clone() { hook(); }
+        if let Some(hook) = self.inner.admission_hook.lock().unwrap().clone() {
+            hook();
+        }
         if let Some(existing) = self.inner.store.message(message_id)? {
             if existing.agent_id == agent_id && existing.mode == mode && existing.content == content
             {

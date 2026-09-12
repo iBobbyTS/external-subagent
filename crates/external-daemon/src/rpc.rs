@@ -1844,6 +1844,51 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
+    fn drain_transition_serializes_with_new_message_admission() {
+        let (_dir, service, id) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        service.scheduler.set_admission_hook({
+            let barrier = Arc::clone(&barrier);
+            Arc::new(move || {
+                barrier.wait();
+                barrier.wait();
+            })
+        });
+
+        let message_service = Arc::clone(&service);
+        let first_id = id.clone();
+        let message = std::thread::spawn(move || {
+            message_service.dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: first_id,
+                message_id: "before-drain".into(),
+                mode: "queue".into(),
+                content: "accepted before the drain linearization point".into(),
+            }))
+        });
+
+        barrier.wait();
+        let drain_service = Arc::clone(&service);
+        let drain = std::thread::spawn(move || drain_service.dispatch(RpcMethod::DaemonBeginDrain));
+        barrier.wait();
+
+        assert!(message.join().unwrap().is_ok());
+        assert!(drain.join().unwrap().is_ok());
+        service.scheduler.set_admission_hook(Arc::new(|| {}));
+
+        let error = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id,
+                message_id: "after-drain".into(),
+                mode: "queue".into(),
+                content: "must be rejected".into(),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Unavailable);
+        assert_eq!(error.message, "daemon_draining");
+        assert!(service.store.message("after-drain").unwrap().is_none());
+    }
+
+    #[test]
     fn draining_lifecycle_methods_are_not_gate_rejected() {
         let (_dir, service, id) = fixture();
         service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
