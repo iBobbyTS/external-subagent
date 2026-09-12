@@ -56,7 +56,7 @@ pub fn model_option_offered(config_options: Option<&Value>) -> bool {
         .is_some_and(|options| {
             options.iter().any(|option| {
                 option
-                    .get("configId")
+                    .get("id").or_else(|| option.get("configId"))
                     .and_then(Value::as_str)
                     .is_some_and(|id| id == MODEL_CONFIG_ID)
             })

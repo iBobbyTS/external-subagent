@@ -114,7 +114,7 @@ impl AcpSession {
         }
         let response = self.driver.request(
             transport::SESSION_SET_CONFIG_OPTION,
-            transport::set_config_option_params(model::MODEL_CONFIG_ID, token),
+            transport::set_config_option_params(self.session_id.as_deref().unwrap_or(""), model::MODEL_CONFIG_ID, token),
             timeout,
         );
         match response {
@@ -157,7 +157,7 @@ impl AcpSession {
             .begin_request_with_id(
                 wire_id,
                 transport::SESSION_PROMPT,
-                transport::prompt_params(prompt),
+                transport::prompt_params(self.session_id.as_deref().unwrap_or(""), prompt),
             )
             .map_err(SessionError::from)?;
         Ok((
@@ -318,7 +318,8 @@ sleep 5
         );
         assert_eq!(frames[2]["params"]["configId"], "model");
         assert_eq!(frames[2]["params"]["value"], "fixture-model");
-        assert_eq!(frames[3]["params"]["prompt"], "build it");
+        assert_eq!(frames[3]["params"]["sessionId"], "sess-1");
+        assert_eq!(frames[3]["params"]["prompt"][0]["text"], "build it");
         for frame in &frames {
             assert_eq!(frame["jsonrpc"], "2.0");
         }
