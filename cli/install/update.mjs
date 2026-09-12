@@ -11,8 +11,17 @@ const lockPath = (paths) => path.join(paths.data, 'install.lock');
 function withLock(paths, fn) {
   fs.mkdirSync(paths.data, { recursive: true, mode: 0o700 });
   let fd;
-  try { fd = fs.openSync(lockPath(paths), 'wx', 0o600); } catch (error) {
-    if (error.code === 'EEXIST') throw new CliError('UPDATE_IN_PROGRESS', 'another installation update is in progress');
+  try { fd = fs.openSync(lockPath(paths), 'wx', 0o600); fs.writeSync(fd, JSON.stringify({ pid: process.pid, started_at_ms: Date.now() })); } catch (error) {
+    if (error.code === 'EEXIST') {
+      let stale = false;
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockPath(paths), 'utf8'));
+        if (!Number.isInteger(lock.pid) || lock.pid <= 0) stale = true;
+        else { try { process.kill(lock.pid, 0); } catch (probe) { stale = probe.code === 'ESRCH'; } }
+      } catch { stale = true; }
+      if (stale) { try { fs.unlinkSync(lockPath(paths)); } catch {} return withLock(paths, fn); }
+      throw new CliError('UPDATE_IN_PROGRESS', 'another installation update is in progress');
+    }
     throw error;
   }
   try { return fn(); } finally { fs.closeSync(fd); fs.unlinkSync(lockPath(paths)); }
