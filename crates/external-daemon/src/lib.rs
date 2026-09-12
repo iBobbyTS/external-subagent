@@ -249,6 +249,9 @@ struct PassiveActivityState {
     assistant_buffers: HashMap<String, String>,
     latest_progress: Option<String>,
     terminal_text: String,
+    /// The current turn's terminal text was set by a boundary carrying the
+    /// turn's verified final text; later streaming echoes must not pollute it.
+    terminal_text_settled: bool,
     active_tools: HashMap<String, (PassiveToolKind, Instant)>,
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
@@ -371,7 +374,11 @@ impl PassiveActivityTracker {
                 }
             }
             if let Some(response) = parsed.terminal_response.as_deref() {
+                // A boundary that carries the turn's verified final text
+                // settles it: streaming deltas racing past the boundary are
+                // echoes of a message the settlement already folded.
                 state.terminal_text = response.to_owned();
+                state.terminal_text_settled = true;
             }
         }
 
@@ -413,8 +420,13 @@ impl PassiveActivityTracker {
                 state.active_model_requests.clear();
                 state.active_tools.clear();
             }
-            Some(ActivityTransition::PermissionRequested | ActivityTransition::TurnStarted)
-            | None => {}
+            Some(ActivityTransition::TurnStarted) => {
+                // Terminal text is scoped to one turn: a later turn's result
+                // must never inherit an earlier turn's text.
+                state.terminal_text.clear();
+                state.terminal_text_settled = false;
+            }
+            Some(ActivityTransition::PermissionRequested) | None => {}
         }
         self.changed.notify_all();
     }
@@ -542,7 +554,9 @@ fn activity_wall_now_millis() -> u64 {
 }
 
 fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms: u64) {
-    state.terminal_text.push_str(delta);
+    if !state.terminal_text_settled {
+        state.terminal_text.push_str(delta);
+    }
     state.latest_text_tail.push_str(delta);
     if state.latest_text_tail.len() > MAX_LATEST_TEXT_BYTES {
         let mut split = state.latest_text_tail.len() - MAX_LATEST_TEXT_BYTES;
@@ -3632,6 +3646,75 @@ sleep 2
         assert_eq!(after.snapshot_seq, before.snapshot_seq + 2);
         assert_eq!(tracker.observation_snapshot(), after);
         assert_eq!(tracker.observation_snapshot(), after);
+    }
+
+    #[test]
+    fn terminal_text_is_scoped_to_the_settling_turn() {
+        let tracker = PassiveActivityTracker::new(true);
+        let session_event = |params: serde_json::Value| {
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                external_contract::EventEnvelope {
+                    method: "session/event".into(),
+                    params,
+                },
+            )))
+        };
+
+        // Turn 1 streams its answer, settles with the verified final text, and
+        // a streaming echo racing past the boundary must not duplicate it.
+        tracker.observe(&session_event(serde_json::json!({"type": "turn.started"})));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "model.streaming",
+            "eventId": "delta-1",
+            "payload": {"kind": "text_delta", "delta": "build ", "assistantMessageId": "m1"}
+        })));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "model.streaming",
+            "eventId": "delta-2",
+            "payload": {"kind": "text_delta", "delta": "answer", "assistantMessageId": "m1"}
+        })));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "turn.completed",
+            "eventId": "boundary-1",
+            "payload": {"response": "build answer"}
+        })));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "model.streaming",
+            "eventId": "delta-3",
+            "payload": {"kind": "text_delta", "delta": "build answer", "assistantMessageId": "m1"}
+        })));
+        assert_eq!(
+            tracker.take_terminal_text(),
+            TerminalText::Visible("build answer".into())
+        );
+
+        // Turn 2 starts fresh: the first turn's text must never leak into the
+        // follow-up turn's result.
+        tracker.observe(&session_event(serde_json::json!({"type": "turn.started"})));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "model.streaming",
+            "eventId": "delta-4",
+            "payload": {"kind": "text_delta", "delta": "follow-up settled", "assistantMessageId": "m2"}
+        })));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "turn.completed",
+            "eventId": "boundary-2",
+            "payload": {"response": "follow-up settled"}
+        })));
+        assert_eq!(
+            tracker.take_terminal_text(),
+            TerminalText::Visible("follow-up settled".into())
+        );
+
+        // A turn that never verifies a final text neither inherits the
+        // previous turn's text nor fakes one.
+        tracker.observe(&session_event(serde_json::json!({"type": "turn.started"})));
+        tracker.observe(&session_event(serde_json::json!({
+            "type": "turn.completed",
+            "eventId": "boundary-3",
+            "payload": {}
+        })));
+        assert_eq!(tracker.take_terminal_text(), TerminalText::Missing);
     }
 
     #[test]
