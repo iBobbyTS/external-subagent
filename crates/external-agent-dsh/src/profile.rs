@@ -12,6 +12,8 @@ use serde_json::Value;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 /// Managed build composition declared in `profiles/dsh/build.json`.
 ///
@@ -94,11 +96,18 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
     };
     command.arg("--profile").arg("acp");
     if let Some(patch) = launch.patch.as_deref() {
-        if !patch.is_absolute() || !patch.is_file() { return Err(io::Error::new(io::ErrorKind::InvalidInput, "DSH patch must be an absolute regular file")); }
+        if !patch.is_absolute() || !patch.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DSH patch must be an absolute regular file",
+            ));
+        }
         command.arg("--patch").arg(patch);
     }
     command.current_dir(&launch.workspace);
-    if let Some(mode) = launch.permission_mode.as_deref() { command.env("DSH_PERMISSION_MODE", mode); }
+    if let Some(mode) = launch.permission_mode.as_deref() {
+        command.env("DSH_PERMISSION_MODE", mode);
+    }
     if let Some(home) = launch.home.as_deref() {
         if !home.is_absolute() {
             return Err(io::Error::new(
@@ -127,9 +136,100 @@ pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, Strin
 pub const PINNED_DSH_VERSION: &str = "0.1.5-rc.1";
 
 pub fn validate_dsh_version(output: &str) -> Result<(), String> {
-    let found = output.split_whitespace().find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+    let found = output
+        .split_whitespace()
+        .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
         .ok_or("dsh --version returned no version")?;
-    if found != PINNED_DSH_VERSION { return Err(format!("unsupported dsh version {found}; expected {PINNED_DSH_VERSION}")); }
+    if found != PINNED_DSH_VERSION {
+        return Err(format!(
+            "unsupported dsh version {found}; expected {PINNED_DSH_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+/// Run the provider-owned preflight independently from the ACP command.  The
+/// dump is treated as untrusted data and is accepted only when every enabled
+/// entry is in the managed allowlist and the policy controls are present.
+pub fn preflight(executable: &std::path::Path, patch: &std::path::Path) -> Result<(), String> {
+    if !executable.is_absolute() || !patch.is_absolute() {
+        return Err("preflight paths must be absolute".into());
+    }
+    let version = std::process::Command::new(executable)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("dsh version probe failed: {e}"))?;
+    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let mut child = std::process::Command::new(executable)
+        .arg("--profile")
+        .arg("acp")
+        .arg("--patch")
+        .arg(patch)
+        .arg("--dump-config")
+        .env("DSH_PERMISSION_MODE", "read-only")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("dsh dump-config failed: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err("dsh dump-config timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "dsh dump-config exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let value = validate_dump_config_yaml(&String::from_utf8_lossy(&out.stdout))?;
+    validate_dump_policy(&value)
+}
+
+fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
+    const DANGEROUS: &[&str] = &[
+        "tool-bash", "tool-pwsh", "tool-jobs", "tool-fs", "tool-skill",
+        "tool-subagent", "tool-subagent-fork", "tool-subagent-control",
+        "tool-subagent-list-agents", "subagent", "subagent-spawn-in-process",
+        "subagent-fork-in-process", "tool-workflow", "tool-goal", "tool-ralph",
+        "subprocess", "bash-sandbox", "pwsh-sandbox", "skill-filesystem",
+        "workflow-worker-thread", "goal-round-driver",
+    ];
+    let mut saw_policy = false;
+    fn walk(v: &serde_yaml::Value, saw: &mut bool) -> Result<(), String> {
+        match v {
+            serde_yaml::Value::Mapping(m) => {
+                let id = m.get(serde_yaml::Value::String("id".into())).and_then(|v| v.as_str());
+                let disabled = m.get(serde_yaml::Value::String("disabled".into())).and_then(|v| v.as_bool());
+                if matches!(id, Some("sandbox-policy" | "approval")) { *saw = true; }
+                if id.is_some_and(|id| DANGEROUS.contains(&id)) && disabled != Some(true) {
+                    return Err(format!("dangerous DSH entry is enabled: {id:?}"));
+                }
+                for val in m.values() {
+                    walk(val, saw)?;
+                }
+            }
+            serde_yaml::Value::Sequence(s) => {
+                for x in s {
+                    walk(x, saw)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    walk(value, &mut saw_policy)?;
+    if !saw_policy {
+        return Err("dump-config missing sandbox-policy/approval controls".into());
+    }
     Ok(())
 }
 
@@ -177,13 +277,20 @@ pub fn validate_strict_plan_profile(profile: &Value) -> Result<(), String> {
     if profile.get("agent").and_then(Value::as_str) != Some(crate::DSH_AGENT_NAME) {
         return Err("strict dsh profile must declare agent=dsh".into());
     }
-    let c = profile.get("composition").ok_or("strict dsh profile missing composition")?;
+    let c = profile
+        .get("composition")
+        .ok_or("strict dsh profile missing composition")?;
     if c.get("sandbox").and_then(Value::as_str) != Some("read-only")
         || c.get("permission_mode").and_then(Value::as_str) != Some("read-only")
         || c.get("unknown_entry_policy").and_then(Value::as_str) != Some("fail-closed")
         || c.get("write_manifest").and_then(Value::as_array).is_none()
-    { return Err("strict dsh profile must pin read-only fail-closed composition".into()); }
-    if c["write_manifest"].as_array().is_some_and(|v| !v.is_empty()) {
+    {
+        return Err("strict dsh profile must pin read-only fail-closed composition".into());
+    }
+    if c["write_manifest"]
+        .as_array()
+        .is_some_and(|v| !v.is_empty())
+    {
         return Err("strict dsh profile cannot declare write_manifest entries".into());
     }
     Ok(())
@@ -289,7 +396,10 @@ mod tests {
     fn strict_plan_profile_is_read_only_and_fail_closed() {
         let profile = strict_plan_profile().unwrap();
         assert_eq!(profile["composition"]["sandbox"], "read-only");
-        assert!(profile["composition"]["write_manifest"].as_array().unwrap().is_empty());
+        assert!(profile["composition"]["write_manifest"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let mut widened = profile.clone();
         widened["composition"]["write_manifest"] = serde_json::json!(["src/**"]);
         assert!(validate_strict_plan_profile(&widened).is_err());
