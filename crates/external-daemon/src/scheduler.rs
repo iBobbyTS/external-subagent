@@ -222,6 +222,8 @@ impl Scheduler {
                 #[cfg(test)]
                 result_persist_hook: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
+                draining: AtomicBool::new(false),
+                updater_fired: AtomicBool::new(false),
             }),
         })
     }
@@ -275,6 +277,9 @@ impl Scheduler {
         manifest: &GeneralTaskManifest,
         admission: Option<external_core::AdmissionIdentity>,
     ) -> Result<SubmittedTask, SchedulerError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SchedulerError::InvalidConfig("daemon_draining".into()));
+        }
         let mut manifest = manifest.clone();
         manifest.agent_id = self.inner.store.reserve_task_id()?;
         let prepared = GeneralTaskPreparer::new(Vec::new())
@@ -1522,6 +1527,9 @@ impl Scheduler {
         mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand { agent_id: agent_id.into(), message: "daemon_draining".into() });
+        }
         if mode != "queue" {
             return Err(SchedulerError::InvalidConfig(
                 "generic agent messages must use queue mode".into(),
@@ -1974,6 +1982,15 @@ impl Scheduler {
 
     pub fn active_count(&self) -> usize {
         self.inner.state.lock().unwrap().active.len()
+    }
+
+    pub fn begin_drain(&self) { self.inner.draining.store(true, Ordering::Release); }
+    pub fn is_draining(&self) -> bool { self.inner.draining.load(Ordering::Acquire) }
+    pub fn ready_for_activation(&self) -> bool {
+        self.is_draining() && self.active_count() == 0 && self.inner.store.active_count().unwrap_or(1) == 0
+    }
+    pub fn fire_updater_once(&self) -> bool {
+        self.ready_for_activation() && !self.inner.updater_fired.swap(true, Ordering::AcqRel)
     }
 
     pub fn active_turn_observation(&self, agent_id: &str) -> Option<(TurnSnapshot, u64)> {
