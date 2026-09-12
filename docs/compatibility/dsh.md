@@ -20,3 +20,8 @@ An isolated strict-plan daemon submission completed through ACP. A prompt that
 requested shell/write activity received no shell or write tool and the model
 declined to claim the write; the task was reaped and the workspace remained
 empty. This confirms the safety refusal path for the installed runtime.
+
+The explicit daemon probe currently records local discovery as
+`READY/0.1.5-rc.1`, auth as `UNKNOWN/auth_not_probed`, and the strict no-tool
+hi request as `UNAVAILABLE/remote`; no credentials are modified. A successful
+authenticated hi remains unverified.
