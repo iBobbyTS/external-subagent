@@ -1826,6 +1826,23 @@ pub(crate) mod wait_tests {
         assert!(service.dispatch(RpcMethod::TaskMessage(msg)).is_ok());
     }
 
+    #[test]
+    fn draining_lifecycle_methods_are_not_gate_rejected() {
+        let (_dir, service, id) = fixture();
+        service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
+        let methods = [
+            RpcMethod::TaskWait(TaskWaitQuery { agent_id: id.clone(), after_revision: 0, wait_time: 0, message_id: None }),
+            RpcMethod::TaskCancel { agent_id: id.clone() },
+            RpcMethod::TaskResult { agent_id: id.clone(), offset: 0, limit: 10 },
+            RpcMethod::TaskClose { agent_id: id },
+        ];
+        for method in methods {
+            if let Err(error) = service.dispatch(method) {
+                assert!(!error.message.contains("daemon_draining"));
+            }
+        }
+    }
+
     pub(crate) fn fixture() -> (tempfile::TempDir, Arc<RpcService>, String) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
