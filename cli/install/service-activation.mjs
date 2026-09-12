@@ -69,13 +69,14 @@ export async function activateService(paths, candidate, options = {}) {
     atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(candidate.path)}${c}`)), 0o600);
     await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
     const health = await healthy(candidate, oldPid, oldStatus?.service_generation);
-    return {
+      return {
       ...health,
       rollback: async () => {
         await unload();
         if (digest(oldPath) !== oldHash) throw new Error('previous payload changed; automatic rollback refused');
         atomicWrite(paths.launchAgent, oldPlist, 0o600);
         await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
+        return healthy({ path: oldPath, sha256: oldHash, version: oldStatus?.identity?.daemon?.version }, oldPid, oldStatus?.service_generation);
       },
     };
   } catch (error) {
