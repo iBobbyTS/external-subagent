@@ -25,3 +25,5 @@ The explicit daemon probe currently records local discovery as
 `READY/0.1.5-rc.1`, auth as `UNKNOWN/auth_not_probed`, and the strict no-tool
 hi request as `UNAVAILABLE/remote`; no credentials are modified. A successful
 authenticated hi remains unverified.
+Auth-only probing does not create a session or send a prompt; hi probing is the
+separate strict read-only operation.
