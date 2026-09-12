@@ -3,6 +3,7 @@ import { reconcileInstallation, updateInstallation } from '../install/update.mjs
 import { callDaemon } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
 import fs from 'node:fs';
+import path from 'node:path';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { activateService, hasInstalledService } from '../install/service-activation.mjs';
 
@@ -14,6 +15,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   if (cancelActive && !yes) throw new Error('--cancel-active requires --yes');
   const prior = (() => { try { return JSON.parse(fs.readFileSync(receiptPath(paths), 'utf8')); } catch { return null; } })();
   const priorStateBytes = (() => { try { return fs.readFileSync(paths.state); } catch { return null; } })();
+  const registryPath = path.join(paths.data, 'codex-homes.json');
+  const priorRegistryBytes = (() => { try { return fs.readFileSync(registryPath); } catch { return null; } })();
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
@@ -58,7 +61,12 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (priorStateBytes && paths.state) {
       rollback.attempted = true;
       try { atomicWrite(paths.state, priorStateBytes); rollback.restored = true; } catch (restoreError) { rollback.error = restoreError.message; }
+    } else if (paths.state) {
+      rollback.attempted = true;
+      try { fs.rmSync(paths.state, { force: true }); rollback.restored = true; } catch (restoreError) { rollback.error = restoreError.message; }
     }
+    if (priorRegistryBytes) atomicWrite(registryPath, priorRegistryBytes);
+    else if (fs.existsSync(registryPath)) fs.rmSync(registryPath, { force: true });
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
     throw error;
   }
