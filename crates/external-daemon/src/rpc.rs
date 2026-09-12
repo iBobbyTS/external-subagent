@@ -1815,6 +1815,17 @@ pub(crate) mod wait_tests {
     use external_store::TaskResult;
     use std::process::Command;
 
+    #[test]
+    fn draining_existing_task_message_is_idempotent_but_new_rejected() {
+        let (_dir, service, id) = fixture();
+        let msg = MessageInput { agent_id: id.clone(), message_id: "drain-msg".into(), mode: "queue".into(), content: "x".into() };
+        service.dispatch(RpcMethod::TaskMessage(msg.clone())).unwrap();
+        service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
+        let err = service.dispatch(RpcMethod::TaskMessage(MessageInput { message_id: "new-msg".into(), ..msg.clone() })).unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Unavailable);
+        assert!(service.dispatch(RpcMethod::TaskMessage(msg)).is_ok());
+    }
+
     pub(crate) fn fixture() -> (tempfile::TempDir, Arc<RpcService>, String) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
