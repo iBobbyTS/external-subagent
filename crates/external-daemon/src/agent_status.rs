@@ -455,7 +455,9 @@ fn run_dsh_catalog(
             }),
             deadline,
         )?;
-        if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1) {
+        if initialized.get("protocolVersion").and_then(Value::as_u64) != Some(1)
+            && initialized.get("agentCapabilities").is_none()
+        {
             return Err("protocol_version".into());
         }
         let session = dsh_call(
@@ -463,7 +465,7 @@ fn run_dsh_catalog(
             &frames_rx,
             2,
             "session/new",
-            serde_json::json!({"cwd": workspace}),
+            serde_json::json!({"cwd": workspace, "mcpServers": []}),
             deadline,
         )?;
         if session
@@ -473,6 +475,7 @@ fn run_dsh_catalog(
         {
             return Err("protocol".into());
         }
+        let session_catalog = parse_opaque_model_tokens(&session).unwrap_or_default();
         let catalog = dsh_call(
             &mut input,
             &frames_rx,
@@ -481,7 +484,11 @@ fn run_dsh_catalog(
             serde_json::json!({}),
             deadline,
         )?;
-        parse_opaque_model_tokens(&catalog)
+        match parse_opaque_model_tokens(&catalog) {
+            Ok(tokens) => Ok(tokens),
+            Err(_) if !session_catalog.is_empty() => Ok(session_catalog),
+            Err(error) => Err(error),
+        }
     })();
     drop(input);
     cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
@@ -607,18 +614,48 @@ fn parse_opaque_model_tokens(catalog: &Value) -> Result<Vec<String>, String> {
     let models = catalog
         .get("models")
         .and_then(Value::as_array)
-        .cloned().unwrap_or_default();
+        .cloned()
+        .unwrap_or_default();
     let mut tokens = Vec::new();
     if let Some(options) = catalog.get("configOptions").and_then(Value::as_array) {
         for option in options {
-            let id = option.get("id").or_else(|| option.get("configId")).and_then(Value::as_str);
-            if id != Some("model") { continue; }
-            let mut add = |v: Option<&Value>| { if let Some(t)=v.and_then(Value::as_str) { if !t.is_empty() && t.len()<=DSH_MAX_MODEL_TOKEN_BYTES && !t.contains('\0') && !tokens.iter().any(|x| x==t) { tokens.push(t.to_owned()); } } };
+            let id = option
+                .get("id")
+                .or_else(|| option.get("configId"))
+                .and_then(Value::as_str);
+            if id != Some("model") {
+                continue;
+            }
+            let mut add = |v: Option<&Value>| {
+                if let Some(t) = v.and_then(Value::as_str) {
+                    if !t.is_empty()
+                        && t.len() <= DSH_MAX_MODEL_TOKEN_BYTES
+                        && !t.contains('\0')
+                        && !tokens.iter().any(|x| x == t)
+                    {
+                        tokens.push(t.to_owned());
+                    }
+                }
+            };
             add(option.get("currentValue"));
-            if let Some(vals)=option.get("options").and_then(Value::as_array) { for v in vals { add(v.get("value")); } }
+            fn walk(value: &Value, add: &mut dyn FnMut(Option<&Value>)) {
+                add(value.get("value"));
+                if let Some(vals) = value.get("options").and_then(Value::as_array) {
+                    for nested in vals {
+                        walk(nested, add);
+                    }
+                }
+            }
+            if let Some(vals) = option.get("options").and_then(Value::as_array) {
+                for v in vals {
+                    walk(v, &mut add);
+                }
+            }
         }
     }
-    if !tokens.is_empty() { return Ok(tokens); }
+    if !tokens.is_empty() {
+        return Ok(tokens);
+    }
     if models.len() > DSH_MAX_MODELS {
         return Err("oversized".into());
     }
