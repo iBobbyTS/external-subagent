@@ -1411,7 +1411,7 @@ fn configured_agent_statuses(
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
-                spawn_supported: entry.enabled && entry.spawn_supported,
+                spawn_supported: effective_spawn_supported(agent, entry),
                 transport_support: transport_support(agent, entry),
                 permission_modes: permission_modes(agent, entry),
                 model_selection: model_selection(agent, entry),
@@ -1456,6 +1456,15 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
         .collect()
 }
 
+fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
+    if agent != "dsh" {
+        return entry.enabled && entry.spawn_supported;
+    }
+    entry.enabled && entry.spawn_supported && env::var_os("DSH_RUNTIME_PATH")
+        .map(PathBuf::from)
+        .is_some_and(|path| path.is_absolute() && fs::metadata(path).is_ok_and(|m| m.is_file()))
+}
+
 fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {
     AgentTransportSupportView {
         transport: if agent == "zcode" {
@@ -1464,12 +1473,12 @@ fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSup
             AgentTransportView::DshAcp
         },
         probe: true,
-        spawn: entry.enabled && entry.spawn_supported,
+        spawn: effective_spawn_supported(agent, entry),
     }
 }
 
 fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
-    if !entry.enabled || !entry.spawn_supported {
+    if !effective_spawn_supported(agent, entry) {
         return Vec::new();
     }
     vec![
@@ -1488,7 +1497,7 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
         }
     } else {
         AgentModelSelectionCapabilityView {
-            supported: agent == "dsh" && entry.enabled && entry.spawn_supported,
+            supported: agent == "dsh" && effective_spawn_supported(agent, entry),
             mode: AgentModelSelectionModeView::CatalogToken,
         }
     }
@@ -1613,7 +1622,7 @@ fn resolve_admission(
             "model selection is unsupported for zcode; prompt_count=0",
         ));
     }
-    if !configured.spawn_supported {
+    if !effective_spawn_supported(agent, configured) {
         return Err(RpcError::new(
             RpcErrorCode::AgentUnsupported,
             format!("agent {agent} is unsupported; prompt_count=0"),
@@ -3351,10 +3360,10 @@ mod admission_tests {
         config.agents.get_mut("dsh").unwrap().enabled = true;
         config.agents.get_mut("dsh").unwrap().spawn_supported = true;
         input.model = Some("opaque-token".into());
-        let identity = resolve_admission(&input, &config).unwrap();
-        assert_eq!(identity.agent, "dsh");
-        assert_eq!(identity.model.as_deref(), Some("opaque-token"));
-        assert_eq!(identity.model_source, "catalog");
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::AgentUnsupported
+        );
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
         config.agents.get_mut("zcode").unwrap().spawn_supported = false;
