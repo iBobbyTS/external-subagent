@@ -2011,6 +2011,7 @@ impl Scheduler {
     /// Admission is already closed. A single worker uses the ordinary cancel
     /// owner so uncooperative providers cannot hold the management RPC open.
     pub(crate) fn cancel_draining_tasks(&self) -> Result<(), SchedulerError> {
+        self.inner.store.fence_queued_cancellation()?;
         if self.inner.drain_cancel_running.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -2059,20 +2060,18 @@ impl Scheduler {
         self.is_draining()
             && !self.inner.drain_cancel_running.load(Ordering::Acquire)
             && self.active_count() == 0
-            && self.inner.store.active_count().unwrap_or(1) == 0
             && self
                 .inner
                 .store
-                .terminal_resources_reaped()
+                .all_tasks_reaped()
                 .unwrap_or(false)
     }
     pub fn resources_reaped(&self) -> bool {
         self.active_count() == 0
-            && self.inner.store.active_count().unwrap_or(1) == 0
             && self
                 .inner
                 .store
-                .terminal_resources_reaped()
+                .all_tasks_reaped()
                 .unwrap_or(false)
     }
     pub fn updater_fired(&self) -> bool {

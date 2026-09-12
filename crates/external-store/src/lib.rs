@@ -703,7 +703,7 @@ impl Store {
         let candidate = transaction
             .query_row(
                 "SELECT agent_id FROM tasks queued
-                 WHERE phase='QUEUED' AND close_requested=0
+                 WHERE phase='QUEUED' AND close_requested=0 AND stop_requested=0
                    AND (SELECT COUNT(*) FROM tasks active
                         WHERE active.repository=queued.repository
                           AND active.phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')) < ?1
@@ -720,7 +720,7 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks SET phase='PREPARING',owner_id=?1,owner_epoch=owner_epoch+1,
                  started_at=COALESCE(started_at,?2),last_heartbeat_at=?2
-             WHERE agent_id=?3 AND phase='QUEUED' AND close_requested=0",
+             WHERE agent_id=?3 AND phase='QUEUED' AND close_requested=0 AND stop_requested=0",
             params![owner_id, now, agent_id],
         )?;
         if changed != 1 {
@@ -1175,6 +1175,18 @@ impl Store {
         Ok(())
     }
 
+    /// Persist queued cancellation intent before any running provider is
+    /// awaited. This UPDATE and claim_next serialize on the same database
+    /// transaction owner; an unclaimed queued task cannot start afterwards.
+    /// Keep QUEUED until ordinary cancel_task settles its unstarted lifecycle.
+    pub fn fence_queued_cancellation(&self) -> StoreResult<()> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("UPDATE tasks SET stop_requested=1 WHERE phase='QUEUED'", [])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Daemon management snapshot after admission closes. Unlike startup
     /// recovery this includes queued tasks which explicit drain cancellation
     /// must settle without starting a provider.
@@ -1601,11 +1613,11 @@ impl Store {
         i64_to_u64(count)
     }
 
-    /// Returns whether every terminal task has a durable runtime cleanup receipt.
-    pub fn terminal_resources_reaped(&self) -> StoreResult<bool> {
+    /// Activation requires no nonterminal task and a cleanup receipt for every terminal task.
+    pub fn all_tasks_reaped(&self) -> StoreResult<bool> {
         let connection = self.connection.lock().unwrap();
         let pending: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE phase='TERMINAL' AND reaped_at IS NULL",
+            "SELECT COUNT(*) FROM tasks WHERE phase!='TERMINAL' OR reaped_at IS NULL",
             [],
             |row| row.get(0),
         )?;
@@ -2150,6 +2162,43 @@ mod tests {
             final_text: "terminal text".into(),
             partial: outcome != TaskOutcome::Completed,
         }
+    }
+
+    #[test]
+    fn queued_cancel_fence_blocks_claim_and_survives_reopen() {
+        let (_directory, path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("10000001", "/one", None))
+            .unwrap();
+        store
+            .enqueue_task_authoritative(&task("10000002", "/two", None))
+            .unwrap();
+        running(&store, "10000001");
+        store.fence_queued_cancellation().unwrap();
+        assert!(!store.get_task("10000001").unwrap().unwrap().stop_requested);
+        assert!(store.get_task("10000002").unwrap().unwrap().stop_requested);
+        assert!(store.claim_next("loop", 10, 1).unwrap().is_none());
+        drop(store);
+        let reopened = Store::open(path).unwrap();
+        assert!(reopened.claim_next("restart", 10, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn all_tasks_reaped_excludes_queued_and_requires_terminal_cleanup() {
+        let (_directory, _path, store) = store();
+        assert!(store.all_tasks_reaped().unwrap());
+        store
+            .enqueue_task_authoritative(&task("10000001", "/one", None))
+            .unwrap();
+        assert_eq!(store.active_count().unwrap(), 0);
+        assert!(!store.all_tasks_reaped().unwrap());
+        store.request_stop("10000001").unwrap();
+        store
+            .store_task_result("10000001", &result(TaskOutcome::Cancelled))
+            .unwrap();
+        assert!(!store.all_tasks_reaped().unwrap());
+        store.reap_task("10000001").unwrap();
+        assert!(store.all_tasks_reaped().unwrap());
     }
 
     #[test]
