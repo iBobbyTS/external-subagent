@@ -1707,11 +1707,6 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
             "default_agent is disabled",
         ));
     }
-    snapshot
-        .agents
-        .get_mut("dsh")
-        .expect("dsh default inserted")
-        .spawn_supported = false;
     Ok(snapshot)
 }
 
