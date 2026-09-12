@@ -70,11 +70,11 @@ export async function runProbe(options) {
     await waitForId(1);
     if (options.scenario !== 'initialize') { send('session/new', { cwd: options.workspace ?? process.cwd(), mcpServers: [] }, 2); await waitForId(2); }
     if (options.scenario === 'catalog') { /* current ACP advertises models in session/new.configOptions */ }
-    if (options.scenario === 'hi') send('session/prompt', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId, prompt: [{ type: 'text', text: 'hi' }], model: options.model }, 3);
-    if (options.scenario === 'permission') send('session/prompt', { prompt: 'probe permission' }, 3);
+    if (options.scenario === 'hi') send('session/prompt', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId, prompt: [{ type: 'text', text: 'hi' }], ...(options.model ? { model: options.model } : {}) }, 3); await waitForId(3);
+    if (options.scenario === 'permission') send('session/prompt', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId, prompt: [{ type: 'text', text: 'probe permission' }] }, 3); await waitForId(3);
     if (options.scenario === 'cancel') {
-      send('session/prompt', { prompt: 'probe cancellation' }, 3);
-      send('session/cancel', {}, 4);
+      send('session/prompt', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId, prompt: [{ type: 'text', text: 'probe cancellation' }] }, 3);
+      send('session/cancel', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId }, 4); await waitForId(4);
     }
     if (options.scenario === 'malformed') child.stdin.write('{"jsonrpc":\n');
     await new Promise((resolve) => setTimeout(resolve, 50));
