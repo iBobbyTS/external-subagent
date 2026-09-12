@@ -148,6 +148,104 @@ pub fn validate_dsh_version(output: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Verify the actual user-composed build profile with the exact launch cwd,
+/// home and permission environment. Unsupported overrides fail before ACP starts.
+/// Prompt serialization is enforced separately by the daemon runtime owner.
+pub fn preflight_build(launch: &DshLaunch) -> Result<(), String> {
+    build_profile()?;
+    if launch.permission_mode.as_deref() != Some("workspace-write") {
+        return Err("build launch must pin workspace-write".into());
+    }
+    let version = resolve_launch(launch)
+        .map_err(|e| e.to_string())?
+        .arg("--version")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !version.status.success() {
+        return Err("dsh version probe failed".into());
+    }
+    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
+    let mut child = command
+        .arg("--dump-config")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("dsh build dump-config timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("dsh build dump-config failed".into());
+    }
+    validate_build_dump(
+        &validate_dump_config_yaml(&String::from_utf8_lossy(&output.stdout))?,
+        &launch.workspace,
+    )
+}
+
+fn validate_build_dump(
+    value: &serde_yaml::Value,
+    workspace: &std::path::Path,
+) -> Result<(), String> {
+    let entries = value
+        .as_sequence()
+        .ok_or("build dump must contain a plugin sequence")?;
+    let entry = |id: &str, name: &str| -> Result<&serde_yaml::Value, String> {
+        let matches: Vec<_> = entries
+            .iter()
+            .filter(|e| e["id"].as_str() == Some(id))
+            .collect();
+        if matches.len() != 1 {
+            return Err(format!("build requires exactly one {id}"));
+        }
+        let e = matches[0];
+        if e["name"].as_str() != Some(name)
+            || !(e["disabled"].is_null() || e["disabled"].as_bool() == Some(false))
+        {
+            return Err(format!("build requires enabled provider-owned {id}"));
+        }
+        Ok(e)
+    };
+    let policy = entry("sandbox-policy", "@deepseek-ai/dsh-sandbox-policy")?;
+    // These exact shipped expressions are safe because resolve_launch pins the
+    // environment and cwd for both the dump and the ACP process. Never evaluate JS.
+    if !matches!(
+        policy["config"]["mode"].as_str(),
+        Some("workspace-write" | "process.env.DSH_PERMISSION_MODE ?? 'workspace-write'")
+    ) {
+        return Err("build sandbox must resolve to workspace-write".into());
+    }
+    let root = policy["config"]["workspaceRoot"].as_str();
+    if root != Some("process.cwd()") && root != workspace.to_str() {
+        return Err("build sandbox root must match the task workspace".into());
+    }
+    let approval = entry("approval", "@deepseek-ai/dsh-user-approval")?;
+    if !matches!(approval["config"]["policy"].as_str(), Some("ask" |
+        "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'")) {
+        return Err("build approval must resolve to ask".into());
+    }
+    entry("sandbox", "@deepseek-ai/dsh-sandbox-local")?;
+    let permission = entry("permission", "@deepseek-ai/dsh-permission-presets")?;
+    let build = &permission["config"]["presets"]["workspace-write"];
+    if build["sandbox"].as_str() != Some("workspace-write")
+        || build["approval"].as_str() != Some("ask")
+    {
+        return Err("build permission preset must preserve workspace-write and ask".into());
+    }
+    entry("fs-sandbox", "@deepseek-ai/dsh-fs-sandbox")?;
+    entry("acp", "@deepseek-ai/dsh-acp")?;
+    entry("acp-app-startup", "@deepseek-ai/dsh-acp-app")?;
+    Ok(())
+}
+
 /// Run the provider-owned preflight independently from the ACP command.  The
 /// dump is treated as untrusted data and is accepted only when every enabled
 /// entry is in the managed allowlist and the policy controls are present.
@@ -488,6 +586,71 @@ mod tests {
         let profile = build_profile().unwrap();
         assert_eq!(profile["agent"], "dsh");
         assert_eq!(profile["composition"]["sandbox"], "workspace-write");
+    }
+
+    #[test]
+    fn build_dump_rejects_user_policy_overrides() {
+        let baseline = serde_json::json!([
+            {"id":"sandbox-policy", "name":"@deepseek-ai/dsh-sandbox-policy", "config":{
+                "mode":"process.env.DSH_PERMISSION_MODE ?? 'workspace-write'", "workspaceRoot":"process.cwd()"}},
+            {"id":"approval", "name":"@deepseek-ai/dsh-user-approval", "config":{
+                "policy":"(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"}},
+            {"id":"permission", "name":"@deepseek-ai/dsh-permission-presets", "config":{"presets":{
+                "workspace-write":{"sandbox":"workspace-write", "approval":"ask"}}}},
+            {"id":"sandbox", "name":"@deepseek-ai/dsh-sandbox-local"},
+            {"id":"fs-sandbox", "name":"@deepseek-ai/dsh-fs-sandbox"},
+            {"id":"acp", "name":"@deepseek-ai/dsh-acp"},
+            {"id":"acp-app-startup", "name":"@deepseek-ai/dsh-acp-app"}
+        ]);
+        let validate = |v: &Value| {
+            validate_build_dump(
+                &serde_yaml::to_value(v).unwrap(),
+                std::path::Path::new("/workspace"),
+            )
+        };
+        validate(&baseline).unwrap();
+        for (index, pointer, replacement) in [
+            (
+                0,
+                "/config/mode",
+                Value::String("danger-full-access".into()),
+            ),
+            (0, "/config/workspaceRoot", Value::String("/".into())),
+            (1, "/config/policy", Value::String("never".into())),
+            (
+                2,
+                "/config/presets/workspace-write/approval",
+                Value::String("never".into()),
+            ),
+            (5, "/name", Value::String("unmanaged-acp".into())),
+        ] {
+            let mut drifted = baseline.clone();
+            *drifted[index].pointer_mut(pointer).unwrap() = replacement;
+            assert!(validate(&drifted).is_err(), "{index}{pointer}");
+        }
+        for index in 0..7 {
+            let mut drifted = baseline.clone();
+            drifted[index]["disabled"] = Value::Bool(true);
+            assert!(validate(&drifted).is_err(), "disabled {index}");
+            let mut missing = baseline.clone();
+            missing.as_array_mut().unwrap().remove(index);
+            assert!(validate(&missing).is_err(), "missing {index}");
+        }
+        let mut duplicate = baseline.clone();
+        duplicate.as_array_mut().unwrap().push(baseline[0].clone());
+        assert!(validate(&duplicate).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires explicit DSH_RUNTIME_PATH and installed pinned DSH"]
+    fn live_build_preflight_uses_installed_composition() {
+        let mut launch = DshLaunch::new(
+            Some(PathBuf::from(std::env::var_os("DSH_RUNTIME_PATH").unwrap())),
+            std::env::current_dir().unwrap(),
+            std::env::var_os("DSH_HOME").map(PathBuf::from),
+        );
+        launch.permission_mode = Some("workspace-write".into());
+        preflight_build(&launch).unwrap();
     }
 
     #[test]
