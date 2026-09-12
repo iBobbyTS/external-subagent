@@ -1411,7 +1411,7 @@ fn configured_agent_statuses(
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
-                spawn_supported: agent == "zcode" && entry.spawn_supported,
+                spawn_supported: entry.enabled && entry.spawn_supported && agent == "zcode",
                 transport_support: transport_support(agent, entry),
                 permission_modes: permission_modes(agent, entry),
                 model_selection: model_selection(agent, entry),

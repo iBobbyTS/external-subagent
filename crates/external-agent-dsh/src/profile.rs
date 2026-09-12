@@ -218,7 +218,16 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         "workflow-worker-thread",
         "goal-round-driver",
     ];
-    const ALLOWED_ENABLED: &[&str] = &["observe", "tool-observe", "tool-read", "tool-glob", "tool-grep", "tool-cordis", "telemetry", "logging"];
+    const ALLOWED_ENABLED: &[&str] = &[
+        "observe",
+        "tool-observe",
+        "tool-read",
+        "tool-glob",
+        "tool-grep",
+        "tool-cordis",
+        "telemetry",
+        "logging",
+    ];
     let mut saw_policy = false;
     fn walk(v: &serde_yaml::Value, saw: &mut bool) -> Result<(), String> {
         match v {
@@ -236,7 +245,10 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                     if DANGEROUS.contains(&id) && disabled != Some(true) {
                         return Err(format!("dangerous DSH entry is enabled: {id:?}"));
                     }
-                    if disabled != Some(true) && !ALLOWED_ENABLED.contains(&id) && id.starts_with("tool-") {
+                    if disabled != Some(true)
+                        && !ALLOWED_ENABLED.contains(&id)
+                        && !matches!(id, "sandbox-policy" | "approval")
+                    {
                         return Err(format!("unknown enabled DSH entry: {id:?}"));
                     }
                 }
@@ -422,7 +434,9 @@ mod tests {
     #[test]
     fn dump_policy_rejects_unknown_enabled_tool() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>("- id: sandbox-policy\n  disabled: true\n- id: approval\n  disabled: true\n- id: tool-unknown\n  disabled: false").unwrap();
-        assert!(validate_dump_policy(&yaml).unwrap_err().contains("unknown enabled"));
+        assert!(validate_dump_policy(&yaml)
+            .unwrap_err()
+            .contains("unknown enabled"));
     }
 
     #[test]
