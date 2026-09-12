@@ -1,0 +1,48 @@
+# Applied after the user's DSH profile layer. Strict plan keeps observation
+# available but removes every 0.1.5-rc.1 tool entry that can write, execute,
+# spawn nested work, or load executable extensions.
+
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: subprocess
+  disabled: true
+- id: sandbox
+  disabled: true
+- id: sandbox-policy
+  disabled: true
+- id: bash-sandbox
+  disabled: true
+- id: pwsh-sandbox
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: workflow-worker-thread
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
