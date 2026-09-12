@@ -28,7 +28,10 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   try {
     result = args.includes('reconcile')
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
-      : (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion });
+      : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion });
+    if (result?.phase && result.phase !== 'active') {
+      throw new Error(`installation update did not activate payload (phase=${result.phase})`);
+    }
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'success', result }));
     return result;
   } catch (error) {
