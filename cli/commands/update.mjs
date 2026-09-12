@@ -32,7 +32,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (result?.phase && result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result.phase})`);
     }
-    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'success', result }));
+    const receiptVersion = result?.active?.version || result?.version || requestedVersion;
+    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
     return result;
   } catch (error) {
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message }));
