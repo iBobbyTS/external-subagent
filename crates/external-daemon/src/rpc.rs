@@ -1411,7 +1411,7 @@ fn configured_agent_statuses(
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
-                spawn_supported: entry.enabled && entry.spawn_supported && agent == "zcode",
+                spawn_supported: entry.enabled && entry.spawn_supported,
                 transport_support: transport_support(agent, entry),
                 permission_modes: permission_modes(agent, entry),
                 model_selection: model_selection(agent, entry),
@@ -1464,12 +1464,12 @@ fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSup
             AgentTransportView::DshAcp
         },
         probe: true,
-        spawn: agent == "zcode" && entry.enabled && entry.spawn_supported,
+        spawn: entry.enabled && entry.spawn_supported,
     }
 }
 
 fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
-    if agent != "zcode" || !entry.enabled || !entry.spawn_supported {
+    if !entry.enabled || !entry.spawn_supported {
         return Vec::new();
     }
     vec![
@@ -1488,7 +1488,7 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
         }
     } else {
         AgentModelSelectionCapabilityView {
-            supported: agent == "zcode" && entry.enabled && entry.spawn_supported,
+            supported: agent == "dsh" && entry.enabled && entry.spawn_supported,
             mode: AgentModelSelectionModeView::CatalogToken,
         }
     }
@@ -1617,12 +1617,6 @@ fn resolve_admission(
         return Err(RpcError::new(
             RpcErrorCode::AgentUnsupported,
             format!("agent {agent} is unsupported; prompt_count=0"),
-        ));
-    }
-    if agent == "dsh" {
-        return Err(RpcError::new(
-            RpcErrorCode::AgentUnsupported,
-            "agent_unsupported: dsh; prompt_count=0",
         ));
     }
     Ok(external_core::AdmissionIdentity {
@@ -3351,9 +3345,8 @@ mod admission_tests {
         );
         config.agents.get_mut("dsh").unwrap().enabled = true;
         config.agents.get_mut("dsh").unwrap().spawn_supported = true;
-        let error = resolve_admission(&input, &config).unwrap_err();
-        assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
-        assert!(error.message.contains("prompt_count=0"));
+        let identity = resolve_admission(&input, &config).unwrap();
+        assert_eq!(identity.agent, "dsh");
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
         config.agents.get_mut("zcode").unwrap().spawn_supported = false;
