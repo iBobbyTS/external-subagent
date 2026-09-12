@@ -33,13 +33,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   if (prior?.status === 'success' && prior.claim === activation.activation_claim && prior.version === requestedVersion) return prior.result;
   let result;
   try {
+    const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     result = args.includes('reconcile')
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
-      : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion });
+      : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceInstalled && !daemon.skipServiceActivation });
     if (result?.phase && result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result.phase})`);
     }
-    const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     if (result?.active?.entry && serviceInstalled && !daemon.skipServiceActivation) {
       const activate = daemon.activateService || activateService;
       result.service = await activate(paths, {
@@ -47,6 +47,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
         sha256: result.active.entry_sha256,
         version: result.active.version,
       }, daemon);
+      result.homes = reconcileCodexHomes(paths);
+      if (result.homes.homes.length > 0 && !result.homes.all_updated) throw new Error('Codex home reconciliation failed after service activation');
     }
     const receiptVersion = result?.active?.version || result?.version || requestedVersion;
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
