@@ -57,11 +57,15 @@ const effectiveConfigPath = path.resolve(configPath);
 const effectiveFilePolicyPath = path.join(hookRoot, 'lib', 'agent-file-policy.mjs');
 const auditWrapperPath = path.join(hookRoot, 'hooks', 'audit-bash-result.mjs');
 const fileWrapperPath = path.join(hookRoot, 'hooks', 'check-agent-files.mjs');
+const guardWrapperPath = path.join(hookRoot, 'hooks', 'guard-bash.mjs');
 const verifierSourcePath = path.join(pluginRoot, 'scripts', 'policy-verifier.mjs');
 const filePolicySha256 = hashFile(effectiveFilePolicyPath);
 if (effectiveConfigPath === path.resolve(provenancePath)) throw new Error('config and provenance paths must differ');
 const events = {
-  PreToolUse: [{ matcher: '^(Read|Grep|Glob|Write|Edit|Delete|Move)$', script: 'hooks/check-agent-files.mjs' }],
+  PreToolUse: [
+    { matcher: 'Bash', script: 'hooks/guard-bash.mjs' },
+    { matcher: '^(Read|Grep|Glob|Write|Edit|Delete|Move)$', script: 'hooks/check-agent-files.mjs' },
+  ],
   PostToolUse: [{ matcher: 'Bash', script: 'hooks/audit-bash-result.mjs' }],
   PostToolUseFailure: [{ matcher: 'Bash', script: 'hooks/audit-bash-result.mjs' }],
 };
@@ -104,6 +108,8 @@ const nextProvenance = {
   effective_file_policy_version: 'zcode-agent-file-policy/v1.0.0',
   effective_file_policy_sha256: filePolicySha256,
   effective_file_policy_path: effectiveFilePolicyPath,
+  effective_guard_wrapper_path: guardWrapperPath,
+  effective_guard_wrapper_sha256: hashFile(guardWrapperPath),
   effective_config_path: effectiveConfigPath,
   effective_config_sha256: crypto.createHash('sha256').update(nextConfigBytes).digest('hex'),
   effective_audit_wrapper_path: auditWrapperPath,

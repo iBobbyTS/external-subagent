@@ -226,7 +226,7 @@ fn config_event_references(
                         && hook
                             .and_then(|value| value.get("command"))
                             .and_then(serde_json::Value::as_str)
-                            == Some("node")
+                            .is_some_and(|command| command == "node" || command.ends_with("/node"))
                         && hook
                             .and_then(|value| value.get("args"))
                             .and_then(serde_json::Value::as_array)
