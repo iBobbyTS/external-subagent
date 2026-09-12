@@ -142,9 +142,9 @@ impl RuntimeFactory for DshRuntimeFactory {
                     launch.permission_mode = Some("read-only".into());
                     launch.patch = patch;
                 } else {
-                    external_agent_dsh::profile::build_profile()
-                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                     launch.permission_mode = Some("workspace-write".into());
+                    external_agent_dsh::profile::preflight_build(&launch)
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                 }
                 let command = external_agent_dsh::profile::resolve_launch(&launch)?;
                 Ok(Arc::new(DshRuntimeOwner::spawn(command, _sink)?))
