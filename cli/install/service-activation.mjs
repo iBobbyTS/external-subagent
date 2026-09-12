@@ -81,7 +81,13 @@ export async function activateService(paths, candidate, options = {}) {
     };
   } catch (error) {
     if (!oldPid) {
-      error.rollback = { attempted: false, restored: false, error: 'no previous service identity to restore' };
+      try {
+        await unload();
+        atomicWrite(paths.launchAgent, oldPlist, 0o600);
+        error.rollback = { attempted: true, restored: false, error: 'no previous service identity to verify' };
+      } catch (rollbackError) {
+        error.rollback = { attempted: true, restored: false, error: rollbackError.message };
+      }
       throw error;
     }
     try {
