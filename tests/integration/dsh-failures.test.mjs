@@ -56,13 +56,22 @@ test('daemon DSH pending cancellation stays cancelling', () => {
 
 test('daemon DSH active cancellation sends session/cancel and reaps without result', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
-  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result', '--', '--exact', '--nocapture'], { cwd, encoding: 'utf8' });
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh::tests::dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result', '--', '--exact', '--nocapture'], { cwd, encoding: 'utf8' });
   assert.match(output, /test result: ok\. 1 passed/);
 });
 
 test('runtime executes malformed, EOF and oversized frame or cancellation oracles', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
-  const output = execFileSync('cargo', ['test', '-p', 'external-runtime'], { cwd, encoding: 'utf8' });
-  assert.match(output, /test result: ok/);
-  assert.match(output, /test result: ok\. 29 passed/);
+  const tests = [
+    'tests::malformed_and_child_exit_are_visible',
+    'tests::oversized_line_is_classified_and_discarded',
+    'tests::unterminated_oversized_line_is_bounded_and_closes_reader',
+    'tests::timeout_cancel_duplicate_and_unknown_ids_cannot_complete_another_waiter',
+    'tests::concurrent_stop_callers_share_one_terminal_outcome',
+    'tests::term_resistant_descendant_is_killed_with_owned_group',
+  ];
+  for (const name of tests) {
+    const output = execFileSync('cargo', ['test', '-p', 'external-runtime', name, '--', '--exact'], { cwd, encoding: 'utf8' });
+    assert.match(output, /test result: ok\. 1 passed/);
+  }
 });
