@@ -148,6 +148,102 @@ pub fn validate_dsh_version(output: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Collect both pipes concurrently, retaining at most `cap` bytes per pipe.
+/// The deadline covers pipe EOF as well as process exit; failed probes are
+/// always killed and waited, including output-limit and pipe-read failures.
+fn bounded_output(
+    command: &mut Command,
+    timeout: Duration,
+    cap: usize,
+) -> Result<std::process::Output, String> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("dsh probe spawn failed: {e}"))?;
+    collect_probe(&mut child, deadline, cap)
+}
+
+fn collect_probe(
+    child: &mut std::process::Child,
+    deadline: Instant,
+    cap: usize,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::sync::mpsc;
+    let (sender, receiver) = mpsc::channel();
+    let pipes: [(bool, Box<dyn Read + Send>); 2] = [
+        (false, Box::new(child.stdout.take().expect("piped stdout"))),
+        (true, Box::new(child.stderr.take().expect("piped stderr"))),
+    ];
+    let result = (|| {
+        for (stderr, mut pipe) in pipes {
+            let sender = sender.clone();
+            std::thread::Builder::new()
+                .name("dsh-probe-output".into())
+                .spawn(move || {
+                    let result = (|| {
+                        let mut bytes = Vec::new();
+                        let mut chunk = [0; 8192];
+                        loop {
+                            let count = match pipe.read(&mut chunk) {
+                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                other => {
+                                    other.map_err(|e| format!("dsh probe pipe read failed: {e}"))?
+                                }
+                            };
+                            if count == 0 {
+                                return Ok(bytes);
+                            }
+                            if count > cap.saturating_sub(bytes.len()) {
+                                return Err(format!(
+                                    "dsh probe {} exceeded {cap} byte cap",
+                                    if stderr { "stderr" } else { "stdout" }
+                                ));
+                            }
+                            bytes.extend_from_slice(&chunk[..count]);
+                        }
+                    })();
+                    let _ = sender.send((stderr, result));
+                })
+                .map_err(|e| format!("dsh probe reader spawn failed: {e}"))?;
+        }
+        drop(sender);
+        let (mut stdout, mut stderr) = (None, None);
+        loop {
+            if Instant::now() >= deadline {
+                return Err("dsh probe timed out".into());
+            }
+            while let Ok((is_stderr, bytes)) = receiver.try_recv() {
+                if is_stderr {
+                    stderr = Some(bytes?);
+                } else {
+                    stdout = Some(bytes?);
+                }
+            }
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if stdout.is_some() && stderr.is_some() {
+                    return Ok(std::process::Output {
+                        status,
+                        stdout: stdout.unwrap(),
+                        stderr: stderr.unwrap(),
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        child
+            .wait()
+            .map_err(|e| format!("dsh probe reap failed: {e}"))?;
+    }
+    result
+}
+
 /// Verify the actual user-composed build profile with the exact launch cwd,
 /// home and permission environment. Unsupported overrides fail before ACP starts.
 /// Prompt serialization is enforced separately by the daemon runtime owner.
@@ -156,32 +252,16 @@ pub fn preflight_build(launch: &DshLaunch) -> Result<(), String> {
     if launch.permission_mode.as_deref() != Some("workspace-write") {
         return Err("build launch must pin workspace-write".into());
     }
-    let version = resolve_launch(launch)
-        .map_err(|e| e.to_string())?
-        .arg("--version")
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut version_command = resolve_launch(launch).map_err(|e| e.to_string())?;
+    version_command.arg("--version");
+    let version = bounded_output(&mut version_command, Duration::from_secs(10), 4096)?;
     if !version.status.success() {
         return Err("dsh version probe failed".into());
     }
     validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
     let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
-    let mut child = command
-        .arg("--dump-config")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("dsh build dump-config timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    command.arg("--dump-config");
+    let output = bounded_output(&mut command, Duration::from_secs(10), 1024 * 1024)?;
     if !output.status.success() {
         return Err("dsh build dump-config failed".into());
     }
@@ -253,34 +333,26 @@ pub fn preflight(executable: &std::path::Path, patch: &std::path::Path) -> Resul
     if !executable.is_absolute() || !patch.is_absolute() {
         return Err("preflight paths must be absolute".into());
     }
-    let version = std::process::Command::new(executable)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("dsh version probe failed: {e}"))?;
-    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
-    let mut child = std::process::Command::new(executable)
-        .arg("--profile")
-        .arg("acp")
-        .arg("--patch")
-        .arg(patch)
-        .arg("--dump-config")
-        .env("DSH_PERMISSION_MODE", "read-only")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("dsh dump-config failed: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            return Err("dsh dump-config timed out".into());
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let version = bounded_output(
+        Command::new(executable).arg("--version"),
+        Duration::from_secs(10),
+        4096,
+    )?;
+    if !version.status.success() {
+        return Err("dsh version probe failed".into());
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let out = bounded_output(
+        Command::new(executable)
+            .arg("--profile")
+            .arg("acp")
+            .arg("--patch")
+            .arg(patch)
+            .arg("--dump-config")
+            .env("DSH_PERMISSION_MODE", "read-only"),
+        Duration::from_secs(10),
+        1024 * 1024,
+    )?;
     if !out.status.success() {
         return Err(format!(
             "dsh dump-config exited {}: {}",
@@ -639,6 +711,61 @@ mod tests {
         let mut duplicate = baseline.clone();
         duplicate.as_array_mut().unwrap().push(baseline[0].clone());
         assert!(validate(&duplicate).is_err());
+    }
+
+    #[test]
+    fn probe_drains_both_large_pipes_without_deadlock() {
+        let output = bounded_output(
+            Command::new("python3").arg("-c").arg(
+                "import sys; sys.stdout.buffer.write(b'o'*131072); sys.stderr.buffer.write(b'e'*131072)"
+            ), Duration::from_secs(5), 131072,
+        ).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, vec![b'o'; 131072]);
+        assert_eq!(output.stderr, vec![b'e'; 131072]);
+    }
+
+    #[test]
+    fn probe_caps_each_pipe_and_reaps_the_child() {
+        for stream in ["stdout", "stderr"] {
+            let script = format!("import sys,time; sys.{stream}.buffer.write(b'x'*131073); sys.{stream}.flush(); time.sleep(60)");
+            let mut child = Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let error =
+                collect_probe(&mut child, started + Duration::from_secs(5), 131072).unwrap_err();
+            assert!(error.contains(&format!("{stream} exceeded")), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn hanging_version_and_open_pipe_probes_time_out_and_reap() {
+        for script in [
+            "import time; time.sleep(60)",
+            "import os,time; os.close(1); os.close(2); time.sleep(60)",
+        ] {
+            let mut child = Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .arg("--version")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let error =
+                collect_probe(&mut child, started + Duration::from_millis(150), 4096).unwrap_err();
+            assert!(error.contains("timed out"), "{error}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(child.try_wait().unwrap().is_some());
+        }
     }
 
     #[test]
