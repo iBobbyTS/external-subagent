@@ -756,7 +756,9 @@ mod tests {
         AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA,
     };
     use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase};
+    use external_runtime::StopOutcome;
     use std::io::Write;
+    use std::sync::{atomic::AtomicUsize, Condvar};
 
     const SESSION_ID: &str = "dsh-build-session";
 
@@ -831,28 +833,29 @@ mod tests {
             .collect()
     }
 
-    fn dsh_scheduler(workspace: &std::path::Path, dsh: DshRuntimeFactory) -> Scheduler {
+    // The scripted children speak real process I/O; under the parallel
+    // workspace suite the default 2s windows are too tight, so the tests
+    // budget generously (none of them asserts deadline behavior). The
+    // per-workspace limit is the contract every provider shares: one agent
+    // slot per workspace, no provider-private concurrency.
+    fn scheduler_over(workspace: &std::path::Path, factory: Arc<dyn RuntimeFactory>) -> Scheduler {
         let store = Arc::new(external_store::Store::open(workspace.join("state.sqlite")).unwrap());
+        let config = SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(10),
+            per_workspace_max_agents: 1,
+            ..SchedulerConfig::default()
+        };
+        Scheduler::new("dsh-test", store, factory, config).unwrap()
+    }
+
+    fn dsh_scheduler(workspace: &std::path::Path, dsh: DshRuntimeFactory) -> Scheduler {
         // The zcode factory fails loudly if a test accidentally routes a task
         // away from the DSH adapter under test.
         let zcode = CommandRuntimeFactory::new(|_: &TaskRecord| {
             Err(io::Error::other("zcode route must not spawn in dsh tests"))
         });
-        // The scripted children speak real process I/O; under the parallel
-        // workspace suite the default 2s windows are too tight, so the tests
-        // budget generously (none of them asserts deadline behavior).
-        let config = SchedulerConfig {
-            bootstrap_timeout: Duration::from_secs(30),
-            control_timeout: Duration::from_secs(10),
-            ..SchedulerConfig::default()
-        };
-        Scheduler::new(
-            "dsh-test",
-            store,
-            Arc::new(RoutingRuntimeFactory::new(zcode, dsh)),
-            config,
-        )
-        .unwrap()
+        scheduler_over(workspace, Arc::new(RoutingRuntimeFactory::new(zcode, dsh)))
     }
 
     fn dsh_workspace() -> tempfile::TempDir {
@@ -1225,17 +1228,277 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         );
     }
 
+    /// Minimal test-only provider runtime (the conformance "third adapter"):
+    /// an in-process `ManagedRuntime` with no child process at all. Bootstrap
+    /// opens one active turn, `stop_turn` settles it cooperatively, and `stop`
+    /// publishes a terminal that proves reaping vacuously (no process existed).
+    /// It exists so a second provider can hold the shared scheduler/workspace
+    /// contract through the same `ManagedRuntime` seam without launching real
+    /// ZCode and without touching the production factory composition.
+    struct FakeProviderRuntime {
+        session_id: String,
+        tracker: Arc<TurnTracker>,
+        terminal: Mutex<Option<RuntimeTerminal>>,
+        terminal_changed: Condvar,
+    }
+
+    impl FakeProviderRuntime {
+        fn new() -> Self {
+            Self {
+                session_id: "fake-provider-session".into(),
+                tracker: Arc::new(TurnTracker::new()),
+                terminal: Mutex::new(None),
+                terminal_changed: Condvar::new(),
+            }
+        }
+
+        fn turn_event(&self, kind: &str) {
+            self.tracker.observe(&Inbound::Message(WireMessage::Event(
+                EventEnvelope {
+                    method: SESSION_EVENT.into(),
+                    params: serde_json::json!({"type": kind}),
+                },
+            )));
+        }
+    }
+
+    struct FakeProviderFactory {
+        spawns: AtomicUsize,
+    }
+
+    impl RuntimeFactory for FakeProviderFactory {
+        fn spawn(
+            &self,
+            _task: &TaskRecord,
+            _sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            self.spawns.fetch_add(1, Ordering::AcqRel);
+            Ok(Arc::new(FakeProviderRuntime::new()))
+        }
+    }
+
+    impl ManagedRuntime for FakeProviderRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+
+        fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+            let mut terminal = self.terminal.lock().unwrap();
+            let published = terminal
+                .get_or_insert(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                )))
+                .clone();
+            drop(terminal);
+            self.terminal_changed.notify_all();
+            published
+        }
+
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            let deadline = Instant::now().checked_add(timeout)?;
+            let mut terminal = self.terminal.lock().unwrap();
+            loop {
+                if let Some(published) = terminal.as_ref() {
+                    return Some(published.clone());
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                let (next, waited) = self
+                    .terminal_changed
+                    .wait_timeout(terminal, deadline - now)
+                    .unwrap();
+                terminal = next;
+                if waited.timed_out() {
+                    return terminal.clone();
+                }
+            }
+        }
+
+        fn diagnostic_session_id(&self) -> Option<String> {
+            Some(self.session_id.clone())
+        }
+
+        fn bootstrap_session_with_mcp(
+            &self,
+            _task: &TaskRecord,
+            _mcp_servers: &[external_contract::StdioMcpServer],
+            _timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            self.turn_event("turn.started");
+            Ok(SessionReady {
+                session_id: self.session_id.clone(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+
+        fn stop_turn(
+            &self,
+            session_id: &str,
+            timeout: Duration,
+        ) -> Result<TurnSnapshot, RuntimeCommandError> {
+            if session_id != self.session_id {
+                return Err(RuntimeCommandError::InvalidSession(
+                    "session id does not belong to this runtime".into(),
+                ));
+            }
+            let current = self.tracker.snapshot();
+            if !current.active {
+                return Ok(current);
+            }
+            self.turn_event("turn.completed");
+            self.tracker.wait_boundary_after(current.generation, timeout)
+        }
+
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            self.tracker.snapshot()
+        }
+
+        fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
+            self.tracker.activity_snapshot()
+        }
+    }
+
+    /// Test-only composition mirroring `RoutingRuntimeFactory`: the zcode
+    /// route lands on the in-process fake provider, the dsh route on the same
+    /// test-harness DSH factory the other dsh tests use.
+    struct JointProviderFactory {
+        zcode: Arc<FakeProviderFactory>,
+        dsh: DshRuntimeFactory,
+    }
+
+    impl RuntimeFactory for JointProviderFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            match task_agent(task).as_str() {
+                "zcode" => self.zcode.spawn(task, sink),
+                "dsh" => self.dsh.spawn(task, sink),
+                agent => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("task routes to unknown agent {agent:?}"),
+                )),
+            }
+        }
+    }
+
     #[test]
     fn cross_provider_shared_scheduler_contract() {
         let _guard = scripted_test_guard();
         let workspace = dsh_workspace();
-        let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
-        let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
-        let error = scheduler.start_ready().expect_err("closed DSH gate must reject");
-        assert!(error.to_string().contains("unsupported") || error.to_string().contains("closed"));
-        let task = await_terminal_task(&scheduler, &agent_id);
-        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
-        assert!(scheduler.last_error(&agent_id).is_some());
+        // The dsh provider runs for real after the workspace is released: the
+        // same scripted ACP child the active-cancellation test uses.
+        let script = format!(
+            "{BOOTSTRAP_PREFIX}printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"stopReason\":\"cancelled\"}}}}'\\nsleep 1\\n"
+        )
+        .replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let fake = Arc::new(FakeProviderFactory {
+            spawns: AtomicUsize::new(0),
+        });
+        let scheduler = scheduler_over(
+            workspace.path(),
+            Arc::new(JointProviderFactory {
+                zcode: Arc::clone(&fake),
+                dsh: DshRuntimeFactory::test_harness(Some(child)),
+            }),
+        );
+
+        // The first provider (the fake zcode runtime, one active turn) is
+        // admitted and occupies the workspace's single agent slot.
+        let first = scheduler
+            .enqueue_general(&manifest_for(workspace.path(), "occupy the shared workspace"))
+            .unwrap()
+            .task
+            .agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![first.clone()]);
+        let running = scheduler.store().get_task(&first).unwrap().unwrap();
+        assert_eq!(running.phase, TaskPhase::Running);
+        assert_eq!(scheduler.active_count(), 1);
+        assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
+
+        // While the workspace is occupied the second provider's admission is
+        // rejected with the workspace conflict naming the active agent;
+        // nothing is queued and no dsh provider process is spawned.
+        let conflict = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "second provider must wait"),
+                Some(dsh_admission(Some("fixture-model"))),
+            )
+            .unwrap_err();
+        match &conflict {
+            SchedulerError::Store(external_store::StoreError::Conflict(message)) => {
+                assert_eq!(message, &format!("WORKSPACE_BUSY active_agent_id={first}"));
+            }
+            other => panic!("expected a workspace conflict, got {other:?}"),
+        }
+        assert!(!workspace.path().join("wire.jsonl").exists());
+        assert!(scheduler.start_ready().unwrap().is_empty());
+        assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
+
+        // Cancelling the occupier terminalizes it exactly once and releases
+        // the slot; the cancelled provider never revives.
+        let phase = scheduler.cancel_task(&first).expect("cancel active occupier");
+        assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
+        let cancelled = await_terminal_task(&scheduler, &first);
+        assert_eq!(cancelled.outcome, Some(TaskOutcome::Cancelled));
+        assert_eq!(
+            scheduler
+                .store()
+                .task_result(&first)
+                .unwrap()
+                .expect("cancelled occupier keeps its immutable result")
+                .result
+                .outcome,
+            TaskOutcome::Cancelled
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() != 0 {
+            assert!(Instant::now() < deadline, "occupier runtime was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(scheduler.cancel_task(&first).unwrap(), TaskPhase::Terminal);
+        assert!(scheduler.start_ready().unwrap().is_empty());
+        assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
+
+        // After release the same workspace admits the dsh provider for real:
+        // the scripted child performs the ACP bootstrap and blocks on the
+        // fixture permission, holding the slot the cancelled provider lost.
+        let second = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
+        let _request = await_pending_permission(&scheduler, &second);
+        assert_eq!(scheduler.active_count(), 1);
+
+        // Cancelling the second provider reaps it without reviving either
+        // provider: one cooperative session/cancel, both tasks terminal.
+        let phase = scheduler.cancel_task(&second).expect("cancel active dsh provider");
+        assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
+        let second_terminal = await_terminal_task(&scheduler, &second);
+        assert_eq!(second_terminal.outcome, Some(TaskOutcome::Cancelled));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() != 0 {
+            assert!(Instant::now() < deadline, "dsh runtime was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let frames = wait_for_frames(workspace.path(), 5);
+        assert!(request_methods(&frames).contains(&"session/prompt"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+                .count(),
+            1
+        );
+        // The cancelled first provider stayed terminal through the second
+        // provider's whole lifecycle and was never respawned.
+        let first_final = scheduler.store().get_task(&first).unwrap().unwrap();
+        assert_eq!(first_final.phase, TaskPhase::Terminal);
+        assert_eq!(first_final.outcome, Some(TaskOutcome::Cancelled));
+        assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
     }
 
     #[test]
