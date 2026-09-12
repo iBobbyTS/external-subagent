@@ -1889,6 +1889,49 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
+    fn drain_transition_serializes_with_new_task_admission() {
+        let (directory, service, _) = fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        service.scheduler.set_admission_hook({
+            let barrier = Arc::clone(&barrier);
+            Arc::new(move || {
+                barrier.wait();
+                barrier.wait();
+            })
+        });
+
+        let task_workspace = directory.path().join("spawn-admission");
+        std::fs::create_dir(&task_workspace).unwrap();
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: task_workspace.canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "accepted before the drain linearization point".into(),
+            write_manifest: vec![],
+        };
+        let enqueue_service = Arc::clone(&service);
+        let first_manifest = manifest.clone();
+        let enqueue =
+            std::thread::spawn(move || enqueue_service.scheduler.enqueue_general(&first_manifest));
+
+        barrier.wait();
+        let drain_service = Arc::clone(&service);
+        let drain = std::thread::spawn(move || drain_service.dispatch(RpcMethod::DaemonBeginDrain));
+        barrier.wait();
+
+        assert!(enqueue.join().unwrap().is_ok());
+        assert!(drain.join().unwrap().is_ok());
+        service.scheduler.set_admission_hook(Arc::new(|| {}));
+
+        let error = service.scheduler.enqueue_general(&manifest).unwrap_err();
+        assert!(matches!(
+            error,
+            SchedulerError::InvalidConfig(ref message) if message == "daemon_draining"
+        ));
+    }
+
+    #[test]
     fn draining_lifecycle_methods_are_not_gate_rejected() {
         let (_dir, service, id) = fixture();
         service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
