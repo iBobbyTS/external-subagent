@@ -607,11 +607,22 @@ fn parse_opaque_model_tokens(catalog: &Value) -> Result<Vec<String>, String> {
     let models = catalog
         .get("models")
         .and_then(Value::as_array)
-        .ok_or_else(|| "protocol".to_owned())?;
+        .cloned().unwrap_or_default();
+    let mut tokens = Vec::new();
+    if let Some(options) = catalog.get("configOptions").and_then(Value::as_array) {
+        for option in options {
+            let id = option.get("id").or_else(|| option.get("configId")).and_then(Value::as_str);
+            if id != Some("model") { continue; }
+            let mut add = |v: Option<&Value>| { if let Some(t)=v.and_then(Value::as_str) { if !t.is_empty() && t.len()<=DSH_MAX_MODEL_TOKEN_BYTES && !t.contains('\0') && !tokens.iter().any(|x| x==t) { tokens.push(t.to_owned()); } } };
+            add(option.get("currentValue"));
+            if let Some(vals)=option.get("options").and_then(Value::as_array) { for v in vals { add(v.get("value")); } }
+        }
+    }
+    if !tokens.is_empty() { return Ok(tokens); }
     if models.len() > DSH_MAX_MODELS {
         return Err("oversized".into());
     }
-    let mut tokens = Vec::with_capacity(models.len());
+    tokens = Vec::with_capacity(models.len());
     for model in models {
         let token = model
             .get("id")
