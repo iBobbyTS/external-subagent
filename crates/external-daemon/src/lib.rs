@@ -2266,6 +2266,7 @@ struct SchedulerInner {
     #[cfg(test)]
     admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     draining: AtomicBool,
+    drain_cancel_running: AtomicBool,
     updater_fired: AtomicBool,
     activation_claim: Mutex<Option<String>>,
 }
