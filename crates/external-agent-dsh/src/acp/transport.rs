@@ -100,8 +100,11 @@ pub fn parse_initialize_result(result: &Value) -> Result<InitializeResult, Shape
             "initialize returned unsupported protocolVersion {protocol_version}"
         )));
     }
-    let capabilities = result.get("agentCapabilities").or_else(|| result.get("capabilities"))
-        .cloned().unwrap_or(Value::Null);
+    let capabilities = result
+        .get("agentCapabilities")
+        .or_else(|| result.get("capabilities"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let flag = |key: &str| {
         capabilities
             .get(key)
