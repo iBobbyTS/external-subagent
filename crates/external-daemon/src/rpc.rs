@@ -1464,12 +1464,12 @@ fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSup
             AgentTransportView::DshAcp
         },
         probe: true,
-        spawn: entry.enabled && entry.spawn_supported,
+        spawn: agent == "zcode" && entry.enabled && entry.spawn_supported,
     }
 }
 
-fn permission_modes(_agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
-    if !entry.enabled || !entry.spawn_supported {
+fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
+    if agent != "zcode" || !entry.enabled || !entry.spawn_supported {
         return Vec::new();
     }
     vec![
