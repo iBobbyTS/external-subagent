@@ -84,9 +84,9 @@ export async function activateService(paths, candidate, options = {}) {
       try {
         await unload();
         atomicWrite(paths.launchAgent, oldPlist, 0o600);
-        error.rollback = { attempted: true, restored: false, error: 'no previous service identity to verify' };
+        error.rollback = { attempted: true, restored: false, plist_restored: true, error: 'no previous service identity to verify' };
       } catch (rollbackError) {
-        error.rollback = { attempted: true, restored: false, error: rollbackError.message };
+        error.rollback = { attempted: true, restored: false, plist_restored: false, error: rollbackError.message };
       }
       throw error;
     }
