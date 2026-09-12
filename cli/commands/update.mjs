@@ -4,6 +4,7 @@ import { reconcileInstallation, updateInstallation } from '../install/update.mjs
 export function updateCommand(paths, args = []) {
   const cancelActive = args.includes('--cancel-active');
   const yes = args.includes('--yes');
+  if (cancelActive && !yes) throw new Error('--cancel-active requires --yes');
   if (args.includes('reconcile')) return { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) };
   return updateInstallation(paths, { version: args.find((arg) => arg.startsWith('--version='))?.slice(10) });
 }
