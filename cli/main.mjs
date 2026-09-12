@@ -6,6 +6,7 @@ import { CliError } from './errors.mjs';
 import { installHooks, installPlan, runInit } from './install/init.mjs';
 import { nativeBinary } from './install/layout.mjs';
 import { cleanupLegacy, purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
+import { updateCommand } from './commands/update.mjs';
 import { localInstallStatus, startDaemon, stopDaemon } from './commands/daemon.mjs';
 import { mcpCommand, pluginCommand } from './commands/plugin.mjs';
 import { platform, productPaths } from './paths.mjs';
@@ -365,6 +366,7 @@ export async function main(args) {
   if (command === 'restore') { output(restoreData(value(args, '--input'), paths)); return; }
   if (command === 'start') { output(startDaemon(paths)); return; }
   if (command === 'stop') { output(stopDaemon(paths)); return; }
+  if (command === 'update' || command === 'reconcile') { output(updateCommand(paths, command === 'reconcile' ? ['reconcile', ...args.slice(1)] : args.slice(1))); return; }
   if (command === 'uninstall') { output(uninstall(paths)); return; }
   if (command === 'purge') {
     if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'purge requires --yes');
