@@ -1657,6 +1657,8 @@ mod server {
     fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {
         match method {
             RpcMethod::SystemStatus => ("status", None),
+            RpcMethod::DaemonBeginDrain => ("drain", None),
+            RpcMethod::DaemonDrainStatus => ("drain_status", None),
             RpcMethod::AgentProbe { .. } => ("agent_probe", None),
             RpcMethod::AgentModels { .. } => ("agent_models", None),
             RpcMethod::SubmitGeneral { .. } => ("spawn", None),

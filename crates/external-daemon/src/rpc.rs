@@ -65,6 +65,8 @@ pub struct RpcRequest {
 #[allow(clippy::large_enum_variant)]
 pub enum RpcMethod {
     SystemStatus,
+    DaemonBeginDrain,
+    DaemonDrainStatus,
     AgentProbe {
         input: AgentProbeInput,
     },
@@ -282,6 +284,7 @@ pub enum RpcSuccess {
     SystemStatus {
         status: SystemStatusView,
     },
+    DaemonDrainStatus { is_draining: bool, active_count: usize, resources_reaped: bool, ready_for_activation: bool, updater_fired: bool },
     AgentProbed {
         evidence: AgentProbeEvidence,
         status: AgentStatusView,
@@ -979,6 +982,8 @@ impl RpcService {
             RpcMethod::SystemStatus => Ok(RpcSuccess::SystemStatus {
                 status: self.system_status(),
             }),
+            RpcMethod::DaemonBeginDrain => { self.scheduler.begin_drain(); Ok(RpcSuccess::DaemonDrainStatus { is_draining: true, active_count: self.scheduler.active_count(), resources_reaped: self.scheduler.active_count()==0, ready_for_activation: self.scheduler.ready_for_activation(), updater_fired: false }) },
+            RpcMethod::DaemonDrainStatus => Ok(RpcSuccess::DaemonDrainStatus { is_draining: self.scheduler.is_draining(), active_count: self.scheduler.active_count(), resources_reaped: self.scheduler.active_count()==0, ready_for_activation: self.scheduler.ready_for_activation(), updater_fired: false }),
             RpcMethod::AgentProbe { input } => {
                 validate_agent_probe_input(&input)?;
                 let config = read_agent_config_snapshot()?;
