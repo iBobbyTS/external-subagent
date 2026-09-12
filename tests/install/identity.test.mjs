@@ -34,13 +34,13 @@ test('Codex MCP installer writes canonical external_subagent section', () => {
 test('hook installer installs a verified real file policy without dropping unrelated hooks', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hooks-'));
   const paths = { zcodeConfig: path.join(home, 'zcode.json'), hookProvenance: path.join(home, 'hooks.json') };
-  const original = Buffer.from('{"hooks":{"enabled":false,"events":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"process","command":"existing"}]}]}}}\n');
+  const original = Buffer.from('{"hooks":{"enabled":false,"events":{"PreToolUse":[{"matcher":"Custom","hooks":[{"type":"process","command":"existing"}]}]}}}\n');
   fs.writeFileSync(paths.zcodeConfig, original);
   const result = installHooks(paths);
   assert.equal(typeof result.file_policy_sha256, 'string');
   const installed = JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
   assert.equal(installed.hooks.enabled, true);
-  assert.equal(installed.hooks.events.PreToolUse.length, 2);
+  assert.equal(installed.hooks.events.PreToolUse.length, 3);
   assert.equal(installed.hooks.events.PostToolUse.length, 1);
   assert.equal(fs.existsSync(paths.hookProvenance), true);
   assert.equal(fs.existsSync(path.join(home, 'external-subagent-policy-verifier')), true);

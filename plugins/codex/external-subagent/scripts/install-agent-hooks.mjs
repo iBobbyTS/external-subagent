@@ -121,11 +121,14 @@ const nextProvenance = {
   activation_generation: `${Date.now()}-${filePolicySha256.slice(0, 12)}`,
 };
 const previousProvenance = fs.existsSync(provenancePath) ? fs.readFileSync(provenancePath) : null;
-atomicWrite(provenancePath, nextProvenance);
 const verifierPath = path.join(path.dirname(provenancePath), 'external-subagent-policy-verifier');
-atomicWriteBytes(verifierPath, fs.readFileSync(verifierSourcePath));
-fs.chmodSync(verifierPath, 0o700);
+const previousVerifier = fs.existsSync(verifierPath)
+  ? { bytes: fs.readFileSync(verifierPath), mode: fs.statSync(verifierPath).mode & 0o777 }
+  : null;
 try {
+  atomicWrite(provenancePath, nextProvenance);
+  atomicWriteBytes(verifierPath, fs.readFileSync(verifierSourcePath));
+  fs.chmodSync(verifierPath, 0o700);
   atomicWriteBytes(configPath, nextConfigBytes);
 } catch (error) {
   if (previousProvenance === null) {
@@ -135,7 +138,12 @@ try {
   } else {
     atomicWriteBytes(provenancePath, previousProvenance);
   }
-  try { fs.unlinkSync(verifierPath); } catch (unlinkError) { if (unlinkError?.code !== 'ENOENT') throw unlinkError; }
+  if (previousVerifier === null) {
+    try { fs.unlinkSync(verifierPath); } catch (unlinkError) { if (unlinkError?.code !== 'ENOENT') throw unlinkError; }
+  } else {
+    atomicWriteBytes(verifierPath, previousVerifier.bytes);
+    fs.chmodSync(verifierPath, previousVerifier.mode);
+  }
   throw error;
 }
 console.log(JSON.stringify({ config: effectiveConfigPath, provenance: path.resolve(provenancePath), file_policy_sha256: filePolicySha256 }));
