@@ -1818,10 +1818,22 @@ pub(crate) mod wait_tests {
     #[test]
     fn draining_existing_task_message_is_idempotent_but_new_rejected() {
         let (_dir, service, id) = fixture();
-        let msg = MessageInput { agent_id: id.clone(), message_id: "drain-msg".into(), mode: "queue".into(), content: "x".into() };
-        service.dispatch(RpcMethod::TaskMessage(msg.clone())).unwrap();
+        let msg = MessageInput {
+            agent_id: id.clone(),
+            message_id: "drain-msg".into(),
+            mode: "queue".into(),
+            content: "x".into(),
+        };
+        service
+            .dispatch(RpcMethod::TaskMessage(msg.clone()))
+            .unwrap();
         service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
-        let err = service.dispatch(RpcMethod::TaskMessage(MessageInput { message_id: "new-msg".into(), ..msg.clone() })).unwrap_err();
+        let err = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                message_id: "new-msg".into(),
+                ..msg.clone()
+            }))
+            .unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Unavailable);
         assert!(service.dispatch(RpcMethod::TaskMessage(msg)).is_ok());
     }
@@ -1831,9 +1843,20 @@ pub(crate) mod wait_tests {
         let (_dir, service, id) = fixture();
         service.dispatch(RpcMethod::DaemonBeginDrain).unwrap();
         let methods = [
-            RpcMethod::TaskWait(TaskWaitQuery { agent_id: id.clone(), after_revision: 0, wait_time: 0, message_id: None }),
-            RpcMethod::TaskCancel { agent_id: id.clone() },
-            RpcMethod::TaskResult { agent_id: id.clone(), offset: 0, limit: 10 },
+            RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: id.clone(),
+                after_revision: 0,
+                wait_time: 0,
+                message_id: None,
+            }),
+            RpcMethod::TaskCancel {
+                agent_id: id.clone(),
+            },
+            RpcMethod::TaskResult {
+                agent_id: id.clone(),
+                offset: 0,
+                limit: 10,
+            },
             RpcMethod::TaskClose { agent_id: id },
         ];
         for method in methods {
@@ -3501,15 +3524,35 @@ mod agent_probe_tests {
     #[test]
     fn draining_status_read_is_side_effect_free_and_activation_is_once() {
         let (_directory, service) = service();
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap() else { panic!("status") };
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
+            service.dispatch(RpcMethod::DaemonDrainStatus).unwrap()
+        else {
+            panic!("status")
+        };
         assert!(!updater_fired);
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonBeginDrain).unwrap() else { panic!("begin") };
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
+            service.dispatch(RpcMethod::DaemonBeginDrain).unwrap()
+        else {
+            panic!("begin")
+        };
         assert!(!updater_fired);
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap() else { panic!("status") };
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
+            service.dispatch(RpcMethod::DaemonDrainStatus).unwrap()
+        else {
+            panic!("status")
+        };
         assert!(!updater_fired);
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonActivateReady).unwrap() else { panic!("activate") };
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
+            service.dispatch(RpcMethod::DaemonActivateReady).unwrap()
+        else {
+            panic!("activate")
+        };
         assert!(updater_fired);
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonActivateReady).unwrap() else { panic!("activate") };
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
+            service.dispatch(RpcMethod::DaemonActivateReady).unwrap()
+        else {
+            panic!("activate")
+        };
         assert!(updater_fired);
     }
 }
