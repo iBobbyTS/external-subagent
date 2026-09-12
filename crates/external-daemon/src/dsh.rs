@@ -1155,14 +1155,16 @@ printf '%s\\n' \
             })
             .collect();
         assert_eq!(prompts.len(), 2);
-        assert!(prompts[0]["params"]["prompt"]
-            .as_str()
-            .unwrap()
-            .contains("build the fixture"));
-        assert!(prompts[1]["params"]["prompt"]
-            .as_str()
-            .unwrap()
-            .contains("follow-up prompt"));
+        fn prompt_text(frame: &serde_json::Value) -> String {
+            frame["params"]["prompt"]
+                .as_array()
+                .expect("ACP prompt is a content block array")
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect()
+        }
+        assert!(prompt_text(prompts[0]).contains("build the fixture"));
+        assert!(prompt_text(prompts[1]).contains("follow-up prompt"));
         let permission_responses: Vec<&serde_json::Value> = frames
             .iter()
             .filter(|frame| frame.get("id").and_then(|id| id.as_str()) == Some("srv-1"))
