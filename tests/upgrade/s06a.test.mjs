@@ -50,9 +50,9 @@ test('registered home reconcile reports per-home partial results', () => {
   assert.equal(result.all_updated, false); assert.deepEqual(result.homes.map((x) => x.status), ['updated', 'failed']);
 });
 
-test('update command requires yes for active cancellation', () => {
+test('update command requires yes for active cancellation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
   fs.mkdirSync(p.data, { recursive: true });
-  assert.throws(() => updateCommand(p, ['--cancel-active']), /--yes/);
+  await assert.rejects(() => updateCommand(p, ['--cancel-active']), /--yes/);
   assert.doesNotThrow(() => updateCommand(p, ['--cancel-active', '--yes']));
 });
