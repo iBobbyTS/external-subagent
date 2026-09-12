@@ -1081,6 +1081,17 @@ else:
     }
 
     #[test]
+    fn dump_policy_rejects_executor_and_settings_drift() {
+        for drift in [
+            "- id: sandbox-policy\n  disabled: false\n  config:\n    mode: read-only\n    runnerCommand: /bin/sh\n- id: approval\n  disabled: true",
+            "- id: sandbox-policy\n  disabled: false\n  config:\n    mode: read-only\n- id: approval\n  disabled: true\n- id: settings\n  disabled: false\n  config:\n    permission_mode: workspace-write",
+        ] {
+            let yaml = serde_yaml::from_str::<serde_yaml::Value>(drift).unwrap();
+            assert!(validate_dump_policy(&yaml).is_err());
+        }
+    }
+
+    #[test]
     fn strict_plan_profile_is_read_only_and_fail_closed() {
         let profile = strict_plan_profile().unwrap();
         assert_eq!(profile["composition"]["sandbox"], "read-only");
