@@ -440,16 +440,26 @@ pub struct AgentModelSelectionCapabilityView {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentConfigSnapshot {
+    #[serde(default)]
+    schema_version: u32,
     #[serde(default)]
     revision: u64,
     #[serde(default)]
     default_agent: Option<String>,
     #[serde(default)]
     agents: BTreeMap<String, AgentConfigEntry>,
+    #[serde(default)]
+    runtime: Option<String>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentConfigEntry {
     enabled: bool,
     spawn_supported: bool,
@@ -460,6 +470,7 @@ struct AgentConfigEntry {
 impl Default for AgentConfigSnapshot {
     fn default() -> Self {
         Self {
+            schema_version: 1,
             revision: 0,
             default_agent: None,
             agents: BTreeMap::from([
@@ -480,6 +491,9 @@ impl Default for AgentConfigSnapshot {
                     },
                 ),
             ]),
+            runtime: None,
+            database: None,
+            socket: None,
         }
     }
 }
@@ -1595,6 +1609,12 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
     };
     let mut snapshot: AgentConfigSnapshot = serde_json::from_slice(&bytes)
         .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
+    if snapshot.schema_version != 0 && snapshot.schema_version != 1 {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "unsupported agent config schema version",
+        ));
+    }
     if snapshot
         .agents
         .keys()
