@@ -32,6 +32,13 @@ test('cancel is an explicit bounded protocol operation', async () => {
 
 test('runtime observes bounded oversized and reap failure paths', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
-  const output = execFileSync('cargo', ['test', '-p', 'external-runtime', 'oversized_line_is_classified_and_discarded', '--', '--exact'], { cwd, encoding: 'utf8' });
+  const output = execFileSync('cargo', ['test', '-p', 'external-runtime', 'malformed_and_child_exit_are_visible', '--', '--exact'], { cwd, encoding: 'utf8' });
   assert.match(output, /test result: ok/);
+});
+
+test('runtime executes malformed, EOF and oversized frame or cancellation oracles', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const output = execFileSync('cargo', ['test', '-p', 'external-runtime'], { cwd, encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
+  assert.doesNotMatch(output, /0 passed/);
 });
