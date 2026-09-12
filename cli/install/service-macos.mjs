@@ -21,8 +21,14 @@ export function launchAgentPlist(paths) {
   const daemon = nativeBinary('external-subagentd');
   const dshRuntime = process.env.DSH_RUNTIME_PATH;
   const dshHome = process.env.DSH_HOME;
+  let configRevision = null;
+  try {
+    const config = JSON.parse(fs.readFileSync(paths.config, 'utf8'));
+    if (Number.isInteger(config.revision)) configRevision = config.revision;
+  } catch {}
   const dshEnvironment = [
     `<key>PATH</key><string>${LAUNCHD_FIXED_PATH}</string>`,
+    ...(configRevision === null ? [] : [`<key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>${configRevision}</string>`]),
     ...(dshRuntime ? [`<key>DSH_RUNTIME_PATH</key><string>${escapeXml(dshRuntime)}</string>`] : []),
     ...(dshHome ? [`<key>DSH_HOME</key><string>${escapeXml(dshHome)}</string>`] : []),
   ].join('');
