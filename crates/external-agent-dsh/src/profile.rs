@@ -211,26 +211,71 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         "tool-workflow",
         "tool-goal",
         "tool-ralph",
-        "subprocess",
-        "bash-sandbox",
-        "pwsh-sandbox",
         "skill-filesystem",
         "workflow-worker-thread",
         "goal-round-driver",
     ];
     const ALLOWED_ENABLED: &[&str] = &[
-        "timer", "llm", "deepseek-llm-api-extensions", "session",
-        "session-log-deepseek", "typert", "typert-loader", "typert-gateway",
-        "session-title", "user-questions", "agent", "plugin-package-inventory-deepseek",
-        "agent-default-model", "llm-retry", "settings", "credentials", "llm-pi-ai",
-        "attachment-local", "session-query-sqlite", "session-projection", "storage",
-        "storage-json", "storage-domain", "session-projection-cache", "session-telemetry-otel",
-        "permission", "shell-env", "fs-observation-policy", "agent-instructions", "commands",
-        "command-feedback", "goal", "command-goal", "plan-mode", "token-meter",
-        "compaction-basic", "command-compact", "timeout-policy", "spill-local", "spill-policy",
-        "session-checkpoint-policy", "tool-result-pruner", "tool-todo", "repeat-tool-reminder",
-        "web", "web-search-deepseek", "web-fetch-http", "tool-web", "tools", "system-prompt",
-        "agent-loop", "fs-sandbox", "llm-deepseek", "acp-app-startup", "acp",
+        "timer",
+        "llm",
+        "deepseek-llm-api-extensions",
+        "session",
+        "session-log-deepseek",
+        "typert",
+        "typert-loader",
+        "typert-gateway",
+        "session-title",
+        "user-questions",
+        "agent",
+        "plugin-package-inventory-deepseek",
+        "agent-default-model",
+        "llm-retry",
+        "settings",
+        "credentials",
+        "llm-pi-ai",
+        "attachment-local",
+        "session-query-sqlite",
+        "session-projection",
+        "storage",
+        "storage-json",
+        "storage-domain",
+        "session-projection-cache",
+        "session-telemetry-otel",
+        "permission",
+        "shell-env",
+        "fs-observation-policy",
+        "agent-instructions",
+        "commands",
+        "command-feedback",
+        "goal",
+        "command-goal",
+        "plan-mode",
+        "token-meter",
+        "compaction-basic",
+        "command-compact",
+        "timeout-policy",
+        "spill-local",
+        "spill-policy",
+        "session-checkpoint-policy",
+        "tool-result-pruner",
+        "tool-todo",
+        "repeat-tool-reminder",
+        "web",
+        "web-search-deepseek",
+        "web-fetch-http",
+        "tool-web",
+        "tools",
+        "system-prompt",
+        "agent-loop",
+        "fs-sandbox",
+        "llm-deepseek",
+        "acp-app-startup",
+        "acp",
+        "subprocess",
+        "sandbox",
+        "bash-sandbox",
+        "pwsh-sandbox",
+        "sandbox-policy",
         "observe",
         "tool-observe",
         "tool-read",
@@ -295,16 +340,32 @@ pub fn build_profile() -> Result<Value, String> {
 }
 
 pub fn validate_build_profile(profile: &Value) -> Result<(), String> {
-    let Some(obj) = profile.as_object() else { return Err("managed dsh build profile must be an object".into()) };
-    if obj.keys().any(|k| !matches!(k.as_str(), "agent" | "composition" | "notes")) { return Err("managed dsh build profile contains unknown fields".into()); }
+    let Some(obj) = profile.as_object() else {
+        return Err("managed dsh build profile must be an object".into());
+    };
+    if obj
+        .keys()
+        .any(|k| !matches!(k.as_str(), "agent" | "composition" | "notes"))
+    {
+        return Err("managed dsh build profile contains unknown fields".into());
+    }
     if profile.get("agent").and_then(Value::as_str) != Some(crate::DSH_AGENT_NAME) {
         return Err("managed dsh build profile must declare agent=dsh".into());
     }
     let composition = profile
         .get("composition")
         .ok_or_else(|| "managed dsh build profile is missing the composition object".to_string())?;
-    let Some(cobj) = composition.as_object() else { return Err("managed dsh composition must be an object".into()) };
-    if cobj.keys().any(|k| !matches!(k.as_str(), "sandbox" | "respondable_permissions" | "prompt_scope")) { return Err("managed dsh composition contains unknown fields".into()); }
+    let Some(cobj) = composition.as_object() else {
+        return Err("managed dsh composition must be an object".into());
+    };
+    if cobj.keys().any(|k| {
+        !matches!(
+            k.as_str(),
+            "sandbox" | "respondable_permissions" | "prompt_scope"
+        )
+    }) {
+        return Err("managed dsh composition contains unknown fields".into());
+    }
     if composition.get("sandbox").and_then(Value::as_str) != Some("workspace-write") {
         return Err("managed dsh build profile must pin sandbox=workspace-write".into());
     }
@@ -444,12 +505,26 @@ mod tests {
         let mut wrong_agent = baseline.clone();
         wrong_agent["agent"] = Value::String("zcode".into());
         assert!(validate_build_profile(&wrong_agent).is_err());
+        let mut unknown = baseline.clone();
+        unknown["composition"]["unmanaged"] = Value::Bool(true);
+        assert!(validate_build_profile(&unknown).is_err());
         assert!(validate_build_profile(&Value::Null).is_err());
     }
 
     #[test]
     fn dump_policy_rejects_unknown_enabled_tool() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>("- id: sandbox-policy\n  disabled: true\n- id: approval\n  disabled: true\n- id: tool-unknown\n  disabled: false").unwrap();
+        assert!(validate_dump_policy(&yaml)
+            .unwrap_err()
+            .contains("unknown enabled"));
+    }
+
+    #[test]
+    fn dump_policy_rejects_unknown_enabled_entry() {
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(
+            "- id: sandbox-policy\n  disabled: false\n- id: approval\n  disabled: true\n- id: unmanaged-entry\n  disabled: false",
+        )
+        .unwrap();
         assert!(validate_dump_policy(&yaml)
             .unwrap_err()
             .contains("unknown enabled"));

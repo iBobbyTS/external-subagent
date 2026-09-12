@@ -26,16 +26,9 @@
   disabled: true
 - id: tool-ralph
   disabled: true
-- id: subprocess
-  disabled: true
-- id: sandbox
-  disabled: true
 - id: sandbox-policy
-  disabled: true
-- id: bash-sandbox
-  disabled: true
-- id: pwsh-sandbox
-  disabled: true
+  config:
+    mode: read-only
 - id: skill-filesystem
   disabled: true
 - id: workflow-worker-thread
