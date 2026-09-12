@@ -12,7 +12,7 @@ rl.on('line', (line) => {
   let request;
   try { request = JSON.parse(line); } catch { process.stderr.write('fixture malformed input\n'); return; }
   if (request.method === 'initialize') send({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: 1, capabilities: { models: true, cancel: true, permission: true } } });
-  else if (request.method === 'session/new') send({ jsonrpc: '2.0', id: request.id, result: { sessionId: 'fixture-session', configOptions: [{ configId: 'model' }] } });
+  else if (request.method === 'session/new') send({ jsonrpc: '2.0', id: request.id, result: { sessionId: 'fixture-session', configOptions: [{ configId: 'model', currentValue: 'fixture-model', options: [{ value: 'fixture-model' }, { value: 'fixture-alt' }] }] } });
   else if (request.method === 'models/list') send({ jsonrpc: '2.0', id: request.id, result: { models: [{ id: 'fixture-model', name: 'Fixture' }] } });
   else if (request.method === 'session/set_config_option') {
     if (request.params?.configId === 'model' && typeof request.params?.value === 'string' && request.params.value.length > 0 && !request.params.value.includes('\u0000')) {

@@ -13,7 +13,7 @@ test('probe exposes bounded scenarios and records ACP initialize/catalog', async
   assert.equal(result.protocol, 'jsonrpc-over-stdio');
   assert.equal(result.malformedFrames, 0);
   assert.equal(result.responses[0].result.protocolVersion, 1);
-  assert.equal(result.responses.at(-1).result.models[0].id, 'fixture-model');
+  assert.deepEqual(result.responses[1].result.configOptions[0].options.map((entry) => entry.value), ['fixture-model', 'fixture-alt']);
 });
 
 test('probe captures permission updates, message identity, and keeps stderr separate', async () => {

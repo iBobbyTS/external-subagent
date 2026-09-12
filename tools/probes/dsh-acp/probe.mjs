@@ -66,8 +66,8 @@ export async function runProbe(options) {
   const timer = setTimeout(() => child.kill('SIGTERM'), options.timeout);
   try {
     send('initialize', { protocolVersion: 1, clientInfo: { name: 'external-subagent-dsh-probe', version: '0.1.0' } }, 1);
-    if (options.scenario !== 'initialize') send('session/new', { cwd: options.workspace ?? process.cwd() }, 2);
-    if (options.scenario === 'catalog') send('models/list', {}, 3);
+    if (options.scenario !== 'initialize') send('session/new', { cwd: options.workspace ?? process.cwd(), mcpServers: [] }, 2);
+    if (options.scenario === 'catalog') { /* current ACP advertises models in session/new.configOptions; models/list is legacy fallback */ }
     if (options.scenario === 'hi') send('session/prompt', { prompt: 'hi', model: options.model }, 3);
     if (options.scenario === 'permission') send('session/prompt', { prompt: 'probe permission' }, 3);
     if (options.scenario === 'cancel') {
