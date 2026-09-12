@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const fixture = fileURLToPath(new URL('../fixtures/dsh-acp/fake-server.mjs', import.meta.url));
 
@@ -27,4 +28,10 @@ test('cancel is an explicit bounded protocol operation', async () => {
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.deepEqual(frames[0].result, { cancelled: true });
   child.kill('SIGTERM');
+});
+
+test('runtime observes bounded oversized and reap failure paths', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const output = execFileSync('cargo', ['test', '-p', 'external-runtime', 'oversized_line_is_classified_and_discarded', '--', '--exact'], { cwd, encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
 });
