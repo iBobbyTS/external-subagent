@@ -12,20 +12,21 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const prior = (() => { try { return JSON.parse(fs.readFileSync(receiptPath(paths), 'utf8')); } catch { return null; } })();
   if (prior?.status === 'success') return prior.result;
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
-  const begin = await callDaemon(socket, 'drain', {});
+  const rpc = daemon.callDaemon || callDaemon;
+  const begin = await rpc(socket, 'drain', {});
   let status = begin;
   for (let i = 0; i < 30 && !status.ready_for_activation; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));
-    status = await callDaemon(socket, 'drain-status', {});
+    status = await rpc(socket, 'drain-status', {});
   }
   if (!status.ready_for_activation) throw new Error('daemon drain timed out before activation readiness');
-  const activation = await callDaemon(socket, 'activate-ready', {});
+  const activation = await rpc(socket, 'activate-ready', {});
   if (!activation.activation_claim) return { ...status, activation_claim: null, update: 'not_activated' };
   let result;
   try {
     result = args.includes('reconcile')
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
-      : updateInstallation(paths, { version: args.find((arg) => arg.startsWith('--version='))?.slice(10) });
+      : (daemon.updateInstallation || updateInstallation)(paths, { version: args.find((arg) => arg.startsWith('--version='))?.slice(10) });
     fs.writeFileSync(receiptPath(paths), JSON.stringify({ claim: activation.activation_claim, status: 'success', result }));
     return result;
   } catch (error) {
