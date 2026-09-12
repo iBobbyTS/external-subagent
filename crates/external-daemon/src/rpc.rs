@@ -992,13 +992,12 @@ impl RpcService {
             }),
             RpcMethod::DaemonBeginDrain => {
                 self.scheduler.begin_drain();
-                let fired = self.scheduler.fire_updater_once();
                 Ok(RpcSuccess::DaemonDrainStatus {
                     is_draining: true,
                     active_count: self.scheduler.active_count(),
                     resources_reaped: self.scheduler.resources_reaped(),
                     ready_for_activation: self.scheduler.ready_for_activation(),
-                    updater_fired: fired || self.scheduler.updater_fired(),
+                    updater_fired: self.scheduler.updater_fired(),
                 })
             }
             RpcMethod::DaemonDrainStatus => Ok(RpcSuccess::DaemonDrainStatus {
@@ -3477,6 +3476,10 @@ mod agent_probe_tests {
         let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap() else { panic!("status") };
         assert!(!updater_fired);
         let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonBeginDrain).unwrap() else { panic!("begin") };
+        assert!(!updater_fired);
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap() else { panic!("status") };
+        assert!(!updater_fired);
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonActivateReady).unwrap() else { panic!("activate") };
         assert!(updater_fired);
         let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonActivateReady).unwrap() else { panic!("activate") };
         assert!(updater_fired);
