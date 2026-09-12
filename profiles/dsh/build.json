@@ -7,6 +7,6 @@
   },
   "notes": [
     "Managed DSH build composition pinned by S04.A; strict plan and full cancellation hardening land in S04.B.",
-    "Production DSH spawn stays gated off until the S04 parent is accepted; this file never widens provider configuration."
+    "Production DSH spawn still requires the daemon configuration gate and runtime preflight; this file never widens provider configuration."
   ]
 }
