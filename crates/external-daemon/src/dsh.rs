@@ -7,8 +7,8 @@
 //! settlement watchers that drive turn boundaries, and single-shot public
 //! permission responses that only echo offered options.
 //!
-//! Production DSH spawn stays behind a closed gate until the S04 parent is
-//! accepted; the closed factory refuses to spawn even if routing changes.
+//! Production DSH spawn is selected only by the explicit configuration and
+//! runtime-path gate; the closed factory remains the fail-closed default.
 
 use std::{
     collections::HashMap,
@@ -175,8 +175,8 @@ impl RuntimeFactory for DshRuntimeFactory {
 }
 
 /// Route each prepared task to its agent factory. Legacy tasks without an
-/// admission identity keep the ZCode route; DSH tasks route to the (closed)
-/// DSH factory so opening the gate later is a single composition change.
+/// admission identity keep the ZCode route; DSH tasks route to the configured
+/// factory, which is closed unless the production gate is satisfied.
 pub struct RoutingRuntimeFactory<F> {
     zcode: CommandRuntimeFactory<F>,
     dsh: DshRuntimeFactory,
