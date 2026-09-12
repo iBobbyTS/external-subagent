@@ -352,12 +352,34 @@ impl Scheduler {
     fn recover_startup_task(&self, task: &TaskRecord) -> Result<(), SchedulerError> {
         // Drain fences survive process exit. They never owned a runtime, so
         // settle them through the same unstarted cancellation owner as RPC.
-        if task.phase == TaskPhase::Queued
+        let never_claimed_cancellation = task.phase == TaskPhase::Cancelling
+            && task.owner_epoch == 0
+            && task.zcode_session_id.is_none();
+        if (task.phase == TaskPhase::Queued || never_claimed_cancellation)
             && task.stop_requested
             && task.runtime_agent_id.is_none()
             && task.process_identity.is_none()
         {
-            self.cancel_task(&task.agent_id)?;
+            if task.phase == TaskPhase::Queued {
+                self.cancel_task(&task.agent_id)?;
+            } else {
+                // A prior recovery committed stop intent but crashed before
+                // result persistence. Epoch zero proves no claim ever ran.
+                let route = task_route(task).map_err(SchedulerError::InvalidConfig)?;
+                validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+                self.finish_unstarted_route(
+                    &task.agent_id,
+                    task.owner_epoch,
+                    &route,
+                    Some(task),
+                    UnstartedTerminal {
+                        outcome: CompletionOutcome::Cancelled,
+                        reason_code: "CANCELLED",
+                        message: "task cancelled before runtime launch",
+                    },
+                    true,
+                )?;
+            }
             return Ok(());
         }
         match (&task.runtime_agent_id, &task.process_identity) {
@@ -2330,6 +2352,15 @@ mod queued_recovery_tests {
 
     #[test]
     fn fenced_queue_reopen_recovers_cancelled_without_spawn_and_becomes_ready() {
+        assert_fenced_queue_recovery(false);
+    }
+
+    #[test]
+    fn second_crash_after_stop_commit_recovers_without_spawn() {
+        assert_fenced_queue_recovery(true);
+    }
+
+    fn assert_fenced_queue_recovery(crash_before_result: bool) {
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&base).unwrap();
@@ -2378,10 +2409,43 @@ mod queued_recovery_tests {
         let reopened = Scheduler::new(
             "after-exit",
             Arc::new(Store::open(&database).unwrap()),
-            factory,
+            factory.clone(),
             SchedulerConfig::default(),
         )
         .unwrap();
+        let reopened = if crash_before_result {
+            // Inject failure at the real result transaction, after the
+            // cancellation transaction has committed. Then discard all
+            // in-memory recovery state exactly as a second exit would.
+            let db = rusqlite::Connection::open(&database).unwrap();
+            db.execute_batch("CREATE TRIGGER fail_cancel_result BEFORE INSERT ON task_results BEGIN SELECT RAISE(ABORT, 'injected second exit'); END;").unwrap();
+            assert!(reopened.reconcile_startup().is_err());
+            let interrupted = reopened.store().get_task(&task.agent_id).unwrap().unwrap();
+            assert_eq!(interrupted.phase, TaskPhase::Cancelling);
+            assert!(interrupted.stop_requested);
+            assert_eq!(interrupted.owner_epoch, 0);
+            assert!(interrupted.runtime_agent_id.is_none());
+            assert!(interrupted.process_identity.is_none());
+            assert!(interrupted.reaped_at.is_none());
+            assert!(reopened
+                .store()
+                .task_result(&task.agent_id)
+                .unwrap()
+                .is_none());
+            drop(reopened);
+            db.execute_batch("DROP TRIGGER fail_cancel_result;")
+                .unwrap();
+            drop(db);
+            Scheduler::new(
+                "after-second-exit",
+                Arc::new(Store::open(&database).unwrap()),
+                factory,
+                SchedulerConfig::default(),
+            )
+            .unwrap()
+        } else {
+            reopened
+        };
         assert_eq!(
             reopened.reconcile_startup().unwrap(),
             vec![(task.agent_id.clone(), TaskOutcome::Cancelled)]
@@ -2410,5 +2474,71 @@ mod queued_recovery_tests {
         reopened.begin_drain();
         assert!(reopened.ready_for_activation());
         assert!(reopened.claim_activation().is_some());
+    }
+    #[test]
+    fn identityless_cancelling_requires_never_claimed_and_explicit_stop() {
+        for claimed in [false, true] {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/live-agent/workspace");
+            let directory = tempfile::Builder::new()
+                .prefix("invalid-recovery-")
+                .tempdir_in(base)
+                .unwrap();
+            let database = directory.path().join("state.sqlite");
+            let factory = Arc::new(CommandRuntimeFactory::new(
+                |_: &TaskRecord| -> io::Result<Command> {
+                    panic!("recovery must not spawn");
+                },
+            ));
+            let scheduler = Scheduler::new(
+                "invalid",
+                Arc::new(Store::open(&database).unwrap()),
+                factory.clone(),
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let task = scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: "zcode-general-task/v1".into(),
+                    agent_id: String::new(),
+                    repository: directory.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Build,
+                    prompt: "invalid runtime identity".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap()
+                .task;
+            if claimed {
+                scheduler
+                    .store()
+                    .claim_next("prior-owner", 10, 1)
+                    .unwrap()
+                    .unwrap();
+                scheduler.store().request_stop(&task.agent_id).unwrap();
+            } else {
+                scheduler
+                    .store()
+                    .request_runtime_stop(&task.agent_id)
+                    .unwrap();
+            }
+            drop(scheduler);
+            let reopened = Scheduler::new(
+                "after-exit",
+                Arc::new(Store::open(&database).unwrap()),
+                factory,
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let error = reopened.reconcile_startup().unwrap_err();
+            assert!(error.to_string().contains("runtime identity is incomplete"));
+            let retained = reopened.store().get_task(&task.agent_id).unwrap().unwrap();
+            assert_eq!(retained.phase, TaskPhase::Cancelling);
+            assert!(retained.reaped_at.is_none());
+            assert!(reopened
+                .store()
+                .task_result(&task.agent_id)
+                .unwrap()
+                .is_none());
+        }
     }
 }
