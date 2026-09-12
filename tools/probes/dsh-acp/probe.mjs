@@ -65,16 +65,19 @@ export async function runProbe(options) {
   const startedAt = new Date().toISOString();
   const timer = setTimeout(() => child.kill('SIGTERM'), options.timeout);
   try {
+    const waitForId = async (id) => { const end = Date.now() + options.timeout; while (Date.now() < end) { if (stdout.some((entry) => entry.id === id)) return; await new Promise((resolve) => setTimeout(resolve, 10)); } };
     send('initialize', { protocolVersion: 1, clientInfo: { name: 'external-subagent-dsh-probe', version: '0.1.0' } }, 1);
-    if (options.scenario !== 'initialize') send('session/new', { cwd: options.workspace ?? process.cwd(), mcpServers: [] }, 2);
-    if (options.scenario === 'catalog') { /* current ACP advertises models in session/new.configOptions; models/list is legacy fallback */ }
-    if (options.scenario === 'hi') send('session/prompt', { prompt: 'hi', model: options.model }, 3);
+    await waitForId(1);
+    if (options.scenario !== 'initialize') { send('session/new', { cwd: options.workspace ?? process.cwd(), mcpServers: [] }, 2); await waitForId(2); }
+    if (options.scenario === 'catalog') { /* current ACP advertises models in session/new.configOptions */ }
+    if (options.scenario === 'hi') send('session/prompt', { sessionId: stdout.find((entry) => entry.id === 2)?.result?.sessionId, prompt: [{ type: 'text', text: 'hi' }], model: options.model }, 3);
     if (options.scenario === 'permission') send('session/prompt', { prompt: 'probe permission' }, 3);
     if (options.scenario === 'cancel') {
       send('session/prompt', { prompt: 'probe cancellation' }, 3);
       send('session/cancel', {}, 4);
     }
     if (options.scenario === 'malformed') child.stdin.write('{"jsonrpc":\n');
+    await new Promise((resolve) => setTimeout(resolve, 50));
     child.stdin.end();
     await once(child, 'close');
   } finally {
