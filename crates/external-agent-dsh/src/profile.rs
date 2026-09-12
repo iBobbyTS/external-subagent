@@ -124,6 +124,15 @@ pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, Strin
     Ok(value)
 }
 
+pub const PINNED_DSH_VERSION: &str = "0.1.5-rc.1";
+
+pub fn validate_dsh_version(output: &str) -> Result<(), String> {
+    let found = output.split_whitespace().find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .ok_or("dsh --version returned no version")?;
+    if found != PINNED_DSH_VERSION { return Err(format!("unsupported dsh version {found}; expected {PINNED_DSH_VERSION}")); }
+    Ok(())
+}
+
 /// Parse and validate the managed build composition. Unknown fields or a
 /// non-`workspace-write` sandbox are rejected: the build composition is the
 /// only DSH permission surface S04.A is allowed to drive.
