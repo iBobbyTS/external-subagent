@@ -224,6 +224,7 @@ impl Scheduler {
                 state: Mutex::new(SchedulerState::default()),
                 draining: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
+                activation_claim: Mutex::new(None),
             }),
         })
     }
@@ -2005,7 +2006,22 @@ impl Scheduler {
         self.inner.updater_fired.load(Ordering::Acquire)
     }
     pub fn fire_updater_once(&self) -> bool {
-        self.ready_for_activation() && !self.inner.updater_fired.swap(true, Ordering::AcqRel)
+        self.claim_activation().is_some()
+    }
+
+    /// Atomically claims the single activation handoff. The daemon only issues
+    /// an opaque receipt; the installer owns the update state machine.
+    pub fn claim_activation(&self) -> Option<String> {
+        if !self.ready_for_activation() {
+            return None;
+        }
+        let mut claim = self.inner.activation_claim.lock().unwrap();
+        if claim.is_none() {
+            let token = format!("{}-activation", self.inner.owner_id);
+            *claim = Some(token);
+            self.inner.updater_fired.store(true, Ordering::Release);
+        }
+        claim.clone()
     }
 
     pub fn active_turn_observation(&self, agent_id: &str) -> Option<(TurnSnapshot, u64)> {
