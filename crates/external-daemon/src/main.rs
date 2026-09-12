@@ -1,6 +1,8 @@
 use external_daemon::{
-    configure_diagnostic_log, rpc::ServerOptions, CommandRuntimeFactory, Daemon, RuntimeFactory,
-    Scheduler, SchedulerConfig,
+    configure_diagnostic_log,
+    dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
+    rpc::ServerOptions,
+    CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 use external_store::Store;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
@@ -44,10 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
-    let factory = Arc::new(CommandRuntimeFactory::new_prepared(
-        move |_task: &external_store::TaskRecord| runtime_command(runtime.as_deref()),
+    let zcode = CommandRuntimeFactory::new_prepared(move |_task: &external_store::TaskRecord| {
+        runtime_command(runtime.as_deref())
+    });
+    // Production composition registers the DSH adapter behind a closed spawn
+    // gate: admission can know about the agent while spawn stays refused until
+    // the S04 parent is accepted.
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::new(
+        zcode,
+        DshRuntimeFactory::closed(),
     ));
-    let runtime_factory: Arc<dyn RuntimeFactory> = factory;
     let scheduler = Scheduler::new(
         format!("agentd-{}", std::process::id()),
         store,

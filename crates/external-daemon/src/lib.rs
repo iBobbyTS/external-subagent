@@ -32,6 +32,7 @@ use std::{
 };
 
 pub mod agent_status;
+pub mod dsh;
 pub mod mcp;
 pub mod observation;
 pub mod rpc;
@@ -70,13 +71,24 @@ pub enum RuntimeTerminal {
     Orphaned(RuntimeLoss),
 }
 
-fn terminal_proves_process_group_reaped(terminal: &RuntimeTerminal) -> bool {
+pub(crate) fn terminal_proves_process_group_reaped(terminal: &RuntimeTerminal) -> bool {
     matches!(
         terminal,
         RuntimeTerminal::Stopped(_)
             | RuntimeTerminal::Completed(_)
             | RuntimeTerminal::FailedTurn(_)
     )
+}
+
+pub(crate) fn task_agent(task: &TaskRecord) -> String {
+    match task_route(task) {
+        Ok(TaskRoute::General(prepared)) => prepared
+            .admission
+            .as_ref()
+            .map(|identity| identity.agent.clone())
+            .unwrap_or_else(|| "zcode".into()),
+        Err(_) => "zcode".into(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -899,13 +911,12 @@ struct TurnTrackerState {
     last_stream_activity_at: Option<Instant>,
 }
 
-struct TurnTracker {
+pub(crate) struct TurnTracker {
     state: Mutex<TurnTrackerState>,
     changed: Condvar,
 }
-
 impl TurnTracker {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(TurnTrackerState {
                 generation: 0,
@@ -918,7 +929,7 @@ impl TurnTracker {
         }
     }
 
-    fn observe(&self, inbound: &Inbound) {
+    pub(crate) fn observe(&self, inbound: &Inbound) {
         let mut state = self.state.lock().unwrap();
         if state.active {
             state.last_stream_activity_at = Some(Instant::now());
@@ -955,7 +966,7 @@ impl TurnTracker {
         self.changed.notify_all();
     }
 
-    fn snapshot(&self) -> TurnSnapshot {
+    pub(crate) fn snapshot(&self) -> TurnSnapshot {
         let state = self.state.lock().unwrap();
         TurnSnapshot {
             generation: state.generation,
@@ -964,7 +975,7 @@ impl TurnTracker {
         }
     }
 
-    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
+    pub(crate) fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
         let state = self.state.lock().unwrap();
         let now = Instant::now();
         RuntimeActivitySnapshot {
@@ -990,7 +1001,7 @@ impl TurnTracker {
         self.wait_until(timeout, |state| state.generation > previous_generation)
     }
 
-    fn wait_boundary_after(
+    pub(crate) fn wait_boundary_after(
         &self,
         generation: u64,
         timeout: Duration,
@@ -1058,14 +1069,14 @@ struct PublisherState {
     exit_boundary_delivered: bool,
 }
 
-struct Publisher {
+pub(crate) struct Publisher {
     sink: Arc<dyn LifecycleSink>,
     state: Mutex<PublisherState>,
     changed: Condvar,
 }
 
 impl Publisher {
-    fn new(sink: Arc<dyn LifecycleSink>) -> Self {
+    pub(crate) fn new(sink: Arc<dyn LifecycleSink>) -> Self {
         Self {
             sink,
             state: Mutex::new(PublisherState {
@@ -1077,7 +1088,7 @@ impl Publisher {
         }
     }
 
-    fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
+    pub(crate) fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
         let mut state = self.state.lock().unwrap();
         if matches!(state.owner, OwnerState::Terminal(_)) {
             return;
@@ -1095,7 +1106,7 @@ impl Publisher {
         }
     }
 
-    fn begin_stopping(&self) -> Option<RuntimeTerminal> {
+    pub(crate) fn begin_stopping(&self) -> Option<RuntimeTerminal> {
         let mut state = self.state.lock().unwrap();
         match &state.owner {
             OwnerState::Terminal(terminal) => Some(terminal.clone()),
@@ -1107,7 +1118,7 @@ impl Publisher {
         }
     }
 
-    fn publish_terminal(&self, terminal: RuntimeTerminal) -> RuntimeTerminal {
+    pub(crate) fn publish_terminal(&self, terminal: RuntimeTerminal) -> RuntimeTerminal {
         let mut state = self.state.lock().unwrap();
         if let OwnerState::Terminal(existing) = &state.owner {
             return existing.clone();
@@ -1116,7 +1127,7 @@ impl Publisher {
         terminal
     }
 
-    fn wait_for_exit_boundary(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+    pub(crate) fn wait_for_exit_boundary(&self, timeout: Duration) -> Option<RuntimeTerminal> {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1157,7 +1168,7 @@ impl Publisher {
         self.sink.emit(record);
     }
 
-    fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+    pub(crate) fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
         let deadline = Instant::now().checked_add(timeout)?;
         let mut state = self.state.lock().unwrap();
         loop {

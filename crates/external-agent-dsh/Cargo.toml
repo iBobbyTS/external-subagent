@@ -1,0 +1,10 @@
+[package]
+name = "external-agent-dsh"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+external-contract = { path = "../external-contract" }
+external-runtime = { path = "../external-runtime" }
+serde_json = "1"

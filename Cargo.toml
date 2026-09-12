@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/external-contract", "crates/external-runtime", "crates/external-agent-zcode", "crates/external-store", "crates/external-core", "crates/external-daemon", "crates/external-mcp"]
+members = ["crates/external-contract", "crates/external-runtime", "crates/external-agent-zcode", "crates/external-agent-dsh", "crates/external-store", "crates/external-core", "crates/external-daemon", "crates/external-mcp"]
 resolver = "2"
 
 [workspace.package]
