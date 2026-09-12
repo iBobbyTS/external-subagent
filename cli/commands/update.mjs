@@ -14,7 +14,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
-  const begin = await rpc(socket, 'drain', {});
+  const begin = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
   let status = begin;
   for (let i = 0; i < 30 && !status.ready_for_activation; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 50));

@@ -82,6 +82,19 @@ test('update activation calls daemon in order and runs updater once', async () =
   assert.deepEqual(calls, ['drain', 'activate-ready']); assert.equal(updates, 1);
 });
 
+test('cancel-active with yes is forwarded to drain and waits for reap readiness', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  const calls = []; let statuses = 0;
+  const rpc = async (_s, command, params) => {
+    calls.push([command, params]);
+    if (command === 'drain') return { ready_for_activation: false, cancelling: true };
+    if (command === 'drain-status') { statuses += 1; return { ready_for_activation: statuses >= 2, tasks_reaped: statuses >= 2 }; }
+    return { ready_for_activation: true, activation_claim: null };
+  };
+  await updateCommand(p, ['--cancel-active', '--yes'], { callDaemon: rpc });
+  assert.deepEqual(calls.slice(0, 3), [['drain', { cancel_active: true }], ['drain-status', {}], ['drain-status', {}]]);
+});
+
 test('missing activation claim does not run updater', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true }); let updates = 0;
   const rpc = async () => ({ ready_for_activation: true, activation_claim: null });
