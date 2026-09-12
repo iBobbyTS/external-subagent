@@ -1607,7 +1607,10 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
             ))
         }
     };
-    let mut snapshot: AgentConfigSnapshot = serde_json::from_slice(&bytes)
+    let mut value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
+    normalize_agent_config_value(&mut value)?;
+    let mut snapshot: AgentConfigSnapshot = serde_json::from_value(value)
         .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
     if snapshot.schema_version != 0 && snapshot.schema_version != 1 {
         return Err(RpcError::new(
@@ -1655,6 +1658,44 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
         .expect("dsh default inserted")
         .spawn_supported = false;
     Ok(snapshot)
+}
+
+fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        RpcError::new(RpcErrorCode::Validation, "agent config is invalid")
+    })?;
+    if let Some(schema) = object.get("schema_version") {
+        if schema.as_u64() != Some(1) {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "unsupported agent config schema version",
+            ));
+        }
+    }
+    for field in ["runtime", "database", "socket"] {
+        if let Some(value) = object.get(field) {
+            if !value.is_string() {
+                return Err(RpcError::new(
+                    RpcErrorCode::Validation,
+                    "agent config path fields must be non-null strings",
+                ));
+            }
+        }
+    }
+    let Some(agents) = object.get_mut("agents") else { return Ok(()); };
+    let agents = agents.as_object_mut().ok_or_else(|| {
+        RpcError::new(RpcErrorCode::Validation, "agent config agents must be an object")
+    })?;
+    for (name, entry) in agents.iter_mut() {
+        let entry = entry.as_object_mut().ok_or_else(|| {
+            RpcError::new(RpcErrorCode::Validation, "agent config entry must be an object")
+        })?;
+        let default_enabled = name == "zcode";
+        entry.entry("enabled").or_insert(Value::Bool(default_enabled));
+        entry.entry("spawn_supported").or_insert(Value::Bool(default_enabled));
+        entry.entry("default_model").or_insert(Value::Null);
+    }
+    Ok(())
 }
 
 fn respondable_pending_request(request: &PendingRequestView) -> bool {

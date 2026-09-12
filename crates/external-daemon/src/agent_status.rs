@@ -189,8 +189,8 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let checked_at_ms = wall_now_millis();
         let mut scope = input.scope.clone();
         if scope.home.is_none() {
-            scope.home =
-                env::var_os("ZCODE_HOME").map(|value| value.to_string_lossy().into_owned());
+            let variable = if input.agent == "dsh" { "DSH_HOME" } else { "ZCODE_HOME" };
+            scope.home = env::var_os(variable).map(|value| value.to_string_lossy().into_owned());
         }
         let disposable_workspace = if input.agent == "zcode"
             && input.through == ProbeLayer::Hi
@@ -300,6 +300,9 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
 fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
     let checked_at_ms = wall_now_millis();
     let mut scope = input.scope.clone();
+    if scope.home.is_none() {
+        scope.home = env::var_os("DSH_HOME").map(|value| value.to_string_lossy().into_owned());
+    }
     let disposable_workspace = if scope.workspace.is_none() {
         tempfile::Builder::new()
             .prefix("external-subagent-dsh-catalog-")
