@@ -135,3 +135,17 @@ test('service activation failure restores prior state and records rollback evide
   assert.equal(JSON.parse(fs.readFileSync(`${state}.activation.json`)).rollback.restored, true);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('service activation failure removes a newly created active state', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rollback-fresh-'));
+  const p = { data: dir, state: path.join(dir, 'state.json'), socket: path.join(dir, 'sock') };
+  const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'fresh-rollback', ready_for_activation: true } : { ready_for_activation: true };
+  await assert.rejects(() => updateCommand(p, ['--version=2'], {
+    callDaemon: rpc,
+    updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'entry'), entry_sha256: 'x' } }),
+    hasInstalledService: () => true,
+    activateService: async () => { throw new Error('bootstrap failed'); },
+  }), /bootstrap failed/);
+  assert.equal(fs.existsSync(p.state), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
