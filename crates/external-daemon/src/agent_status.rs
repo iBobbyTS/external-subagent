@@ -189,7 +189,11 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let checked_at_ms = wall_now_millis();
         let mut scope = input.scope.clone();
         if scope.home.is_none() {
-            let variable = if input.agent == "dsh" { "DSH_HOME" } else { "ZCODE_HOME" };
+            let variable = if input.agent == "dsh" {
+                "DSH_HOME"
+            } else {
+                "ZCODE_HOME"
+            };
             scope.home = env::var_os(variable).map(|value| value.to_string_lossy().into_owned());
         }
         let disposable_workspace = if input.agent == "zcode"
