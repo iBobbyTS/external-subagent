@@ -48,6 +48,12 @@ test('daemon DSH max_tokens oracle preserves failed settlement', () => {
   assert.match(output, /test result: ok/);
 });
 
+test('daemon DSH pending cancellation stays cancelling', () => {
+  const cwd = fileURLToPath(new URL('../..', import.meta.url));
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh_pending_task_cancel_is_terminal_and_non_resurrecting', '--', '--exact'], { cwd, encoding: 'utf8' });
+  assert.match(output, /test result: ok\. 1 passed/);
+});
+
 test('runtime executes malformed, EOF and oversized frame or cancellation oracles', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
   const output = execFileSync('cargo', ['test', '-p', 'external-runtime'], { cwd, encoding: 'utf8' });
