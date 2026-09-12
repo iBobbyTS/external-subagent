@@ -3470,4 +3470,15 @@ mod agent_probe_tests {
         assert!(RpcMethod::is_known("daemon_begin_drain"));
         assert!(RpcMethod::is_known("daemon_drain_status"));
     }
+
+    #[test]
+    fn draining_status_read_is_side_effect_free_and_activation_is_once() {
+        let (_directory, service) = service();
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap() else { panic!("status") };
+        assert!(!updater_fired);
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonBeginDrain).unwrap() else { panic!("begin") };
+        assert!(updater_fired);
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service.dispatch(RpcMethod::DaemonActivateReady).unwrap() else { panic!("activate") };
+        assert!(updater_fired);
+    }
 }
