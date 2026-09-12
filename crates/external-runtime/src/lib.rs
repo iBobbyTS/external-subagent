@@ -24,6 +24,18 @@ use std::{
 
 pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
 
+/// Wire framing the driver applies on stdio.
+///
+/// `ZcodeStrict` keeps the pinned app-server envelope (no `jsonrpc` field).
+/// `JsonRpc2` accepts and emits standard JSON-RPC 2.0 frames for adapters
+/// whose provider speaks that dialect (for example the DSH ACP transport).
+/// The envelope types stay shared; only the framing differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameCodec {
+    ZcodeStrict,
+    JsonRpc2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildExit {
     Exited(Option<i32>),
@@ -183,10 +195,19 @@ pub struct Driver {
     subscribers: Arc<Mutex<Vec<Sender<Inbound>>>>,
     diagnostics: Arc<Mutex<Vec<u8>>>,
     diagnostics_done: Arc<(Mutex<bool>, Condvar)>,
+    codec: FrameCodec,
 }
 
 impl Driver {
-    pub fn spawn(mut command: Command) -> std::io::Result<Self> {
+    pub fn spawn(command: Command) -> std::io::Result<Self> {
+        Self::spawn_with_codec(command, FrameCodec::ZcodeStrict)
+    }
+
+    /// Spawn with an explicit wire codec. JSON-RPC 2.0 mode parses inbound
+    /// frames that carry `"jsonrpc":"2.0"` and stamps the field on outbound
+    /// requests/responses; all other process, deadline, and correlation
+    /// behavior is identical.
+    pub fn spawn_with_codec(mut command: Command, codec: FrameCodec) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             unsafe {
@@ -223,7 +244,8 @@ impl Driver {
         let (raw_tx, raw_rx) = mpsc::channel();
         let read_tx = raw_tx.clone();
         let (read_done_tx, read_done_rx) = mpsc::channel();
-        thread::spawn(move || read_loop(stdout, read_tx, read_done_tx));
+        let read_codec = codec;
+        thread::spawn(move || read_loop(stdout, read_tx, read_done_tx, read_codec));
         // Always drain diagnostics independently of the protocol stream. A
         // noisy runtime must not block stdout. The bounded diagnostic tail is
         // retained for the daemon's failure projection, never raw-unbounded.
@@ -266,6 +288,7 @@ impl Driver {
             subscribers,
             diagnostics,
             diagnostics_done,
+            codec,
         })
     }
     #[cfg(test)]
@@ -282,9 +305,29 @@ impl Driver {
         method: &str,
         params: serde_json::Value,
     ) -> Result<PendingRequest, RequestError> {
-        let id = i64::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
-            .map(WireId::Integer)
-            .map_err(|_| RequestError::StreamClosed)?;
+        let id = self.reserve_id();
+        self.begin_request_with_id(id, method, params)
+    }
+
+    /// Reserve the next request id without sending anything. Pair with
+    /// [`Driver::begin_request_with_id`]; callers that need the id before the
+    /// envelope is built own the ordering between both calls.
+    pub fn reserve_id(&self) -> WireId {
+        let id = i64::try_from(self.next_id.fetch_add(1, Ordering::Relaxed)).unwrap_or_else(|_| {
+            self.next_id.store(1, Ordering::Relaxed);
+            1
+        });
+        WireId::Integer(id)
+    }
+
+    /// Begin a request under a previously reserved id. Fails closed when the
+    /// id is already pending.
+    pub fn begin_request_with_id(
+        &self,
+        id: WireId,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<PendingRequest, RequestError> {
         let key = response_key(&id);
         let (sender, receiver) = mpsc::channel();
         {
@@ -325,7 +368,8 @@ impl Driver {
         result: serde_json::Value,
         deadline: Instant,
     ) -> Result<(), RequestError> {
-        let encoded = encode(&ResponseEnvelope::success(id, result))
+        let encoded = self
+            .encode_frame(&ResponseEnvelope::success(id, result))
             .map_err(|error| RequestError::WriteFailed(error.to_string()))?;
         let mut frame = encoded.into_bytes();
         frame.push(b'\n');
@@ -367,8 +411,28 @@ impl Driver {
     }
     pub fn send<T: serde::Serialize>(&self, value: &T) -> std::io::Result<()> {
         let mut input = self.stdin.lock().unwrap();
-        writeln!(input, "{}", encode(value).map_err(std::io::Error::other)?)?;
+        writeln!(
+            input,
+            "{}",
+            self.encode_frame(value).map_err(std::io::Error::other)?
+        )?;
         input.flush()
+    }
+    /// Serialize one outbound frame under the driver's wire codec.
+    fn encode_frame<T: serde::Serialize>(&self, value: &T) -> serde_json::Result<String> {
+        match self.codec {
+            FrameCodec::ZcodeStrict => encode(value),
+            FrameCodec::JsonRpc2 => {
+                let mut object = serde_json::to_value(value)?;
+                if let Some(map) = object.as_object_mut() {
+                    map.insert("jsonrpc".into(), serde_json::Value::String("2.0".into()));
+                }
+                serde_json::to_string(&object)
+            }
+        }
+    }
+    pub fn codec(&self) -> FrameCodec {
+        self.codec
     }
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Inbound, RecvTimeoutError> {
         self.incoming.lock().unwrap().recv_timeout(timeout)
@@ -1211,7 +1275,12 @@ fn broadcast(subscribers: &Mutex<Vec<Sender<Inbound>>>, inbound: Inbound) {
         .retain(|subscriber| subscriber.send(inbound.clone()).is_ok());
 }
 
-fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>, done: Sender<()>) {
+fn read_loop(
+    stdout: impl std::io::Read + Send + 'static,
+    tx: Sender<Inbound>,
+    done: Sender<()>,
+    codec: FrameCodec,
+) {
     let _done = ReadDone(done);
     let mut reader = BufReader::new(stdout);
     let mut sequence = 0;
@@ -1221,7 +1290,11 @@ fn read_loop(stdout: impl std::io::Read + Send + 'static, tx: Sender<Inbound>, d
             Ok(Some((line, bytes))) if bytes <= MAX_NDJSON_LINE_BYTES => {
                 sequence += 1;
                 let line = String::from_utf8_lossy(&line).to_string();
-                match parse_line(&line) {
+                let parsed = match codec {
+                    FrameCodec::ZcodeStrict => parse_line(&line),
+                    FrameCodec::JsonRpc2 => parse_jsonrpc_line(&line),
+                };
+                match parsed {
                     Ok(msg) => {
                         if let WireMessage::Event(event) = &msg {
                             if let Some(kind) = event_type(event) {
@@ -1274,6 +1347,30 @@ impl Drop for ReadDone {
     fn drop(&mut self) {
         let _ = self.0.send(());
     }
+}
+
+/// Parse one inbound JSON-RPC 2.0 frame into the shared envelope types.
+///
+/// The frame must carry exactly `"jsonrpc":"2.0"` plus the strict envelope
+/// keys; after removing the version field the same validation as
+/// [`parse_line`] applies (ids are numbers or strings, responses carry
+/// exactly one non-null outcome). Anything else stays a malformed frame.
+pub fn parse_jsonrpc_line(line: &str) -> Result<WireMessage, external_contract::ParseError> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| external_contract::ParseError::InvalidJson(error.to_string()))?;
+    let Some(object) = value.as_object() else {
+        return Err(external_contract::ParseError::NotObject);
+    };
+    if object.get("jsonrpc") != Some(&serde_json::Value::String("2.0".into())) {
+        return Err(external_contract::ParseError::InvalidEnvelope(
+            "jsonrpc frame must declare version 2.0".into(),
+        ));
+    }
+    let mut canonical = object.clone();
+    canonical.remove("jsonrpc");
+    let canonical = serde_json::to_string(&canonical)
+        .map_err(|error| external_contract::ParseError::InvalidJson(error.to_string()))?;
+    parse_line(&canonical)
 }
 
 fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>, usize)>> {
@@ -1383,6 +1480,140 @@ fn exit_class(status: ExitStatus) -> ChildExit {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+
+    #[test]
+    fn jsonrpc_codec_parses_requests_responses_and_notifications() {
+        assert_eq!(
+            parse_jsonrpc_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"prompt":"hi"}}"#
+            )
+            .unwrap(),
+            WireMessage::Request(RequestEnvelope {
+                id: WireId::Integer(1),
+                method: "session/prompt".into(),
+                params: serde_json::json!({"prompt": "hi"}),
+            })
+        );
+        assert_eq!(
+            parse_jsonrpc_line(
+                r#"{"jsonrpc":"2.0","id":"srv-1","result":{"stopReason":"end_turn"}}"#
+            )
+            .unwrap(),
+            WireMessage::Response(ResponseEnvelope {
+                id: WireId::String("srv-1".into()),
+                result: Some(serde_json::json!({"stopReason": "end_turn"})),
+                error: None,
+            })
+        );
+        assert!(matches!(
+            parse_jsonrpc_line(
+                r#"{"jsonrpc":"2.0","method":"session/update","params":{"update":{"type":"tool_call"}}}"#
+            )
+            .unwrap(),
+            WireMessage::UnknownEvent { method, .. } if method == "session/update"
+        ));
+    }
+
+    #[test]
+    fn jsonrpc_codec_rejects_wrong_version_extra_fields_and_bad_ids() {
+        for line in [
+            r#"{"id":1,"method":"session/prompt","params":{}}"#,
+            r#"{"jsonrpc":"1.0","id":1,"method":"session/prompt","params":{}}"#,
+            r#"{"jsonrpc":2.0,"id":1,"method":"session/prompt","params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{},"extra":true}"#,
+            r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{}}"#,
+            r#"{"jsonrpc":"2.0","result":{}}"#,
+        ] {
+            assert!(parse_jsonrpc_line(line).is_err(), "frame accepted: {line}");
+        }
+    }
+
+    #[test]
+    fn jsonrpc_codec_marks_outbound_frames_with_the_version_field() {
+        let path = capture_path("jsonrpc-outbound");
+        let mut command = Command::new("sh");
+        command
+            .env("RESPONSE_PATH", &path)
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s\\n' \"$line\" > \"$RESPONSE_PATH\"; IFS= read -r line; printf '%s\\n' \"$line\" >> \"$RESPONSE_PATH\"; sleep 5",
+            ]);
+        let driver = Driver::spawn_with_codec(command, FrameCodec::JsonRpc2).unwrap();
+        assert_eq!(driver.codec(), FrameCodec::JsonRpc2);
+        let initialize = driver
+            .begin_request("initialize", serde_json::json!({}))
+            .unwrap();
+        driver
+            .respond(
+                WireId::String("srv-1".into()),
+                serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        let file_contents = wait_for_file(&path);
+        let text = String::from_utf8(file_contents).unwrap();
+        let mut frames = text.lines();
+        let request: serde_json::Value =
+            serde_json::from_str(frames.next().expect("request frame")).unwrap();
+        assert_eq!(request["jsonrpc"], "2.0");
+        assert_eq!(request["method"], "initialize");
+        let response: serde_json::Value =
+            serde_json::from_str(frames.next().expect("response frame")).unwrap();
+        assert_eq!(response["jsonrpc"], "2.0");
+        assert_eq!(response["id"], "srv-1");
+        assert_eq!(response["result"]["ok"], true);
+        initialize.cancel();
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn jsonrpc_driver_round_trips_through_a_real_child() {
+        // A JSON-RPC 2.0 echo child: notifications are rebroadcast as updates
+        // and requests get correlated responses while another request waits.
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "read init; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}'; read prompt; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"update\":{\"type\":\"agent_message\",\"messageId\":\"m1\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}}' '{\"jsonrpc\":\"2.0\",\"id\":\"srv-9\",\"method\":\"session/request_permission\",\"params\":{\"toolCallId\":\"t1\",\"options\":[{\"optionId\":\"allow-once\",\"kind\":\"allow_once\"}]}}' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"stopReason\":\"end_turn\",\"messageId\":\"m1\"}}'; read answer; sleep 5",
+        ]);
+        let driver = Driver::spawn_with_codec(command, FrameCodec::JsonRpc2).unwrap();
+        let initialized = driver
+            .request("initialize", serde_json::json!({}), Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(initialized.result.unwrap()["protocolVersion"], 1);
+        let prompt = driver
+            .begin_request("session/prompt", serde_json::json!({"prompt": "hi"}))
+            .unwrap();
+        let mut saw_update = false;
+        let mut permission_id = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !(saw_update && permission_id.is_some()) {
+            assert!(Instant::now() < deadline, "broadcast frames never arrived");
+            match driver.recv_timeout(Duration::from_millis(200)).unwrap() {
+                Inbound::Message(WireMessage::UnknownEvent { method, .. }) => {
+                    assert_eq!(method, "session/update");
+                    saw_update = true;
+                }
+                Inbound::Message(WireMessage::Request(request)) => {
+                    assert_eq!(request.method, "session/request_permission");
+                    permission_id = Some(request.id);
+                }
+                other => panic!("unexpected inbound: {other:?}"),
+            }
+        }
+        assert!(saw_update);
+        let permission_id = permission_id.expect("permission request arrived");
+        driver
+            .respond(
+                permission_id,
+                serde_json::json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}),
+            )
+            .unwrap();
+        let settled = prompt.wait(Duration::from_secs(2)).unwrap();
+        assert_eq!(settled.result.unwrap()["stopReason"], "end_turn");
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+    }
 
     #[cfg(unix)]
     fn stdin_settable_flags(driver: &Driver) -> i32 {
