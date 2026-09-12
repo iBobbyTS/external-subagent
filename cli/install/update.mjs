@@ -3,7 +3,8 @@ import path from 'node:path';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
 import { reconcileCodexHomes } from './reconcile.mjs';
-import { packageVersion } from './layout.mjs';
+import { packageVersion, packageRoot } from './layout.mjs';
+import { verifyPayload } from './payload.mjs';
 
 const SCHEMA_VERSION = 2;
 const lockPath = (paths) => path.join(paths.data, 'install.lock');
@@ -35,18 +36,20 @@ export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
     const requested = options.version || 'current';
+    const candidateRoot = options.candidateRoot || null;
+    const payload = candidateRoot ? verifyPayload({ root: candidateRoot, platform: options.platform }) : null;
     const version = requested === 'current' ? packageVersion() : requested;
     const available = options.availableVersions || [packageVersion()];
     if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
       throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
     }
     const prior = readState(paths);
-    const state = { schema_version: SCHEMA_VERSION, candidate: { version }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
+    const state = { schema_version: SCHEMA_VERSION, candidate: { version, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const sync = reconcileCodexHomes(paths, options);
     const ok = sync.homes.length === 0 || sync.all_updated;
     state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
-    if (ok) { state.active = state.candidate; state.candidate = null; }
+    if (ok) { state.active = state.candidate; state.candidate = null; if (candidateRoot) state.active.entry = path.join(candidateRoot, 'bin', 'external-subagent'); }
     atomicWrite(paths.state, jsonBytes(state));
     return state;
   });
