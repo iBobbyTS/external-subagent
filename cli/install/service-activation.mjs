@@ -80,6 +80,10 @@ export async function activateService(paths, candidate, options = {}) {
       },
     };
   } catch (error) {
+    if (!oldPid) {
+      error.rollback = { attempted: false, restored: false, error: 'no previous service identity to restore' };
+      throw error;
+    }
     try {
       await unload();
       if (digest(oldPath) !== oldHash) throw new Error('previous payload changed; automatic rollback refused');

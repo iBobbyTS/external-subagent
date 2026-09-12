@@ -77,6 +77,10 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (result?.service?.rollback) {
       try { await result.service.rollback(); rollback.service_restored = true; } catch (restoreError) { rollback.service_error = restoreError.message; }
     }
+    if (error.rollback) {
+      rollback.service = error.rollback;
+      rollback.service_restored = Boolean(error.rollback.pid && error.rollback.artifact);
+    }
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
     throw error;
   }
