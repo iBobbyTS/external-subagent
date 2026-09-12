@@ -117,23 +117,24 @@ impl RuntimeFactory for DshRuntimeFactory {
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "DSH_RUNTIME_PATH is unavailable")
                     })?;
+                let plan = matches!(prepared.permission_mode, external_core::PermissionMode::Plan);
                 let patch = std::env::var_os("DSH_STRICT_PLAN_PATCH")
-                    .map(PathBuf::from)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "DSH_STRICT_PLAN_PATCH is unavailable",
-                        )
-                    })?;
-                external_agent_dsh::profile::preflight(&executable, &patch)
-                    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    .map(PathBuf::from);
+                if plan && patch.is_none() {
+                    return Err(io::Error::new(io::ErrorKind::NotFound,
+                        "DSH_STRICT_PLAN_PATCH is unavailable"));
+                }
                 let mut launch = external_agent_dsh::profile::DshLaunch::new(
-                    Some(executable),
-                    prepared.workspace.path.clone(),
-                    std::env::var_os("DSH_HOME").map(PathBuf::from),
-                );
-                launch.permission_mode = Some("read-only".into());
-                launch.patch = Some(patch);
+                    Some(executable), prepared.workspace.path.clone(),
+                    std::env::var_os("DSH_HOME").map(PathBuf::from));
+                if plan {
+                    external_agent_dsh::profile::preflight(&launch.executable.clone().unwrap(), patch.as_ref().unwrap())
+                        .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+                    launch.permission_mode = Some("read-only".into());
+                    launch.patch = patch;
+                } else {
+                    launch.permission_mode = Some("workspace-write".into());
+                }
                 let command = external_agent_dsh::profile::resolve_launch(&launch)?;
                 Ok(Arc::new(DshRuntimeOwner::spawn(command, _sink)?))
             }
