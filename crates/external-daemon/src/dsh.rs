@@ -1244,7 +1244,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
         let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
         let phase = scheduler.cancel_task(&agent_id).expect("cancel pending task");
-        assert_eq!(phase, TaskPhase::Cancelling);
-        assert_eq!(scheduler.cancel_task(&agent_id).unwrap(), TaskPhase::Cancelling);
+        assert_eq!(phase, TaskPhase::Terminal);
+        assert_eq!(scheduler.cancel_task(&agent_id).unwrap(), TaskPhase::Terminal);
+        assert_eq!(await_terminal_task(&scheduler, &agent_id).phase, TaskPhase::Terminal);
     }
 }

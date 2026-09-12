@@ -50,7 +50,7 @@ test('daemon DSH max_tokens oracle preserves failed settlement', () => {
 
 test('daemon DSH pending cancellation stays cancelling', () => {
   const cwd = fileURLToPath(new URL('../..', import.meta.url));
-  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh_pending_task_cancel_is_terminal_and_non_resurrecting', '--', '--exact'], { cwd, encoding: 'utf8' });
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'dsh_pending_task_cancel_is_terminal_and_non_resurrecting'], { cwd, encoding: 'utf8' });
   assert.match(output, /test result: ok\. 1 passed/);
 });
 
