@@ -444,6 +444,16 @@ fn validate_build_dump(
     {
         return Err("build permission preset must preserve workspace-write and ask".into());
     }
+    if let Some(default) = permission["config"]["defaultPreset"].as_str() {
+        if default != "workspace-write" {
+            return Err("build permission defaultPreset must be workspace-write".into());
+        }
+    }
+    if let Some(settings) = permission["config"].get("settings") {
+        if !settings.is_null() && !settings.as_mapping().is_some_and(|m| m.is_empty()) {
+            return Err("build permission settings overrides are not managed".into());
+        }
+    }
     entry("fs-sandbox", "@deepseek-ai/dsh-fs-sandbox")?;
     entry("acp", "@deepseek-ai/dsh-acp")?;
     entry("acp-app-startup", "@deepseek-ai/dsh-acp-app")?;
@@ -807,6 +817,17 @@ mod tests {
             )
         };
         validate(&baseline).unwrap();
+        for (key, value) in [
+            ("defaultPreset", Value::String("danger-full-access".into())),
+            (
+                "settings",
+                serde_json::json!({"preset":"danger-full-access"}),
+            ),
+        ] {
+            let mut drifted = baseline.clone();
+            drifted[2]["config"][key] = value;
+            assert!(validate(&drifted).is_err(), "permission {key}");
+        }
         for (index, pointer, replacement) in [
             (
                 0,
