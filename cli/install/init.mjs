@@ -4,6 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
+import { readConfig } from '../config/read.mjs';
+import { writeConfig } from '../config/write.mjs';
 import { codexHomeFor, installPlugin, resolveStaging } from './codex.mjs';
 import { verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
@@ -133,7 +135,13 @@ export function runInit(options = {}) {
       mark('create-data');
     }
     if (!completed.has('write-product-config')) {
-      atomicWrite(paths.config, jsonBytes({ schema_version: 1, runtime: ZCODE_RUNTIME, database: paths.database, socket: paths.socket }));
+      const configured = readConfig(paths.config);
+      writeConfig(paths.config, {
+        ...configured,
+        runtime: ZCODE_RUNTIME,
+        database: paths.database,
+        socket: paths.socket,
+      });
       failAt('write-product-config');
       mark('write-product-config');
     }

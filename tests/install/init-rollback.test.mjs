@@ -84,6 +84,33 @@ test('successful init claims the codex home with the staged plugin tree digest',
   }
 });
 
+test('init preserves configured agents and advances the service config revision', () => {
+  const { paths, run } = initFixture();
+  try {
+    fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+    fs.writeFileSync(paths.config, JSON.stringify({
+      schema_version: 1,
+      revision: 7,
+      default_agent: 'dsh',
+      agents: {
+        zcode: { enabled: true, spawn_supported: true, default_model: null },
+        dsh: { enabled: true, spawn_supported: true, default_model: 'opaque-model' },
+      },
+    }));
+    run({ skipCodexPlugin: true });
+    const configured = JSON.parse(fs.readFileSync(paths.config, 'utf8'));
+    assert.equal(configured.revision, 8);
+    assert.equal(configured.default_agent, 'dsh');
+    assert.equal(configured.agents.dsh.enabled, true);
+    assert.equal(configured.agents.dsh.spawn_supported, true);
+    assert.equal(configured.agents.dsh.default_model, 'opaque-model');
+    const plist = fs.readFileSync(paths.launchAgent, 'utf8');
+    assert.match(plist, /EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>8<\/string>/u);
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
+});
+
 test('failure after the plugin binding rolls back staging, marketplace, and the created codex home', () => {
   const { paths, codexHome, run } = initFixture({ failStep: 'claim-codex-home' });
   try {
