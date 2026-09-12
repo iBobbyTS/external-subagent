@@ -8,5 +8,5 @@ export const BUSINESS_COMMANDS = new Set([
   'init', 'hooks', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop',
   'uninstall', 'purge', 'cleanup-legacy', 'install-plugin', 'install-mcp', 'create', 'spawn', 'wait', 'list', 'send',
   'respond', 'cancel', 'result', 'close', 'config', 'agents',
-  'observe',
+  'observe', 'update', 'reconcile',
 ]);
