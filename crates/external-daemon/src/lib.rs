@@ -35,6 +35,7 @@ pub mod agent_status;
 pub mod dsh;
 pub mod mcp;
 pub mod observation;
+mod projection;
 pub mod rpc;
 mod scheduler;
 use external_core::{
@@ -47,6 +48,7 @@ use scheduler::{
     bounded_error, bounded_prefix, runtime_failure_record, update_latest_failure,
     DIAGNOSTIC_FILE_BYTES, DIAGNOSTIC_QUEUE_CAPACITY, DIAGNOSTIC_RECORD_BYTES,
 };
+use projection::LifecycleProjection;
 pub use scheduler::{SchedulerConfig, SchedulerError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2518,12 +2520,6 @@ struct SinkWriteState {
     last_source_sequence: u64,
     pending_terminal_sequence: Option<u64>,
     terminal_written: bool,
-}
-
-struct LifecycleProjection {
-    event_type: &'static str,
-    payload_json: String,
-    redaction_level: &'static str,
 }
 
 impl StoreLifecycleSink {
