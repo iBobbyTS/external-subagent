@@ -1527,12 +1527,6 @@ impl Scheduler {
         mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
-        if self.inner.draining.load(Ordering::Acquire) {
-            return Err(SchedulerError::RuntimeCommand {
-                agent_id: agent_id.into(),
-                message: "daemon_draining".into(),
-            });
-        }
         if mode != "queue" {
             return Err(SchedulerError::InvalidConfig(
                 "generic agent messages must use queue mode".into(),
@@ -1551,6 +1545,12 @@ impl Scheduler {
             return Err(SchedulerError::Store(StoreError::Conflict(
                 "MESSAGE_ID_CONFLICT".into(),
             )));
+        }
+        if self.inner.draining.load(Ordering::Acquire) {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "daemon_draining".into(),
+            });
         }
         if self
             .inner
