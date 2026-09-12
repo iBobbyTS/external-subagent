@@ -1460,9 +1460,11 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
     if agent != "dsh" {
         return entry.enabled && entry.spawn_supported;
     }
-    entry.enabled && entry.spawn_supported && env::var_os("DSH_RUNTIME_PATH")
-        .map(PathBuf::from)
-        .is_some_and(|path| path.is_absolute() && fs::metadata(path).is_ok_and(|m| m.is_file()))
+    entry.enabled
+        && entry.spawn_supported
+        && env::var_os("DSH_RUNTIME_PATH")
+            .map(PathBuf::from)
+            .is_some_and(|path| path.is_absolute() && fs::metadata(path).is_ok_and(|m| m.is_file()))
 }
 
 fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {
@@ -3378,7 +3380,10 @@ mod admission_tests {
         assert_eq!(identity.agent, "dsh");
         assert_eq!(identity.model.as_deref(), Some("opaque-token"));
         assert_eq!(identity.model_source, "catalog");
-        match previous_runtime { Some(value) => env::set_var("DSH_RUNTIME_PATH", value), None => env::remove_var("DSH_RUNTIME_PATH") }
+        match previous_runtime {
+            Some(value) => env::set_var("DSH_RUNTIME_PATH", value),
+            None => env::remove_var("DSH_RUNTIME_PATH"),
+        }
         drop(env_guard);
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
