@@ -192,7 +192,10 @@ export function callDaemon(socketPath, command, input, timeoutMs) {
     const finish = (fn, value) => { if (!settled) { settled = true; socket.destroy(); fn(value); } };
     const timer = setTimeout(() => finish(reject, new CliError('SOCKET_UNAVAILABLE', `daemon socket unavailable: ${socketPath}`)), effectiveTimeoutMs);
     socket.setEncoding('utf8');
-    socket.on('connect', () => socket.end(request));
+    // Keep the client write side open while the daemon processes the request.
+    // A half-close is interpreted by the daemon as peer disconnect, which
+    // would incorrectly interrupt long-polling wait requests.
+    socket.on('connect', () => socket.write(request));
     socket.on('data', (chunk) => {
       dataBytes += Buffer.byteLength(chunk, 'utf8');
       if (dataBytes > MAX_RESPONSE_FRAME_BYTES) {

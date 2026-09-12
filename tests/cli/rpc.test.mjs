@@ -26,8 +26,10 @@ test('CLI help documents JSON list scope instead of nonexistent flags', () => {
 
 test('CLI sends daemon RPC and preserves success result', async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-${process.pid}-${Date.now()}.sock`);
+  let clientEnded = false;
   const server = net.createServer((socket) => {
     let body = '';
+    socket.on('end', () => { clientEnded = true; });
     socket.on('data', (chunk) => {
       body += chunk;
       if (!body.includes('\n')) return;
@@ -59,6 +61,7 @@ test('CLI sends daemon RPC and preserves success result', async () => {
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
     const result = await callDaemon(socketPath, 'wait', { agent_id: 10000001, wait_time: 0 });
+    assert.equal(clientEnded, false, 'sending a request must not half-close the RPC socket');
     assert.equal(result.task.cancel_requested, false);
     assert.equal(result.task.resources_reaped, false);
     assert.equal(result.activity.latest_progress, undefined);
