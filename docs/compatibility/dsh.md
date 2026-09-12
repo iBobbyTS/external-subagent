@@ -12,4 +12,6 @@ Catalog discovery isolates the provider in a process group and cleans the group 
 
 The shared executable-version check applies the same process-group and incremental-reader bounds, including cleanup when a leader exits while a descendant still owns stdout/stderr.
 
-S01 live status: **BLOCKED / NOT_RUN** until an authorized DSH executable, version/source, runtime, credentials, and disposable workspace are supplied. The local fixture is deterministic protocol coverage, not a substitute for a real DSH run. Strict-plan enforcement and complete write/shell entry-point coverage remain unproven; therefore no DSH spawn support or policy plugin is enabled by this section.
+S04 live status (2026-09-12): **PARTIALLY VERIFIED** against DSH `0.1.5-rc.1` in a disposable workspace. Real ACP `initialize`, `session/new`, and `session/prompt` completed; the default-model prompt returned `LIVE_OK` with `end_turn`. Under the strict patch profile, shell/write probing exposed only the expected `glob`/`grep` operations and created no target file.
+
+These observations validate the ACP wire path and the bounded strict-plan probe only. Production daemon routing, a complete production lifecycle (spawn, prompt, cancellation, cleanup, and restart), provider `hi`/authentication, and Codex/ZCode host integration remain **NOT_RUN**. Accordingly this document does not enable DSH production spawn or claim that the production gate is open.
