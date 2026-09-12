@@ -1,0 +1,29 @@
+{
+  "name": "external-subagent",
+  "version": "0.1.0",
+  "description": "Run ZCode and DSH as managed external subagents for Codex",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "external-subagent": "bin/external-subagent.mjs",
+    "external-subagent-mcp": "bin/external-subagent-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "cli/",
+    "npm/",
+    "plugins/",
+    "schema/",
+    "launchd/",
+    "scripts/release/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "test:install": "node --test tests/install/*.test.mjs",
+    "check": "node --check bin/external-subagent.mjs && node --check bin/external-subagent-mcp.mjs && node --check cli/main.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

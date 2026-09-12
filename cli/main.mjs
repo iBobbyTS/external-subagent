@@ -3,17 +3,19 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { BUSINESS_COMMANDS, PRODUCT_NAME, VERSION, ZCODE_RUNTIME } from './constants.mjs';
 import { CliError } from './errors.mjs';
-import { runInit, installHooks, installPlugin, installPlan, nativeBinary } from './installer.mjs';
-import { backupData, cleanupLegacy, purge, restoreData, uninstall } from './maintenance.mjs';
+import { installHooks, installPlan, runInit } from './install/init.mjs';
+import { nativeBinary } from './install/layout.mjs';
+import { cleanupLegacy, purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
+import { localInstallStatus, startDaemon, stopDaemon } from './commands/daemon.mjs';
+import { mcpCommand, pluginCommand } from './commands/plugin.mjs';
 import { platform, productPaths } from './paths.mjs';
-import { startService, stopService } from './service.mjs';
 import { callDaemon, parseDaemonInput } from './rpc.mjs';
 import { configCommand } from './commands/config.mjs';
 import { parseConfigArgs } from './commands/config.mjs';
 import { agentsCommand, parseAgentsArgs } from './commands/agents.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from './commands/tasks.mjs';
 
-const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] Install and configure the local service\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration\n  status, diagnose            Inspect local service and runtime state\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
+const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks]\n      [--skip-runtime-probe] [--skip-codex-plugin] [--skip-service-start]\n      [--codex-home <path>]    Install service, bind Codex, claim the Codex home\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed Codex plugin (MCP + skill)\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex claims; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
 const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  agents list | agents status [agent] | agents probe/models [agent]\n  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function structuredInput(args, parser) {
@@ -292,7 +294,7 @@ async function diagnose(paths, args) {
 export async function main(args) {
   const command = args[0] || 'help';
   if (command === 'help' || command === '--help' || command === '-h') {
-    process.stdout.write(HELP.replace('install-mcp [codex] [--dry-run|--uninstall] Install or remove the Codex MCP configuration', 'install-plugin [--dry-run|--uninstall] Install or remove the Codex plugin (MCP + skill)') + DAEMON_HELP); return;
+    process.stdout.write(HELP + DAEMON_HELP); return;
   }
   if (command === 'version' || command === '--version' || command === '-v') {
     process.stdout.write(`${VERSION}\n`); return;
@@ -302,18 +304,42 @@ export async function main(args) {
 
   const paths = productPaths();
   if (command === 'init') {
-    output(runInit({ paths, dryRun: args.includes('--dry-run'), resume: args.includes('--resume'), installHooks: args.includes('--install-hooks') })); return;
+    const flags = args.slice(1);
+    const known = ['--dry-run', '--resume', '--install-hooks', '--skip-runtime-probe', '--skip-codex-plugin', '--skip-service-start'];
+    const codexHomeIndex = flags.indexOf('--codex-home');
+    let codexHome;
+    if (codexHomeIndex >= 0) {
+      codexHome = flags[codexHomeIndex + 1];
+      if (!codexHome || codexHome.startsWith('--')) throw new CliError('INVALID_ARGUMENT', '--codex-home requires a value', 2);
+    }
+    for (let index = 0; index < flags.length; index += 1) {
+      if (index === codexHomeIndex) { index += 1; continue; }
+      if (!known.includes(flags[index])) throw new CliError('INVALID_ARGUMENT', `unsupported init option: ${flags[index]}`, 2);
+    }
+    output(runInit({
+      paths,
+      dryRun: flags.includes('--dry-run'),
+      resume: flags.includes('--resume'),
+      installHooks: flags.includes('--install-hooks'),
+      skipRuntimeProbe: flags.includes('--skip-runtime-probe'),
+      skipCodexPlugin: flags.includes('--skip-codex-plugin'),
+      skipServiceStart: flags.includes('--skip-service-start'),
+      codexHome,
+    }));
+    return;
   }
   if (command === 'hooks') {
     if (args[1] !== 'install') throw new CliError('INVALID_ARGUMENT', 'usage: hooks install [--dry-run]', 2);
     output(installHooks(paths, { dryRun: args.includes('--dry-run') })); return;
   }
   if (command === 'install-plugin') {
-    if (args.slice(1).some((arg) => !['--dry-run', '--uninstall'].includes(arg))) throw new CliError('INVALID_ARGUMENT', 'usage: install-plugin [--dry-run|--uninstall]', 2);
-    output(installPlugin(paths, { dryRun: args.includes('--dry-run'), uninstall: args.includes('--uninstall') })); return;
+    output(pluginCommand(paths, args.slice(1))); return;
+  }
+  if (command === 'install-mcp') {
+    output(mcpCommand(paths, args.slice(1))); return;
   }
   if (command === 'status') {
-    const local = { installed: fs.existsSync(paths.state), launch_agent: fs.existsSync(paths.launchAgent), data: fs.existsSync(paths.data) };
+    const local = localInstallStatus(paths);
     try {
       output({ ...local, daemon_status: await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}) });
     } catch (error) {
@@ -337,8 +363,8 @@ export async function main(args) {
   }
   if (command === 'backup') { output(backupData(value(args, '--output'), paths)); return; }
   if (command === 'restore') { output(restoreData(value(args, '--input'), paths)); return; }
-  if (command === 'start') { output(startService(paths)); return; }
-  if (command === 'stop') { output(stopService(paths)); return; }
+  if (command === 'start') { output(startDaemon(paths)); return; }
+  if (command === 'stop') { output(stopDaemon(paths)); return; }
   if (command === 'uninstall') { output(uninstall(paths)); return; }
   if (command === 'purge') {
     if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'purge requires --yes');

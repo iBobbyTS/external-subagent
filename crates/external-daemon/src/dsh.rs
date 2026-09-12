@@ -755,8 +755,8 @@ mod tests {
     use external_core::{
         AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA,
     };
-    use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase};
     use external_runtime::StopOutcome;
+    use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase};
     use std::io::Write;
     use std::sync::{atomic::AtomicUsize, Condvar};
 
@@ -1253,12 +1253,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         }
 
         fn turn_event(&self, kind: &str) {
-            self.tracker.observe(&Inbound::Message(WireMessage::Event(
-                EventEnvelope {
+            self.tracker
+                .observe(&Inbound::Message(WireMessage::Event(EventEnvelope {
                     method: SESSION_EVENT.into(),
                     params: serde_json::json!({"type": kind}),
-                },
-            )));
+                })));
         }
     }
 
@@ -1349,7 +1348,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 return Ok(current);
             }
             self.turn_event("turn.completed");
-            self.tracker.wait_boundary_after(current.generation, timeout)
+            self.tracker
+                .wait_boundary_after(current.generation, timeout)
         }
 
         fn turn_snapshot(&self) -> TurnSnapshot {
@@ -1411,7 +1411,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         // The first provider (the fake zcode runtime, one active turn) is
         // admitted and occupies the workspace's single agent slot.
         let first = scheduler
-            .enqueue_general(&manifest_for(workspace.path(), "occupy the shared workspace"))
+            .enqueue_general(&manifest_for(
+                workspace.path(),
+                "occupy the shared workspace",
+            ))
             .unwrap()
             .task
             .agent_id;
@@ -1442,7 +1445,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
 
         // Cancelling the occupier terminalizes it exactly once and releases
         // the slot; the cancelled provider never revives.
-        let phase = scheduler.cancel_task(&first).expect("cancel active occupier");
+        let phase = scheduler
+            .cancel_task(&first)
+            .expect("cancel active occupier");
         assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
         let cancelled = await_terminal_task(&scheduler, &first);
         assert_eq!(cancelled.outcome, Some(TaskOutcome::Cancelled));
@@ -1475,7 +1480,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
 
         // Cancelling the second provider reaps it without reviving either
         // provider: one cooperative session/cancel, both tasks terminal.
-        let phase = scheduler.cancel_task(&second).expect("cancel active dsh provider");
+        let phase = scheduler
+            .cancel_task(&second)
+            .expect("cancel active dsh provider");
         assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
         let second_terminal = await_terminal_task(&scheduler, &second);
         assert_eq!(second_terminal.outcome, Some(TaskOutcome::Cancelled));
@@ -1489,7 +1496,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert_eq!(
             frames
                 .iter()
-                .filter(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel"))
+                .filter(
+                    |frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel")
+                )
                 .count(),
             1
         );
@@ -1506,10 +1515,18 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let workspace = dsh_workspace();
         let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
         let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
-        let phase = scheduler.cancel_task(&agent_id).expect("cancel pending task");
+        let phase = scheduler
+            .cancel_task(&agent_id)
+            .expect("cancel pending task");
         assert_eq!(phase, TaskPhase::Terminal);
-        assert_eq!(scheduler.cancel_task(&agent_id).unwrap(), TaskPhase::Terminal);
-        assert_eq!(await_terminal_task(&scheduler, &agent_id).phase, TaskPhase::Terminal);
+        assert_eq!(
+            scheduler.cancel_task(&agent_id).unwrap(),
+            TaskPhase::Terminal
+        );
+        assert_eq!(
+            await_terminal_task(&scheduler, &agent_id).phase,
+            TaskPhase::Terminal
+        );
     }
 
     #[test]
@@ -1528,7 +1545,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
         let _request = await_pending_permission(&scheduler, &agent_id);
-        let phase = scheduler.cancel_task(&agent_id).expect("cancel active task");
+        let phase = scheduler
+            .cancel_task(&agent_id)
+            .expect("cancel active task");
         assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
         let stored = await_result(&scheduler, &agent_id);
         assert_eq!(stored.result.outcome, TaskOutcome::Cancelled);
@@ -1543,10 +1562,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert!(request_methods(&frames).contains(&"session/prompt"));
         assert!(request_methods(&frames).contains(&"session/cancel"));
         assert_eq!(
-            frames.iter().filter(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel")).count(),
+            frames
+                .iter()
+                .filter(
+                    |frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel")
+                )
+                .count(),
             1
         );
         assert!(scheduler.store().task_result(&agent_id).unwrap().is_some());
     }
-
 }
