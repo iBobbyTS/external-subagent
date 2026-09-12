@@ -1,6 +1,7 @@
 import { reconcileCodexHomes } from '../install/reconcile.mjs';
 import { reconcileInstallation, updateInstallation } from '../install/update.mjs';
 import { callDaemon } from '../rpc.mjs';
+import { CliError } from '../errors.mjs';
 import fs from 'node:fs';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 
@@ -14,7 +15,12 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
-  const begin = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
+  const begin = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {}).catch((error) => {
+    if (cancelActive && ['VALIDATION', 'UNKNOWN_METHOD'].includes(error.code)) {
+      throw new CliError('CANCEL_ACTIVE_UNSUPPORTED', 'running daemon does not support explicit drain cancellation; cancellation was not downgraded to passive drain');
+    }
+    throw error;
+  });
   let status = begin;
   while (!status.ready_for_activation) {
     await new Promise((resolve) => setTimeout(resolve, 50));

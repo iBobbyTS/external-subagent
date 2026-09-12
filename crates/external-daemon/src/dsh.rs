@@ -1781,8 +1781,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 ..
             }
         ));
+        let fenced = scheduler.store().get_task(&queued_id).unwrap().unwrap();
+        assert_eq!(fenced.phase, TaskPhase::Queued);
+        assert!(fenced.stop_requested);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
+            // Exercise the actual iteration called by Daemon's production
+            // claim thread while cancellation is waiting on the first child.
+            assert!(scheduler.start_ready().unwrap().is_empty(), "cancelled queue was claimed");
             let status = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap();
             if matches!(
                 status,
@@ -1808,6 +1814,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let queued = scheduler.store().get_task(&queued_id).unwrap().unwrap();
         assert_eq!(queued.phase, TaskPhase::Terminal);
         assert_eq!(queued.outcome, Some(TaskOutcome::Cancelled));
+        assert_eq!(queued.owner_epoch, 0, "queued cancellation must never acquire a runtime claim");
         assert!(!queued_workspace.path().join("wire.jsonl").exists());
         let frames = wait_for_frames(workspace.path(), 5);
         assert_eq!(
@@ -1860,6 +1867,27 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn queued_only_drain_cannot_claim_activation_but_default_drain_can_start_admitted_work() {
+        let workspace = dsh_workspace();
+        let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
+        let id = enqueue_dsh(&scheduler, workspace.path(), None);
+        scheduler.begin_drain();
+        assert_eq!(scheduler.active_count(), 0);
+        assert!(!scheduler.resources_reaped());
+        assert!(!scheduler.ready_for_activation());
+        assert!(scheduler.claim_activation().is_none());
+        // Default drain still permits the admitted queue to run. Using the
+        // durable production claim owner isolates this from provider setup.
+        let claim = scheduler
+            .store()
+            .claim_next("default-drain", 10, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.task.agent_id, id);
+        assert!(!scheduler.ready_for_activation());
     }
 
 
