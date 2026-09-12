@@ -366,7 +366,7 @@ export async function main(args) {
   if (command === 'restore') { output(restoreData(value(args, '--input'), paths)); return; }
   if (command === 'start') { output(startDaemon(paths)); return; }
   if (command === 'stop') { output(stopDaemon(paths)); return; }
-  if (command === 'update' || command === 'reconcile') { output(updateCommand(paths, command === 'reconcile' ? ['reconcile', ...args.slice(1)] : args.slice(1))); return; }
+  if (command === 'update' || command === 'reconcile') { output(await updateCommand(paths, command === 'reconcile' ? ['reconcile', ...args.slice(1)] : args.slice(1), { socket: process.env.ZCODE_AGENTD_SOCKET || paths.socket })); return; }
   if (command === 'uninstall') { output(uninstall(paths)); return; }
   if (command === 'purge') {
     if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'purge requires --yes');
