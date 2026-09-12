@@ -15,7 +15,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   if (cancelActive && !yes) throw new Error('--cancel-active requires --yes');
   const prior = (() => { try { return JSON.parse(fs.readFileSync(receiptPath(paths), 'utf8')); } catch { return null; } })();
   const priorStateBytes = (() => { try { return fs.readFileSync(paths.state); } catch { return null; } })();
-  const registryPath = path.join(paths.data, 'codex-homes.json');
+  const registryPath = paths.data ? path.join(paths.data, 'codex-homes.json') : null;
   const priorRegistryBytes = (() => { try { return fs.readFileSync(registryPath); } catch { return null; } })();
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
@@ -65,8 +65,14 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       rollback.attempted = true;
       try { fs.rmSync(paths.state, { force: true }); rollback.restored = true; } catch (restoreError) { rollback.error = restoreError.message; }
     }
-    if (priorRegistryBytes) atomicWrite(registryPath, priorRegistryBytes);
-    else if (fs.existsSync(registryPath)) fs.rmSync(registryPath, { force: true });
+    if (registryPath) {
+      try {
+        if (priorRegistryBytes) atomicWrite(registryPath, priorRegistryBytes);
+        else if (fs.existsSync(registryPath)) fs.rmSync(registryPath, { force: true });
+      } catch (restoreError) {
+        rollback.registry_error = restoreError.message;
+      }
+    }
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
     throw error;
   }
