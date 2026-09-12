@@ -222,6 +222,7 @@ impl Scheduler {
                 #[cfg(test)]
                 result_persist_hook: Mutex::new(None),
                 state: Mutex::new(SchedulerState::default()),
+                admission: Mutex::new(()),
                 draining: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
                 activation_claim: Mutex::new(None),
@@ -1534,6 +1535,7 @@ impl Scheduler {
             ));
         }
         let deadline = self.control_deadline();
+        let _admission = self.inner.admission.lock().unwrap();
         if let Some(existing) = self.inner.store.message(message_id)? {
             if existing.agent_id == agent_id && existing.mode == mode && existing.content == content
             {
@@ -1989,6 +1991,7 @@ impl Scheduler {
     }
 
     pub fn begin_drain(&self) {
+        let _admission = self.inner.admission.lock().unwrap();
         self.inner.draining.store(true, Ordering::Release);
     }
     pub fn is_draining(&self) -> bool {
