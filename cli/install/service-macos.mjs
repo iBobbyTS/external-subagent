@@ -41,15 +41,16 @@ export function installLaunchAgent(paths, options = {}) {
   return { installed: true, path: paths.launchAgent, label: LAUNCH_AGENT_LABEL };
 }
 
-function launchctl(args) {
+export function launchctl(args) {
   if (process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL === '1') {
     return { action: args[0], skipped: true, reason: 'launchd neutralized by test seam' };
   }
   const result = spawnSync('/bin/launchctl', args, { encoding: 'utf8' });
+  if (args[0] === 'print' && result.status === 113) return { action: 'print', absent: true };
   if (result.error || result.status !== 0) {
     throw new CliError('DAEMON_CONTROL_FAILED', (result.stderr || result.error?.message || 'launchctl failed').trim());
   }
-  return { action: args[0], status: result.status };
+  return { action: args[0], status: result.status, stdout: result.stdout };
 }
 
 export function bootstrapService(paths, uid = process.getuid()) {

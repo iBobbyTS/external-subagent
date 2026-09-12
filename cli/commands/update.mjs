@@ -4,6 +4,7 @@ import { callDaemon } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
 import fs from 'node:fs';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
+import { activateService, hasInstalledService } from '../install/service-activation.mjs';
 
 const receiptPath = (paths) => `${paths.state}.activation.json`;
 
@@ -36,6 +37,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion });
     if (result?.phase && result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result.phase})`);
+    }
+    if (result?.active?.entry && hasInstalledService(paths) && !daemon.skipServiceActivation) {
+      result.service = await activateService(paths, {
+        path: result.active.entry,
+        sha256: result.active.entry_sha256,
+        version: result.active.version,
+      }, daemon);
     }
     const receiptVersion = result?.active?.version || result?.version || requestedVersion;
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
