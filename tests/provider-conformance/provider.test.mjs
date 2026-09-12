@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { agentsCommand } from '../../cli/commands/agents.mjs';
 import { productPaths } from '../../cli/paths.mjs';
+import { execFileSync } from 'node:child_process';
 
 const providers = ['zcode', 'dsh'];
 
@@ -19,8 +20,7 @@ for (const provider of providers) {
 }
 
 test('provider adapters do not share a workspace concurrently', () => {
-  const leases = new Map();
-  leases.set('/workspace', 'zcode');
-  assert.equal(leases.get('/workspace'), 'zcode');
-  assert.equal(leases.has('/workspace'), true);
+  const output = execFileSync('cargo', ['test', '-p', 'external-daemon', 'mcp::tests::workspace_busy_preserves_code_message_and_active_agent', '--', '--exact'], { cwd: new URL('../..', import.meta.url), encoding: 'utf8' });
+  assert.match(output, /test result: ok/);
+  assert.match(output, /1 passed/);
 });
