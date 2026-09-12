@@ -1,6 +1,6 @@
 use external_agent_dsh::{
     acp::session::AcpSession,
-    profile::{resolve_launch, DshLaunch},
+    profile::{preflight, resolve_launch, DshLaunch, STRICT_PLAN_PATCH_YAML},
 };
 use external_contract::{
     event_type, CreateSessionParams, RuntimePreferences, SendParams, SessionCreateProjection,
@@ -304,7 +304,10 @@ fn probe_dsh_hi(
             checked_at_ms: checked,
             reason: Some(reason.into()),
         };
-        (e.clone(), e)
+        (
+            ScopeEvidence::unknown(scope.clone(), checked, "auth_not_probed"),
+            e,
+        )
     };
     let Some(workspace) = scope.workspace.as_deref() else {
         return unavailable("workspace_missing");
@@ -315,9 +318,23 @@ fn probe_dsh_hi(
         scope.home.as_ref().map(PathBuf::from),
     );
     launch.permission_mode = Some("read-only".into());
-    launch.patch = Some(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../profiles/dsh/strict-plan.patch.yml"),
-    );
+    // The embedded resource survives native/npm installation without the build
+    // source tree. The private directory lives until the ACP child is reaped.
+    let patch_directory = match tempfile::Builder::new()
+        .prefix("external-dsh-hi-")
+        .tempdir()
+    {
+        Ok(directory) => directory,
+        Err(_) => return unavailable("auth_hi_unavailable"),
+    };
+    let patch = patch_directory.path().join("strict-plan.patch.yml");
+    if fs::write(&patch, STRICT_PLAN_PATCH_YAML).is_err() {
+        return unavailable("auth_hi_unavailable");
+    }
+    launch.patch = Some(patch);
+    if preflight(&launch).is_err() {
+        return unavailable("strict_preflight_failed");
+    }
     let mut command = match resolve_launch(&launch) {
         Ok(c) => c,
         Err(_) => return unavailable("auth_hi_unavailable"),
@@ -2026,6 +2043,82 @@ process.stdin.on('data', (chunk) => {
             assert_eq!(evidence.hi.reason.as_deref(), Some(reason));
             assert_eq!(evidence.auth.state, state);
             assert_eq!(evidence.hi.state, state);
+        }
+    }
+
+    #[test]
+    fn dsh_hi_preflights_actual_scope_and_reaps_embedded_patch() {
+        for unknown in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let workspace = directory.path().join("workspace");
+            let home = directory.path().join("home");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&home).unwrap();
+            let runtime = directory.path().join("runtime.mjs");
+            fs::write(
+                &runtime,
+                include_str!("../../../tests/fixtures/dsh-hi-probe.mjs"),
+            )
+            .unwrap();
+            if unknown {
+                fs::write(home.join("unknown-tool"), "").unwrap();
+            }
+            let scope = ProbeScope {
+                workspace: Some(workspace.to_string_lossy().into_owned()),
+                home: Some(home.to_string_lossy().into_owned()),
+            };
+            let (auth, hi) = probe_dsh_hi(Some(&runtime), &scope, None, 0);
+            assert_eq!(auth.state, EvidenceState::Unknown);
+            assert_eq!(
+                hi.state,
+                if unknown {
+                    EvidenceState::Unavailable
+                } else {
+                    EvidenceState::Ready
+                }
+            );
+            let events: Vec<Value> = fs::read_to_string(home.join("probe.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events[0]["kind"], "dump");
+            let canonical_workspace = fs::canonicalize(&workspace)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let canonical_home = fs::canonicalize(&home)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            for event in events.iter().filter(|event| event.get("kind").is_some()) {
+                assert_eq!(
+                    fs::canonicalize(event["cwd"].as_str().unwrap())
+                        .unwrap()
+                        .to_string_lossy(),
+                    canonical_workspace
+                );
+                assert_eq!(
+                    fs::canonicalize(event["home"].as_str().unwrap())
+                        .unwrap()
+                        .to_string_lossy(),
+                    canonical_home
+                );
+                assert_eq!(event["mode"], "read-only");
+                assert!(!Path::new(event["patch"].as_str().unwrap()).exists());
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["method"] == "session/prompt")
+                    .count(),
+                usize::from(!unknown)
+            );
+            assert_eq!(fs::read_dir(workspace).unwrap().count(), 0);
+            if unknown {
+                assert_eq!(hi.reason.as_deref(), Some("strict_preflight_failed"));
+                assert_eq!(events.len(), 1, "ACP must not start after refused dump");
+            }
         }
     }
 

@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 /// byte-equivalent (a drift test pins this) so a missing file never widens the
 /// composition at runtime.
 pub const BUILD_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/build.json");
+pub const STRICT_PLAN_PATCH_YAML: &str =
+    include_str!("../../../profiles/dsh/strict-plan.patch.yml");
 pub const STRICT_PLAN_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/strict-plan.json");
 
 /// Launch inputs for one DSH child process.
@@ -463,30 +465,21 @@ fn validate_build_dump(
 /// Run the provider-owned preflight independently from the ACP command.  The
 /// dump is treated as untrusted data and is accepted only when every enabled
 /// entry is in the managed allowlist and the policy controls are present.
-pub fn preflight(executable: &std::path::Path, patch: &std::path::Path) -> Result<(), String> {
-    if !executable.is_absolute() || !patch.is_absolute() {
-        return Err("preflight paths must be absolute".into());
+pub fn preflight(launch: &DshLaunch) -> Result<(), String> {
+    strict_plan_profile()?;
+    if launch.permission_mode.as_deref() != Some("read-only") || launch.patch.is_none() {
+        return Err("strict launch must pin read-only and a managed patch".into());
     }
-    let version = bounded_output(
-        Command::new(executable).arg("--version"),
-        Duration::from_secs(10),
-        4096,
-    )?;
+    let mut version_command = resolve_launch(launch).map_err(|e| e.to_string())?;
+    version_command.arg("--version");
+    let version = bounded_output(&mut version_command, Duration::from_secs(10), 4096)?;
     if !version.status.success() {
         return Err("dsh version probe failed".into());
     }
     validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
-    let out = bounded_output(
-        Command::new(executable)
-            .arg("--profile")
-            .arg("acp")
-            .arg("--patch")
-            .arg(patch)
-            .arg("--dump-config")
-            .env("DSH_PERMISSION_MODE", "read-only"),
-        Duration::from_secs(10),
-        1024 * 1024,
-    )?;
+    let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
+    command.arg("--dump-config");
+    let out = bounded_output(&mut command, Duration::from_secs(10), 1024 * 1024)?;
     if !out.status.success() {
         return Err(format!(
             "dsh dump-config exited {}: {}",
