@@ -151,12 +151,15 @@ pub fn validate_dsh_version(output: &str) -> Result<(), String> {
 /// Collect both pipes concurrently, retaining at most `cap` bytes per pipe.
 /// The deadline covers pipe EOF as well as process exit; failed probes are
 /// always killed and waited, including output-limit and pipe-read failures.
+#[cfg(unix)]
 fn bounded_output(
     command: &mut Command,
     timeout: Duration,
     cap: usize,
 ) -> Result<std::process::Output, String> {
+    use std::os::unix::process::CommandExt;
     let deadline = Instant::now() + timeout;
+    command.process_group(0);
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -166,49 +169,83 @@ fn bounded_output(
     collect_probe(&mut child, deadline, cap)
 }
 
+#[cfg(not(unix))]
+fn bounded_output(_: &mut Command, _: Duration, _: usize) -> Result<std::process::Output, String> {
+    Err("DSH preflight requires supported process-group isolation".into())
+}
+
+#[cfg(unix)]
 fn collect_probe(
     child: &mut std::process::Child,
     deadline: Instant,
     cap: usize,
 ) -> Result<std::process::Output, String> {
     use std::io::Read;
-    use std::sync::mpsc;
+    use std::os::fd::AsRawFd;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    };
+    trait Pipe: Read + AsRawFd + Send {}
+    impl<T: Read + AsRawFd + Send> Pipe for T {}
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
     let (sender, receiver) = mpsc::channel();
-    let pipes: [(bool, Box<dyn Read + Send>); 2] = [
+    let pipes: [(bool, Box<dyn Pipe>); 2] = [
         (false, Box::new(child.stdout.take().expect("piped stdout"))),
         (true, Box::new(child.stderr.take().expect("piped stderr"))),
     ];
     let result = (|| {
         for (stderr, mut pipe) in pipes {
             let sender = sender.clone();
-            std::thread::Builder::new()
-                .name("dsh-probe-output".into())
-                .spawn(move || {
-                    let result = (|| {
-                        let mut bytes = Vec::new();
-                        let mut chunk = [0; 8192];
-                        loop {
-                            let count = match pipe.read(&mut chunk) {
-                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                                other => {
-                                    other.map_err(|e| format!("dsh probe pipe read failed: {e}"))?
+            let stop = stop.clone();
+            let fd = pipe.as_raw_fd();
+            // Nonblocking reads allow every reader to terminate and join even
+            // if an unexpected descendant keeps a pipe open past the deadline.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(format!(
+                    "dsh probe pipe setup failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            readers.push(
+                std::thread::Builder::new()
+                    .name("dsh-probe-output".into())
+                    .spawn(move || {
+                        let result = (|| {
+                            let mut bytes = Vec::new();
+                            let mut chunk = [0; 8192];
+                            loop {
+                                if stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                                    return Err("dsh probe timed out".into());
                                 }
-                            };
-                            if count == 0 {
-                                return Ok(bytes);
+                                let count = match pipe.read(&mut chunk) {
+                                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                        std::thread::sleep(Duration::from_millis(5));
+                                        continue;
+                                    }
+                                    other => other
+                                        .map_err(|e| format!("dsh probe pipe read failed: {e}"))?,
+                                };
+                                if count == 0 {
+                                    return Ok(bytes);
+                                }
+                                if count > cap.saturating_sub(bytes.len()) {
+                                    return Err(format!(
+                                        "dsh probe {} exceeded {cap} byte cap",
+                                        if stderr { "stderr" } else { "stdout" }
+                                    ));
+                                }
+                                bytes.extend_from_slice(&chunk[..count]);
                             }
-                            if count > cap.saturating_sub(bytes.len()) {
-                                return Err(format!(
-                                    "dsh probe {} exceeded {cap} byte cap",
-                                    if stderr { "stderr" } else { "stdout" }
-                                ));
-                            }
-                            bytes.extend_from_slice(&chunk[..count]);
-                        }
-                    })();
-                    let _ = sender.send((stderr, result));
-                })
-                .map_err(|e| format!("dsh probe reader spawn failed: {e}"))?;
+                        })();
+                        let _ = sender.send((stderr, result));
+                    })
+                    .map_err(|e| format!("dsh probe reader spawn failed: {e}"))?,
+            );
         }
         drop(sender);
         let (mut stdout, mut stderr) = (None, None);
@@ -235,11 +272,46 @@ fn collect_probe(
             std::thread::sleep(Duration::from_millis(5));
         }
     })();
-    if result.is_err() {
-        let _ = child.kill();
-        child
-            .wait()
-            .map_err(|e| format!("dsh probe reap failed: {e}"))?;
+    // This group was created specifically for this command, never inherited
+    // from the daemon. SIGKILL also handles descendants that ignore SIGTERM.
+    let pgid = child.id() as i32;
+    let killed = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let kill_error =
+        if killed != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            Some(format!(
+                "dsh probe group kill failed: {}",
+                io::Error::last_os_error()
+            ))
+        } else {
+            None
+        };
+    let reaped = child
+        .wait()
+        .map_err(|e| format!("dsh probe reap failed: {e}"));
+    stop.store(true, Ordering::Release);
+    let mut join_failed = false;
+    for reader in readers {
+        join_failed |= reader.join().is_err();
+    }
+    reaped?;
+    if let Some(error) = kill_error {
+        return Err(error);
+    }
+    if join_failed {
+        return Err("dsh probe reader panicked".into());
+    }
+    let reap_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match external_runtime::observe_process_group(pgid) {
+            Ok(members) if members.is_empty() => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(format!("dsh probe group observation failed: {e}")),
+        }
+        if Instant::now() >= reap_deadline {
+            return Err("dsh probe process group did not finish reaping".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
     result
 }
@@ -281,16 +353,36 @@ fn validate_build_dump(
     let entry = |id: &str, name: &str| -> Result<&serde_yaml::Value, String> {
         let matches: Vec<_> = entries
             .iter()
-            .filter(|e| e["id"].as_str() == Some(id))
+            .filter(|e| e["id"].as_str() == Some(id) || e["name"].as_str() == Some(name))
             .collect();
         if matches.len() != 1 {
             return Err(format!("build requires exactly one {id}"));
         }
         let e = matches[0];
-        if e["name"].as_str() != Some(name)
-            || !(e["disabled"].is_null() || e["disabled"].as_bool() == Some(false))
+        let disabled = match &e["disabled"] {
+            serde_yaml::Value::Null => Some(false),
+            serde_yaml::Value::Bool(value) => Some(*value),
+            serde_yaml::Value::String(value)
+                if id == "bash-sandbox" && value == "process.platform === 'win32'" =>
+            {
+                Some(cfg!(windows))
+            }
+            serde_yaml::Value::String(value)
+                if id == "pwsh-sandbox" && value == "process.platform !== 'win32'" =>
+            {
+                Some(!cfg!(windows))
+            }
+            _ => None,
+        };
+        let should_disable =
+            (id == "pwsh-sandbox" && !cfg!(windows)) || (id == "bash-sandbox" && cfg!(windows));
+        if e["id"].as_str() != Some(id)
+            || e["name"].as_str() != Some(name)
+            || disabled != Some(should_disable)
         {
-            return Err(format!("build requires enabled provider-owned {id}"));
+            return Err(format!(
+                "build requires provider-owned {id} with the pinned platform activation"
+            ));
         }
         Ok(e)
     };
@@ -312,7 +404,39 @@ fn validate_build_dump(
         "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'")) {
         return Err("build approval must resolve to ask".into());
     }
-    entry("sandbox", "@deepseek-ai/dsh-sandbox-local")?;
+    // The installed sandbox-local supports runnerCommand, which bypasses
+    // built-in runner selection/probing. Only its unconfigured default is trusted.
+    for (id, name, timeout) in [
+        ("sandbox", "@deepseek-ai/dsh-sandbox-local", false),
+        ("bash-sandbox", "@deepseek-ai/dsh-bash-sandbox", true),
+        ("pwsh-sandbox", "@deepseek-ai/dsh-pwsh-sandbox", false),
+    ] {
+        let e = entry(id, name)?;
+        if e.as_mapping()
+            .unwrap()
+            .keys()
+            .any(|key| !matches!(key.as_str(), Some("id" | "name" | "disabled" | "config")))
+        {
+            return Err(format!("build {id} contains unverified plugin overrides"));
+        }
+        let config = &e["config"];
+        let valid = if config.is_null() {
+            !timeout
+        } else {
+            config.as_mapping().is_some_and(|map| {
+                if timeout {
+                    map.len() == 1 && config["timeoutMs"].as_u64() == Some(60000)
+                } else {
+                    map.is_empty()
+                }
+            })
+        };
+        if !valid {
+            return Err(format!(
+                "build {id} contains unverified executor configuration"
+            ));
+        }
+    }
     let permission = entry("permission", "@deepseek-ai/dsh-permission-presets")?;
     let build = &permission["config"]["presets"]["workspace-write"];
     if build["sandbox"].as_str() != Some("workspace-write")
@@ -672,7 +796,9 @@ mod tests {
             {"id":"sandbox", "name":"@deepseek-ai/dsh-sandbox-local"},
             {"id":"fs-sandbox", "name":"@deepseek-ai/dsh-fs-sandbox"},
             {"id":"acp", "name":"@deepseek-ai/dsh-acp"},
-            {"id":"acp-app-startup", "name":"@deepseek-ai/dsh-acp-app"}
+            {"id":"acp-app-startup", "name":"@deepseek-ai/dsh-acp-app"},
+            {"id":"bash-sandbox", "name":"@deepseek-ai/dsh-bash-sandbox", "disabled":"process.platform === 'win32'", "config":{"timeoutMs":60000}},
+            {"id":"pwsh-sandbox", "name":"@deepseek-ai/dsh-pwsh-sandbox", "disabled":"process.platform !== 'win32'"}
         ]);
         let validate = |v: &Value| {
             validate_build_dump(
@@ -708,6 +834,39 @@ mod tests {
             missing.as_array_mut().unwrap().remove(index);
             assert!(validate(&missing).is_err(), "missing {index}");
         }
+        for (index, key, value) in [
+            (
+                3,
+                "config",
+                serde_json::json!({"runnerCommand":["/bin/sh"],"runnerFailureSignatures":["denied"]}),
+            ),
+            (3, "config", serde_json::json!({"probeTimeoutMs":0})),
+            (
+                7,
+                "config",
+                serde_json::json!({"timeoutMs":60000,"shell":"/bin/sh"}),
+            ),
+            (7, "name", serde_json::json!("@deepseek-ai/dsh-bash-local")),
+            (7, "disabled", serde_json::json!(true)),
+            (8, "disabled", serde_json::json!(false)),
+            (8, "name", serde_json::json!("@deepseek-ai/dsh-pwsh-local")),
+            (3, "inject", serde_json::json!(["unmanaged"])),
+        ] {
+            let mut drifted = baseline.clone();
+            drifted[index][key] = value;
+            assert!(validate(&drifted).is_err(), "{index}.{key}");
+        }
+        for index in [3, 7, 8] {
+            let mut duplicate = baseline.clone();
+            duplicate
+                .as_array_mut()
+                .unwrap()
+                .push(baseline[index].clone());
+            assert!(validate(&duplicate).is_err());
+            let mut missing = baseline.clone();
+            missing.as_array_mut().unwrap().remove(index);
+            assert!(validate(&missing).is_err());
+        }
         let mut duplicate = baseline.clone();
         duplicate.as_array_mut().unwrap().push(baseline[0].clone());
         assert!(validate(&duplicate).is_err());
@@ -727,9 +886,11 @@ mod tests {
 
     #[test]
     fn probe_caps_each_pipe_and_reaps_the_child() {
+        use std::os::unix::process::CommandExt;
         for stream in ["stdout", "stderr"] {
             let script = format!("import sys,time; sys.{stream}.buffer.write(b'x'*131073); sys.{stream}.flush(); time.sleep(60)");
             let mut child = Command::new("python3")
+                .process_group(0)
                 .arg("-c")
                 .arg(script)
                 .stdout(Stdio::piped())
@@ -747,11 +908,13 @@ mod tests {
 
     #[test]
     fn hanging_version_and_open_pipe_probes_time_out_and_reap() {
+        use std::os::unix::process::CommandExt;
         for script in [
             "import time; time.sleep(60)",
             "import os,time; os.close(1); os.close(2); time.sleep(60)",
         ] {
             let mut child = Command::new("python3")
+                .process_group(0)
                 .arg("-c")
                 .arg(script)
                 .arg("--version")
@@ -765,6 +928,62 @@ mod tests {
             assert!(error.contains("timed out"), "{error}");
             assert!(started.elapsed() < Duration::from_secs(3));
             assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_reaps_term_resistant_descendants_with_inherited_pipes() {
+        use std::os::unix::process::CommandExt;
+        for overflow in [false, true] {
+            // Parent exits only after its child installed SIGTERM ignore.
+            // The descendant retains both pipes, with no filesystem fixtures.
+            let script = format!(
+                r#"
+import os,signal,time
+r,w=os.pipe()
+if os.fork()==0:
+    os.close(r)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.write(w,b'ready')
+    os.close(w)
+    {write}
+    time.sleep(60)
+else:
+    os.close(w)
+    os.read(r,5)
+    os._exit(0)
+"#,
+                write = if overflow {
+                    "os.write(2,b'x'*65536)"
+                } else {
+                    "pass"
+                }
+            );
+            let mut child = Command::new("python3")
+                .process_group(0)
+                .arg("-c")
+                .arg(script)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pgid = child.id() as i32;
+            let started = Instant::now();
+            let error =
+                collect_probe(&mut child, started + Duration::from_millis(500), 4096).unwrap_err();
+            assert!(
+                error.contains(if overflow {
+                    "stderr exceeded"
+                } else {
+                    "timed out"
+                }),
+                "{error}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(external_runtime::observe_process_group(pgid)
+                .unwrap()
+                .is_empty());
         }
     }
 
