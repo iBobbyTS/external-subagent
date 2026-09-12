@@ -62,7 +62,7 @@ export function updateInstallation(paths, options = {}) {
     if (payload && version !== verifiedVersion) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${verifiedVersion}`);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
-    const sync = reconcileCodexHomes(paths, options);
+    const sync = options.deferCodexSync ? { homes: [], all_updated: true, deferred: true } : reconcileCodexHomes(paths, options);
     const ok = sync.homes.length === 0 || sync.all_updated;
     state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
     if (ok && candidateRoot) {
