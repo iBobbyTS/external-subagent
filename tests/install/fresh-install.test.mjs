@@ -293,8 +293,8 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     const authProbe = jsonOutput(run(ctx.cli, ['agents', 'probe', 'dsh', '--auth', '--workspace', workspace, '--home', providerHome], { env }), 'DSH auth');
     assert.equal(fs.existsSync(path.join(providerHome, 'probe.jsonl')), false, 'auth-only must not start ACP or prompt');
     const hiProbe = jsonOutput(run(ctx.cli, ['agents', 'probe', 'dsh', '--hi', '--workspace', workspace, '--home', providerHome], { env }), 'DSH hi');
-    assert.equal(hiProbe.hi.state, 'READY');
-    assert.equal(authProbe.auth.state, 'UNKNOWN');
+    assert.equal(hiProbe.evidence.hi.state, 'READY');
+    assert.equal(authProbe.evidence.auth.state, 'UNKNOWN');
     const events = fs.readFileSync(path.join(providerHome, 'probe.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     assert.equal(events[0].kind, 'dump');
     assert.equal(events.filter((event) => event.method === 'session/prompt').length, 1);
