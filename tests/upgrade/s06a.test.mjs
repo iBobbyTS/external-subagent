@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { reconcileInstallation, updateInstallation } from '../../cli/install/update.mjs';
-import { registerCodexHome } from '../../cli/install/reconcile.mjs';
+import { registerCodexHome, reconcileCodexHomes } from '../../cli/install/reconcile.mjs';
 
 function paths(root) {
   return { data: path.join(root, 'data'), home: path.join(root, 'home'), state: path.join(root, 'data', 'install-state.json') };
@@ -39,4 +39,12 @@ test('unregistered homes are never written and repeated update is idempotent', (
   assert.equal(fs.existsSync(path.join(unregistered, 'plugins')), false);
   registerCodexHome(p, path.join(root, 'registered'));
   assert.equal(fs.existsSync(unregistered), true);
+});
+
+test('registered home reconcile reports per-home partial results', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true }); const ok = path.join(root, 'ok'); const bad = path.join(root, 'bad');
+  fs.mkdirSync(ok); fs.mkdirSync(bad); registerCodexHome(p, ok); registerCodexHome(p, bad);
+  const result = reconcileCodexHomes(p, { installer: (_p, o) => { if (path.basename(o.codexHome) === 'bad') throw new Error('boom'); return { digest: 'd' }; } });
+  assert.equal(result.all_updated, false); assert.deepEqual(result.homes.map((x) => x.status), ['updated', 'failed']);
 });
