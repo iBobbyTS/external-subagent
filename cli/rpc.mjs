@@ -75,6 +75,9 @@ function manifest(input) {
 function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
+    case 'drain': return { method: 'daemon_begin_drain' };
+    case 'drain-status': return { method: 'daemon_drain_status' };
+    case 'activate-ready': return { method: 'daemon_activate_ready' };
     case 'agent-probe': return { method: 'agent_probe', params: { input } };
     case 'agent-models': return { method: 'agent_models', params: { input } };
     case 'create': case 'spawn': return {
@@ -156,6 +159,7 @@ function publicResult(result) {
 export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
+    case 'drain': case 'drain-status': case 'activate-ready': return result;
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':
