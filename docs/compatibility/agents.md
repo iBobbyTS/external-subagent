@@ -26,7 +26,7 @@ Lifecycle and diagnostic events received while a command response is still pendi
 
 If a failed terminal event is followed by a generic RPC error or process exit, the cached provider classification wins. An observed `auth_401`, `rate_limit`, `network`, or `policy_violation` is never replaced by a later generic `transport` outcome.
 
-For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`, but this release has no accepted production adapter. Auth and hi remain `UNKNOWN` with `dsh_production_adapter_unavailable`, and `spawn_supported` is always `false`. The S01 fixture is protocol evidence only and is never promoted to live auth or hi evidence.
+For DSH, local discovery may use an explicitly configured `DSH_RUNTIME_PATH`. An auth-only probe is side-effect free and does not send a prompt; because ACP exposes no independent credential check, it remains `UNKNOWN` with `auth_not_probed`. A hi probe runs the accepted ACP initialize/session/prompt sequence and records the resulting hi evidence. Production spawn remains gated by the configured adapter and capability flags; fixture protocol evidence is never promoted to live evidence.
 
 `agent_models` is a separate explicit operation. For DSH it starts only the configured `DSH_RUNTIME_PATH`, uses the bounded S01 JSON-RPC sequence `initialize` → `session/new` → `models/list`, then terminates the process. The result records source `dsh_acp_models_list`, executable version, exact workspace/home scope, check time, and at most 256 opaque model tokens. Tokens are deduplicated by exact string equality; the daemon does not split, normalize, infer, or validate provider-specific token syntax. This discovery operation never changes `spawn_supported`.
 

@@ -230,7 +230,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let mut auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
         let mut hi = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "hi_not_probed");
 
-        if input.agent == "dsh" && input.through != ProbeLayer::Local {
+        if input.agent == "dsh" && input.through == ProbeLayer::Hi {
             let (a, h) = probe_dsh_hi(
                 executable.as_deref(),
                 &scope,
@@ -239,6 +239,11 @@ impl AgentProbeBackend for ProcessProbeBackend {
             );
             auth = a;
             hi = h;
+        } else if input.agent == "dsh" && input.through == ProbeLayer::Auth {
+            // DSH has no independent credential endpoint in the ACP dialect
+            // we support. Auth-only must remain side-effect free: do not
+            // create a session or send a prompt merely to infer auth.
+            auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
         } else if input.agent == "zcode" && input.through != ProbeLayer::Local {
             if local.state != EvidenceState::Ready {
                 auth = derived_failure(&local, scope.clone(), checked_at_ms);
