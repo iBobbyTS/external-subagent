@@ -145,7 +145,8 @@ export function reconcileCodexHomes(paths, options = {}) {
       continue;
     }
     try {
-      const install = installPlugin(paths, { ...options, codexHome: entry.home });
+      const installer = options.installer || installPlugin;
+      const install = installer(paths, { ...options, codexHome: entry.home });
       entry.last_status = 'updated';
       entry.last_sync_ms = Date.now();
       if (install.digest) entry.digest = install.digest;
