@@ -937,7 +937,7 @@ mod tests {
     fn closed_gate_refuses_dsh_spawn_without_touching_any_process() {
         let workspace = dsh_workspace();
         let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
-        let agent_id = enqueue_dsh(&scheduler, workspace.path(), None);
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
         let error = scheduler.start_ready().unwrap_err();
         match &error {
             SchedulerError::RuntimeSpawn { message, .. } => {
@@ -1248,4 +1248,42 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert_eq!(scheduler.cancel_task(&agent_id).unwrap(), TaskPhase::Terminal);
         assert_eq!(await_terminal_task(&scheduler, &agent_id).phase, TaskPhase::Terminal);
     }
+
+    #[test]
+    fn dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result() {
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        let script = format!(
+            "{BOOTSTRAP_PREFIX}printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"stopReason\":\"cancelled\"}}}}'\\nsleep 1\\n"
+        ).replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+        let _request = await_pending_permission(&scheduler, &agent_id);
+        let phase = scheduler.cancel_task(&agent_id).expect("cancel active task");
+        assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::Cancelled);
+        assert!(stored.result.partial);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() != 0 {
+            assert!(Instant::now() < deadline, "runtime was not reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let frames = wait_for_frames(workspace.path(), 5);
+        assert!(request_methods(&frames).contains(&"session/prompt"));
+        assert!(request_methods(&frames).contains(&"session/cancel"));
+        assert_eq!(
+            frames.iter().filter(|frame| frame.get("method").and_then(|v| v.as_str()) == Some("session/cancel")).count(),
+            1
+        );
+        assert!(scheduler.store().task_result(&agent_id).unwrap().is_some());
+    }
+
 }
