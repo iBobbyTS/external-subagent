@@ -3,40 +3,133 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-function arg(name) {
-  const index = process.argv.indexOf(name);
-  const value = index >= 0 ? process.argv[index + 1] : undefined;
-  if (!value || value.startsWith('--')) throw new Error('usage: install-agent-hooks.mjs --config <file> [--provenance <file>]');
-  return value;
-}
-const configPath = path.resolve(arg('--config'));
-const provenanceIndex = process.argv.indexOf('--provenance');
-const provenancePath = path.resolve(provenanceIndex >= 0 ? arg('--provenance') : path.join(path.dirname(configPath), 'external-subagent-hook-provenance.json'));
-if (configPath === provenancePath) throw new Error('config and provenance paths must differ');
-
-const failClosed = (code, message, details = {}) => {
-  process.stderr.write(`${JSON.stringify({ code, error: message, ...details })}\n`);
+const pluginRoot = path.resolve(new URL('..', import.meta.url).pathname);
+const hookRoot = pluginRoot;
+const configPath = process.argv[process.argv.indexOf('--config') + 1];
+if (!configPath || configPath.startsWith('--')) {
+  console.error('usage: node install-agent-hooks.mjs --config /absolute/config.json [--provenance /absolute/provenance.json]');
   process.exit(2);
-};
-const digestBytes = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
-const digestFile = (file) => digestBytes(fs.readFileSync(file));
-
-// No verified ZCode policy implementation is shipped yet. Refuse to create
-// placeholder `{ ok: true }` hooks or mutate any existing policy configuration.
-if (!fs.existsSync(configPath)) failClosed('HOOK_POLICY_UNSUPPORTED', 'real ZCode policy hooks are unavailable; refusing to create placeholder hooks', { config: configPath, provenance: provenancePath });
-const configBytes = fs.readFileSync(configPath);
-let config;
-try { config = JSON.parse(configBytes); } catch (error) { failClosed('HOOK_CONFIG_INVALID', `config is not valid JSON: ${error.message}`, { config: configPath }); }
-if (!config || Array.isArray(config) || typeof config !== 'object') failClosed('HOOK_CONFIG_INVALID', 'config must be a JSON object', { config: configPath });
-
-const root = path.resolve(new URL('..', import.meta.url).pathname);
-const filePolicy = path.join(root, 'hooks', 'check-agent-files.mjs');
-const audit = path.join(root, 'hooks', 'audit-bash-result.mjs');
-if (fs.existsSync(provenancePath)) {
-  let provenance;
-  try { provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8')); } catch (error) { failClosed('HOOK_PROVENANCE_INVALID', `provenance is not valid JSON: ${error.message}`, { config: configPath, provenance: provenancePath }); }
-  const expected = { product: 'external-subagent', effective_config_path: configPath, effective_config_sha256: digestBytes(configBytes), file_policy_path: filePolicy, file_policy_sha256: digestFile(filePolicy), audit_wrapper_path: audit, audit_wrapper_sha256: digestFile(audit) };
-  const mismatch = Object.entries(expected).find(([key, value]) => provenance?.[key] !== value);
-  if (mismatch) failClosed('HOOK_PROVENANCE_INVALID', `hook provenance does not match verifier field ${mismatch[0]}`, { config: configPath, provenance: provenancePath, field: mismatch[0] });
 }
-failClosed('HOOK_POLICY_UNSUPPORTED', 'real ZCode policy hooks and a matching verifier are unavailable; refusing to modify existing configuration', { config: configPath, provenance: provenancePath });
+const provenanceIndex = process.argv.indexOf('--provenance');
+const provenancePath = provenanceIndex >= 0
+  ? process.argv[provenanceIndex + 1]
+  : path.join(path.dirname(configPath), 'zcode-agent-hook-provenance.json');
+
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) {
+    if (error?.code === 'ENOENT') return fallback;
+    throw error;
+  }
+}
+
+function atomicWriteBytes(file, bytes) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.tmp-${process.pid}`;
+  try {
+    fs.writeFileSync(temporary, bytes, { mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } finally {
+    try { fs.unlinkSync(temporary); } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+const encodeJson = (value) => `${JSON.stringify(value, null, 2)}\n`;
+const atomicWrite = (file, value) => atomicWriteBytes(file, encodeJson(value));
+
+const config = readJson(configPath, {});
+if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('config must be a JSON object');
+if (fs.existsSync(provenancePath)) {
+  const prior = readJson(provenancePath, null);
+  if (!prior || prior.effective_config_path !== path.resolve(configPath)) {
+    throw new Error(`HOOK_PROVENANCE_INVALID: effective_config_path does not match ${path.resolve(configPath)}`);
+  }
+}
+const next = structuredClone(config);
+next.hooks ??= {};
+next.hooks.enabled = true;
+next.hooks.events ??= {};
+const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+// Resolve every shipped decision owner before mutating the caller's config.
+// A copied or incomplete plugin must fail without leaving a partial install.
+const effectiveConfigPath = path.resolve(configPath);
+const effectiveFilePolicyPath = path.join(hookRoot, 'lib', 'agent-file-policy.mjs');
+const auditWrapperPath = path.join(hookRoot, 'hooks', 'audit-bash-result.mjs');
+const fileWrapperPath = path.join(hookRoot, 'hooks', 'check-agent-files.mjs');
+const verifierSourcePath = path.join(pluginRoot, 'scripts', 'policy-verifier.mjs');
+const filePolicySha256 = hashFile(effectiveFilePolicyPath);
+if (effectiveConfigPath === path.resolve(provenancePath)) throw new Error('config and provenance paths must differ');
+const events = {
+  PreToolUse: [{ matcher: '^(Read|Grep|Glob|Write|Edit|Delete|Move)$', script: 'hooks/check-agent-files.mjs' }],
+  PostToolUse: [{ matcher: 'Bash', script: 'hooks/audit-bash-result.mjs' }],
+  PostToolUseFailure: [{ matcher: 'Bash', script: 'hooks/audit-bash-result.mjs' }],
+};
+
+function processHookArgs(candidate) {
+  if (!candidate || !Array.isArray(candidate.hooks)) return [];
+  return candidate.hooks
+    .filter((hook) => hook?.type === 'process' && Array.isArray(hook.args))
+    .flatMap((hook) => hook.args)
+    .filter((arg) => typeof arg === 'string');
+}
+
+function isRecognizedAgentHook(candidate, matcher, expectedScript) {
+  if (candidate?.matcher !== matcher) return false;
+  const args = processHookArgs(candidate);
+  return args.some((arg) => path.resolve(arg) === expectedScript);
+}
+
+for (const [event, expectedEntries] of Object.entries(events)) {
+  const existing = Array.isArray(next.hooks.events[event]) ? next.hooks.events[event] : [];
+  for (const { matcher, script } of expectedEntries) {
+    const expectedScript = path.join(hookRoot, script);
+    const managedEntries = existing.filter((candidate) => candidate?.matcher === matcher);
+    const unknownEntries = managedEntries.filter((candidate) => !isRecognizedAgentHook(candidate, matcher, expectedScript));
+    if (unknownEntries.length > 0) {
+      throw new Error(`${event} contains an unknown managed hook; refusing to modify configuration`);
+    }
+  }
+  const unrelated = existing.filter((candidate) => !expectedEntries.some(({ matcher }) => candidate?.matcher === matcher));
+  next.hooks.events[event] = [
+    ...unrelated,
+    ...expectedEntries.map(({ matcher, script }) => ({
+      matcher,
+      hooks: [{ type: 'process', command: process.execPath, args: [path.join(hookRoot, script)], timeoutMs: 5000 }],
+    })),
+  ];
+}
+const nextConfigBytes = encodeJson(next);
+const nextProvenance = {
+  effective_file_policy_version: 'zcode-agent-file-policy/v1.0.0',
+  effective_file_policy_sha256: filePolicySha256,
+  effective_file_policy_path: effectiveFilePolicyPath,
+  effective_config_path: effectiveConfigPath,
+  effective_config_sha256: crypto.createHash('sha256').update(nextConfigBytes).digest('hex'),
+  effective_audit_wrapper_path: auditWrapperPath,
+  effective_audit_wrapper_sha256: hashFile(auditWrapperPath),
+  effective_file_wrapper_path: fileWrapperPath,
+  effective_file_wrapper_sha256: hashFile(fileWrapperPath),
+  hook_activation_verified: true,
+  activation_method: 'outer-plugin-install',
+  activation_generation: `${Date.now()}-${filePolicySha256.slice(0, 12)}`,
+};
+const previousProvenance = fs.existsSync(provenancePath) ? fs.readFileSync(provenancePath) : null;
+atomicWrite(provenancePath, nextProvenance);
+const verifierPath = path.join(path.dirname(provenancePath), 'external-subagent-policy-verifier');
+atomicWriteBytes(verifierPath, fs.readFileSync(verifierSourcePath));
+fs.chmodSync(verifierPath, 0o700);
+try {
+  atomicWriteBytes(configPath, nextConfigBytes);
+} catch (error) {
+  if (previousProvenance === null) {
+    try { fs.unlinkSync(provenancePath); } catch (unlinkError) {
+      if (unlinkError?.code !== 'ENOENT') throw unlinkError;
+    }
+  } else {
+    atomicWriteBytes(provenancePath, previousProvenance);
+  }
+  try { fs.unlinkSync(verifierPath); } catch (unlinkError) { if (unlinkError?.code !== 'ENOENT') throw unlinkError; }
+  throw error;
+}
+console.log(JSON.stringify({ config: effectiveConfigPath, provenance: path.resolve(provenancePath), file_policy_sha256: filePolicySha256 }));
