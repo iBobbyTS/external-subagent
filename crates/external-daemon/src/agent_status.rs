@@ -188,6 +188,10 @@ impl AgentProbeBackend for ProcessProbeBackend {
     fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
         let checked_at_ms = wall_now_millis();
         let mut scope = input.scope.clone();
+        if scope.home.is_none() {
+            scope.home =
+                env::var_os("ZCODE_HOME").map(|value| value.to_string_lossy().into_owned());
+        }
         let disposable_workspace = if input.agent == "zcode"
             && input.through == ProbeLayer::Hi
             && scope.workspace.is_none()
@@ -919,11 +923,14 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
         .args([
             "--workspace",
             workspace,
+            "--home",
+            home,
             "--permission-mode",
             "plan",
             "--write-manifest",
             "[]",
         ])
+        .env("ZCODE_HOME", home)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     #[cfg(unix)]
@@ -1573,7 +1580,7 @@ process.stdin.on('data', (chunk) => {
         let verifier = directory.path().join("external-subagent-policy-verifier");
         fs::write(
             &verifier,
-            b"#!/bin/sh\n[ \"$1\" = \"--workspace\" ] && [ -d \"$2\" ] && [ \"$3\" = \"--permission-mode\" ] && [ \"$4\" = \"plan\" ] && [ \"$5\" = \"--write-manifest\" ] && [ \"$6\" = \"[]\" ]\n",
+            b"#!/bin/sh\n[ \"$1\" = \"--workspace\" ] && [ -d \"$2\" ] && [ \"$3\" = \"--home\" ] && [ -d \"$4\" ] && [ \"$5\" = \"--permission-mode\" ] && [ \"$6\" = \"plan\" ] && [ \"$7\" = \"--write-manifest\" ] && [ \"$8\" = \"[]\" ]\n",
         )
         .unwrap();
         {

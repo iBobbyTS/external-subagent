@@ -157,7 +157,7 @@ export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
-    case 'agent-models': return result;
+    case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':
       return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, phase: result.task.phase };
     case 'wait': {
