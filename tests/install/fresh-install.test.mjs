@@ -299,8 +299,8 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     assert.equal(events[0].kind, 'dump');
     assert.equal(events.filter((event) => event.method === 'session/prompt').length, 1);
     for (const event of events.filter((event) => event.kind)) {
-      assert.equal(event.cwd, workspace);
-      assert.equal(event.home, providerHome);
+      assert.equal(fs.realpathSync(event.cwd), fs.realpathSync(workspace));
+      assert.equal(fs.realpathSync(event.home), fs.realpathSync(providerHome));
       assert.equal(event.mode, 'read-only');
       assert.equal(fs.existsSync(event.patch), false, 'probe patch must be reaped');
       assert.equal(event.patch.startsWith(repoRoot), false);
