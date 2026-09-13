@@ -13,6 +13,7 @@
 // here and remain acceptance-gated outside this file.
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -211,6 +212,21 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
   assert.deepEqual(registry.homes.map((entry) => entry.home), [fs.realpathSync(path.join(home, '.codex'))], 'init claims exactly the configured codex home');
   assert.equal(registry.homes[0].version, report.payload.version);
 
+  // B-3: init itself publishes the active/retention baseline, so the standard
+  // `npm A -> init A -> use A -> npm B` sequence never depends on an extra
+  // "A update" the user was never told to run.
+  const stateFile = path.join(data, 'install-state.json');
+  const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(state.schema_version, 2, 'a successful verified init publishes the activation state');
+  assert.equal(state.active.version, report.payload.version);
+  const manifest = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
+  const daemonSha = manifest.files.find((file) => file.name === 'external-subagentd').sha256;
+  assert.equal(state.active.daemon_entry_sha256, daemonSha);
+  const retained = path.join(data, 'payload-store', report.payload.version, 'external-subagentd');
+  assert.ok(fs.existsSync(retained), 'init retains the verified daemon bytes outside the npm tree');
+  assert.equal(crypto.createHash('sha256').update(fs.readFileSync(retained)).digest('hex'), daemonSha, 'retained bytes match the verified digest');
+  assert.equal(fs.existsSync(`${stateFile}.activation.json`), false, 'init never claims an activation receipt');
+
   for (const profile of ['.zshrc', '.zprofile', '.bash_profile', '.bashrc']) {
     assert.equal(fs.existsSync(path.join(home, profile)), false, 'init must never edit shell profiles');
   }
@@ -219,6 +235,9 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
   assert.equal(again.ok, true);
   const registryAfter = JSON.parse(fs.readFileSync(path.join(data, 'codex-homes.json'), 'utf8'));
   assert.equal(registryAfter.homes.length, 1, 'repeat init stays idempotent in the D08 registry');
+  const stateAfter = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.equal(stateAfter.active.version, report.payload.version, 'repeat init reaffirms the same baseline');
+  assert.equal(stateAfter.active.daemon_entry_sha256, daemonSha);
   const marketplace = JSON.parse(fs.readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
   assert.equal(marketplace.plugins.filter((entry) => entry.name === 'external-subagent').length, 1);
 });

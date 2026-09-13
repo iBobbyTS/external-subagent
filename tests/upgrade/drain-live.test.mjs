@@ -6,9 +6,10 @@
 // installed prefix through the real upgrade with a REAL task in flight:
 //
 //   1. vA installs stage-only (--ignore-scripts: no lifecycle hook fires);
-//      an explicit update publishes the vA identity; the faithful launchctl
-//      seam loads the REAL plist — spawning the REAL vA daemon binary with
-//      the plist's own argv and environment.
+//      an explicit init publishes the vA active/retention baseline itself
+//      (B-3: no hidden extra "A update"); the faithful launchctl seam loads
+//      the REAL plist — spawning the REAL vA daemon binary with the plist's
+//      own argv and environment.
 //   2. Two REAL upstream tasks run on the vA daemon: a ZCode build task that
 //      must stop on a pending permission request, and a long DSH task.
 //   3. The vB tarball is npm-installed into the SAME prefix while the vA
@@ -388,9 +389,15 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     const initReport = JSON.parse(init.stdout);
     assert.equal(initReport.ok, true);
     assert.equal(initReport.service.skipped, true, 'fixtures neutralize launchd through the documented seam');
+    // B-3: init publishes the vA active/retention baseline itself — the live
+    // standard sequence is `npm A -> init A -> use A -> npm B` with no hidden
+    // extra "A update" between init and first use.
     const installedState = readState();
-    assert.equal(installedState.schema_version, 1, 'a plain install plus init stays stage-only');
-    assert.equal(installedState.active, undefined);
+    assert.equal(installedState.schema_version, 2, 'init publishes the activation baseline');
+    assert.equal(installedState.candidate, null);
+    assert.equal(installedState.active.version, VERSION_A);
+    assert.equal(installedState.active.daemon_entry_sha256, shaA, 'the baseline daemon digest is the verified vA payload digest');
+    assert.ok(fs.existsSync(path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd')), 'init retains the verified vA bytes before any update runs');
 
     // Dual-provider daemon configuration through the product config owner,
     // then re-render the plist so the service env matches production shape.
@@ -403,14 +410,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
       },
     });
 
-    // ---- publish the vA identity, then load the REAL vA service
-    const va = runDriver('va');
-    assert.equal(va.ok, true, `vA update failed: ${va.message}`);
-    assert.equal(va.result.phase, 'active');
-    assert.equal(va.result.active.version, VERSION_A);
-    assert.equal(va.result.active.daemon_entry_sha256, shaA);
-    assert.equal(readState().active.version, VERSION_A);
-
+    // ---- load the REAL vA service straight from the init-published baseline
     const up = runDriver('service-up', [], { mode: 'service-up', timeout: 120_000 });
     assert.equal(up.ok, true, `service-up failed: ${up.message}`);
     assert.equal(up.service.version, VERSION_A, 'the running service self-reports vA');

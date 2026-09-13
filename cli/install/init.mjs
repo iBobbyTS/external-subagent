@@ -11,6 +11,7 @@ import { verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
 import { packageRoot } from './layout.mjs';
 import { registerCodexHome } from './reconcile.mjs';
+import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackCodexArtifacts, rollbackFiles, snapshotFile } from './recovery.mjs';
 import { bootstrapService, installLaunchAgent } from './service-macos.mjs';
 
@@ -27,6 +28,14 @@ import { bootstrapService, installLaunchAgent } from './service-macos.mjs';
 //   start-service      launchctl bootstrap (best-effort, reported)
 //   install-codex-plugin managed staging + official codex add
 //   claim-codex-home   D08 registry claim after a successful binding
+//   publish-active-payload  the verified active identity and retained bytes
+//                      (B-3): a successful init establishes the version and
+//                      retention baseline itself, so the standard `npm A ->
+//                      init A -> use A -> npm B` sequence never depends on an
+//                      extra "A update" the user was never told to run.  The
+//                      publication reuses the existing locked update owner —
+//                      no second lifecycle or scheduler — and only runs when
+//                      this init verified the payload it installed.
 // Failures roll tracked files back through recovery.mjs, including the
 // product-owned Codex artifacts (staging tree, marketplace manifest, and
 // directories this run created) — the official codex cache is never rolled
@@ -50,8 +59,9 @@ export function installPlan(paths, options = {}) {
     { id: 'start-service', action: 'bootstrap the daemon service', path: paths.launchAgent, label: 'com.external-subagent.daemon' },
     { id: 'install-codex-plugin', action: 'stage and register the managed Codex plugin', path: path.join(paths.home, 'plugins', 'external-subagent') },
     { id: 'claim-codex-home', action: 'register the claimed Codex home', path: path.join(paths.data, 'codex-homes.json') },
+    { id: 'publish-active-payload', action: 'publish the verified active payload and retained-byte baseline', path: paths.state },
   ];
-  if (options.installHooks) plan.push({ id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });
+  if (options.installHooks) plan.splice(plan.findIndex((step) => step.id === 'publish-active-payload'), 0, { id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });
   return plan;
 }
 
@@ -100,6 +110,7 @@ export function runInit(options = {}) {
   };
 
   let service = { action: 'bootstrap', skipped: true, reason: 'not attempted' };
+  let baseline = null;
   const codexHome = codexHomeFor({ codexHome: options.codexHome }, paths);
   // Product-owned Codex artifacts the init may create, snapshotted before any
   // step runs so a later failure can restore them (see rollbackCodexArtifacts).
@@ -171,6 +182,29 @@ export function runInit(options = {}) {
       installHooks(paths);
       mark('install-hooks');
     }
+    // The baseline publication runs LAST and only for an init that verified
+    // the payload it installed (a skipped probe — test harnesses only —
+    // leaves the resume journal as the sole state).  It reuses the locked
+    // update owner, so the active identity and retained bytes are published
+    // under the exact verification/retention rules every later update
+    // follows; the Codex homes were just bound by this init's own steps, so
+    // the update's home sync is deferred to the next reconcile.  The step is
+    // recorded in the in-memory report only — writing the schema-1 journal
+    // here would clobber the schema-2 activation state it just published.
+    if (payload.status === 'verified') {
+      const published = updateInstallation(paths, { deferCodexSync: true });
+      if (published.phase !== 'active' || !published.active) {
+        throw new CliError('INIT_BASELINE_FAILED', `activation baseline publication did not complete (phase=${published.phase ?? 'none'})`);
+      }
+      completed.add('publish-active-payload');
+      baseline = {
+        version: published.active.version,
+        entry_sha256: published.active.entry_sha256,
+        daemon_entry: published.active.daemon_entry,
+        daemon_entry_sha256: published.active.daemon_entry_sha256,
+        retained_root: published.active.retained?.root ?? null,
+      };
+    }
   } catch (error) {
     const rollbackErrors = [
       ...rollbackFiles(tracked),
@@ -186,6 +220,7 @@ export function runInit(options = {}) {
     completed: [...completed],
     runtime: ZCODE_RUNTIME,
     payload,
+    baseline,
     path_report: pathFindings,
     service,
     codex,

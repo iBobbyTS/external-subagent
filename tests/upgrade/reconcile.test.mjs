@@ -3,13 +3,13 @@
 // packed from this repository; vB is packed from a temporary copy whose
 // package/CLI/daemon-crate versions are bumped and whose native payload is
 // rebuilt, so the daemon artifact genuinely changes bytes.  vA installs into a
-// throwaway npm prefix, an explicit `init` stages the service and claims the
-// Codex home, and the installed tree's own updateCommand establishes the vA
-// active identity.  Installing vB into the SAME prefix and running the public
-// update must republish active with vB's version and verified daemon artifact,
-// hand that verified identity to service activation, and leave the retired vA
-// identity unavailable; a failed activation must preserve the published active
-// byte-for-byte.
+// throwaway npm prefix, an explicit `init` stages the service, claims the
+// Codex home, and publishes the vA active/retention baseline itself (B-3:
+// `npm A -> init A -> use A -> npm B` with no hidden extra A update).  Installing
+// vB into the SAME prefix and running the public update must republish active
+// with vB's version and verified daemon artifact, hand that verified identity
+// to service activation, and leave the retired vA identity unavailable; a
+// failed activation must preserve the published active byte-for-byte.
 //
 // The core defect this file pins: active.entry is the npm bin SHIM
 // (bin/external-subagent.mjs) while the LaunchAgent runs the NATIVE daemon
@@ -408,36 +408,48 @@ async function doInstallVersionB() {
   ctx.shaB = installedDaemonSha();
 }
 
-test('vA tarball installs stage-only and an explicit update publishes the verified vA identity', { skip: !testable }, async () => {
+test('vA tarball installs stage-only; init publishes the verified vA active/retention baseline', { skip: !testable }, async () => {
   await ensureR2();
   assertInstalledPayload(VERSION_A);
   assert.equal(run(ctx.cli, ['version'], { env: childEnv() }).stdout.trim(), VERSION_A, 'the installed vA CLI reports its own version');
 
   const report = ctx.initReport;
-  for (const step of ['verify-payload', 'install-launch-agent', 'install-codex-plugin', 'claim-codex-home']) {
+  for (const step of ['verify-payload', 'install-launch-agent', 'install-codex-plugin', 'claim-codex-home', 'publish-active-payload']) {
     assert.ok(report.completed.includes(step), `init must complete ${step}`);
   }
   assert.equal(report.service.skipped, true, 'fixtures neutralize launchd through the documented seam');
   assert.equal(report.payload.status, 'verified');
   assert.equal(report.payload.version, VERSION_A);
+  assert.equal(report.baseline.version, VERSION_A);
+  assert.equal(report.baseline.daemon_entry_sha256, ctx.shaA, 'the report carries the verified baseline identity');
 
+  // B-3: the baseline comes from init alone.  The standard public sequence is
+  // `npm A -> init A -> use A -> npm B`; no extra "A update" that a real user
+  // never runs may be a prerequisite for the first upgrade.
   const state = readState();
-  assert.equal(state.schema_version, 1, 'a plain install plus init stays stage-only');
-  assert.equal(state.active, undefined);
-  assert.equal(state.candidate, undefined);
+  assert.equal(state.schema_version, 2, 'a successful verified init publishes the activation state itself');
+  assert.equal(state.candidate, null);
+  assert.equal(state.active.version, VERSION_A);
+  assert.equal(state.active.daemon_entry, daemonEntry(), 'active must publish the daemon payload artifact, not the npm bin shim');
+  assert.equal(state.active.daemon_entry_sha256, ctx.shaA, 'the published daemon digest is the verified vA payload digest');
+  assert.equal(state.active.entry, binEntry());
+  const retainedA = path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd');
+  assert.ok(fs.existsSync(retainedA), 'init retains the verified vA daemon bytes outside the npm-replaced tree');
+  assert.equal(sha256(fs.readFileSync(retainedA)), ctx.shaA, 'the retained bytes match the verified vA digest');
   assert.equal(fs.existsSync(`${paths().state}.activation.json`), false, 'init never claims an activation receipt');
   assert.ok(fs.readFileSync(paths().launchAgent, 'utf8').includes(daemonEntry()), 'the LaunchAgent pins the installed daemon artifact path');
   const registry = JSON.parse(fs.readFileSync(path.join(paths().data, 'codex-homes.json'), 'utf8'));
   assert.equal(registry.homes.length, 1);
   assert.equal(registry.homes[0].version, VERSION_A);
 
+  // An explicit update on the SAME version is a reaffirm through the public
+  // command, never a hidden prerequisite of the baseline.
   const va = runDriver('va');
-  assert.equal(va.ok, true, `vA update failed: ${va.message}`);
+  assert.equal(va.ok, true, `vA reaffirm failed: ${va.message}`);
   assert.equal(va.result.phase, 'active');
   assert.equal(va.result.active.version, VERSION_A);
-  assert.equal(va.result.active.daemon_entry, daemonEntry(), 'active must publish the daemon payload artifact, not the npm bin shim');
-  assert.equal(va.result.active.daemon_entry_sha256, ctx.shaA, 'the published daemon digest is the verified vA payload digest');
-  assert.equal(va.result.active.entry, binEntry());
+  assert.equal(va.result.active.daemon_entry, daemonEntry());
+  assert.equal(va.result.active.daemon_entry_sha256, ctx.shaA);
   const afterVa = readState();
   assert.equal(afterVa.candidate, null);
   assert.equal(afterVa.active.version, VERSION_A);
