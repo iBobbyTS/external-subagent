@@ -33,6 +33,15 @@ test('stale install lock is recovered with evidence from dead pid', () => {
   assert.equal(fs.existsSync(path.join(p.data, 'install.lock')), false);
 });
 
+test('malformed install lock is recovered by updateInstallation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  fs.writeFileSync(path.join(p.data, 'install.lock'), 'not-a-lock-document');
+  const result = updateInstallation(p, { version: packageVersion() });
+  assert.equal(result.phase, 'active');
+  assert.equal(fs.existsSync(path.join(p.data, 'install.lock')), false);
+});
+
 test('upgrade rejects unavailable payload versions before publishing active state', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-'));
   const p = paths(root);
@@ -123,6 +132,50 @@ test('partial update is recorded as failed receipt and never reports success', a
   await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'partial' }) }), /did not activate/);
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.equal(receipt.status, 'failed');
+  assert.equal(receipt.retryable, true);
+});
+
+test('update result without an active phase is never recorded as success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'phaseless' } : { ready_for_activation: true };
+  await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: async () => ({}) }), /did not activate payload \(phase=none\)/);
+  const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+  assert.equal(receipt.status, 'failed');
+  assert.equal(receipt.retryable, true);
+});
+
+test('failed activation receipt stays retryable for the same claim', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  let attempts = 0;
+  const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'retry-1' } : { ready_for_activation: true };
+  const updater = async () => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('boom');
+    return { phase: 'active', active: { version: '1.0.0' } };
+  };
+  await assert.rejects(() => updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, updateInstallation: updater }), /boom/);
+  const failed = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+  assert.equal(failed.claim, 'retry-1');
+  assert.equal(failed.version, '1.0.0');
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.retryable, true);
+  const result = await updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, updateInstallation: updater });
+  assert.equal(result.phase, 'active');
+  assert.equal(attempts, 2);
+  const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+  assert.equal(receipt.claim, 'retry-1');
+  assert.equal(receipt.status, 'success');
+});
+
+test('update command recovers a stale install lock through the real updater', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
+  fs.writeFileSync(path.join(p.data, 'install.lock'), 'not-a-lock-document');
+  const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'lock-1' } : { ready_for_activation: true };
+  const result = await updateCommand(p, [], { callDaemon: rpc });
+  assert.equal(result.phase, 'active');
+  assert.equal(fs.existsSync(path.join(p.data, 'install.lock')), false);
+  const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+  assert.equal(receipt.status, 'success');
 });
 
 test('service activation failure restores prior state and records rollback evidence', async () => {

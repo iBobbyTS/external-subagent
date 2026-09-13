@@ -41,8 +41,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     result = args.includes('reconcile')
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceInstalled && !daemon.skipServiceActivation });
-    if (result?.phase && result.phase !== 'active') {
-      throw new Error(`installation update did not activate payload (phase=${result.phase})`);
+    if (!result || typeof result !== 'object' || result.phase !== 'active') {
+      throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }
     if (result?.active?.entry && serviceInstalled && !daemon.skipServiceActivation) {
       const activate = daemon.activateService || activateService;
@@ -58,6 +58,11 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
     return result;
   } catch (error) {
+    // Snapshot what the updater recorded before rollback replaces it, so the
+    // receipt keeps the candidate and active evidence the retry will need.
+    const failedInstall = (() => {
+      try { return JSON.parse(fs.readFileSync(paths.state, 'utf8')); } catch { return null; }
+    })();
     let rollback = { attempted: false, restored: false };
     if (priorStateBytes && paths.state) {
       rollback.attempted = true;
@@ -81,7 +86,11 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       rollback.service = error.rollback;
       rollback.service_restored = Boolean(error.rollback.pid && error.rollback.artifact);
     }
-    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: requestedVersion, status: 'failed', error: error.message, rollback }));
+    const receipt = { claim: activation.activation_claim, version: requestedVersion, status: 'failed', retryable: true, error: error.message, rollback };
+    if (failedInstall && typeof failedInstall === 'object' && failedInstall.phase) {
+      receipt.install_state = { phase: failedInstall.phase, candidate: failedInstall.candidate ?? null, active: failedInstall.active ?? null };
+    }
+    atomicWrite(receiptPath(paths), jsonBytes(receipt));
     throw error;
   }
 }
