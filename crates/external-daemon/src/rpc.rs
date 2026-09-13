@@ -3447,6 +3447,9 @@ mod admission_tests {
         );
         config.agents.get_mut("dsh").unwrap().enabled = true;
         config.agents.get_mut("dsh").unwrap().spawn_supported = true;
+        config.agents.get_mut("dsh").unwrap().profile = Some("acp".into());
+        config.agents.get_mut("dsh").unwrap().version =
+            Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into());
         input.model = Some("opaque-token".into());
         let env_guard = static_env_guard().lock().unwrap();
         let previous_runtime = env::var_os("DSH_RUNTIME_PATH");
@@ -3456,7 +3459,16 @@ mod admission_tests {
             RpcErrorCode::AgentUnsupported
         );
         let runtime = tempfile::NamedTempFile::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = runtime.as_file().metadata().unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(runtime.path(), permissions).unwrap();
+        }
         env::set_var("DSH_RUNTIME_PATH", runtime.path());
+        config.agents.get_mut("dsh").unwrap().runtime_path =
+            Some(runtime.path().to_string_lossy().into_owned());
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
         assert_eq!(identity.model.as_deref(), Some("opaque-token"));
