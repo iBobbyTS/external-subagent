@@ -593,14 +593,20 @@ test('the retired vA version is rejected without touching the published vB activ
   await ensureR2();
   await ensureVersionB();
   const stateBytes = fs.readFileSync(paths().state);
+  const receiptBytes = fs.readFileSync(`${paths().state}.activation.json`);
   const old = runDriver('old', [`--version=${VERSION_A}`]);
   assert.equal(old.ok, false);
   assert.equal(old.code, 'PAYLOAD_VERSION_UNAVAILABLE', 'the replaced tarball version can never be re-activated');
   assert.deepEqual(fs.readFileSync(paths().state), stateBytes, 'a rejected version probe leaves the published active untouched');
+  // The rejection happens in the coordinator's pre-drain preflight, so the
+  // running daemon was never drained and no claim was ever issued: the
+  // previous activation receipt must survive byte-for-byte as the retry
+  // idempotency evidence.
+  assert.deepEqual(fs.readFileSync(`${paths().state}.activation.json`), receiptBytes, 'a pre-drain rejection writes no receipt');
   const state = readState();
   assert.equal(state.active.version, VERSION_B);
   assert.equal(sha256(fs.readFileSync(daemonEntry())), ctx.shaB, 'the active daemon artifact on disk still matches the verified digest');
   const receipt = readReceipt();
-  assert.equal(receipt.status, 'failed');
-  assert.equal(receipt.retryable, true);
+  assert.equal(receipt.status, 'success');
+  assert.match(receipt.claim, /^agentd-\d+-activation$/);
 });

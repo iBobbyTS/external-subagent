@@ -1882,6 +1882,193 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
     }
 
     #[test]
+    fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() {
+        use crate::rpc::{
+            MessageInput, RpcError, RpcErrorCode, RpcMethod, RpcOutcome, RpcService, RpcSuccess,
+            TaskWaitQuery,
+        };
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // This child parks on a pending permission request, exactly like a
+        // live DSH task an update would drain around.
+        let child = scripted_child(
+            workspace.path(),
+            &BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        );
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let request = await_pending_permission(&scheduler, &agent_id);
+        let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
+        let began = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": crate::rpc::RPC_VERSION, "request_id": "passive-drain",
+                "method": "daemon_begin_drain"
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(began.outcome, RpcOutcome::Success { .. }));
+
+        // During the drain: the existing provider session still answers and a
+        // new spawn is refused by the one admission owner.
+        service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                after_revision: 0,
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap();
+        let fresh = dsh_workspace();
+        assert!(matches!(
+            scheduler.enqueue_general_with_admission(
+                &manifest_for(fresh.path(), "spawn during drain"),
+                Some(dsh_admission(Some("fixture-model")))
+            ),
+            Err(SchedulerError::InvalidConfig(ref message)) if message == "daemon_draining"
+        ));
+
+        // The failed update recovers through the wire: abort reopens
+        // admission without a second scheduler and without touching the
+        // drained task's facts.
+        let aborted = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": crate::rpc::RPC_VERSION, "request_id": "abort-drain",
+                "method": "daemon_abort_drain"
+            }))
+            .unwrap(),
+        );
+        let RpcOutcome::Success { result } = aborted.outcome else {
+            panic!("abort drain failed")
+        };
+        assert!(matches!(
+            *result,
+            RpcSuccess::DaemonDrainStatus {
+                is_draining: false,
+                ready_for_activation: false,
+                ..
+            }
+        ));
+        let readmitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(fresh.path(), "spawn after the aborted drain"),
+                Some(dsh_admission(Some("fixture-model"))),
+            )
+            .unwrap();
+        assert_eq!(readmitted.task.phase, TaskPhase::Queued);
+
+        // The drained task keeps its evidence: still answerable over RPC,
+        // with its pending permission intact and nothing reaped underneath
+        // the recovery.
+        let RpcSuccess::TaskWait { task, .. } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                after_revision: 0,
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap()
+        else {
+            panic!("wait")
+        };
+        assert_eq!(task.agent_id, agent_id);
+        assert!(!task.reaped);
+        let still = scheduler.store().pending_requests(&agent_id).unwrap();
+        assert_eq!(
+            still.first().map(|pending| pending.request_id.clone()),
+            Some(request.request_id)
+        );
+        // New business traffic flows again immediately.
+        service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: agent_id.clone(),
+                message_id: "after-abort".into(),
+                mode: "queue".into(),
+                content: "queued once admission reopened".into(),
+            }))
+            .unwrap();
+
+        // The unit-variant wire shape holds: explicit params are rejected
+        // instead of silently ignored.
+        let shaped = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "version": crate::rpc::RPC_VERSION, "request_id": "abort-params",
+                "method": "daemon_abort_drain", "params": {}
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            shaped.outcome,
+            RpcOutcome::Error {
+                error: RpcError {
+                    code: RpcErrorCode::Validation,
+                    ..
+                }
+            }
+        ));
+
+        // Leave no stray provider process behind.
+        service
+            .dispatch(RpcMethod::TaskCancel {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while scheduler.active_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "pending scripted child was never reaped"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn abort_drain_is_refused_while_explicit_cancellation_is_in_flight() {
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // The child parks on a pending permission, so the explicit
+        // cancellation worker stays busy reaping it for a real interval.
+        let child = scripted_child(
+            workspace.path(),
+            &BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        );
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let _request = await_pending_permission(&scheduler, &agent_id);
+        scheduler.begin_drain();
+        scheduler.cancel_draining_tasks().unwrap();
+        // The bounded abort must refuse instead of reopening admission
+        // underneath an in-flight `--cancel-active` worker.
+        match scheduler.abort_drain() {
+            Err(SchedulerError::InvalidConfig(ref message)) if message == "drain_cancel_in_progress" => {}
+            other => panic!("expected an in-flight-cancellation refusal, got {other:?}"),
+        }
+        assert!(scheduler.is_draining());
+        // Once the worker finishes the reap, the same abort succeeds and the
+        // daemon reopens admission.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if scheduler.abort_drain().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "abort never became possible after cancellation settled"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!scheduler.is_draining());
+    }
+
+    #[test]
     fn queued_only_drain_cannot_claim_activation_but_default_drain_can_start_admitted_work() {
         let workspace = dsh_workspace();
         let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());

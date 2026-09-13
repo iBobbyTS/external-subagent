@@ -25,3 +25,19 @@ test('draining keeps admitted lifecycle operations available', () => {
 test('status is read-only and explicit activation fires once', () => {
   runDaemonOracle('rpc::agent_probe_tests::draining_status_read_is_side_effect_free_and_activation_is_once');
 });
+
+test('aborting a drain reopens admission and preserves task facts', () => {
+  runDaemonOracle('rpc::wait_tests::abort_drain_reopens_admission_and_preserves_task_facts');
+});
+
+test('aborting a drain keeps the issued claim for the retry', () => {
+  runDaemonOracle('rpc::agent_probe_tests::abort_drain_preserves_the_issued_claim_for_the_retry');
+});
+
+test('aborting a drain reopens real provider admission while the drained task answers', () => {
+  runDaemonOracle('dsh::tests::aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering');
+});
+
+test('aborting a drain is refused while explicit cancellation is in flight', () => {
+  runDaemonOracle('dsh::tests::abort_drain_is_refused_while_explicit_cancellation_is_in_flight');
+});
