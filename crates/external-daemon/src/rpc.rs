@@ -1521,8 +1521,10 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
     }
     entry.enabled
         && entry.spawn_supported
-        && env::var_os("DSH_RUNTIME_PATH")
-            .map(PathBuf::from)
+        && entry
+            .runtime_path
+            .as_deref()
+            .map(Path::new)
             .is_some_and(|path| path.is_absolute() && fs::metadata(path).is_ok_and(|m| m.is_file()))
 }
 
