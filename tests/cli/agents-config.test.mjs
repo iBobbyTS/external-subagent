@@ -39,20 +39,13 @@ test('explicit dsh spawn support survives config validation', () => {
 
 test('LaunchAgent captures configured DSH runtime and home for GUI services', () => {
   const { paths } = fixture();
-  const previousRuntime = process.env.DSH_RUNTIME_PATH;
-  const previousHome = process.env.DSH_HOME;
-  process.env.DSH_RUNTIME_PATH = '/opt/dsh/runtime with spaces';
-  process.env.DSH_HOME = '/var/lib/dsh profile';
-  try {
-    const plist = launchAgentPlist(paths).toString('utf8');
-    assert.match(plist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/runtime with spaces<\/string>/u);
-    assert.match(plist, /<key>DSH_HOME<\/key><string>\/var\/lib\/dsh profile<\/string>/u);
-  } finally {
-    if (previousRuntime === undefined) delete process.env.DSH_RUNTIME_PATH;
-    else process.env.DSH_RUNTIME_PATH = previousRuntime;
-    if (previousHome === undefined) delete process.env.DSH_HOME;
-    else process.env.DSH_HOME = previousHome;
-  }
+  configCommand(paths, { operation: 'set', patch: { agents: { dsh: {
+    runtime_path: '/opt/dsh/runtime with spaces', home: '/var/lib/dsh profile', profile: 'acp', version: '0.1.5-rc.1',
+  } } } });
+  const plist = launchAgentPlist(paths).toString('utf8');
+  assert.match(plist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/runtime with spaces<\/string>/u);
+  assert.match(plist, /<key>DSH_HOME<\/key><string>\/var\/lib\/dsh profile<\/string>/u);
+  assert.match(plist, /<key>DSH_PROFILE<\/key><string>acp<\/string>/u);
 });
 
 test('config writes a revision and keeps existing task snapshots independent', () => {
