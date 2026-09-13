@@ -46,6 +46,23 @@ function verifyStableEntry(candidateRoot) {
   return { entry, digest };
 }
 
+// The service runs the native daemon binary, never the npm bin shim: the
+// activation identity is the external-subagentd payload artifact whose digest
+// verifyPayload already checked against the release manifest.
+function verifyDaemonArtifact(candidateRoot, payload) {
+  const record = payload.files.find((file) => file.name === 'external-subagentd');
+  if (!record) throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate payload does not carry the daemon artifact');
+  const root = fs.realpathSync(candidateRoot);
+  const entry = path.join(root, 'npm', 'native', payload.platform, record.name);
+  let stat;
+  try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate daemon artifact is missing'); }
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be a regular file');
+  if ((stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be executable');
+  const digest = crypto.createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
+  if (digest !== record.sha256) throw new CliError('PAYLOAD_DIGEST_MISMATCH', 'candidate daemon artifact does not match the verified payload digest');
+  return { entry, digest };
+}
+
 export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
@@ -62,9 +79,10 @@ export function updateInstallation(paths, options = {}) {
     const payload = verifyPayload({ root: candidateRoot, platform: options.platform });
     if (version !== payload.version) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${payload.version}`);
     const verifiedVersion = payload.version;
-    // Reject a doomed candidate up front: an unusable stable entry must never
-    // publish candidate state or touch a single Codex home.
+    // Reject a doomed candidate up front: an unusable stable entry or daemon
+    // artifact must never publish candidate state or touch a single Codex home.
     const stable = verifyStableEntry(candidateRoot);
+    const daemon = verifyDaemonArtifact(candidateRoot, payload);
     const prior = readState(paths);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, root: candidateRoot, payload: payload.files }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
@@ -77,12 +95,16 @@ export function updateInstallation(paths, options = {}) {
         // Re-verify immediately before publishing: active may only ever point
         // at the entry bytes verified above, never a candidate mutated since.
         const stableNow = verifyStableEntry(candidateRoot);
-        if (stableNow.entry !== stable.entry || stableNow.digest !== stable.digest) {
-          throw new CliError('PAYLOAD_ENTRY_CHANGED', 'candidate stable entry changed during activation');
+        const daemonNow = verifyDaemonArtifact(candidateRoot, payload);
+        if (stableNow.entry !== stable.entry || stableNow.digest !== stable.digest
+          || daemonNow.entry !== daemon.entry || daemonNow.digest !== daemon.digest) {
+          throw new CliError('PAYLOAD_ENTRY_CHANGED', 'candidate verified artifacts changed during activation');
         }
         state.active = state.candidate; state.candidate = null;
         state.active.entry = stableNow.entry;
         state.active.entry_sha256 = stableNow.digest;
+        state.active.daemon_entry = daemonNow.entry;
+        state.active.daemon_entry_sha256 = daemonNow.digest;
       }
       atomicWrite(paths.state, jsonBytes(state));
       return state;
