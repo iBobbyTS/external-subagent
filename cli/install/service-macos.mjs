@@ -55,10 +55,42 @@ export function launchctl(args) {
   return { action: args[0], status: result.status, stdout: result.stdout };
 }
 
-export function bootstrapService(paths, uid = process.getuid()) {
-  return launchctl(['bootstrap', `gui/${uid}`, paths.launchAgent]);
+// launchd answers a bootstrap whose label is already loaded in the target
+// domain with "Bootstrap failed: 5: Input/output error" (reproduced live on
+// this GUI session; the same EIO was logged by the first acceptance run).
+// A repeat init/start must stay idempotent instead of failing the whole run,
+// so the registration lookup below — the same print/absent discriminator the
+// update owner uses — decides between "already loaded" and a real failure.
+export function serviceRegistrationStatus(uid = process.getuid(), options = {}) {
+  const control = options.launchctl || launchctl;
+  const result = control(['print', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+  if (result.skipped) return { query: 'skipped', registered: null, reason: result.reason };
+  if (result.absent) return { registered: false };
+  const pid = Number(result.stdout?.match(/\bpid = (\d+)/)?.[1]);
+  const state = result.stdout?.match(/^\s*state = (\S+)$/m)?.[1] ?? null;
+  return { registered: true, state, pid: Number.isInteger(pid) && pid > 0 ? pid : null };
 }
 
-export function bootoutService(paths, uid = process.getuid()) {
-  return launchctl(['bootout', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+export function bootstrapService(paths, uid = process.getuid(), options = {}) {
+  const control = options.launchctl || launchctl;
+  const alreadyLoaded = (lookup) => ({
+    action: 'bootstrap', label: LAUNCH_AGENT_LABEL, already_loaded: true,
+    state: lookup.state ?? null, pid: lookup.pid ?? null,
+  });
+  const existing = serviceRegistrationStatus(uid, { launchctl: control });
+  if (existing.registered) return alreadyLoaded(existing);
+  try {
+    return control(['bootstrap', `gui/${uid}`, paths.launchAgent]);
+  } catch (error) {
+    // Another loader (a racing init, or launchd itself re-reading the plist)
+    // may have won after the check above; confirm before reporting failure.
+    const loaded = serviceRegistrationStatus(uid, { launchctl: control });
+    if (loaded.registered) return alreadyLoaded(loaded);
+    throw error;
+  }
+}
+
+export function bootoutService(paths, uid = process.getuid(), options = {}) {
+  const control = options.launchctl || launchctl;
+  return control(['bootout', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
 }

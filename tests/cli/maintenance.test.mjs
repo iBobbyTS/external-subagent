@@ -4,6 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { backupData, cleanupLegacy, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
+import { bootstrapService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
+import { runInit } from '../../cli/install/init.mjs';
+import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 test('backup verifies bytes and restore replaces product data', () => {
@@ -65,4 +68,139 @@ test('legacy cleanup removes only enumerated old paths and creates no alias or m
   assert.equal(result.migration, false);
   assert.deepEqual(result.aliases_created, []);
   assert.equal(fs.existsSync(old), false);
+});
+
+// launchd answers a bootstrap over an already-loaded label with
+// "Bootstrap failed: 5: Input/output error" (observed live in the user GUI
+// domain); a repeat start/init must stay idempotent instead of failing.
+function servicePaths() {
+  return productPaths(fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-boot-')));
+}
+
+test('bootstrap reports already-loaded instead of surfacing the launchd EIO', () => {
+  const paths = servicePaths();
+  const calls = [];
+  const control = (args) => {
+    calls.push(args.join(' '));
+    if (args[0] === 'print') return { action: 'print', status: 0, stdout: 'state = running\n\tpid = 4242\n' };
+    throw new CliError('DAEMON_CONTROL_FAILED', 'Bootstrap failed: 5: Input/output error');
+  };
+  const started = bootstrapService(paths, 501, { launchctl: control });
+  assert.deepEqual(calls, ['print gui/501/com.external-subagent.daemon'],
+    'an already-loaded label must never reach bootstrap');
+  assert.equal(started.already_loaded, true);
+  assert.equal(started.state, 'running');
+  assert.equal(started.pid, 4242);
+
+  const status = serviceRegistrationStatus(501, { launchctl: control });
+  assert.equal(status.registered, true);
+  assert.equal(status.pid, 4242);
+});
+
+test('bootstrap resolves a lost race through the registration lookup and still fails real errors', () => {
+  const paths = servicePaths();
+  // First print: absent. bootstrap: EIO (a racing loader won). Second print: loaded.
+  let prints = 0;
+  const raced = (args) => {
+    if (args[0] !== 'print') throw new CliError('DAEMON_CONTROL_FAILED', 'Bootstrap failed: 5: Input/output error');
+    prints += 1;
+    return prints === 1 ? { action: 'print', absent: true } : { action: 'print', status: 0, stdout: 'pid = 777\n' };
+  };
+  const resolved = bootstrapService(paths, 501, { launchctl: raced });
+  assert.equal(resolved.already_loaded, true);
+  assert.equal(resolved.pid, 777);
+
+  // Both prints absent and bootstrap still failing is a genuine control failure.
+  const absent = (args) => (args[0] === 'print' ? { action: 'print', absent: true } : (() => { throw new CliError('DAEMON_CONTROL_FAILED', 'Bootstrap failed: 5: Input/output error'); })());
+  assert.throws(() => bootstrapService(paths, 501, { launchctl: absent }), (error) => error.code === 'DAEMON_CONTROL_FAILED');
+  assert.equal(serviceRegistrationStatus(501, { launchctl: absent }).registered, false);
+});
+
+test('service status lookup stays neutralized under the launchd test seam', () => {
+  const previous = process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL;
+  process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL = '1';
+  try {
+    const status = serviceRegistrationStatus();
+    assert.equal(status.registered, null);
+    assert.equal(status.query, 'skipped');
+    const started = bootstrapService(servicePaths());
+    assert.equal(started.skipped, true);
+  } finally {
+    if (previous === undefined) delete process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL;
+    else process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL = previous;
+  }
+});
+
+// Stateful launchctl double: print/bootstrap/bootout track one loaded label,
+// so the init rollback oracles below observe exactly what launchd would see.
+function recordingLaunchctl({ loaded = false } = {}) {
+  const calls = [];
+  const state = { loaded };
+  return {
+    calls,
+    state,
+    control(args) {
+      calls.push(args.join(' '));
+      if (args[0] === 'print') {
+        return state.loaded
+          ? { action: 'print', status: 0, stdout: 'state = running\npid = 999\n' }
+          : { action: 'print', absent: true };
+      }
+      if (args[0] === 'bootstrap') { state.loaded = true; return { action: 'bootstrap', status: 0 }; }
+      if (args[0] === 'bootout') { state.loaded = false; return { action: 'bootout', status: 0 }; }
+      throw new Error(`unexpected launchctl call: ${args.join(' ')}`);
+    },
+  };
+}
+
+function initFixture({ failStep } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-service-'));
+  const paths = productPaths(home);
+  const fakeCodex = path.join(home, 'codex-fake.mjs');
+  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
+if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') { text({ marketplaceName: 'personal' }); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'add') { text({ pluginId: 'external-subagent@personal', installedPath: '' }); process.exit(0); }
+process.stderr.write('unexpected codex invocation: ' + JSON.stringify(args) + '\\n');
+process.exit(1);
+`);
+  fs.chmodSync(fakeCodex, 0o755);
+  const run = (overrides = {}) => runInit({
+    paths,
+    skipRuntimeProbe: true,
+    skipPayloadProbe: true,
+    codexCli: fakeCodex,
+    codexHome: path.join(home, 'codex-home'),
+    ...(failStep ? { _failStep: failStep } : {}),
+    ...overrides,
+  });
+  return { home, paths, run };
+}
+
+test('a failed init boots back out the service that init itself loaded', () => {
+  const { paths, run } = initFixture({ failStep: 'claim-codex-home' });
+  const launchctl = recordingLaunchctl();
+  try {
+    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at claim-codex-home/u);
+    assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'rollback must undo the bootstrap init performed');
+    assert.equal(launchctl.state.loaded, false);
+    assert.equal(fs.existsSync(paths.launchAgent), false, 'the LaunchAgent still rolls back with the service');
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
+});
+
+test('a failed init never boots out a service that was already loaded before it', () => {
+  const { paths, run } = initFixture({ failStep: 'claim-codex-home' });
+  const launchctl = recordingLaunchctl({ loaded: true });
+  try {
+    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at claim-codex-home/u);
+    assert.equal(launchctl.calls.some((call) => call.startsWith('bootstrap ')), false, 'an already-loaded label is not bootstrapped again');
+    assert.equal(launchctl.calls.some((call) => call.startsWith('bootout')), false, 'rollback must not touch a service init did not load');
+    assert.equal(launchctl.state.loaded, true);
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
 });

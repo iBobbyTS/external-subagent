@@ -5,11 +5,14 @@ as MCP.
 
 ## Status
 
-Feature branch `codex/external-subagent-v1`; DSH and ZCode installed-artifact
-lifecycles, active-task upgrade, and managed Codex binding are implemented and
-reviewed. DSH admission currently supports `build` and strict `plan`; its
-model selection is explicit spawn model, configured default, then the native
-default. Nothing has been published to a registry.
+Feature branch `codex/external-subagent-productization-closeout`. DSH and
+ZCode installed-artifact lifecycles, active-task upgrade, and managed Codex
+binding are implemented and reviewed; installing from a packed artifact and
+explicitly initializing to a launchd-resident service (idempotent repeat
+init/start) is live-verified on a real GUI session. DSH admission currently
+supports `build` and strict `plan`; its model selection is explicit spawn
+model, configured default, then the native default. Nothing has been
+published to a registry.
 
 ## Install (from a packed artifact)
 
