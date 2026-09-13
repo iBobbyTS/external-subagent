@@ -1521,11 +1521,8 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
     }
     entry.enabled
         && entry.spawn_supported
-        && entry.profile.as_deref().unwrap_or("acp") == "acp"
-        && entry
-            .version
-            .as_deref()
-            .is_none_or(|version| version == external_agent_dsh::profile::PINNED_DSH_VERSION)
+        && entry.profile.as_deref() == Some("acp")
+        && entry.version.as_deref() == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
         && entry
             .runtime_path
             .as_deref()

@@ -110,16 +110,25 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
             .is_some_and(|runtime| {
                 runtime.is_absolute()
                     && runtime.is_file()
+                    && {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            true
+                        }
+                    }
                     && configured
                         .and_then(|entry| entry.get("profile"))
                         .and_then(serde_json::Value::as_str)
-                        .is_none_or(|profile| profile == "acp")
+                        == Some("acp")
                     && configured
                         .and_then(|entry| entry.get("version"))
                         .and_then(serde_json::Value::as_str)
-                        .is_none_or(|version| {
-                            version == external_agent_dsh::profile::PINNED_DSH_VERSION
-                        })
+                        == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
             })
 }
 
