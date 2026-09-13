@@ -1,6 +1,6 @@
 import { npmUpdateCoordination, reconcileCodexHomes } from '../install/reconcile.mjs';
 import { preflightUpdate, reconcileInstallation, updateInstallation } from '../install/update.mjs';
-import { callDaemon } from '../rpc.mjs';
+import { callDaemon, canonicalDaemonCode } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -41,7 +41,9 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   try {
     status = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
   } catch (error) {
-    if (cancelActive && ['VALIDATION', 'UNKNOWN_METHOD'].includes(error.code)) {
+    // A legacy daemon answers the cancel_active param with the raw wire code
+    // ("validation"), so the check matches the canonicalized form.
+    if (cancelActive && ['VALIDATION', 'UNKNOWN_METHOD'].includes(canonicalDaemonCode(error.code))) {
       throw new CliError('CANCEL_ACTIVE_UNSUPPORTED', 'running daemon does not support explicit drain cancellation; cancellation was not downgraded to passive drain');
     }
     // No daemon is listening and none answered: an already-initialized
@@ -138,17 +140,20 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     // This run drained a live daemon and never completed an activation:
     // bounded recovery reopens admission on the still-running old daemon so
     // it keeps serving spawns, while its completed-task and reap facts stay
-    // untouched. A daemon that cannot abort (legacy) or will not yet (a
-    // --cancel-active worker still in flight) keeps that evidence in the
-    // receipt; the failure stays retryable either way, and the abort outcome
-    // never masks the original update error.
+    // untouched. A daemon that cannot abort (legacy, answering the raw
+    // snake_case wire code) or will not yet (a --cancel-active worker still
+    // in flight) keeps that evidence in the receipt — the canonical abort
+    // code plus an explicit marker that the daemon may still be draining —
+    // and the failure stays retryable; the abort outcome never masks the
+    // original update error.
     if (online && !result?.service) {
       try {
         await rpc(socket, 'drain-abort', {});
         receipt.drain_aborted = true;
       } catch (abortError) {
         receipt.drain_aborted = false;
-        receipt.drain_abort_error = { code: abortError.code ?? 'DAEMON_ERROR', message: abortError.message };
+        receipt.drain_abort_error = { code: canonicalDaemonCode(abortError.code), message: abortError.message };
+        receipt.daemon_may_be_draining = true;
       }
     }
     if (failedInstall && typeof failedInstall === 'object' && failedInstall.phase) {
