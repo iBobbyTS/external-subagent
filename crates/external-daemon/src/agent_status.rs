@@ -500,18 +500,16 @@ fn run_dsh_catalog(
         .workspace
         .as_deref()
         .ok_or_else(|| "workspace_required".to_owned())?;
-    let mut command = if matches!(
-        executable.extension().and_then(|value| value.to_str()),
-        Some("js" | "cjs" | "mjs")
-    ) {
-        let mut command = Command::new("node");
-        command.arg(executable);
-        command
-    } else {
-        Command::new(executable)
-    };
+    let mut launch = DshLaunch::new(
+        Some(executable.to_path_buf()),
+        workspace,
+        scope.home.clone().map(PathBuf::from),
+    );
+    launch.profile = env::var("DSH_PROFILE").ok();
+    launch.version = env::var("DSH_VERSION").ok();
+    let mut command =
+        resolve_launch(&launch).map_err(|_| "unsupported_profile_or_version".to_owned())?;
     command
-        .current_dir(workspace)
         .env("DSH_ACP_PROBE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
