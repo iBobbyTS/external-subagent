@@ -259,8 +259,9 @@ test('update command runs the updater once and activates the service from the ve
     });
     assert.equal(result.phase, 'active');
     assert.deepEqual(events, ['update', 'activate']);
-    assert.equal(activated.path, result.active.daemon_entry, 'service activation receives the verified daemon artifact');
-    assert.equal(activated.sha256, result.active.daemon_entry_sha256);
+    assert.equal(activated.path, result.active.retained.daemon_entry, 'service activation receives the immutable retained daemon artifact');
+    assert.equal(activated.sha256, result.active.retained.daemon_entry_sha256);
+    assert.equal(result.active.retained.daemon_entry_sha256, result.active.daemon_entry_sha256, 'retained and published daemon identities agree');
     assert.equal(activated.version, result.active.version);
     assert.notEqual(activated.path, result.active.entry, 'activation must not target the npm bin shim');
     const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
