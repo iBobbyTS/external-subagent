@@ -3573,6 +3573,8 @@ mod agent_probe_tests {
         let scope = ProbeScope {
             workspace: Some("/workspace-a".into()),
             home: Some("/home-a".into()),
+            profile: None,
+            version: None,
         };
         let RpcSuccess::AgentProbed { evidence, status } = service
             .dispatch(RpcMethod::AgentProbe {
@@ -3658,6 +3660,8 @@ mod agent_probe_tests {
                 scope: ProbeScope {
                     workspace: Some("relative".into()),
                     home: None,
+                    profile: None,
+                    version: None,
                 },
             },
         ] {
