@@ -70,6 +70,7 @@ pub enum RpcMethod {
         cancel_active: bool,
     },
     DaemonDrainStatus,
+    DaemonAbortDrain,
     DaemonActivateReady,
     AgentProbe {
         input: AgentProbeInput,
@@ -109,6 +110,7 @@ impl RpcMethod {
             "system_status"
                 | "daemon_begin_drain"
                 | "daemon_drain_status"
+                | "daemon_abort_drain"
                 | "daemon_activate_ready"
                 | "agent_probe"
                 | "agent_models"
@@ -1040,6 +1042,20 @@ impl RpcService {
                 updater_fired: self.scheduler.updater_fired(),
                 activation_claim: None,
             }),
+            RpcMethod::DaemonAbortDrain => {
+                // Bounded recovery: reopen admission on a daemon whose update
+                // failed before activation. Refusals (no drain active, cancel
+                // worker in flight) surface as state errors, never a reset.
+                self.scheduler.abort_drain().map_err(map_scheduler)?;
+                Ok(RpcSuccess::DaemonDrainStatus {
+                    is_draining: self.scheduler.is_draining(),
+                    active_count: self.scheduler.active_count(),
+                    resources_reaped: self.scheduler.resources_reaped(),
+                    ready_for_activation: self.scheduler.ready_for_activation(),
+                    updater_fired: self.scheduler.updater_fired(),
+                    activation_claim: None,
+                })
+            }
             RpcMethod::DaemonActivateReady => {
                 let claim = self.scheduler.claim_activation();
                 Ok(RpcSuccess::DaemonDrainStatus {
@@ -1928,6 +1944,89 @@ pub(crate) mod wait_tests {
             .unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Unavailable);
         assert!(service.dispatch(RpcMethod::TaskMessage(msg)).is_ok());
+    }
+
+    #[test]
+    fn abort_drain_reopens_admission_and_preserves_task_facts() {
+        let (directory, service, id) = fixture();
+        let original = MessageInput {
+            agent_id: id.clone(),
+            message_id: "before-abort".into(),
+            mode: "queue".into(),
+            content: "delivered before the drain".into(),
+        };
+        service
+            .dispatch(RpcMethod::TaskMessage(original.clone()))
+            .unwrap();
+        service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap();
+        let rejected = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                message_id: "during-drain".into(),
+                ..original.clone()
+            }))
+            .unwrap_err();
+        assert_eq!(rejected.message, "daemon_draining");
+
+        let RpcSuccess::DaemonDrainStatus {
+            is_draining,
+            ready_for_activation,
+            updater_fired,
+            activation_claim,
+            ..
+        } = service.dispatch(RpcMethod::DaemonAbortDrain).unwrap()
+        else {
+            panic!("abort must answer with the drain status")
+        };
+        assert!(!is_draining);
+        assert!(!ready_for_activation);
+        assert!(!updater_fired);
+        assert_eq!(activation_claim, None);
+
+        // Admission is open again: the message the drain rejected and a
+        // brand-new task are both accepted, and the pre-drain delivery keeps
+        // its idempotent fact.
+        service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                message_id: "during-drain".into(),
+                ..original.clone()
+            }))
+            .unwrap();
+        service
+            .dispatch(RpcMethod::TaskMessage(original))
+            .unwrap();
+        let workspace = directory.path().join("abort-readmission");
+        std::fs::create_dir(&workspace).unwrap();
+        service
+            .scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: String::new(),
+                repository: workspace.canonicalize().unwrap(),
+                permission_mode: external_core::PermissionMode::Plan,
+                prompt: "admitted after the aborted drain".into(),
+                write_manifest: vec![],
+            })
+            .unwrap();
+        // The drained task keeps its recorded facts.
+        let RpcSuccess::TaskWait { task, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("wait")
+        };
+        assert_eq!(task.agent_id, id);
+        assert!(!task.stop_requested);
+        assert!(!task.reaped);
+        // Bounded: aborting without an active drain is a state error, never
+        // a second reset.
+        let repeated = service
+            .dispatch(RpcMethod::DaemonAbortDrain)
+            .unwrap_err();
+        assert_eq!(repeated.message, "drain_not_active");
     }
 
     #[test]
@@ -3195,6 +3294,9 @@ fn map_scheduler(error: SchedulerError) -> RpcError {
             if message == "daemon_draining" {
                 return RpcError::new(RpcErrorCode::Unavailable, "daemon_draining");
             }
+            if message == "drain_not_active" || message == "drain_cancel_in_progress" {
+                return RpcError::new(RpcErrorCode::Unavailable, message.clone());
+            }
             // Preserve the bounded, actionable preparation reason. The MCP
             // facade may still redact it for callers, but RPC diagnostics
             // must distinguish repository, path, budget, and state errors.
@@ -3779,6 +3881,7 @@ mod agent_probe_tests {
     fn draining_management_methods_are_public_rpc_names() {
         assert!(RpcMethod::is_known("daemon_begin_drain"));
         assert!(RpcMethod::is_known("daemon_drain_status"));
+        assert!(RpcMethod::is_known("daemon_abort_drain"));
     }
 
     #[test]
@@ -3816,6 +3919,63 @@ mod agent_probe_tests {
         else {
             panic!("activate")
         };
+        assert!(updater_fired);
+    }
+
+    #[test]
+    fn abort_drain_preserves_the_issued_claim_for_the_retry() {
+        let (_directory, service) = service();
+        service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap();
+        let claim = match service
+            .dispatch(RpcMethod::DaemonActivateReady)
+            .unwrap()
+        {
+            RpcSuccess::DaemonDrainStatus {
+                activation_claim: Some(claim),
+                updater_fired: true,
+                ..
+            } => claim,
+            _ => panic!("expected the first activation claim"),
+        };
+
+        // The update the claim was issued for failed without activating:
+        // reopen admission, but keep the claim as a recorded fact.
+        let RpcSuccess::DaemonDrainStatus { is_draining, .. } =
+            service.dispatch(RpcMethod::DaemonAbortDrain).unwrap()
+        else {
+            panic!("abort")
+        };
+        assert!(!is_draining);
+        let RpcSuccess::DaemonDrainStatus {
+            activation_claim, ..
+        } = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap()
+        else {
+            panic!("status")
+        };
+        assert_eq!(activation_claim, None);
+
+        // The retry drains again and the SAME claim hands it its identity:
+        // a reopened daemon never strands a retryable receipt.
+        service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap();
+        let RpcSuccess::DaemonDrainStatus {
+            activation_claim: Some(retry),
+            updater_fired,
+            ..
+        } = service
+            .dispatch(RpcMethod::DaemonActivateReady)
+            .unwrap()
+        else {
+            panic!("activate")
+        };
+        assert_eq!(retry, claim);
         assert!(updater_fired);
     }
 }

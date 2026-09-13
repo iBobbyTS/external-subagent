@@ -91,7 +91,10 @@ test('update activation calls daemon in order and runs updater once', async () =
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
   const calls = []; let updates = 0;
   const rpc = async (_s, command) => { calls.push(command); return command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'c1' } : { ready_for_activation: true }; };
-  await updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
+  // Stub-updater tests waive the coordinator preflight: the simulated
+  // installer brings its own validation, and the preflight-before-drain
+  // ordering oracle lives in recovery.test.mjs.
+  await updateCommand(p, ['--version=1'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
   assert.deepEqual(calls, ['drain', 'activate-ready']); assert.equal(updates, 1);
 });
 
@@ -118,14 +121,14 @@ test('missing activation claim does not run updater', async () => {
 test('matching activation receipt is idempotent', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true }); let updates = 0;
   const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'same' } : { ready_for_activation: true };
-  const run = () => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
+  const run = () => updateCommand(p, ['--version=1'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: () => { updates += 1; return { phase: 'active' }; } });
   await run(); await run(); assert.equal(updates, 1);
 });
 
 test('failed update preserves a failed activation receipt', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
   const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'bad' } : { ready_for_activation: true };
-  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => { throw new Error('boom'); } }), /boom/);
+  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: () => { throw new Error('boom'); } }), /boom/);
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.deepEqual({ claim: receipt.claim, version: receipt.version, status: receipt.status, error: receipt.error }, { claim: 'bad', version: '2', status: 'failed', error: 'boom' });
 });
@@ -133,7 +136,7 @@ test('failed update preserves a failed activation receipt', async () => {
 test('partial update is recorded as failed receipt and never reports success', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
   const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'partial' } : { ready_for_activation: true };
-  await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'partial' }) }), /did not activate/);
+  await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: () => ({ phase: 'partial' }) }), /did not activate/);
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.equal(receipt.status, 'failed');
   assert.equal(receipt.retryable, true);
@@ -142,7 +145,7 @@ test('partial update is recorded as failed receipt and never reports success', a
 test('update result without an active phase is never recorded as success', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root); fs.mkdirSync(p.data, { recursive: true });
   const rpc = async (_s, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'phaseless' } : { ready_for_activation: true };
-  await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, updateInstallation: async () => ({}) }), /did not activate payload \(phase=none\)/);
+  await assert.rejects(() => updateCommand(p, ['--version=1'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: async () => ({}) }), /did not activate payload \(phase=none\)/);
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.equal(receipt.status, 'failed');
   assert.equal(receipt.retryable, true);
@@ -157,13 +160,13 @@ test('failed activation receipt stays retryable for the same claim', async () =>
     if (attempts === 1) throw new Error('boom');
     return { phase: 'active', active: { version: '1.0.0' } };
   };
-  await assert.rejects(() => updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, updateInstallation: updater }), /boom/);
+  await assert.rejects(() => updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: updater }), /boom/);
   const failed = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
   assert.equal(failed.claim, 'retry-1');
   assert.equal(failed.version, '1.0.0');
   assert.equal(failed.status, 'failed');
   assert.equal(failed.retryable, true);
-  const result = await updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, updateInstallation: updater });
+  const result = await updateCommand(p, ['--version=1.0.0'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: updater });
   assert.equal(result.phase, 'active');
   assert.equal(attempts, 2);
   const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
@@ -187,7 +190,7 @@ test('service activation failure restores prior state and records rollback evide
   fs.writeFileSync(state, JSON.stringify({ phase: 'active', active: { version: '1.0.0' } }));
   const p = { data: dir, state, socket: path.join(dir, 'sock') };
   const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'rollback-1', ready_for_activation: true } : { ready_for_activation: true };
-  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'new-entry'), entry_sha256: 'new', daemon_entry: path.join(dir, 'new-daemon'), daemon_entry_sha256: 'new-daemon-sha' } }), hasInstalledService: () => true, activateService: async () => { throw new Error('bootstrap failed'); } }), /bootstrap failed/);
+  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, preflightUpdate: () => ({}), updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'new-entry'), entry_sha256: 'new', daemon_entry: path.join(dir, 'new-daemon'), daemon_entry_sha256: 'new-daemon-sha' } }), hasInstalledService: () => true, activateService: async () => { throw new Error('bootstrap failed'); } }), /bootstrap failed/);
   assert.equal(JSON.parse(fs.readFileSync(state)).active.version, '1.0.0');
   assert.equal(JSON.parse(fs.readFileSync(`${state}.activation.json`)).rollback.restored, true);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -199,6 +202,7 @@ test('service activation failure removes a newly created active state', async ()
   const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'fresh-rollback', ready_for_activation: true } : { ready_for_activation: true };
   await assert.rejects(() => updateCommand(p, ['--version=2'], {
     callDaemon: rpc,
+    preflightUpdate: () => ({}),
     updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'entry'), entry_sha256: 'x', daemon_entry: path.join(dir, 'daemon'), daemon_entry_sha256: 'y' } }),
     hasInstalledService: () => true,
     activateService: async () => { throw new Error('bootstrap failed'); },

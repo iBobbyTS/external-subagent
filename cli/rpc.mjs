@@ -77,6 +77,7 @@ function methodFor(command, input) {
     case 'status': return { method: 'system_status' };
     case 'drain': return { method: 'daemon_begin_drain', ...(input.cancel_active === true ? { params: { cancel_active: true } } : {}) };
     case 'drain-status': return { method: 'daemon_drain_status' };
+    case 'drain-abort': return { method: 'daemon_abort_drain' };
     case 'activate-ready': return { method: 'daemon_activate_ready' };
     case 'agent-probe': return { method: 'agent_probe', params: { input } };
     case 'agent-models': return { method: 'agent_models', params: { input } };
@@ -159,7 +160,7 @@ function publicResult(result) {
 export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
-    case 'drain': case 'drain-status': case 'activate-ready': return result;
+    case 'drain': case 'drain-status': case 'drain-abort': case 'activate-ready': return result;
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':

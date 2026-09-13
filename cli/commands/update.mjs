@@ -1,5 +1,5 @@
 import { npmUpdateCoordination, reconcileCodexHomes } from '../install/reconcile.mjs';
-import { reconcileInstallation, updateInstallation } from '../install/update.mjs';
+import { preflightUpdate, reconcileInstallation, updateInstallation } from '../install/update.mjs';
 import { callDaemon } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
 import fs from 'node:fs';
@@ -29,6 +29,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const detected = npmUpdateCoordination(paths);
   const reconciling = args.includes('reconcile');
   const coordinate = !reconciling || detected.update_pending;
+  // A doomed candidate must never take the working daemon offline: whenever
+  // this run may activate a payload, the SAME pure validation the locked
+  // updater owns runs BEFORE the drain RPC, so a bad version or manifest
+  // returns with the daemon still serving spawns. A pure reaffirmal that
+  // activates nothing drains only for its claim and needs no candidate.
+  const preflight = daemon.preflightUpdate || preflightUpdate;
+  if (!(reconciling && !coordinate)) preflight({ version: requestedVersion });
   let status = null;
   let online = true;
   try {
@@ -128,6 +135,22 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       rollback.service_restored = Boolean(error.rollback.pid && error.rollback.artifact);
     }
     const receipt = { claim, version: requestedVersion, status: 'failed', retryable: true, error: error.message, rollback };
+    // This run drained a live daemon and never completed an activation:
+    // bounded recovery reopens admission on the still-running old daemon so
+    // it keeps serving spawns, while its completed-task and reap facts stay
+    // untouched. A daemon that cannot abort (legacy) or will not yet (a
+    // --cancel-active worker still in flight) keeps that evidence in the
+    // receipt; the failure stays retryable either way, and the abort outcome
+    // never masks the original update error.
+    if (online && !result?.service) {
+      try {
+        await rpc(socket, 'drain-abort', {});
+        receipt.drain_aborted = true;
+      } catch (abortError) {
+        receipt.drain_aborted = false;
+        receipt.drain_abort_error = { code: abortError.code ?? 'DAEMON_ERROR', message: abortError.message };
+      }
+    }
     if (failedInstall && typeof failedInstall === 'object' && failedInstall.phase) {
       receipt.install_state = { phase: failedInstall.phase, candidate: failedInstall.candidate ?? null, active: failedInstall.active ?? null };
     }

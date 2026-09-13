@@ -2040,6 +2040,26 @@ impl Scheduler {
         let _admission = self.inner.admission.lock().unwrap();
         self.inner.draining.store(true, Ordering::Release);
     }
+    /// Bounded recovery for an update that drained this daemon but never
+    /// activated: reopen admission so the still-running daemon keeps serving
+    /// spawns. The flag flip is the entire state change — completed tasks,
+    /// reap facts, and an already-issued activation claim stay exactly as
+    /// they were, so a retry sees the same evidence. Refused while an
+    /// explicit `--cancel-active` worker is still in flight, so cancellation
+    /// semantics never change, and refused when no drain is active.
+    pub fn abort_drain(&self) -> Result<(), SchedulerError> {
+        let _admission = self.inner.admission.lock().unwrap();
+        if !self.inner.draining.load(Ordering::Acquire) {
+            return Err(SchedulerError::InvalidConfig("drain_not_active".into()));
+        }
+        if self.inner.drain_cancel_running.load(Ordering::Acquire) {
+            return Err(SchedulerError::InvalidConfig(
+                "drain_cancel_in_progress".into(),
+            ));
+        }
+        self.inner.draining.store(false, Ordering::Release);
+        Ok(())
+    }
     /// Admission is already closed. A single worker uses the ordinary cancel
     /// owner so uncooperative providers cannot hold the management RPC open.
     pub(crate) fn cancel_draining_tasks(&self) -> Result<(), SchedulerError> {

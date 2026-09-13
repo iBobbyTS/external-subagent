@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { verifyPayload } from '../../cli/install/payload.mjs';
-import { updateInstallation } from '../../cli/install/update.mjs';
+import { preflightUpdate, updateInstallation } from '../../cli/install/update.mjs';
 import { updateCommand } from '../../cli/commands/update.mjs';
 import { registerCodexHome } from '../../cli/install/reconcile.mjs';
 
@@ -211,6 +211,9 @@ test('update command records retryable receipt evidence when the candidate drift
     await assert.rejects(
       () => updateCommand(p, ['--version=2.0.0'], {
         callDaemon: rpc,
+        // The candidate is genuine at preflight time; the tamper only lands
+        // mid-activation through the installer hook below.
+        preflightUpdate: (options) => preflightUpdate({ ...options, ...upgradeOptions(b, '2.0.0') }),
         updateInstallation: (paths, options) => updateInstallation(paths, { ...options, ...upgradeOptions(b, '2.0.0'), installer: tamper }),
       }),
       /changed during activation/,

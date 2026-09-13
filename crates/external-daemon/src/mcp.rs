@@ -1659,6 +1659,7 @@ mod server {
             RpcMethod::SystemStatus => ("status", None),
             RpcMethod::DaemonBeginDrain { .. } => ("drain", None),
             RpcMethod::DaemonDrainStatus => ("drain_status", None),
+            RpcMethod::DaemonAbortDrain => ("drain_abort", None),
             RpcMethod::DaemonActivateReady => ("activate_ready", None),
             RpcMethod::AgentProbe { .. } => ("agent_probe", None),
             RpcMethod::AgentModels { .. } => ("agent_models", None),

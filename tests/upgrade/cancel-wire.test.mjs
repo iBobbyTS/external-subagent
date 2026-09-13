@@ -40,6 +40,44 @@ test('update cancel-active survives the real CLI RPC encoder', async (t) => {
   assert.equal(Object.hasOwn(frames[0], 'params'), false);
 });
 
+test('a failed update aborts the drain through the real CLI RPC encoder', async (t) => {
+  const base = path.resolve('tests/live-agent/workspace');
+  fs.mkdirSync(base, { recursive: true });
+  const root = fs.mkdtempSync(path.join(base, 'abort-'));
+  const socketPath = path.join(root, 'd.sock');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const frames = [];
+  const server = net.createServer((socket) => {
+    let body = '';
+    socket.on('data', (chunk) => {
+      body += chunk;
+      if (!body.includes('\n')) return;
+      const request = JSON.parse(body);
+      frames.push(request);
+      const result = request.method === 'daemon_activate_ready'
+        ? { kind: 'daemon_drain_status', ready_for_activation: true, resources_reaped: true, activation_claim: 'abort-claim' }
+        : request.method === 'daemon_abort_drain'
+          ? { kind: 'daemon_drain_status', is_draining: false, ready_for_activation: false, activation_claim: null }
+          : { kind: 'daemon_drain_status', ready_for_activation: true, resources_reaped: true, activation_claim: null };
+      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result }) + '\n');
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  await assert.rejects(updateCommand({ state: path.join(root, 'state'), socket: socketPath }, ['--version=2'], {
+    preflightUpdate: () => ({}),
+    updateInstallation: async () => { throw new Error('boom'); },
+  }), /boom/);
+  assert.equal(frames[0].method, 'daemon_begin_drain');
+  assert.equal(frames[1].method, 'daemon_activate_ready');
+  const abort = frames.at(-1);
+  assert.equal(abort.method, 'daemon_abort_drain', 'the failed update must abort the drain over the real encoder');
+  assert.equal(Object.hasOwn(abort, 'params'), false, 'the abort is a unit-variant method like drain-status');
+  const receipt = JSON.parse(fs.readFileSync(path.join(root, 'state.activation.json'), 'utf8'));
+  assert.equal(receipt.status, 'failed');
+  assert.equal(receipt.drain_aborted, true);
+});
+
 test('legacy daemon accepts default drain and rejects explicit cancellation without fallback', async (t) => {
   const base = path.resolve('tests/live-agent/workspace');
   fs.mkdirSync(base, { recursive: true });

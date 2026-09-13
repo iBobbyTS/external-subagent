@@ -341,6 +341,139 @@ test('reconcile re-affirmation never fires provider probes through the update su
   }
 });
 
+// R2 bounded repair oracle A: a doomed candidate must never take the working
+// daemon offline. The coordinator's pre-drain preflight is the SAME pure
+// validation the locked updater owns (no second rule set), so a bad version
+// or a bad manifest returns before any daemon RPC, any state write, or any
+// receipt.
+test('a bad requested version is rejected before the working daemon is drained', async () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'preflight-version-'));
+  const p = statePaths(data);
+  const daemon = { draining: false };
+  const commands = [];
+  const rpc = async (_socket, command) => {
+    commands.push(command);
+    if (command === 'drain') { daemon.draining = true; return { ready_for_activation: true }; }
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'never-claimed' };
+    if (command === 'drain-abort') { daemon.draining = false; return { is_draining: false }; }
+    throw new Error(`unexpected rpc ${command}`);
+  };
+  try {
+    await assert.rejects(() => updateCommand(p, ['--version=9.9.99'], { callDaemon: rpc }),
+      (error) => error.code === 'PAYLOAD_VERSION_UNAVAILABLE');
+    assert.deepEqual(commands, [], 'candidate verification must precede every daemon RPC');
+    assert.equal(daemon.draining, false, 'the working daemon was never put into draining');
+    assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'a pre-drain rejection writes no receipt');
+    assert.equal(fs.existsSync(p.state), false, 'a pre-drain rejection publishes no install state');
+  } finally {
+    fs.rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test('an unverifiable candidate manifest is rejected before any daemon RPC through the same validation owner', async () => {
+  const { preflightUpdate } = await import('../../cli/install/update.mjs');
+  assert.equal(typeof preflightUpdate, 'function', 'the pure preflight must be exported by the install validation owner');
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'preflight-manifest-'));
+  const p = statePaths(data);
+  const a = makeCandidate('1.0.0');
+  const bad = makeCandidate('2.0.0');
+  // A genuinely broken release: the payload manifest is not even valid JSON.
+  fs.writeFileSync(path.join(bad.root, 'npm/native/darwin-arm64/payload.json'), '{ NOT-A-VALID-DOCUMENT');
+  const commands = [];
+  const rpc = async (_socket, command) => {
+    commands.push(command);
+    if (command === 'drain') return { ready_for_activation: true };
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'manifest-1' };
+    if (command === 'drain-abort') return { is_draining: false };
+    throw new Error(`unexpected rpc ${command}`);
+  };
+  try {
+    updateInstallation(p, upgradeOptions(a, '1.0.0'));
+    const before = fs.readFileSync(p.state);
+    // The seam pair wraps the REAL owners with the same forced candidate, so
+    // the preflight and the updater can never disagree about the rules.
+    const forced = (options) => ({ ...options, ...upgradeOptions(bad, '2.0.0') });
+    await assert.rejects(() => updateCommand(p, ['--version=2.0.0'], {
+      callDaemon: rpc,
+      preflightUpdate: (options) => preflightUpdate(forced(options)),
+      updateInstallation: (target, options) => updateInstallation(target, forced(options)),
+    }), (error) => error.code === 'PAYLOAD_MANIFEST_INVALID');
+    assert.deepEqual(commands, [], 'a bad manifest must return before the drain RPC');
+    assert.deepEqual(fs.readFileSync(p.state), before, 'the published active is untouched by the pre-drain rejection');
+    assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'the pre-drain rejection writes no receipt');
+  } finally {
+    for (const dir of [a.root, bad.root, data]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// R2 bounded repair oracle B: a failed update that already drained a live
+// daemon must reopen its admission through the bounded abort-drain
+// management RPC, keep every completed/reaped fact, and leave a retryable
+// receipt with the abort evidence.
+test('a failed post-claim update aborts the daemon drain and keeps the receipt retryable', async () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'abort-recover-'));
+  const p = statePaths(data);
+  const commands = [];
+  const rpc = async (_socket, command) => {
+    commands.push(command);
+    if (command === 'drain') return { ready_for_activation: true };
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'abort-1' };
+    if (command === 'drain-abort') return { is_draining: false, ready_for_activation: false };
+    throw new Error(`unexpected rpc ${command}`);
+  };
+  try {
+    await assert.rejects(() => updateCommand(p, ['--version=2.0.0'], {
+      callDaemon: rpc,
+      // Stub-updater test: the preflight is waived; its ordering oracle is
+      // the two tests above.
+      preflightUpdate: () => ({}),
+      updateInstallation: async () => { throw new Error('boom'); },
+    }), /boom/);
+    assert.deepEqual(commands, ['drain', 'activate-ready', 'drain-abort'],
+      'a failed, not-yet-activated update must end with the bounded drain abort');
+    const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+    assert.equal(receipt.claim, 'abort-1');
+    assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.retryable, true);
+    assert.equal(receipt.drain_aborted, true);
+  } finally {
+    fs.rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test('a legacy daemon that cannot abort keeps its evidence without masking the update failure', async () => {
+  const data = fs.mkdtempSync(path.join(os.tmpdir(), 'abort-legacy-'));
+  const p = statePaths(data);
+  const commands = [];
+  const rpc = async (_socket, command) => {
+    commands.push(command);
+    if (command === 'drain') return { ready_for_activation: true };
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'legacy-1' };
+    if (command === 'drain-abort') {
+      const error = new Error('unknown RPC method');
+      error.code = 'UNKNOWN_METHOD';
+      error.daemonResponded = true;
+      throw error;
+    }
+    throw new Error(`unexpected rpc ${command}`);
+  };
+  try {
+    await assert.rejects(() => updateCommand(p, ['--version=2.0.0'], {
+      callDaemon: rpc,
+      preflightUpdate: () => ({}),
+      updateInstallation: async () => { throw new Error('boom'); },
+    }), /boom/);
+    assert.deepEqual(commands, ['drain', 'activate-ready', 'drain-abort']);
+    const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+    assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.retryable, true, 'a daemon that stayed draining keeps the failure retryable');
+    assert.equal(receipt.drain_aborted, false);
+    assert.equal(receipt.drain_abort_error.code, 'UNKNOWN_METHOD');
+  } finally {
+    fs.rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test('reconcile preserves registered home content and the disabled plugin state', { skip: !darwinArm64 }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'home-preserve-'));
   const p = { ...statePaths(path.join(root, 'data')), home: root, socket: path.join(root, 'data', 's.sock') };

@@ -95,26 +95,37 @@ function verifyDaemonArtifact(candidateRoot, payload) {
   return { entry, digest };
 }
 
+// The pure validation prologue of a locked update, extracted so the
+// coordinator can run the SAME rules (verifyPayload, the stable-entry and
+// daemon-artifact owners) before it takes the working daemon offline.  It
+// writes nothing — no install state, no receipt — never contacts the daemon
+// or a provider, and derives everything from the candidate root, never the
+// user HOME, so a rejected candidate cannot disturb a working installation.
+export function preflightUpdate(options = {}) {
+  // An explicit update always has a candidate root: the controlled staged
+  // payload when the caller passes one, otherwise the installed package the
+  // CLI itself runs from.  There is no rootless "version-only" activation.
+  const candidateRoot = options.candidateRoot || packageRoot();
+  const requested = options.version || 'current';
+  const version = requested === 'current' ? packageVersion() : requested;
+  const available = options.availableVersions || [packageVersion()];
+  if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
+    throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
+  }
+  const payload = verifyPayload({ root: candidateRoot, platform: options.platform });
+  if (version !== payload.version) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${payload.version}`);
+  // Reject a doomed candidate up front: an unusable stable entry or daemon
+  // artifact must never publish candidate state or touch a single Codex home.
+  const stable = verifyStableEntry(candidateRoot);
+  const daemon = verifyDaemonArtifact(candidateRoot, payload);
+  return { candidateRoot, version, payload, stable, daemon };
+}
+
 export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
-    const requested = options.version || 'current';
-    // An explicit update always has a candidate root: the controlled staged
-    // payload when the caller passes one, otherwise the installed package the
-    // CLI itself runs from.  There is no rootless "version-only" activation.
-    const candidateRoot = options.candidateRoot || packageRoot();
-    const version = requested === 'current' ? packageVersion() : requested;
-    const available = options.availableVersions || [packageVersion()];
-    if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
-      throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
-    }
-    const payload = verifyPayload({ root: candidateRoot, platform: options.platform });
-    if (version !== payload.version) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${payload.version}`);
+    const { candidateRoot, payload, stable, daemon } = preflightUpdate(options);
     const verifiedVersion = payload.version;
-    // Reject a doomed candidate up front: an unusable stable entry or daemon
-    // artifact must never publish candidate state or touch a single Codex home.
-    const stable = verifyStableEntry(candidateRoot);
-    const daemon = verifyDaemonArtifact(candidateRoot, payload);
     const { state: prior, recovery } = readState(paths);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, root: candidateRoot, payload: payload.files }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
