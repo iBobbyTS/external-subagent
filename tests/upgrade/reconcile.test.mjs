@@ -456,7 +456,7 @@ test('vA tarball installs stage-only; init publishes the verified vA active/rete
   assert.equal(afterVa.candidate, null);
   assert.equal(afterVa.active.version, VERSION_A);
   assert.equal(afterVa.active.daemon_entry_sha256, ctx.shaA);
-  assert.deepEqual(serviceActivations().at(-1).candidate, { path: daemonEntry(), sha256: ctx.shaA, version: VERSION_A },
+  assert.deepEqual(serviceActivations().at(-1).candidate, { path: path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd'), sha256: ctx.shaA, version: VERSION_A },
     'service activation must receive the verified vA daemon identity');
   assert.equal(readReceipt().status, 'success');
 });
@@ -487,7 +487,7 @@ test('installing the vB tarball into the same prefix and running the public upda
   assert.equal(state.active.daemon_entry_sha256, ctx.shaB);
   assert.notEqual(state.active.version, VERSION_A, 'the retired vA entry is no longer active');
   assert.notEqual(state.active.daemon_entry_sha256, ctx.shaA);
-  assert.deepEqual(serviceActivations().at(-1).candidate, { path: daemonEntry(), sha256: ctx.shaB, version: VERSION_B },
+  assert.deepEqual(serviceActivations().at(-1).candidate, { path: path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'), sha256: ctx.shaB, version: VERSION_B },
     'service activation must receive the verified NEW daemon identity');
   assert.equal(vb.result.homes.all_updated, true);
   assert.equal(vb.result.homes.homes[0].status, 'updated');
@@ -511,7 +511,7 @@ test('a failed service activation preserves the published vB active byte-for-byt
   assert.equal(preserved.phase, 'active');
   assert.equal(preserved.active.version, VERSION_B);
   assert.equal(preserved.active.daemon_entry_sha256, ctx.shaB);
-  assert.deepEqual(serviceActivations().at(-1).candidate, { path: daemonEntry(), sha256: ctx.shaB, version: VERSION_B },
+  assert.deepEqual(serviceActivations().at(-1).candidate, { path: path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'), sha256: ctx.shaB, version: VERSION_B },
     'the failed attempt still received the verified identity before failing');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'failed');
@@ -529,7 +529,7 @@ test('the public reconcile command re-affirms the published active and rebinds h
   assert.equal(rec.result.active.version, VERSION_B);
   assert.equal(rec.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'));
   assert.equal(rec.result.active.daemon_entry_sha256, ctx.shaB);
-  assert.deepEqual(serviceActivations().at(-1).candidate, { path: daemonEntry(), sha256: ctx.shaB, version: VERSION_B },
+  assert.deepEqual(serviceActivations().at(-1).candidate, { path: path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'), sha256: ctx.shaB, version: VERSION_B },
     'reconcile activates from the published verified identity');
   assert.equal(rec.result.homes.all_updated, true);
   assert.equal(readReceipt().status, 'success');
@@ -590,13 +590,13 @@ test('the public update drives the real activation and health-verifies the verif
   assert.ok(Number.isInteger(service.pid) && service.pid > 0, 'health verification returned a real daemon pid');
   assert.notEqual(service.pid, pidBefore, 'the daemon was replaced, not reused');
   assert.equal(service.version, VERSION_B, 'the running daemon self-reports the payload version');
-  assert.equal(service.artifact.path, daemonEntry(), 'the daemon self-reports the verified daemon artifact path');
+  assert.equal(service.artifact.path, real.result.active.retained.daemon_entry, 'the daemon self-reports the verified daemon artifact path');
   assert.equal(service.artifact.sha256, ctx.shaB, 'the daemon self-reports the verified payload digest');
   assert.ok(service.service_generation, 'health verification captured the new service generation');
 
   const spawned = launchctlLog().filter((entry) => entry.action === 'spawned').slice(spawnCountBefore);
-  assert.deepEqual(spawned.map((entry) => entry.program), [daemonEntry()], 'the public update relaunched exactly the native daemon, never the shim');
-  assert.equal(plistProgram(), daemonEntry(), 'the LaunchAgent keeps pinning the daemon artifact');
+  assert.deepEqual(spawned.map((entry) => entry.program), [real.result.active.retained.daemon_entry], 'the public update relaunched exactly the native daemon, never the shim');
+  assert.equal(plistProgram(), real.result.active.retained.daemon_entry, 'the LaunchAgent keeps pinning the daemon artifact');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'success');
   assert.match(receipt.claim, /^agentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
