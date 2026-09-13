@@ -25,7 +25,6 @@ export async function activateService(paths, candidate, options = {}) {
   const match = oldPlist.toString().match(program);
   if (!match) throw new CliError('SERVICE_DEFINITION_INVALID', 'installed service has no executable entry');
   const oldPath = unxml(match[2]);
-  const oldHash = digest(oldPath);
   const servicePid = async () => {
     const result = await control(['print', target]);
     if (result.absent) return null;
@@ -35,12 +34,31 @@ export async function activateService(paths, candidate, options = {}) {
   };
   const oldPid = await servicePid();
   const oldStatus = oldPid ? await rpc(paths.socket, 'status', {}) : null;
+  // The running daemon's self-reported digest is the truth about which bytes
+  // the service was executing (bound to the running executable at startup);
+  // the file at oldPath may already carry the NEXT version after an npm
+  // install replaced the package directory in place.
+  const runningArtifact = oldStatus?.identity?.daemon?.artifact;
+  const oldSha = (typeof runningArtifact?.sha256 === 'string' && runningArtifact.sha256) || digest(oldPath);
   if (oldPid) {
     const drain = await rpc(paths.socket, 'drain-status', {});
     if (!drain.ready_for_activation) throw new CliError('DAEMON_NOT_DRAINED', 'daemon still owns active or unreaped work');
     const claim = await rpc(paths.socket, 'activate-ready', {});
     if (!claim.activation_claim) throw new CliError('ACTIVATION_NOT_CLAIMED', 'daemon did not grant activation');
   }
+  // npm may have replaced the old program path with the new payload: rolling
+  // the service back must run the OLD bytes, from the original path when they
+  // are still intact or from the retained payload copy the updater staged
+  // for exactly this recovery.
+  const rollbackExecutable = () => {
+    if (fs.existsSync(oldPath) && digest(oldPath) === oldSha) return { path: oldPath, sha256: oldSha };
+    const retained = options.rollbackPayload;
+    if (retained && typeof retained.path === 'string' && typeof retained.sha256 === 'string'
+      && fs.existsSync(retained.path) && digest(retained.path) === retained.sha256) {
+      return { path: retained.path, sha256: retained.sha256 };
+    }
+    throw new CliError('ROLLBACK_PAYLOAD_UNAVAILABLE', 'previous payload bytes are unavailable; automatic rollback refused');
+  };
   const healthy = async (expected, previousPid, previousGeneration) => {
     const deadline = Date.now() + (options.healthTimeoutMs ?? 10_000);
     let last;
@@ -64,19 +82,25 @@ export async function activateService(paths, candidate, options = {}) {
     const result = await control(['print', target]);
     if (!result.absent) await control(['bootout', target]);
   };
+  const writeProgram = (entryPath) => atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(entryPath)}${c}`)), 0o600);
+  const rollbackService = async () => {
+    await unload();
+    const previous = rollbackExecutable();
+    writeProgram(previous.path);
+    await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
+    return healthy({ path: previous.path, sha256: previous.sha256, version: oldStatus?.identity?.daemon?.version }, oldPid, oldStatus?.service_generation);
+  };
   try {
     await unload();
-    atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(candidate.path)}${c}`)), 0o600);
+    writeProgram(candidate.path);
     await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
     const health = await healthy(candidate, oldPid, oldStatus?.service_generation);
       return {
       ...health,
       rollback: async () => {
-        await unload();
-        if (digest(oldPath) !== oldHash) throw new Error('previous payload changed; automatic rollback refused');
-        atomicWrite(paths.launchAgent, oldPlist, 0o600);
-        await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
-        return healthy({ path: oldPath, sha256: oldHash, version: oldStatus?.identity?.daemon?.version }, oldPid, oldStatus?.service_generation);
+        const restored = await rollbackService();
+        if (digest(oldPath) !== oldSha) return { ...restored, restored_from: 'retained_payload' };
+        return restored;
       },
     };
   } catch (error) {
@@ -91,11 +115,7 @@ export async function activateService(paths, candidate, options = {}) {
       throw error;
     }
     try {
-      await unload();
-      if (digest(oldPath) !== oldHash) throw new Error('previous payload changed; automatic rollback refused');
-      atomicWrite(paths.launchAgent, oldPlist, 0o600);
-      await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
-      error.rollback = await healthy({ path: oldPath, sha256: oldHash, version: oldStatus?.identity?.daemon?.version }, oldPid, oldStatus?.service_generation);
+      error.rollback = await rollbackService();
     } catch (rollbackError) { error.rollbackError = rollbackError.message; }
     throw error;
   }

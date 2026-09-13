@@ -1,4 +1,4 @@
-import { reconcileCodexHomes } from '../install/reconcile.mjs';
+import { npmUpdateCoordination, reconcileCodexHomes } from '../install/reconcile.mjs';
 import { reconcileInstallation, updateInstallation } from '../install/update.mjs';
 import { callDaemon } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
@@ -20,33 +20,63 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
-  const begin = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {}).catch((error) => {
+  // npm auto-coordination (U06): an already-initialized product whose
+  // installed package drifted from the published active payload coordinates
+  // through the full update path even when invoked as `reconcile` — the
+  // ignore-scripts flow, where no lifecycle hook ever fired. A matching
+  // version merely re-affirms, and a never-initialized product stays
+  // stage-only.
+  const detected = npmUpdateCoordination(paths);
+  const reconciling = args.includes('reconcile');
+  const coordinate = !reconciling || detected.update_pending;
+  let status = null;
+  let online = true;
+  try {
+    status = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
+  } catch (error) {
     if (cancelActive && ['VALIDATION', 'UNKNOWN_METHOD'].includes(error.code)) {
       throw new CliError('CANCEL_ACTIVE_UNSUPPORTED', 'running daemon does not support explicit drain cancellation; cancellation was not downgraded to passive drain');
     }
-    throw error;
-  });
-  let status = begin;
-  while (!status.ready_for_activation) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    status = await rpc(socket, 'drain-status', {});
+    // No daemon is listening and none answered: an already-initialized
+    // service is (re)started by the activation itself, so there is nothing
+    // to drain and the CLI coordination stays reachable after an
+    // ignore-scripts install. A daemon that ANSWERED with a protocol-level
+    // error still fails loudly instead of being treated as offline.
+    if (error.code !== 'SOCKET_UNAVAILABLE' || error.daemonResponded) throw error;
+    online = false;
   }
-  const activation = await rpc(socket, 'activate-ready', {});
-  if (!activation.activation_claim) return { ...status, activation_claim: null, update: 'not_activated' };
-  if (prior?.status === 'success' && prior.claim === activation.activation_claim
+  if (online) {
+    while (!status.ready_for_activation) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      status = await rpc(socket, 'drain-status', {});
+    }
+    status = await rpc(socket, 'activate-ready', {});
+  }
+  const claim = online ? status.activation_claim : `offline-${process.pid}-${Date.now()}-activation`;
+  if (!claim) return { ...status, activation_claim: null, update: 'not_activated' };
+  if (prior?.status === 'success' && prior.claim === claim
     && (requestedVersion === 'current' || prior.version === requestedVersion)) return prior.result;
+  // The rollback source for service activation: the retained copy of the
+  // PREVIOUS active payload, staged outside the npm directory the new
+  // version may already have replaced.
+  const previousActive = (() => {
+    if (!priorStateBytes) return null;
+    try { return JSON.parse(priorStateBytes)?.active ?? null; } catch { return null; }
+  })();
+  const rollbackPayload = previousActive?.retained?.daemon_entry
+    ? { path: previousActive.retained.daemon_entry, sha256: previousActive.retained.daemon_entry_sha256 ?? previousActive.daemon_entry_sha256 }
+    : (previousActive?.daemon_entry ? { path: previousActive.daemon_entry, sha256: previousActive.daemon_entry_sha256 } : null);
   let result;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
-    const reconciling = args.includes('reconcile');
-    result = reconciling
+    result = (reconciling && !coordinate)
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceDue });
     if (!result || typeof result !== 'object' || result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }
-    if (serviceDue && !reconciling && (!result.active?.entry || !result.active?.entry_sha256
+    if (serviceDue && coordinate && (!result.active?.entry || !result.active?.entry_sha256
       || !result.active?.daemon_entry || !result.active?.daemon_entry_sha256)) {
       // An explicit update exists to switch the service onto the verified
       // daemon payload; an identity it cannot verify must fail rather than
@@ -61,12 +91,12 @@ export async function updateCommand(paths, args = [], daemon = {}) {
         path: result.active.daemon_entry,
         sha256: result.active.daemon_entry_sha256,
         version: result.active.version,
-      }, daemon);
+      }, { ...daemon, rollbackPayload });
       result.homes = reconcileCodexHomes(paths);
       if (result.homes.homes.length > 0 && !result.homes.all_updated) throw new Error('Codex home reconciliation failed after service activation');
     }
     const receiptVersion = result?.active?.version || result?.version || requestedVersion;
-    atomicWrite(receiptPath(paths), jsonBytes({ claim: activation.activation_claim, version: receiptVersion, status: 'success', result }));
+    atomicWrite(receiptPath(paths), jsonBytes({ claim, version: receiptVersion, status: 'success', result }));
     return result;
   } catch (error) {
     // Snapshot what the updater recorded before rollback replaces it, so the
@@ -97,7 +127,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
       rollback.service = error.rollback;
       rollback.service_restored = Boolean(error.rollback.pid && error.rollback.artifact);
     }
-    const receipt = { claim: activation.activation_claim, version: requestedVersion, status: 'failed', retryable: true, error: error.message, rollback };
+    const receipt = { claim, version: requestedVersion, status: 'failed', retryable: true, error: error.message, rollback };
     if (failedInstall && typeof failedInstall === 'object' && failedInstall.phase) {
       receipt.install_state = { phase: failedInstall.phase, candidate: failedInstall.candidate ?? null, active: failedInstall.active ?? null };
     }

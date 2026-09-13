@@ -14,6 +14,31 @@ export function loadInstallState(file) {
   try { return JSON.parse(bytes); } catch { throw new CliError('INVALID_INSTALL_STATE', 'install state is invalid JSON'); }
 }
 
+// The updater's schema-2 state (candidate/active/phase).  Corrupted bytes
+// are evidence, never an empty state: the original file is preserved under a
+// timestamped name so the recovery can be inspected, and the caller restarts
+// from an empty state with the preservation reported alongside the result.
+export function loadUpdateState(file) {
+  const bytes = readOptional(file);
+  if (bytes === null) return { state: null, recovery: null };
+  try {
+    const state = JSON.parse(bytes);
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      throw new SyntaxError('update state is not a JSON object');
+    }
+    return { state, recovery: null };
+  } catch (error) {
+    const backup = `${file}.corrupt-${Date.now()}`;
+    try { fs.renameSync(file, backup); } catch (renameError) {
+      throw new CliError('INSTALL_STATE_CORRUPT', `install state is corrupted and could not be preserved: ${renameError.message}`);
+    }
+    return {
+      state: null,
+      recovery: { status: 'recovered', code: 'INSTALL_STATE_CORRUPT', backup, error: error.message },
+    };
+  }
+}
+
 export function markInstallStep(file, completed, id) {
   completed.add(id);
   atomicWrite(file, jsonBytes({ schema_version: 1, completed: [...completed] }));
