@@ -48,6 +48,10 @@ pub struct ProbeScope {
     pub workspace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,8 +321,14 @@ fn probe_dsh_hi(
         workspace,
         scope.home.as_ref().map(PathBuf::from),
     );
-    launch.profile = env::var("DSH_PROFILE").ok();
-    launch.version = env::var("DSH_VERSION").ok();
+    launch.profile = scope
+        .profile
+        .clone()
+        .or_else(|| env::var("DSH_PROFILE").ok());
+    launch.version = scope
+        .version
+        .clone()
+        .or_else(|| env::var("DSH_VERSION").ok());
     launch.permission_mode = Some("read-only".into());
     // The embedded resource survives native/npm installation without the build
     // source tree. The private directory lives until the ACP child is reaped.
@@ -505,8 +515,14 @@ fn run_dsh_catalog(
         workspace,
         scope.home.clone().map(PathBuf::from),
     );
-    launch.profile = env::var("DSH_PROFILE").ok();
-    launch.version = env::var("DSH_VERSION").ok();
+    launch.profile = scope
+        .profile
+        .clone()
+        .or_else(|| env::var("DSH_PROFILE").ok());
+    launch.version = scope
+        .version
+        .clone()
+        .or_else(|| env::var("DSH_VERSION").ok());
     let mut command =
         resolve_launch(&launch).map_err(|_| "unsupported_profile_or_version".to_owned())?;
     command
