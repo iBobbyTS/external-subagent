@@ -482,13 +482,21 @@ fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModel
         DSH_CATALOG_TIMEOUT,
     );
     match result {
-        Ok(models) => AgentModelsOutput {
+        Ok(models) if !models.is_empty() => AgentModelsOutput {
             agent: input.agent.clone(),
             config_revision: 0,
             supported: true,
             models,
             evidence,
             reason: None,
+        },
+        Ok(_) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: Some("model_catalog_empty".into()),
         },
         Err(reason) => AgentModelsOutput {
             agent: input.agent.clone(),
