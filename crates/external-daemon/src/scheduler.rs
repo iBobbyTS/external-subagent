@@ -2092,19 +2092,10 @@ impl Scheduler {
         self.is_draining()
             && !self.inner.drain_cancel_running.load(Ordering::Acquire)
             && self.active_count() == 0
-            && self
-                .inner
-                .store
-                .all_tasks_reaped()
-                .unwrap_or(false)
+            && self.inner.store.all_tasks_reaped().unwrap_or(false)
     }
     pub fn resources_reaped(&self) -> bool {
-        self.active_count() == 0
-            && self
-                .inner
-                .store
-                .all_tasks_reaped()
-                .unwrap_or(false)
+        self.active_count() == 0 && self.inner.store.all_tasks_reaped().unwrap_or(false)
     }
     pub fn updater_fired(&self) -> bool {
         self.inner.updater_fired.load(Ordering::Acquire)

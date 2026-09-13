@@ -1003,7 +1003,9 @@ impl RpcService {
             RpcMethod::DaemonBeginDrain { cancel_active } => {
                 self.scheduler.begin_drain();
                 if cancel_active {
-                    self.scheduler.cancel_draining_tasks().map_err(map_scheduler)?;
+                    self.scheduler
+                        .cancel_draining_tasks()
+                        .map_err(map_scheduler)?;
                 }
                 Ok(RpcSuccess::DaemonDrainStatus {
                     is_draining: true,
@@ -1848,7 +1850,11 @@ pub(crate) mod wait_tests {
         service
             .dispatch(RpcMethod::TaskMessage(msg.clone()))
             .unwrap();
-        service.dispatch(RpcMethod::DaemonBeginDrain { cancel_active: false }).unwrap();
+        service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap();
         let err = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
                 message_id: "new-msg".into(),
@@ -1884,7 +1890,11 @@ pub(crate) mod wait_tests {
 
         barrier.wait();
         let drain_service = Arc::clone(&service);
-        let drain = std::thread::spawn(move || drain_service.dispatch(RpcMethod::DaemonBeginDrain { cancel_active: false }));
+        let drain = std::thread::spawn(move || {
+            drain_service.dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+        });
         barrier.wait();
 
         assert!(message.join().unwrap().is_ok());
@@ -1933,7 +1943,11 @@ pub(crate) mod wait_tests {
 
         barrier.wait();
         let drain_service = Arc::clone(&service);
-        let drain = std::thread::spawn(move || drain_service.dispatch(RpcMethod::DaemonBeginDrain { cancel_active: false }));
+        let drain = std::thread::spawn(move || {
+            drain_service.dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+        });
         barrier.wait();
 
         assert!(enqueue.join().unwrap().is_ok());
@@ -1950,7 +1964,11 @@ pub(crate) mod wait_tests {
     #[test]
     fn draining_lifecycle_methods_are_not_gate_rejected() {
         let (_dir, service, id) = fixture();
-        service.dispatch(RpcMethod::DaemonBeginDrain { cancel_active: false }).unwrap();
+        service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap();
         let methods = [
             RpcMethod::TaskWait(TaskWaitQuery {
                 agent_id: id.clone(),
@@ -3660,8 +3678,11 @@ mod agent_probe_tests {
             panic!("status")
         };
         assert!(!updater_fired);
-        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } =
-            service.dispatch(RpcMethod::DaemonBeginDrain { cancel_active: false }).unwrap()
+        let RpcSuccess::DaemonDrainStatus { updater_fired, .. } = service
+            .dispatch(RpcMethod::DaemonBeginDrain {
+                cancel_active: false,
+            })
+            .unwrap()
         else {
             panic!("begin")
         };

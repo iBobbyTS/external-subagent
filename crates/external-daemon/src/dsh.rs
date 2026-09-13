@@ -1661,7 +1661,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
     }
     #[test]
     fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
-        use crate::rpc::{MessageInput, RpcMethod, RpcOutcome, RpcService, RpcSuccess, TaskWaitQuery};
+        use crate::rpc::{
+            MessageInput, RpcMethod, RpcOutcome, RpcService, RpcSuccess, TaskWaitQuery,
+        };
         let _guard = scripted_test_guard();
         let workspace = dsh_workspace();
         // This child never finishes a prompt itself. Only the real cancellation
@@ -1788,7 +1790,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         loop {
             // Exercise the actual iteration called by Daemon's production
             // claim thread while cancellation is waiting on the first child.
-            assert!(scheduler.start_ready().unwrap().is_empty(), "cancelled queue was claimed");
+            assert!(
+                scheduler.start_ready().unwrap().is_empty(),
+                "cancelled queue was claimed"
+            );
             let status = service.dispatch(RpcMethod::DaemonDrainStatus).unwrap();
             if matches!(
                 status,
@@ -1814,7 +1819,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let queued = scheduler.store().get_task(&queued_id).unwrap().unwrap();
         assert_eq!(queued.phase, TaskPhase::Terminal);
         assert_eq!(queued.outcome, Some(TaskOutcome::Cancelled));
-        assert_eq!(queued.owner_epoch, 0, "queued cancellation must never acquire a runtime claim");
+        assert_eq!(
+            queued.owner_epoch, 0,
+            "queued cancellation must never acquire a runtime claim"
+        );
         assert!(!queued_workspace.path().join("wire.jsonl").exists());
         let frames = wait_for_frames(workspace.path(), 5);
         assert_eq!(
@@ -1889,6 +1897,4 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         assert_eq!(claim.task.agent_id, id);
         assert!(!scheduler.ready_for_activation());
     }
-
-
 }
