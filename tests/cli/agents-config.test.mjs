@@ -160,6 +160,9 @@ test('agents human operations are strict and unsupported actions are explicit', 
   assert.deepEqual(parseAgentsArgs(['probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']), {
     operation: 'probe', agent: 'zcode', through: 'hi', workspace: '/workspace', home: '/home',
   });
+  assert.deepEqual(parseAgentsArgs(['models', 'dsh', '--workspace', '/workspace', '--home', '/home']), {
+    operation: 'models', agent: 'dsh', workspace: '/workspace', home: '/home',
+  });
   assert.deepEqual(parseAgentsArgs(['probe', 'future-provider', '--local']), { operation: 'probe', agent: 'future-provider', through: 'local' });
   const probed = await agentsCommand(paths, { operation: 'probe', agent: 'zcode', through: 'hi', workspace: '/workspace' }, {
     socket: '/socket',

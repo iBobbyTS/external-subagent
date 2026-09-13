@@ -41,11 +41,28 @@ function parseProbeArgs(rest) {
   return { ...input, through };
 }
 
+function parseModelsArgs(rest) {
+  const agent = rest.shift();
+  if (!agent || agent.startsWith('--')) throw new CliError('agent_required', 'agents models requires an agent', 2);
+  const input = { operation: 'models', agent };
+  while (rest.length > 0) {
+    const option = rest.shift();
+    if (option !== '--workspace' && option !== '--home') throw new CliError('INVALID_ARGUMENT', `unsupported agents models option: ${option}`, 2);
+    const name = option.slice(2);
+    const value = rest.shift();
+    if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', `${option} requires a value`, 2);
+    if (input[name] !== undefined) throw new CliError('INVALID_ARGUMENT', `${option} may be provided only once`, 2);
+    input[name] = value;
+  }
+  return input;
+}
+
 export function parseAgentsArgs(args) {
   if (args.length === 0) return { operation: 'list' };
   const [operation, ...rest] = args;
   if (!['list', 'status', 'probe', 'models'].includes(operation)) throw new CliError('INVALID_ARGUMENT', `unsupported agents operation: ${operation}`, 2);
   if (operation === 'probe') return parseProbeArgs(rest);
+  if (operation === 'models') return parseModelsArgs(rest);
   if (operation === 'list' && rest.length !== 0) throw new CliError('INVALID_ARGUMENT', 'usage: agents list', 2);
   if (operation !== 'list' && rest.length > 1) throw new CliError('INVALID_ARGUMENT', `usage: agents ${operation} [agent]`, 2);
   return { operation, ...(rest[0] ? { agent: rest[0] } : {}) };
