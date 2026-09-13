@@ -592,16 +592,20 @@ fn run_dsh_catalog(
             return Err("protocol".into());
         }
         let session_catalog = parse_opaque_model_tokens(&session).unwrap_or_default();
-        let catalog = dsh_call(
+        match dsh_call(
             &mut input,
             &frames_rx,
             3,
             "models/list",
             serde_json::json!({}),
             deadline,
-        )?;
-        match parse_opaque_model_tokens(&catalog) {
-            Ok(tokens) => Ok(tokens),
+        ) {
+            Ok(catalog) => match parse_opaque_model_tokens(&catalog) {
+                Ok(tokens) if !tokens.is_empty() => Ok(tokens),
+                _ if !session_catalog.is_empty() => Ok(session_catalog),
+                Ok(tokens) => Ok(tokens),
+                Err(error) => Err(error),
+            },
             Err(_) if !session_catalog.is_empty() => Ok(session_catalog),
             Err(error) => Err(error),
         }
