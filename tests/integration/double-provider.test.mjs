@@ -25,7 +25,8 @@
 // copied, or read into the test; business workspaces, the store, and
 // sockets live under a fresh temp root, and every bridged target is
 // digest-checked unchanged in the finally block — even when a live step
-// has already failed.
+// has already failed. The daemon and the temp root are reaped by that same
+// guaranteed finally — even when the daemon socket never appears.
 //
 // Recorded live evidence from this harness pattern (2026-09-12, artifact
 // external-subagent@0.1.0, tgz sha256 75b01ba6..., native daemon sha256
@@ -200,73 +201,83 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
   const realZcodeConfig = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_CONFIG_BRIDGE
     || path.join(os.homedir(), '.zcode', 'cli', 'config.json');
 
+  // The entire live resource lifecycle — temp root, read-only bridges,
+  // daemon spawn, socket wait — lives inside one try/finally so the
+  // finally reaps the daemon and removes the temp root even when the
+  // daemon socket never appears or a live step fails early.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'es-live-accept-'));
-  const home = path.join(root, 'home');
-  const dshHome = path.join(root, 'dshhome');
-  const wsDsh = path.join(root, 'ws-dsh');
-  const wsZcode = path.join(root, 'ws-zcode');
-  const daemonDir = path.join(root, 'daemon');
-  for (const dir of [home, dshHome, wsDsh, wsZcode, daemonDir, path.join(home, '.zcode', 'cli')]) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  }
-  // Read-only auth bridges: the credential files and the `profiles/`
-  // directory stay in the real homes and are referenced through symlinks;
-  // nothing is copied, printed, or read into the test. Every bridged
-  // target — including the profiles tree, recursively — is digest-checked
-  // unchanged in the `finally` below, so bridge drift fails the run even
-  // when a live step has already failed.
-  fs.symlinkSync(realZcodeConfig, path.join(home, '.zcode', 'cli', 'config.json'));
-  for (const name of ['.credentials.yaml', 'settings.yaml', '.anonymous-user-id', 'profiles']) {
-    fs.symlinkSync(path.join(realDshHome, name), path.join(dshHome, name));
-  }
-  const bridged = [
-    ['zcode cli config.json', realZcodeConfig],
-    ['dsh .credentials.yaml', path.join(realDshHome, '.credentials.yaml')],
-    ['dsh settings.yaml', path.join(realDshHome, 'settings.yaml')],
-    ['dsh .anonymous-user-id', path.join(realDshHome, '.anonymous-user-id')],
-    ['dsh profiles/ (recursive tree)', path.join(realDshHome, 'profiles')],
-  ];
-  for (const [label, target] of bridged) {
-    assert.ok(fs.existsSync(target), `live bridge target missing: ${label}`);
-  }
-  const before = new Map(bridged.map(([label, target]) => [label, bridgeDigest(target)]));
-
-  fs.writeFileSync(path.join(daemonDir, 'config.json'), JSON.stringify({
-    schema_version: 1,
-    revision: 1,
-    default_agent: null,
-    agents: {
-      zcode: { enabled: true, spawn_supported: true, default_model: null },
-      dsh: {
-        enabled: true,
-        spawn_supported: true,
-        default_model: null,
-        runtime_path: dshRuntime,
-        home: dshHome,
-        profile: 'acp',
-        version: '0.1.5-rc.1',
-      },
-    },
-  }));
-
-  const socket = path.join(daemonDir, 'daemon.sock');
-  const daemon = spawn(daemonBinary, [
-    '--database', path.join(daemonDir, 'state.sqlite'),
-    '--socket', socket,
-    '--agent-config', path.join(daemonDir, 'config.json'),
-    '--runtime', zcodeRuntime,
-  ], { stdio: ['ignore', 'pipe', 'pipe'], env: cleanDaemonEnv(home) });
+  let daemon = null;
   let daemonErr = '';
-  daemon.stderr.on('data', (chunk) => { daemonErr += chunk.toString(); });
-  const deadline = Date.now() + 20_000;
-  while (!fs.existsSync(socket) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  assert.ok(fs.existsSync(socket), `daemon socket never appeared: ${daemonErr}`);
-  const cli = liveCli(prefix, socket, home);
-
   let settled = false;
+  let bridged = [];
+  let before = new Map();
   try {
+    const home = path.join(root, 'home');
+    const dshHome = path.join(root, 'dshhome');
+    const wsDsh = path.join(root, 'ws-dsh');
+    const wsZcode = path.join(root, 'ws-zcode');
+    const daemonDir = path.join(root, 'daemon');
+    for (const dir of [home, dshHome, wsDsh, wsZcode, daemonDir, path.join(home, '.zcode', 'cli')]) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    }
+    // Read-only auth bridges: the credential files and the `profiles/`
+    // directory stay in the real homes and are referenced through symlinks;
+    // nothing is copied, printed, or read into the test. Every bridged
+    // target — including the profiles tree, recursively — is digest-checked
+    // unchanged in the `finally` below, so bridge drift fails the run even
+    // when a live step has already failed.
+    fs.symlinkSync(realZcodeConfig, path.join(home, '.zcode', 'cli', 'config.json'));
+    for (const name of ['.credentials.yaml', 'settings.yaml', '.anonymous-user-id', 'profiles']) {
+      fs.symlinkSync(path.join(realDshHome, name), path.join(dshHome, name));
+    }
+    bridged = [
+      ['zcode cli config.json', realZcodeConfig],
+      ['dsh .credentials.yaml', path.join(realDshHome, '.credentials.yaml')],
+      ['dsh settings.yaml', path.join(realDshHome, 'settings.yaml')],
+      ['dsh .anonymous-user-id', path.join(realDshHome, '.anonymous-user-id')],
+      ['dsh profiles/ (recursive tree)', path.join(realDshHome, 'profiles')],
+    ];
+    for (const [label, target] of bridged) {
+      assert.ok(fs.existsSync(target), `live bridge target missing: ${label}`);
+    }
+    before = new Map(bridged.map(([label, target]) => [label, bridgeDigest(target)]));
+
+    fs.writeFileSync(path.join(daemonDir, 'config.json'), JSON.stringify({
+      schema_version: 1,
+      revision: 1,
+      default_agent: null,
+      agents: {
+        zcode: { enabled: true, spawn_supported: true, default_model: null },
+        dsh: {
+          enabled: true,
+          spawn_supported: true,
+          default_model: null,
+          runtime_path: dshRuntime,
+          home: dshHome,
+          profile: 'acp',
+          version: '0.1.5-rc.1',
+        },
+      },
+    }));
+
+    const socket = path.join(daemonDir, 'daemon.sock');
+    daemon = spawn(daemonBinary, [
+      '--database', path.join(daemonDir, 'state.sqlite'),
+      '--socket', socket,
+      '--agent-config', path.join(daemonDir, 'config.json'),
+      '--runtime', zcodeRuntime,
+    ], { stdio: ['ignore', 'pipe', 'pipe'], env: cleanDaemonEnv(home) });
+    // An unhandled 'error' event would crash the runner and bypass the
+    // finally, so spawn failures are recorded into the failure message.
+    daemon.on('error', (error) => { daemonErr += error.message; });
+    daemon.stderr.on('data', (chunk) => { daemonErr += chunk.toString(); });
+    const deadline = Date.now() + 20_000;
+    while (!fs.existsSync(socket) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(fs.existsSync(socket), `daemon socket never appeared: ${daemonErr}`);
+    const cli = liveCli(prefix, socket, home);
+
     // Discovery/status through the installed CLI.
     const status = jsonOut(cli(['agents', 'status']));
     const byAgent = Object.fromEntries(status.agents.map((agent) => [agent.agent, agent]));
@@ -324,13 +335,14 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     const zcodeClosed = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
     assert.equal(zcodeClosed.task.closed, true);
 
-    // ZCode explicit model rejection (daemon-enforced boundary).
+    // ZCode explicit model rejection (daemon-enforced boundary). The CLI
+    // shim writes its error JSON to stderr and exits 1.
     const rejected = spawnSync(path.join(prefix, 'bin', 'external-subagent'), [
       'spawn', '--agent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
       '--model', 'glm-5.3', '--prompt', 'hi',
     ], { encoding: 'utf8', timeout: 30_000, env: { ...cleanDaemonEnv(home), ZCODE_AGENTD_SOCKET: socket } });
     assert.equal(rejected.status, 1);
-    const rejection = JSON.parse(rejected.stdout);
+    const rejection = JSON.parse(rejected.stderr);
     assert.equal(rejection.error.code, 'model_selection_unsupported');
     assert.match(rejection.error.message, /prompt_count=0/);
 
@@ -366,23 +378,34 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     ].join('\n'));
     settled = true;
   } finally {
-    daemon.kill('SIGTERM');
-    await new Promise((resolve) => {
-      if (daemon.exitCode !== null || daemon.signalCode !== null) return resolve();
-      const hardKill = setTimeout(() => { try { daemon.kill('SIGKILL'); } catch {} resolve(); }, 5_000);
-      daemon.once('exit', () => { clearTimeout(hardKill); resolve(); });
-    });
-    // Bridge integrity is enforced even when a live step above failed;
-    // drift on a clean run fails the test, drift on an already-failed run
-    // is reported without masking the original failure.
+    // Reap the daemon even when the socket never appeared or a live step
+    // already failed: SIGTERM, wait for exit, SIGKILL fallback.
+    if (daemon && daemon.pid) {
+      try { daemon.kill('SIGTERM'); } catch {}
+      await new Promise((resolve) => {
+        if (daemon.exitCode !== null || daemon.signalCode !== null) return resolve();
+        const hardKill = setTimeout(() => { try { daemon.kill('SIGKILL'); } catch {} resolve(); }, 5_000);
+        daemon.once('exit', () => { clearTimeout(hardKill); resolve(); });
+      });
+    }
+    // Bridge integrity is enforced even when a live step above failed, and
+    // only against targets whose baseline was captured. On a clean run
+    // drift fails the test — but only after the cleanup below, so rmSync is
+    // never skipped; on an already-failed run drift is reported without
+    // masking the original failure. A vanished target counts as drift; a
+    // missing baseline never throws here.
+    let driftFailure = null;
     const drift = bridged
-      .filter(([label, target]) => bridgeDigest(target) !== before.get(label))
+      .filter(([label, target]) => (fs.existsSync(target)
+        ? before.has(label) && bridgeDigest(target) !== before.get(label)
+        : before.has(label)))
       .map(([label]) => label);
     if (drift.length > 0) {
       const message = `bridged real provider files were modified: ${drift.join(', ')}`;
-      if (settled) throw new assert.AssertionError({ message });
-      t.diagnostic(`BRIDGE DRIFT in addition to the failure above: ${message}`);
+      if (settled) driftFailure = new assert.AssertionError({ message });
+      else t.diagnostic(`BRIDGE DRIFT in addition to the failure above: ${message}`);
     }
     fs.rmSync(root, { recursive: true, force: true });
+    if (driftFailure) throw driftFailure;
   }
 });
