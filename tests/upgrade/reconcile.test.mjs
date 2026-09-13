@@ -11,14 +11,28 @@
 // identity unavailable; a failed activation must preserve the published active
 // byte-for-byte.
 //
-// All writes stay inside mkdtemp fixtures: npm prefix/cache and HOME are
-// per-test temp directories, launchd stays neutralized through the documented
-// EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL seam, and the daemon RPC/service
-// activation are controlled seams injected by a driver subprocess that imports
-// the INSTALLED package's own modules (never the repository copy).  Real
-// launchd bootstrap/bootout, a real running daemon PID/health check, and real
-// user HOME installation are NOT_RUN here and stay acceptance-gated outside
-// this file.
+// The core defect this file pins: active.entry is the npm bin SHIM
+// (bin/external-subagent.mjs) while the LaunchAgent runs the NATIVE daemon
+// binary whose self-reported identity (current_exe + digest + version) is what
+// service health verification checks.  The proof is dynamic, not mocked: a
+// faithful launchctl seam (the only thing tests may never do is touch real
+// launchd) loads the REAL plist — spawning the REAL daemon binary from the
+// installed payload with the plist's own argv and environment — and the REAL
+// activateService then runs its full unload/rewrite/bootstrap/health dance.
+// Feeding it the shim identity from active.entry rewrites the service onto the
+// shim, launches it, and can never health-verify (SERVICE_HEALTH_FAILED);
+// feeding it the verified daemon artifact health-verifies against the daemon's
+// own reported identity.  The public update command is exercised the same way
+// with only the launchctl seam injected: its drain/claim prelude talks to the
+// REAL running daemon over the REAL socket.
+//
+// All writes stay inside mkdtemp fixtures (a short /tmp base keeps the product
+// socket path under macOS SUN_LEN, exactly like a short real HOME): npm
+// prefix/cache and HOME are per-test temp directories, launchd stays
+// neutralized for init through EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL, and no
+// registry is ever published.  Real launchd bootstrap/bootout against the
+// user's actual GUI session and installation into a real user HOME are NOT_RUN
+// here and remain acceptance-gated outside this file.
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -41,7 +55,8 @@ const run = (command, args, options = {}) => spawnSync(command, args, { encoding
 
 function paths() {
   const data = path.join(ctx.home, 'Library', 'Application Support', 'external-subagent');
-  return { home: ctx.home, data, state: path.join(data, 'install-state.json'), launchAgent: path.join(ctx.home, 'Library', 'LaunchAgents', 'com.external-subagent.daemon.plist') };
+  return { home: ctx.home, data, state: path.join(data, 'install-state.json'), socket: path.join(data, 'external-subagent.sock'),
+    launchAgent: path.join(ctx.home, 'Library', 'LaunchAgents', 'com.external-subagent.daemon.plist') };
 }
 const readState = () => JSON.parse(fs.readFileSync(paths().state, 'utf8'));
 const readReceipt = () => JSON.parse(fs.readFileSync(`${paths().state}.activation.json`, 'utf8'));
@@ -51,6 +66,17 @@ const binEntry = () => path.join(fs.realpathSync(ctx.packageRoot), 'bin', 'exter
 const installedDaemonSha = () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, PLATFORM_DIR, 'payload.json'), 'utf8'));
   return manifest.files.find((file) => file.name === 'external-subagentd').sha256;
+};
+const launchctlState = () => {
+  try { return JSON.parse(fs.readFileSync(path.join(ctx.workDir, 'launchctl-state.json'), 'utf8')); } catch { return { pid: null, program: null }; }
+};
+const launchctlLog = () => (fs.existsSync(path.join(ctx.workDir, 'launchctl-log.jsonl'))
+  ? fs.readFileSync(path.join(ctx.workDir, 'launchctl-log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : []);
+const plistProgram = () => {
+  const text = fs.readFileSync(paths().launchAgent, 'utf8');
+  const argv = [...text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)[1].matchAll(/<string>([^<]*)<\/string>/g)]
+    .map((match) => match[1].replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&'));
+  return argv[0];
 };
 
 // The installed directory is the oracle's source of truth: the package
@@ -95,10 +121,14 @@ function runDriver(label, args = [], options = {}) {
       R2_PACKAGE_ROOT: ctx.packageRoot,
       R2_HOME: ctx.home,
       R2_SERVICE_LOG: ctx.serviceLog,
+      R2_LAUNCHCTL_STATE: path.join(ctx.workDir, 'launchctl-state.json'),
+      R2_LAUNCHCTL_LOG: path.join(ctx.workDir, 'launchctl-log.jsonl'),
       R2_CLAIM: `r2-${label}`,
       R2_LABEL: label,
       R2_ARGS: JSON.stringify(args),
+      R2_MODE: options.mode || 'seam',
       R2_FAIL_ACTIVATION: options.failActivation ? '1' : '0',
+      R2_HEALTH_TIMEOUT_MS: String(options.healthTimeoutMs ?? 20_000),
     }),
   });
   assert.equal(result.stderr, '', `driver ${label} stderr: ${result.stderr}`);
@@ -137,35 +167,125 @@ process.exit(1);
   return { dir: directory, log };
 }
 
+// The driver always imports the INSTALLED package's own modules; the repository
+// copy stays out of the oracle.  Modes:
+//   seam            update/reconcile with controlled daemon RPC + service seams
+//   service-up      load the real plist through the faithful launchctl seam
+//   shim-activation REAL activateService fed the active.entry shim identity
+//   real-update     public updateCommand with ONLY the launchctl seam injected
 function writeDriver(directory) {
   const driver = path.join(directory, 'r2-driver.mjs');
   fs.writeFileSync(driver, [
     '#!/usr/bin/env node',
     'import fs from \'node:fs\';',
     'import path from \'node:path\';',
+    'import { spawn } from \'node:child_process\';',
     'import { pathToFileURL } from \'node:url\';',
     'const pkgRoot = process.env.R2_PACKAGE_ROOT;',
-    'const label = process.env.R2_LABEL;',
+    'const home = process.env.R2_HOME;',
+    'const mode = process.env.R2_MODE || \'seam\';',
     'const args = process.env.R2_ARGS ? JSON.parse(process.env.R2_ARGS) : [];',
     'const claim = process.env.R2_CLAIM;',
-    'const failActivation = process.env.R2_FAIL_ACTIVATION === \'1\';',
-    '// Only the INSTALLED package\'s own modules run here; the repository copy stays out of the oracle.',
+    'const healthTimeoutMs = Number(process.env.R2_HEALTH_TIMEOUT_MS || 20000);',
     'const { updateCommand } = await import(pathToFileURL(path.join(pkgRoot, \'cli\', \'commands\', \'update.mjs\')).href);',
     'const { productPaths } = await import(pathToFileURL(path.join(pkgRoot, \'cli\', \'paths.mjs\')).href);',
-    'const callDaemon = async (_socket, command) => (command === \'activate-ready\'',
-    '  ? { ready_for_activation: true, activation_claim: claim }',
-    '  : { ready_for_activation: true });',
-    'const activateService = async (_paths, candidate) => {',
-    '  fs.appendFileSync(process.env.R2_SERVICE_LOG, JSON.stringify({ label, candidate }) + \'\\n\');',
-    '  if (failActivation) throw new Error(\'SERVICE_BOOTSTRAP_INJECTED_FAILURE\');',
-    '  return { pid: 4321, service_generation: 9 };',
+    'const { callDaemon } = await import(pathToFileURL(path.join(pkgRoot, \'cli\', \'rpc.mjs\')).href);',
+    'const { activateService: realActivateService } = await import(pathToFileURL(path.join(pkgRoot, \'cli\', \'install\', \'service-activation.mjs\')).href);',
+    'const paths = productPaths(home);',
+    'const emit = (doc) => { process.stdout.write(JSON.stringify(doc) + \'\\n\'); };',
+    '',
+    '// Faithful launchd stand-in: print/bootout/bootstrap against the REAL plist.',
+    '// bootstrap spawns the plist\'s exact ProgramArguments (the real daemon',
+    '// binary with its real --database/--socket/--runtime flags and plist env),',
+    '// exactly what launchd does at load; nothing else is simulated.',
+    'const unxml = (s) => s.replaceAll(\'&lt;\', \'<\').replaceAll(\'&gt;\', \'>\').replaceAll(\'&amp;\', \'&\');',
+    'const stateFile = process.env.R2_LAUNCHCTL_STATE;',
+    'const logFile = process.env.R2_LAUNCHCTL_LOG;',
+    'const readState = () => { try { return JSON.parse(fs.readFileSync(stateFile, \'utf8\')); } catch { return { pid: null, program: null }; } };',
+    'const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };',
+    'const log = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + \'\\n\');',
+    'const launchctl = async (argv) => {',
+    '  log({ action: argv[0], target: argv[1] });',
+    '  if (argv[0] === \'print\') {',
+    '    const state = readState();',
+    '    if (!state.pid || !alive(state.pid)) return { action: \'print\', absent: true };',
+    '    return { action: \'print\', status: 0, stdout: \'\\tpid = \' + state.pid + \'\\n\' };',
+    '  }',
+    '  if (argv[0] === \'bootout\') {',
+    '    const state = readState();',
+    '    if (state.pid && alive(state.pid)) {',
+    '      process.kill(state.pid, \'SIGTERM\');',
+    '      const deadline = Date.now() + 10000;',
+    '      while (alive(state.pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));',
+    '    }',
+    '    fs.writeFileSync(stateFile, JSON.stringify({ pid: null, program: null }));',
+    '    return { action: \'bootout\', status: 0 };',
+    '  }',
+    '  if (argv[0] === \'bootstrap\') {',
+    '    const text = fs.readFileSync(argv[2], \'utf8\');',
+    '    const plistArgv = [...text.match(/<key>ProgramArguments<\\/key>\\s*<array>([\\s\\S]*?)<\\/array>/)[1].matchAll(/<string>([^<]*)<\\/string>/g)].map((m) => unxml(m[1]));',
+    '    const plistEnv = {};',
+    '    const dict = text.match(/<key>EnvironmentVariables<\\/key>\\s*<dict>([\\s\\S]*?)<\\/dict>/);',
+    '    if (dict) for (const m of dict[1].matchAll(/<key>([^<]+)<\\/key>\\s*<string>([^<]*)<\\/string>/g)) plistEnv[unxml(m[1])] = unxml(m[2]);',
+    '    try {',
+    '      const child = spawn(plistArgv[0], plistArgv.slice(1), { stdio: \'ignore\', cwd: pkgRoot, env: { ...process.env, ...plistEnv } });',
+    '      child.unref();',
+    '      fs.writeFileSync(stateFile, JSON.stringify({ pid: child.pid, program: plistArgv[0] }));',
+    '      log({ action: \'spawned\', program: plistArgv[0], pid: child.pid });',
+    '      return { action: \'bootstrap\', status: 0 };',
+    '    } catch (error) {',
+    '      fs.writeFileSync(stateFile, JSON.stringify({ pid: null, program: plistArgv[0] }));',
+    '      log({ action: \'spawn-error\', program: plistArgv[0], error: error.message });',
+    '      return { action: \'bootstrap\', status: 0 };',
+    '    }',
+    '  }',
+    '  throw new Error(\'unexpected launchctl args: \' + JSON.stringify(argv));',
     '};',
-    'try {',
-    '  const result = await updateCommand(productPaths(process.env.R2_HOME), args, { callDaemon, activateService });',
-    '  process.stdout.write(JSON.stringify({ ok: true, result }) + \'\\n\');',
-    '} catch (error) {',
-    '  process.stdout.write(JSON.stringify({ ok: false, code: error.code ?? null, message: error.message }) + \'\\n\');',
-    '  process.exitCode = 1;',
+    '',
+    'if (mode === \'service-up\') {',
+    '  await launchctl([\'bootstrap\', \'gui/\' + process.getuid(), paths.launchAgent]);',
+    '  const deadline = Date.now() + 20000;',
+    '  let status = null;',
+    '  while (!status && Date.now() < deadline) {',
+    '    try { status = await callDaemon(paths.socket, \'status\', {}); }',
+    '    catch { await new Promise((resolve) => setTimeout(resolve, 100)); }',
+    '  }',
+    '  if (!status) { emit({ ok: false, message: \'daemon never answered status\' }); process.exit(1); }',
+    '  emit({ ok: true, service: { pid: readState().pid, version: status.identity?.daemon?.version, service_generation: status.service_generation, artifact: status.identity?.daemon?.artifact } });',
+    '} else if (mode === \'shim-activation\') {',
+    '  const state = JSON.parse(fs.readFileSync(paths.state, \'utf8\'));',
+    '  const candidate = { path: state.active.entry, sha256: state.active.entry_sha256, version: state.active.version };',
+    '  const drain = await callDaemon(paths.socket, \'drain\', {});',
+    '  try {',
+    '    const service = await realActivateService(paths, candidate, { launchctl, healthTimeoutMs });',
+    '    emit({ ok: true, drain_ready: drain.ready_for_activation, candidate, service });',
+    '  } catch (error) {',
+    '    emit({ ok: false, drain_ready: drain.ready_for_activation, candidate, code: error.code ?? null, message: error.message, rollback: error.rollback ?? null, rollback_error: error.rollbackError ?? null });',
+    '  }',
+    '} else if (mode === \'real-update\') {',
+    '  try {',
+    '    const result = await updateCommand(paths, args, { launchctl, healthTimeoutMs });',
+    '    emit({ ok: true, result });',
+    '  } catch (error) {',
+    '    emit({ ok: false, code: error.code ?? null, message: error.message });',
+    '    process.exitCode = 1;',
+    '  }',
+    '} else {',
+    '  const callDaemon = async (_socket, command) => (command === \'activate-ready\'',
+    '    ? { ready_for_activation: true, activation_claim: claim }',
+    '    : { ready_for_activation: true });',
+    '  const activateService = async (_paths, candidate) => {',
+    '    fs.appendFileSync(process.env.R2_SERVICE_LOG, JSON.stringify({ label: process.env.R2_LABEL, candidate }) + \'\\n\');',
+    '    if (process.env.R2_FAIL_ACTIVATION === \'1\') throw new Error(\'SERVICE_BOOTSTRAP_INJECTED_FAILURE\');',
+    '    return { pid: 4321, service_generation: 9 };',
+    '  };',
+    '  try {',
+    '    const result = await updateCommand(paths, args, { callDaemon, activateService });',
+    '    emit({ ok: true, result });',
+    '  } catch (error) {',
+    '    emit({ ok: false, code: error.code ?? null, message: error.message });',
+    '    process.exitCode = 1;',
+    '  }',
     '}',
     '',
   ].join('\n'));
@@ -175,7 +295,7 @@ function writeDriver(directory) {
 // vB is a REAL second release: copy the shippable tree, bump the package, CLI,
 // and daemon-crate versions, rebuild the native payload against the shared
 // dependency cache, and let the release script restage the payload manifest.
-function packVersionB(packDir) {
+function packVersionB() {
   const vbSrc = path.join(ctx.workDir, 'vb-src');
   fs.mkdirSync(vbSrc);
   for (const entry of ['bin', 'cli', 'crates', 'profiles', 'npm', 'plugins', 'schema', 'launchd', 'scripts']) {
@@ -225,7 +345,9 @@ let setupPromise = null;
 const ensureR2 = () => (setupPromise ??= doSetup());
 
 async function doSetup() {
-  ctx.workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-r2-'));
+  // A short base keeps the product socket path below macOS SUN_LEN, exactly
+  // like the short-HOME fixture the S05 live test uses.
+  ctx.workDir = fs.mkdtempSync('/tmp/esr2-');
   ctx.home = path.join(ctx.workDir, 'home');
   fs.mkdirSync(ctx.home, { recursive: true });
   const shimDir = path.join(ctx.workDir, 'shim');
@@ -238,14 +360,14 @@ async function doSetup() {
   assert.equal(build.status, 0, `vA payload build failed: ${build.stderr}`);
   ctx.tgzA = npmPack(repoRoot);
   assert.equal(path.basename(ctx.tgzA), `external-subagent-${VERSION_A}.tgz`);
-  ctx.shaB = packVersionB();
+  const vbSha = packVersionB();
   ctx.tgzB = npmPack(path.join(ctx.workDir, 'vb-src'));
   assert.equal(path.basename(ctx.tgzB), `external-subagent-${VERSION_B}.tgz`);
-  ctx.shaA = (() => {
+  const repoSha = (() => {
     const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, PLATFORM_DIR, 'payload.json'), 'utf8'));
     return manifest.files.find((file) => file.name === 'external-subagentd').sha256;
   })();
-  assert.notEqual(ctx.shaB, ctx.shaA, 'the two real tarballs must carry different daemon artifacts');
+  assert.notEqual(vbSha, repoSha, 'the two real tarballs must carry different daemon artifacts');
 
   ctx.prefix = path.join(ctx.workDir, 'prefix');
   ctx.packageRoot = path.join(ctx.prefix, 'lib', 'node_modules', 'external-subagent');
@@ -265,7 +387,14 @@ async function doSetup() {
   assert.equal(ctx.initReport.ok, true);
 }
 
-after(() => { if (ctx.workDir) fs.rmSync(ctx.workDir, { recursive: true, force: true }); });
+after(() => {
+  if (!ctx.workDir) return;
+  const state = launchctlState();
+  if (state.pid) {
+    try { process.kill(state.pid, 'SIGTERM'); } catch { /* already gone */ }
+  }
+  fs.rmSync(ctx.workDir, { recursive: true, force: true });
+});
 
 const ensureVersionB = () => (ctx.vbPromise ??= doInstallVersionB());
 
@@ -389,6 +518,75 @@ test('the public reconcile command re-affirms the published active and rebinds h
     'reconcile activates from the published verified identity');
   assert.equal(rec.result.homes.all_updated, true);
   assert.equal(readReceipt().status, 'success');
+});
+
+test('the shim identity from active.entry cannot health-verify the real service the LaunchAgent pins', { skip: !testable }, async () => {
+  await ensureR2();
+  await ensureVersionB();
+
+  // Load the real service exactly like launchd would: the real plist spawns
+  // the real daemon binary, which answers status with its own identity.
+  const up = runDriver('service-up', [], { mode: 'service-up' });
+  assert.equal(up.ok, true, `service-up failed: ${up.message}`);
+  assert.equal(up.service.artifact.path, daemonEntry(), 'the running service is the native daemon the plist pins');
+  assert.equal(up.service.artifact.sha256, ctx.shaB);
+  assert.equal(up.service.version, VERSION_B);
+  const daemonPid = up.service.pid;
+
+  // THE PROOF: the REAL activateService, fed exactly the pre-fix identity
+  // (active.entry + entry_sha256), rewrites the service onto the npm shim,
+  // launches it, and can never become healthy — the service needs the native
+  // daemon artifact identity, not the bin shim.
+  const spawnCountBefore = launchctlLog().filter((entry) => entry.action === 'spawned').length;
+  const shim = runDriver('shim', [], { mode: 'shim-activation', healthTimeoutMs: 4_000 });
+  assert.equal(shim.ok, false, 'activating the shim identity must fail');
+  assert.equal(shim.drain_ready, true);
+  assert.equal(shim.candidate.path, binEntry(), 'the candidate is the npm bin shim published as active.entry');
+  assert.equal(shim.code, 'SERVICE_HEALTH_FAILED', 'the real health verification rejects the shim identity');
+  const spawned = launchctlLog().filter((entry) => entry.action === 'spawned').slice(spawnCountBefore);
+  assert.equal(spawned[0].program, binEntry(), 'activation actually rewrote the service onto the shim and launched it');
+  assert.equal(spawned.at(-1).program, daemonEntry(), 'rollback restored and relaunched the native daemon');
+  assert.ok(shim.rollback, 'the failed activation leaves rollback evidence');
+  assert.equal(plistProgram(), daemonEntry(), 'the service definition is restored to the daemon artifact');
+  const state = readState();
+  assert.equal(state.active.version, VERSION_B, 'a direct service failure leaves the published active untouched');
+  assert.notEqual(launchctlState().pid, daemonPid, 'the rollback produced a fresh daemon process');
+  assert.ok(launchctlState().pid, 'a daemon is running again after rollback');
+});
+
+test('the public update drives the real activation and health-verifies the verified daemon artifact', { skip: !testable }, async () => {
+  await ensureR2();
+  await ensureVersionB();
+  const pidBefore = launchctlState().pid;
+  assert.ok(pidBefore, 'the service from the previous leg is still the running daemon');
+  const spawnCountBefore = launchctlLog().filter((entry) => entry.action === 'spawned').length;
+
+  // Only the launchctl seam is injected: drain, claim, updateInstallation,
+  // activateService, health verification, and the real daemon RPC on the real
+  // socket all run for real from the installed package.
+  const real = runDriver('real', [], { mode: 'real-update' });
+  assert.equal(real.ok, true, `real update failed: ${real.code} ${real.message}`);
+  assert.equal(real.result.phase, 'active');
+  assert.equal(real.result.active.version, VERSION_B);
+  assert.equal(real.result.active.daemon_entry, daemonEntry());
+  assert.equal(real.result.active.daemon_entry_sha256, ctx.shaB);
+
+  const service = real.result.service;
+  assert.ok(Number.isInteger(service.pid) && service.pid > 0, 'health verification returned a real daemon pid');
+  assert.notEqual(service.pid, pidBefore, 'the daemon was replaced, not reused');
+  assert.equal(service.version, VERSION_B, 'the running daemon self-reports the payload version');
+  assert.equal(service.artifact.path, daemonEntry(), 'the daemon self-reports the verified daemon artifact path');
+  assert.equal(service.artifact.sha256, ctx.shaB, 'the daemon self-reports the verified payload digest');
+  assert.ok(service.service_generation, 'health verification captured the new service generation');
+
+  const spawned = launchctlLog().filter((entry) => entry.action === 'spawned').slice(spawnCountBefore);
+  assert.deepEqual(spawned.map((entry) => entry.program), [daemonEntry()], 'the public update relaunched exactly the native daemon, never the shim');
+  assert.equal(plistProgram(), daemonEntry(), 'the LaunchAgent keeps pinning the daemon artifact');
+  const receipt = readReceipt();
+  assert.equal(receipt.status, 'success');
+  assert.match(receipt.claim, /^agentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
+  const registry = JSON.parse(fs.readFileSync(path.join(paths().data, 'codex-homes.json'), 'utf8'));
+  assert.equal(registry.homes[0].last_status, 'updated', 'the real update re-bound the claimed codex home');
 });
 
 test('the retired vA version is rejected without touching the published vB active', { skip: !testable }, async () => {
