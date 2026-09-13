@@ -540,7 +540,8 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.notEqual(service.pid, pidA, 'the daemon was replaced, not reused');
     assert.ok(service.service_generation && service.service_generation !== generationA, 'the new daemon carries a new service generation');
     assert.equal(service.version, VERSION_B, 'the running daemon self-reports vB');
-    assert.equal(service.artifact.path, daemonEntry(), 'the daemon self-reports the verified artifact path');
+    assert.equal(service.artifact.path, update.result.active.retained.daemon_entry, 'the daemon self-reports the retained artifact path');
+    assert.equal(service.artifact.sha256, update.result.active.retained.daemon_entry_sha256, 'the running identity matches the retained payload digest');
     assert.equal(service.artifact.sha256, shaB, 'the daemon self-reports the verified payload digest');
     daemonPid = launchctlState().pid;
     assert.equal(daemonPid, service.pid, 'the loaded service process is the health-verified daemon');
