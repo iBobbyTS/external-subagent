@@ -20,6 +20,7 @@
     "README.md"
   ],
   "scripts": {
+    "postinstall": "node cli/install/npm-hook.mjs",
     "test:install": "node --test tests/install/*.test.mjs",
     "check": "node --check bin/external-subagent.mjs && node --check bin/external-subagent-mcp.mjs && node --check cli/main.mjs"
   },

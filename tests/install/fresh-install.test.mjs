@@ -131,9 +131,11 @@ test('install-only stages the package and payload without touching the home', { 
   assert.ok(fs.existsSync(ctx.mcpFacade), 'npm global MCP facade must exist');
 
   const installedPackage = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, 'package.json'), 'utf8'));
-  for (const lifecycle of ['preinstall', 'postinstall', 'prepublish', 'prepare']) {
+  for (const lifecycle of ['preinstall', 'prepublish', 'prepare']) {
     assert.equal(installedPackage.scripts?.[lifecycle], undefined, `plain install must not auto-run ${lifecycle}`);
   }
+  assert.equal(installedPackage.scripts?.postinstall, 'node cli/install/npm-hook.mjs',
+    'postinstall must only run the stage-only-safe coordination bridge');
 
   const payload = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
   assert.equal(payload.version, installedPackage.version, 'payload version must match the package version');
