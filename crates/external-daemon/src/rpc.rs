@@ -1577,6 +1577,14 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
     if !effective_spawn_supported(agent, entry) {
         return Vec::new();
     }
+    if agent == "dsh" {
+        // First-launch dsh admission proves only the read-bounded build and
+        // strict plan scopes; edit/yolo are refused before the prompt.
+        return vec![
+            AgentPermissionModeView::Build,
+            AgentPermissionModeView::Plan,
+        ];
+    }
     vec![
         AgentPermissionModeView::Build,
         AgentPermissionModeView::Edit,
@@ -1725,10 +1733,52 @@ fn resolve_admission(
         ));
     }
     let (model, model_source) = if agent == "dsh" {
-        (input.model.clone(), "catalog")
+        // Explicit spawn token, then the configured default, then the
+        // provider-native model. The configured default is a selection too:
+        // an unusable token is refused here rather than silently downgraded
+        // to native, and every selection is bounded exactly like the token
+        // the ACP session will receive after the prompt gate.
+        let token = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .or_else(|| configured.default_model.as_deref().map(str::trim));
+        match token {
+            Some(token) => {
+                if external_agent_dsh::acp::model::validate_catalog_token(token).is_err() {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "model token is not a bounded non-empty string",
+                    ));
+                }
+                if input.model.is_some() {
+                    (Some(token.to_owned()), "spawn_catalog")
+                } else {
+                    (Some(token.to_owned()), "configured_default")
+                }
+            }
+            None => (None, "native"),
+        }
     } else {
         (None, "native")
     };
+    if agent == "dsh" {
+        if !matches!(
+            input.manifest.permission_mode,
+            external_core::PermissionMode::Build | external_core::PermissionMode::Plan
+        ) {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "dsh first-launch admission supports only the build and plan permission modes; prompt_count=0",
+            ));
+        }
+        if !input.manifest.write_manifest.is_empty() {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "dsh first-launch admission requires the caller-empty write manifest; prompt_count=0",
+            ));
+        }
+    }
     Ok(external_core::AdmissionIdentity {
         agent: agent.to_owned(),
         config_revision: config.revision,
@@ -3574,7 +3624,7 @@ mod admission_tests {
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
         assert_eq!(identity.model.as_deref(), Some("opaque-token"));
-        assert_eq!(identity.model_source, "catalog");
+        assert_eq!(identity.model_source, "spawn_catalog");
         match previous_runtime {
             Some(value) => env::set_var("DSH_RUNTIME_PATH", value),
             None => env::remove_var("DSH_RUNTIME_PATH"),
@@ -3692,6 +3742,526 @@ mod admission_tests {
     }
 }
 
+/// Shared fixtures for the admission policy oracles. The environment guard
+/// serializes tests that install a process-wide agent-config file with every
+/// dispatch-based test that reads the configuration through the service.
+#[cfg(test)]
+pub(crate) mod admission_fixtures {
+    use super::*;
+
+    pub(crate) fn config_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Installs `EXTERNAL_SUBAGENT_CONFIG` for the guard-held scope and
+    /// restores the previous process environment on drop.
+    pub(crate) struct ConfigEnvScope {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ConfigEnvScope {
+        pub(crate) fn install(path: &Path) -> Self {
+            let previous = env::var_os("EXTERNAL_SUBAGENT_CONFIG");
+            env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for ConfigEnvScope {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => env::set_var("EXTERNAL_SUBAGENT_CONFIG", value),
+                None => env::remove_var("EXTERNAL_SUBAGENT_CONFIG"),
+            }
+        }
+    }
+
+    /// Fresh workspace root for admission oracles, kept under the
+    /// repository's prescribed live-agent scratch directory.
+    pub(crate) fn admission_root(prefix: &str) -> tempfile::TempDir {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    /// Writes an on-disk agent configuration whose DSH entry satisfies the
+    /// complete production spawn gate (enabled + spawn_supported + pinned
+    /// profile, version, and an executable absolute runtime).
+    pub(crate) fn gated_dsh_config(default_model: Option<&str>) -> tempfile::TempDir {
+        let root = admission_root("s04a-admission-config-");
+        let runtime = root.path().join("dsh-runtime");
+        fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&runtime).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&runtime, permissions).unwrap();
+        }
+        let config = serde_json::json!({
+            "schema_version": 1,
+            "revision": 7,
+            "agents": {
+                "zcode": {"enabled": true, "spawn_supported": true, "default_model": null},
+                "dsh": {
+                    "enabled": true,
+                    "spawn_supported": true,
+                    "default_model": default_model,
+                    "runtime_path": runtime.to_string_lossy(),
+                    "home": null,
+                    "profile": "acp",
+                    "version": external_agent_dsh::profile::PINNED_DSH_VERSION,
+                }
+            }
+        });
+        fs::write(
+            root.path().join("agents.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        root
+    }
+
+    pub(crate) fn gated_dsh_snapshot(root: &tempfile::TempDir) -> AgentConfigSnapshot {
+        serde_json::from_str::<AgentConfigSnapshot>(
+            &fs::read_to_string(root.path().join("agents.json")).unwrap(),
+        )
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod admission_policy_tests {
+    use super::admission_fixtures::{
+        admission_root, config_env_guard, gated_dsh_config, gated_dsh_snapshot, ConfigEnvScope,
+    };
+    use super::*;
+
+    fn policy_input(
+        agent: Option<&str>,
+        model: Option<&str>,
+        permission_mode: external_core::PermissionMode,
+        write_manifest: &[&str],
+    ) -> GeneralSubmitInput {
+        GeneralSubmitInput {
+            agent: agent.map(str::to_owned),
+            model: model.map(str::to_owned),
+            manifest: external_core::GeneralTaskManifest {
+                schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                agent_id: "admission-oracle".into(),
+                repository: PathBuf::from("/admission-oracle-repository"),
+                permission_mode,
+                prompt: "admission oracle".into(),
+                write_manifest: write_manifest.iter().map(PathBuf::from).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn dsh_model_precedence_is_spawn_then_configured_default_then_native() {
+        let root = gated_dsh_config(Some("configured-default-token"));
+        let config = gated_dsh_snapshot(&root);
+
+        let explicit = policy_input(
+            Some("dsh"),
+            Some("  spawn-token  "),
+            external_core::PermissionMode::Build,
+            &[],
+        );
+        let identity = resolve_admission(&explicit, &config).unwrap();
+        assert_eq!(identity.agent, "dsh");
+        assert_eq!(identity.model.as_deref(), Some("spawn-token"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+
+        let fallback = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
+        let identity = resolve_admission(&fallback, &config).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("configured-default-token"));
+        assert_eq!(identity.model_source, "configured_default");
+
+        let native_root = gated_dsh_config(None);
+        let native_config = gated_dsh_snapshot(&native_root);
+        let omitted = policy_input(Some("dsh"), None, external_core::PermissionMode::Plan, &[]);
+        let identity = resolve_admission(&omitted, &native_config).unwrap();
+        assert_eq!(identity.model, None);
+        assert_eq!(identity.model_source, "native");
+    }
+
+    #[test]
+    fn dsh_invalid_resolved_model_token_is_refused_before_the_task_exists() {
+        let root = gated_dsh_config(Some("configured-default-token"));
+        let config = gated_dsh_snapshot(&root);
+        // A spawn token beyond the opaque catalog-token bound the ACP session
+        // enforces must fail admission, not the task after it is persisted.
+        let oversized = policy_input(
+            Some("dsh"),
+            Some(&"t".repeat(513)),
+            external_core::PermissionMode::Build,
+            &[],
+        );
+        assert_eq!(
+            resolve_admission(&oversized, &config).unwrap_err().code,
+            RpcErrorCode::Validation
+        );
+        // The configured default is a selection too: an unusable default is
+        // refused before prompt rather than silently downgraded to native.
+        let mut invalid_default = config.clone();
+        invalid_default.agents.get_mut("dsh").unwrap().default_model = Some("   ".into());
+        let defaulted = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
+        assert_eq!(
+            resolve_admission(&defaulted, &invalid_default)
+                .unwrap_err()
+                .code,
+            RpcErrorCode::Validation
+        );
+        // The bound itself stays exact: the largest bounded token admits.
+        let bounded = policy_input(
+            Some("dsh"),
+            Some(&"t".repeat(512)),
+            external_core::PermissionMode::Build,
+            &[],
+        );
+        assert!(resolve_admission(&bounded, &config).is_ok());
+    }
+
+    #[test]
+    fn dsh_first_launch_scope_rejects_unproven_modes_and_exact_manifests() {
+        let root = gated_dsh_config(Some("configured-default-token"));
+        let config = gated_dsh_snapshot(&root);
+        for mode in [
+            external_core::PermissionMode::Edit,
+            external_core::PermissionMode::Yolo,
+        ] {
+            let input = policy_input(Some("dsh"), None, mode, &[]);
+            assert_eq!(
+                resolve_admission(&input, &config).unwrap_err().code,
+                RpcErrorCode::AgentUnsupported,
+                "dsh must refuse {mode:?} before prompt"
+            );
+        }
+        for mode in [
+            external_core::PermissionMode::Build,
+            external_core::PermissionMode::Plan,
+        ] {
+            let input = policy_input(Some("dsh"), None, mode, &["src/main.rs"]);
+            assert_eq!(
+                resolve_admission(&input, &config).unwrap_err().code,
+                RpcErrorCode::AgentUnsupported,
+                "dsh must refuse an exact caller write manifest in {mode:?}"
+            );
+        }
+        // The admitted forms remain exactly build with the caller-empty
+        // write manifest (the generic layer derives the protected workspace
+        // scope from it) and strict plan.
+        for mode in [
+            external_core::PermissionMode::Build,
+            external_core::PermissionMode::Plan,
+        ] {
+            let input = policy_input(Some("dsh"), None, mode, &[]);
+            assert_eq!(resolve_admission(&input, &config).unwrap().agent, "dsh");
+        }
+    }
+
+    /// The exact `submit_general` wire frame the CLI emits over the daemon
+    /// socket, so the oracle pins the public RPC entrypoint itself.
+    fn cli_submit_frame(
+        request_id: &str,
+        agent: &str,
+        model: Option<&str>,
+        repository: &Path,
+        mode: &str,
+        write_manifest: &[&str],
+    ) -> Vec<u8> {
+        let mut input = serde_json::Map::new();
+        input.insert("agent".into(), serde_json::json!(agent));
+        if let Some(model) = model {
+            input.insert("model".into(), serde_json::json!(model));
+        }
+        input.insert(
+            "manifest".into(),
+            serde_json::json!({
+                "schema": external_core::GENERAL_TASK_SCHEMA,
+                "agent_id": "cli-admission-oracle",
+                "repository": repository.to_string_lossy(),
+                "permission_mode": mode,
+                "prompt": "cli admission oracle",
+                "write_manifest": write_manifest,
+            }),
+        );
+        serde_json::to_vec(&serde_json::json!({
+            "version": RPC_VERSION,
+            "request_id": request_id,
+            "method": "submit_general",
+            "params": {"input": input},
+        }))
+        .unwrap()
+    }
+
+    fn submit(
+        service: &RpcService,
+        request_id: &str,
+        agent: &str,
+        model: Option<&str>,
+        repository: &Path,
+        mode: &str,
+        write_manifest: &[&str],
+    ) -> RpcResponse {
+        let frame = cli_submit_frame(request_id, agent, model, repository, mode, write_manifest);
+        service.handle_bytes(&frame)
+    }
+
+    fn scoped_task_count(store: &Store, repository: &Path) -> usize {
+        let repository = repository.canonicalize().unwrap();
+        let repository = repository.to_string_lossy().into_owned();
+        store
+            .list_task_page(
+                TaskQueryScope {
+                    repository: Some(repository.as_str()),
+                },
+                TaskPageFilter {
+                    agent: None,
+                    phase: None,
+                    outcome: None,
+                },
+                None,
+                MAX_LIST_TASKS,
+            )
+            .unwrap()
+            .tasks
+            .len()
+    }
+
+    #[test]
+    fn cli_rpc_entrypoint_enforces_dsh_scope_before_any_task_or_prompt() {
+        let _env_guard = config_env_guard();
+        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
+        let (_directory, service, _id) = wait_tests::fixture();
+        let store = service.store_for_wait_test();
+        let workspace = admission_root("s04a-cli-dsh-reject-");
+
+        for (mode, manifest, request_id) in [
+            ("edit", Vec::new(), "dsh-edit"),
+            ("yolo", Vec::new(), "dsh-yolo"),
+            ("build", vec!["src/main.rs"], "dsh-build-exact"),
+            ("plan", vec!["src/main.rs"], "dsh-plan-exact"),
+        ] {
+            let response = submit(
+                &service,
+                request_id,
+                "dsh",
+                None,
+                workspace.path(),
+                mode,
+                &manifest,
+            );
+            let RpcOutcome::Error { error } = response.outcome else {
+                panic!("{request_id} must be rejected before prompt")
+            };
+            assert_eq!(error.code, RpcErrorCode::AgentUnsupported, "{request_id}");
+            assert!(
+                error.message.contains("prompt_count=0"),
+                "{request_id}: {}",
+                error.message
+            );
+            let wire =
+                serde_json::to_value(&RpcResponse::error(Some(request_id.into()), error)).unwrap();
+            assert_eq!(wire["error"]["code"], "agent_unsupported", "{request_id}");
+        }
+        assert_eq!(scoped_task_count(&store, workspace.path()), 0);
+    }
+
+    #[test]
+    fn cli_rpc_entrypoint_admits_dsh_build_and_persists_the_resolved_identity() {
+        let _env_guard = config_env_guard();
+        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
+        let (directory, service, _id) = wait_tests::fixture();
+        let store = service.store_for_wait_test();
+        let spawn_root = admission_root("s04a-cli-dsh-admit-");
+
+        let explicit_workspace = spawn_root.path().join("explicit");
+        fs::create_dir(&explicit_workspace).unwrap();
+        let response = submit(
+            &service,
+            "dsh-explicit",
+            "dsh",
+            Some("spawn-token"),
+            &explicit_workspace,
+            "build",
+            &[],
+        );
+        let RpcOutcome::Success { result } = response.outcome else {
+            panic!("gated dsh build with the caller-empty manifest must admit")
+        };
+        let RpcSuccess::GeneralSubmitted { task, .. } = *result else {
+            panic!("expected a submitted task")
+        };
+        let explicit_identity = task.input_identity.admission.clone().unwrap();
+        assert_eq!(explicit_identity.model.as_deref(), Some("spawn-token"));
+        assert_eq!(explicit_identity.model_source, "spawn_catalog");
+
+        let default_workspace = spawn_root.path().join("default");
+        fs::create_dir(&default_workspace).unwrap();
+        let response = submit(
+            &service,
+            "dsh-default",
+            "dsh",
+            None,
+            &default_workspace,
+            "build",
+            &[],
+        );
+        let RpcOutcome::Success { result } = response.outcome else {
+            panic!("dsh build without a spawn model must fall back to the configured default")
+        };
+        let RpcSuccess::GeneralSubmitted {
+            task: default_task, ..
+        } = *result
+        else {
+            panic!("expected a submitted task")
+        };
+        let default_identity = default_task.input_identity.admission.clone().unwrap();
+        assert_eq!(
+            default_identity.model.as_deref(),
+            Some("configured-default-token")
+        );
+        assert_eq!(default_identity.model_source, "configured_default");
+
+        // The resolved selection is immutable task identity: reopening the
+        // store keeps it inside the validated prepared digest, and the
+        // caller-empty build manifest was expanded to the protected
+        // workspace scope instead of being rejected.
+        let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
+        for (agent_id, identity) in [
+            (&task.agent_id, &explicit_identity),
+            (&default_task.agent_id, &default_identity),
+        ] {
+            let stored = reopened.get_task(agent_id).unwrap().unwrap();
+            let prepared: external_core::PreparedGeneralTask =
+                serde_json::from_str(&stored.prepared_launch_json).unwrap();
+            prepared.validate_digest().unwrap();
+            assert_eq!(prepared.admission.as_ref(), Some(identity));
+            assert_eq!(prepared.write_manifest, vec![PathBuf::from(".")]);
+        }
+        assert_eq!(scoped_task_count(&store, &explicit_workspace), 1);
+    }
+
+    #[test]
+    fn status_publishes_dsh_first_launch_permission_modes_only() {
+        let _env_guard = config_env_guard();
+        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
+        let (_directory, service, _id) = wait_tests::fixture();
+        let RpcSuccess::SystemStatus { status } =
+            service.dispatch(RpcMethod::SystemStatus).unwrap()
+        else {
+            panic!("expected status")
+        };
+        let dsh = status
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "dsh")
+            .unwrap();
+        assert!(dsh.spawn_supported);
+        assert_eq!(
+            dsh.permission_modes,
+            vec![
+                AgentPermissionModeView::Build,
+                AgentPermissionModeView::Plan
+            ]
+        );
+        let zcode = status
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "zcode")
+            .unwrap();
+        assert_eq!(
+            zcode.permission_modes,
+            vec![
+                AgentPermissionModeView::Build,
+                AgentPermissionModeView::Edit,
+                AgentPermissionModeView::Plan,
+                AgentPermissionModeView::Yolo,
+            ]
+        );
+    }
+
+    #[test]
+    fn zcode_admission_capabilities_are_unchanged() {
+        // No EXTERNAL_SUBAGENT_CONFIG: the default snapshot keeps zcode
+        // enabled with all four modes, exact caller manifests, and the
+        // empty-manifest expansion to the protected workspace scope.
+        let (directory, service, _id) = wait_tests::fixture();
+        let zcode_root = admission_root("s04a-cli-zcode-");
+        for (request_id, mode, manifest) in [
+            ("zcode-edit-exact", "edit", vec!["src/zone.rs"]),
+            ("zcode-yolo", "yolo", Vec::new()),
+            ("zcode-build-exact", "build", vec!["docs/notes.md"]),
+        ] {
+            let workspace = zcode_root.path().join(request_id);
+            fs::create_dir(&workspace).unwrap();
+            let response = submit(
+                &service, request_id, "zcode", None, &workspace, mode, &manifest,
+            );
+            let RpcOutcome::Success { result } = response.outcome else {
+                panic!("zcode {mode} must keep its existing admission")
+            };
+            let RpcSuccess::GeneralSubmitted { task, .. } = *result else {
+                panic!("expected a submitted task")
+            };
+            let identity = task.input_identity.admission.clone().unwrap();
+            assert_eq!(identity.agent, "zcode");
+            assert_eq!(identity.model, None);
+            assert_eq!(identity.model_source, "native");
+        }
+        let build_workspace = zcode_root.path().join("zcode-build-empty");
+        fs::create_dir(&build_workspace).unwrap();
+        let response = submit(
+            &service,
+            "zcode-build-empty",
+            "zcode",
+            None,
+            &build_workspace,
+            "build",
+            &[],
+        );
+        let RpcOutcome::Success { result } = response.outcome else {
+            panic!("zcode build with an empty manifest must admit")
+        };
+        let RpcSuccess::GeneralSubmitted { task, .. } = *result else {
+            panic!("expected a submitted task")
+        };
+        let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
+        let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
+        let prepared: external_core::PreparedGeneralTask =
+            serde_json::from_str(&stored.prepared_launch_json).unwrap();
+        assert_eq!(prepared.write_manifest, vec![PathBuf::from(".")]);
+
+        // ZCode model selection stays explicitly refused before prompt.
+        let response = submit(
+            &service,
+            "zcode-model",
+            "zcode",
+            Some("glm-5.3"),
+            &build_workspace,
+            "build",
+            &[],
+        );
+        let RpcOutcome::Error { error } = response.outcome else {
+            panic!("zcode model selection must be refused")
+        };
+        assert_eq!(error.code, RpcErrorCode::ModelSelectionUnsupported);
+        assert!(error.message.contains("prompt_count=0"));
+    }
+}
+
 #[cfg(test)]
 mod agent_probe_tests {
     use super::*;
@@ -3745,6 +4315,7 @@ mod agent_probe_tests {
 
     #[test]
     fn status_is_passive_and_explicit_probe_records_scoped_evidence() {
+        let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
         let RpcSuccess::SystemStatus { status } =
             service.dispatch(RpcMethod::SystemStatus).unwrap()
@@ -3855,6 +4426,7 @@ mod agent_probe_tests {
 
     #[test]
     fn agent_models_rpc_preserves_native_only_result_and_config_identity() {
+        let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
         let RpcSuccess::AgentModels { catalog } = service
             .dispatch(RpcMethod::AgentModels {
