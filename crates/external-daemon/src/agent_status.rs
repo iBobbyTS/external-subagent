@@ -1592,6 +1592,8 @@ mod tests {
         let scope = ProbeScope {
             workspace: Some("/workspace-a".into()),
             home: Some("/home-a".into()),
+            profile: None,
+            version: None,
         };
         let store = AgentEvidenceStore::with_backend(Arc::new(FixtureBackend {
             evidence: evidence(scope.clone()),
@@ -2082,6 +2084,8 @@ process.stdin.on('data', (chunk) => {
             let scope = ProbeScope {
                 workspace: Some(workspace.to_string_lossy().into_owned()),
                 home: Some(home.to_string_lossy().into_owned()),
+                profile: None,
+                version: None,
             };
             let (auth, hi) = probe_dsh_hi(Some(&runtime), &scope, None, 0);
             assert_eq!(auth.state, EvidenceState::Unknown);
