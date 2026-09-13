@@ -1521,11 +1521,31 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
     }
     entry.enabled
         && entry.spawn_supported
+        && entry.profile.as_deref().unwrap_or("acp") == "acp"
+        && entry
+            .version
+            .as_deref()
+            .is_none_or(|version| version == external_agent_dsh::profile::PINNED_DSH_VERSION)
         && entry
             .runtime_path
             .as_deref()
             .map(Path::new)
-            .is_some_and(|path| path.is_absolute() && fs::metadata(path).is_ok_and(|m| m.is_file()))
+            .is_some_and(|path| {
+                path.is_absolute()
+                    && fs::metadata(path).is_ok_and(|m| {
+                        m.is_file() && {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                m.permissions().mode() & 0o111 != 0
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                true
+                            }
+                        }
+                    })
+            })
 }
 
 fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {

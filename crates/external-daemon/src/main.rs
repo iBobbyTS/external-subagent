@@ -107,7 +107,20 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
             .and_then(|entry| entry.get("runtime_path"))
             .and_then(serde_json::Value::as_str)
             .map(Path::new)
-            .is_some_and(|runtime| runtime.is_absolute() && runtime.is_file())
+            .is_some_and(|runtime| {
+                runtime.is_absolute()
+                    && runtime.is_file()
+                    && configured
+                        .and_then(|entry| entry.get("profile"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|profile| profile == "acp")
+                    && configured
+                        .and_then(|entry| entry.get("version"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|version| {
+                            version == external_agent_dsh::profile::PINNED_DSH_VERSION
+                        })
+            })
 }
 
 fn configure_dsh_environment(path: Option<&Path>) {
