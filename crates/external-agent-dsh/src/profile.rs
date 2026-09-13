@@ -659,10 +659,21 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                     match id {
                         "sandbox-policy" => {
                             saw.0 += 1;
-                            let config =
-                                pinned_control_config(m, id, &["mode", "workspaceRoot"])?;
+                            let config = pinned_control_config(m, id, &["mode", "workspaceRoot"])?;
                             if config.get("mode").and_then(|v| v.as_str()) != Some("read-only") {
                                 return Err("sandbox-policy must pin mode read-only".into());
+                            }
+                            // The managed patch pins only the mode; the root is
+                            // the shipped default expression, kept verbatim
+                            // because resolve_launch pins the child cwd to the
+                            // task workspace. Any other value is drift.
+                            if let Some(root) = config.get("workspaceRoot") {
+                                if root.as_str() != Some("process.cwd()") {
+                                    return Err(
+                                        "sandbox-policy workspaceRoot must stay process.cwd()"
+                                            .into(),
+                                    );
+                                }
                             }
                         }
                         "approval" => {
@@ -1207,6 +1218,8 @@ else:
             // drifted values
             "- id: sandbox-policy\n  config:\n    mode: workspace-write\n- id: approval\n  config:\n    policy: ask".to_string(),
             "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: never".to_string(),
+            // drifted workspaceRoot
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n    workspaceRoot: /\n- id: approval\n  config:\n    policy: ask".to_string(),
             // unmanaged config keys
             "- id: sandbox-policy\n  config:\n    mode: read-only\n    autoAllow: true\n- id: approval\n  config:\n    policy: ask".to_string(),
             "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask\n    autoApprove: true".to_string(),
@@ -1221,6 +1234,13 @@ else:
             {"id": "approval", "config": {"policy": "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"}},
         ]);
         validate_dump_policy(&serde_yaml::to_value(&conditional).unwrap()).unwrap();
+        // The shipped default root expression is kept verbatim alongside the
+        // patch-pinned mode; the drift loop above rejects any other value.
+        let shipped_root = serde_json::json!([
+            {"id": "sandbox-policy", "config": {"mode": "read-only", "workspaceRoot": "process.cwd()"}},
+            {"id": "approval", "config": {"policy": "ask"}},
+        ]);
+        validate_dump_policy(&serde_yaml::to_value(&shipped_root).unwrap()).unwrap();
     }
 
     #[test]
