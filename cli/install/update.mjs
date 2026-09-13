@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
+import { atomicWrite, jsonBytes, sha256 } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
 import { reconcileCodexHomes } from './reconcile.mjs';
 import { packageVersion, packageRoot } from './layout.mjs';
+import { loadUpdateState } from './recovery.mjs';
 import { verifyPayload } from './payload.mjs';
 
 const SCHEMA_VERSION = 2;
@@ -30,7 +31,38 @@ function withLock(paths, fn) {
 }
 
 function readState(paths) {
-  try { return JSON.parse(fs.readFileSync(paths.state, 'utf8')); } catch { return { schema_version: SCHEMA_VERSION, candidate: null, active: null, phase: 'idle' }; }
+  const { state, recovery } = loadUpdateState(paths.state);
+  return { state: state ?? { schema_version: SCHEMA_VERSION, candidate: null, active: null, phase: 'idle' }, recovery };
+}
+
+// npm replaces the package directory in place, so the bytes the published
+// active identity was verified against disappear with the next install.  The
+// retained payload store keeps byte-for-byte copies of the verified release
+// (native artifacts, stable entry, release manifest) under versioned product
+// data, outside the directory npm is about to overwrite: active/rollback keep
+// pointing at readable, verifiable old bytes.
+function retainPayload(paths, candidateRoot, verified) {
+  const root = path.join(paths.data, 'payload-store', verified.version);
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const platformDir = path.join(fs.realpathSync(candidateRoot), 'npm', 'native', verified.payload.platform);
+  for (const file of verified.payload.files) {
+    atomicWrite(path.join(root, file.name), fs.readFileSync(path.join(platformDir, file.name)), 0o755);
+  }
+  atomicWrite(path.join(root, 'external-subagent.mjs'), fs.readFileSync(verified.stable.entry), 0o755);
+  atomicWrite(path.join(root, 'payload.json'), fs.readFileSync(path.join(platformDir, 'payload.json')));
+  const retained = {
+    root,
+    entry: path.join(root, 'external-subagent.mjs'),
+    entry_sha256: verified.stable.digest,
+    daemon_entry: path.join(root, 'external-subagentd'),
+    daemon_entry_sha256: verified.daemon.digest,
+  };
+  for (const [file, digest] of [[retained.daemon_entry, verified.daemon.digest], [retained.entry, verified.stable.digest]]) {
+    if (sha256(fs.readFileSync(file)) !== digest) {
+      throw new CliError('PAYLOAD_RETENTION_FAILED', `retained copy of ${path.basename(file)} does not match the verified digest`);
+    }
+  }
+  return retained;
 }
 
 function verifyStableEntry(candidateRoot) {
@@ -83,7 +115,7 @@ export function updateInstallation(paths, options = {}) {
     // artifact must never publish candidate state or touch a single Codex home.
     const stable = verifyStableEntry(candidateRoot);
     const daemon = verifyDaemonArtifact(candidateRoot, payload);
-    const prior = readState(paths);
+    const { state: prior, recovery } = readState(paths);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, root: candidateRoot, payload: payload.files }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const publishedCandidate = state.candidate;
@@ -105,9 +137,10 @@ export function updateInstallation(paths, options = {}) {
         state.active.entry_sha256 = stableNow.digest;
         state.active.daemon_entry = daemonNow.entry;
         state.active.daemon_entry_sha256 = daemonNow.digest;
+        state.active.retained = retainPayload(paths, candidateRoot, { version: verifiedVersion, payload, stable: stableNow, daemon: daemonNow });
       }
       atomicWrite(paths.state, jsonBytes(state));
-      return state;
+      return recovery ? { ...state, recovery } : state;
     } catch (error) {
       // Record retryable failure evidence instead of a phantom in-flight
       // candidate: the prior active stays published and the rejected
@@ -121,5 +154,5 @@ export function updateInstallation(paths, options = {}) {
 
 export function reconcileInstallation(paths, options = {}) {
   if (options.cancelActive && !options.yes) throw new CliError('CONFIRMATION_REQUIRED', '--cancel-active requires --yes');
-  return withLock(paths, () => readState(paths));
+  return withLock(paths, () => readState(paths).state);
 }

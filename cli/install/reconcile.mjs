@@ -3,6 +3,7 @@ import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional } from '../fs-atomic.mjs';
 import { installPlugin } from './codex.mjs';
+import { packageVersion } from './layout.mjs';
 
 // D08: the single owner of the global installed-Codex-homes registry.  The
 // registry records every Codex home this product has successfully claimed via
@@ -130,6 +131,40 @@ function writableDirectory(home) {
     fs.accessSync(home, fs.constants.W_OK);
     return true;
   } catch { return false; }
+}
+
+// The auto-coordination entry for npm-driven updates (U06): npm replaces the
+// package directory in place, so an ALREADY-INITIALIZED product detects here
+// that the installed package and its published active payload have drifted.
+// Detection is strictly local: no daemon RPC, no codex invocation, no provider
+// probe, and not one byte of product state is written, so an ordinary
+// read-only status can never fire a paid probe through this path.  A product
+// that was never initialized stays stage-only — first installs never activate —
+// and a corrupted state coordinates through the updater, which preserves the
+// corrupted bytes as evidence instead of treating them as an empty state.
+export function npmUpdateCoordination(paths) {
+  const installed = packageVersion();
+  const file = readOptional(paths.state);
+  let state = null;
+  let readable = true;
+  if (file !== null) {
+    try { state = JSON.parse(file); } catch { state = null; readable = false; }
+  }
+  const active = state && typeof state === 'object' && state.active && typeof state.active === 'object' ? state.active : null;
+  if (!active) {
+    return file === null
+      ? { initialized: false, stage_only: true, package_version: installed, active_version: null, update_pending: false, coordination: 'none' }
+      : { initialized: false, state_readable: readable, stage_only: false, package_version: installed, active_version: null, update_pending: true, coordination: 'update' };
+  }
+  const update_pending = installed !== active.version;
+  return {
+    initialized: true,
+    stage_only: false,
+    package_version: installed,
+    active_version: active.version,
+    update_pending,
+    coordination: update_pending ? 'update' : 'reaffirm',
+  };
 }
 
 // Refresh the managed binding in every registered, writable Codex home.
