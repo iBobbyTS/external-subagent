@@ -30,7 +30,8 @@ reject business commands without writing HOME.
 See [docs/operations.md](docs/operations.md) for service control, PATH
 behavior, the Codex homes registry, backup/removal, and release checks; and
 [docs/compatibility/codex.md](docs/compatibility/codex.md) for the verified
-codex-cli interface.
+codex-cli interface. See [docs/product.md](docs/product.md) for the product
+workflow, provider configuration, and CLI/MCP acceptance boundary.
 
 ## Development
 
