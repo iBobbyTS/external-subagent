@@ -611,7 +611,10 @@ fn run_dsh_catalog(
             Ok(catalog) => match parse_opaque_model_tokens(&catalog) {
                 Ok(tokens) if !tokens.is_empty() => Ok(tokens),
                 _ if !session_catalog.is_empty() => Ok(session_catalog),
-                Ok(tokens) => Ok(tokens),
+                // Ok must imply a non-empty catalog: when neither models/list
+                // nor session/new exposed a usable token, fail closed with a
+                // diagnosable reason instead of an empty Ok catalog.
+                Ok(_) => Err("model_catalog_empty".into()),
                 Err(error) => Err(error),
             },
             Err(_) if !session_catalog.is_empty() => Ok(session_catalog),
@@ -2224,6 +2227,73 @@ process.stdin.on('data', (chunk) => {
             ["initialize", "session/new", "models/list"]
         );
         assert!(requests.iter().all(|request| request["jsonrpc"] == "2.0"));
+    }
+
+    #[test]
+    fn dsh_catalog_fails_closed_when_catalog_sources_lack_model_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("fake-dsh-empty-catalog");
+        let log = directory.path().join("requests.jsonl");
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('dsh-fixture-1.2.3\n'); process.exit(0); }
+const log = __LOG__;
+let buffer = '';
+const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    fs.appendFileSync(log, JSON.stringify(request) + '\n');
+    if (request.method === 'initialize') write({ jsonrpc:'2.0', id:request.id, result:{ protocolVersion:1, capabilities:{ models:true } } });
+    else if (request.method === 'session/new') write({ jsonrpc:'2.0', id:request.id, result:{ sessionId:'empty-catalog-session' } });
+    else if (request.method === 'models/list') write({ jsonrpc:'2.0', id:request.id, result:{ models: [] } });
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(&log).unwrap());
+        fs::write(&runtime, source).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let scope = ProbeScope {
+            workspace: Some(directory.path().to_string_lossy().into_owned()),
+            home: Some(directory.path().to_string_lossy().into_owned()),
+            profile: None,
+            version: None,
+        };
+        // Counterexample: models/list succeeds with zero tokens and session/new
+        // exposes none, so the catalog must fail closed, not return an empty Ok.
+        assert_eq!(
+            run_dsh_catalog(&runtime, &scope, DSH_CATALOG_TIMEOUT),
+            Err("model_catalog_empty".to_owned())
+        );
+        let output = probe_dsh_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "dsh".into(),
+                scope,
+            },
+        );
+        assert!(!output.supported);
+        assert!(output.models.is_empty());
+        assert_eq!(output.reason.as_deref(), Some("model_catalog_empty"));
+        let requests = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["initialize", "session/new", "models/list", "initialize", "session/new", "models/list"]
+        );
     }
 
     #[test]
