@@ -2605,4 +2605,41 @@ mod tests {
             .complete_message("message", Some("replayed-turn"))
             .unwrap());
     }
+
+    #[test]
+    fn message_insert_is_idempotent_and_rejects_identity_drift() {
+        let (_directory, _path, store) = store();
+        store.enqueue_task_authoritative(&task("agent", "/repo", None)).unwrap();
+        running(&store, "agent");
+        assert!(store.insert_message("m", "agent", "queue", "hello").unwrap());
+        assert!(!store.insert_message("m", "agent", "queue", "hello").unwrap());
+        assert!(matches!(store.insert_message("m", "agent", "queue", "changed"), Err(StoreError::Conflict(_))));
+    }
+
+    #[test]
+    fn pending_response_claim_complete_and_duplicate_are_stateful() {
+        let (_directory, _path, store) = store();
+        store.enqueue_task_authoritative(&task("agent", "/repo", None)).unwrap();
+        running(&store, "agent");
+        assert!(store.insert_pending_request("r", "agent", "c", "permission", "{}").unwrap());
+        assert_eq!(store.pending_request("agent", "r").unwrap().unwrap().state, PendingRequestState::Pending);
+        assert_eq!(store.claim_pending_response_if_accepting("agent", "r", "allow", Some("ok")).unwrap(), PendingResponseClaimDisposition::Claimed);
+        assert_eq!(store.claim_pending_response_if_accepting("agent", "r", "allow", None).unwrap(), PendingResponseClaimDisposition::NotPending(PendingRequestState::Sending));
+        assert!(store.complete_pending_response("agent", "r").unwrap());
+        assert!(!store.complete_pending_response("agent", "r").unwrap());
+        assert_eq!(store.pending_request("agent", "r").unwrap().unwrap().state, PendingRequestState::Responded);
+    }
+
+    #[test]
+    fn failed_message_insert_rolls_back_without_receipt() {
+        let (_directory, _path, store) = store();
+        store.enqueue_task_authoritative(&task("agent", "/repo", None)).unwrap();
+        running(&store, "agent");
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch("CREATE TRIGGER reject_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        }
+        assert!(matches!(store.insert_message("m", "agent", "queue", "hello"), Err(StoreError::Sqlite(_))));
+        assert!(store.message("m").unwrap().is_none());
+    }
 }
