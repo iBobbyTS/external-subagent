@@ -317,6 +317,8 @@ fn probe_dsh_hi(
         workspace,
         scope.home.as_ref().map(PathBuf::from),
     );
+    launch.profile = env::var("DSH_PROFILE").ok();
+    launch.version = env::var("DSH_VERSION").ok();
     launch.permission_mode = Some("read-only".into());
     // The embedded resource survives native/npm installation without the build
     // source tree. The private directory lives until the ACP child is reaped.

@@ -36,6 +36,8 @@ pub struct DshLaunch {
     pub workspace: PathBuf,
     /// Explicit provider home override. Absence inherits the environment.
     pub home: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub version: Option<String>,
     pub permission_mode: Option<String>,
     pub patch: Option<PathBuf>,
 }
@@ -50,6 +52,8 @@ impl DshLaunch {
             executable,
             workspace: workspace.into(),
             home,
+            profile: None,
+            version: None,
             permission_mode: None,
             patch: None,
         }
@@ -96,7 +100,22 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
     } else {
         Command::new(executable)
     };
-    command.arg("--profile").arg("acp");
+    let profile = launch.profile.as_deref().unwrap_or("acp");
+    if profile != "acp" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported DSH profile",
+        ));
+    }
+    command.arg("--profile").arg(profile);
+    if let Some(version) = launch.version.as_deref() {
+        if version != PINNED_DSH_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported DSH version",
+            ));
+        }
+    }
     if let Some(patch) = launch.patch.as_deref() {
         if !patch.is_absolute() || !patch.is_file() {
             return Err(io::Error::new(
@@ -783,6 +802,26 @@ mod tests {
         assert!(command.get_args().any(|arg| arg == script.as_os_str()));
         assert_eq!(command.get_current_dir(), Some(temp_workspace().as_path()));
         std::fs::remove_file(script).unwrap();
+    }
+
+    #[test]
+    fn launch_profile_and_version_are_explicit_and_fail_closed() {
+        let runtime = temp_workspace().join("runtime.mjs");
+        std::fs::write(&runtime, "").unwrap();
+        let mut launch = DshLaunch::new(Some(runtime), temp_workspace(), None);
+        launch.profile = Some("acp".into());
+        launch.version = Some(PINNED_DSH_VERSION.into());
+        let command = resolve_launch(&launch).unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|pair| pair == ["--profile", "acp"]));
+        launch.version = Some("0.0.0".into());
+        assert!(resolve_launch(&launch).is_err());
+        launch.version = None;
+        launch.profile = Some("unsafe".into());
+        assert!(resolve_launch(&launch).is_err());
     }
 
     #[test]
