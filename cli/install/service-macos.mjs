@@ -19,8 +19,8 @@ function escapeXml(value) {
 
 export function launchAgentPlist(paths) {
   const daemon = nativeBinary('external-subagentd');
-  const dshRuntime = process.env.DSH_RUNTIME_PATH;
-  const dshHome = process.env.DSH_HOME;
+  let dshRuntime; let dshHome; let dshProfile; let dshVersion;
+  try { const configured = JSON.parse(fs.readFileSync(paths.config, 'utf8')).agents?.dsh || {}; dshRuntime = configured.runtime_path; dshHome = configured.home; dshProfile = configured.profile; dshVersion = configured.version; } catch {}
   let configRevision = null;
   try {
     const config = JSON.parse(fs.readFileSync(paths.config, 'utf8'));
@@ -31,6 +31,8 @@ export function launchAgentPlist(paths) {
     ...(configRevision === null ? [] : [`<key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>${configRevision}</string>`]),
     ...(dshRuntime ? [`<key>DSH_RUNTIME_PATH</key><string>${escapeXml(dshRuntime)}</string>`] : []),
     ...(dshHome ? [`<key>DSH_HOME</key><string>${escapeXml(dshHome)}</string>`] : []),
+    ...(dshProfile ? [`<key>DSH_PROFILE</key><string>${escapeXml(dshProfile)}</string>`] : []),
+    ...(dshVersion ? [`<key>DSH_VERSION</key><string>${escapeXml(dshVersion)}</string>`] : []),
   ].join('');
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>\n<key>ProgramArguments</key><array><string>${escapeXml(daemon)}</string><string>--database</string><string>${escapeXml(paths.database)}</string><string>--socket</string><string>${escapeXml(paths.socket)}</string><string>--runtime</string><string>${escapeXml(ZCODE_RUNTIME)}</string><string>--diagnostic-log</string><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string></array>\n<key>EnvironmentVariables</key><dict>${dshEnvironment}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${escapeXml(path.join(paths.logs, 'daemon.log'))}</string>\n<key>StandardErrorPath</key><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string>\n</dict></plist>\n`);
 }
