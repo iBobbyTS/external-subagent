@@ -46,16 +46,20 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (!result || typeof result !== 'object' || result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }
-    if (serviceDue && !reconciling && (!result.active?.entry || !result.active?.entry_sha256)) {
-      // An explicit update exists to switch the verified stable executable;
-      // a payload without one must fail rather than silently skip activation.
-      throw new CliError('ACTIVE_ENTRY_UNVERIFIED', 'activated payload has no verified stable entry to activate');
+    if (serviceDue && !reconciling && (!result.active?.entry || !result.active?.entry_sha256
+      || !result.active?.daemon_entry || !result.active?.daemon_entry_sha256)) {
+      // An explicit update exists to switch the service onto the verified
+      // daemon payload; an identity it cannot verify must fail rather than
+      // silently skip activation.
+      throw new CliError('ACTIVE_ENTRY_UNVERIFIED', 'activated payload has no verified daemon artifact to activate');
     }
-    if (result?.active?.entry && serviceDue) {
+    if (result?.active?.daemon_entry && result?.active?.daemon_entry_sha256 && serviceDue) {
       const activate = daemon.activateService || activateService;
+      // The LaunchAgent runs the native daemon, so activation carries the
+      // verified daemon artifact identity — never the npm bin shim.
       result.service = await activate(paths, {
-        path: result.active.entry,
-        sha256: result.active.entry_sha256,
+        path: result.active.daemon_entry,
+        sha256: result.active.daemon_entry_sha256,
         version: result.active.version,
       }, daemon);
       result.homes = reconcileCodexHomes(paths);

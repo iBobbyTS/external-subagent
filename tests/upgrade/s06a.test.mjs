@@ -187,7 +187,7 @@ test('service activation failure restores prior state and records rollback evide
   fs.writeFileSync(state, JSON.stringify({ phase: 'active', active: { version: '1.0.0' } }));
   const p = { data: dir, state, socket: path.join(dir, 'sock') };
   const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'rollback-1', ready_for_activation: true } : { ready_for_activation: true };
-  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'new-entry'), entry_sha256: 'new' } }), hasInstalledService: () => true, activateService: async () => { throw new Error('bootstrap failed'); } }), /bootstrap failed/);
+  await assert.rejects(() => updateCommand(p, ['--version=2'], { callDaemon: rpc, updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'new-entry'), entry_sha256: 'new', daemon_entry: path.join(dir, 'new-daemon'), daemon_entry_sha256: 'new-daemon-sha' } }), hasInstalledService: () => true, activateService: async () => { throw new Error('bootstrap failed'); } }), /bootstrap failed/);
   assert.equal(JSON.parse(fs.readFileSync(state)).active.version, '1.0.0');
   assert.equal(JSON.parse(fs.readFileSync(`${state}.activation.json`)).rollback.restored, true);
   fs.rmSync(dir, { recursive: true, force: true });
@@ -199,7 +199,7 @@ test('service activation failure removes a newly created active state', async ()
   const rpc = async (_s, command) => command === 'activate-ready' ? { activation_claim: 'fresh-rollback', ready_for_activation: true } : { ready_for_activation: true };
   await assert.rejects(() => updateCommand(p, ['--version=2'], {
     callDaemon: rpc,
-    updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'entry'), entry_sha256: 'x' } }),
+    updateInstallation: () => ({ phase: 'active', active: { version: '2.0.0', entry: path.join(dir, 'entry'), entry_sha256: 'x', daemon_entry: path.join(dir, 'daemon'), daemon_entry_sha256: 'y' } }),
     hasInstalledService: () => true,
     activateService: async () => { throw new Error('bootstrap failed'); },
   }), /bootstrap failed/);
@@ -255,9 +255,10 @@ test('update command runs the updater once and activates the service from the ve
     });
     assert.equal(result.phase, 'active');
     assert.deepEqual(events, ['update', 'activate']);
-    assert.equal(activated.path, result.active.entry);
-    assert.equal(activated.sha256, result.active.entry_sha256);
+    assert.equal(activated.path, result.active.daemon_entry, 'service activation receives the verified daemon artifact');
+    assert.equal(activated.sha256, result.active.daemon_entry_sha256);
     assert.equal(activated.version, result.active.version);
+    assert.notEqual(activated.path, result.active.entry, 'activation must not target the npm bin shim');
     const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
     assert.equal(receipt.status, 'success');
   } finally {
