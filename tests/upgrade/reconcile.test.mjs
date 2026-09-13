@@ -430,7 +430,9 @@ test('vA tarball installs stage-only; init publishes the verified vA active/rete
   assert.equal(state.schema_version, 2, 'a successful verified init publishes the activation state itself');
   assert.equal(state.candidate, null);
   assert.equal(state.active.version, VERSION_A);
-  assert.equal(state.active.daemon_entry, daemonEntry(), 'active must publish the daemon payload artifact, not the npm bin shim');
+  assert.equal(state.active.daemon_entry, daemonEntry(), 'active keeps the verified daemon artifact identity');
+  assert.equal(state.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd'));
+  assert.equal(state.active.retained.daemon_entry_sha256, state.active.daemon_entry_sha256);
   assert.equal(state.active.daemon_entry_sha256, ctx.shaA, 'the published daemon digest is the verified vA payload digest');
   assert.equal(state.active.entry, binEntry());
   const retainedA = path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd');
@@ -448,7 +450,7 @@ test('vA tarball installs stage-only; init publishes the verified vA active/rete
   assert.equal(va.ok, true, `vA reaffirm failed: ${va.message}`);
   assert.equal(va.result.phase, 'active');
   assert.equal(va.result.active.version, VERSION_A);
-  assert.equal(va.result.active.daemon_entry, daemonEntry());
+  assert.equal(va.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd'));
   assert.equal(va.result.active.daemon_entry_sha256, ctx.shaA);
   const afterVa = readState();
   assert.equal(afterVa.candidate, null);
@@ -473,7 +475,8 @@ test('installing the vB tarball into the same prefix and running the public upda
   assert.equal(vb.result.phase, 'active');
   assert.equal(vb.result.active.version, VERSION_B, 'the active version advances from vA to vB');
   assert.equal(vb.result.active.root, fs.realpathSync(ctx.packageRoot));
-  assert.equal(vb.result.active.daemon_entry, daemonEntry());
+  assert.equal(vb.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'));
+  assert.equal(vb.result.active.retained.daemon_entry_sha256, vb.result.active.daemon_entry_sha256);
   assert.equal(vb.result.active.daemon_entry_sha256, ctx.shaB, 'the active daemon digest is the verified vB payload digest');
   assert.notEqual(vb.result.active.daemon_entry_sha256, ctx.shaA);
   assert.equal(vb.result.active.entry, binEntry());
@@ -524,7 +527,7 @@ test('the public reconcile command re-affirms the published active and rebinds h
   assert.equal(rec.ok, true, `reconcile failed: ${rec.message}`);
   assert.equal(rec.result.phase, 'active');
   assert.equal(rec.result.active.version, VERSION_B);
-  assert.equal(rec.result.active.daemon_entry, daemonEntry());
+  assert.equal(rec.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'));
   assert.equal(rec.result.active.daemon_entry_sha256, ctx.shaB);
   assert.deepEqual(serviceActivations().at(-1).candidate, { path: daemonEntry(), sha256: ctx.shaB, version: VERSION_B },
     'reconcile activates from the published verified identity');
@@ -580,7 +583,7 @@ test('the public update drives the real activation and health-verifies the verif
   assert.equal(real.ok, true, `real update failed: ${real.code} ${real.message}`);
   assert.equal(real.result.phase, 'active');
   assert.equal(real.result.active.version, VERSION_B);
-  assert.equal(real.result.active.daemon_entry, daemonEntry());
+  assert.equal(real.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'));
   assert.equal(real.result.active.daemon_entry_sha256, ctx.shaB);
 
   const service = real.result.service;
