@@ -2642,4 +2642,32 @@ mod tests {
         assert!(matches!(store.insert_message("m", "agent", "queue", "hello"), Err(StoreError::Sqlite(_))));
         assert!(store.message("m").unwrap().is_none());
     }
+
+    #[test]
+    fn separate_store_handles_claim_messages_once_in_fifo_order() {
+        let (_directory, path, store_a) = store();
+        store_a.enqueue_task_authoritative(&task("agent", "/repo", None)).unwrap();
+        running(&store_a, "agent");
+        let store_b = Store::open(&path).unwrap();
+        store_a.insert_message("m1", "agent", "queue", "one").unwrap();
+        store_a.insert_message("m2", "agent", "queue", "two").unwrap();
+        assert_eq!(store_a.claim_next_message("agent").unwrap().unwrap().message_id, "m1");
+        assert_eq!(store_b.claim_next_message("agent").unwrap().unwrap().message_id, "m2");
+        assert!(store_a.claim_next_message("agent").unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_second_insert_preserves_prior_message_receipt() {
+        let (_directory, _path, store) = store();
+        store.enqueue_task_authoritative(&task("agent", "/repo", None)).unwrap();
+        running(&store, "agent");
+        store.insert_message("m1", "agent", "queue", "prior").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection.execute_batch("CREATE TRIGGER reject_message_two BEFORE INSERT ON messages WHEN NEW.message_id='m2' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        }
+        assert!(matches!(store.insert_message("m2", "agent", "queue", "bad"), Err(StoreError::Sqlite(_))));
+        assert_eq!(store.message("m1").unwrap().unwrap().content, "prior");
+        assert!(store.message("m2").unwrap().is_none());
+    }
 }
