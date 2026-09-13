@@ -3,7 +3,7 @@ import { CliError } from '../errors.mjs';
 export const CONFIG_SCHEMA_VERSION = 1;
 export const AGENT_IDS = Object.freeze(['zcode', 'dsh']);
 const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_agent', 'agents', 'runtime', 'database', 'socket']);
-const AGENT_FIELDS = new Set(['enabled', 'spawn_supported', 'default_model']);
+const AGENT_FIELDS = new Set(['enabled', 'spawn_supported', 'default_model', 'runtime_path', 'home', 'profile', 'version']);
 
 function plainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -22,7 +22,7 @@ export function defaultConfig() {
     default_agent: null,
     agents: {
       zcode: { enabled: true, spawn_supported: true, default_model: null },
-      dsh: { enabled: false, spawn_supported: false, default_model: null },
+      dsh: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
     },
   };
 }
@@ -60,6 +60,7 @@ export function validateConfig(input) {
     if (value.enabled !== undefined && typeof value.enabled !== 'boolean') throw new CliError('CONFIG_INVALID', `agents.${agent}.enabled must be boolean`, 2);
     if (value.spawn_supported !== undefined && typeof value.spawn_supported !== 'boolean') throw new CliError('CONFIG_INVALID', `agents.${agent}.spawn_supported must be boolean`, 2);
     if (value.default_model !== undefined && value.default_model !== null && (typeof value.default_model !== 'string' || value.default_model.length === 0)) throw new CliError('CONFIG_INVALID', `agents.${agent}.default_model must be a non-empty string or null`, 2);
+    for (const field of ['runtime_path', 'home', 'profile', 'version']) { if (value[field] !== undefined && value[field] !== null && (typeof value[field] !== 'string' || value[field].length === 0)) throw new CliError('CONFIG_INVALID', `agents.${agent}.${field} must be a non-empty string or null`, 2); }
     rejectModel(agent, value.default_model, 'default_model');
     config.agents[agent] = { ...config.agents[agent], ...value };
   }

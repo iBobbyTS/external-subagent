@@ -6,7 +6,7 @@ import { CliError } from '../errors.mjs';
 const CONFIG_INPUT_FIELDS = new Set(['operation', 'patch', 'key']);
 const GET_KEYS = new Set([
   'default_agent',
-  ...AGENT_IDS.flatMap((agent) => [`agents.${agent}.enabled`, `agents.${agent}.spawn_supported`, `agents.${agent}.default_model`]),
+  ...AGENT_IDS.flatMap((agent) => [`agents.${agent}.enabled`, `agents.${agent}.spawn_supported`, `agents.${agent}.default_model`, `agents.${agent}.runtime_path`, `agents.${agent}.home`, `agents.${agent}.profile`, `agents.${agent}.version`]),
 ]);
 const SET_KEYS = GET_KEYS;
 
@@ -38,7 +38,7 @@ function unsetPatch(key) {
   const defaults = {
     enabled: agent === 'zcode',
     spawn_supported: agent === 'zcode',
-    default_model: null,
+    default_model: null, runtime_path: null, home: null, profile: null, version: null,
   };
   return { agents: { [agent]: { [field]: defaults[field] } } };
 }
