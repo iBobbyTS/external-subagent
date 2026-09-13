@@ -43,6 +43,11 @@ Missing DSH never blocks installation; `agents status` reports it explicitly
 (`enabled=false`, `spawn_supported=false`, scope states `UNKNOWN`) and the
 product never installs providers itself.
 
+When DSH is explicitly enabled, configure its `runtime_path`, `home`, `profile`,
+and pinned `version` through the public config command. `init` writes those
+values into the LaunchAgent environment, and the DSH adapter consumes and
+validates the profile/version rather than relying on the interactive shell.
+
 ## PATH behavior
 
 The launchd/GUI environment does not inherit the interactive shell PATH, so
