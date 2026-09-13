@@ -2477,6 +2477,10 @@ mod server {
 
         #[tokio::test]
         async fn spawn_routes_admission_errors_through_daemon_before_manifest_preparation() {
+            // Serialize with the admission oracles that install a
+            // process-wide agent-config file: this dispatch-based test must
+            // keep reading the default snapshot.
+            let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
             let (_directory, service, id) = crate::rpc::wait_tests::fixture();
             let store = service.store_for_wait_test();
             let before = store.get_task(&id).unwrap();
