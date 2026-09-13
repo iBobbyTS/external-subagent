@@ -51,28 +51,46 @@ export function updateInstallation(paths, options = {}) {
   return withLock(paths, () => {
     const requested = options.version || 'current';
     const candidateRoot = options.candidateRoot || null;
-    const payload = candidateRoot ? verifyPayload({ root: candidateRoot, platform: options.platform }) : null;
     const version = requested === 'current' ? packageVersion() : requested;
     const available = options.availableVersions || [packageVersion()];
     if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
       throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
     }
-    const prior = readState(paths);
+    const payload = candidateRoot ? verifyPayload({ root: candidateRoot, platform: options.platform }) : null;
     const verifiedVersion = payload?.version || version;
     if (payload && version !== verifiedVersion) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${verifiedVersion}`);
+    // Reject a doomed candidate up front: an unusable stable entry must never
+    // publish candidate state or touch a single Codex home.
+    const stable = candidateRoot ? verifyStableEntry(candidateRoot) : null;
+    const prior = readState(paths);
     const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
-    const sync = options.deferCodexSync ? { homes: [], all_updated: true, deferred: true } : reconcileCodexHomes(paths, options);
-    const ok = sync.homes.length === 0 || sync.all_updated;
-    state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
-    if (ok && candidateRoot) {
-      const stable = verifyStableEntry(candidateRoot);
-      state.active = state.candidate; state.candidate = null;
-      state.active.entry = stable.entry;
-      state.active.entry_sha256 = stable.digest;
-    } else if (ok) { state.active = state.candidate; state.candidate = null; }
-    atomicWrite(paths.state, jsonBytes(state));
-    return state;
+    const publishedCandidate = state.candidate;
+    try {
+      const sync = options.deferCodexSync ? { homes: [], all_updated: true, deferred: true } : reconcileCodexHomes(paths, options);
+      const ok = sync.homes.length === 0 || sync.all_updated;
+      state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
+      if (ok && candidateRoot) {
+        // Re-verify immediately before publishing: active may only ever point
+        // at the entry bytes verified above, never a candidate mutated since.
+        const stableNow = verifyStableEntry(candidateRoot);
+        if (stableNow.entry !== stable.entry || stableNow.digest !== stable.digest) {
+          throw new CliError('PAYLOAD_ENTRY_CHANGED', 'candidate stable entry changed during activation');
+        }
+        state.active = state.candidate; state.candidate = null;
+        state.active.entry = stableNow.entry;
+        state.active.entry_sha256 = stableNow.digest;
+      } else if (ok) { state.active = state.candidate; state.candidate = null; }
+      atomicWrite(paths.state, jsonBytes(state));
+      return state;
+    } catch (error) {
+      // Record retryable failure evidence instead of a phantom in-flight
+      // candidate: the prior active stays published and the rejected
+      // candidate remains identified for the next attempt.
+      const evidence = { ...state, candidate: state.candidate ?? publishedCandidate, active: prior.active, phase: 'failed', error: { code: error.code || 'UPDATE_FAILED', message: error.message }, failed_at_ms: Date.now() };
+      try { atomicWrite(paths.state, jsonBytes(evidence)); } catch { /* evidence is best effort; the thrown error stays authoritative */ }
+      throw error;
+    }
   });
 }
 
