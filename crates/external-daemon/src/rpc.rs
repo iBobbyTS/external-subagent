@@ -483,6 +483,10 @@ struct AgentConfigEntry {
     spawn_supported: bool,
     #[serde(default)]
     default_model: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 impl Default for AgentConfigSnapshot {
@@ -498,6 +502,8 @@ impl Default for AgentConfigSnapshot {
                         enabled: true,
                         spawn_supported: true,
                         default_model: None,
+                        profile: None,
+                        version: None,
                     },
                 ),
                 (
@@ -506,6 +512,8 @@ impl Default for AgentConfigSnapshot {
                         enabled: false,
                         spawn_supported: false,
                         default_model: None,
+                        profile: None,
+                        version: None,
                     },
                 ),
             ]),
@@ -1035,9 +1043,20 @@ impl RpcService {
                     activation_claim: claim,
                 })
             }
-            RpcMethod::AgentProbe { input } => {
+            RpcMethod::AgentProbe { mut input } => {
                 validate_agent_probe_input(&input)?;
                 let config = read_agent_config_snapshot()?;
+                if input.agent == "dsh" {
+                    let dsh = config.agents.get("dsh");
+                    input.scope.profile = input
+                        .scope
+                        .profile
+                        .or_else(|| dsh.and_then(|entry| entry.profile.clone()));
+                    input.scope.version = input
+                        .scope
+                        .version
+                        .or_else(|| dsh.and_then(|entry| entry.version.clone()));
+                }
                 let evidence = self.agent_evidence.probe(&input, config.revision);
                 let status = configured_agent_statuses(&config, &self.agent_evidence)
                     .into_iter()
@@ -1045,9 +1064,20 @@ impl RpcService {
                     .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
                 Ok(RpcSuccess::AgentProbed { evidence, status })
             }
-            RpcMethod::AgentModels { input } => {
+            RpcMethod::AgentModels { mut input } => {
                 validate_agent_models_input(&input)?;
                 let config = read_agent_config_snapshot()?;
+                if input.agent == "dsh" {
+                    let dsh = config.agents.get("dsh");
+                    input.scope.profile = input
+                        .scope
+                        .profile
+                        .or_else(|| dsh.and_then(|entry| entry.profile.clone()));
+                    input.scope.version = input
+                        .scope
+                        .version
+                        .or_else(|| dsh.and_then(|entry| entry.version.clone()));
+                }
                 Ok(RpcSuccess::AgentModels {
                     catalog: self.agent_evidence.models(&input, config.revision),
                 })
@@ -1451,6 +1481,8 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
                     enabled: false,
                     spawn_supported: false,
                     default_model: None,
+                    profile: None,
+                    version: None,
                 },
             ),
             permission_modes: Vec::new(),
@@ -1460,6 +1492,8 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
                     enabled: false,
                     spawn_supported: false,
                     default_model: None,
+                    profile: None,
+                    version: None,
                 },
             ),
             local: unprobed_scope(),
