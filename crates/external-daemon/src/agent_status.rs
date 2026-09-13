@@ -2078,7 +2078,11 @@ process.stdin.on('data', (chunk) => {
 
     #[test]
     fn dsh_hi_preflights_actual_scope_and_reaps_embedded_patch() {
-        for unknown in [false, true] {
+        // The drift scenario is the R0 counterexample: controls present but
+        // the enabled sandbox-policy carries no config and approval is
+        // disabled, so the strict preflight must keep the probe prompt-free.
+        for (unknown, drift) in [(false, false), (true, false), (false, true)] {
+            let refused = unknown || drift;
             let directory = tempfile::tempdir().unwrap();
             let workspace = directory.path().join("workspace");
             let home = directory.path().join("home");
@@ -2093,6 +2097,9 @@ process.stdin.on('data', (chunk) => {
             if unknown {
                 fs::write(home.join("unknown-tool"), "").unwrap();
             }
+            if drift {
+                fs::write(home.join("policy-drift"), "").unwrap();
+            }
             let scope = ProbeScope {
                 workspace: Some(workspace.to_string_lossy().into_owned()),
                 home: Some(home.to_string_lossy().into_owned()),
@@ -2103,7 +2110,7 @@ process.stdin.on('data', (chunk) => {
             assert_eq!(auth.state, EvidenceState::Unknown);
             assert_eq!(
                 hi.state,
-                if unknown {
+                if refused {
                     EvidenceState::Unavailable
                 } else {
                     EvidenceState::Ready
@@ -2144,10 +2151,10 @@ process.stdin.on('data', (chunk) => {
                     .iter()
                     .filter(|event| event["method"] == "session/prompt")
                     .count(),
-                usize::from(!unknown)
+                usize::from(!refused)
             );
             assert_eq!(fs::read_dir(workspace).unwrap().count(), 0);
-            if unknown {
+            if refused {
                 assert_eq!(hi.reason.as_deref(), Some("strict_preflight_failed"));
                 assert_eq!(events.len(), 1, "ACP must not start after refused dump");
             }

@@ -14,7 +14,13 @@ if (!path.isAbsolute(patch) || !fs.readFileSync(patch, 'utf8').includes('sandbox
 if (!path.basename(path.dirname(patch)).startsWith('external-dsh-hi-')) process.exit(3);
 record({ kind: process.argv.includes('--dump-config') ? 'dump' : 'acp', cwd: process.cwd(), home, patch, mode: process.env.DSH_PERMISSION_MODE });
 if (process.argv.includes('--dump-config')) {
-  console.log('- id: sandbox-policy\n  config:\n    mode: read-only');
+  if (fs.existsSync(path.join(home, 'policy-drift'))) {
+    // R0 counterexample: sandbox-policy enabled without config and approval
+    // disabled; the strict preflight must refuse this dump.
+    console.log('- id: sandbox-policy\n  disabled: false\n- id: approval\n  disabled: true');
+  } else {
+    console.log('- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask');
+  }
   if (fs.existsSync(path.join(home, 'unknown-tool'))) console.log('- id: unknown-write-tool');
   process.exit(0);
 }
