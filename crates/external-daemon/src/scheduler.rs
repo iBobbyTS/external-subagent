@@ -2152,7 +2152,7 @@ impl Scheduler {
         match activity {
             Some(activity) => (
                 activity.observation_snapshot(),
-                activity.runtime_source_verified.load(Ordering::Acquire),
+                activity.runtime_source_verified(),
             ),
             None => (
                 observation::ObservationSnapshot::unavailable(),

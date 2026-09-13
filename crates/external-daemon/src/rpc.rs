@@ -2139,15 +2139,7 @@ pub(crate) mod wait_tests {
                 // Deterministic mid-wait snapshot changes, without timing a worker.
                 iterations.set(iterations.get() + 1);
                 if iterations.get() == 2 {
-                    let mut state = tracker.state.lock().unwrap();
-                    state.revision = 900;
-                    state.latest_text_tail = "ordinary text".into();
-                    state.latest_progress = Some("ordinary progress".into());
-                    state.last_model_delta_at = Some(Instant::now());
-                    state.active_tools.insert(
-                        "tool".into(),
-                        (crate::PassiveToolKind::Bash, Instant::now()),
-                    );
+                    tracker.set_wait_fixture(Instant::now());
                 }
                 false
             })
