@@ -484,6 +484,10 @@ struct AgentConfigEntry {
     #[serde(default)]
     default_model: Option<String>,
     #[serde(default)]
+    runtime_path: Option<String>,
+    #[serde(default)]
+    home: Option<String>,
+    #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
     version: Option<String>,
@@ -502,6 +506,8 @@ impl Default for AgentConfigSnapshot {
                         enabled: true,
                         spawn_supported: true,
                         default_model: None,
+                        runtime_path: None,
+                        home: None,
                         profile: None,
                         version: None,
                     },
@@ -512,6 +518,8 @@ impl Default for AgentConfigSnapshot {
                         enabled: false,
                         spawn_supported: false,
                         default_model: None,
+                        runtime_path: None,
+                        home: None,
                         profile: None,
                         version: None,
                     },
@@ -1481,6 +1489,8 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
                     enabled: false,
                     spawn_supported: false,
                     default_model: None,
+                    runtime_path: None,
+                    home: None,
                     profile: None,
                     version: None,
                 },
@@ -1492,6 +1502,8 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
                     enabled: false,
                     spawn_supported: false,
                     default_model: None,
+                    runtime_path: None,
+                    home: None,
                     profile: None,
                     version: None,
                 },
