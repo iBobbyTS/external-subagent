@@ -450,8 +450,13 @@ test('a legacy daemon that cannot abort keeps its evidence without masking the u
     if (command === 'drain') return { ready_for_activation: true };
     if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'legacy-1' };
     if (command === 'drain-abort') {
+      // Exactly what the REAL callDaemon produces for a released daemon
+      // whose is_known table predates daemon_abort_drain: the raw wire
+      // frame { code: 'unknown_method', message: 'unknown RPC method' }
+      // (RpcErrorCode serializes snake_case) passes through as the CliError
+      // code verbatim — rpc.mjs preserves daemon error codes.
       const error = new Error('unknown RPC method');
-      error.code = 'UNKNOWN_METHOD';
+      error.code = 'unknown_method';
       error.daemonResponded = true;
       throw error;
     }
@@ -466,9 +471,13 @@ test('a legacy daemon that cannot abort keeps its evidence without masking the u
     assert.deepEqual(commands, ['drain', 'activate-ready', 'drain-abort']);
     const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
     assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.error, 'boom', 'the receipt reason stays the original update failure, not the abort failure');
     assert.equal(receipt.retryable, true, 'a daemon that stayed draining keeps the failure retryable');
     assert.equal(receipt.drain_aborted, false);
-    assert.equal(receipt.drain_abort_error.code, 'UNKNOWN_METHOD');
+    assert.equal(receipt.drain_abort_error.code, 'UNKNOWN_METHOD',
+      'the raw snake_case wire code is canonicalized into the CLI error vocabulary');
+    assert.equal(receipt.daemon_may_be_draining, true,
+      'the receipt states explicitly that the legacy daemon may still be draining');
   } finally {
     fs.rmSync(data, { recursive: true, force: true });
   }

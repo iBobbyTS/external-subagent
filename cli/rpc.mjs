@@ -11,6 +11,15 @@ export const AGENT_PROBE_TRANSPORT_TIMEOUT_MS = 200_000;
 export const MIN_TASK_ID = 10_000_000;
 export const MAX_TASK_ID = 99_999_999;
 
+// Daemon RpcErrorCode values serialize snake_case on the wire
+// ("unknown_method", "validation"), while CLI error codes are
+// SCREAMING_SNAKE. callDaemon preserves the raw daemon code verbatim —
+// diagnose compares 'not_found' directly — so upgrade-surface consumers
+// canonicalize through this mapping before matching or recording codes.
+export function canonicalDaemonCode(code) {
+  return typeof code === 'string' && code.length > 0 ? code.toUpperCase() : 'DAEMON_ERROR';
+}
+
 function taskId(value) {
   if (!Number.isInteger(value) || value < MIN_TASK_ID || value > MAX_TASK_ID) {
     throw new CliError('INVALID_ARGUMENT', 'agent_id must be an integer between 10000000 and 99999999', 2);
