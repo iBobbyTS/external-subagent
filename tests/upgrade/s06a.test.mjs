@@ -310,24 +310,90 @@ test('service activation is skipped when the default candidate fails verificatio
   }
 });
 
-test('first install stays stage-only and never publishes an activation state', () => {
+test('an init without a verified payload stays journal-only and never publishes activation state', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-stage-only-'));
-  const p = {
+  const p = fullPaths(root);
+  fs.mkdirSync(p.home, { recursive: true });
+  try {
+    const result = runInit({ paths: p, skipRuntimeProbe: true, skipPayloadProbe: true, skipServiceStart: true, skipCodexPlugin: true });
+    assert.equal(result.installed, true);
+    const state = JSON.parse(fs.readFileSync(p.state, 'utf8'));
+    assert.equal(state.schema_version, 1, 'a payload-unverified init writes its resume journal, never the activation state');
+    assert.equal(state.active, undefined);
+    assert.equal(state.candidate, undefined);
+    assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'init never claims an activation receipt');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function fullPaths(root) {
+  return {
     data: path.join(root, 'data'), logs: path.join(root, 'logs'), home: path.join(root, 'home'),
     state: path.join(root, 'data', 'install-state.json'), config: path.join(root, 'config', 'product.json'),
     launchAgent: path.join(root, 'LaunchAgents', 'com.external-subagent.daemon.plist'),
     socket: path.join(root, 'data', 'daemon.sock'), database: path.join(root, 'data', 'daemon.db'),
     zcodeConfig: path.join(root, 'zcode', 'config.toml'), hookProvenance: path.join(root, 'zcode', 'hooks.json'),
   };
+}
+
+// B-3: the standard public sequence is `npm A -> init A -> use A -> npm B`.
+// The baseline oracle: a SUCCESSFUL init that verified its payload publishes
+// the active identity and retained bytes itself, through the existing update
+// owner — no hidden extra "A update" may be a prerequisite for the first
+// upgrade.  Stage-only belongs to the npm install, never to a verified init.
+test('a verified-payload init publishes the active/retention baseline through the update owner', { skip: !darwinArm64 }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-init-baseline-'));
+  const p = fullPaths(root);
   fs.mkdirSync(p.home, { recursive: true });
   try {
-    const result = runInit({ paths: p, skipRuntimeProbe: true, skipPayloadProbe: true, skipServiceStart: true, skipCodexPlugin: true });
+    const result = runInit({ paths: p, skipRuntimeProbe: true, skipServiceStart: true, skipCodexPlugin: true });
     assert.equal(result.installed, true);
+    assert.equal(result.payload.status, 'verified');
+    assert.ok(result.completed.includes('publish-active-payload'), 'init reports the baseline publication step');
+    assert.equal(result.baseline.version, packageVersion());
+
     const state = JSON.parse(fs.readFileSync(p.state, 'utf8'));
-    assert.equal(state.schema_version, 1, 'init writes its resume journal, never the activation state');
-    assert.equal(state.active, undefined);
-    assert.equal(state.candidate, undefined);
+    assert.equal(state.schema_version, 2, 'a successful verified init publishes the activation state');
+    assert.equal(state.phase, 'active');
+    assert.equal(state.candidate, null);
+    assert.equal(state.active.version, packageVersion());
+    // Expected values are recomputed from the package tree itself, never an
+    // ambient version string.
+    const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
+    const daemonSha = manifest.files.find((file) => file.name === 'external-subagentd').sha256;
+    assert.equal(state.active.daemon_entry, path.join(fs.realpathSync(packageRoot()), 'npm', 'native', 'darwin-arm64', 'external-subagentd'));
+    assert.equal(state.active.daemon_entry_sha256, daemonSha, 'the published daemon digest is the verified payload digest');
+
+    const retained = path.join(p.data, 'payload-store', packageVersion(), 'external-subagentd');
+    assert.ok(fs.existsSync(retained), 'the verified daemon bytes are retained outside the package tree');
+    assert.equal(crypto.createHash('sha256').update(fs.readFileSync(retained)).digest('hex'), daemonSha, 'the retained bytes match the verified digest');
     assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'init never claims an activation receipt');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The baseline publication is the last init step and shares the same
+// all-or-nothing rollback: a retention failure must leave no journal, no
+// config, and no LaunchAgent behind.
+test('a failed baseline publication rolls the whole init back', { skip: !darwinArm64 }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-init-baseline-fail-'));
+  const p = fullPaths(root);
+  fs.mkdirSync(p.home, { recursive: true });
+  fs.mkdirSync(p.data, { recursive: true });
+  // Block the retained-payload store so the publication fails after every
+  // earlier init step has completed and been journaled.
+  fs.writeFileSync(path.join(p.data, 'payload-store'), 'not a directory');
+  try {
+    assert.throws(
+      () => runInit({ paths: p, skipRuntimeProbe: true, skipServiceStart: true, skipCodexPlugin: true }),
+      (error) => error.code === 'ENOTDIR' || /ENOTDIR/.test(error.message),
+    );
+    assert.equal(fs.existsSync(p.state), false, 'rollback removes the state the failed init wrote');
+    assert.equal(fs.existsSync(p.config), false, 'product config rolls back');
+    assert.equal(fs.existsSync(p.launchAgent), false, 'the LaunchAgent rolls back');
+    assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'a failed init never claims an activation receipt');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

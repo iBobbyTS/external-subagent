@@ -17,8 +17,15 @@ A plain npm install only stages the package and its native payload:
   Release builds are produced and verified by
   `scripts/release/build-native-payload.mjs`; supported platforms never
   compile Rust at install time.
-- Nothing else happens: no daemon start, no Codex writes, no provider probes,
-  and no shell profile edits. There are no install lifecycle scripts.
+- Nothing else happens on a fresh install: no daemon start, no Codex writes,
+  no provider probes, and no shell profile edits. The single lifecycle script
+  is a `postinstall` bridge that only reads local state: a never-initialized
+  install stays stage-only, and an already-initialized installation whose
+  package version drifted from its published active payload coordinates
+  through the existing update owner (bounded drain, abortable; never a
+  provider probe or a second lifecycle). Installs run with
+  `--ignore-scripts` skip the bridge; the same coordination stays available
+  through the explicit `update`/`reconcile` commands.
 
 Every state-changing action belongs to an explicit `init`:
 
@@ -33,11 +40,18 @@ external-subagent init [--dry-run] [--resume] [--install-hooks]
 fixed ZCode runtime, report PATH findings (never write profiles), create the
 private data/log directories, write the product config, install the
 LaunchAgent, bootstrap the service, stage and register the managed Codex
-plugin, and claim the Codex home in the D08 registry. `--resume` continues
+plugin, claim the Codex home in the D08 registry, and — after all of that —
+publish the verified active payload with its retained byte-for-byte copy
+under product data, so a successful `init` itself establishes the version and
+retention baseline for every later upgrade. The publication reuses the locked
+update owner (same verification, retention, and lock rules as `update`), so
+the standard sequence `npm A → init A → use A → npm B` never depends on an
+extra "A update" step. `--resume` continues
 after an environmental failure using the step journal; failures roll tracked
 files back — including the product-owned Codex artifacts (staging tree,
-marketplace manifest, and directories the run created) while never undoing
-the official codex cache — so a partial install never looks complete.
+marketplace manifest, and directories the run created) and the baseline the
+same run published — while never undoing the official codex cache — so a
+partial install never looks complete.
 
 Missing DSH never blocks installation; `agents status` reports it explicitly
 (`enabled=false`, `spawn_supported=false`, scope states `UNKNOWN`) and the
@@ -88,9 +102,13 @@ Reconciliation only ever writes homes that are both registered and writable,
 reports per-home results, and replaces a corrupted registry atomically while
 preserving the damaged bytes for inspection.
 
-Update coordination (draining active tasks, payload activation, syncing every
-registered Codex copy) is S06 scope; until then, an unverified update path is
-explicitly not activated.
+`init` establishes the active payload and the retained-byte baseline; a later
+npm install that replaces the package coordinates through the postinstall
+bridge above (draining active tasks, payload activation, syncing every
+registered Codex copy) via the same update owner. An `--ignore-scripts`
+machine runs the identical coordination through the explicit
+`update`/`reconcile` commands; read-only commands such as `status` never
+trigger it.
 
 ## Data, backup, and removal
 
