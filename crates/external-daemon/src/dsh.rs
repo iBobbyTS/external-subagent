@@ -1116,6 +1116,10 @@ read_frame
 printf '%s\\n' \
   '{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"{SESSION_ID}\",\"update\":{{\"type\":\"agent_message\",\"messageId\":\"message-2\",\"content\":[{{\"type\":\"text\",\"text\":\"follow-up settled\"}}]}}}}}}' \
   '{{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{{\"stopReason\":\"end_turn\",\"messageId\":\"message-2\"}}}}'
+read_frame
+printf '%s\\n' \
+  '{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":\"{SESSION_ID}\",\"update\":{{\"type\":\"agent_message\",\"messageId\":\"message-3\",\"content\":[{{\"type\":\"text\",\"text\":\"second follow-up settled\"}}]}}}}}}' \
+  '{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{{\"stopReason\":\"end_turn\",\"messageId\":\"message-3\"}}}}'
 "
         )
         .replace("SESSION", SESSION_ID);
@@ -1144,6 +1148,13 @@ printf '%s\\n' \
             MessageDisposition::Queued
         );
 
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "second-follow-up", "queue", "second follow-up prompt")
+                .unwrap(),
+            MessageDisposition::Queued
+        );
+
         let outcome = scheduler
             .respond_request(&agent_id, &request.request_id, "allow", None)
             .unwrap();
@@ -1151,9 +1162,16 @@ printf '%s\\n' \
         assert_eq!(outcome.effective_decision, "allow");
         assert!(!outcome.policy_overrode);
 
+        // A duplicate may report its durable receipt but must never reach ACP again.
+        let duplicate = scheduler
+            .respond_request(&agent_id, &request.request_id, "deny", None)
+            .unwrap();
+        assert_eq!(duplicate.disposition, ResponseDisposition::AlreadyResponded);
+        assert_eq!(duplicate.effective_decision, "allow");
+
         let stored = await_result(&scheduler, &agent_id);
         assert_eq!(stored.result.outcome, TaskOutcome::Completed);
-        assert_eq!(stored.result.final_text, "follow-up settled");
+        assert_eq!(stored.result.final_text, "second follow-up settled");
         assert!(!stored.result.partial);
 
         // The queued message was delivered exactly once.
@@ -1179,13 +1197,14 @@ printf '%s\\n' \
         // Wire evidence: bootstrap order, model verified before the prompt,
         // one prompt per turn, and a single-shot allow echoing the offered id.
         // (The allow response sits between the two prompts in arrival order.)
-        let frames = wait_for_frames(workspace.path(), 6);
+        let frames = wait_for_frames(workspace.path(), 7);
         assert_eq!(
             request_methods(&frames),
             vec![
                 "initialize",
                 "session/new",
                 "session/set_config_option",
+                "session/prompt",
                 "session/prompt",
                 "session/prompt"
             ]
@@ -1198,7 +1217,7 @@ printf '%s\\n' \
                 frame.get("method").and_then(|value| value.as_str()) == Some("session/prompt")
             })
             .collect();
-        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts.len(), 3);
         fn prompt_text(frame: &serde_json::Value) -> String {
             frame["params"]["prompt"]
                 .as_array()
@@ -1209,6 +1228,14 @@ printf '%s\\n' \
         }
         assert!(prompt_text(prompts[0]).contains("build the fixture"));
         assert!(prompt_text(prompts[1]).contains("follow-up prompt"));
+        assert!(!prompt_text(prompts[1]).contains("second follow-up prompt"));
+        assert!(prompt_text(prompts[2]).contains("second follow-up prompt"));
+        assert_eq!(scheduler.store().message("second-follow-up").unwrap().unwrap().state,
+            MessageState::Delivered);
+        let terminal_before = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(scheduler.respond_request(&agent_id, &request.request_id, "allow", None)
+            .unwrap().disposition, ResponseDisposition::AlreadyResponded);
+        assert_eq!(scheduler.store().get_task(&agent_id).unwrap().unwrap(), terminal_before);
         let permission_responses: Vec<&serde_json::Value> = frames
             .iter()
             .filter(|frame| frame.get("id").and_then(|id| id.as_str()) == Some("srv-1"))
@@ -1635,7 +1662,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
-        let _request = await_pending_permission(&scheduler, &agent_id);
+        let request = await_pending_permission(&scheduler, &agent_id);
         let phase = scheduler
             .cancel_task(&agent_id)
             .expect("cancel active task");
@@ -1649,7 +1676,14 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
             assert!(Instant::now() < deadline, "runtime was not reaped");
             thread::sleep(Duration::from_millis(10));
         }
+        let terminal_before = await_terminal_task(&scheduler, &agent_id);
+        let late = scheduler.respond_request(&agent_id, &request.request_id, "allow", None);
+        assert!(late.is_err(), "late permission response must be refused: {late:?}");
+        assert_eq!(scheduler.store().get_task(&agent_id).unwrap().unwrap(), terminal_before);
+        assert_eq!(scheduler.active_count(), 0);
         let frames = wait_for_frames(workspace.path(), 5);
+        assert!(!frames.iter().any(|frame| frame.get("id").and_then(|id| id.as_str()) == Some("srv-1")),
+            "late response must never reach the provider");
         assert!(request_methods(&frames).contains(&"session/prompt"));
         assert!(request_methods(&frames).contains(&"session/cancel"));
         assert_eq!(
