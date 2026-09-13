@@ -11,7 +11,7 @@ npm install -g external-subagent-0.1.0.tgz
 external-subagent init --codex-home "$HOME/.codex"
 ```
 
-普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它会校验 payload，写入产品配置和 LaunchAgent，安装并启用 `external-subagent@personal` Codex plugin，登记 Codex home，并发布 active/retained payload 基线。
+普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它会校验 payload，写入产品配置和 LaunchAgent，安装并启用 `external-subagent@personal` Codex plugin，登记 Codex home，并发布 active/retained payload 基线。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
 
 ## Provider 配置
 
@@ -55,4 +55,4 @@ external-subagent close --json '{"agent_id":10000000}'
 
 初始化后的 npm 更新由 postinstall/reconcile 复用同一个受控 update owner，候选 payload 在排空前验证，旧 payload 保留用于恢复；首次 npm 安装仍保持 stage-only。`--ignore-scripts` 时不会假报已协调，下一次显式 `update`/`reconcile` 可恢复。
 
-已验证的本地能力包括双 provider 的隔离任务、MCP 工具调用、活跃任务排空、取消/重启恢复、版本化 payload 和 Codex plugin 安装。真实用户 LaunchAgent 的 launchd bootstrap、Codex GUI 热重载、npm registry 发布和未覆盖 provider 的完整矩阵仍需单独环境验收。
+已验证的本地能力包括双 provider 的隔离任务、MCP 工具调用、活跃任务排空、取消/重启恢复、版本化 payload 和 Codex plugin 安装。真实用户 GUI 会话中的 launchd bootstrap 与重复 init/start 幂等已实测验证（含 label/PID/socket/RPC 证据）；Codex GUI 热重载、npm registry 发布和未覆盖 provider 的完整矩阵仍需单独验收。

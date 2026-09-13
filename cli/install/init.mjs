@@ -13,7 +13,7 @@ import { packageRoot } from './layout.mjs';
 import { registerCodexHome } from './reconcile.mjs';
 import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackCodexArtifacts, rollbackFiles, snapshotFile } from './recovery.mjs';
-import { bootstrapService, installLaunchAgent } from './service-macos.mjs';
+import { bootstrapService, bootoutService, installLaunchAgent } from './service-macos.mjs';
 
 // Fresh-install coordination (S05).  A plain npm install only stages the
 // package and payload; every state-changing action below belongs to an
@@ -110,6 +110,12 @@ export function runInit(options = {}) {
   };
 
   let service = { action: 'bootstrap', skipped: true, reason: 'not attempted' };
+  // A rollback must also undo what this run itself loaded: a failure after a
+  // successful bootstrap would otherwise leave a launchd job running binary
+  // bytes the rolled-back plist/install-state no longer describe (observed
+  // live: a codex-binding conflict stranded a running candidate daemon).
+  // A service that was already loaded before this init is never touched.
+  let serviceLoadedByThisRun = false;
   let baseline = null;
   const codexHome = codexHomeFor({ codexHome: options.codexHome }, paths);
   // Product-owned Codex artifacts the init may create, snapshotted before any
@@ -162,7 +168,8 @@ export function runInit(options = {}) {
       mark('install-launch-agent');
     }
     if (!completed.has('start-service') && !options.skipServiceStart) {
-      service = bootstrapService(paths);
+      service = bootstrapService(paths, process.getuid(), { launchctl: options.launchctl });
+      serviceLoadedByThisRun = !service.skipped && !service.already_loaded;
       mark('start-service');
     }
     if (!completed.has('install-codex-plugin') && !options.skipCodexPlugin) {
@@ -211,6 +218,11 @@ export function runInit(options = {}) {
       ...rollbackCodexArtifacts(codexArtifacts),
       ...removeCreatedDirectories(directories),
     ];
+    if (serviceLoadedByThisRun) {
+      try { bootoutService(paths, process.getuid(), { launchctl: options.launchctl }); } catch (bootoutError) {
+        rollbackErrors.push(`service rollback (bootout) failed: ${bootoutError.message}`);
+      }
+    }
     if (rollbackErrors.length > 0) error.rollbackErrors = rollbackErrors;
     throw error;
   }

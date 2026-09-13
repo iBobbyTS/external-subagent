@@ -8,6 +8,7 @@ import { nativeBinary } from './install/layout.mjs';
 import { cleanupLegacy, purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
 import { updateCommand } from './commands/update.mjs';
 import { localInstallStatus, startDaemon, stopDaemon } from './commands/daemon.mjs';
+import { serviceRegistrationStatus } from './install/service-macos.mjs';
 import { mcpCommand, pluginCommand } from './commands/plugin.mjs';
 import { platform, productPaths } from './paths.mjs';
 import { callDaemon, parseDaemonInput } from './rpc.mjs';
@@ -341,10 +342,14 @@ export async function main(args) {
   }
   if (command === 'status') {
     const local = localInstallStatus(paths);
+    // `service` is the read-only launchd view (registered job + process);
+    // `daemon_status` stays the RPC view, so a loaded-but-unready or
+    // ready-but-unregistered install reads differently instead of blurring.
+    const service = serviceRegistrationStatus();
     try {
-      output({ ...local, daemon_status: await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}) });
+      output({ ...local, service, daemon_status: await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}) });
     } catch (error) {
-      output({ ...local, daemon_status: null, daemon_error: { code: error.code || 'DAEMON_ERROR', message: error.message } });
+      output({ ...local, service, daemon_status: null, daemon_error: { code: error.code || 'DAEMON_ERROR', message: error.message } });
     }
     return;
   }
