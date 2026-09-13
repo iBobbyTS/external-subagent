@@ -15,11 +15,10 @@ try {
   detected = npmUpdateCoordination(paths);
 } catch (error) {
   process.stderr.write(`${JSON.stringify({ external_subagent: 'postinstall', coordinated: false, error: { code: error.code || 'UPDATE_STATE_READ_FAILED', message: error.message } })}\n`);
-  process.exitCode = 1;
-  detected = null;
+  process.exit(1);
 }
 
-if (!globalInstall || !detected || !detected.initialized || !detected.update_pending) {
+if (!globalInstall || !detected.initialized || !detected.update_pending) {
   process.stdout.write(`${JSON.stringify({ external_subagent: 'postinstall', ...detected })}\n`);
   process.exit(0);
 }
