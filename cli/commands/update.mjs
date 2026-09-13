@@ -101,10 +101,15 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     if (result?.active?.daemon_entry && result?.active?.daemon_entry_sha256 && serviceDue) {
       const activate = daemon.activateService || activateService;
       // The LaunchAgent runs the native daemon, so activation carries the
-      // verified daemon artifact identity — never the npm bin shim.
+      // verified daemon artifact identity — never the npm bin shim. Prefer
+      // the retained immutable copy so a later npm replacement cannot alter
+      // the bytes the service executes.
+      const serviceArtifact = result.active.retained?.daemon_entry
+        ? { path: result.active.retained.daemon_entry, sha256: result.active.retained.daemon_entry_sha256 ?? result.active.daemon_entry_sha256 }
+        : { path: result.active.daemon_entry, sha256: result.active.daemon_entry_sha256 };
       result.service = await activate(paths, {
-        path: result.active.daemon_entry,
-        sha256: result.active.daemon_entry_sha256,
+        path: serviceArtifact.path,
+        sha256: serviceArtifact.sha256,
         version: result.active.version,
       }, { ...daemon, rollbackPayload });
       result.homes = reconcileCodexHomes(paths);
