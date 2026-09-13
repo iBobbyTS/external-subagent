@@ -3493,6 +3493,45 @@ mod admission_tests {
     }
 
     #[test]
+    fn dsh_admission_rejects_incomplete_persisted_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let mut config = AgentConfigSnapshot::default();
+        let dsh = config.agents.get_mut("dsh").unwrap();
+        dsh.enabled = true;
+        dsh.spawn_supported = true;
+        dsh.runtime_path = Some(runtime.to_string_lossy().into_owned());
+        dsh.profile = Some("acp".into());
+        dsh.version = Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into());
+        let input = GeneralSubmitInput {
+            agent: Some("dsh".into()),
+            model: None,
+            manifest: GeneralTaskManifest {
+                schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                agent_id: "gate-test".into(),
+                repository: directory.path().into(),
+                permission_mode: external_core::PermissionMode::Build,
+                prompt: "test".into(),
+                write_manifest: vec![],
+            },
+        };
+        assert_eq!(resolve_admission(&input, &config).unwrap().agent, "dsh");
+        config.agents.get_mut("dsh").unwrap().version = None;
+        assert_eq!(
+            resolve_admission(&input, &config).unwrap_err().code,
+            RpcErrorCode::AgentUnsupported
+        );
+    }
+
+    #[test]
     fn admission_snapshot_survives_config_change_reopen_and_filtered_pagination() {
         let (directory, service, previous_id) = wait_tests::fixture();
         service

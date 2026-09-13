@@ -277,6 +277,7 @@ fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn production_scheduler_allows_the_verified_official_runtime_bootstrap_window() {
@@ -292,5 +293,35 @@ mod tests {
         );
         assert_eq!(production.stop_grace, defaults.stop_grace);
         assert!(production.runtime_source.is_none());
+    }
+
+    #[test]
+    fn dsh_production_gate_requires_complete_persisted_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("dsh-runtime");
+        std::fs::File::create(&runtime)
+            .unwrap()
+            .write_all(b"runtime")
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let config_path = directory.path().join("config.json");
+        let base = serde_json::json!({"agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":runtime,"profile":"acp","version":"0.1.5-rc.1"}}});
+        std::fs::write(&config_path, serde_json::to_vec(&base).unwrap()).unwrap();
+        assert!(dsh_production_enabled(Some(&config_path)));
+        for field in ["profile", "version"] {
+            let mut value = base.clone();
+            value["agents"]["dsh"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(!dsh_production_enabled(Some(&config_path)));
+        }
     }
 }
