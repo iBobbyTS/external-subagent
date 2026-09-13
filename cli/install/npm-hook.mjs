@@ -37,7 +37,10 @@ process.once('SIGTERM', () => abortOnSignal('SIGTERM'));
 
 try {
   const result = await updateCommand(paths, ['reconcile'], { drainTimeoutMs: 30_000 });
-  if (interrupted) process.exit(process.exitCode || 130);
+  if (interrupted) {
+    if (handlingSignal) await handlingSignal;
+    process.exit(process.exitCode || 130);
+  }
   process.stdout.write(`${JSON.stringify({ external_subagent: 'postinstall', coordinated: true, result })}\n`);
 } catch (error) {
   if (handlingSignal) await handlingSignal;
