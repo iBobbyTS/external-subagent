@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_config()?;
     if let Some(path) = config.agent_config.as_ref() {
         env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
+        configure_dsh_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
     wait_for_startup_test_gate(&shutdown_requested)?;
@@ -102,7 +103,32 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
             .and_then(|entry| entry.get("spawn_supported"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
-        && env::var_os("DSH_RUNTIME_PATH").is_some()
+        && configured
+            .and_then(|entry| entry.get("runtime_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new)
+            .is_some_and(|runtime| runtime.is_absolute() && runtime.is_file())
+}
+
+fn configure_dsh_environment(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    let Ok(bytes) = fs::read(path) else { return };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let Some(entry) = value.pointer("/agents/dsh") else {
+        return;
+    };
+    for (field, variable) in [
+        ("runtime_path", "DSH_RUNTIME_PATH"),
+        ("home", "DSH_HOME"),
+        ("profile", "DSH_PROFILE"),
+        ("version", "DSH_VERSION"),
+    ] {
+        if let Some(value) = entry.get(field).and_then(serde_json::Value::as_str) {
+            env::set_var(variable, value);
+        }
+    }
 }
 
 fn production_scheduler_config(runtime_source: Option<PathBuf>) -> SchedulerConfig {
