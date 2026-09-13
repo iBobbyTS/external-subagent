@@ -3,10 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { reconcileInstallation, updateInstallation } from '../../cli/install/update.mjs';
 import { registerCodexHome, reconcileCodexHomes } from '../../cli/install/reconcile.mjs';
 import { updateCommand } from '../../cli/commands/update.mjs';
-import { packageVersion } from '../../cli/install/layout.mjs';
+import { packageRoot, packageVersion } from '../../cli/install/layout.mjs';
+import { runInit } from '../../cli/install/init.mjs';
+
+const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64';
 
 function paths(root) {
   return { data: path.join(root, 'data'), home: path.join(root, 'home'), state: path.join(root, 'data', 'install-state.json') };
@@ -201,4 +205,125 @@ test('service activation failure removes a newly created active state', async ()
   }), /bootstrap failed/);
   assert.equal(fs.existsSync(p.state), false);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('default update derives a verified candidate root from the installed package', { skip: !darwinArm64 }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-derived-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  try {
+    const result = updateInstallation(p, {});
+    assert.equal(result.phase, 'active');
+    // Expected values are recomputed from the staged package tree itself: the
+    // active pointer must describe the package's own manifest and entry bytes,
+    // never an ambient version string.
+    const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
+    const entry = path.join(fs.realpathSync(packageRoot()), 'bin', 'external-subagent.mjs');
+    const entryDigest = crypto.createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
+    assert.equal(result.active.root, packageRoot());
+    assert.ok(!path.resolve(result.active.root).startsWith(path.resolve(p.data)), 'candidate root must be independent of install state');
+    assert.equal(result.active.version, manifest.version);
+    assert.equal(result.active.entry, entry);
+    assert.equal(result.active.entry_sha256, entryDigest);
+    assert.deepEqual(result.active.payload.map((file) => file.name), manifest.files.map((file) => file.name));
+    const state = JSON.parse(fs.readFileSync(p.state, 'utf8'));
+    assert.equal(state.candidate, null);
+    assert.equal(state.active.root, packageRoot());
+    assert.equal(state.active.entry_sha256, entryDigest);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('update command runs the updater once and activates the service from the verified active payload', { skip: !darwinArm64 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-service-wire-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  const events = [];
+  let activated = null;
+  const rpc = async (_socket, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'svc-wire-1' } : { ready_for_activation: true };
+  try {
+    const result = await updateCommand(p, [], {
+      callDaemon: rpc,
+      updateInstallation: (target, options) => {
+        events.push('update');
+        assert.equal(options.candidateRoot, undefined, 'updateCommand must let the updater derive the candidate root');
+        return updateInstallation(target, options);
+      },
+      hasInstalledService: () => true,
+      activateService: async (_target, candidate) => { events.push('activate'); activated = candidate; return { pid: 4242, service_generation: 7 }; },
+    });
+    assert.equal(result.phase, 'active');
+    assert.deepEqual(events, ['update', 'activate']);
+    assert.equal(activated.path, result.active.entry);
+    assert.equal(activated.sha256, result.active.entry_sha256);
+    assert.equal(activated.version, result.active.version);
+    const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+    assert.equal(receipt.status, 'success');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unverifiable default candidate never overwrites the published active', { skip: !darwinArm64 }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-unverifiable-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  try {
+    updateInstallation(p, {});
+    const before = fs.readFileSync(p.state);
+    assert.throws(() => updateInstallation(p, { platform: 'linux-x64' }), (error) => error.code === 'PAYLOAD_MANIFEST_MISSING');
+    assert.deepEqual(fs.readFileSync(p.state), before, 'a rejected default candidate must leave the prior active untouched');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('service activation is skipped when the default candidate fails verification', { skip: !darwinArm64 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-svc-fail-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  const activations = [];
+  const rpc = async (_socket, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'svc-fail-1' } : { ready_for_activation: true };
+  try {
+    updateInstallation(p, {});
+    await assert.rejects(() => updateCommand(p, [], {
+      callDaemon: rpc,
+      updateInstallation: (target, options) => updateInstallation(target, { ...options, platform: 'linux-x64' }),
+      hasInstalledService: () => true,
+      activateService: async (...args) => { activations.push(args); return {}; },
+    }), (error) => error.code === 'PAYLOAD_MANIFEST_MISSING');
+    assert.equal(activations.length, 0);
+    const state = JSON.parse(fs.readFileSync(p.state, 'utf8'));
+    assert.equal(state.phase, 'active');
+    assert.equal(state.active.root, packageRoot());
+    const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+    assert.equal(receipt.status, 'failed');
+    assert.equal(receipt.retryable, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('first install stays stage-only and never publishes an activation state', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-stage-only-'));
+  const p = {
+    data: path.join(root, 'data'), logs: path.join(root, 'logs'), home: path.join(root, 'home'),
+    state: path.join(root, 'data', 'install-state.json'), config: path.join(root, 'config', 'product.json'),
+    launchAgent: path.join(root, 'LaunchAgents', 'com.external-subagent.daemon.plist'),
+    socket: path.join(root, 'data', 'daemon.sock'), database: path.join(root, 'data', 'daemon.db'),
+    zcodeConfig: path.join(root, 'zcode', 'config.toml'), hookProvenance: path.join(root, 'zcode', 'hooks.json'),
+  };
+  fs.mkdirSync(p.home, { recursive: true });
+  try {
+    const result = runInit({ paths: p, skipRuntimeProbe: true, skipPayloadProbe: true, skipServiceStart: true, skipCodexPlugin: true });
+    assert.equal(result.installed, true);
+    const state = JSON.parse(fs.readFileSync(p.state, 'utf8'));
+    assert.equal(state.schema_version, 1, 'init writes its resume journal, never the activation state');
+    assert.equal(state.active, undefined);
+    assert.equal(state.candidate, undefined);
+    assert.equal(fs.existsSync(`${p.state}.activation.json`), false, 'init never claims an activation receipt');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

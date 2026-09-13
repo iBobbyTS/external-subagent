@@ -38,13 +38,20 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   let result;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
-    result = args.includes('reconcile')
+    const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
+    const reconciling = args.includes('reconcile');
+    result = reconciling
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
-      : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceInstalled && !daemon.skipServiceActivation });
+      : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceDue });
     if (!result || typeof result !== 'object' || result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }
-    if (result?.active?.entry && serviceInstalled && !daemon.skipServiceActivation) {
+    if (serviceDue && !reconciling && (!result.active?.entry || !result.active?.entry_sha256)) {
+      // An explicit update exists to switch the verified stable executable;
+      // a payload without one must fail rather than silently skip activation.
+      throw new CliError('ACTIVE_ENTRY_UNVERIFIED', 'activated payload has no verified stable entry to activate');
+    }
+    if (result?.active?.entry && serviceDue) {
       const activate = daemon.activateService || activateService;
       result.service = await activate(paths, {
         path: result.active.entry,
