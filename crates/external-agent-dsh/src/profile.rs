@@ -606,8 +606,38 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         "telemetry",
         "logging",
     ];
-    let mut saw_policy = false;
-    fn walk(v: &serde_yaml::Value, saw: &mut bool) -> Result<(), String> {
+    // Both policy controls must appear exactly once, unambiguously enabled,
+    // with pinned configs. A missing, duplicated, disabled, or drifted
+    // control rejects the whole dump before any prompt is sent: the strict
+    // probe never trusts an unconfigured sandbox or a disabled approval gate.
+    let mut controls = (0usize, 0usize);
+    fn pinned_control_config<'a>(
+        m: &'a serde_yaml::Mapping,
+        id: &str,
+        allowed_keys: &[&str],
+    ) -> Result<&'a serde_yaml::Mapping, String> {
+        if let Some(disabled) = m.get(serde_yaml::Value::String("disabled".into())) {
+            // Activation expressions are never evaluated, so anything except
+            // an explicit `disabled: false` fails closed.
+            if disabled.as_bool() != Some(false) {
+                return Err(format!("strict {id} control must not be disabled"));
+            }
+        }
+        let config = m
+            .get(serde_yaml::Value::String("config".into()))
+            .ok_or_else(|| format!("strict {id} control is missing its config"))?;
+        let map = config
+            .as_mapping()
+            .ok_or_else(|| format!("strict {id} config must be a mapping"))?;
+        if map
+            .keys()
+            .any(|key| !allowed_keys.contains(&key.as_str().unwrap_or("")))
+        {
+            return Err(format!("strict {id} config contains unmanaged keys"));
+        }
+        Ok(map)
+    }
+    fn walk(v: &serde_yaml::Value, saw: &mut (usize, usize)) -> Result<(), String> {
         match v {
             serde_yaml::Value::Mapping(m) => {
                 let id = m
@@ -616,9 +646,6 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                 let disabled = m
                     .get(serde_yaml::Value::String("disabled".into()))
                     .and_then(|v| v.as_bool());
-                if matches!(id, Some("sandbox-policy" | "approval")) {
-                    *saw = true;
-                }
                 if let Some(id) = id {
                     if DANGEROUS.contains(&id) && disabled != Some(true) {
                         return Err(format!("dangerous DSH entry is enabled: {id:?}"));
@@ -629,12 +656,34 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
                     {
                         return Err(format!("unknown enabled DSH entry: {id:?}"));
                     }
-                    if matches!(id, "sandbox-policy" | "approval") {
-                        let config = m.get(serde_yaml::Value::String("config".into()));
-                        let mode = config.and_then(|v| v.get("mode")).and_then(|v| v.as_str());
-                        if id == "sandbox-policy" && config.is_some() && mode != Some("read-only") {
-                            return Err("sandbox-policy must be read-only".into());
+                    match id {
+                        "sandbox-policy" => {
+                            saw.0 += 1;
+                            let config =
+                                pinned_control_config(m, id, &["mode", "workspaceRoot"])?;
+                            if config.get("mode").and_then(|v| v.as_str()) != Some("read-only") {
+                                return Err("sandbox-policy must pin mode read-only".into());
+                            }
                         }
+                        "approval" => {
+                            saw.1 += 1;
+                            let config = pinned_control_config(m, id, &["policy"])?;
+                            // Both accepted values resolve to ask inside DSH:
+                            // preflight pins DSH_PERMISSION_MODE=read-only, so
+                            // the shipped conditional evaluates to ask. The
+                            // expression itself is never evaluated here.
+                            if !matches!(
+                                config.get("policy").and_then(|v| v.as_str()),
+                                Some("ask")
+                                    | Some(
+                                        "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') \
+                                         === 'danger-full-access' ? 'never' : 'ask'",
+                                    )
+                            ) {
+                                return Err("approval must resolve to ask".into());
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 for key in ["runnerCommand", "executor", "executors"] {
@@ -665,9 +714,12 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
         }
         Ok(())
     }
-    walk(value, &mut saw_policy)?;
-    if !saw_policy {
-        return Err("dump-config missing sandbox-policy/approval controls".into());
+    walk(value, &mut controls)?;
+    if controls.0 != 1 {
+        return Err("dump-config requires exactly one enabled sandbox-policy".into());
+    }
+    if controls.1 != 1 {
+        return Err("dump-config requires exactly one enabled approval".into());
     }
     Ok(())
 }
@@ -1102,7 +1154,7 @@ else:
 
     #[test]
     fn dump_policy_rejects_unknown_enabled_tool() {
-        let yaml = serde_yaml::from_str::<serde_yaml::Value>("- id: sandbox-policy\n  disabled: true\n- id: approval\n  disabled: true\n- id: tool-unknown\n  disabled: false").unwrap();
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>("- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask\n- id: tool-unknown\n  disabled: false").unwrap();
         assert!(validate_dump_policy(&yaml)
             .unwrap_err()
             .contains("unknown enabled"));
@@ -1111,7 +1163,7 @@ else:
     #[test]
     fn dump_policy_rejects_unknown_enabled_entry() {
         let yaml = serde_yaml::from_str::<serde_yaml::Value>(
-            "- id: sandbox-policy\n  disabled: false\n- id: approval\n  disabled: true\n- id: unmanaged-entry\n  disabled: false",
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask\n- id: unmanaged-entry\n  disabled: false",
         )
         .unwrap();
         assert!(validate_dump_policy(&yaml)
@@ -1122,12 +1174,53 @@ else:
     #[test]
     fn dump_policy_rejects_executor_and_settings_drift() {
         for drift in [
-            "- id: sandbox-policy\n  disabled: false\n  config:\n    mode: read-only\n    runnerCommand: /bin/sh\n- id: approval\n  disabled: true",
-            "- id: sandbox-policy\n  disabled: false\n  config:\n    mode: read-only\n- id: approval\n  disabled: true\n- id: settings\n  disabled: false\n  config:\n    permission_mode: workspace-write",
+            "- id: sandbox-policy\n  disabled: false\n  config:\n    mode: read-only\n    runnerCommand: /bin/sh\n- id: approval\n  config:\n    policy: ask",
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask\n- id: settings\n  disabled: false\n  config:\n    permission_mode: workspace-write",
         ] {
             let yaml = serde_yaml::from_str::<serde_yaml::Value>(drift).unwrap();
             assert!(validate_dump_policy(&yaml).is_err());
         }
+    }
+
+    #[test]
+    fn dump_policy_fails_closed_on_missing_or_drifted_controls() {
+        let baseline = "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask";
+        validate_dump_policy(&serde_yaml::from_str(baseline).unwrap()).unwrap();
+        // R0 counterexample: an enabled sandbox-policy without config and a
+        // disabled approval used to pass and send the probe prompt.
+        let counterexample =
+            "- id: sandbox-policy\n  disabled: false\n- id: approval\n  disabled: true";
+        assert!(validate_dump_policy(&serde_yaml::from_str(counterexample).unwrap()).is_err());
+        for drift in [
+            // missing or duplicated controls
+            "- id: sandbox-policy\n  config:\n    mode: read-only".to_string(),
+            "- id: approval\n  config:\n    policy: ask".to_string(),
+            format!("{baseline}\n- id: sandbox-policy\n  config:\n    mode: read-only"),
+            format!("{baseline}\n- id: approval\n  config:\n    policy: ask"),
+            // disabled or unresolvable activation
+            "- id: sandbox-policy\n  disabled: true\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask".to_string(),
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  disabled: true\n  config:\n    policy: ask".to_string(),
+            "- id: sandbox-policy\n  disabled: process.platform === 'win32'\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask".to_string(),
+            // missing config
+            "- id: sandbox-policy\n- id: approval\n  config:\n    policy: ask".to_string(),
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval".to_string(),
+            // drifted values
+            "- id: sandbox-policy\n  config:\n    mode: workspace-write\n- id: approval\n  config:\n    policy: ask".to_string(),
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: never".to_string(),
+            // unmanaged config keys
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n    autoAllow: true\n- id: approval\n  config:\n    policy: ask".to_string(),
+            "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask\n    autoApprove: true".to_string(),
+        ] {
+            let yaml = serde_yaml::from_str::<serde_yaml::Value>(&drift).unwrap();
+            assert!(validate_dump_policy(&yaml).is_err(), "{drift}");
+        }
+        // The shipped conditional resolves to ask under the pinned read-only
+        // permission mode; it is matched textually and never evaluated.
+        let conditional = serde_json::json!([
+            {"id": "sandbox-policy", "config": {"mode": "read-only"}},
+            {"id": "approval", "config": {"policy": "(process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"}},
+        ]);
+        validate_dump_policy(&serde_yaml::to_value(&conditional).unwrap()).unwrap();
     }
 
     #[test]
