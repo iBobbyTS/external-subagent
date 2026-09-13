@@ -1755,7 +1755,7 @@ mod server {
         #[tool(
         name = "external_subagent_spawn",
         output_schema = tool_output_schema::<AgentSpawnOutput>(),
-        description = "Start one durable agent in an absolute repository workspace. Specify agent unless default_agent is configured. ZCode uses its initialized native model and rejects model selection; dsh production spawn remains unsupported until its adapter is accepted. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
+        description = "Start one durable agent in an absolute repository workspace. Specify agent unless default_agent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2570,6 +2570,27 @@ mod server {
             assert_eq!(
                 serialized["identity"]["facade"]["artifact"]["path"],
                 "/running/facade"
+            );
+        }
+
+        #[test]
+        fn spawn_description_states_the_config_gated_dsh_reality() {
+            let facade =
+                SubagentMcp::new(PathBuf::from("/tmp/spawn-desc.sock"), Duration::from_secs(1));
+            let spawn = facade
+                .tool_router
+                .list_all()
+                .into_iter()
+                .find(|tool| tool.name == "external_subagent_spawn")
+                .unwrap();
+            let description = spawn.description.as_deref().unwrap();
+            assert!(
+                !description.contains("remains unsupported"),
+                "stale pre-admission dsh claim still exposed to MCP consumers: {description}"
+            );
+            assert!(
+                description.contains("spawn_supported"),
+                "the configured dsh admission gate is not documented: {description}"
             );
         }
 
