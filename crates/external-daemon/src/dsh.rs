@@ -150,6 +150,8 @@ impl RuntimeFactory for DshRuntimeFactory {
                     prepared.workspace.path.clone(),
                     std::env::var_os("DSH_HOME").map(PathBuf::from),
                 );
+                launch.profile = std::env::var("DSH_PROFILE").ok();
+                launch.version = std::env::var("DSH_VERSION").ok();
                 if plan {
                     launch.permission_mode = Some("read-only".into());
                     launch.patch = patch;
@@ -179,11 +181,13 @@ impl RuntimeFactory for DshRuntimeFactory {
                     .executable
                     .clone()
                     .or_else(|| std::env::var_os("DSH_RUNTIME_PATH").map(PathBuf::from));
-                let launch = external_agent_dsh::profile::DshLaunch::new(
+                let mut launch = external_agent_dsh::profile::DshLaunch::new(
                     executable,
                     prepared.workspace.path.clone(),
                     std::env::var_os("DSH_HOME").map(PathBuf::from),
                 );
+                launch.profile = std::env::var("DSH_PROFILE").ok();
+                launch.version = std::env::var("DSH_VERSION").ok();
                 let command = external_agent_dsh::profile::resolve_launch(&launch)?;
                 let owner = DshRuntimeOwner::spawn(command, _sink)?;
                 Ok(Arc::new(owner))
