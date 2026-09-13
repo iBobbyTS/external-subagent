@@ -5,10 +5,11 @@ as MCP.
 
 ## Status
 
-Feature branch `codex/external-subagent-v1`; sections S01–S04 implemented and
-reviewed, S05 (npm fresh install + managed Codex binding) implemented. The
-DSH production spawn gate remains closed pending live evidence, and nothing
-has been published to a registry.
+Feature branch `codex/external-subagent-v1`; DSH and ZCode installed-artifact
+lifecycles, active-task upgrade, and managed Codex binding are implemented and
+reviewed. DSH admission currently supports `build` and strict `plan`; its
+model selection is explicit spawn model, configured default, then the native
+default. Nothing has been published to a registry.
 
 ## Install (from a packed artifact)
 
@@ -19,8 +20,10 @@ npm install -g <external-subagent-0.1.0.tgz>            # stages package + paylo
 external-subagent init                                  # explicit: service, Codex binding, D08 claim
 ```
 
-A plain install never starts the daemon, writes Codex, probes providers, or
-edits shell profiles — those belong to the explicit `init`. Supported
+A plain install stages the package and payload only. On an already initialized
+installation, npm's postinstall hook detects a local version drift and reuses
+the existing reconcile/update owner; it never initializes a fresh home or
+probes a provider. `init` remains the explicit first activation step. Supported
 platform: macOS arm64; other platforms keep `help`/`version` working and
 reject business commands without writing HOME.
 
