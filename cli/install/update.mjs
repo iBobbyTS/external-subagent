@@ -50,27 +50,30 @@ export function updateInstallation(paths, options = {}) {
   if (options.dryRun) return { dry_run: true, phase: 'candidate', version: options.version || 'current' };
   return withLock(paths, () => {
     const requested = options.version || 'current';
-    const candidateRoot = options.candidateRoot || null;
+    // An explicit update always has a candidate root: the controlled staged
+    // payload when the caller passes one, otherwise the installed package the
+    // CLI itself runs from.  There is no rootless "version-only" activation.
+    const candidateRoot = options.candidateRoot || packageRoot();
     const version = requested === 'current' ? packageVersion() : requested;
     const available = options.availableVersions || [packageVersion()];
     if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
       throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
     }
-    const payload = candidateRoot ? verifyPayload({ root: candidateRoot, platform: options.platform }) : null;
-    const verifiedVersion = payload?.version || version;
-    if (payload && version !== verifiedVersion) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${verifiedVersion}`);
+    const payload = verifyPayload({ root: candidateRoot, platform: options.platform });
+    if (version !== payload.version) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${payload.version}`);
+    const verifiedVersion = payload.version;
     // Reject a doomed candidate up front: an unusable stable entry must never
     // publish candidate state or touch a single Codex home.
-    const stable = candidateRoot ? verifyStableEntry(candidateRoot) : null;
+    const stable = verifyStableEntry(candidateRoot);
     const prior = readState(paths);
-    const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, ...(candidateRoot ? { root: candidateRoot, payload: payload.files } : {}) }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
+    const state = { schema_version: SCHEMA_VERSION, candidate: { version: verifiedVersion, root: candidateRoot, payload: payload.files }, active: prior.active, phase: 'candidate', updated_at_ms: Date.now() };
     atomicWrite(paths.state, jsonBytes(state));
     const publishedCandidate = state.candidate;
     try {
       const sync = options.deferCodexSync ? { homes: [], all_updated: true, deferred: true } : reconcileCodexHomes(paths, options);
       const ok = sync.homes.length === 0 || sync.all_updated;
       state.phase = ok ? 'active' : (sync.homes.some((h) => h.status === 'failed') ? 'failed' : 'partial');
-      if (ok && candidateRoot) {
+      if (ok) {
         // Re-verify immediately before publishing: active may only ever point
         // at the entry bytes verified above, never a candidate mutated since.
         const stableNow = verifyStableEntry(candidateRoot);
@@ -80,7 +83,7 @@ export function updateInstallation(paths, options = {}) {
         state.active = state.candidate; state.candidate = null;
         state.active.entry = stableNow.entry;
         state.active.entry_sha256 = stableNow.digest;
-      } else if (ok) { state.active = state.candidate; state.candidate = null; }
+      }
       atomicWrite(paths.state, jsonBytes(state));
       return state;
     } catch (error) {
