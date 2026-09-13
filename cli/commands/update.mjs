@@ -20,6 +20,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
   const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
+  const drainDeadline = Number.isFinite(daemon.drainTimeoutMs) && daemon.drainTimeoutMs > 0
+    ? Date.now() + daemon.drainTimeoutMs : null;
   // npm auto-coordination (U06): an already-initialized product whose
   // installed package drifted from the published active payload coordinates
   // through the full update path even when invoked as `reconcile` — the
@@ -56,6 +58,10 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   }
   if (online) {
     while (!status.ready_for_activation) {
+      if (drainDeadline !== null && Date.now() >= drainDeadline) {
+        try { await rpc(socket, 'drain-abort', {}); } catch { /* preserve timeout as the primary error */ }
+        throw new CliError('UPDATE_DRAIN_TIMEOUT', 'update drain exceeded its bounded deadline; daemon drain was aborted');
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
       status = await rpc(socket, 'drain-status', {});
     }
