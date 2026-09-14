@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { backupData, cleanupLegacy, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
+import { uninstall as uninstallProduct } from '../../cli/commands/maintenance.mjs';
+import { loadCodexHomes, registerCodexHome } from '../../cli/install/reconcile.mjs';
 import { bootstrapService, bootoutService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
 import { runInit } from '../../cli/install/init.mjs';
 import { CliError } from '../../cli/errors.mjs';
@@ -93,6 +95,82 @@ test('uninstall reports a bootout it cannot complete instead of removing the def
   };
   assert.throws(() => uninstall(paths, { launchctl: stuck, unloadTimeoutMs: 150 }), (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT');
   assert.equal(fs.existsSync(paths.launchAgent), true);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('product uninstall keeps every registry claim when the bootout cannot complete', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-stuck-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const codexHome = path.join(home, 'codex-claimed');
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(codexHome, 'binding.json'), 'managed binding');
+  registerCodexHome(paths, codexHome, { version: '0.1.0', digest: 'deadbeef', status: 'claimed' });
+  // A job that stays registered after bootout: the command must fail before
+  // any claim is released, leaving the registry and the bound homes exactly
+  // as they were so the uninstall can simply be retried.
+  const stuck = (args) => {
+    if (args[0] === 'print') return { action: 'print', status: 0, stdout: 'state = running\npid = 999\n' };
+    if (args[0] === 'bootout') return { action: 'bootout', status: 0 };
+    throw new Error(`unexpected launchctl call: ${args.join(' ')}`);
+  };
+  try {
+    assert.throws(
+      () => uninstallProduct(paths, { launchctl: stuck, unloadTimeoutMs: 150 }),
+      (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT',
+    );
+    const registry = loadCodexHomes(paths).registry;
+    assert.deepEqual(registry.homes.map((entry) => entry.home), [fs.realpathSync(codexHome)],
+      'a failed service removal must not release any claim');
+    assert.equal(registry.homes[0].digest, 'deadbeef', 'per-home registry state survives the failed uninstall verbatim');
+    assert.equal(fs.readFileSync(path.join(codexHome, 'binding.json'), 'utf8'), 'managed binding',
+      'the bound home is left untouched for the retry');
+    assert.equal(fs.existsSync(paths.launchAgent), true, 'the service definition stays in place');
+
+    // The intermediate state is retry-safe: the same uninstall completes once
+    // launchd gives the job up, and only then are the claims released.
+    const launchctl = recordingLaunchctl({ loaded: true });
+    const retried = uninstallProduct(paths, { launchctl: launchctl.control });
+    assert.equal(retried.codex_homes_unregistered, 1);
+    assert.deepEqual(loadCodexHomes(paths).registry.homes, []);
+    assert.equal(fs.existsSync(paths.launchAgent), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('product uninstall removes the service first, then releases every claim while retaining data', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-claims-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.writeFileSync(path.join(paths.data, 'install-state.json'), 'state');
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const claimed = [];
+  for (const name of ['codex-a', 'codex-b']) {
+    const codexHome = path.join(home, name);
+    fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(codexHome, 'binding.json'), `binding ${name}`);
+    registerCodexHome(paths, codexHome, { version: '0.1.0', status: 'claimed' });
+    claimed.push(codexHome);
+  }
+  const launchctl = recordingLaunchctl({ loaded: true });
+  const result = uninstallProduct(paths, { launchctl: launchctl.control });
+  assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'uninstall must boot out the service it owns');
+  assert.equal(result.service_stopped, true);
+  assert.equal(result.service_already_stopped, false);
+  assert.equal(result.removed_launch_agent, true);
+  assert.equal(result.codex_homes_unregistered, 2, 'every claimed home is released');
+  assert.equal(result.data_retained, true);
+  assert.equal(fs.existsSync(paths.data), true, 'uninstall never purges retained data');
+  assert.equal(fs.existsSync(paths.launchAgent), false);
+  assert.deepEqual(loadCodexHomes(paths).registry.homes, [], 'no home remains claimed');
+  for (const codexHome of claimed) {
+    assert.equal(fs.readFileSync(path.join(codexHome, 'binding.json'), 'utf8'), `binding ${path.basename(codexHome)}`,
+      'claim release is registry-only; bound home contents are left to their owners');
+  }
   fs.rmSync(home, { recursive: true, force: true });
 });
 
