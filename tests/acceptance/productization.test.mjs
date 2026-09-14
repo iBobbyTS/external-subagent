@@ -24,9 +24,9 @@ test('managed plugin manifest carries a distinct semver cache identity', () => {
   // the same identity share the store's bytes, so a released candidate must
   // carry its own version identity (see docs/compatibility/codex.md).
   // Identity 0.1.0 is cached by the historical installation; identity 0.1.1
-  // is candidate C1's and was itself materialized into the store by the C1
-  // consumer runs. The post-installer-fix final candidate is C2 = 0.1.2,
-  // whose fresh consumer verification is still pending.
+  // is candidate C1's and identity 0.1.2 is candidate C2's, each materialized
+  // into the store by that candidate's own consumer runs. A later release
+  // candidate must bump past 0.1.2 the same way.
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/u, 'plugin version must be a plain semver identity');
   assert.notEqual(manifest.version, '0.1.0', 'identity 0.1.0 is already cached by the historical installation; a release must not reuse it');
   assert.notEqual(manifest.version, '0.1.1', 'identity 0.1.1 is candidate C1\'s, already materialized by the C1 consumer runs; a release must not reuse it');
@@ -50,17 +50,22 @@ test('acceptance matrix deliverable records the four live consumer cells', () =>
   assert.ok(doc.includes('REGISTRY_PUBLICATION_PENDING'), 'publication status must stay explicit until authorized');
 });
 
-test('acceptance doc keeps the pending C2 candidate distinct from the recorded C1 evidence', () => {
+test('acceptance doc records the C2 fresh consumer verification as passed', () => {
   const doc = fs.readFileSync(path.join(root, 'docs', 'acceptance', 'productization.md'), 'utf8');
   // The installer production fixes landed after C1 (`0.1.1`) ran its four
-  // cells, so the final candidate is C2 = `0.1.2` with its own cache
-  // identity. The C1 cells remain the recorded live evidence — they must not
-  // be silently re-attributed to C2, which needs a fresh consumer run of its
-  // own before release.
-  assert.match(doc, /C2/u, 'the post-fix final candidate must be named');
-  assert.match(doc, /`0\.1\.2`/u, 'the C2 cache identity must be recorded');
-  assert.ok(doc.includes('C2_FRESH_CONSUMER_VERIFICATION_PENDING'), 'the pending C2 fresh-consumer verification must stay explicit');
+  // cells, so the final candidate C2 = `0.1.2` needed — and on 2026-09-13
+  // received — its own fresh consumer run. The doc must record that run's
+  // PASS status and its own four C2 cells, while the C1 matrix stays
+  // labelled as the historical evidence for the C1 artifact.
+  assert.ok(doc.includes('C2_FRESH_CONSUMER_VERIFICATION_PASS'), 'the passed C2 fresh-consumer verification must stay explicit');
+  assert.ok(!doc.includes('C2_FRESH_CONSUMER_VERIFICATION_PENDING'), 'the withdrawn pending status must not return');
+  for (const marker of ['S04_C2_CLI_DSH_OK', 'S04_C2_CLI_ZCODE_OK', 'S04_C2_MCP_DSH_OK', 'S04_C2_MCP_ZCODE_OK']) {
+    assert.ok(doc.includes(marker), `the C2 acceptance matrix must record the ${marker} cell`);
+  }
+  assert.ok(doc.includes('7444f59b508d5aae31b6f17e6c8744c6abde494b86701d821fce43d436d04399'), 'the C2 tarball sha256 must be recorded');
+  assert.ok(doc.includes('`cache_verified: true`'), 'the verified plugin-cache receipt must be recorded');
   assert.match(doc, /`0\.1\.1`/u, 'the historical C1 evidence must keep its own identity label');
+  assert.match(doc, /C1, `0\.1\.1` \(historical\)/u, 'the C1 matrix must stay labelled as historical, not re-attributed to C2');
 });
 
 test('acceptance doc attributes the zcode probe home to the real user home, not an isolated HOME', () => {

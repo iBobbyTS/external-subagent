@@ -9,20 +9,23 @@ Feature branch `codex/external-subagent-productization-closeout`. DSH and
 ZCode installed-artifact lifecycles, active-task upgrade, and managed Codex
 binding are implemented and reviewed; installing from a packed artifact and
 explicitly initializing to a launchd-resident service (idempotent repeat
-init/start) is live-verified on a real GUI session. The productization
-candidate additionally passed the four-cell consumer matrix — DSH/ZCode ×
-public CLI / real Codex CLI via the managed plugin over MCP — against one
-tarball (see [docs/acceptance/productization.md](docs/acceptance/productization.md));
-the managed plugin manifest is versioned per released candidate because its
-version is codex's plugin-cache identity — currently `0.1.2` for the
-post-installer-fix final candidate C2 (the pre-fix candidate C1 was `0.1.1`,
-and its consumer runs already cached that identity), so C2 does not inherit
-C1's four cells and still needs its own fresh consumer verification. The
-installer verifies the materialized plugin cache against the staged binding
-before reporting success, failing closed on store-reused bytes. DSH admission
-currently supports `build` and strict `plan`; its model selection is explicit
-spawn model, configured default, then the native default. Nothing has been
-published to a registry (`REGISTRY_PUBLICATION_PENDING`).
+init/start) is live-verified on a real GUI session. Both productization
+candidates passed the four-cell consumer matrix — DSH/ZCode × public CLI /
+real Codex CLI via the managed plugin over MCP, each against its own tarball:
+the pre-fix candidate C1 (`0.1.1`, historical) and the post-installer-fix
+final candidate C2 (`0.1.2`), whose fresh consumer verification passed
+through the public install surface — all four cells COMPLETED with the
+plugin cache verified against the staged binding (`cache_verified: true`;
+see [docs/acceptance/productization.md](docs/acceptance/productization.md)).
+The managed plugin manifest is versioned per released candidate because its
+version is codex's plugin-cache identity, and each candidate's consumer runs
+cache that identity in codex's machine-global store, so any later candidate
+bumps again. The installer verifies the materialized plugin cache against
+the staged binding before reporting success, failing closed on store-reused
+bytes. DSH admission currently supports `build` and strict `plan`; its model
+selection is explicit spawn model, configured default, then the native
+default. Nothing has been published to a registry
+(`REGISTRY_PUBLICATION_PENDING`).
 
 ## Install (from a packed artifact)
 
