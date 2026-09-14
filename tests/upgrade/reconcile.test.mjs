@@ -520,6 +520,55 @@ test('a failed service activation preserves the published vB active byte-for-byt
   assert.equal(receipt.rollback.restored, true);
 });
 
+test('a partial Codex-home sync keeps the verified activation and reports per-home statuses', { skip: !testable }, async () => {
+  await ensureR2();
+  await ensureVersionB();
+
+  // A second registered home the sync cannot write: reconcile must skip it
+  // per home, and the public update must surface that partial outcome without
+  // rolling the completed service activation back (S02's diagnostic limit).
+  const lockedHome = path.join(ctx.workDir, 'codex-locked');
+  fs.mkdirSync(lockedHome, { recursive: true });
+  fs.chmodSync(lockedHome, 0o500);
+  const registryFile = path.join(paths().data, 'codex-homes.json');
+  const registry = JSON.parse(fs.readFileSync(registryFile, 'utf8'));
+  registry.homes.push({ home: fs.realpathSync(lockedHome), claimed_at_ms: Date.now(), version: VERSION_A, digest: null, last_sync_ms: null, last_status: 'claimed' });
+  fs.writeFileSync(registryFile, `${JSON.stringify(registry, null, 2)}\n`);
+  const activationsBefore = serviceActivations().length;
+
+  const partial = runDriver('vbpartial');
+  assert.equal(partial.ok, false, 'a partial home sync must not be reported as success');
+  assert.equal(partial.code, 'CODEX_SYNC_PARTIAL');
+  assert.match(partial.message, /skipped_not_writable/);
+  assert.match(partial.message, new RegExp(fs.realpathSync(lockedHome)));
+  assert.match(partial.message, /external-subagent reconcile/);
+
+  // The verified vB activation survives: active stays published, the service
+  // was switched (and not rolled back), and the registry keeps the per-home
+  // statuses the sync recorded instead of restoring the pre-update bytes.
+  const state = readState();
+  assert.equal(state.phase, 'active');
+  assert.equal(state.active.version, VERSION_B);
+  assert.equal(state.active.daemon_entry_sha256, ctx.shaB);
+  assert.equal(serviceActivations().length, activationsBefore + 1, 'service activation must not be rolled back');
+  const byHome = Object.fromEntries(JSON.parse(fs.readFileSync(registryFile, 'utf8')).homes.map((entry) => [path.basename(entry.home), entry.last_status]));
+  assert.equal(byHome['.codex'], 'updated');
+  assert.equal(byHome['codex-locked'], 'skipped_not_writable');
+  const receipt = readReceipt();
+  assert.equal(receipt.status, 'partial');
+  assert.equal(receipt.retryable, true);
+  assert.equal(receipt.homes.all_updated, false);
+  assert.deepEqual(receipt.homes.homes.map((home) => home.status).sort(), ['skipped_not_writable', 'updated']);
+
+  // Once the blocked home is writable again, the public reconcile finishes
+  // the remaining homes idempotently — no re-activation ritual required.
+  fs.chmodSync(lockedHome, 0o700);
+  const rec = runDriver('vbpartial-rec', ['reconcile']);
+  assert.equal(rec.ok, true, `follow-up reconcile failed: ${rec.message}`);
+  assert.equal(rec.result.homes.all_updated, true);
+  assert.deepEqual(rec.result.homes.homes.map((home) => home.status), ['updated', 'updated']);
+});
+
 test('the public reconcile command re-affirms the published active and rebinds homes', { skip: !testable }, async () => {
   await ensureR2();
   await ensureVersionB();

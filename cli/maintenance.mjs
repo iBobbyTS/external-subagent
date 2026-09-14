@@ -3,6 +3,7 @@ import path from 'node:path';
 import { CliError } from './errors.mjs';
 import { jsonBytes, sha256 } from './fs-atomic.mjs';
 import { legacyPaths, productPaths } from './paths.mjs';
+import { bootoutService } from './install/service-macos.mjs';
 
 function copyTree(source, destination, records, root = source) {
   if (!fs.existsSync(source)) return;
@@ -74,8 +75,23 @@ function removeOne(target) {
   }
 }
 
-export function uninstall(paths = productPaths()) {
-  return { removed_launch_agent: removeOne(paths.launchAgent), data_retained: true, data: paths.data };
+// Deleting the plist alone leaves a job launchd already loaded running until
+// the next logout (observed live: uninstall reported success while the daemon
+// process, the launchd registration, and the RPC socket all stayed alive).
+// The ES-owned service is therefore booted out — with the bounded
+// removal-confirmation bootoutService owns — before its definition file is
+// removed.  A service that is not registered is not an error (idempotent
+// uninstall); a bootout that cannot complete fails the command rather than
+// deleting the definition out from under a still-running service.
+export function uninstall(paths = productPaths(), options = {}) {
+  const service = bootoutService(paths, process.getuid(), options);
+  return {
+    service_stopped: true,
+    service_already_stopped: Boolean(service.already_stopped),
+    removed_launch_agent: removeOne(paths.launchAgent),
+    data_retained: true,
+    data: paths.data,
+  };
 }
 
 export function purge(paths = productPaths()) {
