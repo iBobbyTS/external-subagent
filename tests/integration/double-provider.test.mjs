@@ -124,6 +124,57 @@ test('zcode explicit model selection fails closed at the config boundary', () =>
   });
 });
 
+// Controlled oracle for the bridge-integrity digest itself: the finally-block
+// re-check is only as good as treeDigest's ability to see drift through the
+// symlink bridge, so the link semantics stay pinned by always-on tests.
+test('treeDigest sees symlink target content drift, keeps dangling links, and bounds cycles', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'double-provider-digest-'));
+  try {
+    const tree = path.join(root, 'profiles');
+    const inner = path.join(tree, 'settings');
+    fs.mkdirSync(inner, { recursive: true });
+    fs.writeFileSync(path.join(inner, 'creds.txt'), 'one');
+    fs.writeFileSync(path.join(tree, 'plain.txt'), 'plain');
+    fs.symlinkSync(path.join(inner, 'creds.txt'), path.join(tree, 'cred-link'));
+    fs.symlinkSync(inner, path.join(tree, 'dir-link'));
+    fs.symlinkSync(path.join(root, 'gone', 'target'), path.join(tree, 'dangling-link'));
+
+    const before = treeDigest(tree);
+    assert.match(before, /^tree:[0-9a-f]{64}$/u);
+
+    // In-place edit of a file reached only through a resolving symlink.
+    fs.writeFileSync(path.join(inner, 'creds.txt'), 'two');
+    const afterContent = treeDigest(tree);
+    assert.notEqual(afterContent, before, 'target content edits behind a symlink must surface');
+
+    // Retargeting a resolving symlink (same content elsewhere).
+    fs.writeFileSync(path.join(tree, 'plain.txt'), 'two');
+    fs.rmSync(path.join(tree, 'cred-link'));
+    fs.symlinkSync(path.join(tree, 'plain.txt'), path.join(tree, 'cred-link'));
+    const afterRetarget = treeDigest(tree);
+    assert.notEqual(afterRetarget, afterContent, 'link retargeting must surface');
+
+    // A dangling link resolves into a real (empty) directory.
+    fs.mkdirSync(path.join(root, 'gone', 'target'), { recursive: true });
+    const afterResolving = treeDigest(tree);
+    assert.notEqual(afterResolving, afterRetarget, 'a dangling link becoming resolved must surface');
+
+    // A symlink loop and a diamond terminate, and content inside the looped
+    // subtree is still covered by the digest.
+    const loopBase = path.join(root, 'loop');
+    const loopA = path.join(loopBase, 'a');
+    fs.mkdirSync(loopA, { recursive: true });
+    fs.writeFileSync(path.join(loopA, 'marker.txt'), 'first');
+    fs.symlinkSync(loopA, path.join(loopA, 'self'));
+    fs.symlinkSync(loopA, path.join(loopBase, 'diamond'));
+    const cycled = treeDigest(loopBase);
+    fs.writeFileSync(path.join(loopA, 'marker.txt'), 'second');
+    assert.notEqual(treeDigest(loopBase), cycled, 'content inside a cycled subtree is still hashed');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Live acceptance harness (opt-in). Controlled skips below stay skips: they
 // are not silent passes and never stand in for the live evidence.
@@ -158,25 +209,44 @@ function digest(file) {
 }
 
 // Recursive digest for the one directory bridge (`profiles/`): hashes the
-// sorted (relative path, content) pairs, so both in-place edits and new
-// files written through the symlink surface as drift. Symlink entries are
-// hashed by their target path (lstat, never followed): the real DSH
-// profiles tree legitimately contains dangling dependency symlinks
-// (`profiles/node_modules/...`), which statSync would refuse, and link
-// retargeting still changes the digest.
-function treeDigest(dir) {
+// sorted (relative path, content) pairs, so in-place edits and new files
+// written through the symlink surface as drift. Symlink entries hash the
+// linked CONTENT when the link resolves (an in-place edit of a target file
+// behind the bridge must surface) and keep their target path in the line
+// (retargeting still changes the digest); dangling symlinks stay supported —
+// the real DSH profiles tree contains dangling `node_modules` dependency
+// symlinks, which statSync would refuse. Resolution is cycle-bounded: a
+// directory real path already accounted for (a symlink loop or a diamond)
+// becomes one stable `seen:` line instead of a second traversal, and the
+// walk depth carries a hard backstop, so the digest always terminates.
+export function treeDigest(dir, { depthLimit = 256 } = {}) {
   const lines = [];
-  const walk = (current, prefix) => {
+  const seen = new Set([fs.realpathSync(dir)]);
+  const walk = (current, prefix, depth) => {
     for (const entry of fs.readdirSync(current).sort()) {
       const child = path.join(current, entry);
       const rel = prefix ? `${prefix}/${entry}` : entry;
       const stat = fs.lstatSync(child);
-      if (stat.isSymbolicLink()) lines.push(`${rel} link:${fs.readlinkSync(child)}`);
-      else if (stat.isDirectory()) walk(child, rel);
-      else lines.push(`${rel} ${digest(child)}`);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(child);
+        let resolved = null;
+        try { resolved = fs.statSync(child); } catch { /* dangling: hashed by target path only */ }
+        if (resolved === null) lines.push(`${rel} dangling:${target}`);
+        else if (resolved.isDirectory()) {
+          const real = fs.realpathSync(child);
+          if (seen.has(real)) lines.push(`${rel} seen:${target}`);
+          else if (depth >= depthLimit) lines.push(`${rel} depth:${target}`);
+          else { seen.add(real); lines.push(`${rel} linkdir:${target}`); walk(child, rel, depth + 1); }
+        } else lines.push(`${rel} linkfile:${target}:${digest(child)}`);
+      } else if (stat.isDirectory()) {
+        const real = fs.realpathSync(child);
+        if (seen.has(real)) lines.push(`${rel} seen:.`);
+        else if (depth >= depthLimit) lines.push(`${rel} depth:.`);
+        else { seen.add(real); walk(child, rel, depth + 1); }
+      } else lines.push(`${rel} file:${digest(child)}`);
     }
   };
-  walk(dir, '');
+  walk(dir, '', 0);
   return `tree:${crypto.createHash('sha256').update(lines.join('\n')).digest('hex')}`;
 }
 

@@ -55,6 +55,17 @@ contain a supported manifest`).
   `external-subagent@personal@0.1.1` cache was byte-identical to the staged
   binding (see
   [docs/acceptance/productization.md](../acceptance/productization.md)).
+  Because versioning alone is a release discipline rather than a runtime
+  guarantee, `install-plugin` also **reads the materialized cache back before
+  reporting success** and compares its `.mcp.json` (facade command +
+  `ZCODE_AGENTD_SOCKET`) and `.codex-plugin/plugin.json` identity with this
+  run's staged binding; store-reused or unreadable bytes fail closed with
+  `CODEX_CACHE_BINDING_MISMATCH` / `CODEX_CACHE_UNVERIFIABLE` (a materialized
+  cache that cannot be located is reported as `cache_verified: false`, never
+  as verified). The product only ever reads the cache — the remediation for
+  reused bytes is a distinct release identity, not editing codex-owned
+  state. The fail-closed path is pinned by the store-simulation oracles in
+  `tests/install/codex-binding.test.mjs`.
 
 ## Product binding
 

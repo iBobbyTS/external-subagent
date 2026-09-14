@@ -20,7 +20,9 @@ function fixtureHome(prefix = 'external-subagent-cli-') {
 
 // Minimal stand-in for the verified codex CLI surface (0.153.4 JSON shapes).
 // Named `codex` and exposed through PATH: the command layer resolves the CLI
-// the same way the real binary would be found.
+// the same way the real binary would be found.  `plugin add` materializes
+// the plugin cache the real CLI writes, so the installer's read-back
+// verification is exercised through the public command surface too.
 function fakeCodexCli(directory) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex');
@@ -28,13 +30,29 @@ function fakeCodexCli(directory) {
 import fs from 'node:fs';
 import path from 'node:path';
 const args = process.argv.slice(2);
+const stateDir = ${JSON.stringify(directory)};
+const rootsFile = path.join(stateDir, 'marketplace-roots.json');
 const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
+const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
 if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
-if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') { text({ marketplaceName: 'personal', installedRoot: args[3] }); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const roots = loadRoots();
+  roots[process.env.CODEX_HOME] = args[3];
+  fs.writeFileSync(rootsFile, JSON.stringify(roots));
+  text({ marketplaceName: 'personal', installedRoot: args[3] }); process.exit(0);
+}
 if (args[0] === 'plugin' && args[1] === 'add') {
   const name = args[2]; const marketplace = args[args.indexOf('--marketplace') + 1];
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version: '0.1.0',
-    installedPath: path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, '0.1.0') });
+  const root = loadRoots()[process.env.CODEX_HOME];
+  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
+  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
+  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  fs.rmSync(cache, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.cpSync(staging, cache, { recursive: true });
+  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version, installedPath: cache });
   process.exit(0);
 }
 process.stderr.write('unexpected codex invocation: ' + JSON.stringify(args) + '\\n');
@@ -90,6 +108,7 @@ test('install-plugin --codex-home claims the registry with the real plugin tree 
   try {
     const result = pluginCommand(paths, ['--codex-home', codexHome]);
     assert.equal(result.installed, true);
+    assert.equal(result.cache_verified, true, 'the command layer surfaces the cache read-back verification');
     assert.equal(result.claim.registered, true);
 
     const registry = loadCodexHomes(paths).registry;

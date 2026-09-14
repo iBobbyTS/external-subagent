@@ -129,6 +129,64 @@ function updateMarketplace(file, staging) {
   return { marketplace: file, marketplace_name: doc.name || MARKETPLACE_NAME, entry: rel, digest: treeDigest(staging) };
 }
 
+// The staged managed binding this install just wrote: the manifest identity
+// plus the facade command and daemon socket stagePlugin pinned.  The cache
+// verification below compares the codex-materialized copy against exactly
+// these values, never against recomputed guesses.
+function stagedManagedBinding(staging) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8'));
+  const server = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8')).mcpServers?.external_subagent;
+  if (!server || typeof server.command !== 'string' || typeof server.env?.ZCODE_AGENTD_SOCKET !== 'string') {
+    throw new CliError('INVALID_PLUGIN_SOURCE', 'staged plugin MCP binding is incomplete');
+  }
+  return { manifest, command: server.command, socket: server.env.ZCODE_AGENTD_SOCKET };
+}
+
+function readCacheJson(file, cache, identity) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new CliError('CODEX_CACHE_UNVERIFIABLE', `codex plugin cache for ${identity} is present but unreadable (${file}: ${error.message})`);
+  }
+}
+
+// codex 0.153.4 materializes `plugin add` caches from a machine-global
+// content store keyed by plugin@marketplace@version, so when the same
+// identity was first cached from a different binding (another staging root,
+// installed facade, or daemon socket), this home receives those foreign
+// bytes while `plugin add` still reports success.  Before installPlugin may
+// return success, the materialized cache is read back and compared with this
+// run's staged binding; any surprise fails closed below.  The cache is only
+// ever READ here — codex-owned state is never edited, and the remediation
+// for store-reused bytes is a distinct release identity, not a rewrite.
+function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
+  const expected = stagedManagedBinding(staging);
+  const identity = `${PLUGIN_NAME}@${marketplaceName}@${expected.manifest.version}`;
+  const candidates = [];
+  const reported = add.json?.installedPath || add.json?.installed_path;
+  if (typeof reported === 'string' && reported.length > 0) candidates.push(reported);
+  candidates.push(path.join(codexHome, 'plugins', 'cache', add.json?.marketplaceName || marketplaceName, PLUGIN_NAME, String(expected.manifest.version)));
+  for (const cache of [...new Set(candidates)]) {
+    if (!fs.existsSync(cache)) continue;
+    const manifest = readCacheJson(path.join(cache, '.codex-plugin', 'plugin.json'), cache, identity);
+    for (const field of ['name', 'version', 'skills', 'mcpServers']) {
+      if (manifest[field] !== expected.manifest[field]) {
+        throw new CliError('CODEX_CACHE_BINDING_MISMATCH', `codex plugin cache for ${identity} has manifest ${field}=${JSON.stringify(manifest[field])}, expected the staged ${JSON.stringify(expected.manifest[field])} (${cache})`);
+      }
+    }
+    const server = readCacheJson(path.join(cache, '.mcp.json'), cache, identity).mcpServers?.external_subagent;
+    const socket = server?.env?.ZCODE_AGENTD_SOCKET;
+    if (!server || server.command !== expected.command || socket !== expected.socket) {
+      throw new CliError('CODEX_CACHE_BINDING_MISMATCH', `codex plugin cache for ${identity} carries a different managed binding (command=${server?.command}, socket=${socket}); expected this install's staged binding (command=${expected.command}, socket=${expected.socket}). The machine-global content store reused another installation's bytes for the same identity (${cache}); release a distinct plugin version instead of accepting them`);
+    }
+    return cache;
+  }
+  // No materialized cache to read: report that verification did not happen
+  // instead of implying it (real codex always materializes the cache, so a
+  // real install either verifies above or fails closed).
+  return null;
+}
+
 export function resolveStaging(home, options) {
   let staging = options.stagingPath || path.join(home, 'plugins', PLUGIN_NAME);
   let marketplace = options.marketplacePath || path.join(home, '.agents', 'plugins', 'marketplace.json');
@@ -171,9 +229,11 @@ export function installPlugin(paths, options = {}) {
   // Explicitly configured marketplaces must be registered; the personal
   // default is implicit. Both registrations are idempotent in codex.
   let add;
+  let verifiedCache = null;
   try {
     if (options.registerMarketplace !== false) runCodex(['plugin', 'marketplace', 'add', marketplaceRootFor(marketplace), '--json'], cli);
     add = runCodex(['plugin', 'add', PLUGIN_NAME, '--marketplace', market.marketplace_name, '--json'], cli);
+    verifiedCache = verifyCodexCache(add, { codexHome, staging, marketplaceName: market.marketplace_name });
   } catch (error) {
     if (priorMarketplace === null) fs.rmSync(marketplace, { force: true }); else fs.writeFileSync(marketplace, priorMarketplace, { mode: 0o600 });
     if (!priorStaging) fs.rmSync(staging, { recursive: true, force: true });
@@ -181,7 +241,8 @@ export function installPlugin(paths, options = {}) {
   }
   return {
     installed: true, source, staging, marketplace, codex_home: codexHome,
-    cache: add.json?.installedPath || add.json?.installed_path || null,
+    cache: verifiedCache || add.json?.installedPath || add.json?.installed_path || null,
+    cache_verified: verifiedCache !== null,
     codex: add.json || add.stdout.trim(), ...market,
   };
 }
