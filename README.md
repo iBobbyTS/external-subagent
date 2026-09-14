@@ -14,7 +14,10 @@ candidate additionally passed the four-cell consumer matrix — DSH/ZCode ×
 public CLI / real Codex CLI via the managed plugin over MCP — against one
 tarball (see [docs/acceptance/productization.md](docs/acceptance/productization.md));
 the managed plugin manifest is versioned per released candidate because its
-version is codex's plugin-cache identity (currently `0.1.1`), and the
+version is codex's plugin-cache identity — currently `0.1.2` for the
+post-installer-fix final candidate C2 (the pre-fix candidate C1 was `0.1.1`,
+and its consumer runs already cached that identity), so C2 does not inherit
+C1's four cells and still needs its own fresh consumer verification. The
 installer verifies the materialized plugin cache against the staged binding
 before reporting success, failing closed on store-reused bytes. DSH admission
 currently supports `build` and strict `plan`; its model selection is explicit
