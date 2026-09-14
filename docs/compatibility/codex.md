@@ -49,9 +49,12 @@ contain a supported manifest`).
   observed live: the cached `.mcp.json` carried the real-home socket while
   the staged tree carried the throwaway socket. Consequence: the plugin
   manifest version **is the cache identity** and must be distinct per
-  released candidate. The managed plugin is versioned `0.1.1` from the
-  productization closeout onward (identity `0.1.0` is already cached by the
-  historical installation); verified live that an isolated home's
+  released candidate. Identity `0.1.0` is already cached by the historical
+  installation, and identity `0.1.1` — candidate C1 of the productization
+  closeout — was itself materialized into the machine-global store by the C1
+  consumer runs, so the post-installer-fix final candidate C2 is versioned
+  `0.1.2` (and every later release candidate bumps its own identity again).
+  Verified live during the C1 run that an isolated home's
   `external-subagent@personal@0.1.1` cache was byte-identical to the staged
   binding (see
   [docs/acceptance/productization.md](../acceptance/productization.md)).
@@ -85,8 +88,11 @@ cache — the remediation for
 ## Verified since the productization closeout (2026-09-13)
 
 - Tool discovery **and real tool calls inside a running Codex host**: fresh
-  `codex exec` processes loaded the managed plugin (`0.1.1`, enabled) from an
-  isolated `CODEX_HOME` and completed real `external_subagent_spawn` →
+  `codex exec` processes loaded the managed plugin (`0.1.1`, enabled — that
+  is candidate C1; the post-fix candidate C2 carries identity `0.1.2`, whose
+  fresh consumer verification is still
+  `C2_FRESH_CONSUMER_VERIFICATION_PENDING`) from an isolated `CODEX_HOME`
+  and completed real `external_subagent_spawn` →
   `wait` → `result` → `close` MCP calls for both providers — recorded in
   [docs/acceptance/productization.md](../acceptance/productization.md).
 

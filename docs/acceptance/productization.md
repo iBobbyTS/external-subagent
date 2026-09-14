@@ -2,9 +2,13 @@
 
 Feature `external-subagent-productization-closeout-20260913`, section S04
 (2026-09-13). All four consumer cells below ran against **one** candidate
-tarball through the public install/init surface, with real upstream model
-tasks. Evidence is redacted to identities, states, and markers; no credential
-content was read into any recorded output.
+tarball — **C1, plugin cache identity `0.1.1`** — through the public
+install/init surface, with real upstream model tasks. Evidence is redacted to
+identities, states, and markers; no credential content was read into any
+recorded output. The post-installer-fix final candidate is **C2 (`0.1.2`)**;
+its fresh consumer verification is pending and must not inherit C1's cells
+(see [Post-fix final candidate C2](#post-fix-final-candidate-c2--verification-pending)
+below).
 
 ## Candidate identity
 
@@ -17,7 +21,20 @@ content was read into any recorded output.
   [docs/compatibility/codex.md](../compatibility/codex.md)),
   sha256 `b349a0b2cd5806a5f91fb029ebef9e4e4715a124047a87c647ea413c6a2ea857`,
   `check-native-tarball.mjs` passed.
-- Installed identity (isolated public prefix, removed after the run):
+- **C2 (post-fix final candidate, current sources)**: C1 plus the installer
+  production fixes landed after the C1 runs — `install-plugin` now reads the
+  materialized plugin cache back before reporting success and fails closed on
+  store-reused bytes (`CODEX_CACHE_BINDING_MISMATCH`) and on cache-less
+  successes (`CODEX_CACHE_UNVERIFIABLE`); commits `4a0ea8c`…`dff0661`, pinned
+  by the controlled store-simulation oracles in
+  `tests/install/codex-binding.test.mjs`. The C1 runs themselves materialized
+  `external-subagent@personal@0.1.1` into codex's machine-global content
+  store, so that identity is now burned on this machine exactly like `0.1.0`;
+  per the per-candidate identity rule C2 bumps the plugin manifest
+  `0.1.1` → `0.1.2`. No C2 tarball has been packed or consumer-run yet
+  (`C2_FRESH_CONSUMER_VERIFICATION_PENDING`).
+- Installed identity of the C1 run (isolated public prefix, removed after
+  the run):
   CLI `external-subagent 0.1.0`, native daemon sha256
   `34e547901caad6c243c083c5e894fd9c2062c2fefbfe407ea11f8c7c201b4236`, MCP
   facade sha256 `7da0c995d192fd166b9bd69c0b75bd02e3b3835bab2abbf48f32a47e01c38848`,
@@ -112,6 +129,21 @@ Same-candidate consumer re-check, two records:
   not classified as a product regression; next step is to re-run the harness
   once the DSH authenticated hi answers again.
 
+## Post-fix final candidate C2 — verification pending
+
+The four-cell matrix above is C1 (`0.1.1`) evidence and is **not** carried
+over to C2: the installer production fixes changed the very `install-plugin`
+path every cell exercises, so C2 must be proven by its own fresh consumer
+run — pack a C2 tarball from the current sources, install it through the
+public surface into a fresh consumer prefix, and re-run the four cells
+(DSH/ZCode × public CLI / real Codex CLI → managed plugin → MCP) plus the
+controlled re-checks. Until that run is recorded here, the release status of
+C2 is `C2_FRESH_CONSUMER_VERIFICATION_PENDING`. Rewriting the C1 matrix rows
+to `0.1.2`, or reusing the `0.1.1` identity for C2, would both be evidence
+falsification: the C1 cells prove the C1 artifact only, and codex's
+machine-global store already holds `0.1.1` bytes materialized by the C1 runs
+themselves.
+
 ## Boundaries and limitations
 
 - **Codex 0.153.4 global content store**: `plugin add` materializes caches
@@ -119,8 +151,10 @@ Same-candidate consumer re-check, two records:
   real `~/.codex` already caching `external-subagent@personal@0.1.0`, an
   isolated home binding the *same* identity receives the real installation's
   bytes (observed live in S03 testing). The managed plugin therefore carries
-  a distinct release identity (`0.1.1` for this candidate); verified during
-  this run: the isolated cache at
+  a distinct release identity per candidate (`0.1.1` for C1; the post-fix
+  final candidate C2 carries `0.1.2`, because the C1 runs themselves put
+  `0.1.1` bytes into the machine-global store); verified during the C1 run:
+  the isolated cache at
   `<CODEX_HOME>/plugins/cache/personal/external-subagent/0.1.1/.mcp.json` was
   byte-identical to the staged binding (absolute installed facade + isolated
   socket), i.e. not masked. Post-review hardening (native review finding):
