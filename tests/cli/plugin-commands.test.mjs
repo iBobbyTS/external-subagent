@@ -12,6 +12,7 @@ import path from 'node:path';
 import { mcpCommand, pluginCommand } from '../../cli/commands/plugin.mjs';
 import { installMcp, treeDigest } from '../../cli/install/codex.mjs';
 import { loadCodexHomes } from '../../cli/install/reconcile.mjs';
+import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 function fixtureHome(prefix = 'external-subagent-cli-') {
@@ -22,8 +23,10 @@ function fixtureHome(prefix = 'external-subagent-cli-') {
 // Named `codex` and exposed through PATH: the command layer resolves the CLI
 // the same way the real binary would be found.  `plugin add` materializes
 // the plugin cache the real CLI writes, so the installer's read-back
-// verification is exercised through the public command surface too.
-function fakeCodexCli(directory) {
+// verification is exercised through the public command surface too.  With
+// `materialize: false` the fake reports success (with installedPath) without
+// writing any cache — the never-materialized counterexample.
+function fakeCodexCli(directory, { materialize = true } = {}) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex');
   fs.writeFileSync(script, `#!/usr/bin/env node
@@ -49,9 +52,11 @@ if (args[0] === 'plugin' && args[1] === 'add') {
   const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
   const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
   const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  ${materialize ? `
   fs.rmSync(cache, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(cache), { recursive: true });
-  fs.cpSync(staging, cache, { recursive: true });
+  fs.cpSync(staging, cache, { recursive: true });` : `
+  /* cache-less success: report the install without materializing the cache */`}
   text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version, installedPath: cache });
   process.exit(0);
 }
@@ -121,5 +126,70 @@ test('install-plugin --codex-home claims the registry with the real plugin tree 
   } finally {
     process.env.PATH = priorPath;
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// P1 counterexample through the public command surface: when codex reports
+// success but never materializes a plugin cache, install-plugin fails closed
+// and the D08 registry keeps no success record for that home.
+test('install-plugin records no registry claim when the cache cannot be verified', () => {
+  const home = fixtureHome('external-subagent-noclaim-');
+  const fake = fakeCodexCli(home, { materialize: false });
+  const paths = productPaths(home);
+  const codexHome = path.join(home, 'codex-target');
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${fake.dir}${path.delimiter}${priorPath}`;
+  try {
+    assert.throws(() => pluginCommand(paths, ['--codex-home', codexHome]), (error) => {
+      assert.ok(error instanceof CliError);
+      assert.equal(error.code, 'CODEX_CACHE_UNVERIFIABLE');
+      assert.match(error.message, /no plugin cache was materialized/u);
+      return true;
+    });
+    assert.deepEqual(loadCodexHomes(paths).registry.homes, [], 'an unverified install must not be recorded as a claimed home');
+    assert.equal(fs.existsSync(path.join(home, 'plugins', 'external-subagent')), false, 'the public command surface rolls staging back');
+    assert.equal(fs.existsSync(path.join(home, '.agents', 'plugins', 'marketplace.json')), false, 'the public command surface rolls the marketplace back');
+  } finally {
+    process.env.PATH = priorPath;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// treeDigest pins: valid symlink targets may live OUTSIDE the traversed root
+// and be reachable only through their links — content edits there must change
+// the digest — while dangling links contribute no content and directory
+// cycles stay bounded instead of re-walking the tree.
+test('treeDigest follows symlink targets outside the traversed root and stays safe on dangling links and cycles', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-digest-'));
+  try {
+    const tree = path.join(root, 'tree');
+    fs.mkdirSync(tree);
+    const outsideFile = path.join(root, 'outside', 'linked.txt');
+    fs.mkdirSync(path.dirname(outsideFile), { recursive: true });
+    fs.writeFileSync(outsideFile, 'first');
+    fs.symlinkSync(outsideFile, path.join(tree, 'file-link'));
+    const outsideDir = path.join(root, 'outside-dir');
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(path.join(outsideDir, 'note.txt'), 'one');
+    fs.symlinkSync(outsideDir, path.join(tree, 'dir-link'));
+    fs.symlinkSync(path.join(root, 'gone', 'target'), path.join(tree, 'dangling-link'));
+
+    const before = treeDigest(tree);
+    assert.match(before, /^[0-9a-f]{64}$/u);
+    fs.writeFileSync(outsideFile, 'second');
+    assert.notEqual(treeDigest(tree), before, 'editing an out-of-root file target reachable only via its link must change the digest');
+    const afterFile = treeDigest(tree);
+    fs.writeFileSync(path.join(outsideDir, 'note.txt'), 'two');
+    assert.notEqual(treeDigest(tree), afterFile, 'editing content inside an out-of-root linked directory must change the digest');
+
+    // Dangling links carry no content to hash, and a link back to the walked
+    // root is bounded by its already-seen real path.
+    const bounded = treeDigest(tree);
+    fs.rmSync(path.join(tree, 'dangling-link'));
+    assert.equal(treeDigest(tree), bounded, 'a dangling link contributes no content to the digest');
+    fs.symlinkSync(tree, path.join(tree, 'cycle-link'));
+    assert.equal(treeDigest(tree), bounded, 'a directory cycle is bounded, not re-walked');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
