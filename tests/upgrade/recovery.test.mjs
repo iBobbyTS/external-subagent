@@ -170,7 +170,7 @@ test('service unload polls through a transient launchd registration', async () =
     throw new Error('unexpected launchctl');
   };
   const rpc = async () => ({ });
-  await assert.rejects(() => activateService(paths, { path: '/bin/true', sha256: digest('/bin/true') }, { launchctl: control, callDaemon: rpc, healthTimeoutMs: 1 }), /service has no new process/);
+  await assert.rejects(() => activateService(paths, { path: launchAgent, sha256: digest(launchAgent) }, { launchctl: control, callDaemon: rpc, healthTimeoutMs: 1 }), /service has no new process/);
   assert.ok(prints >= 2);
 });
 
