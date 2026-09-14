@@ -1,14 +1,16 @@
 # Productization acceptance — dual-upstream CLI + real Codex CLI→MCP matrix
 
 Feature `external-subagent-productization-closeout-20260913`, section S04
-(2026-09-13). All four consumer cells below ran against **one** candidate
-tarball — **C1, plugin cache identity `0.1.1`** — through the public
-install/init surface, with real upstream model tasks. Evidence is redacted to
-identities, states, and markers; no credential content was read into any
-recorded output. The post-installer-fix final candidate is **C2 (`0.1.2`)**;
-its fresh consumer verification is pending and must not inherit C1's cells
-(see [Post-fix final candidate C2](#post-fix-final-candidate-c2--verification-pending)
-below).
+(2026-09-13). Two candidate generations are recorded, each proven by its own
+consumer run through the public install/init surface with real upstream model
+tasks: **C1 (plugin cache identity `0.1.1`)** — the matrix below is kept as
+historical evidence for that artifact — and the post-installer-fix final
+candidate **C2 (`0.1.2`)**, whose fresh consumer verification ran on
+2026-09-13 and **passed** (`C2_FRESH_CONSUMER_VERIFICATION_PASS`; see
+[Post-fix final candidate C2 — fresh consumer verification](#post-fix-final-candidate-c2--fresh-consumer-verification-pass)
+below — C2 does not inherit C1's cells). Evidence is redacted to identities,
+states, and markers; no credential content was read into any recorded
+output.
 
 ## Candidate identity
 
@@ -21,7 +23,7 @@ below).
   [docs/compatibility/codex.md](../compatibility/codex.md)),
   sha256 `b349a0b2cd5806a5f91fb029ebef9e4e4715a124047a87c647ea413c6a2ea857`,
   `check-native-tarball.mjs` passed.
-- **C2 (post-fix final candidate, current sources)**: C1 plus the installer
+- **C2 (post-fix final candidate, consumer-verified)**: C1 plus the installer
   production fixes landed after the C1 runs — `install-plugin` now reads the
   materialized plugin cache back before reporting success and fails closed on
   store-reused bytes (`CODEX_CACHE_BINDING_MISMATCH`) and on cache-less
@@ -31,8 +33,15 @@ below).
   `external-subagent@personal@0.1.1` into codex's machine-global content
   store, so that identity is now burned on this machine exactly like `0.1.0`;
   per the per-candidate identity rule C2 bumps the plugin manifest
-  `0.1.1` → `0.1.2`. No C2 tarball has been packed or consumer-run yet
-  (`C2_FRESH_CONSUMER_VERIFICATION_PENDING`).
+  `0.1.1` → `0.1.2`. The C2 tarball was packed from HEAD `8642409` —
+  `external-subagent-0.1.0-c2.tgz`, sha256
+  `7444f59b508d5aae31b6f17e6c8744c6abde494b86701d821fce43d436d04399`
+  (54 files; `check-native-tarball.mjs` passed; contains the plugin manifest
+  `0.1.2` and the fail-closed installer paths) — and consumer-verified by the
+  fresh run recorded below (`C2_FRESH_CONSUMER_VERIFICATION_PASS`). Its
+  native payload was not rebuilt — no Rust inputs changed since the C1 payload
+  staging — so the installed daemon/facade bytes are hash-identical to C1's
+  (daemon `34e54790…`, facade `7da0c995…`; `payload-identity.txt`).
 - Installed identity of the C1 run (isolated public prefix, removed after
   the run):
   CLI `external-subagent 0.1.0`, native daemon sha256
@@ -73,7 +82,11 @@ none), so daemon-side operations that fall back to `HOME` resolved the real
 | DSH strict-plan refusal | task `10000002`: `COMPLETED`, the model reported no write tool available, workspace stayed empty |
 | ZCode explicit model | `model_selection_unsupported` before any prompt (re-asserted live by the 20:0x double-provider session run below; the closeout re-check did not reach this step) |
 
-## ACCEPTANCE-MATRIX (four independent cells, one tarball)
+## ACCEPTANCE-MATRIX — C1, `0.1.1` (historical)
+
+Four independent cells against the one C1 tarball; superseded as release
+evidence by the C2 matrix below, kept as the historical record for the C1
+artifact.
 
 | # | Route | Task ID | Terminal outcome | Final marker | resources_reaped | closed | Exit codes |
 |---|---|---|---|---|---|---|---|
@@ -129,20 +142,103 @@ Same-candidate consumer re-check, two records:
   not classified as a product regression; next step is to re-run the harness
   once the DSH authenticated hi answers again.
 
-## Post-fix final candidate C2 — verification pending
+## Post-fix final candidate C2 — fresh consumer verification (PASS)
 
-The four-cell matrix above is C1 (`0.1.1`) evidence and is **not** carried
-over to C2: the installer production fixes changed the very `install-plugin`
-path every cell exercises, so C2 must be proven by its own fresh consumer
-run — pack a C2 tarball from the current sources, install it through the
-public surface into a fresh consumer prefix, and re-run the four cells
-(DSH/ZCode × public CLI / real Codex CLI → managed plugin → MCP) plus the
-controlled re-checks. Until that run is recorded here, the release status of
-C2 is `C2_FRESH_CONSUMER_VERIFICATION_PENDING`. Rewriting the C1 matrix rows
-to `0.1.2`, or reusing the `0.1.1` identity for C2, would both be evidence
-falsification: the C1 cells prove the C1 artifact only, and codex's
-machine-global store already holds `0.1.1` bytes materialized by the C1 runs
-themselves.
+`C2_FRESH_CONSUMER_VERIFICATION_PASS` (2026-09-13, HEAD `8642409`, managed
+plugin identity `0.1.2`). Run type: fresh consumer verification through the
+public install/init surface only — no tracked file, `.agent-work/`, legacy
+ZAS, or real `~/.codex` was modified. The run root was `/tmp/es-c2/`
+(ephemeral); `outputs/s04-c2-evidence/` is the durable sanitized copy, and
+every fact below is read from those artifacts. The C1 matrix above stays
+C1's evidence — rewriting its rows to `0.1.2` would be evidence
+falsification; C2 was proven by this run of its own.
+
+### Install and init (public surface only)
+
+- `npm install -g` of the C2 tarball (sha256
+  `7444f59b508d5aae31b6f17e6c8744c6abde494b86701d821fce43d436d04399`) into
+  isolated prefix `/tmp/es-c2/prefix` — isolated `HOME` `/tmp/es-c2/home`,
+  npm cache `/tmp/es-c2/npm-cache`, `--allow-scripts=external-subagent`.
+- `init --codex-home /tmp/es-c2/codex` completed all ten steps (`init.json`:
+  probe-runtime, verify-payload, check-path, create-data,
+  write-product-config, install-launch-agent, start-service,
+  install-codex-plugin, claim-codex-home, publish-active-payload); the
+  installed payload is hash-identical to C1's (daemon `34e54790…`, facade
+  `7da0c995…` — payload not rebuilt, Rust inputs unchanged since staging).
+- The launchd service was **real**: the public `init` bootstrapped label
+  `com.external-subagent.daemon` into the GUI session (PID 71071), and the
+  public `stop` booted it out at the end of the run (`stop.json`:
+  `removed: true`, status 0).
+
+### Plugin cache verification (the C2-specific acceptance point)
+
+- `resync-plugin.json` — the idempotent public `install-plugin` receipt —
+  reports `installed: true`, **`cache_verified: true`**, cache
+  `/private/tmp/es-c2/codex/plugins/cache/personal/external-subagent/0.1.2`,
+  digest `22aa0fb68e4073de953d2964ac57eda6026d63c2fc05c9e43f36571d2f7e3292`,
+  codex-side identity `external-subagent@personal` version `0.1.2`.
+- The materialized cache equals this run's staged binding, i.e. the fixed
+  installer's read-back verification ran live on its happy path:
+  `cache-mcp.json` (byte copy of the cache `.mcp.json`) pins this run's
+  absolute facade under `/private/tmp/es-c2/prefix/…` and the isolated
+  socket `/tmp/es-c2/home/Library/Application Support/external-subagent/external-subagent.sock`;
+  `cache-plugin-manifest.json` is `0.1.2`; `cache-vs-staged.diff` is empty.
+- `plugin-list.json`: a fresh `codex plugin list --json` shows
+  `external-subagent@personal` version `0.1.2`, enabled, local marketplace
+  `personal`.
+
+### ACCEPTANCE-MATRIX — C2 (four independent cells, one tarball)
+
+| # | Route | Task ID | Terminal outcome | Final marker | resources_reaped | closed | Exit codes |
+|---|---|---|---|---|---|---|---|
+| 1 | DSH, public ES CLI (`spawn/wait/result/close`) | `10000000` | `COMPLETED` | `S04_C2_CLI_DSH_OK` | true | true | 0 / 0 / 0 / 0 |
+| 2 | ZCode, public ES CLI | `10000001` | `COMPLETED` | `S04_C2_CLI_ZCODE_OK` | true | true | 0 / 0 / 0 / 0 |
+| 3 | DSH, real Codex CLI → managed plugin → MCP | `10000003` | `COMPLETED` | `S04_C2_MCP_DSH_OK` | true | true | codex exec 0 |
+| 4 | ZCode, real Codex CLI → managed plugin → MCP | `10000004` | `COMPLETED` | `S04_C2_MCP_ZCODE_OK` | true | true | codex exec 0 |
+
+- Cells 1–2 artifacts: `cell1-dsh-{spawn,wait,result,close}.json`,
+  `cell2-zcode-{spawn,wait,result,close}.json` (public CLI JSON; markers read
+  from `result` final_text, reaped/closed from `close`).
+- Cells 3–4 artifacts: `cell3-codex-dsh.jsonl`, `cell4-codex-zcode.jsonl` —
+  separate fresh `codex exec --ephemeral --json` processes whose JSONL shows
+  real `mcp_tool_call` items against server `external_subagent`
+  (`spawn` → `wait` → `result` → `close`, each `completed`) and real token
+  usage in `turn.completed` — not `tools/list` or a direct facade call.
+- Daemon-side cross-check: `tasks-list-wsdsh.json` / `tasks-list-wszcode.json`
+  — every task COMPLETED with `resources_reaped: true`, `closed: true`.
+
+### C2 run boundaries (recorded, not hidden)
+
+- **Cell 3 attempt 1 was approval-blocked, not product-blocked**: with codex
+  exec's default approval policy (`never`), the `close` call was rejected
+  ("MCP tool call requires approval, but approval policy is never") while
+  spawn/wait/result completed; that task (`10000002`) was closed afterwards
+  through the public CLI (`cell3-attempt1-task-close.json`: COMPLETED,
+  reaped, closed). The recorded cell 3 was a fresh second codex exec run
+  using `--dangerously-bypass-approvals-and-sandbox` so the full four-call
+  lifecycle could complete; all MCP calls in both attempts were real
+  (`cell3-codex-dsh-attempt1-approval-blocked.jsonl`).
+- **The C1 HOME boundary repeats**: launchd sets no `HOME` on the daemon job
+  (the product plist sets none), so daemon-side `HOME` fallbacks resolved
+  the real `/Users/ibobby`; the zcode hi probe policy gap stays open (cells
+  2 and 4 prove real Zcode capability).
+- **Identity burn-in**: these runs materialized
+  `external-subagent@personal@0.1.2` into codex's machine-global content
+  store; any later candidate must bump the plugin version again.
+- Unrelated stderr noise: codex's account-level remote plugin catalog
+  produced a cloudflare OAuth `AuthRequired` transport error at exit in
+  cells 3–4 (no credential content; the managed local plugin was
+  unaffected).
+- Legacy ZAS (PID 30433), real ES data (digests unchanged), real `~/.codex`
+  (cache still `0.1.0` only), and historical `/tmp/esr2-*` daemons were
+  untouched (`env-before.txt` / `env-after.txt`).
+
+Sanitization: identity-level redaction only; the isolated `auth.json`
+(copied mode 600 from `/Users/ibobby/.codex-multi-2/auth.json`) was never
+printed, never appears in any recorded output, was excluded from the durable
+copy, and was deleted from the `/tmp` run root after the run; no
+credential-shaped content was found by pattern scan across all copied
+files.
 
 ## Boundaries and limitations
 
@@ -151,23 +247,25 @@ themselves.
   real `~/.codex` already caching `external-subagent@personal@0.1.0`, an
   isolated home binding the *same* identity receives the real installation's
   bytes (observed live in S03 testing). The managed plugin therefore carries
-  a distinct release identity per candidate (`0.1.1` for C1; the post-fix
-  final candidate C2 carries `0.1.2`, because the C1 runs themselves put
-  `0.1.1` bytes into the machine-global store); verified during the C1 run:
-  the isolated cache at
-  `<CODEX_HOME>/plugins/cache/personal/external-subagent/0.1.1/.mcp.json` was
-  byte-identical to the staged binding (absolute installed facade + isolated
-  socket), i.e. not masked. Post-review hardening (native review finding):
-  `install-plugin` now reads the materialized cache's `.mcp.json`/manifest
-  back before reporting success and fails closed
+  a distinct release identity per candidate (`0.1.1` for C1; `0.1.2` for C2,
+  because the C1 runs themselves put `0.1.1` bytes into the machine-global
+  store — and the C2 runs have now burned `0.1.2` the same way, so any later
+  candidate must bump again); verified live in both runs that the isolated
+  cache at
+  `<CODEX_HOME>/plugins/cache/personal/external-subagent/<version>/.mcp.json`
+  was byte-identical to the staged binding (absolute installed facade +
+  isolated socket), i.e. not masked. Post-review hardening (native review
+  finding): `install-plugin` now reads the materialized cache's
+  `.mcp.json`/manifest back before reporting success and fails closed
   (`CODEX_CACHE_BINDING_MISMATCH`/`CODEX_CACHE_UNVERIFIABLE`) when the store
-reused another binding's bytes for the same identity, and with
-`CODEX_CACHE_UNVERIFIABLE` when a reported success materialized no cache
-to verify — an install is only ever recorded as
-installed/claimed/updated (`cache_verified: true`) after its cache bytes
-were verified; that guard is pinned by the controlled store-simulation
-oracles in `tests/install/codex-binding.test.mjs` — the four live cells
-above were not re-run for it.
+  reused another binding's bytes for the same identity, and with
+  `CODEX_CACHE_UNVERIFIABLE` when a reported success materialized no cache
+  to verify — an install is only ever recorded as
+  installed/claimed/updated (`cache_verified: true`) after its cache bytes
+  were verified. The C2 fresh consumer run exercised that guard live on its
+  happy path (`cache_verified: true` with an empty `cache-vs-staged.diff`);
+  the fail-closed branches remain pinned by the controlled store-simulation
+  oracles in `tests/install/codex-binding.test.mjs`.
 - **reload_required**: the Codex processes used here were ephemeral and exited
   on completion; no user Codex session was force-quit. Installed-cache
   version and a long-lived host's loaded version are separate facts — a
