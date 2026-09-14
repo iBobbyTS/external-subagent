@@ -159,14 +159,20 @@ function digest(file) {
 
 // Recursive digest for the one directory bridge (`profiles/`): hashes the
 // sorted (relative path, content) pairs, so both in-place edits and new
-// files written through the symlink surface as drift.
+// files written through the symlink surface as drift. Symlink entries are
+// hashed by their target path (lstat, never followed): the real DSH
+// profiles tree legitimately contains dangling dependency symlinks
+// (`profiles/node_modules/...`), which statSync would refuse, and link
+// retargeting still changes the digest.
 function treeDigest(dir) {
   const lines = [];
   const walk = (current, prefix) => {
     for (const entry of fs.readdirSync(current).sort()) {
       const child = path.join(current, entry);
       const rel = prefix ? `${prefix}/${entry}` : entry;
-      if (fs.statSync(child).isDirectory()) walk(child, rel);
+      const stat = fs.lstatSync(child);
+      if (stat.isSymbolicLink()) lines.push(`${rel} link:${fs.readlinkSync(child)}`);
+      else if (stat.isDirectory()) walk(child, rel);
       else lines.push(`${rel} ${digest(child)}`);
     }
   };
