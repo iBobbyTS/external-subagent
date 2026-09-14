@@ -55,4 +55,10 @@ external-subagent close --json '{"agent_id":10000000}'
 
 初始化后的 npm 更新由 postinstall/reconcile 复用同一个受控 update owner，候选 payload 在排空前验证，旧 payload 保留用于恢复；首次 npm 安装仍保持 stage-only。`--ignore-scripts` 时不会假报已协调，下一次显式 `update`/`reconcile` 可恢复。
 
+Codex homes 的同步按 home 逐项报告：某次更新已完成 payload 激活与服务切换但存在无法重绑的 home（如只读目录）时，命令以 `CODEX_SYNC_PARTIAL` 非零退出，错误信息与 `partial` 回执列出每个未完成 home 的状态与原因；已完成的激活与已成功 home 不会回滚，修复后运行 `external-subagent reconcile` 幂等补齐剩余 home。
+
+## 诊断、恢复与移除
+
+`status`/`diagnose` 只读区分包内 payload、active 状态、launchd 注册、RPC 可用性和日志证据；损坏的 install-state/codex-homes 会保留 `.corrupt-*` 字节并按可恢复错误上报，不会被当作空状态覆盖。`stop` 在返回前确认 launchd 任务确实移除（有界等待），重复 stop 幂等；`uninstall` 先引导退出本产品自有服务再删除 LaunchAgent，并释放全部 Codex home 登记，同时保留任务数据、provider 凭据与旧 ZAS；`restore` 后需 `stop`+`start` 使 daemon 回到恢复的数据库。受管 plugin/MCP 解绑由 `install-plugin --uninstall` / `install-mcp --uninstall` 单独完成。
+
 已验证的本地能力包括双 provider 的隔离任务、MCP 工具调用、活跃任务排空、取消/重启恢复、版本化 payload 和 Codex plugin 安装。真实用户 GUI 会话中的 launchd bootstrap 与重复 init/start 幂等已实测验证（含 label/PID/socket/RPC 证据）；Codex GUI 热重载、npm registry 发布和未覆盖 provider 的完整矩阵仍需单独验收。

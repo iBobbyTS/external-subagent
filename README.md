@@ -26,9 +26,13 @@ external-subagent init                                  # explicit: service, Cod
 A plain install stages the package and payload only. On an already initialized
 installation, npm's postinstall hook detects a local version drift and reuses
 the existing reconcile/update owner; it never initializes a fresh home or
-probes a provider. `init` remains the explicit first activation step. Supported
-platform: macOS arm64; other platforms keep `help`/`version` working and
-reject business commands without writing HOME.
+probes a provider. `init` remains the explicit first activation step. A
+completed update whose registered Codex homes only partially rebind reports
+`CODEX_SYNC_PARTIAL` per home and keeps the verified activation; the public
+`stop` confirms launchd removal before returning, and `uninstall` boots out
+the ES-owned service before removing its registration while retaining all
+data. Supported platform: macOS arm64; other platforms keep `help`/`version`
+working and reject business commands without writing HOME.
 
 See [docs/operations.md](docs/operations.md) for service control, PATH
 behavior, the Codex homes registry, backup/removal, and release checks; and

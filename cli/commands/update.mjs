@@ -82,6 +82,12 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     ? { path: previousActive.retained.daemon_entry, sha256: previousActive.retained.daemon_entry_sha256 ?? previousActive.daemon_entry_sha256 }
     : (previousActive?.daemon_entry ? { path: previousActive.daemon_entry, sha256: previousActive.daemon_entry_sha256 } : null);
   let result;
+  // Set when the verified activation completed but the Codex-home sync is
+  // partial: the homes are per-home retryable through the public reconcile
+  // owner, so the completed activation stays published and the partial sync
+  // is reported AFTER the guarded block — never as success, and never as a
+  // reason to roll a healthy service back.
+  let partialHomes = null;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
@@ -113,11 +119,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
         version: result.active.version,
       }, { ...daemon, rollbackPayload });
       result.homes = reconcileCodexHomes(paths);
-      if (result.homes.homes.length > 0 && !result.homes.all_updated) throw new Error('Codex home reconciliation failed after service activation');
+      if (result.homes.homes.length > 0 && !result.homes.all_updated) partialHomes = result.homes;
     }
     const receiptVersion = result?.active?.version || result?.version || requestedVersion;
-    atomicWrite(receiptPath(paths), jsonBytes({ claim, version: receiptVersion, status: 'success', result }));
-    return result;
+    atomicWrite(receiptPath(paths), jsonBytes(partialHomes
+      ? { claim, version: receiptVersion, status: 'partial', retryable: true, homes: partialHomes, result }
+      : { claim, version: receiptVersion, status: 'success', result }));
+    if (partialHomes === null) return result;
   } catch (error) {
     // Snapshot what the updater recorded before rollback replaces it, so the
     // receipt keeps the candidate and active evidence the retry will need.
@@ -173,4 +181,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     atomicWrite(receiptPath(paths), jsonBytes(receipt));
     throw error;
   }
+  // Reached only with a completed, verified activation whose home sync is
+  // partial.  The per-home facts stay actionable — in the error, the receipt,
+  // and the registry reconcileCodexHomes already persisted — and the public
+  // reconcile command finishes the remaining homes idempotently.
+  const notUpdated = partialHomes.homes
+    .filter((home) => home.status !== 'updated')
+    .map((home) => `${home.home}: ${home.status}${home.error ? ` (${home.error.code}: ${home.error.message})` : ''}`);
+  throw new CliError('CODEX_SYNC_PARTIAL',
+    `service activation completed at ${result?.active?.version || requestedVersion}, but Codex home reconciliation is partial — ${notUpdated.join('; ')}; run 'external-subagent reconcile' after fixing the listed homes`);
 }

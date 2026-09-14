@@ -90,7 +90,32 @@ export function bootstrapService(paths, uid = process.getuid(), options = {}) {
   }
 }
 
+// A bootout call returns before launchd has necessarily finished tearing the
+// job down, and a bootstrap issued inside that window can be swept away by the
+// still-running removal (observed live: rapid stop→start cycles left the
+// service unregistered roughly one time in three).  The stop owner therefore
+// confirms the job is actually gone — bounded, with the same print/absent
+// discriminator the update owner's unload uses — before reporting success.
 export function bootoutService(paths, uid = process.getuid(), options = {}) {
   const control = options.launchctl || launchctl;
-  return control(['bootout', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+  const existing = serviceRegistrationStatus(uid, { launchctl: control });
+  if (!existing.registered) return { action: 'bootout', label: LAUNCH_AGENT_LABEL, already_stopped: true };
+  let result;
+  try {
+    result = control(['bootout', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
+  } catch (error) {
+    // A racing removal (another stop, or launchd itself) may have taken the
+    // job out between the registration probe and the bootout; confirm before
+    // reporting failure, so a repeated stop stays idempotent.
+    const settled = serviceRegistrationStatus(uid, { launchctl: control });
+    if (!settled.registered) return { action: 'bootout', label: LAUNCH_AGENT_LABEL, already_stopped: true };
+    throw error;
+  }
+  const deadline = Date.now() + (options.unloadTimeoutMs ?? 10_000);
+  for (;;) {
+    const probe = serviceRegistrationStatus(uid, { launchctl: control });
+    if (!probe.registered) return { ...result, label: LAUNCH_AGENT_LABEL, removed: true };
+    if (Date.now() >= deadline) throw new CliError('SERVICE_UNLOAD_TIMEOUT', 'launchd service remained registered after bootout');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+  }
 }

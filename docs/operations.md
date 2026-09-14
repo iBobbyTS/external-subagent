@@ -77,7 +77,7 @@ startup files).
 
 ```
 external-subagent start   # launchctl bootstrap gui/<uid> <plist> — idempotent
-external-subagent stop    # launchctl bootout gui/<uid>/com.external-subagent.daemon
+external-subagent stop    # launchctl bootout gui/<uid>/com.external-subagent.daemon — waits for removal
 external-subagent status  # launchd service view + install + payload + registry + daemon RPC
 ```
 
@@ -89,6 +89,15 @@ label up with `launchctl print`; an already-loaded job is reported as
 second daemon process, and the loaded service is left untouched. A bootstrap
 that loses a race to another loader resolves through the same lookup; only a
 real control failure surfaces as `DAEMON_CONTROL_FAILED`.
+
+`stop` is idempotent the same way: a job that is not registered reports
+`already_stopped`, and a job that a concurrent removal took out mid-stop is
+settled through the lookup instead of failing. A bootout only succeeds once
+the registration probe confirms the job is actually gone — launchd completes
+the removal asynchronously, and a `start` issued in that window can otherwise
+be swept away by the still-running teardown (observed live). A job that stays
+registered past the bounded deadline fails with `SERVICE_UNLOAD_TIMEOUT`
+instead of pretending removal.
 
 A failing init rolls its own service work back symmetrically: a daemon the
 failed init itself bootstrapped is booted back out together with the plist
@@ -124,6 +133,17 @@ Reconciliation only ever writes homes that are both registered and writable,
 reports per-home results, and replaces a corrupted registry atomically while
 preserving the damaged bytes for inspection.
 
+A partial home sync never reads as success. When an update activates the new
+payload and switches the service but one or more registered homes cannot be
+rebound (for example a home that is no longer writable), the command exits
+non-zero with `CODEX_SYNC_PARTIAL`, names each non-updated home with its
+status and reason, and the activation receipt records `status: "partial"`
+with the per-home results. The completed activation is kept — payload,
+service, install state, and the registry's per-home statuses are not rolled
+back — because homes are independently retryable: after fixing the listed
+homes (e.g. permissions), `external-subagent reconcile` finishes the
+remaining homes idempotently, and `status` shows each home's `last_status`.
+
 `init` establishes the active payload and the retained-byte baseline; a later
 npm install that replaces the package coordinates through the postinstall
 bridge above (draining active tasks, payload activation, syncing every
@@ -137,9 +157,29 @@ trigger it.
 ```
 external-subagent backup --output <dir>
 external-subagent restore --input <dir>
-external-subagent uninstall    # releases Codex claims, removes service registration, retains data
+external-subagent uninstall    # releases Codex claims, boots out + deregisters the service, retains data
 external-subagent purge --yes  # explicitly deletes product data
 ```
+
+`uninstall` first boots the ES-owned service out — with the same bounded
+removal confirmation `stop` uses — and only then deletes the LaunchAgent
+definition; a service that was not registered is not an error
+(`service_already_stopped`). Deleting the plist alone would leave a job
+launchd already loaded running until the next logout, so a bootout that
+cannot complete fails the command (`SERVICE_UNLOAD_TIMEOUT`) rather than
+stranding a running daemon without its definition. Product data, provider
+credentials, and the legacy zcode-as-subagent installation are always
+retained; the managed Codex plugin and MCP binding are removed separately by
+`install-plugin --uninstall` / `install-mcp --uninstall`. After `npm remove`
+and a later reinstall, `init` reclaims the Codex home and restores the
+service from the retained data (configuration and database survive
+byte-for-byte; only the service config revision advances).
+
+A `restore` replaces the product data directory wholesale while a daemon from
+the previous data is still running; that daemon keeps serving its old socket
+path, so `status` shows the service registered but RPC unavailable. Run
+`stop` then `start` after a restore to bring the daemon back onto the
+restored database.
 
 ## Release checks
 

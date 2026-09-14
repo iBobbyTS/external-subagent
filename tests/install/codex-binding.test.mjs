@@ -270,7 +270,16 @@ test('D08 reconcile updates only registered writable homes and never touches str
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { skip: !(process.platform === 'darwin' && process.env.EXTERNAL_SUBAGENT_TEST_REAL_CODEX !== '0' && spawnSync('codex', ['--version'], { encoding: 'utf8' }).status === 0) }, () => {
+// codex 0.153.4 materializes a `plugin add` cache from a machine-global
+// content store keyed by the plugin identity: when the user's real ~/.codex
+// already caches the same plugin@marketplace@version, an isolated CODEX_HOME
+// still receives the REAL installation's bytes (observed live: the cached
+// .mcp.json carried the real-home socket while the staged tree carried the
+// throwaway socket).  The real-CLI oracle below pins the fresh-machine
+// contract, so it only runs where that dedupe cannot mask the staged binding.
+const realCodexCacheConflict = fs.existsSync(path.join(os.homedir(), '.codex', 'plugins', 'cache', 'personal', 'external-subagent'));
+
+test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { skip: !(process.platform === 'darwin' && process.env.EXTERNAL_SUBAGENT_TEST_REAL_CODEX !== '0' && !realCodexCacheConflict && spawnSync('codex', ['--version'], { encoding: 'utf8' }).status === 0) }, () => {
   const home = fixtureHome('external-subagent-real-');
   const codexHome = path.join(home, 'codex-home');
   fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });

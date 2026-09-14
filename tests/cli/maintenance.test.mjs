@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { backupData, cleanupLegacy, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
-import { bootstrapService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
+import { bootstrapService, bootoutService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
 import { runInit } from '../../cli/install/init.mjs';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
@@ -52,11 +52,48 @@ test('uninstall retains data, while purge is an explicit separate operation', ()
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
-  assert.equal(uninstall(paths).data_retained, true);
+  const result = uninstall(paths, { launchctl: recordingLaunchctl().control });
+  assert.equal(result.data_retained, true);
+  assert.equal(result.service_stopped, true);
+  assert.equal(result.service_already_stopped, true, 'an unregistered service is not an uninstall error');
   assert.equal(fs.existsSync(paths.data), true);
   assert.equal(fs.existsSync(paths.launchAgent), false);
   purge(paths);
   assert.equal(fs.existsSync(paths.data), false);
+});
+
+test('uninstall boots out the loaded ES service before removing its definition', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const launchctl = recordingLaunchctl({ loaded: true });
+  const result = uninstall(paths, { launchctl: launchctl.control });
+  assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'uninstall must boot out the service it owns');
+  assert.equal(launchctl.state.loaded, false);
+  assert.equal(result.service_stopped, true);
+  assert.equal(result.service_already_stopped, false);
+  assert.equal(result.removed_launch_agent, true);
+  assert.equal(fs.existsSync(paths.data), true, 'uninstall never purges retained data');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('uninstall reports a bootout it cannot complete instead of removing the definition', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-stuck-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  // A job that stays registered after bootout: the command must fail loudly
+  // and leave the definition in place rather than strand a running service.
+  const stuck = (args) => {
+    if (args[0] === 'print') return { action: 'print', status: 0, stdout: 'state = running\npid = 999\n' };
+    if (args[0] === 'bootout') return { action: 'bootout', status: 0 };
+    throw new Error(`unexpected launchctl call: ${args.join(' ')}`);
+  };
+  assert.throws(() => uninstall(paths, { launchctl: stuck, unloadTimeoutMs: 150 }), (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT');
+  assert.equal(fs.existsSync(paths.launchAgent), true);
+  fs.rmSync(home, { recursive: true, force: true });
 });
 
 test('legacy cleanup removes only enumerated old paths and creates no alias or migration', () => {
@@ -200,6 +237,67 @@ test('a failed init never boots out a service that was already loaded before it'
     assert.equal(launchctl.calls.some((call) => call.startsWith('bootstrap ')), false, 'an already-loaded label is not bootstrapped again');
     assert.equal(launchctl.calls.some((call) => call.startsWith('bootout')), false, 'rollback must not touch a service init did not load');
     assert.equal(launchctl.state.loaded, true);
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
+});
+
+test('stop confirms launchd removal before returning and stays idempotent', () => {
+  const paths = servicePaths();
+  try {
+    // Loaded job: bootout unloads, and the stop only succeeds once the
+    // registration probe observes the job gone (a bootstrap issued before
+    // launchd finishes the removal can be swept by it — observed live).
+    const loaded = recordingLaunchctl({ loaded: true });
+    const stopped = bootoutService(paths, process.getuid(), { launchctl: loaded.control });
+    assert.equal(stopped.removed, true);
+    assert.equal(stopped.already_stopped, undefined);
+    assert.ok(loaded.calls.filter((call) => call.startsWith('print gui/')).length >= 2, 'removal must be confirmed by a follow-up probe');
+    // Stopped job: an idempotent re-stop reports already_stopped without
+    // issuing another bootout.
+    const unloaded = recordingLaunchctl({ loaded: false });
+    const again = bootoutService(paths, process.getuid(), { launchctl: unloaded.control });
+    assert.equal(again.already_stopped, true);
+    assert.equal(unloaded.calls.some((call) => call.startsWith('bootout')), false);
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
+});
+
+test('a stop whose job stays registered fails bounded instead of pretending removal', () => {
+  const paths = servicePaths();
+  try {
+    const stuck = (args) => {
+      if (args[0] === 'print') return { action: 'print', status: 0, stdout: 'state = running\npid = 999\n' };
+      if (args[0] === 'bootout') return { action: 'bootout', status: 0 };
+      throw new Error(`unexpected launchctl call: ${args.join(' ')}`);
+    };
+    assert.throws(
+      () => bootoutService(paths, process.getuid(), { launchctl: stuck, unloadTimeoutMs: 150 }),
+      (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT',
+    );
+  } finally {
+    fs.rmSync(paths.home, { recursive: true, force: true });
+  }
+});
+
+test('a stop racing an external removal treats the gone job as stopped', () => {
+  const paths = servicePaths();
+  try {
+    // The registration probe sees the job, but by the time bootout runs a
+    // concurrent removal won; launchd answers an error, and the settle probe
+    // confirms the job is gone — a repeated stop must stay idempotent.
+    let seen = false;
+    const racing = (args) => {
+      if (args[0] === 'print') {
+        if (!seen) { seen = true; return { action: 'print', status: 0, stdout: 'state = running\npid = 999\n' }; }
+        return { action: 'print', absent: true };
+      }
+      if (args[0] === 'bootout') throw new Error('Boot-out failed: 5: Input/output error');
+      throw new Error(`unexpected launchctl call: ${args.join(' ')}`);
+    };
+    const result = bootoutService(paths, process.getuid(), { launchctl: racing });
+    assert.equal(result.already_stopped, true);
   } finally {
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
