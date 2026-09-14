@@ -80,7 +80,15 @@ export async function activateService(paths, candidate, options = {}) {
   };
   const unload = async () => {
     const result = await control(['print', target]);
-    if (!result.absent) await control(['bootout', target]);
+    if (result.absent) return;
+    await control(['bootout', target]);
+    const deadline = Date.now() + (options.unloadTimeoutMs ?? 10_000);
+    do {
+      const probe = await control(['print', target]);
+      if (probe.absent) return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    throw new CliError('SERVICE_UNLOAD_TIMEOUT', 'launchd service remained registered after bootout');
   };
   const writeProgram = (entryPath) => atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(entryPath)}${c}`)), 0o600);
   const rollbackService = async () => {
