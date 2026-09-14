@@ -127,10 +127,13 @@ Same-candidate consumer re-check, two records:
   `install-plugin` now reads the materialized cache's `.mcp.json`/manifest
   back before reporting success and fails closed
   (`CODEX_CACHE_BINDING_MISMATCH`/`CODEX_CACHE_UNVERIFIABLE`) when the store
-  reused another binding's bytes for the same identity; that guard is pinned
-  by the controlled store-simulation oracles in
-  `tests/install/codex-binding.test.mjs` — the four live cells above were
-  not re-run for it.
+reused another binding's bytes for the same identity, and with
+`CODEX_CACHE_UNVERIFIABLE` when a reported success materialized no cache
+to verify — an install is only ever recorded as
+installed/claimed/updated (`cache_verified: true`) after its cache bytes
+were verified; that guard is pinned by the controlled store-simulation
+oracles in `tests/install/codex-binding.test.mjs` — the four live cells
+above were not re-run for it.
 - **reload_required**: the Codex processes used here were ephemeral and exited
   on completion; no user Codex session was force-quit. Installed-cache
   version and a long-lived host's loaded version are separate facts — a
