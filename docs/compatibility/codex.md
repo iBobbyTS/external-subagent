@@ -59,10 +59,14 @@ contain a supported manifest`).
   guarantee, `install-plugin` also **reads the materialized cache back before
   reporting success** and compares its `.mcp.json` (facade command +
   `ZCODE_AGENTD_SOCKET`) and `.codex-plugin/plugin.json` identity with this
-  run's staged binding; store-reused or unreadable bytes fail closed with
-  `CODEX_CACHE_BINDING_MISMATCH` / `CODEX_CACHE_UNVERIFIABLE` (a materialized
-  cache that cannot be located is reported as `cache_verified: false`, never
-  as verified). The product only ever reads the cache — the remediation for
+run's staged binding; store-reused or unreadable bytes fail closed with
+`CODEX_CACHE_BINDING_MISMATCH` / `CODEX_CACHE_UNVERIFIABLE`, and a `plugin
+add` success whose cache cannot be located at all fails closed the same
+way with `CODEX_CACHE_UNVERIFIABLE` — there is no
+`installed`/`cache_verified: false` outcome; only a cache verified against
+this run's staged binding is ever reported (`cache_verified: true`) or
+recorded as installed/claimed/updated. The product only ever reads the
+cache — the remediation for
   reused bytes is a distinct release identity, not editing codex-owned
   state. The fail-closed path is pinned by the store-simulation oracles in
   `tests/install/codex-binding.test.mjs`.
