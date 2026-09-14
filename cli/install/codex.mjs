@@ -63,14 +63,36 @@ function pluginManifest(source) {
   return manifest;
 }
 
+// Digest of the staged plugin tree.  Valid symlinks are followed: the linked
+// content is hashed under the link's own relative path, so an edit of a
+// target that lives OUTSIDE the traversed root and is reachable only through
+// the link still changes the digest.  Dangling links are skipped (there is
+// no content to hash) and directory loops/diamonds are bounded by resolved
+// real path plus a depth backstop, so the walk always terminates.
 export function treeDigest(root) {
   const hash = crypto.createHash('sha256');
-  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).forEach((entry) => {
-    const target = path.join(dir, entry.name);
-    if (entry.isDirectory()) walk(target);
-    else if (entry.isFile() && entry.name !== '.mcp.json') { hash.update(path.relative(root, target)); hash.update(fs.readFileSync(target)); }
-  });
-  walk(root); return hash.digest('hex');
+  const seen = new Set([fs.realpathSync(root)]);
+  const walk = (dir, depth) => {
+    if (depth > 64) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const target = path.join(dir, entry.name);
+      const isLink = entry.isSymbolicLink();
+      let resolvedStat = entry;
+      if (isLink) {
+        try { resolvedStat = fs.statSync(target); } catch { continue; }
+      }
+      if (resolvedStat.isDirectory()) {
+        const real = fs.realpathSync(target);
+        if (seen.has(real)) continue;
+        seen.add(real);
+        walk(target, depth + 1);
+      } else if (resolvedStat.isFile() && entry.name !== '.mcp.json') {
+        hash.update(path.relative(root, target));
+        hash.update(fs.readFileSync(target));
+      }
+    }
+  };
+  walk(root, 0); return hash.digest('hex');
 }
 
 function stagePlugin(source, staging, paths) {
@@ -181,10 +203,15 @@ function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
     }
     return cache;
   }
-  // No materialized cache to read: report that verification did not happen
-  // instead of implying it (real codex always materializes the cache, so a
-  // real install either verifies above or fails closed).
-  return null;
+  // `plugin add` reported success, yet neither the CLI-reported path nor the
+  // derived cache location exists on disk — there are no bytes to verify this
+  // install against.  Real codex always materializes the cache, so a success
+  // without one is an unverifiable install: fail closed here instead of
+  // reporting installed/cache_verified:false, which let public installs and
+  // reconciles record success (claims, last_status=updated) for an install
+  // whose binding this run never saw.
+  const lookedIn = [...new Set(candidates)].join(', ');
+  throw new CliError('CODEX_CACHE_UNVERIFIABLE', `codex plugin add reported success for ${identity} but no plugin cache was materialized to verify (looked in: ${lookedIn}); refusing to record an unverified install`);
 }
 
 export function resolveStaging(home, options) {
@@ -241,8 +268,8 @@ export function installPlugin(paths, options = {}) {
   }
   return {
     installed: true, source, staging, marketplace, codex_home: codexHome,
-    cache: verifiedCache || add.json?.installedPath || add.json?.installed_path || null,
-    cache_verified: verifiedCache !== null,
+    cache: verifiedCache,
+    cache_verified: true,
     codex: add.json || add.stdout.trim(), ...market,
   };
 }

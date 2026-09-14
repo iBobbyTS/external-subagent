@@ -39,8 +39,11 @@ function fixtureHome(prefix = 'external-subagent-bind-') {
 // `store: true` the fake reproduces the machine-global content store: the
 // first `plugin add` of a plugin@marketplace@version seeds the store from
 // that caller's staged tree, and every later home materializes the STORE's
-// bytes for the identity — not its own staged tree.
-function fakeCodexCli(directory, { store = false } = {}) {
+// bytes for the identity — not its own staged tree.  With `materialize:
+// false` the fake reports `plugin add` success without writing any cache
+// (the never-materialized counterexample); `reportPath: false` additionally
+// omits installedPath from the success JSON.
+function fakeCodexCli(directory, { store = false, materialize = true, reportPath = true } = {}) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex-fake.mjs');
   fs.writeFileSync(script, `#!/usr/bin/env node
@@ -78,11 +81,14 @@ if (args[0] === 'plugin' && args[1] === 'add') {
     fs.cpSync(staging, storeKey, { recursive: true });
   }
   const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  ${materialize ? `
   fs.rmSync(cache, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(cache), { recursive: true });
-  fs.cpSync(${store} ? storeKey : staging, cache, { recursive: true });
+  fs.cpSync(${store} ? storeKey : staging, cache, { recursive: true });` : `
+  /* cache-less success: report the install without materializing the cache */`}
+  const reported = ${reportPath} ? { installedPath: cache } : {};
   text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version,
-    installedPath: cache, authPolicy: 'ON_INSTALL' });
+    authPolicy: 'ON_INSTALL', ...reported });
   process.exit(0);
 }
 if (args[0] === 'plugin' && args[1] === 'remove') {
@@ -279,6 +285,56 @@ test('store reuse is answered by a distinct release identity, and a repeat of th
     );
   } finally {
     for (const dir of [state, homeA, homeB]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// P1 counterexample: `plugin add` reports success but no cache is ever
+// materialized — neither the reported installedPath (when the CLI claims
+// one) nor the derived cache location.  installPlugin must fail closed with
+// CODEX_CACHE_UNVERIFIABLE, roll the product-owned state of this run back,
+// and neither the install nor a later reconcile may record success for it.
+test('a plugin-add success with no materialized cache fails closed and records no success', () => {
+  const home = fixtureHome('external-subagent-nocache-');
+  const liedDir = path.join(home, 'fake-lied');
+  const silentDir = path.join(home, 'fake-silent');
+  fs.mkdirSync(liedDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(silentDir, { recursive: true, mode: 0o700 });
+  const lying = fakeCodexCli(liedDir, { materialize: false });          // reports installedPath it never wrote
+  const silent = fakeCodexCli(silentDir, { materialize: false, reportPath: false }); // reports success with no path
+  const paths = productPaths(home);
+  const codexHome = path.join(home, 'codex-target');
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  try {
+    for (const fake of [lying, silent]) {
+      let failure = null;
+      try { installPlugin(paths, { codexCli: fake.cli, codexHome }); } catch (error) { failure = error; }
+      assert.ok(failure, 'a cache-less plugin-add success must not install');
+      assert.equal(failure.code, 'CODEX_CACHE_UNVERIFIABLE');
+      assert.match(failure.message, /external-subagent@personal@\d+\.\d+\.\d+/u, 'the error names the unverifiable identity');
+      assert.match(failure.message, /no plugin cache was materialized/u);
+      assert.ok(failure.message.includes(codexHome), 'the error shows where the cache was expected');
+      assert.equal(fs.existsSync(staging), false, 'the failed install rolls its staging back');
+      assert.equal(fs.existsSync(marketplace), false, 'the failed install rolls its marketplace back');
+    }
+
+    // Reconcile over the same unverifiable install: the home is recorded as
+    // failed — never updated — and the prior claim's digest survives.
+    registerCodexHome(paths, codexHome, { version: '0.1.0', digest: 'sentinel-digest', status: 'claimed' });
+    const report = reconcileCodexHomes(paths, { codexCli: silent.cli });
+    assert.equal(report.homes.length, 1);
+    assert.equal(report.homes[0].status, 'failed');
+    assert.equal(report.homes[0].error.code, 'CODEX_CACHE_UNVERIFIABLE');
+    assert.equal(report.all_updated, false);
+    const entry = loadCodexHomes(paths).registry.homes[0];
+    assert.equal(entry.last_status, 'failed', 'reconcile must not record updated for an unverifiable install');
+    assert.equal(entry.digest, 'sentinel-digest', 'a failed sync must not overwrite the recorded digest');
+    assert.equal(entry.last_sync_ms, null, 'a failed sync must not record a sync timestamp');
+    assert.equal(fs.existsSync(staging), false, 'the failed reconcile attempt also rolls its staging back');
+    assert.equal(fs.existsSync(marketplace), false, 'the failed reconcile attempt also rolls its marketplace back');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 

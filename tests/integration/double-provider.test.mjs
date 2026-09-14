@@ -159,6 +159,24 @@ test('treeDigest sees symlink target content drift, keeps dangling links, and bo
     const afterResolving = treeDigest(tree);
     assert.notEqual(afterResolving, afterRetarget, 'a dangling link becoming resolved must surface');
 
+    // Valid targets OUTSIDE the traversed root, reachable only through their
+    // links: the walk never visits them directly, so only symlink resolution
+    // can surface their content.
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'token.txt'), 'first');
+    fs.symlinkSync(path.join(outside, 'token.txt'), path.join(tree, 'outside-file-link'));
+    const outsideDir = path.join(root, 'outside-dir');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'note.txt'), 'one');
+    fs.symlinkSync(outsideDir, path.join(tree, 'outside-dir-link'));
+    const beforeOutside = treeDigest(tree);
+    fs.writeFileSync(path.join(outside, 'token.txt'), 'second');
+    assert.notEqual(treeDigest(tree), beforeOutside, 'an out-of-root file target reachable only via its link must surface');
+    const afterOutsideFile = treeDigest(tree);
+    fs.writeFileSync(path.join(outsideDir, 'note.txt'), 'two');
+    assert.notEqual(treeDigest(tree), afterOutsideFile, 'content inside an out-of-root linked directory must surface');
+
     // A symlink loop and a diamond terminate, and content inside the looped
     // subtree is still covered by the digest.
     const loopBase = path.join(root, 'loop');
@@ -211,8 +229,10 @@ function digest(file) {
 // Recursive digest for the one directory bridge (`profiles/`): hashes the
 // sorted (relative path, content) pairs, so in-place edits and new files
 // written through the symlink surface as drift. Symlink entries hash the
-// linked CONTENT when the link resolves (an in-place edit of a target file
-// behind the bridge must surface) and keep their target path in the line
+// linked CONTENT when the link resolves — including targets that live
+// OUTSIDE the traversed root and are reachable only through the link (an
+// in-place edit of a target file behind the bridge must surface) — and keep
+// their target path in the line
 // (retargeting still changes the digest); dangling symlinks stay supported —
 // the real DSH profiles tree contains dangling `node_modules` dependency
 // symlinks, which statSync would refuse. Resolution is cycle-bounded: a
