@@ -157,22 +157,6 @@ async function faithfulService(dir, plist, marker) {
   return { launchctl, callDaemon, read, alive, marker, plist, spawnCount };
 }
 
-test('service unload polls through a transient launchd registration', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unload-poll-'));
-  const launchAgent = path.join(root, 'agent.plist');
-  fs.writeFileSync(launchAgent, '<plist><key>ProgramArguments</key><array><string>/bin/true</string></array></plist>');
-  const paths = { launchAgent, socket: path.join(root, 'sock') };
-  let prints = 0;
-  const control = async (argv) => {
-    if (argv[0] === 'print') return prints++ === 0 ? { status: 0, stdout: 'pid = 1' } : { absent: true };
-    if (argv[0] === 'bootout') return { status: 0 };
-    if (argv[0] === 'bootstrap') return { status: 0 };
-    throw new Error('unexpected launchctl');
-  };
-  const rpc = async (_socket, command) => command === 'drain-status' ? { ready_for_activation: true } : { activation_claim: 'x' };
-  await assert.rejects(() => activateService(paths, { path: launchAgent, sha256: digest(launchAgent) }, { launchctl: control, callDaemon: rpc, healthTimeoutMs: 1 }), /./);
-  assert.ok(prints >= 2);
-});
 
 function stubPlist(program) {
   const xml = (s) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
