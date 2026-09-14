@@ -157,6 +157,23 @@ async function faithfulService(dir, plist, marker) {
   return { launchctl, callDaemon, read, alive, marker, plist, spawnCount };
 }
 
+test('service unload polls through a transient launchd registration', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unload-poll-'));
+  const launchAgent = path.join(root, 'agent.plist');
+  fs.writeFileSync(launchAgent, '<plist><key>ProgramArguments</key><array><string>/bin/true</string></array></plist>');
+  const paths = { launchAgent, socket: path.join(root, 'sock') };
+  let prints = 0;
+  const control = async (argv) => {
+    if (argv[0] === 'print') return prints++ === 0 ? { status: 0, stdout: 'pid = 1' } : { absent: true };
+    if (argv[0] === 'bootout') return { status: 0 };
+    if (argv[0] === 'bootstrap') return { status: 0 };
+    throw new Error('unexpected launchctl');
+  };
+  const rpc = async () => ({ });
+  await assert.rejects(() => activateService(paths, { path: '/bin/true', sha256: digest('/bin/true') }, { launchctl: control, callDaemon: rpc, healthTimeoutMs: 1 }), /service has no new process/);
+  assert.ok(prints >= 2);
+});
+
 function stubPlist(program) {
   const xml = (s) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>${xml(program)}</string><string>--database</string><string>/tmp/unused.db</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`);
