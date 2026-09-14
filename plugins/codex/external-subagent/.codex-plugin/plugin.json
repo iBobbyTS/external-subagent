@@ -1,6 +1,6 @@
 {
   "name": "external-subagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manage bounded external agent tasks from Codex.",
   "author": { "name": "external-subagent maintainers" },
   "skills": "./skills/",

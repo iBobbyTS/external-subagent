@@ -9,10 +9,15 @@ Feature branch `codex/external-subagent-productization-closeout`. DSH and
 ZCode installed-artifact lifecycles, active-task upgrade, and managed Codex
 binding are implemented and reviewed; installing from a packed artifact and
 explicitly initializing to a launchd-resident service (idempotent repeat
-init/start) is live-verified on a real GUI session. DSH admission currently
-supports `build` and strict `plan`; its model selection is explicit spawn
-model, configured default, then the native default. Nothing has been
-published to a registry.
+init/start) is live-verified on a real GUI session. The productization
+candidate additionally passed the four-cell consumer matrix — DSH/ZCode ×
+public CLI / real Codex CLI via the managed plugin over MCP — against one
+tarball (see [docs/acceptance/productization.md](docs/acceptance/productization.md));
+the managed plugin manifest is versioned per released candidate because its
+version is codex's plugin-cache identity (currently `0.1.1`). DSH admission
+currently supports `build` and strict `plan`; its model selection is explicit
+spawn model, configured default, then the native default. Nothing has been
+published to a registry (`REGISTRY_PUBLICATION_PENDING`).
 
 ## Install (from a packed artifact)
 

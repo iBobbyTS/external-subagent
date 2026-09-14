@@ -121,7 +121,11 @@ The plist template is documented in
 `install-plugin` stages the managed plugin under `~/plugins/external-subagent`
 (with an absolute MCP entry and the daemon socket) and registers a local
 source marketplace before invoking the official codex CLI (see the
-compatibility doc). Existing marketplace entries and Codex config are never
+compatibility doc). The plugin manifest's `version` is codex's machine-global
+cache identity (`plugin@marketplace@version`): every released candidate must
+carry its own version (`0.1.1` from the productization closeout onward), or a
+home sharing that identity silently receives another installation's cached
+bytes. Existing marketplace entries and Codex config are never
 overwritten; drift or foreign ownership is rejected (`PLUGIN_STAGING_CONFLICT`,
 `PLUGIN_MARKETPLACE_CONFLICT`). `install-mcp` provides the alternative direct
 TOML binding with the same ten-tool surface.
