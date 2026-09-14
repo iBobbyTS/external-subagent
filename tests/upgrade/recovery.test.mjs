@@ -169,7 +169,7 @@ test('service unload polls through a transient launchd registration', async () =
     if (argv[0] === 'bootstrap') return { status: 0 };
     throw new Error('unexpected launchctl');
   };
-  const rpc = async () => ({ });
+  const rpc = async (_socket, command) => command === 'drain-status' ? { ready_for_activation: true } : { activation_claim: 'x' };
   await assert.rejects(() => activateService(paths, { path: launchAgent, sha256: digest(launchAgent) }, { launchctl: control, callDaemon: rpc, healthTimeoutMs: 1 }), /service has no new process/);
   assert.ok(prints >= 2);
 });
