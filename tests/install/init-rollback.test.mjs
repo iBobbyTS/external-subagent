@@ -20,9 +20,13 @@ function fixtureHome(prefix = 'external-subagent-init-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-// Minimal stand-in for the verified codex CLI surface; the cacheWriter
-// variant adds a fake plugin-cache write so tests can pin that codex-owned
-// content survives rollback.
+// Minimal stand-in for the verified codex CLI surface.  Like the real CLI, a
+// successful `plugin add` materializes the plugin cache (the staged manifest
+// and .mcp.json) under plugins/cache/<marketplace>/<plugin>/<version> in
+// CODEX_HOME and reports that path, so installPlugin's read-back verification
+// has bytes to verify; the version comes from the staged manifest, never a
+// constant.  The cacheWriter variant adds an extra fake codex-owned write so
+// tests can pin that codex-owned content survives rollback.
 function fakeCodexCli(directory, { cacheWriter = false } = {}) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex-fake.mjs');
@@ -30,13 +34,30 @@ function fakeCodexCli(directory, { cacheWriter = false } = {}) {
 import fs from 'node:fs';
 import path from 'node:path';
 const args = process.argv.slice(2);
+const rootsFile = path.join(${JSON.stringify(directory)}, 'marketplace-roots.json');
 const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
+const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
 if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
-if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') { text({ marketplaceName: 'personal', installedRoot: args[3] }); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const roots = loadRoots();
+  roots[process.env.CODEX_HOME] = args[3];
+  fs.writeFileSync(rootsFile, JSON.stringify(roots));
+  text({ marketplaceName: 'personal', installedRoot: args[3] });
+  process.exit(0);
+}
 if (args[0] === 'plugin' && args[1] === 'add') {
   const name = args[2]; const marketplace = args[args.indexOf('--marketplace') + 1];
-  ${cacheWriter ? `const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name); fs.mkdirSync(cache, { recursive: true }); fs.writeFileSync(path.join(cache, 'codex-owned.txt'), 'official cache');` : ''}
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version: '0.1.0', installedPath: path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, '0.1.0') });
+  const root = loadRoots()[process.env.CODEX_HOME];
+  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
+  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
+  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  ${cacheWriter ? `fs.mkdirSync(path.dirname(cache), { recursive: true }); fs.writeFileSync(path.join(path.dirname(cache), 'codex-owned.txt'), 'official cache');` : ''}
+  fs.rmSync(cache, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.cpSync(staging, cache, { recursive: true });
+  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version, installedPath: cache });
   process.exit(0);
 }
 process.stderr.write('unexpected codex invocation: ' + JSON.stringify(args) + '\\n');
@@ -111,7 +132,7 @@ test('init preserves configured agents and advances the service config revision'
   }
 });
 
-test('failure after the plugin binding rolls back staging, marketplace, and the created codex home', () => {
+test('failure after the plugin binding rolls back staging, marketplace, and product-created directories', () => {
   const { paths, codexHome, run } = initFixture({ failStep: 'claim-codex-home' });
   try {
     assert.throws(() => run(), /injected failure at claim-codex-home/u);
@@ -119,7 +140,12 @@ test('failure after the plugin binding rolls back staging, marketplace, and the 
     assert.equal(fs.existsSync(path.join(paths.home, 'plugins')), false, 'the staging parent directory is pruned');
     assert.equal(fs.existsSync(path.join(paths.home, '.agents', 'plugins', 'marketplace.json')), false, 'the marketplace manifest is removed');
     assert.equal(fs.existsSync(path.join(paths.home, '.agents')), false, 'the marketplace parent directories are pruned');
-    assert.equal(fs.existsSync(codexHome), false, 'a codex home this run created disappears when codex wrote nothing');
+    // The realistic fake materializes the official cache inside the codex home
+    // before claim-codex-home fails, so the run-created home survives with
+    // exactly the codex-owned plugin cache in it; every product-owned
+    // directory around it still rolls back.
+    assert.equal(fs.existsSync(codexHome), true, 'the created codex home stays because the official plugin add materialized its cache inside');
+    assert.deepEqual(fs.readdirSync(codexHome), ['plugins'], 'only the codex-owned plugin cache keeps the created home alive');
     assert.equal(fs.existsSync(paths.data), false, 'product data rolls back');
     assert.equal(fs.existsSync(paths.config), false, 'product config rolls back');
     assert.equal(fs.existsSync(paths.launchAgent), false, 'the LaunchAgent rolls back');

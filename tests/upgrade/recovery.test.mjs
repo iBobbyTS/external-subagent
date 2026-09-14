@@ -507,16 +507,40 @@ test('reconcile preserves registered home content and the disabled plugin state'
   fs.writeFileSync(configToml, disabledBinding);
   try {
     registerCodexHome(p, home);
+    // The shim materializes the plugin cache (staged manifest + .mcp.json
+    // under plugins/cache/<marketplace>/<plugin>/<version>) like the real CLI,
+    // so the reconcile below passes installPlugin's read-back cache
+    // verification.
     const shim = path.join(root, 'bin', 'codex');
     fs.mkdirSync(path.dirname(shim), { recursive: true });
     fs.writeFileSync(shim, [
       '#!/usr/bin/env node',
+      'import fs from "node:fs";',
       'import path from "node:path";',
       'const args = process.argv.slice(2);',
+      `const rootsFile = path.join(${JSON.stringify(path.dirname(shim))}, "marketplace-roots.json");`,
+      'const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, "utf8")); } catch { return {}; } };',
       'const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + "\\n"); };',
       'if (args[0] === "plugin" && args[1] === "add" && args.includes("--help")) process.exit(0);',
-      'if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "add") { text({ marketplaceName: "personal", installedRoot: args[3], alreadyAdded: false }); process.exit(0); }',
-      'if (args[0] === "plugin" && args[1] === "add") { text({ pluginId: "external-subagent@personal", installedPath: path.join(process.env.CODEX_HOME || "", "plugins", "cache", "personal", "external-subagent", "0.1.0") }); process.exit(0); }',
+      'if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "add") {',
+      '  const roots = loadRoots();',
+      '  roots[process.env.CODEX_HOME] = args[3];',
+      '  fs.writeFileSync(rootsFile, JSON.stringify(roots));',
+      '  text({ marketplaceName: "personal", installedRoot: args[3], alreadyAdded: false }); process.exit(0);',
+      '}',
+      'if (args[0] === "plugin" && args[1] === "add") {',
+      '  const name = args[2]; const marketplace = args[args.indexOf("--marketplace") + 1];',
+      '  const root = loadRoots()[process.env.CODEX_HOME];',
+      '  if (!root) { process.stderr.write("no marketplace registered for this CODEX_HOME\\n"); process.exit(1); }',
+      '  const doc = JSON.parse(fs.readFileSync(path.join(root, ".agents", "plugins", "marketplace.json"), "utf8"));',
+      '  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);',
+      '  const version = JSON.parse(fs.readFileSync(path.join(staging, ".codex-plugin", "plugin.json"), "utf8")).version;',
+      '  const cache = path.join(process.env.CODEX_HOME || "", "plugins", "cache", marketplace, name, String(version));',
+      '  fs.rmSync(cache, { recursive: true, force: true });',
+      '  fs.mkdirSync(path.dirname(cache), { recursive: true });',
+      '  fs.cpSync(staging, cache, { recursive: true });',
+      '  text({ pluginId: name + "@" + marketplace, name, marketplaceName: marketplace, version, installedPath: cache }); process.exit(0);',
+      '}',
       'process.stderr.write("unexpected codex invocation: " + JSON.stringify(args) + "\\n");',
       'process.exit(1);',
     ].join('\n'), { mode: 0o755 });
