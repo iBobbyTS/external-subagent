@@ -47,7 +47,7 @@ external-subagent close --json '{"agent_id":10000000}'
 
 初始化或显式执行 `install-plugin` 会调用官方 Codex CLI，将 plugin 安装到 `$CODEX_HOME/plugins/cache`，并通过本地 marketplace 注册。plugin 的 MCP server 使用绝对路径连接产品 facade；当前公开工具包括 `external_subagent_spawn`、`wait`、`result`、`close`、`cancel`、`send`、`respond`、`observe`、`list` 和 `status`。
 
-plugin manifest 的 `version` 是 Codex 全局 content-store 的缓存身份（`plugin@marketplace@version`），每个发布候选必须携带独立版本（当前 `0.1.1`），否则已缓存同一身份的其他 home 会覆盖新候选的字节；详见 [compatibility/codex.md](compatibility/codex.md)。
+plugin manifest 的 `version` 是 Codex 全局 content-store 的缓存身份（`plugin@marketplace@version`），每个发布候选必须携带独立版本（当前 `0.1.1`），否则已缓存同一身份的其他 home 会覆盖新候选的字节。安装器在返回成功前会读回实际 cache 的 `.mcp.json`/manifest 并与本次 staged binding 比对，发现复用了其他 binding 的字节时以 `CODEX_CACHE_BINDING_MISMATCH` 显式失败（fail-closed），且从不改动 Codex cache 本身；详见 [compatibility/codex.md](compatibility/codex.md)。
 
 也可以使用 `install-mcp` 写入直接的 TOML MCP binding，适用于不支持 plugin marketplace 的 Codex 版本。两种方式都只管理本产品自己的 binding，并保留其他 marketplace、plugin 和 enabled 状态。
 

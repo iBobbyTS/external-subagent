@@ -43,3 +43,16 @@ test('acceptance matrix deliverable records the four live consumer cells', () =>
   }
   assert.ok(doc.includes('REGISTRY_PUBLICATION_PENDING'), 'publication status must stay explicit until authorized');
 });
+
+test('acceptance doc attributes the zcode probe home to the real user home, not an isolated HOME', () => {
+  const doc = fs.readFileSync(path.join(root, 'docs', 'acceptance', 'productization.md'), 'utf8');
+  // Native-review correction: the launchd-run daemon had no HOME from the
+  // bootstrapping shell (the plist sets none), so the zcode probe's recorded
+  // scope.home was the real /Users/ibobby. The doc must attribute the
+  // policy_unverified boundary to that evidence gap — never to an isolated
+  // scratch HOME — while the ZCode spawn cells stay the capability proof.
+  assert.match(doc, /scope\.home/u, 'the probe scope attribution must stay explicit');
+  assert.match(doc, /\/Users\/ibobby/u);
+  assert.match(doc, /launchd set no `HOME`/u);
+  assert.doesNotMatch(doc, /isolated HOME without the policy hook/u, 'the withdrawn isolated-HOME attribution must not return');
+});

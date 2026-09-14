@@ -24,7 +24,7 @@ import {
   registerCodexHome,
   unregisterCodexHome,
 } from '../../cli/install/reconcile.mjs';
-import { nativeBinary } from '../../cli/install/layout.mjs';
+import { nativeBinary, pluginSourceRoot } from '../../cli/install/layout.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
@@ -34,8 +34,13 @@ function fixtureHome(prefix = 'external-subagent-bind-') {
 }
 
 // Minimal stand-in for the verified codex CLI surface.  Every invocation is
-// appended to a JSONL log; responses mirror the real 0.153.4 JSON shapes.
-function fakeCodexCli(directory) {
+// appended to a JSONL log; responses mirror the real 0.153.4 JSON shapes and
+// `plugin add` materializes the cache directory the real CLI writes.  With
+// `store: true` the fake reproduces the machine-global content store: the
+// first `plugin add` of a plugin@marketplace@version seeds the store from
+// that caller's staged tree, and every later home materializes the STORE's
+// bytes for the identity — not its own staged tree.
+function fakeCodexCli(directory, { store = false } = {}) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex-fake.mjs');
   fs.writeFileSync(script, `#!/usr/bin/env node
@@ -43,25 +48,47 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const log = process.env.FAKE_CODEX_LOG || path.join(path.dirname(fileURLToPath(import.meta.url)), 'codex-invocations.jsonl');
+const stateDir = path.dirname(log);
+const rootsFile = path.join(stateDir, 'marketplace-roots.json');
+const storeRoot = path.join(stateDir, 'content-store');
 const args = process.argv.slice(2);
 fs.appendFileSync(log, JSON.stringify({ args, codex_home: process.env.CODEX_HOME }) + '\\n');
 const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
-const join = (sub, rest) => [sub, ...rest];
+const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
 if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage: codex plugin add\\n'); process.exit(0); }
 if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const roots = loadRoots();
+  roots[process.env.CODEX_HOME] = args[3];
+  fs.writeFileSync(rootsFile, JSON.stringify(roots));
   text({ marketplaceName: 'personal', installedRoot: args[3], alreadyAdded: false });
   process.exit(0);
 }
 if (args[0] === 'plugin' && args[1] === 'add') {
   const name = args[2];
   const marketplace = args[args.indexOf('--marketplace') + 1];
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version: '0.1.0',
-    installedPath: path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, '0.1.0'), authPolicy: 'ON_INSTALL' });
+  const root = loadRoots()[process.env.CODEX_HOME];
+  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
+  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const entry = doc.plugins.find((plugin) => plugin.name === name);
+  const staging = path.resolve(root, entry.source.path);
+  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const storeKey = path.join(storeRoot, marketplace, name, String(version));
+  if (${store} && !fs.existsSync(storeKey)) {
+    fs.mkdirSync(path.dirname(storeKey), { recursive: true });
+    fs.cpSync(staging, storeKey, { recursive: true });
+  }
+  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  fs.rmSync(cache, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.cpSync(${store} ? storeKey : staging, cache, { recursive: true });
+  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version,
+    installedPath: cache, authPolicy: 'ON_INSTALL' });
   process.exit(0);
 }
 if (args[0] === 'plugin' && args[1] === 'remove') {
   const [name, marketplace] = String(args[2]).split('@');
   if (!marketplace) { process.stderr.write('plugin requires --marketplace unless passed as <plugin>@<marketplace>\\n'); process.exit(1); }
+  fs.rmSync(path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name), { recursive: true, force: true });
   text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace });
   process.exit(0);
 }
@@ -112,6 +139,14 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   assert.ok(add.args.includes('--marketplace'), 'plugin add must select the marketplace explicitly');
   assert.ok(add.args.includes('--json'));
   assert.equal(add.codex_home, path.join(home, '.codex'), 'CODEX_HOME must confine the install');
+
+  // The materialized cache is read back and verified against the staged
+  // binding before installPlugin reports success.
+  assert.equal(result.cache_verified, true);
+  assert.ok(result.cache.startsWith(path.join(home, '.codex')));
+  const cacheMcp = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8'));
+  assert.equal(cacheMcp.mcpServers.external_subagent.command, nativeBinary('external-subagent-mcp'));
+  assert.equal(cacheMcp.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, paths.socket);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -158,6 +193,93 @@ test('foreign staging and drifted marketplace entries are rejected, not overwrit
   assert.throws(() => installPlugin(paths, options), (error) => error.code === 'PLUGIN_MARKETPLACE_CONFLICT');
   assert.equal(JSON.parse(fs.readFileSync(marketplacePath, 'utf8')).plugins[0].source.path, './plugins/not-ours');
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The store-backed fake below reproduces the 0.153.4 machine-global content
+// store: one shared store across every CODEX_HOME, keyed by
+// plugin@marketplace@version, seeded by whichever binding was installed
+// first.  These tests pin the fail-closed answer to store reuse.
+test('a second binding of the same plugin identity fails closed on store-reused cache bytes', () => {
+  const state = fixtureHome('external-subagent-store-');
+  const fake = fakeCodexCli(state, { store: true });
+  const homeA = fixtureHome('external-subagent-bind-a-');
+  const homeB = fixtureHome('external-subagent-bind-b-');
+  const codexA = path.join(state, 'codex-a');
+  const codexB = path.join(state, 'codex-b');
+  try {
+    const pathsA = productPaths(homeA);
+    const pathsB = productPaths(homeB);
+    const first = installPlugin(pathsA, { codexCli: fake.cli, codexHome: codexA });
+    assert.equal(first.cache_verified, true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(first.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      pathsA.socket,
+    );
+
+    // Same plugin@marketplace@version, different valid binding (different
+    // staging root and daemon socket): the store hands home B binding A's
+    // bytes, and the install must fail closed instead of reporting success.
+    let failure = null;
+    try { installPlugin(pathsB, { codexCli: fake.cli, codexHome: codexB }); } catch (error) { failure = error; }
+    assert.ok(failure, 'the store-reused install must not succeed');
+    assert.equal(failure.code, 'CODEX_CACHE_BINDING_MISMATCH');
+    assert.match(failure.message, /machine-global content store/u);
+    assert.match(failure.message, new RegExp(pathsB.socket.replace(/[/\\]/gu, '\\$&'), 'u'));
+
+    // Fail-closed rollback of product-owned state from this run...
+    assert.equal(fs.existsSync(path.join(homeB, 'plugins', 'external-subagent')), false, 'the second binding\'s staging is rolled back');
+    assert.equal(fs.existsSync(path.join(homeB, '.agents', 'plugins', 'marketplace.json')), false, 'the second binding\'s marketplace is rolled back');
+    // ...while the codex-owned cache is left exactly as codex wrote it: it
+    // still carries binding A's bytes, proving both the reuse and that the
+    // product never edits the cache it rejected.
+    const reused = JSON.parse(fs.readFileSync(path.join(codexB, 'plugins', 'cache', 'personal', 'external-subagent', JSON.parse(fs.readFileSync(path.join(first.cache, '.codex-plugin', 'plugin.json'), 'utf8')).version, '.mcp.json'), 'utf8'));
+    assert.equal(reused.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, pathsA.socket);
+    assert.equal(pathsA.socket === pathsB.socket, false, 'the two bindings must differ for this oracle to mean anything');
+  } finally {
+    for (const dir of [state, homeA, homeB]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('store reuse is answered by a distinct release identity, and a repeat of the same binding verifies', () => {
+  const state = fixtureHome('external-subagent-store-ok-');
+  const fake = fakeCodexCli(state, { store: true });
+  const homeA = fixtureHome('external-subagent-bind-repeat-');
+  const homeB = fixtureHome('external-subagent-bind-bump-');
+  const codexA = path.join(state, 'codex-a');
+  const codexB = path.join(state, 'codex-b');
+  const sourceB = path.join(state, 'source-b');
+  try {
+    const pathsA = productPaths(homeA);
+    const pathsB = productPaths(homeB);
+    installPlugin(pathsA, { codexCli: fake.cli, codexHome: codexA });
+    // Repeating the SAME binding hits the store's identical bytes and still
+    // verifies against this run's staged tree.
+    const repeat = installPlugin(pathsA, { codexCli: fake.cli, codexHome: codexA });
+    assert.equal(repeat.cache_verified, true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(repeat.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      pathsA.socket,
+    );
+
+    // A second binding with a DISTINCT plugin version identity gets its own
+    // store entry and installs cleanly — the documented remediation.
+    fs.cpSync(pluginSourceRoot(), sourceB, { recursive: true });
+    const manifestFile = path.join(sourceB, '.codex-plugin', 'plugin.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    const [major, minor, patch] = manifest.version.split('.').map(Number);
+    manifest.version = `${major}.${minor}.${patch + 1}`;
+    fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+    const second = installPlugin(pathsB, { source: sourceB, codexCli: fake.cli, codexHome: codexB });
+    assert.equal(second.cache_verified, true);
+    assert.equal(path.basename(second.cache), manifest.version, 'the distinct identity materializes its own cache directory');
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(second.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      pathsB.socket,
+      'the second home\'s cache carries the second binding, not the first\'s',
+    );
+  } finally {
+    for (const dir of [state, homeA, homeB]) fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('uninstall uses the verified name@marketplace removal form', () => {
@@ -275,8 +397,10 @@ test('D08 reconcile updates only registered writable homes and never touches str
 // already caches the same plugin@marketplace@version, an isolated CODEX_HOME
 // still receives the REAL installation's bytes (observed live: the cached
 // .mcp.json carried the real-home socket while the staged tree carried the
-// throwaway socket).  The real-CLI oracle below pins the fresh-machine
-// contract, so it only runs where that dedupe cannot mask the staged binding.
+// throwaway socket).  installPlugin now reads the cache back and fails
+// closed on that mismatch; the real-CLI oracle below additionally pins the
+// fresh-machine contract, so it only runs where store dedupe cannot turn
+// the run into the mismatch path it now shares with the unit oracle above.
 const realCodexCacheConflict = fs.existsSync(path.join(os.homedir(), '.codex', 'plugins', 'cache', 'personal', 'external-subagent'));
 
 test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { skip: !(process.platform === 'darwin' && process.env.EXTERNAL_SUBAGENT_TEST_REAL_CODEX !== '0' && !realCodexCacheConflict && spawnSync('codex', ['--version'], { encoding: 'utf8' }).status === 0) }, () => {
@@ -286,6 +410,7 @@ test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { 
   const paths = productPaths(home);
   const result = installPlugin(paths, { codexHome, env: { CODEX_HOME: codexHome } });
   assert.equal(result.installed, true);
+  assert.equal(result.cache_verified, true, 'the real materialized cache must verify against the staged binding');
   assert.ok(result.cache, 'codex reports the installed cache path');
   assert.ok(result.cache.startsWith(fs.realpathSync(codexHome)), 'the plugin cache must live inside the claimed CODEX_HOME');
   const cacheMcp = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8'));

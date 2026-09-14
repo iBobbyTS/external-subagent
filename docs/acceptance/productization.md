@@ -32,21 +32,26 @@ macOS darwin 25.6.0 arm64; node v26.5.0; npm 11.17.0
 `/opt/homebrew/bin/dsh` → `0.1.5-rc.1` (credentials bridged read-only by
 symlink from the real `~/.dsh`); ZCode runtime
 `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs` (zcode `0.16.5`,
-real `~/.zcode/cli/config.json` bridged read-only). Isolation per the Rosetta
-skill's disposable-host pattern: isolated `HOME`, npm prefix/cache,
-`CODEX_HOME`, and product data dir under a short scratch root (`/tmp/es4`,
-fully removed afterwards); launchd service was **real** (label
-`com.external-subagent.daemon` bootstrapped into the GUI session by the
-public `init`, PID 4343, later booted out by public `stop`; the real home's
-plist/label and every user Codex session were left untouched — before/after
-snapshots of the real environment are identical).
+real `~/.zcode/cli/config.json` bridged read-only). Isolation per the
+Rosetta skill's disposable-host pattern: npm prefix/cache, `CODEX_HOME`, and
+the product data dir under a short scratch root (`/tmp/es4`, fully removed
+afterwards), with the session shell running an isolated `HOME`; launchd
+service was **real** (label `com.external-subagent.daemon` bootstrapped into
+the GUI session by the public `init`, PID 4343, later booted out by public
+`stop`; the real home's plist/label and every user Codex session were left
+untouched — before/after snapshots of the real environment are identical).
+One boundary of that isolation is recorded here and in the probe table:
+launchd set no `HOME` on the job (the bootstrapping shell's isolated `HOME`
+is not inherited by a GUI-session launch agent, and the product plist sets
+none), so daemon-side operations that fall back to `HOME` resolved the real
+`/Users/ibobby`, not the scratch root.
 
 ## Provider probes (public ES commands)
 
 | Probe | Result |
 |---|---|
 | `agents probe dsh --hi` | local `READY` (`0.1.5-rc.1`, bridged home), auth `UNKNOWN/auth_not_probed` (by design), **hi `READY`** — real upstream round-trip |
-| `agents probe zcode --hi` | local `READY` (zcode `0.16.5`), auth/hi `UNAVAILABLE/policy_unverified` — the read-only hi probe requires the user-home policy verifier (`hooks install`); this isolated host does not mutate the user's real product data dir, so the boundary is recorded rather than bypassed. An isolated HOME without the policy hook does not indicate a normal user's configuration is broken; real ZCode capability is proven by the spawn cells below |
+| `agents probe zcode --hi` | local `READY` (zcode `0.16.5`), auth/hi `UNAVAILABLE/policy_unverified`. Correction (native review): the probe's recorded `scope.home` was the real `/Users/ibobby`, not the scratch `HOME` — launchd set no `HOME` on the daemon job (the plist sets none), and the daemon's home fallback resolved the real user home. This run therefore establishes neither which ZCode config source the probe consulted nor how the policy gate evaluated against that real home; `policy_unverified` is recorded as that evidence gap, not as a property of an isolated HOME and not as a statement about a normal user's configuration. Real ZCode capability is unaffected and proven by the spawn cells below |
 | DSH build mode | proven by cell 1 (live) |
 | DSH strict-plan refusal | task `10000002`: `COMPLETED`, the model reported no write tool available, workspace stayed empty |
 | ZCode explicit model | `model_selection_unsupported` before any prompt (re-asserted live by the 20:0x double-provider session run below; the closeout re-check did not reach this step) |
@@ -118,14 +123,26 @@ Same-candidate consumer re-check, two records:
   this run: the isolated cache at
   `<CODEX_HOME>/plugins/cache/personal/external-subagent/0.1.1/.mcp.json` was
   byte-identical to the staged binding (absolute installed facade + isolated
-  socket), i.e. not masked.
+  socket), i.e. not masked. Post-review hardening (native review finding):
+  `install-plugin` now reads the materialized cache's `.mcp.json`/manifest
+  back before reporting success and fails closed
+  (`CODEX_CACHE_BINDING_MISMATCH`/`CODEX_CACHE_UNVERIFIABLE`) when the store
+  reused another binding's bytes for the same identity; that guard is pinned
+  by the controlled store-simulation oracles in
+  `tests/install/codex-binding.test.mjs` — the four live cells above were
+  not re-run for it.
 - **reload_required**: the Codex processes used here were ephemeral and exited
   on completion; no user Codex session was force-quit. Installed-cache
   version and a long-lived host's loaded version are separate facts — a
   running host keeps its loaded plugin until it reloads; `codex plugin list`
   from a fresh process is the supported check.
-- **ZCode hi probe policy gate**: as recorded above; spawn capability is
-  proven by cells 2 and 4.
+- **ZCode hi probe policy gate**: the probe ran with `scope.home`
+  `/Users/ibobby` (launchd set no `HOME`; the product plist sets none), so
+  the config source behind the probe and the policy-gate evaluation that
+  produced `policy_unverified` are unproven for this run — an authenticated
+  plus policy-verified ZCode hi on a launchd-resident daemon remains open
+  evidence. This gap does not negate the ZCode task cells: cells 2 and 4
+  prove real ZCode capability through the public CLI and the managed plugin.
 - **REGISTRY_PUBLICATION_PENDING**: no public npm publish was authorized or
   performed; the local tarball install above does not claim publication.
 - NOT_RUN for this candidate: installation into the real user `~/.codex`

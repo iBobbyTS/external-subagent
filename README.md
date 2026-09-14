@@ -14,7 +14,9 @@ candidate additionally passed the four-cell consumer matrix — DSH/ZCode ×
 public CLI / real Codex CLI via the managed plugin over MCP — against one
 tarball (see [docs/acceptance/productization.md](docs/acceptance/productization.md));
 the managed plugin manifest is versioned per released candidate because its
-version is codex's plugin-cache identity (currently `0.1.1`). DSH admission
+version is codex's plugin-cache identity (currently `0.1.1`), and the
+installer verifies the materialized plugin cache against the staged binding
+before reporting success, failing closed on store-reused bytes. DSH admission
 currently supports `build` and strict `plan`; its model selection is explicit
 spawn model, configured default, then the native default. Nothing has been
 published to a registry (`REGISTRY_PUBLICATION_PENDING`).
