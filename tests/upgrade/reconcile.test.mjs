@@ -136,6 +136,10 @@ function runDriver(label, args = [], options = {}) {
   return JSON.parse(result.stdout);
 }
 
+// The fake codex CLI also materializes the plugin cache (staged manifest +
+// .mcp.json under plugins/cache/<marketplace>/<plugin>/<version> in
+// CODEX_HOME) like the real CLI, so every init/update/reconcile in this file
+// passes installPlugin's read-back cache verification.
 function fakeCodexCli(directory) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex');
@@ -144,15 +148,33 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const log = process.env.FAKE_CODEX_LOG || path.join(path.dirname(fileURLToPath(import.meta.url)), 'codex-invocations.jsonl');
+const stateDir = path.dirname(log);
+const rootsFile = path.join(stateDir, 'marketplace-roots.json');
 const args = process.argv.slice(2);
 fs.appendFileSync(log, JSON.stringify({ args, codex_home: process.env.CODEX_HOME }) + '\\n');
 const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
+const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
 if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
-if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') { text({ marketplaceName: 'personal', installedRoot: args[3], alreadyAdded: false }); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const roots = loadRoots();
+  roots[process.env.CODEX_HOME] = args[3];
+  fs.writeFileSync(rootsFile, JSON.stringify(roots));
+  text({ marketplaceName: 'personal', installedRoot: args[3], alreadyAdded: false });
+  process.exit(0);
+}
 if (args[0] === 'plugin' && args[1] === 'add') {
   const name = args[2]; const marketplace = args[args.indexOf('--marketplace') + 1];
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version: '0.1.0',
-    installedPath: path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, '0.1.0'), authPolicy: 'ON_INSTALL' });
+  const root = loadRoots()[process.env.CODEX_HOME];
+  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
+  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
+  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  fs.rmSync(cache, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.cpSync(staging, cache, { recursive: true });
+  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version,
+    installedPath: cache, authPolicy: 'ON_INSTALL' });
   process.exit(0);
 }
 if (args[0] === 'plugin' && args[1] === 'remove') {
