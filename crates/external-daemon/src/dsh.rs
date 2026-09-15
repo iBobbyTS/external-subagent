@@ -31,7 +31,8 @@ use external_agent_dsh::acp::{
 };
 use external_contract::{
     classify_lifecycle, EventEnvelope, RequestEnvelope, WireId, WireMessage,
-    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_EVENT,
+    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+    INTERACTION_REQUEST_USER_INPUT, SESSION_EVENT,
 };
 use external_runtime::{
     observe_process_group, ChildExit, Driver, FrameCodec, Inbound, StopOutcome,
@@ -673,6 +674,23 @@ fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) -> Option<Inb
                         "dsh permission request carried no usable offer",
                     )),
                 }
+            } else if request.method == transport::SESSION_REQUEST_INPUT {
+                // The only real answerable producer on the DSH path: the
+                // question is preserved verbatim and the answer travels back
+                // as the plain JSON-RPC result for this request id.
+                match transport::request_input_question(&request.params) {
+                    Some(question) => Some(Inbound::Message(WireMessage::Request(
+                        RequestEnvelope::new(
+                            request.id.clone(),
+                            INTERACTION_REQUEST_USER_INPUT,
+                            serde_json::json!({ "question": question }),
+                        ),
+                    ))),
+                    None => Some(unsupported_input_request(
+                        request.id.clone(),
+                        "dsh input request carried no usable question",
+                    )),
+                }
             } else {
                 Some(unsupported_input_request(
                     request.id.clone(),
@@ -687,7 +705,7 @@ fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) -> Option<Inb
 fn unsupported_input_request(id: WireId, reason: &str) -> Inbound {
     Inbound::Message(WireMessage::Request(RequestEnvelope::new(
         id,
-        INTERACTION_REQUEST_USER_INPUT,
+        INTERACTION_REQUEST_UNSUPPORTED_INPUT,
         serde_json::json!({"origin": "dsh_acp", "reason": reason}),
     )))
 }
@@ -775,13 +793,24 @@ impl ManagedRuntime for DshRuntimeOwner {
         &self,
         correlation_id: &str,
         decision: &str,
-        _content: Option<&str>,
+        content: Option<&str>,
         _validated_denial: Option<&external_core::ValidatedPermissionDenial>,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         let id = serde_json::from_str::<WireId>(correlation_id).map_err(|_| {
             RuntimeCommandError::InvalidSession("stored request correlation is invalid".into())
         })?;
+        // Answerable user-input requests carry the answer as the plain
+        // JSON-RPC result; the driver already accepts arbitrary JSON results.
+        if decision == "answer" {
+            let answer = content
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(RuntimeCommandError::Unsupported)?;
+            return self
+                .driver
+                .respond_before(id, serde_json::Value::String(answer.to_owned()), deadline)
+                .map_err(RuntimeCommandError::from);
+        }
         if !matches!(decision, "allow" | "deny") {
             return Err(RuntimeCommandError::Unsupported);
         }
@@ -1143,14 +1172,14 @@ printf '%s\\n' \
         // delivery may only happen after settlement.
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "follow-up", "queue", "follow-up prompt")
+                .queue_message(&agent_id, "follow-up", "follow-up prompt")
                 .unwrap(),
             MessageDisposition::Queued
         );
 
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "second-follow-up", "queue", "second follow-up prompt")
+                .queue_message(&agent_id, "second-follow-up", "second follow-up prompt")
                 .unwrap(),
             MessageDisposition::Queued
         );
@@ -1179,7 +1208,7 @@ printf '%s\\n' \
         assert_eq!(receipt.state, MessageState::Delivered);
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "follow-up", "queue", "follow-up prompt")
+                .queue_message(&agent_id, "follow-up", "follow-up prompt")
                 .unwrap(),
             MessageDisposition::AlreadyDelivered
         );
@@ -1248,6 +1277,330 @@ printf '%s\\n' \
         for frame in &frames {
             assert_eq!(frame["jsonrpc"], "2.0");
         }
+    }
+
+    #[test]
+    fn answerable_server_request_wakes_declared_waits_and_answers_over_acp() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // The child parks the turn on a NON-permission server request, which
+        // the adapter projects as the answerable interaction/requestUserInput
+        // producer instead of a permission offer.
+        let script = format!(
+            r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-q","content":[{{"type":"text","text":"which scope should I use?"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":"ask-1","method":"session/request_input","params":{{"prompt":"pick a scope"}}}}'
+read_frame
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-final","content":[{{"type":"text","text":"building with the answered scope"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn","messageId":"message-final"}}}}'
+while IFS= read -r line; do :; done
+"#
+        )
+        .replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+        let request = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(request) =
+                    scheduler.store().pending_requests(&agent_id).unwrap().first()
+                {
+                    assert_eq!(request.request_type, "user_input");
+                    assert_eq!(request.state, PendingRequestState::Pending);
+                    break request.clone();
+                }
+                assert!(Instant::now() < deadline, "server request never became pending");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
+        // A caller without the answer capability is not woken and must not see
+        // the request advertised as respondable.
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                wait_time: 0,
+                message_id: None,
+                supports_answer: false,
+            }))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(timed_out);
+        assert_eq!(pending_requests.len(), 1);
+        assert!(!pending_requests[0].respondable);
+        assert_eq!(pending_requests[0].kind, "user_input");
+        // The declared capability wakes immediately with answer guidance and
+        // the preserved question.
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            instruction,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                wait_time: 299,
+                message_id: None,
+                supports_answer: true,
+            }))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(!timed_out);
+        assert!(pending_requests[0].respondable);
+        assert_eq!(pending_requests[0].summary, "question pick a scope");
+        assert_eq!(
+            instruction.as_deref(),
+            Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
+        );
+        // The caller answers through the request id exactly as the wait
+        // response returned it, with no second lookup.
+        let returned_id = pending_requests[0].request_id.clone();
+        assert_eq!(returned_id, request.request_id);
+        // allow/deny against an answerable request fails closed.
+        assert!(scheduler
+            .respond_request(&agent_id, &returned_id, "allow", None)
+            .is_err());
+        assert_eq!(
+            scheduler
+                .respond_request(&agent_id, &returned_id, "answer", Some("release scope"))
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        assert_eq!(stored.result.final_text, "building with the answered scope");
+        // Wire evidence: the answer reached the ACP server as the plain result
+        // frame for its request id.
+        let frames = wait_for_frames(workspace.path(), 5);
+        let answer = frames
+            .iter()
+            .find(|frame| frame.get("id").and_then(|id| id.as_str()) == Some("ask-1"))
+            .expect("ACP server never observed the answer frame");
+        assert_eq!(answer["result"], "release scope");
+    }
+
+    #[test]
+    fn unsupported_dsh_requests_stay_non_respondable_even_for_answering_callers() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // One unknown interaction method and one malformed input request
+        // (no usable prompt): both must land as the unsupported sentinel,
+        // never as the answerable producer. The child holds them back until
+        // the start path has finished marking the session running.
+        let script = format!(
+            r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+while [ ! -f ask-now ]; do sleep 0.01; done
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","id":"odd-1","method":"session/requestTail","params":{{"topic":"logs"}}}}' \
+  '{{"jsonrpc":"2.0","id":"ask-bad","method":"session/request_input","params":{{"topic":"no prompt here"}}}}'
+while IFS= read -r line; do :; done
+"#
+        )
+        .replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        assert_eq!(
+            scheduler.store().get_task(&agent_id).unwrap().unwrap().phase,
+            TaskPhase::Running
+        );
+        std::fs::write(workspace.path().join("ask-now"), "").unwrap();
+        let requests = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let requests = scheduler.store().pending_requests(&agent_id).unwrap();
+                if requests.len() == 2 {
+                    break requests;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unsupported requests never became pending"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        assert!(requests
+            .iter()
+            .all(|request| request.request_type == "unsupported_input"));
+        let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
+        // Even a caller that declared the answer capability is not woken and
+        // cannot act on the sentinel records.
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                wait_time: 0,
+                message_id: None,
+                supports_answer: true,
+            }))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(timed_out);
+        assert_eq!(pending_requests.len(), 2);
+        assert!(pending_requests
+            .iter()
+            .all(|request| request.kind == "unsupported_input" && !request.respondable));
+        assert!(scheduler
+            .respond_request(&agent_id, &requests[0].request_id, "answer", Some("guess"))
+            .is_err());
+        service
+            .dispatch(RpcMethod::TaskCancel {
+                agent_id: agent_id.clone(),
+            })
+            .unwrap();
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+    }
+
+    #[test]
+    fn answerable_request_beyond_the_projection_cap_is_returned_and_answerable() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+        let _guard = scripted_test_guard();
+        let workspace = dsh_workspace();
+        // The child holds its input request back until the test has planted
+        // one hundred filler records, so the real answerable producer arrives
+        // as request 101 — beyond the bounded wait projection.
+        let script = format!(
+            r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+while [ ! -f ask-now ]; do sleep 0.01; done
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-q","content":[{{"type":"text","text":"which scope should I use?"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":"ask-101","method":"session/request_input","params":{{"prompt":"pick a scope"}}}}'
+read_frame
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-final","content":[{{"type":"text","text":"answered past the cap"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn","messageId":"message-final"}}}}'
+while IFS= read -r line; do :; done
+"#
+        )
+        .replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        for index in 0..crate::rpc::MAX_PENDING_REQUESTS {
+            scheduler
+                .store()
+                .insert_pending_request(
+                    &format!("filler-{index}"),
+                    &agent_id,
+                    &format!("\"filler-correlation-{index}\""),
+                    "unsupported_input",
+                    "{}",
+                )
+                .unwrap();
+        }
+        std::fs::write(workspace.path().join("ask-now"), "").unwrap();
+        let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: agent_id.clone(),
+                wait_time: 299,
+                message_id: None,
+                supports_answer: true,
+            }))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        // The projection stays capped at 100 while the wake-causing 101st
+        // request is part of the returned page.
+        assert!(!timed_out);
+        assert_eq!(pending_requests.len(), crate::rpc::MAX_PENDING_REQUESTS);
+        assert_eq!(pending_requests[0].request_id, "filler-0");
+        assert_eq!(pending_requests[0].kind, "unsupported_input");
+        let wake = pending_requests.last().unwrap();
+        assert!(!wake.request_id.starts_with("filler-"));
+        assert_eq!(wake.kind, "user_input");
+        assert!(wake.respondable);
+        assert_eq!(wake.summary, "question pick a scope");
+        // Answering through the returned id settles the parked ACP request.
+        assert_eq!(
+            scheduler
+                .respond_request(&agent_id, &wake.request_id, "answer", Some("release scope"))
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        // The fillers only existed to push the real request past the cap;
+        // settle them so natural completion is not blocked.
+        for index in 0..crate::rpc::MAX_PENDING_REQUESTS {
+            let filler = format!("filler-{index}");
+            scheduler
+                .store()
+                .claim_pending_response_if_accepting(&agent_id, &filler, "answer", None)
+                .unwrap();
+            scheduler
+                .store()
+                .complete_pending_response(&agent_id, &filler)
+                .unwrap();
+        }
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        assert_eq!(stored.result.final_text, "answered past the cap");
+        let frames = wait_for_frames(workspace.path(), 5);
+        let answer = frames
+            .iter()
+            .find(|frame| frame.get("id").and_then(|id| id.as_str()) == Some("ask-101"))
+            .expect("ACP server never observed the answer frame");
+        assert_eq!(answer["result"], "release scope");
     }
 
     #[test]
@@ -1722,7 +2075,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
         let passive = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
-                "version": crate::rpc::RPC_VERSION, "request_id": "passive-upgrade",
+                "request_id": "passive-upgrade",
                 "method": "daemon_begin_drain"
             }))
             .unwrap(),
@@ -1756,8 +2109,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let send = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
                 agent_id: agent_id.clone(),
-                message_id: "after-drain".into(),
-                mode: "queue".into(),
+                message_id: Some("after-drain".into()),
                 content: "must not run".into(),
             }))
             .unwrap_err();
@@ -1766,14 +2118,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         service
             .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
                 agent_id: agent_id.clone(),
-                after_revision: 0,
                 wait_time: 0,
                 message_id: None,
+                supports_answer: false,
             }))
             .unwrap();
         service
             .dispatch(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
+                request_id: None,
                 offset: 0,
                 limit: 1024,
             })
@@ -1784,7 +2137,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let began = Instant::now();
         let response = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
-                "version": crate::rpc::RPC_VERSION, "request_id": "cancel-upgrade",
+                "request_id": "cancel-upgrade",
                 "method": "daemon_begin_drain", "params": { "cancel_active": true }
             }))
             .unwrap(),
@@ -1882,14 +2235,15 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         service
             .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
                 agent_id: agent_id.clone(),
-                after_revision: 0,
                 wait_time: 0,
                 message_id: None,
+                supports_answer: false,
             }))
             .unwrap();
         service
             .dispatch(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
+                request_id: None,
                 offset: 0,
                 limit: 1024,
             })
@@ -1939,7 +2293,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
         let began = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
-                "version": crate::rpc::RPC_VERSION, "request_id": "passive-drain",
+                "request_id": "passive-drain",
                 "method": "daemon_begin_drain"
             }))
             .unwrap(),
@@ -1951,9 +2305,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         service
             .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
                 agent_id: agent_id.clone(),
-                after_revision: 0,
                 wait_time: 0,
                 message_id: None,
+                supports_answer: false,
             }))
             .unwrap();
         let fresh = dsh_workspace();
@@ -1970,7 +2324,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         // drained task's facts.
         let aborted = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
-                "version": crate::rpc::RPC_VERSION, "request_id": "abort-drain",
+                "request_id": "abort-drain",
                 "method": "daemon_abort_drain"
             }))
             .unwrap(),
@@ -2000,9 +2354,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         let RpcSuccess::TaskWait { task, .. } = service
             .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
                 agent_id: agent_id.clone(),
-                after_revision: 0,
                 wait_time: 0,
                 message_id: None,
+                supports_answer: false,
             }))
             .unwrap()
         else {
@@ -2019,8 +2373,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
                 agent_id: agent_id.clone(),
-                message_id: "after-abort".into(),
-                mode: "queue".into(),
+                message_id: Some("after-abort".into()),
                 content: "queued once admission reopened".into(),
             }))
             .unwrap();
@@ -2029,7 +2382,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         // instead of silently ignored.
         let shaped = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
-                "version": crate::rpc::RPC_VERSION, "request_id": "abort-params",
+                "request_id": "abort-params",
                 "method": "daemon_abort_drain", "params": {}
             }))
             .unwrap(),

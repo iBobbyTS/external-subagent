@@ -17,6 +17,7 @@ pub const SESSION_CANCEL: &str = "session/cancel";
 pub const SESSION_CLOSE: &str = "session/close";
 pub const SESSION_UPDATE: &str = "session/update";
 pub const SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
+pub const SESSION_REQUEST_INPUT: &str = "session/request_input";
 pub const MODELS_LIST: &str = "models/list";
 
 /// DSH ACP advertises exactly one protocol version (S01-pinned).
@@ -74,6 +75,18 @@ pub fn cancel_params(session_id: &str) -> Value {
 
 pub fn close_params(session_id: &str) -> Value {
     json!({ "sessionId": session_id })
+}
+
+/// Extract the question of a `session/request_input` ask. The question is the
+/// plain non-empty `prompt` string (the inbound frame cap already bounds its
+/// size); `None` marks the frame malformed so the caller keeps it
+/// non-respondable instead of inventing an answerable contract.
+pub fn request_input_question(params: &Value) -> Option<String> {
+    params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && !text.contains('\0'))
+        .map(str::to_owned)
 }
 
 /// Capabilities observed on `initialize`.

@@ -1568,14 +1568,11 @@ impl Scheduler {
         &self,
         agent_id: &str,
         message_id: &str,
-        mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
-        if mode != "queue" {
-            return Err(SchedulerError::InvalidConfig(
-                "generic agent messages must use queue mode".into(),
-            ));
-        }
+        // Queue is the only generic message behavior; the fixed mode lives
+        // here instead of traveling on the wire.
+        let mode = "queue";
         let deadline = self.control_deadline();
         let _admission = self.inner.admission.lock().unwrap();
         #[cfg(test)]
@@ -1670,15 +1667,16 @@ impl Scheduler {
             })?;
         let valid = match request.request_type.as_str() {
             "permission" => matches!(decision, "allow" | "deny"),
+            // Answerable user-input requests execute only as answer plus
+            // non-empty content; the wait capability is never persisted here.
+            "user_input" => {
+                decision == "answer" && content.is_some_and(|value| !value.trim().is_empty())
+            }
             _ => false,
         };
         if !valid {
             return Err(SchedulerError::InvalidConfig(
-                if request.request_type == "unsupported_input" {
-                    "user-input response is unsupported by the pinned app-server seam".into()
-                } else {
-                    "response decision does not match the pending request type".into()
-                },
+                "response decision does not match the pending request type".into(),
             ));
         }
         if request.state != PendingRequestState::Pending {

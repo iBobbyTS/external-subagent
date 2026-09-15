@@ -23,7 +23,7 @@ function task(phase = 'running', outcome = null) {
 }
 
 function rpcResult(requestId, result) {
-  return `${JSON.stringify({ version: 13, request_id: requestId, outcome: 'success', result })}\n`;
+  return `${JSON.stringify({ request_id: requestId, outcome: 'success', result })}\n`;
 }
 
 async function lifecycleServer(socketPath) {
@@ -61,8 +61,8 @@ async function lifecycleServer(socketPath) {
         const commandPendingApproval = projected.some((item) => item.state === 'pending' && item.respondable);
         const timedOut = !commandPendingApproval;
         result = {
-          task: task(), revision, next_revision: revision, pending_requests: projected,
-          command_pending_approval: commandPendingApproval, result_available: false,
+          task: task(), pending_requests: projected,
+          result_available: false,
           activity: { state: 'active', latest_text_tail: '', latest_text_updated_at: null,
             latest_text_truncated: false, active_tools: [], window_60s: {}, telemetry_status: 'healthy' },
           latest_progress: null, result: null,
@@ -72,7 +72,7 @@ async function lifecycleServer(socketPath) {
         respondCount += 1;
         const target = pending.find((item) => item.request_id === request.params.request_id);
         if (phase === 'cancelling' || !target || target.state !== 'pending' || !target.respondable) {
-          socket.end(`${JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'error', error: { code: 'REQUEST_NOT_PENDING', message: 'late or duplicate response' } })}\n`);
+          socket.end(`${JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'REQUEST_NOT_PENDING', message: 'late or duplicate response' } })}\n`);
           return;
         }
         target.state = 'responded';
@@ -126,8 +126,9 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     assert.equal(sent.result.disposition, 'queued');
     const waited = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
     assert.equal(waited.result.pending_requests.length, 100);
-    assert.equal(waited.result.command_pending_approval, true);
     assert.equal(waited.result.timed_out, false);
+    assert.equal(waited.result.revision, undefined);
+    assert.equal(waited.result.command_pending_approval, undefined);
     assert.deepEqual(waited.result.pending_requests[0], {
       request_id: 'request-1', kind: 'permission', state: 'pending', respondable: true,
       tool_name: 'Read', operation: 'read', summary: 'read 1', policy_preview: 'allow_once',
@@ -135,8 +136,6 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     const response = await runCli(socket, 'respond', { agent_id: agentId, request_id: 'request-1', decision: 'allow' });
     assert.equal(response.result.disposition, 'accepted');
     const afterResponse = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
-    assert.equal(afterResponse.result.revision, 8);
-    assert.equal(afterResponse.result.command_pending_approval, false);
     assert.equal(afterResponse.result.timed_out, true);
     assert.equal(afterResponse.result.pending_requests[0].state, 'responded');
     assert.equal(afterResponse.result.pending_requests[0].respondable, false);

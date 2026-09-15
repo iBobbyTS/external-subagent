@@ -32,9 +32,10 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.equal(schema.properties.spawn.properties.model.type, 'string');
   assert.equal(schema.properties.spawn.properties.agent.type, 'string');
   assert.equal(schema.properties.list.properties.limit.default, 100);
-  assert.equal(schema.properties.wait.properties.after_revision.default, 0);
+  assert.equal(schema.properties.wait.properties.supports_answer.default, false);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
-  assert.match(schema.properties.wait.description, /state is pending and respondable is true/u);
+  assert.equal(schema.properties.wait.properties.after_revision, undefined);
+  assert.match(schema.properties.wait.description, /supports_answer=true/u);
   assert.equal(schema.properties.result.properties.offset.default, 0);
   assert.equal(schema.properties.result.properties.limit.default, 262144);
   assert.deepEqual(schema.properties.observe.required, ['agent_id']);
@@ -44,19 +45,33 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'tools', 'reasoning', 'coverage',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_status.output, [
-    'components', 'capabilities', 'agents', 'identity',
+    'mcp_version', 'components', 'capabilities', 'agents', 'identity',
+  ]);
+  assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.input, [
+    'agent_id', 'wait_time', 'message_id', 'supports_answer',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.output, [
-    'task', 'revision', 'next_revision', 'pending_requests', 'command_pending_approval',
-    'result_available', 'activity', 'latest_progress', 'result', 'instruction', 'timed_out',
-    'message_receipt',
+    'task', 'pending_requests', 'result_available', 'activity', 'latest_progress',
+    'result', 'instruction', 'timed_out', 'message_receipt',
   ]);
   assert.deepEqual(schema.properties.error_projection.required, ['error']);
   assert.deepEqual(schema.properties.error_projection.properties.error.required, ['code', 'message']);
   assert.deepEqual(Object.keys(schema.properties.error_projection.properties.error.properties).sort(), [
     'agent_id', 'cleanup', 'code', 'component', 'message', 'operation', 'prompt_count', 'request_id',
   ]);
-  assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.output, ['task', 'result']);
+  assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.output, ['task', 'result', 'question']);
+  assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.input, [
+    'agent_id', 'request_id', 'offset', 'limit',
+  ]);
+  assert.deepEqual(schema.properties.question_projection.required, [
+    'text', 'offset', 'total_bytes', 'next_offset', 'complete',
+  ]);
+  assert.equal(schema.properties.question_projection.additionalProperties, false);
+  assert.equal(schema.properties.result.properties.request_id.type, 'string');
+  assert.match(schema.properties.wait.description, /first question page/u);
+  assert.deepEqual(schema.properties.contracts.properties.external_subagent_respond.input, [
+    'agent_id', 'request_id', 'decision', 'content',
+  ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [
     'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'complete',

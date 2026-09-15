@@ -15,6 +15,7 @@ use external_store::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use std::{
     collections::BTreeMap,
     env,
@@ -26,7 +27,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub const RPC_VERSION: u16 = 13;
+/// Diagnostic-only MCP tool surface version reported by status. It never
+/// participates in request admission.
+pub const MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const MAX_REQUEST_FRAME_BYTES: usize = 512 * 1024;
 pub const MAX_RESPONSE_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REQUEST_ID_BYTES: usize = 128;
@@ -49,7 +52,6 @@ pub use unix::{RpcClient, RpcServer, ServerOptions};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RpcRequest {
-    pub version: u16,
     pub request_id: String,
     #[serde(flatten)]
     pub method: RpcMethod,
@@ -72,15 +74,9 @@ pub enum RpcMethod {
     DaemonDrainStatus,
     DaemonAbortDrain,
     DaemonActivateReady,
-    AgentProbe {
-        input: AgentProbeInput,
-    },
-    AgentModels {
-        input: AgentModelsInput,
-    },
-    SubmitGeneral {
-        input: GeneralSubmitInput,
-    },
+    AgentProbe(AgentProbeInput),
+    AgentModels(AgentModelsInput),
+    SubmitGeneral(GeneralSubmitInput),
     TaskList(TaskListQuery),
     TaskWait(TaskWaitQuery),
     TaskMessage(MessageInput),
@@ -90,6 +86,10 @@ pub enum RpcMethod {
     },
     TaskResult {
         agent_id: String,
+        /// Pages the stored question of this pending user-input request
+        /// instead of the task's terminal result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
         #[serde(default)]
         offset: usize,
         #[serde(default = "default_result_limit")]
@@ -201,12 +201,15 @@ where
 #[serde(deny_unknown_fields)]
 pub struct TaskWaitQuery {
     pub agent_id: String,
-    #[serde(default)]
-    pub after_revision: u64,
     #[serde(default = "default_wait_time")]
     pub wait_time: u64,
     #[serde(default)]
     pub message_id: Option<String>,
+    /// Declares whether the caller can answer `interaction/requestUserInput`
+    /// requests. Without it, only allow/deny permission requests are treated
+    /// as respondable wake targets.
+    #[serde(default)]
+    pub supports_answer: bool,
 }
 
 fn default_wait_time() -> u64 {
@@ -217,8 +220,8 @@ fn default_wait_time() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct MessageInput {
     pub agent_id: String,
-    pub message_id: String,
-    pub mode: String,
+    #[serde(default)]
+    pub message_id: Option<String>,
     pub content: String,
 }
 
@@ -252,7 +255,6 @@ impl ResponseDecision {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcResponse {
-    pub version: u16,
     pub request_id: Option<String>,
     #[serde(flatten)]
     pub outcome: RpcOutcome,
@@ -261,7 +263,6 @@ pub struct RpcResponse {
 impl RpcResponse {
     pub fn success(request_id: String, result: RpcSuccess) -> Self {
         Self {
-            version: RPC_VERSION,
             request_id: Some(request_id),
             outcome: RpcOutcome::Success {
                 result: Box::new(result),
@@ -271,7 +272,6 @@ impl RpcResponse {
 
     pub fn error(request_id: Option<String>, error: RpcError) -> Self {
         Self {
-            version: RPC_VERSION,
             request_id,
             outcome: RpcOutcome::Error { error },
         }
@@ -317,10 +317,7 @@ pub enum RpcSuccess {
     },
     TaskWait {
         task: TaskView,
-        revision: u64,
-        next_revision: u64,
         pending_requests: Vec<PendingRequestView>,
-        command_pending_approval: bool,
         result_available: bool,
         activity: TaskActivityView,
         latest_progress: Option<String>,
@@ -332,6 +329,7 @@ pub enum RpcSuccess {
     TaskResult {
         task: TaskView,
         result: Option<TaskResultView>,
+        question: Option<QuestionView>,
     },
     Message {
         message_id: String,
@@ -397,8 +395,9 @@ impl From<TaskSubmissionDisposition> for SubmissionDispositionView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemStatusView {
+    /// Diagnostic-only MCP tool surface version. Never used for admission.
+    pub mcp_version: String,
     pub api_surface: String,
-    pub protocol_version: u16,
     pub service_generation: String,
     pub components: BTreeMap<String, ComponentStateView>,
     pub capabilities: AgentCapabilitiesView,
@@ -717,7 +716,6 @@ pub struct TaskActivityView {
     pub latest_text_tail: String,
     pub latest_text_updated_at: Option<u64>,
     pub latest_text_truncated: bool,
-    pub latest_progress: Option<String>,
     pub active_tools: Vec<ActiveToolView>,
     pub window_60s: ActivityWindowView,
     pub telemetry_status: TelemetryStatusView,
@@ -739,12 +737,24 @@ fn default_result_limit() -> usize {
     MAX_RESULT_CHUNK_BYTES
 }
 
+/// Recoverable paged view of an answerable user-input question, using the
+/// same continuation contract as result pages. The wait projection embeds
+/// only the first bounded page; callers continue from next_offset through
+/// task_result with the pending request_id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionView {
+    pub text: String,
+    pub offset: usize,
+    pub total_bytes: usize,
+    pub next_offset: Option<usize>,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
     Malformed,
     Oversized,
-    UnsupportedVersion,
     UnknownMethod,
     Validation,
     AgentRequired,
@@ -859,6 +869,9 @@ pub struct PendingRequestView {
     pub tool_name: Option<String>,
     pub operation: String,
     pub summary: String,
+    /// First bounded page of the question for user_input requests; the
+    /// summary marker alone is not recoverable without it.
+    pub question: Option<QuestionView>,
     pub policy_preview: String,
 }
 
@@ -949,20 +962,10 @@ impl RpcService {
             .and_then(Value::as_str)
             .filter(|request_id| valid_request_id(request_id))
             .map(str::to_owned);
-        let version = value.get("version").and_then(Value::as_u64);
-        if version != Some(u64::from(RPC_VERSION)) {
-            return RpcResponse::error(
-                request_id,
-                RpcError::new(
-                    RpcErrorCode::UnsupportedVersion,
-                    "unsupported RPC protocol version",
-                ),
-            );
-        }
         if value.as_object().is_none_or(|object| {
             object
                 .keys()
-                .any(|key| !matches!(key.as_str(), "version" | "request_id" | "method" | "params"))
+                .any(|key| !matches!(key.as_str(), "request_id" | "method" | "params"))
         }) {
             return RpcResponse::error(
                 request_id,
@@ -1067,7 +1070,7 @@ impl RpcService {
                     activation_claim: claim,
                 })
             }
-            RpcMethod::AgentProbe { mut input } => {
+            RpcMethod::AgentProbe(mut input) => {
                 validate_agent_probe_input(&input)?;
                 let config = read_agent_config_snapshot()?;
                 if input.agent == "dsh" {
@@ -1088,7 +1091,7 @@ impl RpcService {
                     .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
                 Ok(RpcSuccess::AgentProbed { evidence, status })
             }
-            RpcMethod::AgentModels { mut input } => {
+            RpcMethod::AgentModels(mut input) => {
                 validate_agent_models_input(&input)?;
                 let config = read_agent_config_snapshot()?;
                 if input.agent == "dsh" {
@@ -1106,7 +1109,7 @@ impl RpcService {
                     catalog: self.agent_evidence.models(&input, config.revision),
                 })
             }
-            RpcMethod::SubmitGeneral { input } => {
+            RpcMethod::SubmitGeneral(input) => {
                 let config = read_agent_config_snapshot()?;
                 let admission = resolve_admission(&input, &config)?;
                 let manifest = input.manifest;
@@ -1194,30 +1197,24 @@ impl RpcService {
             }
             RpcMethod::TaskMessage(input) => {
                 let task = self.require_task(&input.agent_id)?;
-                validate_id(&input.message_id, "message_id")?;
+                if let Some(message_id) = input.message_id.as_deref() {
+                    validate_id(message_id, "message_id")?;
+                }
                 // The generic control plane only queues clarification. A
                 // terminal task may be resumed by the scheduler when the
                 // persisted ZCode session accepts a restore; other
                 // interrupt-and-continue paths remain private.
-                if input.mode != "queue" {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        "generic agent messages must use queue mode",
-                    ));
-                }
                 validate_text(&input.content, "content", 16 * 1024)?;
+                let message_id = input
+                    .message_id
+                    .unwrap_or_else(|| format!("subagent-message-{}", Uuid::new_v4()));
                 let disposition = self
                     .scheduler
-                    .queue_message(
-                        &task.agent_id,
-                        &input.message_id,
-                        &input.mode,
-                        &input.content,
-                    )
+                    .queue_message(&task.agent_id, &message_id, &input.content)
                     .map_err(map_scheduler)?;
                 let task = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Message {
-                    message_id: input.message_id,
+                    message_id,
                     disposition: disposition.into(),
                     task: task_view(task),
                 })
@@ -1227,6 +1224,17 @@ impl RpcService {
                 validate_id(&input.request_id, "request_id")?;
                 if let Some(content) = input.content.as_deref() {
                     validate_text(content, "response content", 16 * 1024)?;
+                }
+                if input.decision == ResponseDecision::Answer
+                    && input
+                        .content
+                        .as_deref()
+                        .is_none_or(|content| content.trim().is_empty())
+                {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "answer requires non-empty content",
+                    ));
                 }
                 let outcome = self
                     .scheduler
@@ -1255,6 +1263,7 @@ impl RpcService {
             }
             RpcMethod::TaskResult {
                 agent_id,
+                request_id,
                 offset,
                 limit,
             } => {
@@ -1267,6 +1276,41 @@ impl RpcService {
                         ),
                     ));
                 }
+                // The recoverable continuation for question summaries: the
+                // same paging contract as result text, keyed by the pending
+                // request the caller already holds.
+                if let Some(request_id) = request_id.as_deref() {
+                    validate_id(request_id, "request_id")?;
+                    let request = self
+                        .store
+                        .pending_request(&task.agent_id, request_id)
+                        .map_err(map_store)?
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                RpcErrorCode::NotFound,
+                                "pending request was not found",
+                            )
+                        })?;
+                    let question = recoverable_user_input_question(&request).ok_or_else(|| {
+                        RpcError::new(
+                            RpcErrorCode::Validation,
+                            "request does not expose recoverable question content",
+                        )
+                    })?;
+                    let (end, next_offset) =
+                        paged_text_bounds(&question, offset, limit, "question")?;
+                    return Ok(RpcSuccess::TaskResult {
+                        task: task_view(task),
+                        result: None,
+                        question: Some(QuestionView {
+                            text: question[offset..end].to_owned(),
+                            offset,
+                            total_bytes: question.len(),
+                            next_offset,
+                            complete: next_offset.is_none(),
+                        }),
+                    });
+                }
                 let result = self
                     .store
                     .task_result(&task.agent_id)
@@ -1276,6 +1320,7 @@ impl RpcService {
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(task),
                     result,
+                    question: None,
                 })
             }
             RpcMethod::TaskClose { agent_id } => {
@@ -1331,8 +1376,8 @@ impl RpcService {
         components.insert("runtime".into(), ComponentStateView::Unknown);
         components.insert("model_auth".into(), ComponentStateView::Unknown);
         SystemStatusView {
+            mcp_version: MCP_VERSION.into(),
             api_surface: "generic_agent".into(),
-            protocol_version: RPC_VERSION,
             service_generation: self.service_generation.clone(),
             components,
             capabilities: agent_capabilities(self.scheduler.runtime_source_verified()),
@@ -1413,46 +1458,67 @@ impl RpcService {
             } else {
                 None
             };
-            let pending_requests = self
+            // The wake decision scans the real pending owner so a respondable
+            // request beyond the 100-record output projection still wakes this
+            // wait; only ordinary progress, message receipts, and requests the
+            // caller cannot respond to keep it blocked.
+            let all_pending = self
                 .store
-                .pending_requests_bounded(&task.agent_id, MAX_PENDING_REQUESTS)
-                .map_err(map_store)?
-                .into_iter()
-                .map(pending_request_view)
+                .pending_requests(&task.agent_id)
+                .map_err(map_store)?;
+            let wake_request = all_pending
+                .iter()
+                .find(|request| wake_pending_request(request, query.supports_answer))
+                .cloned();
+            // The bounded projection always contains the request that woke
+            // this wait: when the wake target sits beyond the cap it replaces
+            // the last projected slot, so the caller can respond using the
+            // returned request_id without a second lookup.
+            let mut pending_requests = all_pending
+                .iter()
+                .take(MAX_PENDING_REQUESTS)
+                .cloned()
+                .map(|request| pending_request_view(request, query.supports_answer))
                 .collect::<Vec<_>>();
-            let command_pending_approval = pending_requests.iter().any(respondable_pending_request);
+            if let Some(wake) = wake_request.as_ref() {
+                if pending_requests
+                    .iter()
+                    .all(|view| view.request_id != wake.request_id)
+                {
+                    pending_requests.truncate(MAX_PENDING_REQUESTS - 1);
+                    pending_requests
+                        .push(pending_request_view(wake.clone(), query.supports_answer));
+                }
+            }
+            let wake_respondable = wake_request.is_some();
             let stored_result = self.store.task_result(&task.agent_id).map_err(map_store)?;
             let result_available = stored_result.is_some();
             let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
-            let revision = activity
-                .as_ref()
-                .map(|activity| activity.revision)
-                .unwrap_or(0)
-                .max(task.last_event_seq);
             let terminal = task.phase == TaskPhase::Terminal;
             let now = Instant::now();
-            if command_pending_approval || terminal || now >= deadline {
-                let timed_out = !command_pending_approval && !terminal && now >= deadline;
+            if wake_respondable || terminal || now >= deadline {
+                let timed_out = !wake_respondable && !terminal && now >= deadline;
+                let result_page = stored_result
+                    .filter(|_| terminal)
+                    .map(|stored| self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES))
+                    .transpose()?;
+                let instruction = wait_instruction(
+                    terminal,
+                    result_page.as_ref(),
+                    wake_request.as_ref(),
+                    query.supports_answer,
+                );
                 let mut response = RpcSuccess::TaskWait {
                     activity: task_activity_view(task.phase, activity),
                     task: task_view(task.clone()),
-                    revision,
-                    next_revision: revision,
                     pending_requests,
-                    command_pending_approval,
                     result_available,
                     latest_progress: self
                         .scheduler
                         .passive_activity_snapshot(&task.agent_id)
                         .and_then(|a| a.latest_progress),
-                    result: stored_result.filter(|_| terminal).map(Into::into),
-                    instruction: if result_available {
-                        Some("Result now available".to_owned())
-                    } else if !terminal {
-                        Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop".to_owned())
-                    } else {
-                        None
-                    },
+                    result: result_page,
+                    instruction,
                     timed_out,
                     message_receipt,
                 };
@@ -1462,6 +1528,59 @@ impl RpcService {
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
     }
+}
+
+/// Instructions are advisory text for models that forget skill guidance
+/// during long runs; they name the action the current state allows.
+fn wait_instruction(
+    terminal: bool,
+    result_page: Option<&TaskResultView>,
+    wake_request: Option<&external_store::StoredPendingRequest>,
+    supports_answer: bool,
+) -> Option<String> {
+    if terminal {
+        return match result_page {
+            Some(result) if result.complete => Some(
+                "This is the final result. There is no need to call external_subagent_result again."
+                    .to_owned(),
+            ),
+            Some(result) => Some(format!(
+                "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
+                result.next_offset.unwrap_or(result.offset)
+            )),
+            None => Some(
+                "The task is finished; use external_subagent_result to read the stored result."
+                    .to_owned(),
+            ),
+        };
+    }
+    match wake_request.map(|request| request.request_type.as_str()) {
+        Some("user_input") if supports_answer => Some(
+            "The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content."
+                .to_owned(),
+        ),
+        Some(_) => Some(
+            "A permission request is pending; respond now with external_subagent_respond using decision allow or deny."
+                .to_owned(),
+        ),
+        None => Some(
+            "Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop"
+                .to_owned(),
+        ),
+    }
+}
+
+/// A pending request wakes (and is respondable for this caller) only when its
+/// state is pending and the caller can actually respond to it: permission
+/// requests need allow/deny, user-input requests need the declared answer
+/// capability.
+fn wake_pending_request(request: &external_store::StoredPendingRequest, supports_answer: bool) -> bool {
+    request.state == PendingRequestState::Pending
+        && match request.request_type.as_str() {
+            "permission" => true,
+            "user_input" => supports_answer,
+            _ => false,
+        }
 }
 
 fn configured_agent_statuses(
@@ -1923,8 +2042,73 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
     Ok(())
 }
 
-fn respondable_pending_request(request: &PendingRequestView) -> bool {
-    request.state == PendingRequestStateView::Pending && request.respondable
+/// Bounded question exposure for answerable user-input requests. The byte cap
+/// keeps even a worst-case 100-request wait projection inside the response
+/// frame cap — the summary prefix and the question first page each carry at
+/// most these bytes — and the marker keeps the cut observable: the caller
+/// sees how many question chars were omitted instead of a silently
+/// shortened question. The cut is recoverable: the projection's question
+/// page continues from next_offset through task_result with the request_id.
+const MAX_QUESTION_SUMMARY_BYTES: usize = 2048;
+
+fn user_input_question(payload_json: &str) -> Option<String> {
+    serde_json::from_str::<Value>(payload_json)
+        .ok()
+        .and_then(|params| {
+            params
+                .get("question")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Only answerable user_input requests expose a recoverable question;
+/// permission and unsupported requests have no question payload to page.
+fn recoverable_user_input_question(
+    request: &external_store::StoredPendingRequest,
+) -> Option<String> {
+    (request.request_type == "user_input")
+        .then(|| user_input_question(&request.payload_json))
+        .flatten()
+}
+
+fn sanitized_user_input_summary(payload_json: &str) -> String {
+    user_input_question(payload_json)
+        .map(|question| {
+            let total = question.chars().count();
+            let prefix = truncate_at_char_boundary(&question, MAX_QUESTION_SUMMARY_BYTES);
+            let shown = prefix.chars().count();
+            if shown < total {
+                format!("question {prefix} [+{} more chars]", total - shown)
+            } else {
+                format!("question {question}")
+            }
+        })
+        .unwrap_or_else(|| "user input request".into())
+}
+
+fn user_input_question_page(payload_json: &str) -> Option<QuestionView> {
+    let question = user_input_question(payload_json)?;
+    let (end, next_offset) =
+        paged_text_bounds(&question, 0, MAX_QUESTION_SUMMARY_BYTES, "question").ok()?;
+    Some(QuestionView {
+        text: question[..end].to_owned(),
+        offset: 0,
+        total_bytes: question.len(),
+        next_offset,
+        complete: next_offset.is_none(),
+    })
+}
+
+fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 // Measure the complete envelope with the largest valid request ID. Large result
@@ -1974,8 +2158,7 @@ pub(crate) mod wait_tests {
         let (_dir, service, id) = fixture();
         let msg = MessageInput {
             agent_id: id.clone(),
-            message_id: "drain-msg".into(),
-            mode: "queue".into(),
+            message_id: Some("drain-msg".into()),
             content: "x".into(),
         };
         service
@@ -1988,7 +2171,7 @@ pub(crate) mod wait_tests {
             .unwrap();
         let err = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
-                message_id: "new-msg".into(),
+                message_id: Some("new-msg".into()),
                 ..msg.clone()
             }))
             .unwrap_err();
@@ -2001,8 +2184,7 @@ pub(crate) mod wait_tests {
         let (directory, service, id) = fixture();
         let original = MessageInput {
             agent_id: id.clone(),
-            message_id: "before-abort".into(),
-            mode: "queue".into(),
+            message_id: Some("before-abort".into()),
             content: "delivered before the drain".into(),
         };
         service
@@ -2015,7 +2197,7 @@ pub(crate) mod wait_tests {
             .unwrap();
         let rejected = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
-                message_id: "during-drain".into(),
+                message_id: Some("during-drain".into()),
                 ..original.clone()
             }))
             .unwrap_err();
@@ -2041,7 +2223,7 @@ pub(crate) mod wait_tests {
         // its idempotent fact.
         service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
-                message_id: "during-drain".into(),
+                message_id: Some("during-drain".into()),
                 ..original.clone()
             }))
             .unwrap();
@@ -2096,8 +2278,7 @@ pub(crate) mod wait_tests {
         let message = std::thread::spawn(move || {
             message_service.dispatch(RpcMethod::TaskMessage(MessageInput {
                 agent_id: first_id,
-                message_id: "before-drain".into(),
-                mode: "queue".into(),
+                message_id: Some("before-drain".into()),
                 content: "accepted before the drain linearization point".into(),
             }))
         });
@@ -2118,8 +2299,7 @@ pub(crate) mod wait_tests {
         let error = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
                 agent_id: id,
-                message_id: "after-drain".into(),
-                mode: "queue".into(),
+                message_id: Some("after-drain".into()),
                 content: "must be rejected".into(),
             }))
             .unwrap_err();
@@ -2184,17 +2364,13 @@ pub(crate) mod wait_tests {
             })
             .unwrap();
         let methods = [
-            RpcMethod::TaskWait(TaskWaitQuery {
-                agent_id: id.clone(),
-                after_revision: 0,
-                wait_time: 0,
-                message_id: None,
-            }),
+            RpcMethod::TaskWait(query(&id, 0)),
             RpcMethod::TaskCancel {
                 agent_id: id.clone(),
             },
             RpcMethod::TaskResult {
                 agent_id: id.clone(),
+                request_id: None,
                 offset: 0,
                 limit: 10,
             },
@@ -2250,9 +2426,16 @@ pub(crate) mod wait_tests {
     pub(crate) fn query(id: &str, wait_time: u64) -> TaskWaitQuery {
         TaskWaitQuery {
             agent_id: id.into(),
-            after_revision: 0,
             wait_time,
             message_id: None,
+            supports_answer: false,
+        }
+    }
+
+    pub(crate) fn answer_query(id: &str, wait_time: u64) -> TaskWaitQuery {
+        TaskWaitQuery {
+            supports_answer: true,
+            ..query(id, wait_time)
         }
     }
 
@@ -2262,11 +2445,12 @@ pub(crate) mod wait_tests {
         let parsed: TaskWaitQuery =
             serde_json::from_value(serde_json::json!({"agent_id":id})).unwrap();
         assert_eq!(parsed.wait_time, 290);
+        assert!(!parsed.supports_answer);
         assert_eq!(agent_capabilities(false).max_wait_ms, 299000);
         for value in [-1, 300] {
             let response = service.handle_bytes(
                 &serde_json::to_vec(&serde_json::json!({
-                    "version":RPC_VERSION,"request_id":"limits","method":"task_wait",
+                    "request_id":"limits","method":"task_wait",
                     "params":{"agent_id":id,"wait_time":value}
                 }))
                 .unwrap(),
@@ -2280,6 +2464,27 @@ pub(crate) mod wait_tests {
                     }
                 }
             ));
+        }
+        // The removed custom envelope version is rejected as an unknown field.
+        for obsolete in [
+            serde_json::json!({"request_id":"obsolete","method":"task_wait",
+                "params":{"agent_id":id},"version":13}),
+            serde_json::json!({"request_id":"obsolete","method":"task_wait",
+                "params":{"agent_id":id,"after_revision":0}}),
+        ] {
+            let response = service.handle_bytes(&serde_json::to_vec(&obsolete).unwrap());
+            assert!(
+                matches!(
+                    response.outcome,
+                    RpcOutcome::Error {
+                        error: RpcError {
+                            code: RpcErrorCode::Validation,
+                            ..
+                        }
+                    }
+                ),
+                "obsolete frame was accepted: {obsolete}"
+            );
         }
         assert!(!RpcMethod::is_known("task_poll"));
         let before = service.store.get_task(&id).unwrap();
@@ -2316,6 +2521,7 @@ pub(crate) mod wait_tests {
             timed_out: false,
             instruction,
             result_available,
+            result: Some(result),
             ..
         } = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
@@ -2324,11 +2530,15 @@ pub(crate) mod wait_tests {
             panic!("expected terminal wait response")
         };
         assert!(result_available);
-        assert_eq!(instruction.as_deref(), Some("Result now available"));
+        assert!(result.complete);
+        assert_eq!(
+            instruction.as_deref(),
+            Some("This is the final result. There is no need to call external_subagent_result again.")
+        );
     }
 
     #[test]
-    fn wait_ignores_revision_message_and_ordinary_activity() {
+    fn wait_ignores_message_receipt_and_ordinary_activity() {
         let (_, service, id) = fixture();
         service
             .store
@@ -2361,7 +2571,6 @@ pub(crate) mod wait_tests {
         assert!(start.elapsed() >= Duration::from_millis(80));
         let RpcSuccess::TaskWait {
             timed_out: true,
-            revision: 900,
             activity,
             instruction,
             message_receipt: Some(_),
@@ -2379,70 +2588,45 @@ pub(crate) mod wait_tests {
         assert_eq!(before, service.store.get_task(&id).unwrap());
     }
 
+    fn stored_pending(
+        request_type: &str,
+        state: PendingRequestState,
+    ) -> external_store::StoredPendingRequest {
+        external_store::StoredPendingRequest {
+            request_id: "r".into(),
+            agent_id: "a".into(),
+            correlation_id: "1".into(),
+            request_type: request_type.into(),
+            payload_json: r#"{"toolName":"Read"}"#.into(),
+            state,
+            response_decision: None,
+            response_content: None,
+            created_at: 0,
+        }
+    }
+
     #[test]
-    fn wait_respondable_pending_predicate_ignores_tool_kind_and_state() {
-        for (kind, tool, state, respondable, wakes) in [
-            (
-                "permission",
-                "bAsH",
-                PendingRequestStateView::Pending,
-                true,
-                true,
-            ),
-            (
-                "permission",
-                "Read",
-                PendingRequestStateView::Pending,
-                true,
-                true,
-            ),
-            (
-                "permission",
-                "Other",
-                PendingRequestStateView::Pending,
-                true,
-                true,
-            ),
+    fn wait_wake_predicate_matches_request_type_state_and_answer_capability() {
+        for (request_type, state, supports_answer, wakes) in [
+            ("permission", PendingRequestState::Pending, false, true),
+            ("permission", PendingRequestState::Pending, true, true),
+            ("user_input", PendingRequestState::Pending, false, false),
+            ("user_input", PendingRequestState::Pending, true, true),
             (
                 "unsupported_input",
-                "Read",
-                PendingRequestStateView::Pending,
-                true,
-                true,
-            ),
-            (
-                "permission",
-                "Bash",
-                PendingRequestStateView::Pending,
-                false,
-                false,
-            ),
-            (
-                "permission",
-                "Bash",
-                PendingRequestStateView::Sending,
+                PendingRequestState::Pending,
                 true,
                 false,
             ),
-            (
-                "permission",
-                "Bash",
-                PendingRequestStateView::Responded,
-                true,
-                false,
-            ),
+            ("permission", PendingRequestState::Sending, true, false),
+            ("permission", PendingRequestState::Responded, true, false),
+            ("user_input", PendingRequestState::Responded, true, false),
         ] {
-            let request = PendingRequestView {
-                request_id: "r".into(),
-                kind: kind.into(),
-                state,
-                respondable,
-                tool_name: Some(tool.into()),
-                operation: "command".into(),
-                summary: "fixture".into(),
-                policy_preview: "unknown".into(),
-            };
-            assert_eq!(respondable_pending_request(&request), wakes);
+            assert_eq!(
+                wake_pending_request(&stored_pending(request_type, state), supports_answer),
+                wakes,
+                "{request_type}/{state:?}/supports_answer={supports_answer}"
+            );
         }
     }
 
@@ -2460,9 +2644,9 @@ pub(crate) mod wait_tests {
             )
             .unwrap();
         let RpcSuccess::TaskWait {
-            command_pending_approval,
             pending_requests,
             timed_out,
+            instruction,
             ..
         } = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
@@ -2470,15 +2654,329 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected wait response")
         };
-        assert!(command_pending_approval);
         assert!(!timed_out);
         assert_eq!(pending_requests.len(), 1);
         assert_eq!(pending_requests[0].tool_name.as_deref(), Some("Read"));
         assert!(pending_requests[0].respondable);
+        assert_eq!(
+            instruction.as_deref(),
+            Some("A permission request is pending; respond now with external_subagent_respond using decision allow or deny.")
+        );
     }
 
     #[test]
-    fn wait_projection_cap_does_not_promote_the_101st_request() {
+    fn wait_wakes_only_declared_answerable_requests() {
+        let (_, service, id) = fixture();
+        service
+            .store
+            .insert_pending_request(
+                "request",
+                &id,
+                "correlation",
+                "user_input",
+                r#"{"question":"which branch?"}"#,
+            )
+            .unwrap();
+        // Without the answer capability the request is neither a wake target
+        // nor projected as respondable for this caller.
+        let start = Instant::now();
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            ..
+        } = service
+            .task_wait(query(&id, 0), start + Duration::from_millis(30), &|| false)
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(timed_out);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].kind, "user_input");
+        assert!(!pending_requests[0].respondable);
+        // Declaring the capability wakes immediately and projects the request
+        // as respondable with answer guidance.
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            instruction,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(!timed_out);
+        assert!(pending_requests[0].respondable);
+        assert_eq!(pending_requests[0].summary, "question which branch?");
+        assert_eq!(
+            instruction.as_deref(),
+            Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
+        );
+    }
+
+    #[test]
+    fn wait_never_wakes_for_unsupported_input_even_with_answer_capability() {
+        let (_, service, id) = fixture();
+        service
+            .store
+            .insert_pending_request(
+                "request",
+                &id,
+                "correlation",
+                "unsupported_input",
+                r#"{"origin":"dsh_acp","reason":"dsh server request is not a supported interaction"}"#,
+            )
+            .unwrap();
+        // The unsupported sentinel is not answerable for any caller: even a
+        // declared answer capability neither wakes the wait nor projects the
+        // record as respondable.
+        let start = Instant::now();
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            instruction,
+            ..
+        } = service
+            .task_wait(
+                answer_query(&id, 0),
+                start + Duration::from_millis(30),
+                &|| false,
+            )
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        assert!(timed_out);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].kind, "unsupported_input");
+        assert!(!pending_requests[0].respondable);
+        assert_eq!(
+            instruction.as_deref(),
+            Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
+        );
+    }
+
+    #[test]
+    fn long_answer_questions_expose_bounded_content_with_an_observable_cut() {
+        let (_, service, id) = fixture();
+        let question = "q".repeat(5000);
+        service
+            .store
+            .insert_pending_request(
+                "request",
+                &id,
+                "correlation",
+                "user_input",
+                &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            pending_requests, ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        let summary = &pending_requests[0].summary;
+        // The exposed prefix is bounded by bytes, the cut states exactly how
+        // many question chars were omitted, and the full marker resolves.
+        assert_eq!(
+            summary,
+            &format!(
+                "question {} [+{} more chars]",
+                "q".repeat(2048),
+                5000 - 2048
+            )
+        );
+        // A multibyte question cuts on a character boundary inside the cap.
+        let wide = "語".repeat(1024);
+        service
+            .store
+            .insert_pending_request(
+                "wide",
+                &id,
+                "correlation-wide",
+                "user_input",
+                &serde_json::to_string(&serde_json::json!({ "question": wide })).unwrap(),
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            pending_requests, ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        let wide_summary = &pending_requests
+            .iter()
+            .find(|request| request.request_id == "wide")
+            .expect("wide request in projection")
+            .summary;
+        // 2048 bytes holds 682 three-byte chars (2 bytes remain, below the
+        // next boundary), so 342 chars are omitted.
+        assert_eq!(
+            wide_summary.as_str(),
+            format!("question {} [+{} more chars]", "語".repeat(682), 342)
+        );
+    }
+
+    #[test]
+    fn question_content_beyond_the_summary_cut_is_recoverable_through_result_paging() {
+        let (_, service, id) = fixture();
+        // The decisive option sits entirely beyond the former 2048-byte cut.
+        let option = "Deploy to which environment? options: [production, staging]";
+        let question = format!("{}{}", "x".repeat(2500), option);
+        service
+            .store
+            .insert_pending_request(
+                "request",
+                &id,
+                "correlation",
+                "user_input",
+                &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            pending_requests, ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+        .unwrap()
+        else {
+            panic!("expected wait response")
+        };
+        let view = &pending_requests[0];
+        // The bounded marker stays observable exactly as before ...
+        assert_eq!(
+            view.summary,
+            format!(
+                "question {} [+{} more chars]",
+                "x".repeat(2048),
+                question.chars().count() - 2048
+            )
+        );
+        // ... and the same projection now carries a recoverable first page
+        // that stops at the cut instead of losing it.
+        let page = view.question.as_ref().expect("question first page");
+        assert_eq!(page.text, "x".repeat(2048));
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.total_bytes, question.len());
+        assert_eq!(page.next_offset, Some(2048));
+        assert!(!page.complete);
+        assert!(!page.text.contains("production"));
+        // The continuation retrieves the content beyond the cut through the
+        // existing result paging contract, keyed by the pending request_id.
+        let RpcSuccess::TaskResult {
+            result,
+            question: fetched,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id.clone(),
+                request_id: Some("request".into()),
+                offset: page.next_offset.unwrap(),
+                limit: MAX_RESULT_CHUNK_BYTES,
+            })
+            .unwrap()
+        else {
+            panic!("expected result response")
+        };
+        assert!(result.is_none());
+        let fetched = fetched.expect("retrieved question page");
+        assert_eq!(fetched.offset, 2048);
+        assert_eq!(fetched.total_bytes, question.len());
+        assert_eq!(fetched.next_offset, None);
+        assert!(fetched.complete);
+        assert!(fetched.text.contains(option));
+        assert!(!page.text.contains(option));
+        // Reassembling both pages reproduces the stored question exactly.
+        assert_eq!(format!("{}{}", page.text, fetched.text), question);
+    }
+
+    #[test]
+    fn worst_case_wait_projection_with_question_pages_fits_the_frame() {
+        let (_, service, id) = fixture();
+        let question = format!("{}{}", "q".repeat(3000), "tail");
+        for index in 0..MAX_PENDING_REQUESTS {
+            service
+                .store
+                .insert_pending_request(
+                    &format!("request-{index}"),
+                    &id,
+                    &format!("correlation-{index}"),
+                    "user_input",
+                    &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
+                )
+                .unwrap();
+        }
+        let response = service
+            .dispatch(RpcMethod::TaskWait(answer_query(&id, 0)))
+            .unwrap();
+        let envelope = RpcResponse::success("\u{1}".repeat(128), response);
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len() + 1 <= MAX_RESPONSE_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn question_paging_is_request_scoped_and_rejects_unknown_fields() {
+        let (_, service, id) = fixture();
+        service
+            .store
+            .insert_pending_request(
+                "permission-request",
+                &id,
+                "correlation-permission",
+                "permission",
+                r#"{"toolName":"Read"}"#,
+            )
+            .unwrap();
+        // A permission request has no recoverable question to page.
+        let error = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id.clone(),
+                request_id: Some("permission-request".into()),
+                offset: 0,
+                limit: 1024,
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, RpcErrorCode::Validation));
+        // Unknown request ids are reported as missing, scoped to this task.
+        let error = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id.clone(),
+                request_id: Some("missing".into()),
+                offset: 0,
+                limit: 1024,
+            })
+            .unwrap_err();
+        assert!(matches!(error.code, RpcErrorCode::NotFound));
+        // The wire decoder still rejects unknown params on the extended
+        // method, preserving the unknown-field contract.
+        let response = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "request_id":"wire",
+                "method":"task_result",
+                "params":{"agent_id":id,"request_id":"missing","bogus":true}
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            response.outcome,
+            RpcOutcome::Error {
+                error: RpcError {
+                    code: RpcErrorCode::Validation,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn wait_wakes_for_the_101st_respondable_request_beyond_the_projection_cap() {
         let (_, service, id) = fixture();
         for index in 0..=MAX_PENDING_REQUESTS {
             let (request_type, payload) = if index < MAX_PENDING_REQUESTS {
@@ -2502,7 +3000,6 @@ pub(crate) mod wait_tests {
             .task_wait(query(&id, 1), start + Duration::from_millis(60), &|| false)
             .unwrap();
         let RpcSuccess::TaskWait {
-            command_pending_approval,
             pending_requests,
             timed_out,
             ..
@@ -2510,11 +3007,59 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected wait response")
         };
+        // The output projection stays capped at 100, the wake decision scans
+        // the real pending owner, and the request that woke the wait is part
+        // of the returned projection so its id can be used to respond.
+        assert!(!timed_out);
+        assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(pending_requests.len(), MAX_PENDING_REQUESTS);
-        assert!(pending_requests
+        assert_eq!(pending_requests[0].request_id, "request-0");
+        assert!(!pending_requests[0].respondable);
+        let wake = pending_requests.last().unwrap();
+        assert_eq!(wake.request_id, "request-100");
+        assert_eq!(wake.kind, "permission");
+        assert!(wake.respondable);
+        // The returned id addresses the real 101st store row, not a
+        // projection-only copy.
+        assert_eq!(
+            service
+                .store
+                .pending_request(&id, &wake.request_id)
+                .unwrap()
+                .expect("wake request row")
+                .request_type,
+            "permission"
+        );
+        assert!(pending_requests[..MAX_PENDING_REQUESTS - 1]
             .iter()
-            .all(|request| !respondable_pending_request(request)));
-        assert!(!command_pending_approval);
+            .all(|request| !request.respondable));
+        // The same 101st request, answerable-only, still needs the declared
+        // capability before it can wake this wait.
+        let (_, service, id) = fixture();
+        for index in 0..=MAX_PENDING_REQUESTS {
+            let (request_type, payload) = if index < MAX_PENDING_REQUESTS {
+                ("unsupported_input", r#"{}"#)
+            } else {
+                ("user_input", r#"{"question":"continue?"}"#)
+            };
+            service
+                .store
+                .insert_pending_request(
+                    &format!("request-{index}"),
+                    &id,
+                    &format!("correlation-{index}"),
+                    request_type,
+                    payload,
+                )
+                .unwrap();
+        }
+        let start = Instant::now();
+        let RpcSuccess::TaskWait { timed_out, .. } = service
+            .task_wait(query(&id, 1), start + Duration::from_millis(60), &|| false)
+            .unwrap()
+        else {
+            panic!("expected wait response")
+        };
         assert!(timed_out);
         assert!(start.elapsed() >= Duration::from_millis(40));
     }
@@ -2537,7 +3082,6 @@ pub(crate) mod wait_tests {
                 .dispatch(RpcMethod::TaskWait(query(&id, 299)))
                 .unwrap(),
             RpcSuccess::TaskWait {
-                command_pending_approval: true,
                 timed_out: false,
                 ..
             }
@@ -2555,7 +3099,6 @@ pub(crate) mod wait_tests {
                 )
                 .unwrap(),
             RpcSuccess::TaskWait {
-                command_pending_approval: false,
                 timed_out: true,
                 ..
             }
@@ -2564,11 +3107,11 @@ pub(crate) mod wait_tests {
 
     #[test]
     fn wait_terminal_results_preserve_outcomes_and_page_large_text() {
-        for (outcome, text, complete) in [
+        for (outcome, text, fits_page) in [
             (
                 TaskOutcome::Completed,
                 "x".repeat(MAX_RESULT_CHUNK_BYTES + 10),
-                true,
+                false,
             ),
             (TaskOutcome::Failed, "failure".into(), true),
             (TaskOutcome::Cancelled, "cancelled".into(), true),
@@ -2596,6 +3139,7 @@ pub(crate) mod wait_tests {
             let RpcSuccess::TaskWait {
                 result: Some(result),
                 timed_out: false,
+                instruction,
                 ..
             } = &response
             else {
@@ -2603,14 +3147,31 @@ pub(crate) mod wait_tests {
             };
             assert_eq!(result.outcome, outcome);
             assert_eq!(result.total_bytes, text.len());
-            assert_eq!(result.complete, complete);
+            // Wait inlines the same bounded first page as external_subagent_result.
+            assert_eq!(result.offset, 0);
+            assert_eq!(result.complete, fits_page);
             assert_eq!(
                 result.next_offset,
-                (!complete).then_some(MAX_RESULT_CHUNK_BYTES)
+                (!fits_page).then_some(MAX_RESULT_CHUNK_BYTES)
             );
             assert_eq!(result.final_text, text[..result.final_text.len()]);
+            let instruction = instruction.as_deref().expect("terminal instruction");
+            if fits_page {
+                assert_eq!(
+                    instruction,
+                    "This is the final result. There is no need to call external_subagent_result again."
+                );
+            } else {
+                assert_eq!(
+                    instruction,
+                    &format!(
+                        "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
+                        MAX_RESULT_CHUNK_BYTES
+                    )
+                );
+            }
             assert!(
-                serde_json::to_vec(&RpcResponse::success("q".repeat(128), response))
+                serde_json::to_vec(&RpcResponse::success("q".repeat(128), response.clone()))
                     .unwrap()
                     .len()
                     + 1
@@ -2635,7 +3196,6 @@ pub(crate) mod wait_tests {
         let before = service.store.get_task(&id).unwrap();
         let response = service.handle_bytes_interruptible(
             &serde_json::to_vec(&RpcRequest {
-                version: RPC_VERSION,
                 request_id: "interrupt".into(),
                 method: RpcMethod::TaskWait(query(&id, 299)),
             })
@@ -2652,8 +3212,7 @@ pub(crate) mod wait_tests {
         let response = service
             .dispatch(RpcMethod::TaskMessage(MessageInput {
                 agent_id: id.clone(),
-                message_id: "assembled-message".into(),
-                mode: "queue".into(),
+                message_id: Some("assembled-message".into()),
                 content: "continue with the requested work".into(),
             }))
             .unwrap();
@@ -2669,6 +3228,64 @@ pub(crate) mod wait_tests {
         assert_eq!(receipt.message_id, "assembled-message");
         assert_eq!(receipt.mode, "queue");
         assert_eq!(receipt.content, "continue with the requested work");
+    }
+
+    #[test]
+    fn daemon_generates_missing_message_ids_and_returns_them() {
+        let (_directory, service, id) = fixture();
+        let generated = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: None,
+                content: "continue without an explicit id".into(),
+            }))
+            .unwrap();
+        let RpcSuccess::Message {
+            message_id,
+            disposition,
+            ..
+        } = generated
+        else {
+            panic!("expected message response")
+        };
+        assert_eq!(disposition, MessageDispositionView::Queued);
+        assert!(
+            message_id.starts_with("subagent-message-"),
+            "generated id must use the daemon prefix: {message_id}"
+        );
+        assert!(service.store.message(&message_id).unwrap().is_some());
+        // An explicit id keeps its idempotency semantics; a different content
+        // under the same id is still a conflict.
+        let repeated = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: Some(message_id.clone()),
+                content: "continue without an explicit id".into(),
+            }))
+            .unwrap();
+        let RpcSuccess::Message {
+            message_id: echoed,
+            ..
+        } = repeated
+        else {
+            panic!("expected message response")
+        };
+        assert_eq!(echoed, message_id);
+        assert!(matches!(
+            service.dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: Some("explicit-conflict".into()),
+                content: "first".into(),
+            })),
+            Ok(_)
+        ));
+        assert!(service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id,
+                message_id: Some("explicit-conflict".into()),
+                content: "different".into(),
+            }))
+            .is_err());
     }
 
     #[test]
@@ -2688,8 +3305,7 @@ pub(crate) mod wait_tests {
         let before = service.store.task_result(&id).unwrap().unwrap();
         let response = service.dispatch(RpcMethod::TaskMessage(MessageInput {
             agent_id: id.clone(),
-            message_id: "terminal-message".into(),
-            mode: "queue".into(),
+            message_id: Some("terminal-message".into()),
             content: "must not resume".into(),
         }));
         assert!(matches!(
@@ -2732,7 +3348,6 @@ pub(crate) mod wait_tests {
         .unwrap();
         let before = service.store.get_task(&id).unwrap();
         let request = RpcRequest {
-            version: RPC_VERSION,
             request_id: "wait".into(),
             method: RpcMethod::TaskWait(query(&id, 299)),
         };
@@ -2748,7 +3363,6 @@ pub(crate) mod wait_tests {
         loop {
             let response = client
                 .call(&RpcRequest {
-                    version: RPC_VERSION,
                     request_id: "status".into(),
                     method: RpcMethod::SystemStatus,
                 })
@@ -2784,11 +3398,20 @@ fn result_page_bounds(
     offset: usize,
     limit: usize,
 ) -> Result<(usize, Option<usize>), RpcError> {
+    paged_text_bounds(text, offset, limit, "result")
+}
+
+fn paged_text_bounds(
+    text: &str,
+    offset: usize,
+    limit: usize,
+    field: &str,
+) -> Result<(usize, Option<usize>), RpcError> {
     let total_bytes = text.len();
     if offset > total_bytes || !text.is_char_boundary(offset) {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
-            "result offset is outside the result",
+            format!("{field} offset is outside the {field}"),
         ));
     }
     let mut end = offset.saturating_add(limit).min(total_bytes);
@@ -2798,7 +3421,7 @@ fn result_page_bounds(
     if end == offset && offset < total_bytes {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
-            "result limit does not include a complete UTF-8 character",
+            format!("{field} limit does not include a complete UTF-8 character"),
         ));
     }
     let next_offset = (end < total_bytes).then_some(end);
@@ -2915,7 +3538,6 @@ fn task_activity_view(
             latest_text_tail: String::new(),
             latest_text_updated_at: None,
             latest_text_truncated: false,
-            latest_progress: None,
             active_tools: Vec::new(),
             window_60s: ActivityWindowView::default(),
             telemetry_status: TelemetryStatusView::Unavailable,
@@ -2935,7 +3557,6 @@ fn task_activity_view(
         latest_text_tail: snapshot.latest_text_tail,
         latest_text_updated_at: snapshot.latest_text_updated_at,
         latest_text_truncated: snapshot.latest_text_truncated,
-        latest_progress: snapshot.latest_progress,
         active_tools: snapshot
             .active_tools
             .into_iter()
@@ -2997,9 +3618,13 @@ mod activity_projection_tests {
         assert_eq!(activity.last_activity_age_ms, Some(250));
         assert_eq!(activity.model_last_delta_age_ms, Some(300));
         assert_eq!(activity.latest_text_tail, "preserved tail");
+        // The duplicated activity.latest_progress projection is gone; wait
+        // exposes progress only through its top-level latest_progress field.
         assert_eq!(
-            activity.latest_progress.as_deref(),
-            Some("preserved progress")
+            serde_json::to_value(&activity)
+                .unwrap()
+                .get("latest_progress"),
+            None
         );
         assert_eq!(activity.window_60s.reasoning_delta_events, 2);
     }
@@ -3071,12 +3696,30 @@ impl From<StoredTaskResult> for TaskResultView {
     }
 }
 
-fn pending_request_view(request: StoredPendingRequest) -> PendingRequestView {
+fn pending_request_view(
+    request: StoredPendingRequest,
+    supports_answer: bool,
+) -> PendingRequestView {
     let state = match request.state {
         PendingRequestState::Pending => PendingRequestStateView::Pending,
         PendingRequestState::Sending => PendingRequestStateView::Sending,
         PendingRequestState::Responded => PendingRequestStateView::Responded,
     };
+    if request.request_type == "user_input" {
+        return PendingRequestView {
+            request_id: request.request_id,
+            kind: "user_input".into(),
+            state,
+            // An answerable request is only actionable for callers that
+            // declared the answer capability on their wait.
+            respondable: supports_answer,
+            tool_name: None,
+            operation: "user_input".into(),
+            summary: sanitized_user_input_summary(&request.payload_json),
+            question: user_input_question_page(&request.payload_json),
+            policy_preview: "unknown".into(),
+        };
+    }
     if request.request_type != "permission" {
         return PendingRequestView {
             request_id: request.request_id,
@@ -3086,6 +3729,7 @@ fn pending_request_view(request: StoredPendingRequest) -> PendingRequestView {
             tool_name: None,
             operation: "user_input".into(),
             summary: "unsupported user input request".into(),
+            question: None,
             policy_preview: "unknown".into(),
         };
     }
@@ -3113,6 +3757,7 @@ fn pending_request_view(request: StoredPendingRequest) -> PendingRequestView {
         tool_name,
         operation,
         summary,
+        question: None,
         policy_preview,
     }
 }
@@ -3177,6 +3822,7 @@ mod result_paging_tests {
                     next_offset: Some(MAX_RESULT_CHUNK_BYTES),
                     complete: false,
                 }),
+                question: None,
             },
         );
         assert!(serde_json::to_vec(&response).unwrap().len() + 1 <= MAX_RESPONSE_FRAME_BYTES);
@@ -3497,13 +4143,13 @@ mod identity_tests {
     }
 
     #[test]
-    fn same_version_legacy_status_frame_without_identity_still_decodes() {
+    fn legacy_status_frame_without_identity_still_decodes() {
         let response = RpcResponse::success(
             "legacy-status".into(),
             RpcSuccess::SystemStatus {
                 status: SystemStatusView {
+                    mcp_version: MCP_VERSION.into(),
                     api_surface: "generic_agent".into(),
-                    protocol_version: RPC_VERSION,
                     service_generation: "legacy-generation".into(),
                     components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
                     capabilities: agent_capabilities(false),
@@ -3978,12 +4624,12 @@ mod admission_policy_tests {
         mode: &str,
         write_manifest: &[&str],
     ) -> Vec<u8> {
-        let mut input = serde_json::Map::new();
-        input.insert("agent".into(), serde_json::json!(agent));
+        let mut params = serde_json::Map::new();
+        params.insert("agent".into(), serde_json::json!(agent));
         if let Some(model) = model {
-            input.insert("model".into(), serde_json::json!(model));
+            params.insert("model".into(), serde_json::json!(model));
         }
-        input.insert(
+        params.insert(
             "manifest".into(),
             serde_json::json!({
                 "schema": external_core::GENERAL_TASK_SCHEMA,
@@ -3995,10 +4641,9 @@ mod admission_policy_tests {
             }),
         );
         serde_json::to_vec(&serde_json::json!({
-            "version": RPC_VERSION,
             "request_id": request_id,
             "method": "submit_general",
-            "params": {"input": input},
+            "params": params,
         }))
         .unwrap()
     }
@@ -4332,13 +4977,11 @@ mod agent_probe_tests {
             version: None,
         };
         let RpcSuccess::AgentProbed { evidence, status } = service
-            .dispatch(RpcMethod::AgentProbe {
-                input: AgentProbeInput {
-                    agent: "zcode".into(),
-                    through: crate::agent_status::ProbeLayer::Hi,
-                    scope: scope.clone(),
-                },
-            })
+            .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
+                agent: "zcode".into(),
+                through: crate::agent_status::ProbeLayer::Hi,
+                scope: scope.clone(),
+            }))
             .unwrap()
         else {
             panic!("expected probe")
@@ -4420,7 +5063,7 @@ mod agent_probe_tests {
                 },
             },
         ] {
-            assert!(service.dispatch(RpcMethod::AgentProbe { input }).is_err());
+            assert!(service.dispatch(RpcMethod::AgentProbe(input)).is_err());
         }
     }
 
@@ -4429,12 +5072,10 @@ mod agent_probe_tests {
         let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
         let RpcSuccess::AgentModels { catalog } = service
-            .dispatch(RpcMethod::AgentModels {
-                input: AgentModelsInput {
-                    agent: "zcode".into(),
-                    scope: ProbeScope::default(),
-                },
-            })
+            .dispatch(RpcMethod::AgentModels(AgentModelsInput {
+                agent: "zcode".into(),
+                scope: ProbeScope::default(),
+            }))
             .unwrap()
         else {
             panic!("expected models result")

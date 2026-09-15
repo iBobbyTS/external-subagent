@@ -32,7 +32,6 @@ import { updateCommand } from '../../cli/commands/update.mjs';
 import { activateService } from '../../cli/install/service-activation.mjs';
 import { npmUpdateCoordination, reconcileCodexHomes, registerCodexHome } from '../../cli/install/reconcile.mjs';
 import { packageVersion } from '../../cli/install/layout.mjs';
-import { RPC_VERSION } from '../../cli/rpc.mjs';
 
 const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64';
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -149,7 +148,7 @@ async function faithfulService(dir, plist, marker) {
     const state = read();
     generation += 1;
     return {
-      protocol_version: RPC_VERSION,
+      mcp_version: '0.1.0',
       service_generation: `sim-${generation}`,
       identity: { daemon: { version: versionFor(state.program), artifact: { path: state.program, sha256: state.sha } } },
     };

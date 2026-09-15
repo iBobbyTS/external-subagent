@@ -1,6 +1,6 @@
 use super::{
     RpcError, RpcErrorCode, RpcOutcome, RpcRequest, RpcResponse, RpcService,
-    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES, RPC_VERSION,
+    MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
 };
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::{
@@ -433,7 +433,6 @@ fn write_response(stream: &mut UnixStream, mut response: RpcResponse) -> io::Res
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if frame.len() + 1 > MAX_RESPONSE_FRAME_BYTES {
         response = RpcResponse {
-            version: RPC_VERSION,
             request_id: response
                 .request_id
                 .filter(|request_id| !request_id.is_empty() && request_id.len() <= 128),
@@ -559,7 +558,7 @@ mod tests {
                 }
                 request.push(byte[0]);
             }
-            for byte in b"{\"version\":" {
+            for byte in b"{\"request_id\":" {
                 if stream.write_all(&[*byte]).is_err() {
                     break;
                 }
@@ -570,7 +569,6 @@ mod tests {
         let started = Instant::now();
         let error = client
             .call(&RpcRequest {
-                version: RPC_VERSION,
                 request_id: "deadline".into(),
                 method: super::super::RpcMethod::SystemStatus,
             })

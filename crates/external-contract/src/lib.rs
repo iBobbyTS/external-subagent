@@ -13,6 +13,10 @@ pub const SESSION_EVENT: &str = "session/event";
 pub const SESSION_REQUEST_RUNTIME_PREFERENCES: &str = "session/requestRuntimePreferences";
 pub const INTERACTION_REQUEST_PERMISSION: &str = "interaction/requestPermission";
 pub const INTERACTION_REQUEST_USER_INPUT: &str = "interaction/requestUserInput";
+/// Daemon-internal sentinel for a runtime server request no adapter can
+/// interpret. It stays observable as a pending record but is never a real
+/// producer of any response contract, so it must never become respondable.
+pub const INTERACTION_REQUEST_UNSUPPORTED_INPUT: &str = "interaction/unsupportedInput";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]

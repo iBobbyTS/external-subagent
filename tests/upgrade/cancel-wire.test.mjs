@@ -23,7 +23,7 @@ test('update cancel-active survives the real CLI RPC encoder', async (t) => {
       if (request.method === 'daemon_begin_drain') readyAt = request.params?.cancel_active ? Date.now() + 6100 : 0;
       const ready = Date.now() >= readyAt;
       if (request.method === 'daemon_activate_ready') assert.equal(ready, true, 'activation preceded reap readiness');
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success',
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success',
         result: { kind: 'daemon_drain_status', ready_for_activation: ready, resources_reaped: ready, activation_claim: null },
       }) + '\n');
     });
@@ -59,7 +59,7 @@ test('a failed update aborts the drain through the real CLI RPC encoder', async 
         : request.method === 'daemon_abort_drain'
           ? { kind: 'daemon_drain_status', is_draining: false, ready_for_activation: false, activation_claim: null }
           : { kind: 'daemon_drain_status', ready_for_activation: true, resources_reaped: true, activation_claim: null };
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result }) + '\n');
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result }) + '\n');
     });
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
@@ -102,14 +102,14 @@ test('a legacy daemon without drain-abort keeps the original failure and the sti
       const request = JSON.parse(body);
       frames.push(request);
       if (request.method === 'daemon_abort_drain') {
-        socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'error',
+        socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error',
           error: { code: 'unknown_method', message: 'unknown RPC method' } }) + '\n');
         return;
       }
       const result = request.method === 'daemon_activate_ready'
         ? { kind: 'daemon_drain_status', ready_for_activation: true, resources_reaped: true, activation_claim: 'legacy-abort-claim' }
         : { kind: 'daemon_drain_status', ready_for_activation: true, resources_reaped: true, activation_claim: null };
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result }) + '\n');
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result }) + '\n');
     });
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
@@ -152,7 +152,7 @@ test('legacy daemon accepts default drain and rejects explicit cancellation with
       // The rejected frame is the daemon's real wire bytes: RpcErrorCode
       // serializes snake_case ("validation"), never a SCREAMING CLI code.
       const rejected = Object.hasOwn(request, 'params');
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id,
+      socket.end(JSON.stringify({ request_id: request.request_id,
         ...(rejected ? { outcome: 'error', error: { code: 'validation', message: 'request fields are invalid' } }
           : { outcome: 'success', result: { kind: 'daemon_drain_status', ready_for_activation: true, activation_claim: null } }),
       }) + '\n');

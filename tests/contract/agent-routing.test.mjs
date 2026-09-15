@@ -41,7 +41,7 @@ async function withServer(socket, respond, body) {
   let observed = null;
   const server = net.createServer((connection) => connection.once('data', (chunk) => {
     observed = JSON.parse(chunk.toString('utf8'));
-    connection.end(`${JSON.stringify({ version: 13, request_id: observed.request_id, ...respond(observed) })}\n`);
+    connection.end(`${JSON.stringify({ request_id: observed.request_id, ...respond(observed) })}\n`);
   }));
   await new Promise((resolve) => server.listen(socket, resolve));
   try { return { result: await body(), observed: () => observed }; }
@@ -58,8 +58,9 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'submit_general');
-  assert.equal(Object.hasOwn(fixture.observed().params.input, 'agent'), false);
-  assert.equal(Object.hasOwn(fixture.observed().params.input, 'model'), false);
+  assert.equal(Object.hasOwn(fixture.observed().params, 'input'), false);
+  assert.equal(Object.hasOwn(fixture.observed().params, 'agent'), false);
+  assert.equal(Object.hasOwn(fixture.observed().params, 'model'), false);
 });
 
 test('spawn and create flags produce the same daemon DTO as JSON', async () => {
@@ -80,9 +81,9 @@ test('spawn and create flags produce the same daemon DTO as JSON', async () => {
       kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
     } }), () => runCli(home, socket, invocations[index]));
     assert.equal(fixture.result.code, 0, fixture.result.stderr);
-    const input = structuredClone(fixture.observed().params.input);
-    input.manifest.agent_id = '<request-id>';
-    captured.push(input);
+    const params = structuredClone(fixture.observed().params);
+    params.manifest.agent_id = '<request-id>';
+    captured.push(params);
   }
   assert.deepEqual(captured[1], captured[0]);
   assert.deepEqual(captured[2], captured[0]);
@@ -101,9 +102,9 @@ test('spawn and create JSON stdin preserve the same daemon wire DTO', async () =
       kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
     } }), () => runCliWithStdin(home, socket, command, jsonInput));
     assert.equal(fixture.result.code, 0, fixture.result.stderr);
-    const input = structuredClone(fixture.observed().params.input);
-    input.manifest.agent_id = '<request-id>';
-    captured.push(input);
+    const params = structuredClone(fixture.observed().params);
+    params.manifest.agent_id = '<request-id>';
+    captured.push(params);
   }
   assert.deepEqual(captured[1], captured[0]);
 });
@@ -126,9 +127,9 @@ test('literal null flag strings reach daemon while structured JSON null is rejec
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-null-'));
   const socket = path.join(os.tmpdir(), `es-n-${process.pid}-${Date.now()}.sock`);
   const fixture = await withServer(socket, (request) => {
-    assert.equal(request.params.input.agent, 'zcode');
-    assert.equal(request.params.input.model, 'null');
-    assert.equal(request.params.input.manifest.prompt, 'null');
+    assert.equal(request.params.agent, 'zcode');
+    assert.equal(request.params.model, 'null');
+    assert.equal(request.params.manifest.prompt, 'null');
     return { outcome: 'error', error: { code: 'model_selection_unsupported', message: 'model selection is unsupported' } };
   }, () => runCli(home, socket, ['spawn', '--agent', 'zcode', '--model', 'null', '--repository', '/repo', '--prompt', 'null']));
   assert.equal(fixture.result.code, 1);
@@ -166,9 +167,9 @@ test('unknown agent, dsh support, and model decisions all come from daemon', asy
     const [input, code] = cases[index];
     const socket = path.join(os.tmpdir(), `es-s-${process.pid}-${index}-${Date.now()}.sock`);
     const fixture = await withServer(socket, (request) => {
-      assert.equal(request.params.input.agent, input.agent);
-      if (input.model === undefined) assert.equal(Object.hasOwn(request.params.input, 'model'), false);
-      else assert.equal(request.params.input.model, input.model);
+      assert.equal(request.params.agent, input.agent);
+      if (input.model === undefined) assert.equal(Object.hasOwn(request.params, 'model'), false);
+      else assert.equal(request.params.model, input.model);
       return { outcome: 'error', error: { code, message: code } };
     }, () => runCli(home, socket, ['spawn', '--json', JSON.stringify(input)]));
     assert.equal(fixture.result.code, 1);
@@ -207,7 +208,7 @@ test('human config and agents forms execute instead of falling through to JSON d
   } }), () => runCli(home, socket, ['agents', 'models', 'zcode']));
   assert.equal(models.result.code, 0, models.result.stderr);
   assert.equal(models.observed().method, 'agent_models');
-  assert.deepEqual(models.observed().params.input, { agent: 'zcode', scope: {} });
+  assert.deepEqual(models.observed().params, { agent: 'zcode', scope: {} });
   const modelOutput = JSON.parse(models.result.stdout);
   assert.equal(modelOutput.agent, 'zcode');
   assert.equal(modelOutput.kind, undefined);
@@ -234,7 +235,7 @@ test('human config and agents forms execute instead of falling through to JSON d
   } }), () => runCli(home, socket, ['agents', 'probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']));
   assert.equal(probe.result.code, 0, probe.result.stderr);
   assert.equal(probe.observed().method, 'agent_probe');
-  assert.deepEqual(probe.observed().params.input, {
+  assert.deepEqual(probe.observed().params, {
     agent: 'zcode', through: 'hi', scope: { workspace: '/workspace', home: '/home' },
   });
 });

@@ -34,25 +34,21 @@ test('CLI sends daemon RPC and preserves success result', async () => {
       body += chunk;
       if (!body.includes('\n')) return;
       const request = JSON.parse(body);
-      assert.equal(request.version, 13);
+      assert.equal(Object.hasOwn(request, 'version'), false, 'requests carry no custom protocol version');
       assert.equal(request.method, 'task_wait');
       assert.equal(request.params.agent_id, '10000001');
       socket.end(JSON.stringify({
-        version: 13,
         request_id: request.request_id,
         outcome: 'success',
         result: {
           kind: 'task_wait',
           task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
-          revision: 0,
-          next_revision: 0,
           pending_requests: [{ request_id: 'read-1', kind: 'permission', state: 'pending', respondable: true, tool_name: 'Read', operation: 'read', summary: 'target input.txt', policy_preview: 'official_permission_request' }],
-          command_pending_approval: true,
           result_available: false,
-          activity: { state: 'active', latest_progress: 'private duplicate', active_tools: [], window_60s: {}, telemetry_status: 'healthy' },
+          activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' },
           latest_progress: null,
           result: null,
-          instruction: 'Use wait for progress',
+          instruction: 'A permission request is pending; respond now with external_subagent_respond using decision allow or deny.',
           timed_out: false,
         },
       }) + '\n');
@@ -66,7 +62,6 @@ test('CLI sends daemon RPC and preserves success result', async () => {
     assert.equal(result.task.resources_reaped, false);
     assert.equal(result.activity.latest_progress, undefined);
     assert.equal(result.result, null);
-    assert.equal(result.command_pending_approval, true);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
     assert.equal(result.pending_requests[0].respondable, true);
     assert.equal(result.timed_out, false);
@@ -77,24 +72,63 @@ test('CLI sends daemon RPC and preserves success result', async () => {
 
 test('CLI preserves daemon error code, message, and active agent id', async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-error-${process.pid}-${Date.now()}.sock`);
-  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002 } }) + '\n'); }); });
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002 } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000002 }), (error) => error instanceof CliError && error.code === 'not_found' && error.agentId === 10000002); }
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI rejects daemon responses with wrong RPC version or request id', async () => {
-  for (const response of [
-    { version: 11, request_id: 'ignored', outcome: 'success', result: {} },
-    { version: 12, request_id: 'ignored', outcome: 'success', result: {} },
-    { version: 13, request_id: 'other-request', outcome: 'success', result: {} },
-  ]) {
-    const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-protocol-${process.pid}-${Date.now()}-${response.version}.sock`);
+test('CLI rejects daemon responses for a different request id', async () => {
+  for (const [index, response] of [
+    { request_id: 'other-request', outcome: 'success', result: {} },
+    { request_id: null, outcome: 'success', result: {} },
+  ].entries()) {
+    const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-protocol-${process.pid}-${Date.now()}-${index}.sock`);
     const server = net.createServer((socket) => { socket.once('data', () => socket.end(JSON.stringify(response) + '\n')); });
     await new Promise((resolve) => server.listen(socketPath, resolve));
     try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000001 }), (error) => error instanceof CliError && error.code === 'PROTOCOL_ERROR'); }
     finally { await new Promise((resolve) => server.close(resolve)); }
   }
+});
+
+test('CLI rejects obsolete protocol fields before connecting', () => {
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: 10000001, after_revision: 0 }), /after_revision/);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'send', { agent_id: 10000001, mode: 'queue', content: 'x' }), /mode/);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'respond', { agent_id: 10000001, request_id: 'r', decision: 'deny', reason: 'because' }), /reason/);
+});
+
+test('CLI forwards supports_answer only when declared', async () => {
+  const observed = [];
+  const respond = (request) => {
+    observed.push(request.params);
+    return { request_id: request.request_id, outcome: 'success', result: { kind: 'task_wait', task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false }, pending_requests: [], result_available: false, activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' }, latest_progress: null, result: null, instruction: null, timed_out: true } };
+  };
+  for (const input of [{ agent_id: 10000001, wait_time: 0 }, { agent_id: 10000001, wait_time: 0, supports_answer: true }]) {
+    const socketPath = path.join(os.tmpdir(), `zcode-cli-wait-cap-${process.pid}-${Date.now()}-${observed.length}.sock`);
+    const server = net.createServer((socket) => { socket.once('data', (chunk) => socket.end(`${JSON.stringify(respond(JSON.parse(chunk)))}\n`)); });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    try { await callDaemon(socketPath, 'wait', input); }
+    finally { await new Promise((resolve) => server.close(resolve)); }
+  }
+  assert.equal(observed[0].supports_answer, undefined);
+  assert.equal(observed[1].supports_answer, true);
+  assert.equal(observed.every((params) => params.after_revision === undefined), true);
+});
+
+test('CLI omits send message_id for daemon generation and projects the returned id', async () => {
+  const socketPath = path.join(os.tmpdir(), `zcode-cli-send-${process.pid}-${Date.now()}.sock`);
+  let observedParams;
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    observedParams = request.params;
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'message', message_id: 'subagent-message-generated', disposition: 'queued', task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false } } }) + '\n');
+  }); });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const result = await callDaemon(socketPath, 'send', { agent_id: 10000001, content: 'continue' });
+    assert.deepEqual(observedParams, { agent_id: '10000001', content: 'continue' });
+    assert.deepEqual(result, { message_id: 'subagent-message-generated', disposition: 'queued' });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
 test('CLI rejects list without repository or workspace scope before connecting', async () => {
@@ -103,7 +137,7 @@ test('CLI rejects list without repository or workspace scope before connecting',
 
 test('CLI maps workspace list scope to daemon repository scope', async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-list-${process.pid}-${Date.now()}.sock`);
-  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); assert.equal(request.params.repository, '/workspace'); socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: { tasks: [] } }) + '\n'); }); });
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); assert.equal(request.params.repository, '/workspace'); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { tasks: [] } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try { await callDaemon(socketPath, 'list', { workspace: '/workspace' }); }
   finally { await new Promise((resolve) => server.close(resolve)); }
@@ -119,7 +153,7 @@ test('CLI passes list agent filter and projects persisted input identity', async
     const request = JSON.parse(chunk);
     assert.equal(request.method, 'task_list');
     assert.equal(request.params.agent, 'future-provider');
-    socket.end(`${JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: {
+    socket.end(`${JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
       kind: 'task_listed', tasks: [{ agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null,
         stop_requested: false, close_requested: false, closed: false, reaped: false, input_identity: identity }], next_cursor: null,
     } })}\n`);
@@ -146,7 +180,7 @@ test('CLI applies documented list and result defaults before connecting', async 
       const result = command === 'list'
         ? { kind: 'task_listed', tasks: [], next_cursor: null }
         : { kind: 'task_result', task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false }, result: null };
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result }) + '\n');
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result }) + '\n');
     }); });
     await new Promise((resolve) => server.listen(socketPath, resolve));
     try { await callDaemon(socketPath, command, input); }
@@ -166,7 +200,7 @@ test('CLI observe uses the shared read-only daemon snapshot without adding field
     const request = JSON.parse(chunk);
     assert.equal(request.method, 'task_observe');
     assert.deepEqual(request.params, { agent_id: '10000001' });
-    socket.end(`${JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: { kind: 'task_observed', observation } })}\n`);
+    socket.end(`${JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'task_observed', observation } })}\n`);
   }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
@@ -181,10 +215,49 @@ test('CLI public projection removes private RPC fields and result digest', () =>
     task,
     result: { outcome: 'COMPLETED', final_text: 'ok', partial: false, result_sha256: 'private', offset: 0, total_bytes: 2, next_offset: null, complete: true },
   });
-  assert.deepEqual(Object.keys(projected).sort(), ['result', 'task']);
+  assert.deepEqual(Object.keys(projected).sort(), ['question', 'result', 'task']);
   assert.equal(projected.task.resources_reaped, true);
   assert.equal(projected.task.reaped, undefined);
   assert.equal(projected.result.result_sha256, undefined);
+  assert.equal(projected.question, null);
+});
+
+test('CLI result pages a recoverable pending question by request_id', async () => {
+  const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-question-${process.pid}-${Date.now()}.sock`);
+  const question = {
+    text: 'Deploy to which environment? options: [production, staging]',
+    offset: 2048,
+    total_bytes: 2548,
+    next_offset: null,
+    complete: true,
+  };
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    assert.equal(request.method, 'task_result');
+    assert.equal(request.params.agent_id, '10000001');
+    assert.equal(request.params.request_id, 'question-1');
+    assert.equal(request.params.offset, 2048);
+    socket.end(JSON.stringify({
+      request_id: request.request_id,
+      outcome: 'success',
+      result: {
+        kind: 'task_result',
+        task: { agent_id: '10000001', phase: 'WAITING_INPUT', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
+        result: null,
+        question,
+      },
+    }) + '\n');
+  }); });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const projected = await callDaemon(socketPath, 'result', { agent_id: 10000001, request_id: 'question-1', offset: 2048 });
+    assert.deepEqual(projected.question, question);
+    assert.equal(projected.result, null);
+    assert.throws(
+      () => callDaemon(socketPath, 'result', { agent_id: 10000001, bogus: true }),
+      (error) => error.code === 'INVALID_ARGUMENT' && /unsupported field/.test(error.message),
+    );
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
 test('CLI reports unavailable daemon socket', async () => {
@@ -193,7 +266,7 @@ test('CLI reports unavailable daemon socket', async () => {
 
 test('CLI accepts a response exactly at the 2MiB frame cap and rejects one byte over', async () => {
   const responseFor = (request, targetBytes) => {
-    const response = { version: 13, request_id: request.request_id, outcome: 'success', result: { tasks: [] }, padding: '' };
+    const response = { request_id: request.request_id, outcome: 'success', result: { tasks: [] }, padding: '' };
     const base = Buffer.byteLength(JSON.stringify(response), 'utf8');
     response.padding = 'x'.repeat(Math.max(0, targetBytes - base));
     while (Buffer.byteLength(JSON.stringify(response), 'utf8') < targetBytes) response.padding += 'x';
@@ -231,7 +304,7 @@ test('CLI preserves a maximum control and Unicode result page', async () => {
   const expected = '\u0001'.repeat(100000) + '你好🙂';
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
-    socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: { kind: 'task_result', task: { agent_id: '10000001', phase: 'TERMINAL', outcome: 'COMPLETED', reason_code: null, stop_requested: false, close_requested: false, reaped: true }, result: { outcome: 'COMPLETED', final_text: expected, partial: false, offset: 0, total_bytes: Buffer.byteLength(expected), next_offset: null, complete: true } } }) + '\n');
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'task_result', task: { agent_id: '10000001', phase: 'TERMINAL', outcome: 'COMPLETED', reason_code: null, stop_requested: false, close_requested: false, reaped: true }, result: { outcome: 'COMPLETED', final_text: expected, partial: false, offset: 0, total_bytes: Buffer.byteLength(expected), next_offset: null, complete: true } } }) + '\n');
   }));
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try { const result = await callDaemon(socketPath, 'result', { agent_id: 10000001, limit: 100000 }); assert.equal(result.result.final_text, expected); }

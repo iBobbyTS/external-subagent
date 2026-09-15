@@ -92,7 +92,8 @@ pub(crate) fn parse_passive_activity(event: &RuntimeEvent) -> ParsedActivity {
         }
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
             if request.method == INTERACTION_REQUEST_PERMISSION
-                || request.method == INTERACTION_REQUEST_USER_INPUT =>
+                || request.method == INTERACTION_REQUEST_USER_INPUT
+                || request.method == INTERACTION_REQUEST_UNSUPPORTED_INPUT =>
         {
             let mut parsed = ParsedActivity::runtime();
             parsed.transition = Some(ActivityTransition::PermissionRequested);

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
-import { callDaemon, RPC_VERSION } from '../rpc.mjs';
+import { callDaemon } from '../rpc.mjs';
 import { LAUNCH_AGENT_LABEL } from '../constants.mjs';
 import { launchctl } from './service-macos.mjs';
 
@@ -68,7 +68,10 @@ export async function activateService(paths, candidate, options = {}) {
         if (!pid || pid === previousPid) throw new Error('service has no new process');
         const status = await rpc(paths.socket, 'status', {});
         const identity = status.identity?.daemon;
-        if (status.protocol_version !== RPC_VERSION || !status.service_generation || status.service_generation === previousGeneration
+        // Health verification uses the service generation and the running
+        // artifact identity. The diagnostic-only mcp_version never gates
+        // admission.
+        if (!status.service_generation || status.service_generation === previousGeneration
           || identity?.artifact?.path !== expected.path || identity?.artifact?.sha256 !== expected.sha256
           || (expected.version && identity?.version !== expected.version)) throw new Error('running daemon identity does not match selected payload');
         if (await servicePid() !== pid) throw new Error('service process changed during health verification');

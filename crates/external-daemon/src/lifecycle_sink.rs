@@ -4,7 +4,8 @@ use crate::{
     RuntimeTerminal,
 };
 use external_contract::{
-    WireMessage, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT,
+    WireMessage, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+    INTERACTION_REQUEST_USER_INPUT,
 };
 use external_core::{CompletionOutcome, GeneralCompletion, GeneralFinalizer, PreparedGeneralTask};
 use external_runtime::Inbound;
@@ -322,7 +323,9 @@ impl LifecycleSink for StoreLifecycleSink {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
                 if matches!(
                     request.method.as_str(),
-                    INTERACTION_REQUEST_PERMISSION | INTERACTION_REQUEST_USER_INPUT
+                    INTERACTION_REQUEST_PERMISSION
+                        | INTERACTION_REQUEST_USER_INPUT
+                        | INTERACTION_REQUEST_UNSUPPORTED_INPUT
                 ) =>
             {
                 let request_id = format!("{}:request:{}", self.agent_id, record.sequence);
@@ -333,10 +336,13 @@ impl LifecycleSink for StoreLifecycleSink {
                         return;
                     }
                 };
-                let request_type = if request.method == INTERACTION_REQUEST_PERMISSION {
-                    "permission"
-                } else {
-                    "unsupported_input"
+                // Only real producers become answerable user input; the
+                // unsupported sentinel stays an observable, non-respondable
+                // record no caller capability can act on.
+                let request_type = match request.method.as_str() {
+                    INTERACTION_REQUEST_PERMISSION => "permission",
+                    INTERACTION_REQUEST_USER_INPUT => "user_input",
+                    _ => "unsupported_input",
                 };
                 if let Err(error) = self.store.insert_pending_request(
                     &request_id,

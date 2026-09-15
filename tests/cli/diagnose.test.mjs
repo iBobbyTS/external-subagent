@@ -49,7 +49,7 @@ test('diagnose preserves daemon self identity and does not promote packaged faca
   };
   await withDaemon(paths, (request) => {
     assert.equal(request.method, 'system_status');
-    return { outcome: 'success', result: { status: { protocol_version: 13, identity: daemonIdentity } } };
+    return { outcome: 'success', result: { status: { mcp_version: '0.1.0', identity: daemonIdentity } } };
   }, async () => {
     const report = await diagnose(paths, []);
     assert.deepEqual(report.daemon.status.identity, daemonIdentity);
@@ -71,15 +71,15 @@ test('agent diagnose reads only the public wait projection and exports a bounded
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
     if (request.method === 'system_status') {
-      socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: { status: { protocol_version: 13 } } }) + '\n');
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { status: { mcp_version: '0.1.0' } } }) + '\n');
       return;
     }
     assert.equal(request.method, 'task_wait');
-    socket.end(JSON.stringify({ version: 13, request_id: request.request_id, outcome: 'success', result: {
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
       kind: 'task_wait', task: { agent_id: 10000001, phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
-      revision: 3, next_revision: 3, pending_requests: [], result_available: false,
+      pending_requests: [], result_available: false,
       activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' }, latest_progress: null,
-      result: null, instruction: 'Use wait for progress', timed_out: false,
+      result: null, instruction: 'Not finished yet, call wait again', timed_out: false,
     } }) + '\n');
   }));
   await new Promise((resolve) => server.listen(paths.socket, resolve));
@@ -164,7 +164,7 @@ test('diagnostic export write failure is reported without throwing', async () =>
 async function withDaemon(paths, respond, run) {
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
-    socket.end(JSON.stringify({ version: 13, request_id: request.request_id, ...respond(request) }) + '\n');
+    socket.end(JSON.stringify({ request_id: request.request_id, ...respond(request) }) + '\n');
   }));
   await new Promise((resolve) => server.listen(paths.socket, resolve));
   try { return await run(); }
@@ -172,7 +172,7 @@ async function withDaemon(paths, respond, run) {
 }
 
 function statusOrTask(request, agentId = '10000001') {
-  if (request.method === 'system_status') return { outcome: 'success', result: { status: { protocol_version: 13 } } };
+  if (request.method === 'system_status') return { outcome: 'success', result: { status: { mcp_version: '0.1.0' } } };
   assert.equal(request.method, 'task_wait');
   assert.equal(request.params.agent_id, agentId);
   return { outcome: 'success', result: {

@@ -1,4 +1,6 @@
-use crate::rpc::{PendingRequestStateView, PendingRequestView, RpcError, RpcErrorCode};
+use crate::rpc::{
+    PendingRequestStateView, PendingRequestView, QuestionView, RpcError, RpcErrorCode,
+};
 use rmcp::{
     handler::server::tool::IntoCallToolResult,
     model::{CallToolResponse, CallToolResult, ContentBlock},
@@ -10,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum PublicPendingKind {
     Permission,
+    UserInput,
     UnsupportedInput,
 }
 
@@ -51,17 +54,43 @@ pub struct PublicPendingRequest {
     pub tool_name: Option<String>,
     pub operation: PublicOperation,
     pub summary: String,
+    /// First bounded page of the question for answerable user-input
+    /// requests; continuation pages come from external_subagent_result
+    /// with this request_id when next_offset is set.
+    pub question: Option<PublicQuestion>,
     pub policy_preview: PublicPolicyPreview,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicQuestion {
+    pub text: String,
+    pub offset: usize,
+    pub total_bytes: usize,
+    pub next_offset: Option<usize>,
+    pub complete: bool,
+}
+
+impl From<QuestionView> for PublicQuestion {
+    fn from(value: QuestionView) -> Self {
+        Self {
+            text: value.text,
+            offset: value.offset,
+            total_bytes: value.total_bytes,
+            next_offset: value.next_offset,
+            complete: value.complete,
+        }
+    }
 }
 
 impl From<PendingRequestView> for PublicPendingRequest {
     fn from(value: PendingRequestView) -> Self {
         Self {
             request_id: value.request_id,
-            kind: if value.kind == "permission" {
-                PublicPendingKind::Permission
-            } else {
-                PublicPendingKind::UnsupportedInput
+            kind: match value.kind.as_str() {
+                "permission" => PublicPendingKind::Permission,
+                "user_input" => PublicPendingKind::UserInput,
+                _ => PublicPendingKind::UnsupportedInput,
             },
             state: match value.state {
                 PendingRequestStateView::Pending => PublicPendingState::Pending,
@@ -80,6 +109,7 @@ impl From<PendingRequestView> for PublicPendingRequest {
                 _ => PublicOperation::Unknown,
             },
             summary: value.summary,
+            question: value.question.map(Into::into),
             policy_preview: match value.policy_preview.as_str() {
                 "externally_decidable" => PublicPolicyPreview::ExternallyDecidable,
                 "hard_deny" => PublicPolicyPreview::HardDeny,
@@ -94,6 +124,7 @@ impl From<PendingRequestView> for PublicPendingRequest {
 pub enum PublicDecision {
     Allow,
     Deny,
+    Answer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -237,9 +268,6 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             "model selection is unsupported for zcode",
         ),
         RpcErrorCode::Oversized => ("oversized", "bounded response or request was too large"),
-        RpcErrorCode::UnsupportedVersion => {
-            ("protocol_version_mismatch", "incompatible subagent daemon")
-        }
         RpcErrorCode::UnknownMethod => ("protocol_error", "daemon method is unavailable"),
         RpcErrorCode::NotFound => ("not_found", "agent task was not found"),
         RpcErrorCode::Conflict => (
@@ -438,6 +466,7 @@ mod tests {
             tool_name: Some("Read".into()),
             operation: "read".into(),
             summary: "target input.txt".into(),
+            question: None,
             policy_preview: "official_permission_request".into(),
         };
         let projected: PublicPendingRequest = view.into();
@@ -458,7 +487,7 @@ mod server {
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess,
         SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
         TaskListQuery, TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView,
-        TaskWaitQuery, TelemetryStatusView, RPC_VERSION,
+        TaskWaitQuery, TelemetryStatusView,
     };
     use external_core::{GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
     use external_store::TaskOutcome;
@@ -480,11 +509,11 @@ mod server {
         },
         time::Duration,
     };
-    use uuid::Uuid;
 
     use super::{
         protocol_error, public_error, public_transport_error, validation_error, PublicDecision,
-        PublicErrorEnvelope, PublicPendingRequest, PublicResponseDisposition, ToolError,
+        PublicErrorEnvelope, PublicPendingRequest, PublicQuestion, PublicResponseDisposition,
+        ToolError,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -527,7 +556,6 @@ mod server {
     ];
 
     const MAX_MESSAGE_BYTES: usize = 16 * 1024;
-    const MAX_REASON_BYTES: usize = 2048;
 
     fn default_wait_time() -> u64 {
         290
@@ -766,6 +794,7 @@ mod server {
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct SystemStatusOutput {
+        pub mcp_version: String,
         pub components: BTreeMap<String, PublicComponentState>,
         pub capabilities: PublicAgentCapabilities,
         pub agents: Vec<PublicAgentStatus>,
@@ -929,6 +958,7 @@ mod server {
                 None => (None, PublicModelIdentity { configured: None }),
             };
             Self {
+                mcp_version: value.mcp_version,
                 components: value
                     .components
                     .into_iter()
@@ -1249,13 +1279,16 @@ mod server {
     pub struct AgentWaitInput {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
-        #[serde(default)]
-        pub after_revision: u64,
         #[serde(default = "default_wait_time")]
         #[schemars(range(min = 0, max = 299))]
         pub wait_time: u64,
         #[serde(default)]
         pub message_id: Option<String>,
+        /// Declare support for answering `interaction/requestUserInput`
+        /// requests. Without it (the default) only allow/deny permission
+        /// requests are treated as respondable wake targets.
+        #[serde(default)]
+        pub supports_answer: bool,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -1380,10 +1413,7 @@ mod server {
     #[schemars(deny_unknown_fields)]
     pub struct AgentWaitOutput {
         pub task: PublicTask,
-        pub revision: u64,
-        pub next_revision: u64,
         pub pending_requests: Vec<PublicPendingRequest>,
-        pub command_pending_approval: bool,
         pub result_available: bool,
         pub activity: PublicActivity,
         pub latest_progress: Option<String>,
@@ -1435,8 +1465,10 @@ mod server {
         pub agent_id: u64,
         pub request_id: String,
         pub decision: PublicDecision,
+        /// Answer content; required and non-empty exactly when the decision is
+        /// answer.
         #[serde(default, deserialize_with = "optional_non_null")]
-        pub reason: Option<String>,
+        pub content: Option<String>,
     }
 
     #[derive(Debug, Serialize, JsonSchema)]
@@ -1460,6 +1492,10 @@ mod server {
     pub struct AgentResultInput {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
+        /// Pending user-input request whose stored question should be paged
+        /// instead of the terminal result.
+        #[serde(default, deserialize_with = "optional_non_null")]
+        pub request_id: Option<String>,
         #[serde(default)]
         pub offset: usize,
         #[serde(default = "default_result_limit")]
@@ -1476,6 +1512,7 @@ mod server {
     pub struct AgentResultOutput {
         pub task: PublicTask,
         pub result: Option<PublicResult>,
+        pub question: Option<PublicQuestion>,
     }
 
     #[derive(Clone)]
@@ -1523,10 +1560,6 @@ mod server {
                 #[cfg(test)]
                 wait_handler_interrupted: None,
             }
-        }
-
-        fn generated_message_id(&self) -> String {
-            format!("subagent-message-{}", Uuid::new_v4())
         }
 
         fn rpc(&self, method: RpcMethod) -> Result<RpcSuccess, ToolError> {
@@ -1578,7 +1611,6 @@ mod server {
         ) -> Result<RpcSuccess, ToolError> {
             let (operation, agent_id) = rpc_context(&method);
             let request = RpcRequest {
-                version: RPC_VERSION,
                 request_id: format!(
                     "subagent-mcp-{}",
                     self.next_request.fetch_add(1, Ordering::Relaxed)
@@ -1613,22 +1645,22 @@ mod server {
                         .with_agent_id(agent_id.clone())
                 })?
             };
-            if response.version != RPC_VERSION {
+            if response.request_id.as_deref() != Some(request_id.as_str()) {
                 return Err(ToolError::new(
-                    "protocol_version_mismatch",
-                    "incompatible agent daemon",
-                    "protocol_version_mismatch: incompatible agent daemon",
+                    "protocol_error",
+                    "unexpected daemon response",
+                    "protocol_error: daemon answered a different request id",
                     "daemon",
                 )
                 .with_operation(operation)
-                .with_request_id(request.request_id)
+                .with_request_id(request_id)
                 .with_agent_id(agent_id));
             }
             match response.outcome {
                 RpcOutcome::Success { result } => Ok(*result),
                 RpcOutcome::Error { error } => Err(public_error(error)
                     .with_operation(operation)
-                    .with_request_id(request.request_id)
+                    .with_request_id(request_id)
                     .with_agent_id(agent_id)),
             }
         }
@@ -1636,17 +1668,25 @@ mod server {
         fn result(
             &self,
             agent_id: String,
+            request_id: Option<String>,
             offset: usize,
             limit: usize,
-        ) -> Result<(PublicTask, Option<PublicResult>), ToolError> {
+        ) -> Result<(PublicTask, Option<PublicResult>, Option<PublicQuestion>), ToolError> {
             match self.rpc(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
+                request_id,
                 offset,
                 limit,
             })? {
-                RpcSuccess::TaskResult { task, result, .. } => {
-                    Ok((task.try_into()?, result.map(TryInto::try_into).transpose()?))
-                }
+                RpcSuccess::TaskResult {
+                    task,
+                    result,
+                    question,
+                } => Ok((
+                    task.try_into()?,
+                    result.map(TryInto::try_into).transpose()?,
+                    question.map(Into::into),
+                )),
                 _ => Err(protocol_error()
                     .with_operation("result")
                     .with_agent_id(Some(agent_id))),
@@ -1690,31 +1730,29 @@ mod server {
         })
     }
 
-    fn project_response(value: ResponseOutcomeView) -> AgentRespondOutput {
-        let requested_decision = if value.requested_decision == "allow" {
-            PublicDecision::Allow
-        } else {
-            PublicDecision::Deny
-        };
-        let effective_decision = if value.effective_decision == "allow" {
-            PublicDecision::Allow
-        } else {
-            PublicDecision::Deny
-        };
-        let disposition = match value.disposition {
-            crate::rpc::ResponseDispositionView::Responded => PublicResponseDisposition::Responded,
-            crate::rpc::ResponseDispositionView::AlreadyResponded => {
-                PublicResponseDisposition::AlreadyResponded
-            }
-            crate::rpc::ResponseDispositionView::InFlight => PublicResponseDisposition::InFlight,
-        };
-        AgentRespondOutput {
-            disposition,
-            requested_decision,
-            effective_decision,
+    fn public_decision(value: &str) -> Result<PublicDecision, ToolError> {
+        match value {
+            "allow" => Ok(PublicDecision::Allow),
+            "deny" => Ok(PublicDecision::Deny),
+            "answer" => Ok(PublicDecision::Answer),
+            _ => Err(protocol_error()),
+        }
+    }
+
+    fn project_response(value: ResponseOutcomeView) -> Result<AgentRespondOutput, ToolError> {
+        Ok(AgentRespondOutput {
+            disposition: match value.disposition {
+                crate::rpc::ResponseDispositionView::Responded => PublicResponseDisposition::Responded,
+                crate::rpc::ResponseDispositionView::AlreadyResponded => {
+                    PublicResponseDisposition::AlreadyResponded
+                }
+                crate::rpc::ResponseDispositionView::InFlight => PublicResponseDisposition::InFlight,
+            },
+            requested_decision: public_decision(&value.requested_decision)?,
+            effective_decision: public_decision(&value.effective_decision)?,
             policy_overrode: value.policy_overrode,
             policy_reason_code: value.policy_reason_code,
-        }
+        })
     }
 
     #[tool_handler(router = self.tool_router)]
@@ -1731,7 +1769,7 @@ mod server {
         #[tool(
         name = "external_subagent_status",
         output_schema = tool_output_schema::<SystemStatusOutput>(),
-        description = "Read daemon/runtime readiness, protocol version, component states, and capability limits. Read-only.",
+        description = "Read daemon/runtime readiness, the diagnostic-only mcp_version, component states, and capability limits. Read-only.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1769,13 +1807,11 @@ mod server {
         ) -> Result<Json<AgentSpawnOutput>, ToolError> {
             let manifest =
                 general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
-            let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral {
-                input: GeneralSubmitInput {
-                    agent: input.agent.clone(),
-                    model: input.model.clone(),
-                    manifest,
-                },
-            })? {
+            let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral(GeneralSubmitInput {
+                agent: input.agent.clone(),
+                model: input.model.clone(),
+                manifest,
+            }))? {
                 RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
                 _ => return Err(protocol_error().with_operation("spawn")),
             };
@@ -1793,7 +1829,7 @@ mod server {
         #[tool(
         name = "external_subagent_wait",
         output_schema = tool_output_schema::<AgentWaitOutput>(),
-        description = "Wait up to 290 seconds by default for terminal completion or any respondable pending request (state pending and respondable true), regardless of tool kind or name. The ordered pending-request projection is capped at 100 records, so a qualifying request beyond that projection does not wake this wait. Set wait_time manually when other work or subagents need attention; avoid unnecessarily short waits across multiple tasks; use 0 for current status.",
+        description = "Wait up to 290 seconds by default. Returns early only when a respondable pending request exists in the caller's declared capability scope (permission requests always; answerable user-input requests only with supports_answer=true) or the terminal result is available; ordinary progress, message receipts, and non-respondable requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. Each answerable user-input request carries a bounded first question page with the same contract; when its next_offset is set, page the remaining question content with external_subagent_result passing that request_id. Set supports_answer=true only if you can answer user-input questions with decision answer and non-empty content; the pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1817,9 +1853,9 @@ mod server {
                 .rpc_wait(
                     TaskWaitQuery {
                         agent_id,
-                        after_revision: input.after_revision,
                         wait_time: input.wait_time,
                         message_id: input.message_id,
+                        supports_answer: input.supports_answer,
                     },
                     move || context.ct.is_cancelled(),
                 )
@@ -1827,10 +1863,7 @@ mod server {
             {
                 RpcSuccess::TaskWait {
                     task,
-                    revision,
-                    next_revision,
                     pending_requests,
-                    command_pending_approval,
                     result_available,
                     activity,
                     latest_progress,
@@ -1840,10 +1873,7 @@ mod server {
                     message_receipt,
                 } => Ok(Json(AgentWaitOutput {
                     task: task.try_into()?,
-                    revision,
-                    next_revision,
                     pending_requests: pending_requests.into_iter().map(Into::into).collect(),
-                    command_pending_approval,
                     result_available,
                     activity: activity.into(),
                     latest_progress,
@@ -1943,7 +1973,7 @@ mod server {
         #[tool(
         name = "external_subagent_send",
         output_schema = tool_output_schema::<AgentSendOutput>(),
-        description = "Queue a bounded message for a running task",
+        description = "Queue a bounded message for a running task; the daemon generates message_id when omitted and always returns the effective id",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1962,13 +1992,9 @@ mod server {
                     .with_operation("send")
                     .with_agent_id(Some(agent_id.clone()))
             })?;
-            let message_id = input
-                .message_id
-                .unwrap_or_else(|| self.generated_message_id());
             match self.rpc(RpcMethod::TaskMessage(MessageInput {
                 agent_id: agent_id.clone(),
-                message_id,
-                mode: "queue".into(),
+                message_id: input.message_id,
                 content: input.content,
             }))? {
                 RpcSuccess::Message {
@@ -2001,7 +2027,7 @@ mod server {
         #[tool(
         name = "external_subagent_respond",
         output_schema = tool_output_schema::<AgentRespondOutput>(),
-        description = "Respond idempotently to a typed respondable pending request",
+        description = "Respond idempotently to a typed respondable pending request: allow or deny for permission requests, answer with non-empty content for answerable user-input requests",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2015,24 +2041,41 @@ mod server {
         ) -> Result<Json<AgentRespondOutput>, ToolError> {
             let agent_id = internal_task_id(input.agent_id)
                 .map_err(|error| error.with_operation("respond"))?;
-            if input.reason.as_ref().is_some_and(|value| {
-                value.is_empty() || value.len() > MAX_REASON_BYTES || value.contains('\0')
-            }) {
-                return Err(validation_error("reason is invalid")
+            if let Some(content) = input.content.as_deref() {
+                if content.is_empty() || content.len() > MAX_MESSAGE_BYTES || content.contains('\0') {
+                    return Err(validation_error("content is invalid")
+                        .with_operation("respond")
+                        .with_agent_id(Some(agent_id)));
+                }
+            }
+            if matches!(input.decision, PublicDecision::Answer)
+                && input
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| content.trim().is_empty())
+            {
+                return Err(validation_error("answer requires non-empty content")
                     .with_operation("respond")
                     .with_agent_id(Some(agent_id)));
             }
             let decision = match input.decision {
                 PublicDecision::Allow => ResponseDecision::Allow,
                 PublicDecision::Deny => ResponseDecision::Deny,
+                PublicDecision::Answer => ResponseDecision::Answer,
             };
             match self.rpc(RpcMethod::TaskRespond(RespondInput {
                 agent_id: agent_id.clone(),
                 request_id: input.request_id,
                 decision,
-                content: input.reason,
+                content: input.content,
             }))? {
-                RpcSuccess::Respond { outcome, .. } => Ok(Json(project_response(outcome))),
+                RpcSuccess::Respond { outcome, .. } => {
+                    Ok(Json(project_response(outcome).map_err(|error| {
+                        error
+                            .with_operation("respond")
+                            .with_agent_id(Some(agent_id))
+                    })?))
+                }
                 _ => Err(protocol_error()
                     .with_operation("respond")
                     .with_agent_id(Some(agent_id))),
@@ -2071,7 +2114,7 @@ mod server {
         #[tool(
         name = "external_subagent_result",
         output_schema = tool_output_schema::<AgentResultOutput>(),
-        description = "Read a terminal task result with stable outcome, partial status, reason code, and bounded final-text segments. Returns null result while the task is non-terminal.",
+        description = "Read a terminal task result with stable outcome, partial status, reason code, and bounded final-text segments. Returns null result while the task is non-terminal. With request_id set, pages the stored question of that pending user-input request instead, using the same offset and limit continuation contract; continue from the next_offset carried by a wait projection's question page.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2085,8 +2128,16 @@ mod server {
         ) -> Result<Json<AgentResultOutput>, ToolError> {
             let agent_id =
                 internal_task_id(input.agent_id).map_err(|error| error.with_operation("result"))?;
-            let (task, result) = self.result(agent_id, input.offset, input.limit)?;
-            Ok(Json(AgentResultOutput { task, result }))
+            if let Some(request_id) = input.request_id.as_deref() {
+                if request_id.is_empty() || request_id.len() > 256 || request_id.contains('\0') {
+                    return Err(validation_error("request_id is invalid")
+                        .with_operation("result")
+                        .with_agent_id(Some(agent_id)));
+                }
+            }
+            let (task, result, question) =
+                self.result(agent_id, input.request_id, input.offset, input.limit)?;
+            Ok(Json(AgentResultOutput { task, result, question }))
         }
 
         #[tool(
@@ -2151,7 +2202,7 @@ mod server {
         use rmcp::ServiceExt;
         use sha2::{Digest, Sha256};
         use std::{
-            collections::{BTreeMap, HashSet},
+            collections::BTreeMap,
             path::PathBuf,
             sync::{
                 atomic::{AtomicBool, Ordering},
@@ -2173,12 +2224,24 @@ mod server {
 
             let wait: AgentWaitInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
-            assert_eq!(wait.after_revision, 0);
+            assert!(!wait.supports_answer);
             assert_eq!(wait.wait_time, 290);
             let immediate: AgentWaitInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000, "wait_time": 0}))
                     .unwrap();
             assert_eq!(immediate.wait_time, 0);
+            assert!(
+                serde_json::from_value::<AgentWaitInput>(serde_json::json!({
+                    "agent_id": 10000000, "after_revision": 0
+                }))
+                .is_err(),
+                "removed after_revision must be rejected"
+            );
+            let answering: AgentWaitInput = serde_json::from_value(serde_json::json!({
+                "agent_id": 10000000, "supports_answer": true
+            }))
+            .unwrap();
+            assert!(answering.supports_answer);
 
             let result: AgentResultInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
@@ -2294,13 +2357,16 @@ mod server {
             let response: serde_json::Value = serde_json::from_str(&response).unwrap();
             let wait = &response["result"]["structuredContent"];
             assert_eq!(response["id"], 2);
-            assert_eq!(wait["command_pending_approval"], true);
             assert_eq!(wait["timed_out"], false);
             assert_eq!(wait["pending_requests"][0]["kind"], "permission");
             assert_eq!(wait["pending_requests"][0]["state"], "pending");
             assert_eq!(wait["pending_requests"][0]["respondable"], true);
             assert_eq!(wait["pending_requests"][0]["tool_name"], "Read");
             assert_eq!(wait["pending_requests"][0]["operation"], "read");
+            assert!(wait["instruction"]
+                .as_str()
+                .expect("respond instruction")
+                .contains("external_subagent_respond"));
             serving.abort();
             let _ = serving.await;
         }
@@ -2422,26 +2488,33 @@ mod server {
             let _ = serving.await;
         }
 
-        #[test]
-        fn generated_message_ids_are_unique_across_facades_and_restart() {
-            let facade_a = SubagentMcp::new(PathBuf::from("/tmp/a.sock"), Duration::from_secs(1));
-            let facade_b = SubagentMcp::new(PathBuf::from("/tmp/b.sock"), Duration::from_secs(1));
-            let id_a = facade_a.generated_message_id();
-            let id_b = facade_b.generated_message_id();
-            let restarted = SubagentMcp::new(PathBuf::from("/tmp/a.sock"), Duration::from_secs(1));
-            let ids = [
-                id_a,
-                id_b,
-                restarted.generated_message_id(),
-                restarted.generated_message_id(),
-            ];
-            assert_eq!(ids.len(), ids.iter().collect::<HashSet<_>>().len());
-            assert_eq!(
-                restarted
-                    .next_request
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                1
+        #[tokio::test]
+        async fn send_without_message_id_returns_the_daemon_generated_id() {
+            let (_directory, service, id) = crate::rpc::wait_tests::fixture();
+            let facade = SubagentMcp::from_service(service);
+            let output = facade
+                .agent_send(rmcp::handler::server::wrapper::Parameters(AgentSendInput {
+                    agent_id: super::super::public_task_id(&id).unwrap(),
+                    message_id: None,
+                    content: "continue".into(),
+                }))
+                .await
+                .unwrap();
+            assert!(
+                output.0.message_id.starts_with("subagent-message-"),
+                "daemon must generate the id: {}",
+                output.0.message_id
             );
+            // An explicit id is echoed back and keeps idempotent retries.
+            let explicit = facade
+                .agent_send(rmcp::handler::server::wrapper::Parameters(AgentSendInput {
+                    agent_id: super::super::public_task_id(&id).unwrap(),
+                    message_id: Some("explicit-id".into()),
+                    content: "retry".into(),
+                }))
+                .await
+                .unwrap();
+            assert_eq!(explicit.0.message_id, "explicit-id");
         }
 
         #[test]
@@ -2511,28 +2584,26 @@ mod server {
 
         #[test]
         fn spawn_rpc_context_omits_the_preallocation_placeholder() {
-            let method = RpcMethod::SubmitGeneral {
-                input: GeneralSubmitInput {
-                    agent: Some("zcode".into()),
-                    model: None,
-                    manifest: external_core::GeneralTaskManifest {
-                        schema: external_core::GENERAL_TASK_SCHEMA.into(),
-                        agent_id: "daemon-prepared".into(),
-                        repository: PathBuf::from("/tmp/repository"),
-                        permission_mode: external_core::PermissionMode::Plan,
-                        prompt: "test".into(),
-                        write_manifest: Vec::new(),
-                    },
+            let method = RpcMethod::SubmitGeneral(GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: None,
+                manifest: external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: "daemon-prepared".into(),
+                    repository: PathBuf::from("/tmp/repository"),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "test".into(),
+                    write_manifest: Vec::new(),
                 },
-            };
+            });
             assert_eq!(rpc_context(&method), ("spawn", None));
         }
 
         #[test]
         fn legacy_daemon_status_keeps_readiness_and_real_facade_identity() {
             let status = SystemStatusView {
+                mcp_version: "0.1.0".into(),
                 api_surface: "generic_agent".into(),
-                protocol_version: 13,
                 service_generation: "legacy-generation".into(),
                 components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
                 capabilities: AgentCapabilitiesView {
@@ -2560,6 +2631,7 @@ mod server {
                 },
             };
             let output = SystemStatusOutput::from_view(status, facade);
+            assert_eq!(output.mcp_version, "0.1.0");
             assert!(matches!(
                 output.components.get("daemon"),
                 Some(super::PublicComponentState::Ready)
@@ -2567,6 +2639,7 @@ mod server {
             assert!(output.identity.daemon.is_none());
             assert!(output.identity.models.configured.is_none());
             let serialized = serde_json::to_value(output).unwrap();
+            assert_eq!(serialized["mcp_version"], "0.1.0");
             for removed in ["api_surface", "protocol_version", "service_generation"] {
                 assert!(serialized.get(removed).is_none());
             }
@@ -2677,6 +2750,7 @@ mod server {
                 "path":"/running/component"
             });
             let status = serde_json::json!({
+                "mcp_version":"0.1.0",
                 "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
                     "maturity":{},"observation":{"public_reasoning_default":true,
                         "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
@@ -2686,8 +2760,8 @@ mod server {
                     "models":{}}
             });
             let wait = serde_json::json!({
-                "task":task.clone(),"revision":0,"next_revision":0,"pending_requests":[],
-                "command_pending_approval":false,"result_available":false,"activity":activity,
+                "task":task.clone(),"pending_requests":[],
+                "result_available":false,"activity":activity,
                 "latest_progress":null,"result":null,"instruction":null,"timed_out":false
             });
             let successes = BTreeMap::from([
@@ -2716,7 +2790,7 @@ mod server {
                 ),
                 (
                     "external_subagent_result",
-                    serde_json::json!({"task":task.clone(),"result":null}),
+                    serde_json::json!({"task":task.clone(),"result":null,"question":null}),
                 ),
                 ("external_subagent_close", serde_json::json!({"task":task})),
             ]);

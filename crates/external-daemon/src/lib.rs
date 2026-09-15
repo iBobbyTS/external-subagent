@@ -2,9 +2,9 @@ use external_contract::{
     event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
     CreateSessionParams, ResumeSessionParams, RuntimePreferences, SendParams,
     SessionCreateProjection, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage,
-    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
-    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
-    SESSION_SUBSCRIBE,
+    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+    INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_REQUEST_RUNTIME_PREFERENCES,
+    SESSION_RESUME, SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE,
 };
 use external_runtime::{
     observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
@@ -876,6 +876,17 @@ impl RuntimeOwner {
         let id = serde_json::from_str::<WireId>(correlation_id).map_err(|_| {
             RuntimeCommandError::InvalidSession("stored request correlation is invalid".into())
         })?;
+        // Answerable user-input requests carry the answer as the plain
+        // JSON-RPC result; the driver already accepts arbitrary JSON results.
+        if decision == "answer" {
+            let answer = content
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(RuntimeCommandError::Unsupported)?;
+            return self
+                .driver
+                .respond_before(id, serde_json::Value::String(answer.to_owned()), deadline)
+                .map_err(RuntimeCommandError::from);
+        }
         if !matches!(decision, "allow" | "deny") {
             return Err(RuntimeCommandError::Unsupported);
         }
@@ -1764,7 +1775,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         for _ in 0..2 {
             assert_eq!(
                 scheduler
-                    .queue_message(&agent_id, "counted", "queue", "follow-up")
+                    .queue_message(&agent_id, "counted", "follow-up")
                     .unwrap(),
                 MessageDisposition::Queued
             );
@@ -1786,7 +1797,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert!(receipt.delivered_at.is_some());
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "counted", "queue", "follow-up")
+                .queue_message(&agent_id, "counted", "follow-up")
                 .unwrap(),
             MessageDisposition::AlreadyDelivered
         );
@@ -1807,6 +1818,84 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             scheduler.store().message("counted").unwrap().unwrap(),
             receipt
         );
+    }
+
+    #[test]
+    fn answerable_user_input_executes_answer_content_through_the_zcode_runtime_seam() {
+        let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        let directory = workspace.path().to_owned();
+        let script = format!(
+            r#"{RUNNING_PROTOCOL}
+printf '%s\n' '{{"id":"srv-input-1","method":"interaction/requestUserInput","params":{{"question":"which scope?"}}}}'
+read answer
+printf '%s\n' "$answer" >> deliveries.jsonl
+while [ ! -f release-turn ]; do sleep 0.01; done
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"answered with the release scope","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
+"#
+        );
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory =
+            Arc::new(CommandRuntimeFactory::new(move |_: &TaskRecord| {
+                let mut command = Command::new("sh");
+                command.args(["-c", &script]).current_dir(&directory);
+                Ok(command)
+            }));
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let request = {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(request) = scheduler.store().pending_requests(&agent_id).unwrap().first()
+                {
+                    assert_eq!(request.request_type, "user_input");
+                    assert_eq!(request.state, PendingRequestState::Pending);
+                    break request.clone();
+                }
+                assert!(Instant::now() < deadline, "user input never became pending");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Decision/type mismatches fail closed before the runtime seam.
+        for (decision, content) in [("allow", None), ("answer", Some("  "))] {
+            assert!(
+                scheduler
+                    .respond_request(&agent_id, &request.request_id, decision, content)
+                    .is_err(),
+                "{decision} must not execute against a user_input request"
+            );
+        }
+        assert_eq!(
+            scheduler
+                .respond_request(
+                    &agent_id,
+                    &request.request_id,
+                    "answer",
+                    Some("use the release scope")
+                )
+                .unwrap(),
+            ResponseOutcome {
+                disposition: ResponseDisposition::Responded,
+                requested_decision: "answer".into(),
+                effective_decision: "answer".into(),
+                policy_overrode: false,
+                policy_reason_code: None,
+            }
+        );
+        fs::write(workspace.path().join("release-turn"), "").unwrap();
+        assert_eq!(
+            await_result(&scheduler, &agent_id).result.final_text,
+            "answered with the release scope"
+        );
+        // The runtime received the answer as the plain JSON-RPC result.
+        let deliveries = fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+        let answer: serde_json::Value = serde_json::from_str(
+            deliveries
+                .lines()
+                .find(|line| line.contains("srv-input-1"))
+                .expect("runtime never observed the answer frame"),
+        )
+        .unwrap();
+        assert_eq!(answer["id"], "srv-input-1");
+        assert_eq!(answer["result"], "use the release scope");
     }
 
     #[test]
@@ -1837,7 +1926,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                 )
                 .unwrap());
             scheduler
-                .queue_message(&agent_id, "unknown", "queue", "never replay")
+                .queue_message(&agent_id, "unknown", "never replay")
                 .unwrap();
             assert_eq!(
                 store.claim_next_message(&agent_id).unwrap().unwrap().state,
@@ -2055,7 +2144,7 @@ sleep 2
             ("different-agent", "original"),
         ] {
             let error = scheduler
-                .queue_message(agent, "existing", "queue", content)
+                .queue_message(agent, "existing", content)
                 .unwrap_err();
             assert!(
                 matches!(error, SchedulerError::Store(StoreError::Conflict(ref message)) if message == "MESSAGE_ID_CONFLICT")
@@ -2067,7 +2156,7 @@ sleep 2
         assert_eq!(message.state, MessageState::Queued);
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "existing", "queue", "original")
+                .queue_message(&agent_id, "existing", "original")
                 .unwrap(),
             MessageDisposition::Queued
         );

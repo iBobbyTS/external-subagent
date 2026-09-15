@@ -3,7 +3,6 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { CliError } from './errors.mjs';
 
-export const RPC_VERSION = 13;
 export const MAX_FRAME_BYTES = 512 * 1024;
 export const MAX_RESPONSE_FRAME_BYTES = 2 * 1024 * 1024;
 export const MAX_RESULT_CHUNK_BYTES = 256 * 1024;
@@ -81,6 +80,12 @@ function manifest(input) {
   };
 }
 
+function rejectUnknownFields(command, input, allowed) {
+  for (const key of Object.keys(input)) {
+    if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `${command} contains unsupported field: ${key}`, 2);
+  }
+}
+
 function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
@@ -88,17 +93,31 @@ function methodFor(command, input) {
     case 'drain-status': return { method: 'daemon_drain_status' };
     case 'drain-abort': return { method: 'daemon_abort_drain' };
     case 'activate-ready': return { method: 'daemon_activate_ready' };
-    case 'agent-probe': return { method: 'agent_probe', params: { input } };
-    case 'agent-models': return { method: 'agent_models', params: { input } };
+    case 'agent-probe': return { method: 'agent_probe', params: input };
+    case 'agent-models': return { method: 'agent_models', params: input };
     case 'create': case 'spawn': return {
       method: 'submit_general',
-      params: { input: {
+      params: {
         ...(input.agent !== undefined ? { agent: input.agent } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
         manifest: manifest(input),
-      } },
+      },
     };
-    case 'wait': return { method: 'task_wait', params: { agent_id: daemonTaskId(input.agent_id), after_revision: input.after_revision ?? 0, wait_time: input.wait_time ?? 290, ...(input.message_id ? { message_id: input.message_id } : {}) } };
+    case 'wait': {
+      rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id', 'supports_answer']));
+      if (input.supports_answer !== undefined && typeof input.supports_answer !== 'boolean') {
+        throw new CliError('INVALID_ARGUMENT', 'supports_answer must be a boolean', 2);
+      }
+      return {
+        method: 'task_wait',
+        params: {
+          agent_id: daemonTaskId(input.agent_id),
+          wait_time: input.wait_time ?? 290,
+          ...(input.message_id ? { message_id: input.message_id } : {}),
+          ...(input.supports_answer !== undefined ? { supports_answer: input.supports_answer } : {}),
+        },
+      };
+    }
     case 'list': {
       const allowed = new Set(['agent', 'repository', 'workspace', 'phase', 'outcome', 'cursor', 'limit']);
       for (const key of Object.keys(input)) {
@@ -118,10 +137,31 @@ function methodFor(command, input) {
         limit: input.limit ?? 100,
       } };
     }
-    case 'send': return { method: 'task_message', params: { agent_id: daemonTaskId(input.agent_id), message_id: input.message_id || requestId(), mode: input.mode || 'queue', content: input.content } };
-    case 'respond': return { method: 'task_respond', params: { agent_id: daemonTaskId(input.agent_id), request_id: input.request_id, decision: input.decision, content: input.reason ?? input.content ?? null } };
+    case 'send': {
+      rejectUnknownFields('send', input, new Set(['agent_id', 'message_id', 'content']));
+      return { method: 'task_message', params: {
+        agent_id: daemonTaskId(input.agent_id),
+        ...(input.message_id ? { message_id: input.message_id } : {}),
+        content: input.content,
+      } };
+    }
+    case 'respond': {
+      rejectUnknownFields('respond', input, new Set(['agent_id', 'request_id', 'decision', 'content']));
+      return { method: 'task_respond', params: { agent_id: daemonTaskId(input.agent_id), request_id: input.request_id, decision: input.decision, content: input.content ?? null } };
+    }
     case 'cancel': return { method: 'task_cancel', params: { agent_id: daemonTaskId(input.agent_id) } };
-    case 'result': return { method: 'task_result', params: { agent_id: daemonTaskId(input.agent_id), offset: input.offset ?? 0, limit: input.limit ?? MAX_RESULT_CHUNK_BYTES } };
+    case 'result': {
+      rejectUnknownFields('result', input, new Set(['agent_id', 'request_id', 'offset', 'limit']));
+      if (input.request_id !== undefined && (typeof input.request_id !== 'string' || input.request_id.length === 0)) {
+        throw new CliError('INVALID_ARGUMENT', 'request_id must be a non-empty string', 2);
+      }
+      return { method: 'task_result', params: {
+        agent_id: daemonTaskId(input.agent_id),
+        ...(input.request_id !== undefined ? { request_id: input.request_id } : {}),
+        offset: input.offset ?? 0,
+        limit: input.limit ?? MAX_RESULT_CHUNK_BYTES,
+      } };
+    }
     case 'close': return { method: 'task_close', params: { agent_id: daemonTaskId(input.agent_id) } };
     case 'observe': return { method: 'task_observe', params: { agent_id: daemonTaskId(input.agent_id) } };
     default: throw new CliError('UNKNOWN_COMMAND', `unsupported daemon command: ${command}`, 2);
@@ -166,6 +206,17 @@ function publicResult(result) {
   };
 }
 
+function publicQuestion(question) {
+  if (question == null) return null;
+  return {
+    text: question.text,
+    offset: question.offset,
+    total_bytes: question.total_bytes,
+    next_offset: question.next_offset ?? null,
+    complete: question.complete,
+  };
+}
+
 export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
@@ -176,14 +227,13 @@ export function projectDaemonResult(command, result) {
       return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, phase: result.task.phase };
     case 'wait': {
       const { latest_progress, result: taskResult, task, activity, kind: _kind, ...rest } = result;
-      const { latest_progress: _activityProgress, ...publicActivity } = activity;
-      return { ...rest, task: publicTask(task), activity: publicActivity, latest_progress, result: publicResult(taskResult) };
+      return { ...rest, task: publicTask(task), activity, latest_progress, result: publicResult(taskResult) };
     }
     case 'list': return { tasks: result.tasks.map(publicTask), next_cursor: result.next_cursor ?? null };
-    case 'send': return { disposition: result.disposition };
+    case 'send': return { message_id: result.message_id, disposition: result.disposition };
     case 'respond': return { ...result.outcome, policy_reason_code: result.outcome.policy_reason_code ?? null };
     case 'cancel': case 'close': return { task: publicTask(result.task) };
-    case 'result': return { task: publicTask(result.task), result: publicResult(result.result) };
+    case 'result': return { task: publicTask(result.task), result: publicResult(result.result), question: publicQuestion(result.question) };
     case 'observe': return { ...result.observation, agent_id: publicTaskId(result.observation.agent_id) };
     default: throw new CliError('PROTOCOL_ERROR', `daemon returned an unsupported result for ${command}`);
   }
@@ -193,7 +243,7 @@ export function callDaemon(socketPath, command, input, timeoutMs) {
   const { method, params } = methodFor(command, input);
   const effectiveTimeoutMs = timeoutMs ?? daemonTransportTimeoutMs(command, params);
   const request_id = requestId();
-  const request = JSON.stringify({ version: RPC_VERSION, request_id, method, params }) + '\n';
+  const request = JSON.stringify({ request_id, method, params }) + '\n';
   if (Buffer.byteLength(request, 'utf8') > MAX_FRAME_BYTES) {
     throw new CliError('OVERSIZED', 'encoded RPC request exceeds frame cap', 2);
   }
@@ -220,7 +270,7 @@ export function callDaemon(socketPath, command, input, timeoutMs) {
       clearTimeout(timer);
       try {
         const response = JSON.parse(line);
-        if (response.version !== RPC_VERSION || response.request_id !== request_id) finish(reject, new CliError('PROTOCOL_ERROR', 'daemon returned an RPC response for a different version or request'));
+        if (response.request_id !== request_id) finish(reject, new CliError('PROTOCOL_ERROR', 'daemon returned an RPC response for a different request'));
         else if (response.outcome === 'error') { const daemon = response.error || {}; const error = new CliError(daemon.code || 'DAEMON_ERROR', daemon.message || 'daemon request failed'); error.agentId = daemon.active_agent_id == null ? undefined : publicTaskId(daemon.active_agent_id); error.daemonResponded = true; finish(reject, error); }
         else if (response.outcome === 'success') {
           try {
