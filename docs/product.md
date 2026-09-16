@@ -45,6 +45,8 @@ external-subagent close --json '{"agent_id":10000000}'
 
 ## Codex plugin 与 MCP
 
+完整工具与字段说明见 [MCP 工具与字段设计说明](mcp-api.md)，包含每个参数的使用时机、必填条件、默认值和省略／移除影响。
+
 初始化或显式执行 `install-plugin` 会调用官方 Codex CLI，将 plugin 安装到 `$CODEX_HOME/plugins/cache`，并通过本地 marketplace 注册。plugin 的 MCP server 使用绝对路径连接产品 facade；当前公开工具包括 `external_subagent_spawn`、`wait`、`result`、`close`、`cancel`、`send`、`respond`、`observe`、`list` 和 `status`。
 
 plugin manifest 的 `version` 是 Codex 全局 content-store 的缓存身份（`plugin@marketplace@version`），每个发布候选必须携带独立版本（最终候选 C2 为 `0.1.2`；修复前的 C1 是 `0.1.1`，两次消费运行已分别把各自身份写入全局 store，后续候选同样需要再提升版本），否则已缓存同一身份的其他 home 会覆盖新候选的字节。C2 已于 2026-09-13 完成自己的 fresh consumer 验收（`C2_FRESH_CONSUMER_VERIFICATION_PASS`）：通过公开安装面装入隔离 prefix，`install-plugin` 回执 `cache_verified: true` 且 cache 与 staged binding 逐字节一致，四格矩阵（DSH/ZCode × 公开 CLI / 真实 Codex CLI→受管 plugin→MCP）全部真实上游任务 COMPLETED；C1 的四格证据保留为该候选的历史记录，不随身份提升继承。安装器在返回成功前会读回实际 cache 的 `.mcp.json`/manifest 并与本次 staged binding 比对：复用了其他 binding 的字节以 `CODEX_CACHE_BINDING_MISMATCH` 显式失败，cache 缺失或不可读以 `CODEX_CACHE_UNVERIFIABLE` 显式失败（均 fail-closed——不存在返回 `installed`/`cache_verified: false` 的路径，cache 缺失本身就使整个安装失败）；只有校验通过的 cache 才会以 `cache_verified: true` 返回并记录 installed/claimed/updated，且安装器从不改动 Codex cache 本身；详见 [compatibility/codex.md](compatibility/codex.md)。

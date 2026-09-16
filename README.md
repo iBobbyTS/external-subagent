@@ -53,6 +53,9 @@ behavior, the Codex homes registry, backup/removal, and release checks; and
 codex-cli interface. See [docs/product.md](docs/product.md) for the product
 workflow, provider configuration, and CLI/MCP acceptance boundary.
 
+See [docs/mcp-api.md](docs/mcp-api.md) for the complete MCP tool reference,
+field usage, defaults, design rationale, and omission/removal impacts.
+
 ## Development
 
 ```
