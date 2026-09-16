@@ -52,7 +52,7 @@
     },
     "agent_scope_status": {
       "type": "object",
-      "required": ["state", "scope"],
+      "required": ["state", "scope", "checked_at_ms"],
       "properties": {
         "state": { "enum": ["READY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"] },
         "scope": {
@@ -64,7 +64,7 @@
           "additionalProperties": false
         },
         "version": { "type": "string", "minLength": 1 },
-        "checked_at_ms": { "type": "integer", "minimum": 0 },
+        "checked_at_ms": { "type": ["integer", "null"], "minimum": 0 },
         "reason": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false

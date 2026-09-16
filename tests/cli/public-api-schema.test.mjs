@@ -24,6 +24,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.deepEqual(schema.properties.agent_status.properties.transport_support.properties.transport.enum, [
     'zcode_app_server', 'dsh_acp', 'codex_app_server',
   ]);
+  assert.deepEqual(schema.properties.agent_scope_status.required, ['state', 'scope', 'checked_at_ms']);
+  assert.deepEqual(schema.properties.agent_scope_status.properties.checked_at_ms.type, ['integer', 'null']);
   assert.deepEqual(schema.properties.agent_status.properties.model_selection.properties.mode.enum, [
     'native_only', 'catalog_token',
   ]);

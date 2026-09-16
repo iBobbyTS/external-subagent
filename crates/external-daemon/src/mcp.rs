@@ -893,7 +893,6 @@ mod server {
         pub scope: PublicProbeScope,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub version: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         pub checked_at_ms: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub reason: Option<String>,

@@ -237,8 +237,8 @@ test('agents status projects daemon evidence and rejects absent identities', asy
       permission_modes: ['build', 'edit', 'plan', 'yolo'],
       model_selection: { supported: false, mode: 'native_only' },
       local: { state: 'READY', version: '1.2.3', checked_at_ms: 10, scope: {} },
-      auth: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
-      hi: { state: 'UNKNOWN', reason: 'not_probed', scope: {} },
+      auth: { state: 'UNKNOWN', checked_at_ms: null, scope: {} },
+      hi: { state: 'UNKNOWN', checked_at_ms: null, scope: {} },
     }],
   };
   const options = { socket: '/socket', callDaemon: async (socket, command, input) => {

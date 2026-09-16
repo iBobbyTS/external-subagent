@@ -14,18 +14,23 @@ export function stopDaemon(paths) {
   return bootoutService(paths);
 }
 
-export function localInstallStatus(paths) {
+export function localInstallStatus(paths, { verbose = false } = {}) {
   let payload = { status: 'unverified' };
   try { payload = verifyPayload(); } catch (error) {
     payload = { status: 'invalid', error: { code: error.code || 'PAYLOAD_INVALID', message: error.message } };
   }
   const registry = loadCodexHomes(paths);
+  const publicPayload = verbose
+    ? payload
+    : { status: payload.status, platform: payload.platform, version: payload.version };
   return {
     installed: fs.existsSync(paths.state),
     launch_agent: fs.existsSync(paths.launchAgent),
     data: fs.existsSync(paths.data),
-    payload,
-    codex_homes: registry.registry.homes.map((entry) => ({ home: entry.home, version: entry.version, last_status: entry.last_status })),
-    ...(registry.recovery ? { codex_homes_recovery: registry.recovery } : {}),
+    payload: publicPayload,
+    // Home paths are installation internals; status reports only the
+    // aggregate binding state. Detailed paths remain available to diagnose.
+    codex_homes: registry.registry.homes.map((entry) => ({ version: entry.version, last_status: entry.last_status })),
+    ...(verbose && registry.recovery ? { codex_homes_recovery: registry.recovery } : {}),
   };
 }

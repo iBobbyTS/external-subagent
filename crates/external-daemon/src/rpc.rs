@@ -552,7 +552,6 @@ pub struct AgentScopeStatusView {
     pub scope: ProbeScope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -1789,11 +1788,15 @@ fn current_scope(
 }
 
 fn stale_scope(value: &ScopeEvidence) -> AgentScopeStatusView {
+    let was_checked = value
+        .reason
+        .as_deref()
+        .map_or(true, |reason| !reason.contains("not_probed"));
     AgentScopeStatusView {
         state: ComponentStateView::Unknown,
         scope: value.scope.clone(),
         version: value.version.clone(),
-        checked_at_ms: Some(value.checked_at_ms),
+        checked_at_ms: was_checked.then_some(value.checked_at_ms),
         reason: Some("stale_config_revision".into()),
     }
 }
@@ -1804,11 +1807,15 @@ fn unprobed_scope() -> AgentScopeStatusView {
         scope: ProbeScope::default(),
         version: None,
         checked_at_ms: None,
-        reason: Some("not_probed".into()),
+        reason: None,
     }
 }
 
 fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
+    let was_checked = value
+        .reason
+        .as_deref()
+        .map_or(true, |reason| !reason.contains("not_probed"));
     AgentScopeStatusView {
         state: match value.state {
             EvidenceState::Ready => ComponentStateView::Ready,
@@ -1818,8 +1825,14 @@ fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
         },
         scope: value.scope.clone(),
         version: value.version.clone(),
-        checked_at_ms: Some(value.checked_at_ms),
-        reason: value.reason.clone(),
+        checked_at_ms: was_checked.then_some(value.checked_at_ms),
+        // `*_not_probed` is an internal derivation detail. Public status
+        // conveys whether a scope was checked via state + timestamp instead.
+        reason: value
+            .reason
+            .as_deref()
+            .filter(|reason| !reason.contains("not_probed"))
+            .map(str::to_owned),
     }
 }
 
@@ -5150,12 +5163,31 @@ mod agent_probe_tests {
                 checked_at_ms: 123,
                 reason: None,
             };
+            let unknown_auth = ScopeEvidence {
+                state: EvidenceState::Unknown,
+                scope: input.scope.clone(),
+                version: None,
+                checked_at_ms: 123,
+                reason: Some("auth_not_probed".into()),
+            };
+            let unknown_hi = ScopeEvidence {
+                state: EvidenceState::Unknown,
+                scope: input.scope.clone(),
+                version: None,
+                checked_at_ms: 123,
+                reason: Some("hi_not_probed".into()),
+            };
+            let (local, auth, hi) = match input.through {
+                crate::agent_status::ProbeLayer::Local => (ready.clone(), unknown_auth, unknown_hi),
+                crate::agent_status::ProbeLayer::Auth => (ready.clone(), ready.clone(), unknown_hi),
+                crate::agent_status::ProbeLayer::Hi => (ready.clone(), ready.clone(), ready),
+            };
             AgentProbeEvidence {
                 agent: input.agent.clone(),
                 config_revision: 0,
-                local: ready.clone(),
-                auth: ready.clone(),
-                hi: ready,
+                local,
+                auth,
+                hi,
             }
         }
     }
@@ -5194,7 +5226,22 @@ mod agent_probe_tests {
             panic!("expected status")
         };
         assert_eq!(status.agents[0].local.state, ComponentStateView::Unknown);
-        assert_eq!(status.agents[0].local.reason.as_deref(), Some("not_probed"));
+        assert_eq!(status.agents[0].local.reason, None);
+        assert_eq!(status.agents[0].local.checked_at_ms, None);
+
+        let RpcSuccess::AgentProbed { status, .. } = service
+            .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
+                agent: "zcode".into(),
+                through: crate::agent_status::ProbeLayer::Local,
+                scope: ProbeScope::default(),
+            }))
+            .unwrap()
+        else {
+            panic!("expected local probe")
+        };
+        assert_eq!(status.local.checked_at_ms, Some(123));
+        assert_eq!(status.auth.checked_at_ms, None);
+        assert_eq!(status.hi.checked_at_ms, None);
 
         let scope = ProbeScope {
             workspace: Some("/workspace-a".into()),

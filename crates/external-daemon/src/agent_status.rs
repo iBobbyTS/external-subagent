@@ -170,10 +170,24 @@ impl AgentEvidenceStore {
     pub fn probe(&self, input: &AgentProbeInput, config_revision: u64) -> AgentProbeEvidence {
         let mut evidence = self.backend.probe(input);
         evidence.config_revision = config_revision;
-        self.latest
-            .lock()
-            .unwrap()
-            .insert(input.agent.clone(), evidence.clone());
+        let mut latest = self.latest.lock().unwrap();
+        if let Some(previous) = latest.get(&input.agent).cloned() {
+            // A scoped probe must not erase evidence from layers it did not
+            // actually inspect. The backend uses `through` to indicate the
+            // highest layer requested; local is always refreshed as the
+            // prerequisite for auth/hi probes.
+            match input.through {
+                ProbeLayer::Local => {
+                    evidence.auth = preserved_or_stale(previous.auth, &input.scope, previous.config_revision, config_revision);
+                    evidence.hi = preserved_or_stale(previous.hi, &input.scope, previous.config_revision, config_revision);
+                }
+                ProbeLayer::Auth => {
+                    evidence.hi = preserved_or_stale(previous.hi, &input.scope, previous.config_revision, config_revision);
+                }
+                ProbeLayer::Hi => {}
+            }
+        }
+        latest.insert(input.agent.clone(), evidence.clone());
         evidence
     }
 
@@ -185,6 +199,33 @@ impl AgentEvidenceStore {
         let mut output = self.backend.models(input);
         output.config_revision = config_revision;
         output
+    }
+}
+
+fn preserved_or_stale(
+    value: ScopeEvidence,
+    current_scope: &ProbeScope,
+    previous_revision: u64,
+    current_revision: u64,
+) -> ScopeEvidence {
+    if previous_revision == current_revision && value.scope == *current_scope {
+        return value;
+    }
+    if previous_revision == current_revision {
+        return ScopeEvidence {
+            state: EvidenceState::Unknown,
+            scope: current_scope.clone(),
+            version: None,
+            checked_at_ms: value.checked_at_ms,
+            reason: Some("not_probed".into()),
+        };
+    }
+    ScopeEvidence {
+        state: EvidenceState::Unknown,
+        scope: value.scope,
+        version: value.version,
+        checked_at_ms: value.checked_at_ms,
+        reason: Some("stale_config_revision".into()),
     }
 }
 
@@ -1592,8 +1633,17 @@ mod tests {
     }
 
     impl AgentProbeBackend for FixtureBackend {
-        fn probe(&self, _input: &AgentProbeInput) -> AgentProbeEvidence {
-            self.evidence.clone()
+        fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
+            let mut evidence = self.evidence.clone();
+            let checked = match input.through {
+                ProbeLayer::Local => 10,
+                ProbeLayer::Auth => 20,
+                ProbeLayer::Hi => 30,
+            };
+            evidence.local.checked_at_ms = checked;
+            evidence.auth.checked_at_ms = checked;
+            evidence.hi.checked_at_ms = checked;
+            evidence
         }
     }
 
@@ -1637,6 +1687,42 @@ mod tests {
         assert_eq!(observed.local.scope, scope);
         assert_eq!(store.latest("zcode"), Some(observed));
         assert_eq!(store.latest("dsh"), None);
+    }
+
+    #[test]
+    fn scoped_probe_preserves_unchecked_layers_and_stale_revision_is_projected_unknown() {
+        let store = AgentEvidenceStore::with_backend(Arc::new(FixtureBackend {
+            evidence: evidence(ProbeScope::default()),
+        }));
+        let scope = ProbeScope::default();
+        let hi = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: scope.clone() }, 7);
+        assert_eq!(hi.hi.checked_at_ms, 30);
+        let local = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: scope.clone() }, 7);
+        assert_eq!(local.local.checked_at_ms, 10);
+        assert_eq!(local.auth.checked_at_ms, 30);
+        assert_eq!(local.hi.checked_at_ms, 30);
+        let auth = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Auth, scope }, 7);
+        assert_eq!(auth.auth.checked_at_ms, 20);
+        assert_eq!(auth.hi.checked_at_ms, 30);
+        assert_eq!(auth.config_revision, 7);
+
+        let hi_again = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: ProbeScope::default() }, 7);
+        assert_eq!(hi_again.hi.checked_at_ms, 30);
+        let revision_changed = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: ProbeScope::default() }, 8);
+        assert_eq!(revision_changed.config_revision, 8);
+        assert_eq!(revision_changed.auth.state, EvidenceState::Unknown);
+        assert_eq!(revision_changed.hi.state, EvidenceState::Unknown);
+        assert_eq!(revision_changed.auth.reason.as_deref(), Some("stale_config_revision"));
+        assert_eq!(revision_changed.hi.reason.as_deref(), Some("stale_config_revision"));
+
+        let scope_a = ProbeScope { workspace: Some("/a".into()), home: Some("/ha".into()), ..ProbeScope::default() };
+        let scope_b = ProbeScope { workspace: Some("/b".into()), home: Some("/hb".into()), ..ProbeScope::default() };
+        let _ = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: scope_a }, 9);
+        let across_scope = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: scope_b }, 9);
+        assert_eq!(across_scope.auth.state, EvidenceState::Unknown);
+        assert_eq!(across_scope.hi.state, EvidenceState::Unknown);
+        assert_eq!(across_scope.auth.reason.as_deref(), Some("not_probed"));
+        assert_eq!(across_scope.hi.reason.as_deref(), Some("not_probed"));
     }
 
     #[test]

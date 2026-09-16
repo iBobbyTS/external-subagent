@@ -36,6 +36,36 @@ function output(valueToWrite) {
   process.stdout.write(`${JSON.stringify({ ok: true, product: PRODUCT_NAME, ...valueToWrite }, null, 2)}\n`);
 }
 
+function summarizeAgentStatus(agent) {
+  if (!agent || typeof agent !== 'object') return agent;
+  const scopes = {};
+  for (const scope of ['local', 'auth', 'hi']) {
+    if (agent[scope] && typeof agent[scope] === 'object') {
+      scopes[scope] = {
+        state: agent[scope].state ?? 'UNKNOWN',
+        checked_at_ms: agent[scope].checked_at_ms ?? null,
+      };
+    }
+  }
+  return {
+    agent: agent.agent,
+    configured: agent.configured,
+    enabled: agent.enabled,
+    spawn_supported: agent.spawn_supported,
+    ...scopes,
+  };
+}
+
+function publicDaemonStatus(status, { verbose = false } = {}) {
+  if (!status || typeof status !== 'object') return status;
+  if (verbose) return status;
+  return {
+    ...(status.mcp_version === undefined ? {} : { mcp_version: status.mcp_version }),
+    ...(status.components === undefined ? {} : { components: status.components }),
+    ...(Array.isArray(status.agents) ? { agents: status.agents.map(summarizeAgentStatus) } : {}),
+  };
+}
+
 const DIAGNOSTIC_TAIL_BYTES = 16 * 1024;
 const DIAGNOSTIC_TOTAL_BYTES = 32 * 1024;
 const DIAGNOSTIC_LOG_NAMES = ['daemon.log', 'daemon-error.log'];
@@ -296,7 +326,7 @@ async function diagnose(paths, args) {
 export async function main(args) {
   const command = args[0] || 'help';
   if (command === 'help' || command === '--help' || command === '-h') {
-    process.stdout.write(HELP + DAEMON_HELP); return;
+    process.stdout.write(HELP.replace('status, diagnose            Inspect local service and runtime state', 'status [--verbose]          Inspect essential service and runtime state\n  diagnose                    Export bounded diagnostic details') + DAEMON_HELP); return;
   }
   if (command === 'version' || command === '--version' || command === '-v') {
     process.stdout.write(`${VERSION}\n`); return;
@@ -341,13 +371,17 @@ export async function main(args) {
     output(mcpCommand(paths, args.slice(1))); return;
   }
   if (command === 'status') {
-    const local = localInstallStatus(paths);
+    const verbose = args.includes('--verbose');
+    const local = localInstallStatus(paths, { verbose });
     // `service` is the read-only launchd view (registered job + process);
     // `daemon_status` stays the RPC view, so a loaded-but-unready or
     // ready-but-unregistered install reads differently instead of blurring.
-    const service = serviceRegistrationStatus();
+    const serviceRaw = serviceRegistrationStatus();
+    // PID is an implementation detail and may be reused by another process;
+    // keep it out of the ordinary status projection.
+    const { pid: _pid, ...service } = serviceRaw;
     try {
-      output({ ...local, service, daemon_status: await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}) });
+      output({ ...local, service, daemon_status: publicDaemonStatus(await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}), { verbose }) });
     } catch (error) {
       output({ ...local, service, daemon_status: null, daemon_error: { code: error.code || 'DAEMON_ERROR', message: error.message } });
     }
@@ -392,4 +426,4 @@ export async function main(args) {
   output({ command, result });
 }
 
-export { DAEMON_HELP, HELP, installPlan, diagnose, diagnosticLogs, fileArtifact };
+export { DAEMON_HELP, HELP, installPlan, diagnose, diagnosticLogs, fileArtifact, publicDaemonStatus, summarizeAgentStatus };

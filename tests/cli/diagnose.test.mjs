@@ -4,7 +4,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { diagnose, diagnosticLogs, fileArtifact } from '../../cli/main.mjs';
+import { diagnose, diagnosticLogs, fileArtifact, publicDaemonStatus } from '../../cli/main.mjs';
 
 function pathsFor(home) {
   return {
@@ -37,6 +37,24 @@ test('artifact identity hashes only its labeled file and records source and capt
   assert.equal(identity.captured_at_ms, 17);
   assert.equal(identity.sha256, 'cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4');
   assert.notEqual(identity.sha256, fileArtifact(packaged, 'distributed_payload', 18).sha256);
+});
+
+test('ordinary status projection keeps essential daemon state while verbose keeps diagnostics', () => {
+  const status = {
+    mcp_version: '0.1.0',
+    components: { daemon: 'READY' },
+    service_generation: 'generation-secret',
+    capabilities: { max_rpc_request_frame_bytes: 524288 },
+    agents: [{ agent: 'zcode', configured: true, enabled: true, spawn_supported: true, permission_modes: ['yolo'], local: { state: 'UNKNOWN', checked_at_ms: null } }],
+    identity: { daemon: { artifact: { path: '/private/daemon', sha256: 'secret-hash' } } },
+  };
+  assert.deepEqual(publicDaemonStatus(status), {
+    mcp_version: '0.1.0',
+    components: { daemon: 'READY' },
+    agents: [{ agent: 'zcode', configured: true, enabled: true, spawn_supported: true, local: { state: 'UNKNOWN', checked_at_ms: null } }],
+  });
+  assert.deepEqual(publicDaemonStatus(status, { verbose: true }), status);
+  assert.ok(status.identity, 'projection must not mutate the RPC diagnostic view');
 });
 
 test('diagnose preserves daemon self identity and does not promote packaged facade to running', async () => {
