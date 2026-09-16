@@ -993,21 +993,37 @@ impl Store {
         })
     }
 
+    /// Explicit terminal-send resume admission. The full durable
+    /// eligibility check and the requeue state update share one immediate
+    /// transaction, so a concurrent close or cancel that committed first can
+    /// never be overwritten by a later resume. Returns `Ok(false)` without
+    /// mutating anything when the durable state refuses the resume: a
+    /// cancelled outcome, a stop/close request, a closed task, or a
+    /// persisted old process identity whose process group was not proven
+    /// reaped (`reaped_at` stays the only durable reap proof, so the old
+    /// PID/PGID is preserved for recovery instead of being cleared).
     pub fn requeue_task_for_resume_with_message(
         &self,
         agent_id: &str,
         message_id: &str,
         content: &str,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<bool> {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (phase, session_id, workspace_path, owner_epoch): (
+        let (phase, session_id, workspace_path, owner_epoch, outcome, stop_requested, close_requested, closed_at, pid, reaped_at): (
             TaskPhase,
             Option<String>,
             String,
             i64,
+            Option<TaskOutcome>,
+            bool,
+            bool,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
         ) = transaction.query_row(
-            "SELECT phase,zcode_session_id,workspace_path,owner_epoch
+            "SELECT phase,zcode_session_id,workspace_path,owner_epoch,outcome,
+                    stop_requested,close_requested,closed_at,pid,reaped_at
              FROM tasks WHERE agent_id=?1",
             [agent_id],
             |row| {
@@ -1022,6 +1038,20 @@ impl Store {
                     row.get(1)?,
                     row.get(2)?,
                     row.get(3)?,
+                    row.get::<_, Option<String>>(4)?.map(|value| TaskOutcome::parse(&value))
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                    row.get::<_, i64>(5)? != 0,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
                 ))
             },
         )?;
@@ -1034,6 +1064,16 @@ impl Store {
             return Err(StoreError::InvalidState(
                 "task has no persisted session id to resume".into(),
             ));
+        }
+        if outcome == Some(TaskOutcome::Cancelled)
+            || stop_requested
+            || close_requested
+            || closed_at.is_some()
+        {
+            return Ok(false);
+        }
+        if pid.is_some() && reaped_at.is_none() {
+            return Ok(false);
         }
         if let Some(active_agent_id) = transaction
             .query_row(
@@ -1093,7 +1133,7 @@ impl Store {
             params![message_id, agent_id, content, now_millis()],
         )?;
         transaction.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn reap_task(&self, agent_id: &str) -> StoreResult<TaskOutcome> {

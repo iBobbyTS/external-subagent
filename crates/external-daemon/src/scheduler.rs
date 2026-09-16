@@ -1650,7 +1650,11 @@ impl Scheduler {
     /// cancellation or close — requeues through the existing store path; a
     /// later claim spawns a fresh app-server, resumes the same thread, and
     /// starts exactly one new turn with the queued message. The interrupted
-    /// pre-crash turn is never replayed.
+    /// pre-crash turn is never replayed. The durable eligibility check and
+    /// the requeue state update share one store transaction, so a close or
+    /// cancel that committed first is never overwritten, and a task whose
+    /// old process group was not proven reaped keeps its persisted process
+    /// identity instead of being resumed.
     fn resume_terminal_with_message(
         &self,
         agent_id: &str,
@@ -1664,6 +1668,9 @@ impl Scheduler {
             .ok_or_else(|| SchedulerError::Store(StoreError::InvalidState(format!(
                 "unknown task {agent_id}"
             ))))?;
+        // The prepared route is immutable, so this precheck only refuses
+        // early; every durable field is re-checked inside the requeue
+        // transaction before any state changes.
         let eligible = task_agent(&task) == "codex"
             && task.zcode_session_id.as_deref().is_some_and(|id| {
                 !id.is_empty() && id.len() <= 512
@@ -1678,9 +1685,16 @@ impl Scheduler {
                 message: "TERMINAL_SEND_UNSUPPORTED".into(),
             });
         }
-        self.inner
+        if !self
+            .inner
             .store
-            .requeue_task_for_resume_with_message(agent_id, message_id, content)?;
+            .requeue_task_for_resume_with_message(agent_id, message_id, content)?
+        {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "TERMINAL_SEND_UNSUPPORTED".into(),
+            });
+        }
         // The daemon claim loop performs the spawn: requeueing inside this
         // control operation must never block on bootstrap deadlines.
         Ok(MessageDisposition::Queued)
