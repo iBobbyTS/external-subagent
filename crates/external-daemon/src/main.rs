@@ -1,4 +1,5 @@
 use external_daemon::{
+    codex::{CodexRuntimeFactory, resolve_codex_home},
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
     rpc::ServerOptions,
@@ -39,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = config.agent_config.as_ref() {
         env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
         configure_dsh_environment(Some(path));
+        configure_codex_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
     wait_for_startup_test_gate(&shutdown_requested)?;
@@ -55,8 +57,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         DshRuntimeFactory::closed()
     };
-    let runtime_factory: Arc<dyn RuntimeFactory> =
-        Arc::new(RoutingRuntimeFactory::new(zcode, dsh_factory));
+    let codex_factory = if codex_production_enabled(config.agent_config.as_deref()) {
+        CodexRuntimeFactory::enabled()
+    } else {
+        CodexRuntimeFactory::closed()
+    };
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::with_codex(
+        zcode,
+        dsh_factory,
+        codex_factory,
+    ));
     let scheduler = Scheduler::new(
         format!("agentd-{}", std::process::id()),
         store,
@@ -151,6 +161,82 @@ fn configure_dsh_environment(path: Option<&Path>) {
             env::set_var(variable, value);
         }
     }
+}
+
+/// Export the persisted Codex launch contract into the daemon environment.
+/// `agents.codex.home` is only exported when configured, so an inherited
+/// `CODEX_HOME` stays the deliberate second-priority source and the factory
+/// rejects any launch with neither (never `~/.codex`).
+fn configure_codex_environment(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    let Ok(bytes) = fs::read(path) else { return };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return;
+    };
+    let Some(entry) = value.pointer("/agents/codex") else {
+        return;
+    };
+    if let Some(runtime) = entry
+        .get("runtime_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        env::set_var("CODEX_RUNTIME_PATH", runtime);
+    }
+    let configured_home = entry.get("home").and_then(serde_json::Value::as_str);
+    let inherited_home = env::var_os("CODEX_HOME");
+    match resolve_codex_home(
+        configured_home,
+        inherited_home
+            .as_ref()
+            .map(|value| value.to_string_lossy().into_owned())
+            .as_deref(),
+    ) {
+        Some(Ok(home)) => env::set_var("CODEX_HOME", home),
+        // An invalid configured home fails closed: clear any inherited value
+        // so the spawn gate rejects instead of silently downgrading to it.
+        Some(Err(_)) => env::remove_var("CODEX_HOME"),
+        // An absent home simply leaves nothing exported for the same gate.
+        None => {}
+    }
+}
+
+fn codex_production_enabled(path: Option<&Path>) -> bool {
+    let Some(path) = path else { return false };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    let configured = value.pointer("/agents/codex");
+    configured
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && configured
+            .and_then(|entry| entry.get("spawn_supported"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && configured
+            .and_then(|entry| entry.get("runtime_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new)
+            .is_some_and(|runtime| {
+                runtime.is_absolute()
+                    && runtime.is_file()
+                    && {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::metadata(runtime)
+                                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            true
+                        }
+                    }
+            })
 }
 
 fn production_scheduler_config(runtime_source: Option<PathBuf>) -> SchedulerConfig {
@@ -293,6 +379,79 @@ mod tests {
         );
         assert_eq!(production.stop_grace, defaults.stop_grace);
         assert!(production.runtime_source.is_none());
+    }
+
+    #[test]
+    fn codex_production_gate_requires_enabled_spawn_and_pinned_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("codex-runtime");
+        std::fs::File::create(&runtime)
+            .unwrap()
+            .write_all(b"runtime")
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let config_path = directory.path().join("config.json");
+        let base = serde_json::json!({"agents":{"codex":{
+            "enabled":true,"spawn_supported":true,
+            "runtime_path":runtime,"home":"/persisted/codex-home"}}});
+        std::fs::write(&config_path, serde_json::to_vec(&base).unwrap()).unwrap();
+        assert!(codex_production_enabled(Some(&config_path)));
+        for field in ["enabled", "spawn_supported"] {
+            let mut value = base.clone();
+            value["agents"]["codex"][field] = serde_json::json!(false);
+            std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(!codex_production_enabled(Some(&config_path)));
+        }
+        let mut relative = base.clone();
+        relative["agents"]["codex"]["runtime_path"] =
+            serde_json::json!("relative/codex");
+        std::fs::write(&config_path, serde_json::to_vec(&relative).unwrap()).unwrap();
+        assert!(!codex_production_enabled(Some(&config_path)));
+        assert!(!codex_production_enabled(None));
+    }
+
+    #[test]
+    fn codex_environment_exports_configured_home_over_inherited() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({"agents":{"codex":{
+                "runtime_path":"/opt/codex","home":"/persisted/codex-home"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let previous = env::var_os("CODEX_RUNTIME_PATH");
+        let previous_home = env::var_os("CODEX_HOME");
+        env::set_var("CODEX_RUNTIME_PATH", "/opt/codex");
+        env::set_var("CODEX_HOME", "/inherited/codex-home");
+        configure_codex_environment(Some(&config_path));
+        assert_eq!(env::var_os("CODEX_HOME").unwrap(), "/persisted/codex-home");
+        // An invalid configured home clears the inherited value so the spawn
+        // gate fails closed instead of downgrading to it.
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({"agents":{"codex":{
+                "runtime_path":"/opt/codex","home":"relative-home"}}}))
+            .unwrap(),
+        )
+        .unwrap();
+        configure_codex_environment(Some(&config_path));
+        assert_eq!(env::var_os("CODEX_HOME"), None);
+        match previous {
+            Some(value) => env::set_var("CODEX_RUNTIME_PATH", value),
+            None => env::remove_var("CODEX_RUNTIME_PATH"),
+        }
+        match previous_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@
       "type": "object",
       "required": ["agent", "config_revision", "configured", "enabled", "spawn_supported", "transport_support", "permission_modes", "model_selection", "local", "auth", "hi"],
       "properties": {
-        "agent": { "enum": ["zcode", "dsh"] },
+        "agent": { "enum": ["zcode", "dsh", "codex"] },
         "config_revision": { "type": "integer", "minimum": 0 },
         "configured": { "type": "boolean" },
         "enabled": { "type": "boolean" },
@@ -24,7 +24,7 @@
           "type": "object",
           "required": ["transport", "probe", "spawn"],
           "properties": {
-            "transport": { "enum": ["zcode_app_server", "dsh_acp"] },
+            "transport": { "enum": ["zcode_app_server", "dsh_acp", "codex_app_server"] },
             "probe": { "type": "boolean" },
             "spawn": { "type": "boolean" }
           },

@@ -822,6 +822,7 @@ mod server {
     pub enum PublicAgentTransport {
         ZcodeAppServer,
         DshAcp,
+        CodexAppServer,
     }
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -860,6 +861,7 @@ mod server {
             match value {
                 AgentTransportView::ZcodeAppServer => Self::ZcodeAppServer,
                 AgentTransportView::DshAcp => Self::DshAcp,
+                AgentTransportView::CodexAppServer => Self::CodexAppServer,
             }
         }
     }

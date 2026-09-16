@@ -202,7 +202,7 @@ test('human config and agents forms execute instead of falling through to JSON d
   assert.equal(JSON.parse(get.stdout).value, 'zcode');
   const list = await runCli(home, socket, ['agents', 'list']);
   assert.equal(list.code, 0, list.stderr);
-  assert.deepEqual(JSON.parse(list.stdout).agents.map((agent) => agent.agent), ['zcode', 'dsh']);
+  assert.deepEqual(JSON.parse(list.stdout).agents.map((agent) => agent.agent), ['zcode', 'dsh', 'codex']);
   const models = await withServer(socket, () => ({ outcome: 'success', result: {
     kind: 'agent_models', catalog: { agent: 'zcode', scope: {}, models: [], supported: false },
   } }), () => runCli(home, socket, ['agents', 'models', 'zcode']));

@@ -197,14 +197,19 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let checked_at_ms = wall_now_millis();
         let mut scope = input.scope.clone();
         if scope.home.is_none() {
-            let variable = if input.agent == "dsh" {
-                "DSH_HOME"
-            } else {
-                "ZCODE_HOME"
+            let variable = match input.agent.as_str() {
+                "dsh" => "DSH_HOME",
+                // Codex never falls back to ~/.codex: only an explicit home
+                // (persisted configuration or exported CODEX_HOME) counts.
+                "codex" if env::var_os("CODEX_HOME").is_some() => "CODEX_HOME",
+                _ => "ZCODE_HOME",
             };
-            scope.home = env::var_os(variable)
-                .or_else(|| env::var_os("HOME"))
-                .map(|value| value.to_string_lossy().into_owned());
+            scope.home = if variable == "CODEX_HOME" {
+                env::var_os(variable)
+            } else {
+                env::var_os(variable).or_else(|| env::var_os("HOME"))
+            }
+            .map(|value| value.to_string_lossy().into_owned());
         }
         let disposable_workspace = if input.agent == "zcode"
             && input.through == ProbeLayer::Hi
@@ -228,6 +233,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
         let executable = match input.agent.as_str() {
             "zcode" => self.runtime_source.clone(),
             "dsh" => env::var_os("DSH_RUNTIME_PATH").map(PathBuf::from),
+            "codex" => env::var_os("CODEX_RUNTIME_PATH").map(PathBuf::from),
             _ => None,
         };
         let local = probe_local(executable.as_deref(), scope.clone(), checked_at_ms);
@@ -284,6 +290,11 @@ impl AgentProbeBackend for ProcessProbeBackend {
     fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
         if input.agent == "zcode" {
             return unsupported_models(input, "native_only");
+        }
+        if input.agent == "codex" {
+            // The Codex catalog was observed only through the controlled live
+            // probe; no in-band catalog claim is made here.
+            return unsupported_models(input, "codex_models_probed_live_only");
         }
         probe_dsh_models(
             env::var_os("DSH_RUNTIME_PATH")
@@ -402,10 +413,10 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
         supported: false,
         models: Vec::new(),
         evidence: ModelCatalogEvidence {
-            source: if input.agent == "zcode" {
-                "zcode_native_model".into()
-            } else {
-                "dsh_acp_models_list".into()
+            source: match input.agent.as_str() {
+                "zcode" => "zcode_native_model".into(),
+                "codex" => "codex_app_server_model_list".into(),
+                _ => "dsh_acp_models_list".into(),
             },
             version: None,
             scope: input.scope.clone(),

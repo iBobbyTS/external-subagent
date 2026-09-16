@@ -18,7 +18,7 @@ test('config has no default and lists layered agent support', async () => {
   const { paths } = fixture();
   const listed = await agentsCommand(paths);
   assert.equal(listed.default_agent, null);
-  assert.deepEqual(listed.agents.map((agent) => [agent.agent, agent.spawn_supported]), [['zcode', true], ['dsh', false]]);
+  assert.deepEqual(listed.agents.map((agent) => [agent.agent, agent.spawn_supported]), [['zcode', true], ['dsh', false], ['codex', false]]);
 });
 
 test('zcode model is rejected before prompt and dsh remains discovery-only', () => {
@@ -46,6 +46,41 @@ test('LaunchAgent captures configured DSH runtime and home for GUI services', ()
   assert.match(plist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/runtime with spaces<\/string>/u);
   assert.match(plist, /<key>DSH_HOME<\/key><string>\/var\/lib\/dsh profile<\/string>/u);
   assert.match(plist, /<key>DSH_PROFILE<\/key><string>acp<\/string>/u);
+});
+
+test('codex config persists runtime, home, and default model through every path', () => {
+  const { paths } = fixture();
+  const config = configCommand(paths, { operation: 'set', patch: { agents: { codex: {
+    enabled: true, spawn_supported: true, default_model: 'gpt-5.6-terra',
+    runtime_path: '/opt/homebrew/bin/codex', home: '/Users/fixture/.codex-multi-2',
+  } } } }).config;
+  assert.equal(config.agents.codex.enabled, true);
+  assert.equal(config.agents.codex.spawn_supported, true);
+  assert.equal(config.agents.codex.default_model, 'gpt-5.6-terra');
+  // Human key paths and unset restore the disabled defaults.
+  configCommand(paths, parseConfigArgs(['set', 'agents.codex.home', '/tmp/other-home']));
+  assert.equal(readConfig(paths.config).agents.codex.home, '/tmp/other-home');
+  assert.deepEqual(
+    configCommand(paths, parseConfigArgs(['unset', 'agents.codex.home'])).config.agents.codex,
+    { enabled: true, spawn_supported: true, default_model: 'gpt-5.6-terra', runtime_path: '/opt/homebrew/bin/codex', home: null, profile: null, version: null },
+  );
+  // Unknown agents stay rejected.
+  assert.throws(() => parseConfigArgs(['set', 'agents.other.enabled', 'true']), (error) => error.code === 'INVALID_ARGUMENT');
+});
+
+test('LaunchAgent forwards the persisted Codex runtime and home exactly', () => {
+  const { paths } = fixture();
+  configCommand(paths, { operation: 'set', patch: { agents: { codex: {
+    runtime_path: '/opt/homebrew/bin/codex with space', home: '/Users/fixture/.codex-multi & 2',
+  } } } });
+  const plist = launchAgentPlist(paths).toString('utf8');
+  assert.match(plist, /<key>CODEX_RUNTIME_PATH<\/key><string>\/opt\/homebrew\/bin\/codex with space<\/string>/u);
+  assert.match(plist, /<key>CODEX_HOME<\/key><string>\/Users\/fixture\/\.codex-multi &amp; 2<\/string>/u);
+  // Without persisted values the plist forwards neither entry.
+  const bare = fixture();
+  const barePlist = launchAgentPlist(bare.paths).toString('utf8');
+  assert.doesNotMatch(barePlist, /CODEX_RUNTIME_PATH/u);
+  assert.doesNotMatch(barePlist, /CODEX_HOME/u);
 });
 
 test('config writes a revision and keeps existing task snapshots independent', () => {

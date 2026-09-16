@@ -37,6 +37,7 @@ use activity_parser::{
     parse_passive_activity, ActivitySample, ActivitySampleKind, ActivitySource, ActivityTransition,
 };
 pub mod agent_status;
+pub mod codex;
 pub mod dsh;
 mod lifecycle_sink;
 pub mod mcp;

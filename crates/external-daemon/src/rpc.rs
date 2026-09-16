@@ -427,6 +427,7 @@ pub struct AgentStatusView {
 pub enum AgentTransportView {
     ZcodeAppServer,
     DshAcp,
+    CodexAppServer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -515,6 +516,18 @@ impl Default for AgentConfigSnapshot {
                 ),
                 (
                     "dsh".into(),
+                    AgentConfigEntry {
+                        enabled: false,
+                        spawn_supported: false,
+                        default_model: None,
+                        runtime_path: None,
+                        home: None,
+                        profile: None,
+                        version: None,
+                    },
+                ),
+                (
+                    "codex".into(),
                     AgentConfigEntry {
                         enabled: false,
                         spawn_supported: false,
@@ -1124,7 +1137,7 @@ impl RpcService {
             }
             RpcMethod::TaskList(query) => {
                 if let Some(agent) = query.agent.as_deref() {
-                    if !matches!(agent, "zcode" | "dsh") {
+                    if !matches!(agent, "zcode" | "dsh" | "codex") {
                         return Err(RpcError::new(
                             RpcErrorCode::AgentUnknown,
                             "agent is unknown",
@@ -1587,7 +1600,7 @@ fn configured_agent_statuses(
     config: &AgentConfigSnapshot,
     evidence: &AgentEvidenceStore,
 ) -> Vec<AgentStatusView> {
-    ["zcode", "dsh"]
+    ["zcode", "dsh", "codex"]
         .into_iter()
         .map(|agent| {
             let entry = &config.agents[agent];
@@ -1610,7 +1623,7 @@ fn configured_agent_statuses(
 }
 
 fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
-    ["zcode", "dsh"]
+    ["zcode", "dsh", "codex"]
         .into_iter()
         .map(|agent| AgentStatusView {
             agent: agent.into(),
@@ -1651,41 +1664,68 @@ fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
 }
 
 fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
-    if agent != "dsh" {
-        return entry.enabled && entry.spawn_supported;
+    if agent == "dsh" {
+        return entry.enabled
+            && entry.spawn_supported
+            && entry.profile.as_deref() == Some("acp")
+            && entry.version.as_deref() == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
+            && entry
+                .runtime_path
+                .as_deref()
+                .map(Path::new)
+                .is_some_and(|path| {
+                    path.is_absolute()
+                        && fs::metadata(path).is_ok_and(|m| {
+                            m.is_file() && {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    m.permissions().mode() & 0o111 != 0
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    true
+                                }
+                            }
+                        })
+                });
     }
-    entry.enabled
-        && entry.spawn_supported
-        && entry.profile.as_deref() == Some("acp")
-        && entry.version.as_deref() == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
-        && entry
-            .runtime_path
-            .as_deref()
-            .map(Path::new)
-            .is_some_and(|path| {
-                path.is_absolute()
-                    && fs::metadata(path).is_ok_and(|m| {
-                        m.is_file() && {
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                m.permissions().mode() & 0o111 != 0
+    if agent == "codex" {
+        // The Codex gate pins the persisted runtime executable only; the home
+        // precedence (agents.codex.home over inherited CODEX_HOME) is enforced
+        // at admission and spawn so no launch ever falls back to ~/.codex.
+        return entry.enabled
+            && entry.spawn_supported
+            && entry
+                .runtime_path
+                .as_deref()
+                .map(Path::new)
+                .is_some_and(|path| {
+                    path.is_absolute()
+                        && fs::metadata(path).is_ok_and(|m| {
+                            m.is_file() && {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    m.permissions().mode() & 0o111 != 0
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    true
+                                }
                             }
-                            #[cfg(not(unix))]
-                            {
-                                true
-                            }
-                        }
-                    })
-            })
+                        })
+                });
+    }
+    entry.enabled && entry.spawn_supported
 }
 
 fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {
     AgentTransportSupportView {
-        transport: if agent == "zcode" {
-            AgentTransportView::ZcodeAppServer
-        } else {
-            AgentTransportView::DshAcp
+        transport: match agent {
+            "zcode" => AgentTransportView::ZcodeAppServer,
+            "codex" => AgentTransportView::CodexAppServer,
+            _ => AgentTransportView::DshAcp,
         },
         probe: true,
         spawn: effective_spawn_supported(agent, entry),
@@ -1704,6 +1744,13 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
             AgentPermissionModeView::Plan,
         ];
     }
+    if agent == "codex" {
+        // Codex admission is deliberately read-only: plan maps to
+        // sandbox=read-only with approvalPolicy=never. The write modes stay
+        // refused before the prompt until an equivalent workspace-write
+        // confinement is proven.
+        return vec![AgentPermissionModeView::Plan];
+    }
     vec![
         AgentPermissionModeView::Build,
         AgentPermissionModeView::Edit,
@@ -1720,7 +1767,8 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
         }
     } else {
         AgentModelSelectionCapabilityView {
-            supported: agent == "dsh" && effective_spawn_supported(agent, entry),
+            supported: matches!(agent, "dsh" | "codex")
+                && effective_spawn_supported(agent, entry),
             mode: AgentModelSelectionModeView::CatalogToken,
         }
     }
@@ -1776,7 +1824,7 @@ fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
 }
 
 fn validate_agent_probe_input(input: &AgentProbeInput) -> Result<(), RpcError> {
-    if !matches!(input.agent.as_str(), "zcode" | "dsh") {
+    if !matches!(input.agent.as_str(), "zcode" | "dsh" | "codex") {
         return Err(RpcError::new(
             RpcErrorCode::AgentUnknown,
             "agent is unknown",
@@ -1878,6 +1926,31 @@ fn resolve_admission(
             }
             None => (None, "native"),
         }
+    } else if agent == "codex" {
+        // Explicit submit model, then the configured default. Absence is
+        // rejected: the daemon never silently picks a provider-default model.
+        let token = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .or_else(|| configured.default_model.as_deref().map(str::trim));
+        let Some(token) = token else {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "codex requires an explicit model or agents.codex.default_model; prompt_count=0",
+            ));
+        };
+        if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "model token is not a bounded non-empty string",
+            ));
+        }
+        if input.model.is_some() {
+            (Some(token.to_owned()), "spawn_catalog")
+        } else {
+            (Some(token.to_owned()), "configured_default")
+        }
     } else {
         (None, "native")
     };
@@ -1895,6 +1968,29 @@ fn resolve_admission(
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
                 "dsh first-launch admission requires the caller-empty write manifest; prompt_count=0",
+            ));
+        }
+    }
+    if agent == "codex" {
+        // Codex admission is read-only: plan maps to sandbox=read-only with
+        // approvalPolicy=never. build/edit/yolo are refused before the prompt
+        // because the native workspace-write policy is not proven equivalent
+        // to this daemon's protected workspace confinement.
+        if !matches!(
+            input.manifest.permission_mode,
+            external_core::PermissionMode::Plan
+        ) {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "codex admission supports only the plan permission mode; prompt_count=0",
+            ));
+        }
+        // Home precedence is agents.codex.home over the inherited CODEX_HOME;
+        // neither being present rejects before the prompt, never ~/.codex.
+        if configured.home.is_none() && env::var_os("CODEX_HOME").is_none() {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "codex home is unconfigured; prompt_count=0",
             ));
         }
     }
@@ -1939,7 +2035,7 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
     if snapshot
         .agents
         .keys()
-        .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh"))
+        .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh" | "codex"))
     {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
@@ -4326,6 +4422,136 @@ mod admission_tests {
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentUnsupported
+        );
+    }
+
+    fn codex_gate_config(directory: &std::path::Path) -> AgentConfigSnapshot {
+        let runtime = directory.join("codex-runtime");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let mut config = AgentConfigSnapshot::default();
+        let codex = config.agents.get_mut("codex").unwrap();
+        codex.enabled = true;
+        codex.spawn_supported = true;
+        codex.runtime_path = Some(runtime.to_string_lossy().into_owned());
+        codex.home = Some(directory.join("codex-home").to_string_lossy().into_owned());
+        config
+    }
+
+    fn codex_input(
+        directory: &std::path::Path,
+        mode: external_core::PermissionMode,
+    ) -> GeneralSubmitInput {
+        GeneralSubmitInput {
+            agent: Some("codex".into()),
+            model: Some("gpt-5.6-terra".into()),
+            manifest: GeneralTaskManifest {
+                schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                agent_id: "codex-gate-test".into(),
+                repository: directory.into(),
+                permission_mode: mode,
+                prompt: "test".into(),
+                write_manifest: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn codex_admission_accepts_plan_only_with_a_model_and_configured_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = codex_gate_config(directory.path());
+        let input = codex_input(directory.path(), external_core::PermissionMode::Plan);
+        let identity = resolve_admission(&input, &config).unwrap();
+        assert_eq!(identity.agent, "codex");
+        assert_eq!(identity.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+
+        // The configured default is an equally valid selection.
+        let mut default_model_input = codex_input(directory.path(), external_core::PermissionMode::Plan);
+        default_model_input.model = None;
+        let mut defaulted = config.clone();
+        defaulted.agents.get_mut("codex").unwrap().default_model =
+            Some("gpt-5.6-terra".into());
+        let identity = resolve_admission(&default_model_input, &defaulted).unwrap();
+        assert_eq!(identity.model_source, "configured_default");
+
+        // Absent model is rejected instead of silently choosing a provider default.
+        let unconfigured = config.clone();
+        let error = resolve_admission(&default_model_input, &unconfigured).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert!(error.message.contains("agents.codex.default_model"));
+
+        // Every write mode is refused before the prompt.
+        for mode in [
+            external_core::PermissionMode::Build,
+            external_core::PermissionMode::Edit,
+            external_core::PermissionMode::Yolo,
+        ] {
+            let error = resolve_admission(
+                &codex_input(directory.path(), mode),
+                &config,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
+            assert!(error.message.contains("only the plan permission mode"));
+        }
+
+        // No home from either source rejects before the prompt.
+        let env_guard = static_env_guard().lock().unwrap();
+        let previous_home = env::var_os("CODEX_HOME");
+        env::remove_var("CODEX_HOME");
+        let mut homeless = config.clone();
+        homeless.agents.get_mut("codex").unwrap().home = None;
+        let error =
+            resolve_admission(&codex_input(directory.path(), external_core::PermissionMode::Plan), &homeless)
+                .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
+        assert!(error.message.contains("codex home is unconfigured"));
+        // An inherited CODEX_HOME is the accepted second-priority source.
+        env::set_var("CODEX_HOME", "/inherited/codex-home");
+        assert!(
+            resolve_admission(&codex_input(directory.path(), external_core::PermissionMode::Plan), &homeless).is_ok()
+        );
+        match previous_home {
+            Some(value) => env::set_var("CODEX_HOME", value),
+            None => env::remove_var("CODEX_HOME"),
+        }
+        drop(env_guard);
+
+        // The runtime-path gate still fails closed.
+        let mut ungated = config.clone();
+        ungated.agents.get_mut("codex").unwrap().runtime_path = None;
+        assert_eq!(
+            resolve_admission(&codex_input(directory.path(), external_core::PermissionMode::Plan), &ungated)
+                .unwrap_err()
+                .code,
+            RpcErrorCode::AgentUnsupported
+        );
+
+        // Capability projection is plan-only over the codex transport.
+        let evidence = AgentEvidenceStore::new(None);
+        let status = configured_agent_statuses(&config, &evidence)
+            .into_iter()
+            .find(|status| status.agent == "codex")
+            .unwrap();
+        assert_eq!(
+            status.transport_support.transport,
+            AgentTransportView::CodexAppServer
+        );
+        assert!(status.transport_support.spawn);
+        assert_eq!(status.permission_modes, vec![AgentPermissionModeView::Plan]);
+        assert_eq!(
+            status.model_selection,
+            AgentModelSelectionCapabilityView {
+                supported: true,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            }
         );
     }
 

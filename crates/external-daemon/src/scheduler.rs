@@ -1604,10 +1604,7 @@ impl Scheduler {
             .get_task(agent_id)?
             .is_some_and(|task| task.phase == TaskPhase::Terminal)
         {
-            return Err(SchedulerError::RuntimeCommand {
-                agent_id: agent_id.into(),
-                message: "TERMINAL_SEND_UNSUPPORTED".into(),
-            });
+            return self.resume_terminal_with_message(agent_id, message_id, content);
         }
         let active = self.active_session(agent_id);
         let operation = active
@@ -1645,6 +1642,47 @@ impl Scheduler {
                 },
             );
         }
+        Ok(MessageDisposition::Queued)
+    }
+
+    /// The explicit recovery trigger for a terminal Codex task. Only an
+    /// eligible terminal Codex task — a persisted thread id and no
+    /// cancellation or close — requeues through the existing store path; a
+    /// later claim spawns a fresh app-server, resumes the same thread, and
+    /// starts exactly one new turn with the queued message. The interrupted
+    /// pre-crash turn is never replayed.
+    fn resume_terminal_with_message(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<MessageDisposition, SchedulerError> {
+        let task = self
+            .inner
+            .store
+            .get_task(agent_id)?
+            .ok_or_else(|| SchedulerError::Store(StoreError::InvalidState(format!(
+                "unknown task {agent_id}"
+            ))))?;
+        let eligible = task_agent(&task) == "codex"
+            && task.zcode_session_id.as_deref().is_some_and(|id| {
+                !id.is_empty() && id.len() <= 512
+            })
+            && task.outcome != Some(TaskOutcome::Cancelled)
+            && !task.stop_requested
+            && !task.close_requested
+            && task.closed_at.is_none();
+        if !eligible {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "TERMINAL_SEND_UNSUPPORTED".into(),
+            });
+        }
+        self.inner
+            .store
+            .requeue_task_for_resume_with_message(agent_id, message_id, content)?;
+        // The daemon claim loop performs the spawn: requeueing inside this
+        // control operation must never block on bootstrap deadlines.
         Ok(MessageDisposition::Queued)
     }
 
