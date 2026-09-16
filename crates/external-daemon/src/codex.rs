@@ -291,6 +291,7 @@ const MAX_ITEM_TEXT_BYTES: usize = 512 * 1024;
 const MAX_TRACKED_ITEMS: usize = 128;
 const MAX_TURN_FAILURE_DETAIL_BYTES: usize = 512;
 const MAX_MCP_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+const MAX_RETIRED_TURNS: usize = 64;
 
 struct CodexShared {
     publisher: Arc<Publisher>,
@@ -299,6 +300,8 @@ struct CodexShared {
     admitted_model: Mutex<Option<String>>,
     diagnostic_session_id: Mutex<Option<String>>,
     current_turn: Mutex<Option<String>>,
+    retired_turns: Mutex<Vec<String>>,
+    start_in_flight: AtomicBool,
     last_message_item: Mutex<Option<String>>,
     items: Mutex<HashMap<String, String>>,
     turn_failure: Mutex<Option<String>>,
@@ -393,6 +396,25 @@ impl CodexShared {
         }
     }
 
+    /// A turn that reached its terminal boundary is retired: its identity
+    /// can never become current again. Late or duplicate `turn/started`
+    /// frames for a retired turn stay diagnostic observations instead of
+    /// reopening a closed boundary.
+    fn retire_turn(&self, turn_id: &str) {
+        let mut retired = self.retired_turns.lock().unwrap();
+        if !retired.iter().any(|id| id == turn_id) {
+            if retired.len() >= MAX_RETIRED_TURNS {
+                retired.remove(0);
+            }
+            retired.push(turn_id.to_owned());
+        }
+        *self.current_turn.lock().unwrap() = None;
+    }
+
+    fn turn_is_retired(&self, turn_id: &str) -> bool {
+        self.retired_turns.lock().unwrap().iter().any(|id| id == turn_id)
+    }
+
     /// One inbound Codex notification, normalized. Returns `None` when the
     /// frame was fully projected into canonical events; otherwise the
     /// original frame is re-emitted unchanged as a diagnostic observation.
@@ -446,6 +468,18 @@ impl CodexShared {
                     // A started while a turn is already active is a late
                     // replay or duplicate: it must never re-open the active
                     // boundary or reset this turn's recorded state.
+                    return true;
+                }
+                if self.turn_is_retired(turn_id) {
+                    // A completed or failed turn stays closed: a late or
+                    // duplicate started for it must not reactivate the old
+                    // identity after its boundary was projected.
+                    return true;
+                }
+                if !self.start_in_flight.load(Ordering::Acquire) {
+                    // A started for an unknown turn with no start request in
+                    // flight is unsolicited replay traffic; it must not
+                    // reopen a boundary either.
                     return true;
                 }
                 *self.current_turn.lock().unwrap() = Some(turn_id.to_owned());
@@ -549,6 +583,7 @@ impl CodexShared {
                         let boundary = self.canonical_event(params.clone());
                         self.emit_canonical(params);
                         self.turn_tracker.observe(&boundary);
+                        self.retire_turn(&current);
                         self.emit_lifecycle("turn.completed");
                         false
                     }
@@ -565,6 +600,7 @@ impl CodexShared {
                         let boundary = self.canonical_event(params.clone());
                         self.emit_canonical(params);
                         self.turn_tracker.observe(&boundary);
+                        self.retire_turn(&current);
                         self.emit_lifecycle("turn.failed");
                         false
                     }
@@ -673,6 +709,8 @@ impl CodexRuntimeOwner {
             admitted_model: Mutex::new(None),
             diagnostic_session_id: Mutex::new(None),
             current_turn: Mutex::new(None),
+            retired_turns: Mutex::new(Vec::new()),
+            start_in_flight: AtomicBool::new(false),
             last_message_item: Mutex::new(None),
             items: Mutex::new(HashMap::new()),
             turn_failure: Mutex::new(None),
@@ -839,11 +877,20 @@ impl CodexRuntimeOwner {
         // turn is trusted: read-only sandbox, never-approve policy, and the
         // persisted task workspace. An unconfirmed or divergent posture
         // fails closed instead of resuming with write capability.
-        if resume_thread_field(&result, "sandbox").and_then(|value| value.as_str())
-            != Some("read-only")
-        {
+        //
+        // The live probe resolves the resumed sandbox as the object
+        // `{"type":"readOnly","networkAccess":false}`; only that exact
+        // read-only posture is accepted. Request-time string presets, any
+        // write mode, an unknown representation, or a network-capable
+        // sandbox are all unconfirmed and fail closed.
+        let sandbox_confirmed = resume_thread_field(&result, "sandbox").is_some_and(|value| {
+            value.get("type").and_then(|mode| mode.as_str()) == Some("readOnly")
+                && value.get("networkAccess").and_then(|access| access.as_bool())
+                    == Some(false)
+        });
+        if !sandbox_confirmed {
             return Err(RuntimeCommandError::InvalidSession(
-                "resume sandbox was not confirmed as read-only".into(),
+                "resume sandbox was not confirmed as the read-only object".into(),
             ));
         }
         if resume_thread_field(&result, "approvalPolicy").and_then(|value| value.as_str())
@@ -876,16 +923,39 @@ impl CodexRuntimeOwner {
             "effort": "low",
             "input": [{"type": "text", "text": input}],
         });
+        // A started notification is attributable only while the start
+        // request it answers is in flight; the flag closes on every exit so
+        // a later replay cannot pose as the expected notification.
+        self.shared.start_in_flight.store(true, Ordering::Release);
+        let started = self.drive_start_turn(params, previous, deadline);
+        self.shared.start_in_flight.store(false, Ordering::Release);
+        started
+    }
+
+    fn drive_start_turn(
+        &self,
+        params: serde_json::Value,
+        previous: u64,
+        deadline: Instant,
+    ) -> Result<Option<String>, RuntimeCommandError> {
         let response = self
             .driver
             .request("turn/start", params, remaining_time(deadline)?)?;
-        let turn_id = response
+        // The response must name the turn it started: a missing or unbounded
+        // id cannot be reconciled with the started notification, so the
+        // start fails closed instead of adopting an unverified turn.
+        let Some(turn_id) = response
             .result
             .as_ref()
             .and_then(|result| result.pointer("/turn/id"))
             .and_then(|value| value.as_str())
             .filter(|id| !id.is_empty() && id.len() <= 512)
-            .map(str::to_owned);
+            .map(str::to_owned)
+        else {
+            return Err(RuntimeCommandError::InvalidSession(
+                "turn/start response is missing a bounded turn id".into(),
+            ));
+        };
         self.shared
             .turn_tracker
             .wait_started_after(previous, remaining_time(deadline)?)?;
@@ -893,15 +963,13 @@ impl CodexRuntimeOwner {
         // the start response; a mismatch means stale or foreign traffic won
         // the boundary race and the start fails closed instead of adopting
         // an unverified turn.
-        if let Some(response_turn) = turn_id.as_deref() {
-            let started = self.shared.current_turn.lock().unwrap().clone();
-            if started.as_deref() != Some(response_turn) {
-                return Err(RuntimeCommandError::InvalidSession(
-                    "turn/start response turn id does not match the started turn".into(),
-                ));
-            }
+        let started = self.shared.current_turn.lock().unwrap().clone();
+        if started.as_deref() != Some(turn_id.as_str()) {
+            return Err(RuntimeCommandError::InvalidSession(
+                "turn/start response turn id does not match the started turn".into(),
+            ));
         }
-        Ok(turn_id)
+        Ok(Some(turn_id))
     }
 
     fn finish_process(&self, grace: Duration, boundary: Option<TurnBoundary>) -> RuntimeTerminal {
@@ -1508,7 +1576,7 @@ printf '%s\n' "$line" >> deliveries-resume.jsonl
 printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries-resume.jsonl
-printf '%s\n' "{\"id\":2,\"result\":{\"thread\":{\"id\":\"codex-thread-1\",\"ephemeral\":false,\"sandbox\":\"read-only\",\"approvalPolicy\":\"never\",\"cwd\":\"$(pwd)\"},\"model\":\"gpt-5.6-terra\"}}"
+printf '%s\n' "{\"id\":2,\"result\":{\"thread\":{\"id\":\"codex-thread-1\",\"ephemeral\":false},\"model\":\"gpt-5.6-terra\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"approvalPolicy\":\"never\",\"cwd\":\"$(pwd)\"}}"
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries-resume.jsonl
 IFS= read -r line
@@ -2505,6 +2573,96 @@ sleep 1
         );
     }
 
+    #[test]
+    fn turn_start_response_without_a_turn_id_fails_closed() {
+        let _guard = scripted_test_guard();
+        let workspace = codex_workspace();
+        // The start response omits its turn id; even a well-formed started
+        // notification cannot reconcile an unacknowledged turn.
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}'
+sleep 1
+"#;
+        let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "anonymous turn"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.task.agent_id.clone();
+        assert!(
+            scheduler.start_ready().is_err(),
+            "a start response without a turn id must fail closed"
+        );
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        let record = scheduler.last_error(&agent_id).expect("failure record");
+        assert!(
+            record.contains("missing a bounded turn id"),
+            "record: {record}"
+        );
+    }
+
+    #[test]
+    fn completed_turn_cannot_be_reopened_by_late_or_duplicate_started() {
+        let _guard = scripted_test_guard();
+        let workspace = codex_workspace();
+        // After the turn completes, the server replays a duplicate started
+        // for the finished turn, a stale started for an older turn, late
+        // turn-scoped traffic, and a duplicate completion. None of it may
+        // reactivate the retired turn or touch the stored result.
+        let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"LATE_DELTA"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"LATE_ITEM"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+while IFS= read -r line; do :; done
+"#;
+        let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "late replay probe"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.task.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+        assert_eq!(
+            result.result.final_text, "CODEX_OK",
+            "late traffic must not rewrite the completed turn's result"
+        );
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+        assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+        assert!(
+            scheduler.last_error(&agent_id).is_none(),
+            "late replays must not label a failure: {:?}",
+            scheduler.last_error(&agent_id)
+        );
+    }
+
     struct TwoPhaseFactory {
         first: Mutex<Option<CodexRuntimeFactory>>,
         second: CodexRuntimeFactory,
@@ -2548,19 +2706,31 @@ sleep 1
                 r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}"#,
                 "read-only",
             ),
-            // A write-capable sandbox is never accepted on resume.
+            // A write-capable sandbox object is never accepted on resume.
             (
-                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false,"sandbox":"workspace-write","approvalPolicy":"never","cwd":"/elsewhere"},"model":"gpt-5.6-terra"}}"#,
+                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"workspaceWrite","networkAccess":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+                "read-only",
+            ),
+            // The request-time string preset is not the resolved posture
+            // the live probe returns; it stays unconfirmed.
+            (
+                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":"read-only","approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+                "read-only",
+            ),
+            // A network-capable sandbox diverges from the observed
+            // read-only posture and fails closed.
+            (
+                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
                 "read-only",
             ),
             // An approval policy other than never.
             (
-                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false,"sandbox":"read-only","approvalPolicy":"on-request","cwd":"/elsewhere"},"model":"gpt-5.6-terra"}}"#,
+                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"on-request","cwd":"/elsewhere"}}"#,
                 "never",
             ),
             // A thread rooted somewhere other than the task workspace.
             (
-                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false,"sandbox":"read-only","approvalPolicy":"never","cwd":"/elsewhere"},"model":"gpt-5.6-terra"}}"#,
+                r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
                 "task workspace",
             ),
         ] {
