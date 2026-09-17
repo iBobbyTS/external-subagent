@@ -103,10 +103,7 @@ impl PassiveActivityTracker {
         if admitted
             && matches!(
                 parsed.sample,
-                Some(
-                    ActivitySampleKind::ReasoningDelta { .. }
-                        | ActivitySampleKind::TextDelta { .. }
-                )
+                Some(ActivitySampleKind::ReasoningDelta | ActivitySampleKind::TextDelta)
             )
         {
             state.last_model_delta_at = Some(now);
@@ -206,14 +203,11 @@ impl PassiveActivityTracker {
                 continue;
             }
             match sample.kind {
-                ActivitySampleKind::ReasoningDelta { bytes } => {
+                ActivitySampleKind::ReasoningDelta => {
                     window.reasoning_delta_events = window.reasoning_delta_events.saturating_add(1);
-                    window.reasoning_delta_bytes =
-                        window.reasoning_delta_bytes.saturating_add(bytes);
                 }
-                ActivitySampleKind::TextDelta { bytes } => {
+                ActivitySampleKind::TextDelta => {
                     window.text_delta_events = window.text_delta_events.saturating_add(1);
-                    window.text_delta_bytes = window.text_delta_bytes.saturating_add(bytes);
                 }
                 ActivitySampleKind::ToolStarted { kind } => {
                     window.tool_calls_started = window.tool_calls_started.saturating_add(1);

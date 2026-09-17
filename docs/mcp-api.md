@@ -1,6 +1,6 @@
 # MCP 工具与字段设计说明
 
-本文说明本项目对外注册的全部 10 个 MCP 工具，以及每个输入、输出字段的使用时机、存在理由和省略／移除影响。核对日期：2026-09-16。
+本文说明本项目对外注册的全部 10 个 MCP 工具，以及每个输入、输出字段的使用时机、存在理由和省略／移除影响。核对日期：2026-09-17。
 
 ## 0. 调用宿主、子代理与实例边界
 
@@ -502,7 +502,6 @@ ActivityWindow 的所有字段均为 integer，单位是最近60秒内的事件�
 | `error.operation` | string/省略 | 诊断哪种操作失败 | 多操作日志难以关联 |
 | `error.request_id` | string/省略 | 关联 facade 发起的 RPC 请求 | 无法从错误定位具体 RPC；不是待回答问题的 ID |
 | `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务；workspace busy 时尤其有用 |
-| `error.cleanup` | string/省略 | 当前定义中的预留诊断字段 | 当前 mcp.rs 构造路径未赋值，删掉不影响现有运行信息，但会改变公开 schema；没有证据说明必须保留 |
 | `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
 
 当前公开映射的错误码：
@@ -564,6 +563,5 @@ unavailable, daemon_unavailable
 | 权限／正确性解释 | permission_mode、write_manifest、effective_decision、coverage | 必须避免扩大授权或对缺失证据作错误判断 |
 | 可推导／便利 | complete、result_available、requested_decision、instruction | 可精简，但需迁移消费者并明确替代计算／调用 |
 | 诊断 | identity、config_revision、活动时间、各类计数 | 不一定阻止执行，但会降低排障和可追溯性 |
-| 当前预留 | error.cleanup | 当前没有赋值证据；按兼容策略决定是否保留 |
 
 本文只说明现有接口及其设计代价，不修改协议。后续修改参数时，应同步 Rust 输入／输出及 handler、静态契约、相关回归测试和本文；以实际行为为准处理 schema 与运行时校验差异。

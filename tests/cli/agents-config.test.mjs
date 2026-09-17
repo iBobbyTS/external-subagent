@@ -227,14 +227,11 @@ test('unknown config fields and operations fail closed', () => {
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { subagents: { zcode: { mystery: true } } } }), (error) => error.code === 'CONFIG_INVALID');
 });
 
-test('product runtime paths survive agent config updates', () => {
+test('retired top-level product path fields fail closed as unknown config fields', () => {
   const { paths } = fixture();
   fs.mkdirSync(path.dirname(paths.config), { recursive: true });
-  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 1, runtime: '/runtime', database: '/database', socket: '/socket' }));
-  const updated = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;
-  assert.equal(updated.runtime, '/runtime');
-  assert.equal(updated.database, '/database');
-  assert.equal(updated.socket, '/socket');
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, runtime: '/runtime', database: '/database', socket: '/socket' }));
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }), (error) => error.code === 'CONFIG_INVALID');
 });
 
 test('agents human operations are strict and unsupported actions are explicit', async () => {

@@ -24,7 +24,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Diagnostic-only MCP tool surface version reported by status. It never
@@ -399,7 +399,6 @@ impl From<TaskSubmissionDisposition> for SubmissionDispositionView {
 pub struct SystemStatusView {
     /// Diagnostic-only MCP tool surface version. Never used for admission.
     pub mcp_version: String,
-    pub api_surface: String,
     pub service_generation: String,
     pub components: BTreeMap<String, ComponentStateView>,
     pub capabilities: AgentCapabilitiesView,
@@ -472,12 +471,6 @@ struct AgentConfigSnapshot {
     default_subagent: Option<String>,
     #[serde(default)]
     subagents: BTreeMap<String, AgentConfigEntry>,
-    #[serde(default)]
-    runtime: Option<String>,
-    #[serde(default)]
-    database: Option<String>,
-    #[serde(default)]
-    socket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,9 +534,6 @@ impl Default for AgentConfigSnapshot {
                     },
                 ),
             ]),
-            runtime: None,
-            database: None,
-            socket: None,
         }
     }
 }
@@ -562,7 +552,6 @@ pub struct AgentScopeStatusView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonIdentityView {
     pub daemon: ComponentIdentityView,
-    pub runtime: RuntimeIdentityView,
     pub models: ModelIdentityView,
 }
 
@@ -570,10 +559,6 @@ pub struct DaemonIdentityView {
 pub struct ComponentIdentityView {
     pub component: String,
     pub version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_revision: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_dirty: Option<bool>,
     pub artifact: ArtifactIdentityView,
 }
 
@@ -583,26 +568,12 @@ pub struct ArtifactIdentityView {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    pub source: String,
-    pub captured_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeIdentityView {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub configured_path: Option<String>,
-    pub configured_path_source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_version: Option<String>,
-    pub observed_version_source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelIdentityView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configured: Option<ModelIdentityFactView>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_response: Option<ModelIdentityFactView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -622,9 +593,7 @@ pub struct AgentCapabilitiesView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationCapabilityView {
-    pub protocol: String,
     pub public_reasoning_default: bool,
-    pub runtime_source_verified: bool,
     pub defaults: ObservationDefaultsView,
 }
 
@@ -639,8 +608,6 @@ pub struct ObservationDefaultsView {
 pub struct TaskObservationView {
     pub schema: String,
     pub agent_id: String,
-    pub service_generation: String,
-    pub snapshot_seq: u64,
     pub count_scope: String,
     pub tools: Vec<ObservedTool>,
     pub reasoning: ObservedReasoning,
@@ -668,7 +635,6 @@ pub struct InputIdentityView {
     pub admission: Option<external_core::AdmissionIdentity>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
-    pub caller_prompt_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,9 +674,7 @@ pub struct ActiveToolView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityWindowView {
     pub reasoning_delta_events: u64,
-    pub reasoning_delta_bytes: u64,
     pub text_delta_events: u64,
-    pub text_delta_bytes: u64,
     pub tool_calls_started: u64,
     pub tool_calls_completed: u64,
     pub tool_calls_failed: u64,
@@ -740,7 +704,6 @@ pub struct TaskResultView {
     pub outcome: TaskOutcome,
     pub final_text: String,
     pub partial: bool,
-    pub result_sha256: String,
     pub offset: usize,
     pub total_bytes: usize,
     pub next_offset: Option<usize>,
@@ -1361,8 +1324,6 @@ impl RpcService {
                     observation: TaskObservationView {
                         schema: OBSERVATION_SCHEMA.into(),
                         agent_id: task.agent_id,
-                        service_generation: self.service_generation.clone(),
-                        snapshot_seq: snapshot.snapshot_seq,
                         count_scope: "agent_lifetime".into(),
                         tools: snapshot.tools,
                         reasoning: snapshot.reasoning,
@@ -1391,21 +1352,18 @@ impl RpcService {
         components.insert("model_auth".into(), ComponentStateView::Unknown);
         SystemStatusView {
             mcp_version: MCP_VERSION.into(),
-            api_surface: "generic_agent".into(),
             service_generation: self.service_generation.clone(),
             components,
-            capabilities: agent_capabilities(self.scheduler.runtime_source_verified()),
+            capabilities: agent_capabilities(),
             agents: read_agent_config_snapshot()
                 .map(|config| configured_agent_statuses(&config, &self.agent_evidence))
                 .unwrap_or_else(|_| unavailable_agent_statuses()),
             identity: Some(DaemonIdentityView {
                 daemon: self.daemon_identity.clone(),
-                runtime: configured_runtime_identity(self.scheduler.configured_runtime_source()),
                 // Status has no Agent/session scope, and the current runtime
                 // exposes no verified response-producer model identity.
                 models: ModelIdentityView {
                     configured: None,
-                    observed_response: None,
                 },
             }),
         }
@@ -1439,7 +1397,6 @@ impl RpcService {
             outcome: stored.result.outcome,
             final_text: text[offset..end].to_owned(),
             partial: stored.result.partial,
-            result_sha256: stored.result_sha256,
             offset,
             total_bytes,
             next_offset,
@@ -2147,16 +2104,6 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
     if let Some(legacy) = object.remove("agents") { object.insert("subagents".into(), legacy); }
     if let Some(legacy) = object.remove("default_agent") { object.insert("default_subagent".into(), legacy); }
     object.insert("schema_version".into(), Value::from(2));
-    for field in ["runtime", "database", "socket"] {
-        if let Some(value) = object.get(field) {
-            if !value.as_str().is_some_and(|value| !value.is_empty()) {
-                return Err(RpcError::new(
-                    RpcErrorCode::Validation,
-                    "agent config path fields must be non-null strings",
-                ));
-            }
-        }
-    }
     let Some(agents) = object.get_mut("subagents") else {
         return Ok(());
     };
@@ -2615,7 +2562,7 @@ pub(crate) mod wait_tests {
             serde_json::from_value(serde_json::json!({"agent_id":id})).unwrap();
         assert_eq!(parsed.wait_time, 290);
         assert!(!parsed.supports_answer);
-        assert_eq!(agent_capabilities(false).max_wait_ms, 299000);
+        assert_eq!(agent_capabilities().max_wait_ms, 299000);
         for value in [-1, 300] {
             let response = service.handle_bytes(
                 &serde_json::to_vec(&serde_json::json!({
@@ -3606,7 +3553,7 @@ fn opaque_generation() -> Result<String, RpcServiceConfigError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn agent_capabilities(runtime_source_verified: bool) -> AgentCapabilitiesView {
+fn agent_capabilities() -> AgentCapabilitiesView {
     let maturity = BTreeMap::new();
     AgentCapabilitiesView {
         max_rpc_request_frame_bytes: MAX_REQUEST_FRAME_BYTES,
@@ -3614,9 +3561,7 @@ fn agent_capabilities(runtime_source_verified: bool) -> AgentCapabilitiesView {
         max_wait_ms: MAX_WAIT.as_millis() as u64,
         maturity,
         observation: ObservationCapabilityView {
-            protocol: OBSERVATION_SCHEMA.into(),
             public_reasoning_default: true,
-            runtime_source_verified,
             defaults: ObservationDefaultsView {
                 top_tools: 3,
                 recent_calls_per_tool: 5,
@@ -3643,11 +3588,6 @@ fn task_view(task: TaskRecord) -> TaskView {
     let prepared = serde_json::from_str::<serde_json::Value>(&task.prepared_launch_json).ok();
     let permission_mode = prepared.as_ref().and_then(|v| {
         v.get("permission_mode")
-            .and_then(|x| x.as_str())
-            .map(str::to_owned)
-    });
-    let caller_prompt_sha256 = prepared.as_ref().and_then(|v| {
-        v.get("prompt_sha256")
             .and_then(|x| x.as_str())
             .map(str::to_owned)
     });
@@ -3678,7 +3618,6 @@ fn task_view(task: TaskRecord) -> TaskView {
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
             workspace_path,
             permission_mode,
-            caller_prompt_sha256,
         },
     }
 }
@@ -3818,28 +3757,19 @@ mod activity_projection_tests {
     }
 
     #[test]
-    fn status_reports_observation_contract_and_real_source_state() {
-        let verified = agent_capabilities(true).observation;
-        assert_eq!(verified.protocol, "zas-observation/1.1");
-        assert!(verified.public_reasoning_default);
-        assert!(verified.runtime_source_verified);
-        assert_eq!(verified.defaults.top_tools, 3);
-        assert_eq!(verified.defaults.recent_calls_per_tool, 5);
-        assert_eq!(verified.defaults.reasoning_chars, 200);
-        assert!(
-            !agent_capabilities(false)
-                .observation
-                .runtime_source_verified
-        );
+    fn status_reports_the_observation_contract_defaults() {
+        let observation = agent_capabilities().observation;
+        assert!(observation.public_reasoning_default);
+        assert_eq!(observation.defaults.top_tools, 3);
+        assert_eq!(observation.defaults.recent_calls_per_tool, 5);
+        assert_eq!(observation.defaults.reasoning_chars, 200);
     }
 }
 
 fn activity_window_view(value: PassiveActivityWindow) -> ActivityWindowView {
     ActivityWindowView {
         reasoning_delta_events: value.reasoning_delta_events,
-        reasoning_delta_bytes: value.reasoning_delta_bytes,
         text_delta_events: value.text_delta_events,
-        text_delta_bytes: value.text_delta_bytes,
         tool_calls_started: value.tool_calls_started,
         tool_calls_completed: value.tool_calls_completed,
         tool_calls_failed: value.tool_calls_failed,
@@ -3856,7 +3786,6 @@ impl From<StoredTaskResult> for TaskResultView {
             outcome: stored.result.outcome,
             final_text: stored.result.final_text,
             partial: stored.result.partial,
-            result_sha256: stored.result_sha256,
             offset: 0,
             total_bytes,
             next_offset: None,
@@ -3955,7 +3884,6 @@ mod result_paging_tests {
                 admission: None,
                 workspace_path: None,
                 permission_mode: None,
-                caller_prompt_sha256: None,
             },
         }
     }
@@ -3985,7 +3913,6 @@ mod result_paging_tests {
                     outcome: TaskOutcome::Completed,
                     final_text: text,
                     partial: false,
-                    result_sha256: "f".repeat(64),
                     offset: 0,
                     total_bytes: MAX_RESULT_CHUNK_BYTES + 1,
                     next_offset: Some(MAX_RESULT_CHUNK_BYTES),
@@ -4003,7 +3930,6 @@ mod result_paging_tests {
             outcome: TaskOutcome::Failed,
             final_text: "failure".into(),
             partial: true,
-            result_sha256: "f".repeat(64),
             offset: 0,
             total_bytes: 7,
             next_offset: None,
@@ -4014,48 +3940,15 @@ mod result_paging_tests {
     }
 }
 
-fn configured_runtime_identity(path: Option<PathBuf>) -> RuntimeIdentityView {
-    RuntimeIdentityView {
-        configured_path_source: if path.is_some() {
-            "daemon_configuration".into()
-        } else {
-            "unknown".into()
-        },
-        configured_path: path.map(|path| path.to_string_lossy().into_owned()),
-        // A configured path is not proof that a process ran or which version
-        // answered. No status query starts the runtime to fill this field.
-        observed_version: None,
-        observed_version_source: "unknown".into(),
-    }
-}
-
 pub fn running_component_identity(component: &str, version: &str) -> ComponentIdentityView {
-    running_component_identity_from(
-        component,
-        version,
-        option_env!("ZAS_SOURCE_REVISION"),
-        option_env!("ZAS_SOURCE_DIRTY"),
-        env::current_exe().ok(),
-        SystemTime::now(),
-    )
+    running_component_identity_from(component, version, env::current_exe().ok())
 }
 
 fn running_component_identity_from(
     component: &str,
     version: &str,
-    revision: Option<&str>,
-    dirty: Option<&str>,
     executable: Option<PathBuf>,
-    captured_at: SystemTime,
 ) -> ComponentIdentityView {
-    let source_revision = revision
-        .filter(|value| *value != "unknown" && !value.is_empty())
-        .map(str::to_owned);
-    let source_dirty = match dirty {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    };
     let (path, sha256) = executable.map_or((None, None), |path| {
         let hash = File::open(&path).ok().and_then(|mut file| {
             let mut hasher = Sha256::new();
@@ -4074,19 +3967,7 @@ fn running_component_identity_from(
     ComponentIdentityView {
         component: component.into(),
         version: version.into(),
-        source_revision,
-        source_dirty,
-        artifact: ArtifactIdentityView {
-            path,
-            sha256,
-            source: "running_executable".into(),
-            captured_at_ms: captured_at
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(u64::MAX),
-        },
+        artifact: ArtifactIdentityView { path, sha256 },
     }
 }
 
@@ -4246,20 +4127,12 @@ mod identity_tests {
     use std::io::Write;
 
     #[test]
-    fn missing_build_and_executable_facts_remain_unknown() {
-        let identity = running_component_identity_from(
-            "daemon",
-            "1.2.3",
-            Some("unknown"),
-            Some("unknown"),
-            None,
-            UNIX_EPOCH + Duration::from_millis(7),
-        );
-        assert_eq!(identity.source_revision, None);
-        assert_eq!(identity.source_dirty, None);
+    fn missing_executable_fact_leaves_artifact_unknown() {
+        let identity = running_component_identity_from("daemon", "1.2.3", None);
+        assert_eq!(identity.component, "daemon");
+        assert_eq!(identity.version, "1.2.3");
         assert_eq!(identity.artifact.path, None);
         assert_eq!(identity.artifact.sha256, None);
-        assert_eq!(identity.artifact.captured_at_ms, 7);
     }
 
     #[test]
@@ -4275,40 +4148,32 @@ mod identity_tests {
             .unwrap()
             .write_all(b"new")
             .unwrap();
-        let identity = running_component_identity_from(
-            "daemon",
-            "1.2.3",
-            Some("abc123"),
-            Some("true"),
-            Some(executable.clone()),
-            UNIX_EPOCH,
-        );
+        let identity = running_component_identity_from("daemon", "1.2.3", Some(executable.clone()));
         assert_eq!(identity.artifact.path.as_deref(), executable.to_str());
         assert_eq!(
             identity.artifact.sha256.as_deref(),
             Some("cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4")
         );
         assert_ne!(identity.artifact.path.as_deref(), disk_payload.to_str());
-        assert_eq!(identity.source_revision.as_deref(), Some("abc123"));
-        assert_eq!(identity.source_dirty, Some(true));
     }
 
     #[test]
-    fn configured_runtime_is_not_promoted_to_observed_version_or_model() {
-        let runtime = configured_runtime_identity(Some(PathBuf::from("/runtime/zcode")));
-        assert_eq!(runtime.configured_path.as_deref(), Some("/runtime/zcode"));
-        assert_eq!(runtime.configured_path_source, "daemon_configuration");
-        assert_eq!(runtime.observed_version, None);
-        assert_eq!(runtime.observed_version_source, "unknown");
-        let models = ModelIdentityView {
-            configured: Some(ModelIdentityFactView {
-                value: "configured-model".into(),
-                source: "session_create_configuration".into(),
-            }),
-            observed_response: None,
+    fn status_identity_reports_only_daemon_and_configured_models() {
+        let identity = DaemonIdentityView {
+            daemon: running_component_identity_from("daemon", "0.1.0", None),
+            models: ModelIdentityView {
+                configured: Some(ModelIdentityFactView {
+                    value: "configured-model".into(),
+                    source: "session_create_configuration".into(),
+                }),
+            },
         };
-        assert!(models.configured.is_some());
-        assert!(models.observed_response.is_none());
+        let serialized = serde_json::to_value(&identity).unwrap();
+        assert!(serialized.get("runtime").is_none());
+        assert!(serialized["models"].get("observed_response").is_none());
+        assert_eq!(serialized["models"]["configured"]["value"], "configured-model");
+        assert!(serialized["daemon"].get("source_revision").is_none());
+        assert!(serialized["daemon"]["artifact"].get("captured_at_ms").is_none());
     }
 
     #[test]
@@ -4318,19 +4183,14 @@ mod identity_tests {
             RpcSuccess::SystemStatus {
                 status: SystemStatusView {
                     mcp_version: MCP_VERSION.into(),
-                    api_surface: "generic_agent".into(),
                     service_generation: "legacy-generation".into(),
                     components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
-                    capabilities: agent_capabilities(false),
+                    capabilities: agent_capabilities(),
                     agents: Vec::new(),
                     identity: Some(DaemonIdentityView {
-                        daemon: running_component_identity_from(
-                            "daemon", "0.1.0", None, None, None, UNIX_EPOCH,
-                        ),
-                        runtime: configured_runtime_identity(None),
+                        daemon: running_component_identity_from("daemon", "0.1.0", None),
                         models: ModelIdentityView {
                             configured: None,
-                            observed_response: None,
                         },
                     }),
                 },

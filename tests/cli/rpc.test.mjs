@@ -147,7 +147,7 @@ test('CLI passes list agent filter and projects persisted input identity', async
   const socketPath = path.join(os.tmpdir(), `external-cli-list-identity-${process.pid}-${Date.now()}.sock`);
   const identity = {
     admission: { agent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null, model_source: 'native' },
-    workspace_path: '/workspace', permission_mode: 'build', caller_prompt_sha256: 'private',
+    workspace_path: '/workspace', permission_mode: 'build',
   };
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
@@ -218,6 +218,8 @@ test('CLI public projection removes private RPC fields and result digest', () =>
   assert.deepEqual(Object.keys(projected).sort(), ['question', 'result', 'task']);
   assert.equal(projected.task.resources_reaped, true);
   assert.equal(projected.task.reaped, undefined);
+  // A legacy daemon frame may still carry the retired digest; the projection
+  // must not forward it even if one appears.
   assert.equal(projected.result.result_sha256, undefined);
   assert.equal(projected.question, null);
 });

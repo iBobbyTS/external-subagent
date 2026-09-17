@@ -216,7 +216,9 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
   assert.ok(plist.includes('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'));
   assert.ok(plist.includes('/usr/bin:/bin'), 'GUI environment must not inherit the shell PATH');
   const config = JSON.parse(fs.readFileSync(path.join(data, 'config.json'), 'utf8'));
-  assert.equal(config.socket, path.join(data, 'external-subagent.sock'));
+  for (const field of ['runtime', 'database', 'socket']) {
+    assert.equal(config[field], undefined, `config must not persist the retired ${field} field`);
+  }
 
   const staging = path.join(home, 'plugins', 'external-subagent');
   const staged = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));

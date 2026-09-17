@@ -376,7 +376,6 @@ mod tests {
 
         assert_eq!(production.bootstrap_timeout, Duration::from_secs(90));
         assert_eq!(production.control_timeout, Duration::from_secs(5));
-        assert_eq!(production.global_max_agents, defaults.global_max_agents);
         assert_eq!(
             production.per_workspace_max_agents,
             defaults.per_workspace_max_agents

@@ -148,9 +148,7 @@ pub struct PassiveActiveTool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassiveActivityWindow {
     pub reasoning_delta_events: u64,
-    pub reasoning_delta_bytes: u64,
     pub text_delta_events: u64,
-    pub text_delta_bytes: u64,
     pub tool_calls_started: u64,
     pub tool_calls_completed: u64,
     pub tool_calls_failed: u64,

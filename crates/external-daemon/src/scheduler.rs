@@ -7,7 +7,6 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
-    pub global_max_agents: usize,
     pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
     pub bootstrap_timeout: Duration,
@@ -17,7 +16,6 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            global_max_agents: usize::MAX,
             per_workspace_max_agents: 1,
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(2),
@@ -2229,10 +2227,6 @@ impl Scheduler {
                 observation::runtime_source_verified(self.inner.config.runtime_source.as_deref()),
             ),
         }
-    }
-
-    pub(crate) fn runtime_source_verified(&self) -> bool {
-        observation::runtime_source_verified(self.inner.config.runtime_source.as_deref())
     }
 
     pub fn last_error(&self, agent_id: &str) -> Option<String> {

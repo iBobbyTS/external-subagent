@@ -155,8 +155,6 @@ pub struct PublicToolErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cleanup: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_count: Option<u64>,
 }
 
@@ -181,7 +179,6 @@ impl ToolError {
                 operation: None,
                 request_id: None,
                 agent_id: None,
-                cleanup: None,
                 prompt_count: None,
             },
             legacy_text: legacy_text.into(),
@@ -2609,7 +2606,6 @@ mod server {
         fn legacy_daemon_status_keeps_readiness_and_real_facade_identity() {
             let status = SystemStatusView {
                 mcp_version: "0.1.0".into(),
-                api_surface: "generic_agent".into(),
                 service_generation: "legacy-generation".into(),
                 components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
                 capabilities: AgentCapabilitiesView {
@@ -2618,9 +2614,7 @@ mod server {
                     max_wait_ms: 299000,
                     maturity: BTreeMap::from([("spawn".into(), CapabilityMaturityView::BetaReady)]),
                     observation: ObservationCapabilityView {
-                        protocol: "zas-observation/1.1".into(),
                         public_reasoning_default: true,
-                        runtime_source_verified: false,
                         defaults: ObservationDefaultsView {
                             top_tools: 3,
                             recent_calls_per_tool: 5,
@@ -2646,7 +2640,7 @@ mod server {
             assert!(output.identity.models.configured.is_none());
             let serialized = serde_json::to_value(output).unwrap();
             assert_eq!(serialized["mcp_version"], "0.1.0");
-            for removed in ["api_surface", "protocol_version", "service_generation"] {
+            for removed in ["protocol_version", "service_generation"] {
                 assert!(serialized.get(removed).is_none());
             }
             assert!(serialized["identity"].get("daemon").is_none());
@@ -2715,8 +2709,6 @@ mod server {
             let view = TaskObservationView {
                 schema: "zas-observation/1.1".into(),
                 agent_id: "10000000".into(),
-                service_generation: "generation".into(),
-                snapshot_seq: snapshot.snapshot_seq,
                 count_scope: "agent_lifetime".into(),
                 tools: snapshot.tools,
                 reasoning: snapshot.reasoning,

@@ -84,8 +84,8 @@ async function lifecycleServer(socketPath) {
         result = { task: task('cancelling') };
       } else if (request.method === 'task_observe') {
         result = { observation: { schema: 'external-subagent-observation/1.0', agent_id: String(agentId),
-          service_generation: 'fixture', snapshot_seq: 1, count_scope: 'agent_lifetime', tools: [],
-          reasoning: { text: 'bounded', char_count: 7, truncated: false, source: { status: 'VERIFIED' } },
+          count_scope: 'agent_lifetime', tools: [],
+          reasoning: { text: 'bounded', truncated: false, source: { status: 'VERIFIED' } },
           coverage: { tool_history_complete: true, reasoning_complete: true, dropped_events: 0 } } };
       } else if (request.method === 'task_close') {
         phase = 'closed';

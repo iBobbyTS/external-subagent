@@ -14,7 +14,11 @@ function migrateLegacyConfig(value) {
   return { ...rest, schema_version: 2, ...(agents === undefined ? {} : { subagents: agents }), ...(default_agent === undefined ? {} : { default_subagent: default_agent }) };
 }
 
+export function parseConfig(value) {
+  return validateConfig(migrateLegacyConfig(value));
+}
+
 export function readConfig(file) {
-  try { return validateConfig(migrateLegacyConfig(JSON.parse(fs.readFileSync(file, 'utf8')))); }
+  try { return parseConfig(JSON.parse(fs.readFileSync(file, 'utf8'))); }
   catch (error) { if (error?.code === 'ENOENT') return defaultConfig(); if (error instanceof SyntaxError) error.code = 'CONFIG_INVALID'; throw error; }
 }

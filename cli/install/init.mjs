@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
-import { readConfig } from '../config/read.mjs';
+import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
 import { codexHomeFor, installPlugin, resolveStaging } from './codex.mjs';
 import { verifyPayload } from './payload.mjs';
@@ -23,7 +23,7 @@ import { bootstrapService, bootoutService, installLaunchAgent } from './service-
 //                      missing DSH never blocks installation)
 //   check-path         PATH findings are reported, never written
 //   create-data        private data/log directories
-//   write-product-config  paths + fixed runtime for daemon and agents
+//   write-product-config  publish the current agent config schema
 //   install-launch-agent  the one macOS service template
 //   start-service      launchctl bootstrap (best-effort, reported)
 //   install-codex-plugin managed staging + official codex add
@@ -152,13 +152,14 @@ export function runInit(options = {}) {
       mark('create-data');
     }
     if (!completed.has('write-product-config')) {
-      const configured = readConfig(paths.config);
-      writeConfig(paths.config, {
-        ...configured,
-        runtime: ZCODE_RUNTIME,
-        database: paths.database,
-        socket: paths.socket,
-      });
+      // The daemon takes its database/socket/runtime from service arguments,
+      // never from this file; drop the retired top-level path fields so an
+      // install over an older local config republishes the current schema.
+      const prior = fs.existsSync(paths.config)
+        ? JSON.parse(fs.readFileSync(paths.config, 'utf8'))
+        : {};
+      for (const field of ['runtime', 'database', 'socket']) delete prior[field];
+      writeConfig(paths.config, parseConfig(prior));
       failAt('write-product-config');
       mark('write-product-config');
     }

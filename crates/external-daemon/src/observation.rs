@@ -54,7 +54,6 @@ pub struct ObservedCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedReasoning {
     pub text: String,
-    pub char_count: usize,
     pub truncated: bool,
     pub source: ReasoningSource,
 }
@@ -92,7 +91,6 @@ impl ObservationSnapshot {
             tools: Vec::new(),
             reasoning: ObservedReasoning {
                 text: String::new(),
-                char_count: 0,
                 truncated: false,
                 source: ReasoningSource::verified(),
             },
@@ -309,7 +307,6 @@ impl ObservationState {
             snapshot_seq: self.snapshot_seq,
             tools,
             reasoning: ObservedReasoning {
-                char_count: text.chars().count(),
                 text,
                 truncated: self.reasoning_truncated,
                 source: ReasoningSource::verified(),
@@ -450,7 +447,7 @@ mod tests {
             &event("3", "other", serde_json::json!({"delta":"NO"})),
         );
         let snapshot = state.snapshot();
-        assert_eq!(snapshot.reasoning.char_count, 200);
+        assert_eq!(snapshot.reasoning.text.chars().count(), 200);
         assert_eq!(
             snapshot.reasoning.text,
             format!("{}{}", "中🙂".repeat(50), "乙".repeat(100))
@@ -506,7 +503,7 @@ mod tests {
             .text
             .ends_with("post-overflow-unique-marker"));
         assert!(state.reasoning_raw.len() <= MAX_REASONING_BYTES);
-        assert!(snapshot.reasoning.char_count <= MAX_REASONING_CHARS);
+        assert!(snapshot.reasoning.text.chars().count() <= MAX_REASONING_CHARS);
         assert!(snapshot.reasoning.truncated);
         assert!(!snapshot.coverage.reasoning_complete);
         assert_eq!(snapshot.coverage.dropped_events, 1);
@@ -532,7 +529,7 @@ mod tests {
             ),
         );
         let snapshot = state.snapshot();
-        assert_eq!(snapshot.reasoning.char_count, MAX_REASONING_CHARS);
+        assert_eq!(snapshot.reasoning.text.chars().count(), MAX_REASONING_CHARS);
         assert_eq!(snapshot.reasoning.text, "中🙂".repeat(100));
         assert!(state.reasoning_raw.len() <= MAX_REASONING_BYTES);
         assert!(!snapshot.coverage.reasoning_complete);
@@ -733,7 +730,7 @@ mod tests {
                 .rev()
                 .collect::<String>()
         );
-        assert_eq!(snapshot.reasoning.char_count, 200);
+        assert_eq!(snapshot.reasoning.text.chars().count(), 200);
         assert!(snapshot.reasoning.truncated);
         assert_eq!(snapshot.tools.len(), 2);
         assert_eq!(
@@ -798,7 +795,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Alpha", "Zed"]
         );
-        assert_eq!(snapshot.reasoning.char_count, 0);
+        assert!(snapshot.reasoning.text.is_empty());
         assert!(snapshot.coverage.reasoning_complete);
         assert_eq!(snapshot.snapshot_seq, 3);
     }

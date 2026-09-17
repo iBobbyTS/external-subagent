@@ -61,8 +61,7 @@ test('diagnose preserves daemon self identity and does not promote packaged faca
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-identity-'));
   const paths = pathsFor(home);
   const daemonIdentity = {
-    daemon: { component: 'daemon', version: '0.1.0', source_revision: 'old-revision', artifact: { path: '/running/old-daemon', sha256: 'old-hash', source: 'running_executable', captured_at_ms: 10 } },
-    runtime: { configured_path: '/configured/runtime', configured_path_source: 'daemon_configuration', observed_version_source: 'unknown' },
+    daemon: { component: 'daemon', version: '0.1.0', artifact: { path: '/running/old-daemon', sha256: 'old-hash' } },
     models: { configured: { value: 'configured-model', source: 'session_create_configuration' } },
   };
   await withDaemon(paths, (request) => {
@@ -71,7 +70,6 @@ test('diagnose preserves daemon self identity and does not promote packaged faca
   }, async () => {
     const report = await diagnose(paths, []);
     assert.deepEqual(report.daemon.status.identity, daemonIdentity);
-    assert.equal(report.daemon.status.identity.models.observed_response, undefined);
     assert.equal(report.facade.running_identity, null);
     assert.equal(report.facade.packaged_artifact.source, 'distributed_payload');
     assert.equal(report.runtime.running_identity, null);

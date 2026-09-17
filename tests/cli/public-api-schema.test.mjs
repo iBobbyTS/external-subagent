@@ -59,7 +59,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.deepEqual(schema.properties.error_projection.required, ['error']);
   assert.deepEqual(schema.properties.error_projection.properties.error.required, ['code', 'message']);
   assert.deepEqual(Object.keys(schema.properties.error_projection.properties.error.properties).sort(), [
-    'agent_id', 'cleanup', 'code', 'component', 'message', 'operation', 'prompt_count', 'request_id',
+    'agent_id', 'code', 'component', 'message', 'operation', 'prompt_count', 'request_id',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.output, ['task', 'result', 'question']);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.input, [

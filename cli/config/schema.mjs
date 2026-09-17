@@ -2,7 +2,7 @@ import { CliError } from '../errors.mjs';
 
 export const CONFIG_SCHEMA_VERSION = 2;
 export const SUBAGENT_IDS = Object.freeze(['zcode', 'dsh', 'codex']);
-const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_subagent', 'subagents', 'runtime', 'database', 'socket']);
+const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_subagent', 'subagents']);
 const AGENT_FIELDS = new Set(['enabled', 'spawn_supported', 'default_model', 'runtime_path', 'home', 'profile', 'version']);
 
 function plainObject(value) {
@@ -43,12 +43,6 @@ export function validateConfig(input) {
   if (input.default_subagent !== undefined && input.default_subagent !== null && !SUBAGENT_IDS.includes(input.default_subagent)) throw new CliError('CONFIG_INVALID', 'default_subagent is unknown', 2);
   config.revision = input.revision ?? 0;
   config.default_subagent = input.default_subagent ?? null;
-  for (const field of ['runtime', 'database', 'socket']) {
-    if (input[field] !== undefined) {
-      if (typeof input[field] !== 'string' || input[field].length === 0) throw new CliError('CONFIG_INVALID', `${field} must be a non-empty string`, 2);
-      config[field] = input[field];
-    }
-  }
   if (input.subagents !== undefined && !plainObject(input.subagents)) throw new CliError('CONFIG_INVALID', 'subagents must be an object', 2);
   for (const agent of Object.keys(input.subagents || {})) {
     if (!SUBAGENT_IDS.includes(agent)) throw new CliError('CONFIG_INVALID', `subagents contains unknown subagent: ${agent}`, 2);

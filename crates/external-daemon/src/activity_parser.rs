@@ -9,8 +9,8 @@ pub(crate) enum ActivitySource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivitySampleKind {
-    ReasoningDelta { bytes: u64 },
-    TextDelta { bytes: u64 },
+    ReasoningDelta,
+    TextDelta,
     ToolStarted { kind: PassiveToolKind },
     ToolCompleted,
     ToolFailed,
@@ -127,18 +127,15 @@ fn parse_activity_message(
         let turn_id = activity_id(params.get("turnId"));
         match (kind, payload_kind, payload_type) {
             (Some("model.streaming"), Some("reasoning_delta"), _) => {
-                let delta = payload.get("delta").and_then(serde_json::Value::as_str);
-                let bytes = delta.map(|value| value.len() as u64).unwrap_or(0);
                 parsed.stream_key = stream_key(params, payload, "reasoning");
                 parsed.identity = event_id.map(|id| format!("stream:{id}"));
-                parsed.sample = Some(ActivitySampleKind::ReasoningDelta { bytes });
+                parsed.sample = Some(ActivitySampleKind::ReasoningDelta);
             }
             (Some("model.streaming"), Some("text_delta"), _) => {
                 let delta = payload.get("delta").and_then(serde_json::Value::as_str);
-                let bytes = delta.map(|value| value.len() as u64).unwrap_or(0);
                 parsed.stream_key = stream_key(params, payload, "text");
                 parsed.identity = event_id.map(|id| format!("stream:{id}"));
-                parsed.sample = Some(ActivitySampleKind::TextDelta { bytes });
+                parsed.sample = Some(ActivitySampleKind::TextDelta);
                 parsed.text_delta = delta.map(str::to_owned);
                 parsed.assistant_message_id = activity_id(payload.get("assistantMessageId"));
             }
@@ -206,20 +203,13 @@ fn parse_activity_message(
                         return parsed;
                     }
                 };
-                let Some(bytes) = params
-                    .get("chunkLength")
-                    .and_then(serde_json::Value::as_u64)
-                else {
-                    parsed.telemetry_known = false;
-                    return parsed;
-                };
                 parsed.stream_key = stream_key(params, params, channel);
                 parsed.identity =
                     activity_id(params.get("eventId")).map(|id| format!("stream:{id}"));
                 parsed.sample = Some(if channel == "reasoning" {
-                    ActivitySampleKind::ReasoningDelta { bytes }
+                    ActivitySampleKind::ReasoningDelta
                 } else {
-                    ActivitySampleKind::TextDelta { bytes }
+                    ActivitySampleKind::TextDelta
                 });
             }
             Some("tool.lifecycle") => parse_tool_activity(&mut parsed, params, source),
