@@ -259,8 +259,8 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
         RpcErrorCode::Malformed | RpcErrorCode::Validation => {
             ("validation", "request validation failed")
         }
-        RpcErrorCode::AgentRequired => ("agent_required", "agent is required"),
-        RpcErrorCode::AgentUnknown => ("agent_unknown", "agent is unknown"),
+        RpcErrorCode::AgentRequired => ("subagent_required", "subagent is required"),
+        RpcErrorCode::AgentUnknown => ("subagent_unknown", "subagent is unknown"),
         RpcErrorCode::AgentDisabled => ("agent_disabled", "agent is disabled"),
         RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
         RpcErrorCode::ModelSelectionUnsupported => (
@@ -797,6 +797,7 @@ mod server {
         pub mcp_version: String,
         pub components: BTreeMap<String, PublicComponentState>,
         pub capabilities: PublicAgentCapabilities,
+        #[serde(rename = "subagents")]
         pub agents: Vec<PublicAgentStatus>,
         pub identity: PublicDeploymentIdentity,
     }
@@ -804,6 +805,7 @@ mod server {
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct PublicAgentStatus {
+        #[serde(rename = "subagent")]
         pub agent: String,
         pub config_revision: u64,
         pub configured: bool,
@@ -1037,6 +1039,7 @@ mod server {
     pub struct AgentSpawnInput {
         #[serde(default, deserialize_with = "optional_non_null")]
         #[schemars(with = "String")]
+        #[serde(rename = "subagent")]
         pub agent: Option<String>,
         pub repository: String,
         #[serde(default)]
@@ -1090,6 +1093,7 @@ mod server {
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     pub struct PublicInputIdentity {
+        #[serde(rename = "subagent")]
         pub agent: Option<String>,
         pub config_revision: Option<u64>,
         pub adapter_version: Option<String>,
@@ -1202,6 +1206,7 @@ mod server {
     pub struct AgentListInput {
         #[serde(default, deserialize_with = "optional_non_null")]
         #[schemars(with = "String")]
+        #[serde(rename = "subagent")]
         pub agent: Option<String>,
         #[serde(default, deserialize_with = "optional_non_null")]
         pub repository: Option<String>,
@@ -1794,7 +1799,7 @@ mod server {
         #[tool(
         name = "external_subagent_spawn",
         output_schema = tool_output_schema::<AgentSpawnOutput>(),
-        description = "Start one durable agent in an absolute repository workspace. Specify agent unless default_agent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
+        description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2528,24 +2533,24 @@ mod server {
             assert!(general_manifest(&omitted).is_ok());
 
             let dsh: AgentSpawnInput = serde_json::from_value(
-                serde_json::json!({"agent":"dsh","repository":"/tmp/repository","prompt":"test"}),
+                serde_json::json!({"subagent":"dsh","repository":"/tmp/repository","prompt":"test"}),
             )
             .unwrap();
             // Admission is owned by daemon, including disabled versus unsupported order.
             assert!(general_manifest(&dsh).is_ok());
-            for field in ["agent", "model"] {
+            for field in ["subagent", "model"] {
                 let mut null_input = base.clone();
                 null_input[field] = serde_json::Value::Null;
                 assert!(serde_json::from_value::<AgentSpawnInput>(null_input).is_err());
             }
 
             let zcode: AgentSpawnInput = serde_json::from_value(
-                serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test"}),
+                serde_json::json!({"subagent":"zcode","repository":"/tmp/repository","prompt":"test"}),
             )
             .unwrap();
             assert!(general_manifest(&zcode).is_ok());
             assert!(serde_json::from_value::<AgentSpawnInput>(
-                serde_json::json!({"agent":"zcode","repository":"/tmp/repository","prompt":"test","extra":true})
+                serde_json::json!({"subagent":"zcode","repository":"/tmp/repository","prompt":"test","extra":true})
             ).is_err());
         }
 
@@ -2560,7 +2565,7 @@ mod server {
             let before = store.get_task(&id).unwrap();
             let facade = SubagentMcp::from_service(service);
             for (agent, model, expected) in [
-                ("unknown", None, "agent_unknown"),
+                ("unknown", None, "subagent_unknown"),
                 ("dsh", None, "agent_disabled"),
                 ("zcode", Some("chosen"), "model_selection_unsupported"),
             ] {
@@ -2755,7 +2760,7 @@ mod server {
                 "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
                     "maturity":{},"observation":{"public_reasoning_default":true,
                         "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
-                "agents":[],
+                "subagents":[],
                 "identity":{"daemon":{"artifact":artifact.clone()},
                     "facade":{"artifact":artifact},
                     "models":{}}

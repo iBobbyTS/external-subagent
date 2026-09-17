@@ -57,6 +57,7 @@ pub struct ProbeScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentProbeInput {
+    #[serde(alias = "subagent")]
     pub agent: String,
     #[serde(default)]
     pub through: ProbeLayer,
@@ -116,6 +117,7 @@ pub struct AgentProbeEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentModelsInput {
+    #[serde(alias = "subagent")]
     pub agent: String,
     #[serde(default)]
     pub scope: ProbeScope,

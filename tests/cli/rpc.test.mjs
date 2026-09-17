@@ -152,7 +152,7 @@ test('CLI passes list agent filter and projects persisted input identity', async
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
     assert.equal(request.method, 'task_list');
-    assert.equal(request.params.agent, 'future-provider');
+    assert.equal(request.params.subagent, 'future-provider');
     socket.end(`${JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
       kind: 'task_listed', tasks: [{ agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null,
         stop_requested: false, close_requested: false, closed: false, reaped: false, input_identity: identity }], next_cursor: null,
@@ -160,9 +160,9 @@ test('CLI passes list agent filter and projects persisted input identity', async
   }));
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
-    const result = await callDaemon(socketPath, 'list', { agent: 'future-provider', repository: '/workspace' });
+    const result = await callDaemon(socketPath, 'list', { subagent: 'future-provider', repository: '/workspace' });
     assert.deepEqual(result.tasks[0].input_identity, {
-      agent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null,
+      subagent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null,
       model_source: 'native', workspace_path: '/workspace', permission_mode: 'build',
     });
   } finally { await new Promise((resolve) => server.close(resolve)); }

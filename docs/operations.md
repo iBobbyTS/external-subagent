@@ -8,7 +8,7 @@ interface.
 ## Host and subagent instances
 
 The product distinguishes the calling application (`host`) from the managed
-execution target (`subagent`). Codex is a host; ZCode and DSH are subagents;
+execution target (`subagent`). Codex is both a host and a subagent; ZCode and DSH are subagents;
 their protocol implementations are internal `adapter`s.
 
 Host access is open to local MCP clients. In addition to the built-in `codex`
@@ -20,7 +20,7 @@ it is never an MCP connection or task-submission prerequisite.
 `host.codex` supports multiple installations. Each registered Codex `home` is
 an independent host instance and is reconciled, upgraded, inspected, and
 unbound separately. A subagent name currently supports only one instance:
-`subagents.zcode` and `subagents.dsh` each describe one runtime/home. The
+`subagents.zcode`, `subagents.dsh`, and `subagents.codex` each describe one runtime/home. The
 product does not currently provide same-name subagent instance selection or
 multi-instance routing.
 
@@ -48,12 +48,12 @@ A plain npm install only stages the package and its native payload:
   `scripts/release/build-native-payload.mjs`; supported platforms never
   compile Rust at install time.
 - Nothing else happens on a fresh install: no daemon start, no Codex writes,
-  no provider probes, and no shell profile edits. The single lifecycle script
+  no subagent probes, and no shell profile edits. The single lifecycle script
   is a `postinstall` bridge that only reads local state: a never-initialized
   install stays stage-only, and an already-initialized installation whose
   package version drifted from its published active payload coordinates
   through the existing update owner (bounded drain, abortable; never a
-  provider probe or a second lifecycle). Installs run with
+  subagent probe or a second lifecycle). Installs run with
   `--ignore-scripts` skip the bridge; the same coordination stays available
   through the explicit `update`/`reconcile` commands.
 
@@ -83,9 +83,9 @@ marketplace manifest, and directories the run created) and the baseline the
 same run published — while never undoing the official codex cache — so a
 partial install never looks complete.
 
-Missing DSH never blocks installation; `agents status` reports it explicitly
+Missing DSH never blocks installation; `subagents status` reports it explicitly
 (`enabled=false`, `spawn_supported=false`, scope states `UNKNOWN`) and the
-product never installs providers itself.
+product never installs subagent runtimes itself.
 
 When DSH is explicitly enabled, configure its `runtime_path`, `home`, `profile`,
 and pinned `version` through the public config command. `init` writes those
@@ -137,7 +137,7 @@ is never booted out by the rollback.
 
 `status` separates the launchd view from the RPC view. The default output is
 an operational summary: install/data presence, payload verification state,
-registered service state, daemon component readiness, agent enablement and
+registered service state, daemon component readiness, subagent enablement and
 spawn support, and each probe scope's `state` plus `checked_at_ms`.
 `status --verbose` adds diagnostic-only details such as payload file hashes,
 registry recovery data, daemon capabilities, service generation, transport and
@@ -204,7 +204,7 @@ definition; a service that was not registered is not an error
 (`service_already_stopped`). Deleting the plist alone would leave a job
 launchd already loaded running until the next logout, so a bootout that
 cannot complete fails the command (`SERVICE_UNLOAD_TIMEOUT`) rather than
-stranding a running daemon without its definition. Product data, provider
+stranding a running daemon without its definition. Product data, subagent
 credentials, and the legacy zcode-as-subagent installation are always
 retained; the managed Codex plugin and MCP binding are removed separately by
 `install-plugin --uninstall` / `install-mcp --uninstall`. After `npm remove`

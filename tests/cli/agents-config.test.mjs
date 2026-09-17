@@ -253,8 +253,8 @@ test('agents human operations are strict and unsupported actions are explicit', 
     callDaemon: async (socket, command, input) => {
       assert.equal(socket, '/socket');
       assert.equal(command, 'agent-probe');
-      assert.deepEqual(input, { agent: 'zcode', through: 'hi', scope: { workspace: '/workspace' } });
-      return { evidence: { agent: 'zcode' }, status: { agent: 'zcode' } };
+      assert.deepEqual(input, { subagent: 'zcode', through: 'hi', scope: { workspace: '/workspace' } });
+      return { evidence: { subagent: 'zcode' }, status: { subagent: 'zcode' } };
     },
   });
   assert.equal(probed.status.subagent, 'zcode');
@@ -263,8 +263,8 @@ test('agents human operations are strict and unsupported actions are explicit', 
     callDaemon: async (socket, command, input) => {
       assert.equal(socket, '/socket');
       assert.equal(command, 'agent-models');
-      assert.deepEqual(input, { agent: 'dsh', scope: {} });
-      return { agent: 'dsh', scope: {}, models: [] };
+      assert.deepEqual(input, { subagent: 'dsh', scope: {} });
+      return { subagent: 'dsh', scope: {}, models: [] };
     },
   });
   assert.deepEqual(models.models, []);
@@ -280,8 +280,8 @@ test('agents status projects daemon evidence and rejects absent identities', asy
   const { paths } = fixture();
   const status = {
     service_generation: 'generation-1',
-    agents: [{
-      agent: 'zcode', config_revision: 7, configured: true, enabled: true, spawn_supported: true,
+    subagents: [{
+      subagent: 'zcode', config_revision: 7, configured: true, enabled: true, spawn_supported: true,
       transport_support: { transport: 'zcode_app_server', probe: true, spawn: true },
       permission_modes: ['build', 'edit', 'plan', 'yolo'],
       model_selection: { supported: false, mode: 'native_only' },
@@ -293,24 +293,24 @@ test('agents status projects daemon evidence and rejects absent identities', asy
   const options = { socket: '/socket', callDaemon: async (socket, command, input) => {
     assert.equal(socket, '/socket'); assert.equal(command, 'status'); assert.deepEqual(input, {}); return status;
   } };
-  assert.deepEqual(await subagentsCommand(paths, { operation: 'status', subagent: 'zcode' }, options), { service_generation: 'generation-1', subagents: status.agents.map(({ agent, ...entry }) => ({ subagent: agent, ...entry })) });
-  await assert.rejects(() => subagentsCommand(paths, { operation: 'status', subagent: 'dsh' }, options), (error) => error.code === 'agent_unknown');
+  assert.deepEqual(await subagentsCommand(paths, { operation: 'status', subagent: 'zcode' }, options), { service_generation: 'generation-1', subagents: status.subagents });
+  await assert.rejects(() => subagentsCommand(paths, { operation: 'status', subagent: 'dsh' }, options), (error) => error.code === 'subagent_unknown');
 });
 
 test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {
-  assert.throws(() => prepareSpawnInput({ agent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
-  assert.throws(() => prepareSpawnInput({ agent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => prepareSpawnInput({ subagent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => prepareSpawnInput({ subagent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
-  assert.equal(Object.hasOwn(omitted, 'agent'), false);
+  assert.equal(Object.hasOwn(omitted, 'subagent'), false);
   assert.equal(Object.hasOwn(omitted, 'model'), false);
 });
 
 test('spawn flags build the shared DTO and reject malformed values', () => {
   assert.deepEqual(parseSpawnArgs([
-    '--agent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build',
+    '--subagent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build',
     '--model', 'catalog-token', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
   ]), {
-    agent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
+    subagent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
     model: 'catalog-token', write_manifest: ['src/**', 'tests/**'],
   });
   assert.throws(() => parseSpawnArgs(['--repository', '/repo']), /--prompt is required/u);

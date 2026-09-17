@@ -64,11 +64,11 @@ function readJsonInput(args) {
 function requestId() { return `cli-${process.pid}-${crypto.randomUUID()}`; }
 
 function manifest(input) {
-  const allowed = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
+  const allowed = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
-  if (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0)) throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
+  if (input.subagent !== undefined && (typeof input.subagent !== 'string' || input.subagent.length === 0)) throw new CliError('INVALID_ARGUMENT', 'subagent must be a non-empty string', 2);
   if (input.model !== undefined && (typeof input.model !== 'string' || input.model.length === 0)) throw new CliError('INVALID_ARGUMENT', 'model must be a non-empty string', 2);
   if (typeof input.repository !== 'string' || input.repository.length === 0 || typeof input.prompt !== 'string' || input.prompt.length === 0) throw new CliError('INVALID_ARGUMENT', 'create requires non-empty repository and prompt strings', 2);
   if (input.permission_mode !== undefined && (typeof input.permission_mode !== 'string' || input.permission_mode.length === 0)) throw new CliError('INVALID_ARGUMENT', 'permission_mode must be a non-empty string', 2);
@@ -98,7 +98,7 @@ function methodFor(command, input) {
     case 'create': case 'spawn': return {
       method: 'submit_general',
       params: {
-        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        ...(input.subagent !== undefined ? { subagent: input.subagent } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
         manifest: manifest(input),
       },
@@ -119,17 +119,17 @@ function methodFor(command, input) {
       };
     }
     case 'list': {
-      const allowed = new Set(['agent', 'repository', 'workspace', 'phase', 'outcome', 'cursor', 'limit']);
+      const allowed = new Set(['subagent', 'repository', 'workspace', 'phase', 'outcome', 'cursor', 'limit']);
       for (const key of Object.keys(input)) {
         if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `list contains unsupported field: ${key}`, 2);
       }
-      if (input.agent === null || (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0))) {
-        throw new CliError('INVALID_ARGUMENT', 'list agent must be omitted or a non-empty string', 2);
+      if (input.subagent === null || (input.subagent !== undefined && (typeof input.subagent !== 'string' || input.subagent.length === 0))) {
+        throw new CliError('INVALID_ARGUMENT', 'list subagent must be omitted or a non-empty string', 2);
       }
       const repository = input.repository ?? input.workspace;
       if (!repository) throw new CliError('INVALID_ARGUMENT', 'list requires repository or workspace scope', 2);
       return { method: 'task_list', params: {
-        ...(input.agent !== undefined ? { agent: input.agent } : {}),
+        ...(input.subagent !== undefined ? { subagent: input.subagent } : {}),
         repository,
         phase: input.phase ?? null,
         outcome: input.outcome ?? null,
@@ -182,7 +182,7 @@ function publicTask(task) {
     closed: task.closed,
     resources_reaped: task.reaped,
     input_identity: task.input_identity ? {
-      agent: admission?.agent ?? null,
+      subagent: admission?.agent ?? null,
       config_revision: admission?.config_revision ?? null,
       adapter_version: admission?.adapter_version ?? null,
       model: admission?.model ?? null,

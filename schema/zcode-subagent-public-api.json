@@ -11,11 +11,11 @@
       "const": ["external_subagent_cancel", "external_subagent_close", "external_subagent_list", "external_subagent_observe", "external_subagent_wait", "external_subagent_respond", "external_subagent_result", "external_subagent_send", "external_subagent_spawn", "external_subagent_status"]
     },
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
-    "agent_status": {
+    "subagent_status": {
       "type": "object",
-      "required": ["agent", "config_revision", "configured", "enabled", "spawn_supported", "transport_support", "permission_modes", "model_selection", "local", "auth", "hi"],
+      "required": ["subagent", "config_revision", "configured", "enabled", "spawn_supported", "transport_support", "permission_modes", "model_selection", "local", "auth", "hi"],
       "properties": {
-        "agent": { "enum": ["zcode", "dsh", "codex"] },
+        "subagent": { "enum": ["zcode", "dsh", "codex"] },
         "config_revision": { "type": "integer", "minimum": 0 },
         "configured": { "type": "boolean" },
         "enabled": { "type": "boolean" },
@@ -44,13 +44,13 @@
           },
           "additionalProperties": false
         },
-        "local": { "$ref": "#/properties/agent_scope_status" },
-        "auth": { "$ref": "#/properties/agent_scope_status" },
-        "hi": { "$ref": "#/properties/agent_scope_status" }
+        "local": { "$ref": "#/properties/subagent_scope_status" },
+        "auth": { "$ref": "#/properties/subagent_scope_status" },
+        "hi": { "$ref": "#/properties/subagent_scope_status" }
       },
       "additionalProperties": false
     },
-    "agent_scope_status": {
+    "subagent_scope_status": {
       "type": "object",
       "required": ["state", "scope", "checked_at_ms"],
       "properties": {
@@ -73,7 +73,7 @@
       "type": "object",
       "required": ["repository", "prompt"],
       "properties": {
-        "agent": { "type": "string", "minLength": 1, "description": "Provider route key; omission uses configured default_agent or returns agent_required. Null is invalid; dsh production spawn remains gated." },
+        "subagent": { "type": "string", "minLength": 1, "description": "Subagent route key; omission uses configured default_subagent or returns subagent_required. Null is invalid; dsh production spawn remains gated." },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode" },
         "prompt": { "type": "string", "minLength": 1 },
@@ -90,7 +90,7 @@
       "type": "object",
       "required": ["repository"],
       "properties": {
-        "agent": { "type": "string", "minLength": 1 },
+        "subagent": { "type": "string", "minLength": 1 },
         "repository": { "type": "string", "minLength": 1 },
         "phase": { "type": ["string", "null"], "default": null },
         "outcome": { "type": ["string", "null"], "default": null },
@@ -184,11 +184,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "agents", "identity"] },
-        "external_subagent_spawn": { "input": ["agent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
+        "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents", "identity"] },
+        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id", "supports_answer"], "output": ["task", "pending_requests", "result_available", "activity", "latest_progress", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
-        "external_subagent_list": { "input": ["agent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
+        "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
         "external_subagent_send": { "input": ["agent_id", "message_id", "content"], "output": ["message_id", "disposition"] },
         "external_subagent_respond": { "input": ["agent_id", "request_id", "decision", "content"], "output": ["disposition", "requested_decision", "effective_decision", "policy_overrode", "policy_reason_code"] },
         "external_subagent_cancel": { "input": ["agent_id"], "output": ["task"] },

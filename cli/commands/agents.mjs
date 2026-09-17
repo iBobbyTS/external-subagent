@@ -16,7 +16,7 @@ function validateInput(input) {
 
 function parseProbeArgs(rest) {
   const subagent = rest.shift();
-  if (!subagent || subagent.startsWith('--')) throw new CliError('agent_required', 'subagents probe requires an subagent', 2);
+  if (!subagent || subagent.startsWith('--')) throw new CliError('subagent_required', 'subagents probe requires a subagent', 2);
   let through = 'local';
   let selectedLayer = false;
   const input = { operation: 'probe', subagent };
@@ -43,7 +43,7 @@ function parseProbeArgs(rest) {
 
 function parseModelsArgs(rest) {
   const subagent = rest.shift();
-  if (!subagent || subagent.startsWith('--')) throw new CliError('agent_required', 'subagents models requires an subagent', 2);
+  if (!subagent || subagent.startsWith('--')) throw new CliError('subagent_required', 'subagents models requires a subagent', 2);
   const input = { operation: 'models', subagent };
   while (rest.length > 0) {
     const option = rest.shift();
@@ -77,28 +77,29 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
   }
   if (operation === 'models') {
     if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents models requires a daemon connection');
-    if (!input.subagent) throw new CliError('agent_required', 'subagents models requires an subagent', 2);
+    if (!input.subagent) throw new CliError('subagent_required', 'subagents models requires a subagent', 2);
     const scope = {};
     if (input.workspace !== undefined) scope.workspace = input.workspace;
     if (input.home !== undefined) scope.home = input.home;
-    const result = await options.callDaemon(options.socket, 'agent-models', { agent: input.subagent, scope });
+    const result = await options.callDaemon(options.socket, 'agent-models', { subagent: input.subagent, scope });
     return subagentView(result);
   }
   if (operation === 'probe') {
     if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents probe requires a daemon connection');
-    if (!input.subagent) throw new CliError('agent_required', 'subagents probe requires an subagent', 2);
+    if (!input.subagent) throw new CliError('subagent_required', 'subagents probe requires a subagent', 2);
     const scope = {};
     if (input.workspace !== undefined) scope.workspace = input.workspace;
     if (input.home !== undefined) scope.home = input.home;
-    const result = await options.callDaemon(options.socket, 'agent-probe', { agent: input.subagent, through: input.through ?? 'local', scope });
+    const result = await options.callDaemon(options.socket, 'agent-probe', { subagent: input.subagent, through: input.through ?? 'local', scope });
     return { ...result, evidence: subagentView(result.evidence), status: subagentView(result.status) };
   }
   if (operation !== 'status') throw new CliError('INVALID_ARGUMENT', `unsupported subagents operation: ${operation}`, 2);
   if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents status requires a daemon connection');
   const status = await options.callDaemon(options.socket, 'status', {});
-  if (!Array.isArray(status?.agents)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include subagent status');
-  const subagents = status.agents.filter((entry) => input.subagent === undefined || entry.agent === input.subagent).map(subagentView);
-  if (input.subagent !== undefined && subagents.length === 0) throw new CliError('agent_unknown', `daemon did not report subagent: ${input.subagent}`, 2);
+  const entries = status.subagents ?? status.agents;
+  if (!Array.isArray(entries)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include subagent status');
+  const subagents = entries.filter((entry) => input.subagent === undefined || (entry.subagent ?? entry.agent) === input.subagent).map(subagentView);
+  if (input.subagent !== undefined && subagents.length === 0) throw new CliError('subagent_unknown', `daemon did not report subagent: ${input.subagent}`, 2);
   return { service_generation: status.service_generation ?? null, subagents };
 }
 
@@ -112,5 +113,5 @@ export const parseAgentsArgs = parseSubagentsArgs;
 function subagentView(value) {
   if (!value) return value;
   const { agent, ...rest } = value;
-  return { subagent: agent, ...rest };
+  return { subagent: value.subagent ?? agent, ...rest };
 }

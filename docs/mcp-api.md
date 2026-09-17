@@ -4,7 +4,7 @@
 
 ## 0. 调用宿主、子代理与实例边界
 
-MCP 调用链中的上游应用称为 `host`，被调度执行的目标称为 `subagent`，连接目标协议的内部实现称为 `adapter`。例如，Codex 是一个 host，ZCode 和 DSH 是 subagent；它们不是同一层的“agent”。
+MCP 调用链中的上游应用称为 `host`，被调度执行的目标称为 `subagent`，连接目标协议的内部实现称为 `adapter`。例如，Codex 是一个 host，ZCode、DSH 和 Codex 是 subagent；它们不是同一层的“agent”。
 
 Host 接入不是注册制：本机任意 MCP client 都可以作为 `custom` host 直接连接
 facade 并调用公开工具。`codex` 是拥有产品特定安装和自动升级协调能力的内置 host；
@@ -16,7 +16,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 - `host.codex` 支持多个 instance。每个 instance 由一个独立的 Codex `home` 标识，安装绑定使用 `hosts.codex.installations[].home`；状态、升级同步和解绑必须按 home 分开处理。
 - `host.custom` 表示未注册的本机 MCP client。它不要求持久化 instance，也没有 Codex home、安装或自动升级绑定；每个连接按 MCP session 处理。
-- 每个 `subagent` 名称目前只支持单一 instance。`subagents.zcode` 和 `subagents.dsh` 分别描述一个受管 runtime/home；`spawn` 的 `subagent` 选择的是名称，不是 instance ID。当前协议不承诺同名 subagent 的多实例路由、实例选择或实例级故障隔离。
+- 每个 `subagent` 名称目前只支持单一 instance。`subagents.zcode`、`subagents.dsh` 和 `subagents.codex` 分别描述一个受管 runtime/home；`spawn` 的 `subagent` 选择的是名称，不是 instance ID。当前协议不承诺同名 subagent 的多实例路由、实例选择或实例级故障隔离。
 
 这意味着 `codex_home` 是 host 安装绑定信息，不是产品顶层运行时配置；不能把多个 Codex home 的能力误解为 subagent 多实例能力。
 
@@ -83,7 +83,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `result.isError` | 区分业务成功和工具执行失败 | 仅按协议成功判断的调用方可能把失败当成功 |
 | 顶层 `error` | JSON-RPC／框架层失败，含协议定义的 `code/message`，可能有 `data` | 协议故障无法按标准报告；不是本文业务 `error` 的替代字段 |
 
-所有工具输入拒绝未声明字段。所有 `agent_id` 是 **10000000–99999999 的整数**，标识持久化任务，不是 provider 名、上游会话 ID 或字符串。下文 `integer` 均指 JSON 整数；计数、偏移为非负值，另有说明除外。
+所有工具输入拒绝未声明字段。所有 `agent_id` 是 **10000000–99999999 的整数**，标识持久化任务，不是 subagent 名、上游会话 ID 或字符串。下文 `integer` 均指 JSON 整数；计数、偏移为非负值，另有说明除外。
 
 除 `wait.message_id` 明确允许 `null`，下文可选输入应通过省略表达未提供，不应传 `null`。
 
@@ -91,7 +91,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 工具 | 用途 | MCP annotations |
 |---|---|---|
-| `external_subagent_status` | 系统就绪、provider 能力和身份 | 只读、幂等 |
+| `external_subagent_status` | 系统就绪、subagent 能力和身份 | 只读、幂等 |
 | `external_subagent_spawn` | 提交任务 | 非只读、非幂等 |
 | `external_subagent_wait` | 有界等待可处理请求或终态结果 | 只读、幂等 |
 | `external_subagent_observe` | 疑似循环时查看观测事实 | 只读、幂等 |
@@ -106,7 +106,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 ## 4. external_subagent_status
 
-输入为 `{}`。读取状态不会代替显式 provider probe 或真实执行验收；`hi` 等信息须结合检查时间和 scope 判断。
+输入为 `{}`。读取状态不会代替显式 subagent probe 或真实执行验收；`hi` 等信息须结合检查时间和 scope 判断。
 
 ### 4.1 顶层输出
 
@@ -115,7 +115,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `mcp_version` | string | 诊断：记录服务报告的版本 | 降低版本排障能力；它本身不是兼容性协商开关 |
 | `components` | map<string, ComponentState> | 判断各组件就绪情况 | 无法定位哪层不可用 |
 | `capabilities` | Capabilities | 构造有界调用和了解观测能力 | 客户端只能硬编码限制 |
-| `agents` | AgentStatus[] | 选择 provider 前查看启用、启动、权限和模型能力 | 容易提交不受支持的组合 |
+| `subagents` | SubagentStatus[] | 选择 subagent 前查看启用、启动、权限和模型能力 | 容易提交不受支持的组合 |
 | `identity` | DeploymentIdentity | 诊断：核对组件路径及配置模型来源 | 难以解释安装／运行对象不一致 |
 
 `ComponentState = READY | DEGRADED | UNAVAILABLE | UNKNOWN`。
@@ -137,21 +137,21 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 `maturity` 值：`beta_ready | experimental_unverified_runtime`。map 的键为能力名称，不应推断固定键集合。
 
-### 4.3 agents[]
+### 4.3 subagents[]
 
 | 字段 | 类型 | 何时使用／存在理由 | 移除影响 |
 |---|---|---|---|
-| `agent` | string | 把状态关联到 provider 路由，如 zcode、dsh、codex | 无法知道能力属于谁 |
+| `subagent` | string | 把状态关联到 subagent 路由，如 zcode、dsh、codex | 无法知道能力属于谁 |
 | `config_revision` | integer | 诊断：对照任务创建时配置 | 无法判断配置是否已变更 |
 | `configured` | boolean | 判断配置是否存在 | 无法区分未配置与已禁用 |
 | `enabled` | boolean | 判断配置是否允许使用 | 客户端只能通过失败获知禁用 |
-| `spawn_supported` | boolean | 判断此 provider 配置是否支持启动 | 容易把可 probe 误当作可 spawn |
+| `spawn_supported` | boolean | 判断此 subagent 配置是否支持启动 | 容易把可 probe 误当作可 spawn |
 | `transport_support` | object | 描述适配器传输与操作支持 | 丢失实现层能力边界 |
 | `transport_support.transport` | enum | 诊断：`zcode_app_server / dsh_acp / codex_app_server` | 无法识别适配器协议 |
 | `transport_support.probe` | boolean | 判断是否支持探测 | 无法预先判断 probe 支持 |
 | `transport_support.spawn` | boolean | 判断适配器是否实现启动 | 与配置 gate 的差别不可见 |
-| `permission_modes` | PermissionMode[] | 选择该 provider 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 provider 都支持 |
-| `model_selection` | object | 描述模型选择能力 | 无法按 provider 选择参数策略 |
+| `permission_modes` | PermissionMode[] | 选择该 subagent 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 subagent 都支持 |
+| `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
 | `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式 | 不清楚应省略还是使用模型 token |
 | `local` | AgentScopeStatus | 查看本地 runtime 检查 | 缺少本地可用性依据 |
@@ -165,7 +165,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `state` | ComponentState | 判断本项检查结论 | 无法判断检查是否成功或未知 |
 | `scope` | object | 解释检查适用范围 | 可能把其他目录的结果套用于当前任务 |
 | `scope.workspace` | string/省略 | 诊断：检查使用的 workspace | 失去工作区适用性依据 |
-| `scope.home` | string/省略 | 诊断：检查使用的 provider home | 难以识别凭据／配置作用域差异 |
+| `scope.home` | string/省略 | 诊断：检查使用的 subagent home | 难以识别凭据／配置作用域差异 |
 | `version` | string/省略 | 诊断：检查发现的版本 | 无法分析 runtime 版本差异 |
 | `checked_at_ms` | integer/省略 | 判断检查结果新旧 | 无法识别陈旧状态 |
 | `reason` | string/省略 | 解释非就绪等状态 | 只能看到结论，缺少原因 |
@@ -189,14 +189,14 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 参数 | 类型／必填与默认 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
-| `agent` | string；可选 | 选 provider，或避免默认配置变化影响路由 | 省略使用 `default_agent`，未配置则 `agent_required`；移除后无法逐任务选 provider |
+| `subagent` | string；可选 | 选择 subagent，或避免默认配置变化影响路由 | 省略使用 `default_subagent`，未配置则 `subagent_required`；移除后无法逐任务选 subagent |
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
 | `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | 非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
-| `model` | string；可选 | provider 支持时指定任务模型 | 省略采用 provider 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝 |
+| `model` | string；可选 | subagent 支持时指定任务模型 | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝 |
 
-`PermissionMode = build | edit | plan | yolo`，实际可用组合以 provider 能力和 admission 为准。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
+`PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
 
 `prompt` 必须非空白、无 NUL，最大 262144 字节。`write_manifest` 不允许重复路径、绝对路径、`..`，或包含 `.git`／`.gitmodules` 路径组件；plan 模式必须为空。整个内部 RPC 帧另有上限，因此正文上限不等于完整请求上限。`repository` 名称沿用契约，实际通用准备逻辑要求目录，不应仅因名称就额外假设必须有 `.git`。
 
@@ -279,7 +279,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | 参数 | 类型／要求 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
 | `repository` | string；业务必填 | 明确查询作用域 | 省略返回 validation；移除会失去当前 daemon 强制的仓库范围契约 |
-| `agent` | string；可选 | 只查询特定 provider 任务 | 省略不按 provider 过滤；移除后客户端需自己过滤 |
+| `subagent` | string；可选 | 只查询特定 subagent 任务 | 省略不按 subagent 过滤；移除后客户端需自己过滤 |
 | `phase` | Phase；可选 | 只找运行中、等待输入、终态等任务 | 省略不按阶段过滤；移除后扩大查询量 |
 | `outcome` | Outcome；可选 | 查失败、取消或成功历史 | 省略不按结果过滤；移除后需自行筛选 |
 | `cursor` | string；可选 | 使用上一页 next_cursor 获取续页 | 省略取起始页；移除后无法访问超出首批的任务 |
@@ -392,7 +392,7 @@ phase 在输出类型中是 string，而非强制枚举。不要把 phase、acti
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `agent` | string/null | 追溯接纳该任务的 provider | 无法区分不同上游执行来源 |
+| `subagent` | string/null | 追溯接纳该任务的 subagent | 无法区分不同上游执行来源 |
 | `config_revision` | integer/null | 对照提交时配置版本 | 当前配置变化后无法解释旧任务 |
 | `adapter_version` | string/null | 排查适配器版本行为差异 | 缺少适配器证据 |
 | `model` | string/null | 查看已记录模型选择；null 不应猜测为某个模型 | 无法追溯已知模型选择 |
@@ -503,12 +503,12 @@ ActivityWindow 的所有字段均为 integer，单位是最近60秒内的事件�
 | `error.request_id` | string/省略 | 关联 facade 发起的 RPC 请求 | 无法从错误定位具体 RPC；不是待回答问题的 ID |
 | `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务；workspace busy 时尤其有用 |
 | `error.cleanup` | string/省略 | 当前定义中的预留诊断字段 | 当前 mcp.rs 构造路径未赋值，删掉不影响现有运行信息，但会改变公开 schema；没有证据说明必须保留 |
-| `error.prompt_count` | integer/省略 | provider 路由／能力拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
+| `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
 
 当前公开映射的错误码：
 
 ```text
-validation, agent_required, agent_unknown, agent_disabled,
+validation, subagent_required, subagent_unknown, agent_disabled,
 agent_unsupported, model_selection_unsupported, oversized,
 protocol_error, not_found, conflict, runtime_command_failed,
 timeout, runtime_lost, result_invalid, persistence, internal,
@@ -523,7 +523,7 @@ unavailable, daemon_unavailable
 
 ```json
 {
-  "agent": "dsh",
+  "subagent": "dsh",
   "repository": "/absolute/path/to/project",
   "permission_mode": "plan",
   "prompt": "阅读代码并解释入口，不修改文件。"

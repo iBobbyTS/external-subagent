@@ -135,6 +135,7 @@ pub struct TaskListQuery {
         deserialize_with = "optional_non_null",
         skip_serializing_if = "Option::is_none"
     )]
+    #[serde(alias = "subagent")]
     pub agent: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
@@ -179,6 +180,7 @@ pub struct GeneralSubmitInput {
         deserialize_with = "optional_non_null",
         skip_serializing_if = "Option::is_none"
     )]
+    #[serde(alias = "subagent")]
     pub agent: Option<String>,
     #[serde(
         default,

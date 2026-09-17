@@ -48,7 +48,7 @@ function summarizeAgentStatus(agent) {
     }
   }
   return {
-    agent: agent.agent,
+    subagent: agent.subagent ?? agent.agent,
     configured: agent.configured,
     enabled: agent.enabled,
     spawn_supported: agent.spawn_supported,
@@ -62,7 +62,7 @@ function publicDaemonStatus(status, { verbose = false } = {}) {
   return {
     ...(status.mcp_version === undefined ? {} : { mcp_version: status.mcp_version }),
     ...(status.components === undefined ? {} : { components: status.components }),
-    ...(Array.isArray(status.agents) ? { agents: status.agents.map(summarizeAgentStatus) } : {}),
+    ...(Array.isArray(status.subagents ?? status.agents) ? { subagents: (status.subagents ?? status.agents).map(summarizeAgentStatus) } : {}),
   };
 }
 

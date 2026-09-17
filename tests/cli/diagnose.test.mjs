@@ -45,13 +45,13 @@ test('ordinary status projection keeps essential daemon state while verbose keep
     components: { daemon: 'READY' },
     service_generation: 'generation-secret',
     capabilities: { max_rpc_request_frame_bytes: 524288 },
-    agents: [{ agent: 'zcode', configured: true, enabled: true, spawn_supported: true, permission_modes: ['yolo'], local: { state: 'UNKNOWN', checked_at_ms: null } }],
+    subagents: [{ subagent: 'zcode', configured: true, enabled: true, spawn_supported: true, permission_modes: ['yolo'], local: { state: 'UNKNOWN', checked_at_ms: null } }],
     identity: { daemon: { artifact: { path: '/private/daemon', sha256: 'secret-hash' } } },
   };
   assert.deepEqual(publicDaemonStatus(status), {
     mcp_version: '0.1.0',
     components: { daemon: 'READY' },
-    agents: [{ agent: 'zcode', configured: true, enabled: true, spawn_supported: true, local: { state: 'UNKNOWN', checked_at_ms: null } }],
+    subagents: [{ subagent: 'zcode', configured: true, enabled: true, spawn_supported: true, local: { state: 'UNKNOWN', checked_at_ms: null } }],
   });
   assert.deepEqual(publicDaemonStatus(status, { verbose: true }), status);
   assert.ok(status.identity, 'projection must not mutate the RPC diagnostic view');

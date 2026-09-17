@@ -1,8 +1,8 @@
 import { CliError } from '../errors.mjs';
 
-const SPAWN_FIELDS = new Set(['agent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
+const SPAWN_FIELDS = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
 const FLAG_FIELDS = new Map([
-  ['--agent', 'agent'],
+  ['--subagent', 'subagent'],
   ['--repository', 'repository'],
   ['--prompt', 'prompt'],
   ['--permission-mode', 'permission_mode'],
@@ -41,11 +41,11 @@ export function prepareSpawnInput(input) {
   for (const key of Object.keys(input)) {
     if (!SPAWN_FIELDS.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
-  if (Object.prototype.hasOwnProperty.call(input, 'agent') && input.agent === null) {
-    throw new CliError('INVALID_ARGUMENT', 'agent must be omitted or a supported agent id; null is invalid', 2);
+  if (Object.prototype.hasOwnProperty.call(input, 'subagent') && input.subagent === null) {
+    throw new CliError('INVALID_ARGUMENT', 'subagent must be omitted or a supported subagent id; null is invalid', 2);
   }
-  if (input.agent !== undefined && (typeof input.agent !== 'string' || input.agent.length === 0)) {
-    throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
+  if (input.subagent !== undefined && (typeof input.subagent !== 'string' || input.subagent.length === 0)) {
+    throw new CliError('INVALID_ARGUMENT', 'subagent must be a non-empty string', 2);
   }
   if (Object.prototype.hasOwnProperty.call(input, 'model') && input.model === null) {
     throw new CliError('INVALID_ARGUMENT', 'model must be omitted or a non-null model token', 2);

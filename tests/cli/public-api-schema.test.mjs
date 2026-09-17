@@ -17,22 +17,22 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     assert.equal(serialized.includes(forbidden), false, `public schema exposes ${forbidden}`);
   }
   assert.deepEqual(schema.properties.spawn.additionalProperties, false);
-  assert.deepEqual(schema.properties.agent_status.required, [
-    'agent', 'config_revision', 'configured', 'enabled', 'spawn_supported',
+  assert.deepEqual(schema.properties.subagent_status.required, [
+    'subagent', 'config_revision', 'configured', 'enabled', 'spawn_supported',
     'transport_support', 'permission_modes', 'model_selection', 'local', 'auth', 'hi',
   ]);
-  assert.deepEqual(schema.properties.agent_status.properties.transport_support.properties.transport.enum, [
+  assert.deepEqual(schema.properties.subagent_status.properties.transport_support.properties.transport.enum, [
     'zcode_app_server', 'dsh_acp', 'codex_app_server',
   ]);
-  assert.deepEqual(schema.properties.agent_scope_status.required, ['state', 'scope', 'checked_at_ms']);
-  assert.deepEqual(schema.properties.agent_scope_status.properties.checked_at_ms.type, ['integer', 'null']);
-  assert.deepEqual(schema.properties.agent_status.properties.model_selection.properties.mode.enum, [
+  assert.deepEqual(schema.properties.subagent_scope_status.required, ['state', 'scope', 'checked_at_ms']);
+  assert.deepEqual(schema.properties.subagent_scope_status.properties.checked_at_ms.type, ['integer', 'null']);
+  assert.deepEqual(schema.properties.subagent_status.properties.model_selection.properties.mode.enum, [
     'native_only', 'catalog_token',
   ]);
   assert.deepEqual(schema.properties.spawn.properties.write_manifest.items.type, 'string');
   assert.equal(schema.properties.spawn.properties.prompt.type, 'string');
   assert.equal(schema.properties.spawn.properties.model.type, 'string');
-  assert.equal(schema.properties.spawn.properties.agent.type, 'string');
+  assert.equal(schema.properties.spawn.properties.subagent.type, 'string');
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.supports_answer.default, false);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
@@ -47,7 +47,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'tools', 'reasoning', 'coverage',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_status.output, [
-    'mcp_version', 'components', 'capabilities', 'agents', 'identity',
+    'mcp_version', 'components', 'capabilities', 'subagents', 'identity',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.input, [
     'agent_id', 'wait_time', 'message_id', 'supports_answer',
