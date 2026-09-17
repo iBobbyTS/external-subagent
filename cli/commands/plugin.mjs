@@ -36,7 +36,7 @@ export function pluginCommand(paths, args) {
   if (options.uninstall) {
     const result = uninstallPlugin(paths, installerOptions);
     if (!options.dry_run && result.uninstalled) {
-      const claim = unregisterCodexHome(paths, result.codex_home);
+      const claim = unregisterCodexHome(paths, result.codex_home, 'plugin');
       result.claim_released = claim.unregistered;
     }
     return result;
@@ -44,7 +44,7 @@ export function pluginCommand(paths, args) {
   const result = installPlugin(paths, installerOptions);
   if (!options.dry_run && result.installed) {
     const payload = safePayloadVersion();
-    const claim = registerCodexHome(paths, result.codex_home, { version: payload, digest: result.digest });
+    const claim = registerCodexHome(paths, result.codex_home, { version: payload, digest: result.digest, binding_mode: 'plugin' });
     result.claim = { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes };
   }
   return result;
@@ -52,7 +52,16 @@ export function pluginCommand(paths, args) {
 
 export function mcpCommand(paths, args) {
   const options = parseCommon(args, ['--dry-run', '--uninstall']);
-  return installMcp(paths, withInstallerFlags(options));
+  const installerOptions = withInstallerFlags(options);
+  const result = installMcp(paths, installerOptions);
+  if (!options.dry_run && result.installed) {
+    const claim = registerCodexHome(paths, result.codex_home || installerOptions.codexHome, { binding_mode: 'mcp', status: 'claimed' });
+    result.claim = { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes };
+  } else if (!options.dry_run && options.uninstall) {
+    const claim = unregisterCodexHome(paths, result.codex_home || installerOptions.codexHome, 'mcp');
+    result.claim_released = claim.unregistered;
+  }
+  return result;
 }
 
 // The install layer speaks camelCase (dryRun); CLI parsing produces snake_case

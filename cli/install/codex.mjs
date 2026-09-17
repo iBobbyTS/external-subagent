@@ -318,16 +318,17 @@ export function installMcp(paths, options = {}) {
   // The TOML binding lives inside the Codex home, so an explicit --codex-home
   // (then CODEX_HOME) selects the config file for install and removal alike.
   const config = options.configPath || path.join(codexHomeFor(options, paths), 'config.toml');
+  const codexHome = codexHomeFor(options, paths);
   const command = nativeBinary('external-subagent-mcp');
   if (options.dryRun) {
-    return { dry_run: true, operation: options.uninstall ? 'uninstall' : 'install', platform: 'codex', config, command, socket: paths.socket };
+    return { dry_run: true, operation: options.uninstall ? 'uninstall' : 'install', platform: 'codex', config, codex_home: codexHome, command, socket: paths.socket };
   }
   if (options.uninstall) {
     const prior = readOptional(config);
-    if (prior === null) return { uninstalled: false, platform: 'codex', config };
+    if (prior === null) return { uninstalled: false, platform: 'codex', config, codex_home: codexHome };
     const preserved = removeTomlSection(prior.toString('utf8'), CODEX_MCP_SECTION).replace(/^\n+|\n+$/gu, '');
     atomicWrite(config, Buffer.from(preserved ? `${preserved}\n` : ''));
-    return { uninstalled: true, platform: 'codex', config };
+    return { uninstalled: true, platform: 'codex', config, codex_home: codexHome };
   }
   if (!fs.existsSync(command) && !options.skipNativeProbe) {
     throw new CliError('NATIVE_BINARY_NOT_FOUND', 'npm package does not contain the macOS MCP binary');
@@ -337,5 +338,5 @@ export function installMcp(paths, options = {}) {
   const preserved = removeTomlSection(base, CODEX_MCP_SECTION).replace(/\s*$/u, '');
   const next = `${preserved ? `${preserved}\n\n` : ''}${codexMcpConfig(paths)}`;
   atomicWrite(config, Buffer.from(next));
-  return { installed: true, platform: 'codex', config, command, socket: paths.socket, tools: [...CODEX_TOOLS] };
+  return { installed: true, platform: 'codex', config, codex_home: codexHome, command, socket: paths.socket, tools: [...CODEX_TOOLS] };
 }

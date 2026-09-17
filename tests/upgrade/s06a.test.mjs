@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { reconcileInstallation, updateInstallation } from '../../cli/install/update.mjs';
-import { registerCodexHome, reconcileCodexHomes } from '../../cli/install/reconcile.mjs';
+import { loadCodexHomes, registerCodexHome, reconcileCodexHomes, unregisterCodexHome } from '../../cli/install/reconcile.mjs';
 import { updateCommand } from '../../cli/commands/update.mjs';
 import { packageRoot, packageVersion } from '../../cli/install/layout.mjs';
 import { runInit } from '../../cli/install/init.mjs';
@@ -79,6 +79,25 @@ test('registered home reconcile reports per-home partial results', () => {
   fs.mkdirSync(ok); fs.mkdirSync(bad); registerCodexHome(p, ok); registerCodexHome(p, bad);
   const result = reconcileCodexHomes(p, { installer: (_p, o) => { if (path.basename(o.codexHome) === 'bad') throw new Error('boom'); return { digest: 'd' }; } });
   assert.equal(result.all_updated, false); assert.deepEqual(result.homes.map((x) => x.status), ['updated', 'failed']);
+});
+
+test('registry migration defaults legacy claims to plugin and preserves explicit MCP mode', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  fs.writeFileSync(path.join(p.data, 'codex-homes.json'), JSON.stringify({ schema_version: 1, product: 'external-subagent', homes: [{ home: path.join(root, 'legacy') }] }));
+  assert.equal(loadCodexHomes(p).registry.homes[0].binding_mode, 'plugin');
+  registerCodexHome(p, path.join(root, 'mcp'), { binding_mode: 'mcp' });
+  assert.deepEqual(loadCodexHomes(p).registry.homes.map((entry) => entry.binding_mode), ['plugin', 'mcp']);
+});
+
+test('mode-specific uninstall release never removes the other binding claim', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-upgrade-')); const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true }); const home = path.join(root, 'codex'); fs.mkdirSync(home);
+  registerCodexHome(p, home, { binding_mode: 'mcp' });
+  assert.equal(unregisterCodexHome(p, home, 'plugin').unregistered, false);
+  assert.equal(loadCodexHomes(p).registry.homes.length, 1);
+  assert.equal(unregisterCodexHome(p, home, 'mcp').unregistered, true);
+  assert.equal(loadCodexHomes(p).registry.homes.length, 0);
 });
 
 test('update command requires yes for active cancellation', async () => {

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional } from '../fs-atomic.mjs';
-import { installPlugin } from './codex.mjs';
+import { installMcp, installPlugin } from './codex.mjs';
 import { packageVersion } from './layout.mjs';
 
 // D08: the single owner of the global installed-Codex-homes registry.  The
@@ -30,11 +30,17 @@ function resolveHome(home) {
 
 function normalizeEntry(entry) {
   if (!entry || typeof entry.home !== 'string') throw new CliError('CODEX_HOMES_REGISTRY_INVALID', 'registry entry is missing its home path');
+  const hasMode = Object.prototype.hasOwnProperty.call(entry, 'binding_mode');
+  if (hasMode && entry.binding_mode !== 'mcp' && entry.binding_mode !== 'plugin') {
+    throw new CliError('CODEX_HOMES_REGISTRY_INVALID', 'registry entry has an unsupported binding mode');
+  }
   return {
     home: entry.home,
     claimed_at_ms: Number.isInteger(entry.claimed_at_ms) ? entry.claimed_at_ms : null,
     version: typeof entry.version === 'string' ? entry.version : null,
     digest: typeof entry.digest === 'string' ? entry.digest : null,
+    // Schema-1 claims were plugin-only; default omitted modes accordingly.
+    binding_mode: hasMode ? entry.binding_mode : 'plugin',
     last_sync_ms: Number.isInteger(entry.last_sync_ms) ? entry.last_sync_ms : null,
     last_status: typeof entry.last_status === 'string' ? entry.last_status : null,
   };
@@ -85,12 +91,14 @@ export function registerCodexHome(paths, home, meta = {}) {
     if (typeof meta.version === 'string') entry.version = meta.version;
     if (typeof meta.digest === 'string') entry.digest = meta.digest;
     if (typeof meta.status === 'string') entry.last_status = meta.status;
+    if (meta.binding_mode === 'mcp' || meta.binding_mode === 'plugin') entry.binding_mode = meta.binding_mode;
   } else {
     entry = {
       home: resolved,
       claimed_at_ms: Date.now(),
       version: typeof meta.version === 'string' ? meta.version : null,
       digest: typeof meta.digest === 'string' ? meta.digest : null,
+      binding_mode: meta.binding_mode === 'mcp' ? 'mcp' : 'plugin',
       last_sync_ms: null,
       last_status: typeof meta.status === 'string' ? meta.status : 'claimed',
     };
@@ -100,10 +108,11 @@ export function registerCodexHome(paths, home, meta = {}) {
   return { registered: true, home: resolved, deduplicated: Boolean(existing), homes: registry.homes.length, recovery };
 }
 
-export function unregisterCodexHome(paths, home) {
+export function unregisterCodexHome(paths, home, bindingMode = null) {
   const { registry } = loadCodexHomes(paths);
   const resolved = resolveHome(home);
-  const remaining = registry.homes.filter((entry) => entry.home !== resolved);
+  const remaining = registry.homes.filter((entry) => entry.home !== resolved
+    || (bindingMode !== null && entry.binding_mode !== bindingMode));
   const unregistered = remaining.length !== registry.homes.length;
   registry.homes = remaining;
   if (unregistered) persistRegistry(paths, registry);
@@ -180,7 +189,8 @@ export function reconcileCodexHomes(paths, options = {}) {
       continue;
     }
     try {
-      const installer = options.installer || installPlugin;
+      const installer = options.installer || (entry.binding_mode === 'mcp' ? installMcp : installPlugin);
+      if (typeof installer !== 'function') throw new CliError('CODEX_BINDING_FAILED', `no installer is available for ${entry.binding_mode} binding`);
       const install = installer(paths, { ...options, codexHome: entry.home });
       entry.last_status = 'updated';
       entry.last_sync_ms = Date.now();
