@@ -14,11 +14,11 @@ import { platform, productPaths } from './paths.mjs';
 import { callDaemon, parseDaemonInput } from './rpc.mjs';
 import { configCommand } from './commands/config.mjs';
 import { parseConfigArgs } from './commands/config.mjs';
-import { agentsCommand, parseAgentsArgs } from './commands/agents.mjs';
+import { subagentsCommand, parseSubagentsArgs } from './commands/agents.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from './commands/tasks.mjs';
 
 const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks]\n      [--skip-runtime-probe] [--skip-codex-plugin] [--skip-service-start]\n      [--codex-home <path>]    Install service, bind Codex, claim the Codex home\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed Codex plugin (MCP + skill)\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex claims; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
-const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  agents list | agents status [agent] | agents probe/models [agent]\n  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
+const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  subagents list | subagents status [subagent] | subagents probe/models [subagent]\n  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function structuredInput(args, parser) {
   return args.length > 0 && !args[0].startsWith('--') ? parser(args) : parseDaemonInput(args);
@@ -387,11 +387,11 @@ export async function main(args) {
     }
     return;
   }
-  if (command === 'config' || command === 'agents') {
-    const input = structuredInput(args.slice(1), command === 'config' ? parseConfigArgs : parseAgentsArgs);
+  if (command === 'config' || command === 'subagents' || command === 'agents') {
+    const input = structuredInput(args.slice(1), command === 'config' ? parseConfigArgs : parseSubagentsArgs);
     output(command === 'config'
       ? configCommand(paths, input)
-      : await agentsCommand(paths, input, { callDaemon, socket: process.env.ZCODE_AGENTD_SOCKET || paths.socket }));
+      : await subagentsCommand(paths, input, { callDaemon, socket: process.env.ZCODE_AGENTD_SOCKET || paths.socket }));
     return;
   }
   if (command === 'diagnose') {

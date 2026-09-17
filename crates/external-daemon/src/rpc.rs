@@ -459,7 +459,7 @@ pub struct AgentModelSelectionCapabilityView {
     pub mode: AgentModelSelectionModeView,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigSnapshot {
     #[serde(default)]
@@ -467,9 +467,9 @@ struct AgentConfigSnapshot {
     #[serde(default)]
     revision: u64,
     #[serde(default)]
-    default_agent: Option<String>,
+    default_subagent: Option<String>,
     #[serde(default)]
-    agents: BTreeMap<String, AgentConfigEntry>,
+    subagents: BTreeMap<String, AgentConfigEntry>,
     #[serde(default)]
     runtime: Option<String>,
     #[serde(default)]
@@ -478,7 +478,7 @@ struct AgentConfigSnapshot {
     socket: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentConfigEntry {
     enabled: bool,
@@ -498,10 +498,10 @@ struct AgentConfigEntry {
 impl Default for AgentConfigSnapshot {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             revision: 0,
-            default_agent: None,
-            agents: BTreeMap::from([
+            default_subagent: None,
+            subagents: BTreeMap::from([
                 (
                     "zcode".into(),
                     AgentConfigEntry {
@@ -1086,7 +1086,7 @@ impl RpcService {
                 validate_agent_probe_input(&input)?;
                 let config = read_agent_config_snapshot()?;
                 if input.agent == "dsh" {
-                    let dsh = config.agents.get("dsh");
+                    let dsh = config.subagents.get("dsh");
                     input.scope.profile = input
                         .scope
                         .profile
@@ -1107,7 +1107,7 @@ impl RpcService {
                 validate_agent_models_input(&input)?;
                 let config = read_agent_config_snapshot()?;
                 if input.agent == "dsh" {
-                    let dsh = config.agents.get("dsh");
+                    let dsh = config.subagents.get("dsh");
                     input.scope.profile = input
                         .scope
                         .profile
@@ -1602,7 +1602,7 @@ fn configured_agent_statuses(
     ["zcode", "dsh", "codex"]
         .into_iter()
         .map(|agent| {
-            let entry = &config.agents[agent];
+            let entry = &config.subagents[agent];
             let observed = evidence.latest(agent);
             AgentStatusView {
                 agent: agent.into(),
@@ -1883,15 +1883,15 @@ fn resolve_admission(
     let agent = input
         .agent
         .as_deref()
-        .or(config.default_agent.as_deref())
+        .or(config.default_subagent.as_deref())
         .ok_or_else(|| {
             RpcError::new(
                 RpcErrorCode::AgentRequired,
-                "agent is required when no default_agent is configured",
+                "agent is required when no default_subagent is configured",
             )
         })?;
     let configured = config
-        .agents
+        .subagents
         .get(agent)
         .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
     if !configured.enabled {
@@ -2034,19 +2034,29 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
             ))
         }
     };
-    let mut value: Value = serde_json::from_slice(&bytes)
+    parse_agent_config_snapshot(&bytes)
+}
+
+/// Startup and RPC admission share the persisted config validation and migration.
+pub fn parse_subagent_config(bytes: &[u8]) -> Result<Value, RpcError> {
+    serde_json::to_value(parse_agent_config_snapshot(bytes)?)
+        .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))
+}
+
+fn parse_agent_config_snapshot(bytes: &[u8]) -> Result<AgentConfigSnapshot, RpcError> {
+    let mut value: Value = serde_json::from_slice(bytes)
         .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
     normalize_agent_config_value(&mut value)?;
     let mut snapshot: AgentConfigSnapshot = serde_json::from_value(value)
         .map_err(|_| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
-    if snapshot.schema_version != 0 && snapshot.schema_version != 1 {
+    if snapshot.schema_version != 2 {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
             "unsupported agent config schema version",
         ));
     }
     if snapshot
-        .agents
+        .subagents
         .keys()
         .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh" | "codex"))
     {
@@ -2056,30 +2066,62 @@ fn read_agent_config_snapshot() -> Result<AgentConfigSnapshot, RpcError> {
         ));
     }
     let defaults = AgentConfigSnapshot::default();
-    for (name, entry) in defaults.agents {
-        snapshot.agents.entry(name).or_insert(entry);
+    for (name, entry) in defaults.subagents {
+        snapshot.subagents.entry(name).or_insert(entry);
     }
     if snapshot
-        .default_agent
+        .default_subagent
         .as_deref()
-        .is_some_and(|agent| !snapshot.agents.contains_key(agent))
+        .is_some_and(|agent| !snapshot.subagents.contains_key(agent))
     {
         return Err(RpcError::new(
             RpcErrorCode::AgentUnknown,
-            "default_agent is unknown",
+            "default_subagent is unknown",
         ));
     }
     if snapshot
-        .default_agent
+        .default_subagent
         .as_deref()
-        .is_some_and(|agent| !snapshot.agents[agent].enabled)
+        .is_some_and(|agent| !snapshot.subagents[agent].enabled)
     {
         return Err(RpcError::new(
             RpcErrorCode::AgentDisabled,
-            "default_agent is disabled",
+            "default_subagent is disabled",
         ));
     }
     Ok(snapshot)
+}
+
+#[cfg(test)]
+mod config_migration_tests {
+    use super::*;
+
+    #[test]
+    fn shared_node_rust_config_matrix() {
+        let cases: Value = serde_json::from_str(include_str!("../../../tests/fixtures/subagent-config-matrix.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let bytes = serde_json::to_vec(&case["input"]).unwrap();
+            let startup = parse_subagent_config(&bytes);
+            let rpc = parse_agent_config_snapshot(&bytes);
+            let valid = case["valid"].as_bool().unwrap();
+            assert_eq!(startup.is_ok(), valid, "startup {}: {:?}", case["name"], startup);
+            assert_eq!(rpc.is_ok(), valid, "RPC {}: {:?}", case["name"], rpc);
+            if let Ok(value) = startup {
+                assert_eq!(value["schema_version"], 2);
+                assert!(value.get("agents").is_none());
+                assert!(value.get("default_agent").is_none());
+                let input = &case["input"];
+                assert_eq!(value["default_subagent"], input.get("default_agent").or_else(|| input.get("default_subagent")).unwrap_or(&Value::Null).clone());
+                if let Some(entries) = input.get("agents").or_else(|| input.get("subagents")).and_then(Value::as_object) {
+                    for (name, entry) in entries {
+                        for (field, expected) in entry.as_object().unwrap() {
+                            assert_eq!(&value["subagents"][name][field], expected, "{}", case["name"]);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
@@ -2087,13 +2129,22 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
         .as_object_mut()
         .ok_or_else(|| RpcError::new(RpcErrorCode::Validation, "agent config is invalid"))?;
     if let Some(schema) = object.get("schema_version") {
-        if schema.as_u64() != Some(1) {
+        if !matches!(schema.as_u64(), Some(1) | Some(2)) {
             return Err(RpcError::new(
                 RpcErrorCode::Validation,
                 "unsupported agent config schema version",
             ));
         }
     }
+    let legacy = object.contains_key("agents") || object.contains_key("default_agent");
+    let canonical = object.contains_key("subagents") || object.contains_key("default_subagent");
+    let version = object.get("schema_version").and_then(Value::as_u64);
+    if (legacy && canonical) || (version == Some(1) && canonical) || (version == Some(2) && legacy) {
+        return Err(RpcError::new(RpcErrorCode::Validation, "agent config fields do not match schema version"));
+    }
+    if let Some(legacy) = object.remove("agents") { object.insert("subagents".into(), legacy); }
+    if let Some(legacy) = object.remove("default_agent") { object.insert("default_subagent".into(), legacy); }
+    object.insert("schema_version".into(), Value::from(2));
     for field in ["runtime", "database", "socket"] {
         if let Some(value) = object.get(field) {
             if !value.as_str().is_some_and(|value| !value.is_empty()) {
@@ -2104,13 +2155,13 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
             }
         }
     }
-    let Some(agents) = object.get_mut("agents") else {
+    let Some(agents) = object.get_mut("subagents") else {
         return Ok(());
     };
     let agents = agents.as_object_mut().ok_or_else(|| {
         RpcError::new(
             RpcErrorCode::Validation,
-            "agent config agents must be an object",
+            "agent config subagents must be an object",
         )
     })?;
     for (name, entry) in agents.iter_mut() {
@@ -2120,6 +2171,13 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
                 "agent config entry must be an object",
             )
         })?;
+        for field in ["runtime_path", "home", "profile", "version"] {
+            if let Some(value) = entry.get(field) {
+                if !value.is_null() && !value.as_str().is_some_and(|value| !value.is_empty()) {
+                    return Err(RpcError::new(RpcErrorCode::Validation, "agent config runtime fields must be non-empty strings or null"));
+                }
+            }
+        }
         let default_enabled = name == "zcode";
         entry
             .entry("enabled")
@@ -4352,10 +4410,10 @@ mod admission_tests {
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentDisabled
         );
-        config.agents.get_mut("dsh").unwrap().enabled = true;
-        config.agents.get_mut("dsh").unwrap().spawn_supported = true;
-        config.agents.get_mut("dsh").unwrap().profile = Some("acp".into());
-        config.agents.get_mut("dsh").unwrap().version =
+        config.subagents.get_mut("dsh").unwrap().enabled = true;
+        config.subagents.get_mut("dsh").unwrap().spawn_supported = true;
+        config.subagents.get_mut("dsh").unwrap().profile = Some("acp".into());
+        config.subagents.get_mut("dsh").unwrap().version =
             Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into());
         input.model = Some("opaque-token".into());
         let env_guard = static_env_guard().lock().unwrap();
@@ -4374,7 +4432,7 @@ mod admission_tests {
             std::fs::set_permissions(runtime.path(), permissions).unwrap();
         }
         env::set_var("DSH_RUNTIME_PATH", runtime.path());
-        config.agents.get_mut("dsh").unwrap().runtime_path =
+        config.subagents.get_mut("dsh").unwrap().runtime_path =
             Some(runtime.path().to_string_lossy().into_owned());
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
@@ -4387,7 +4445,7 @@ mod admission_tests {
         drop(env_guard);
         input.agent = Some("zcode".into());
         input.model = Some("model".into());
-        config.agents.get_mut("zcode").unwrap().spawn_supported = false;
+        config.subagents.get_mut("zcode").unwrap().spawn_supported = false;
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::ModelSelectionUnsupported
@@ -4412,7 +4470,7 @@ mod admission_tests {
             std::fs::set_permissions(&runtime, mode).unwrap();
         }
         let mut config = AgentConfigSnapshot::default();
-        let dsh = config.agents.get_mut("dsh").unwrap();
+        let dsh = config.subagents.get_mut("dsh").unwrap();
         dsh.enabled = true;
         dsh.spawn_supported = true;
         dsh.runtime_path = Some(runtime.to_string_lossy().into_owned());
@@ -4431,7 +4489,7 @@ mod admission_tests {
             },
         };
         assert_eq!(resolve_admission(&input, &config).unwrap().agent, "dsh");
-        config.agents.get_mut("dsh").unwrap().version = None;
+        config.subagents.get_mut("dsh").unwrap().version = None;
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentUnsupported
@@ -4449,7 +4507,7 @@ mod admission_tests {
             std::fs::set_permissions(&runtime, mode).unwrap();
         }
         let mut config = AgentConfigSnapshot::default();
-        let codex = config.agents.get_mut("codex").unwrap();
+        let codex = config.subagents.get_mut("codex").unwrap();
         codex.enabled = true;
         codex.spawn_supported = true;
         codex.runtime_path = Some(runtime.to_string_lossy().into_owned());
@@ -4489,7 +4547,7 @@ mod admission_tests {
         let mut default_model_input = codex_input(directory.path(), external_core::PermissionMode::Plan);
         default_model_input.model = None;
         let mut defaulted = config.clone();
-        defaulted.agents.get_mut("codex").unwrap().default_model =
+        defaulted.subagents.get_mut("codex").unwrap().default_model =
             Some("gpt-5.6-terra".into());
         let identity = resolve_admission(&default_model_input, &defaulted).unwrap();
         assert_eq!(identity.model_source, "configured_default");
@@ -4520,7 +4578,7 @@ mod admission_tests {
         let previous_home = env::var_os("CODEX_HOME");
         env::remove_var("CODEX_HOME");
         let mut homeless = config.clone();
-        homeless.agents.get_mut("codex").unwrap().home = None;
+        homeless.subagents.get_mut("codex").unwrap().home = None;
         let error =
             resolve_admission(&codex_input(directory.path(), external_core::PermissionMode::Plan), &homeless)
                 .unwrap_err();
@@ -4539,7 +4597,7 @@ mod admission_tests {
 
         // The runtime-path gate still fails closed.
         let mut ungated = config.clone();
-        ungated.agents.get_mut("codex").unwrap().runtime_path = None;
+        ungated.subagents.get_mut("codex").unwrap().runtime_path = None;
         assert_eq!(
             resolve_admission(&codex_input(directory.path(), external_core::PermissionMode::Plan), &ungated)
                 .unwrap_err()
@@ -4592,7 +4650,7 @@ mod admission_tests {
             .unwrap()
             .task;
         config.revision = 42;
-        config.agents.get_mut("zcode").unwrap().enabled = false;
+        config.subagents.get_mut("zcode").unwrap().enabled = false;
         assert!(resolve_admission(&input, &config).is_err());
         let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
         let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
@@ -4691,9 +4749,9 @@ pub(crate) mod admission_fixtures {
             fs::set_permissions(&runtime, permissions).unwrap();
         }
         let config = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "revision": 7,
-            "agents": {
+            "subagents": {
                 "zcode": {"enabled": true, "spawn_supported": true, "default_model": null},
                 "dsh": {
                     "enabled": true,
@@ -4797,7 +4855,7 @@ mod admission_policy_tests {
         // The configured default is a selection too: an unusable default is
         // refused before prompt rather than silently downgraded to native.
         let mut invalid_default = config.clone();
-        invalid_default.agents.get_mut("dsh").unwrap().default_model = Some("   ".into());
+        invalid_default.subagents.get_mut("dsh").unwrap().default_model = Some("   ".into());
         let defaulted = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
         assert_eq!(
             resolve_admission(&defaulted, &invalid_default)
@@ -5062,7 +5120,7 @@ mod admission_policy_tests {
             ]
         );
         let zcode = status
-            .agents
+        .agents
             .iter()
             .find(|agent| agent.agent == "zcode")
             .unwrap();

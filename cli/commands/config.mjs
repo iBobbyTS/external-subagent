@@ -1,12 +1,12 @@
 import { readConfig } from '../config/read.mjs';
 import { updateConfig, writeConfig } from '../config/write.mjs';
-import { AGENT_IDS } from '../config/schema.mjs';
+import { SUBAGENT_IDS } from '../config/schema.mjs';
 import { CliError } from '../errors.mjs';
 
 const CONFIG_INPUT_FIELDS = new Set(['operation', 'patch', 'key']);
 const GET_KEYS = new Set([
-  'default_agent',
-  ...AGENT_IDS.flatMap((agent) => [`agents.${agent}.enabled`, `agents.${agent}.spawn_supported`, `agents.${agent}.default_model`, `agents.${agent}.runtime_path`, `agents.${agent}.home`, `agents.${agent}.profile`, `agents.${agent}.version`]),
+  'default_subagent',
+  ...SUBAGENT_IDS.flatMap((agent) => [`subagents.${agent}.enabled`, `subagents.${agent}.spawn_supported`, `subagents.${agent}.default_model`, `subagents.${agent}.runtime_path`, `subagents.${agent}.home`, `subagents.${agent}.profile`, `subagents.${agent}.version`]),
 ]);
 const SET_KEYS = GET_KEYS;
 
@@ -28,19 +28,19 @@ function patchFor(key, value) {
   if (!SET_KEYS.has(key)) throw new CliError('INVALID_ARGUMENT', `unsupported config key: ${key}`, 2);
   const parts = key.split('.');
   if (parts.length === 1) return { [key]: value };
-  return { agents: { [parts[1]]: { [parts[2]]: value } } };
+  return { subagents: { [parts[1]]: { [parts[2]]: value } } };
 }
 
 function unsetPatch(key) {
   if (!SET_KEYS.has(key)) throw new CliError('INVALID_ARGUMENT', `unsupported config key: ${key}`, 2);
-  if (key === 'default_agent') return { default_agent: null };
+  if (key === 'default_subagent') return { default_subagent: null };
   const [, agent, field] = key.split('.');
   const defaults = {
     enabled: agent === 'zcode',
     spawn_supported: agent === 'zcode',
     default_model: null, runtime_path: null, home: null, profile: null, version: null,
   };
-  return { agents: { [agent]: { [field]: defaults[field] } } };
+  return { subagents: { [agent]: { [field]: defaults[field] } } };
 }
 
 function valueFor(config, key) {
@@ -52,11 +52,11 @@ function mergePatch(current, patch) {
   return {
     ...current,
     ...patch,
-    agents: {
-      ...current.agents,
-      ...Object.fromEntries(Object.entries(patch.agents || {}).map(([agent, value]) => [
+    subagents: {
+      ...current.subagents,
+      ...Object.fromEntries(Object.entries(patch.subagents || {}).map(([agent, value]) => [
         agent,
-        { ...current.agents[agent], ...value },
+        { ...current.subagents[agent], ...value },
       ])),
     },
   };
@@ -92,11 +92,11 @@ export function configCommand(paths, input = {}) {
   if (operation === 'set') {
     if (!input.patch || typeof input.patch !== 'object' || Array.isArray(input.patch)) throw new CliError('INVALID_ARGUMENT', 'config set requires an object patch', 2);
     if (Object.hasOwn(input.patch, 'revision')) throw new CliError('INVALID_ARGUMENT', 'config revision is managed by the writer', 2);
-    if (input.patch.agents !== undefined && (!input.patch.agents || typeof input.patch.agents !== 'object' || Array.isArray(input.patch.agents))) {
-      throw new CliError('INVALID_ARGUMENT', 'config agents patch must be an object', 2);
+    if (input.patch.subagents !== undefined && (!input.patch.subagents || typeof input.patch.subagents !== 'object' || Array.isArray(input.patch.subagents))) {
+      throw new CliError('INVALID_ARGUMENT', 'config subagents patch must be an object', 2);
     }
-    for (const [agent, value] of Object.entries(input.patch.agents || {})) {
-      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new CliError('CONFIG_INVALID', `agents.${agent} must be an object`, 2);
+    for (const [agent, value] of Object.entries(input.patch.subagents || {})) {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new CliError('CONFIG_INVALID', `subagents.${agent} must be an object`, 2);
     }
     return { config: updateConfig(paths.config, (latest) => mergePatch(latest, input.patch)) };
   }

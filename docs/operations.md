@@ -5,6 +5,36 @@ Installation, service control, Codex binding, and removal for
 [compatibility/codex.md](compatibility/codex.md) for the verified Codex CLI
 interface.
 
+## Host and subagent instances
+
+The product distinguishes the calling application (`host`) from the managed
+execution target (`subagent`). Codex is a host; ZCode and DSH are subagents;
+their protocol implementations are internal `adapter`s.
+
+Host access is open to local MCP clients. In addition to the built-in `codex`
+host, any local MCP client may act as a `custom` host and call the facade
+without a prior registration or a `hosts` entry. The built-in host layer exists
+only to provide host-specific installation and automatic-upgrade coordination;
+it is never an MCP connection or task-submission prerequisite.
+
+`host.codex` supports multiple installations. Each registered Codex `home` is
+an independent host instance and is reconciled, upgraded, inspected, and
+unbound separately. A subagent name currently supports only one instance:
+`subagents.zcode` and `subagents.dsh` each describe one runtime/home. The
+product does not currently provide same-name subagent instance selection or
+multi-instance routing.
+
+`host.custom` has no required persistent instance model: the MCP session is
+the connection boundary, and an unregistered client receives the same public
+tool surface subject to normal tool and task authorization. It has no Codex
+home binding and is not included in host-specific install or auto-upgrade
+coordination.
+
+For the built-in `host.codex`, installation has two supported forms: the
+managed plugin path (`install-plugin`) and the direct TOML MCP binding
+(`install-mcp`). Both target the same facade; the selected Codex home is used
+only to scope that host integration and subsequent upgrade reconciliation.
+
 ## Install model
 
 A plain npm install only stages the package and its native payload:

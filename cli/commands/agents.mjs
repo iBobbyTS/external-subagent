@@ -1,29 +1,29 @@
 import { readConfig } from '../config/read.mjs';
 import { CliError } from '../errors.mjs';
 
-const INPUT_FIELDS = new Set(['operation', 'agent', 'through', 'workspace', 'home']);
+const INPUT_FIELDS = new Set(['operation', 'subagent', 'through', 'workspace', 'home']);
 
 function validateInput(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CliError('INVALID_ARGUMENT', 'agents input must be an object', 2);
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CliError('INVALID_ARGUMENT', 'subagents input must be an object', 2);
   for (const key of Object.keys(input)) {
-    if (!INPUT_FIELDS.has(key)) throw new CliError('INVALID_ARGUMENT', `agents contains unsupported field: ${key}`, 2);
+    if (!INPUT_FIELDS.has(key)) throw new CliError('INVALID_ARGUMENT', `subagents contains unsupported field: ${key}`, 2);
   }
-  if (Object.prototype.hasOwnProperty.call(input, 'agent')) {
-    if (input.agent === null) throw new CliError('INVALID_ARGUMENT', 'agent must be omitted or a supported agent id; null is invalid', 2);
-    if (typeof input.agent !== 'string' || input.agent.length === 0) throw new CliError('INVALID_ARGUMENT', 'agent must be a non-empty string', 2);
+  if (Object.prototype.hasOwnProperty.call(input, 'subagent')) {
+    if (input.subagent === null) throw new CliError('INVALID_ARGUMENT', 'subagent must be omitted or a supported subagent id; null is invalid', 2);
+    if (typeof input.subagent !== 'string' || input.subagent.length === 0) throw new CliError('INVALID_ARGUMENT', 'subagent must be a non-empty string', 2);
   }
 }
 
 function parseProbeArgs(rest) {
-  const agent = rest.shift();
-  if (!agent || agent.startsWith('--')) throw new CliError('agent_required', 'agents probe requires an agent', 2);
+  const subagent = rest.shift();
+  if (!subagent || subagent.startsWith('--')) throw new CliError('agent_required', 'subagents probe requires an subagent', 2);
   let through = 'local';
   let selectedLayer = false;
-  const input = { operation: 'probe', agent };
+  const input = { operation: 'probe', subagent };
   while (rest.length > 0) {
     const option = rest.shift();
     if (['--local', '--auth', '--hi'].includes(option)) {
-      if (selectedLayer) throw new CliError('INVALID_ARGUMENT', 'agents probe accepts exactly one of --local, --auth, or --hi', 2);
+      if (selectedLayer) throw new CliError('INVALID_ARGUMENT', 'subagents probe accepts exactly one of --local, --auth, or --hi', 2);
       through = option.slice(2);
       selectedLayer = true;
       continue;
@@ -36,18 +36,18 @@ function parseProbeArgs(rest) {
       input[name] = value;
       continue;
     }
-    throw new CliError('INVALID_ARGUMENT', `unsupported agents probe option: ${option}`, 2);
+    throw new CliError('INVALID_ARGUMENT', `unsupported subagents probe option: ${option}`, 2);
   }
   return { ...input, through };
 }
 
 function parseModelsArgs(rest) {
-  const agent = rest.shift();
-  if (!agent || agent.startsWith('--')) throw new CliError('agent_required', 'agents models requires an agent', 2);
-  const input = { operation: 'models', agent };
+  const subagent = rest.shift();
+  if (!subagent || subagent.startsWith('--')) throw new CliError('agent_required', 'subagents models requires an subagent', 2);
+  const input = { operation: 'models', subagent };
   while (rest.length > 0) {
     const option = rest.shift();
-    if (option !== '--workspace' && option !== '--home') throw new CliError('INVALID_ARGUMENT', `unsupported agents models option: ${option}`, 2);
+    if (option !== '--workspace' && option !== '--home') throw new CliError('INVALID_ARGUMENT', `unsupported subagents models option: ${option}`, 2);
     const name = option.slice(2);
     const value = rest.shift();
     if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', `${option} requires a value`, 2);
@@ -57,45 +57,60 @@ function parseModelsArgs(rest) {
   return input;
 }
 
-export function parseAgentsArgs(args) {
+export function parseSubagentsArgs(args) {
   if (args.length === 0) return { operation: 'list' };
   const [operation, ...rest] = args;
-  if (!['list', 'status', 'probe', 'models'].includes(operation)) throw new CliError('INVALID_ARGUMENT', `unsupported agents operation: ${operation}`, 2);
+  if (!['list', 'status', 'probe', 'models'].includes(operation)) throw new CliError('INVALID_ARGUMENT', `unsupported subagents operation: ${operation}`, 2);
   if (operation === 'probe') return parseProbeArgs(rest);
   if (operation === 'models') return parseModelsArgs(rest);
-  if (operation === 'list' && rest.length !== 0) throw new CliError('INVALID_ARGUMENT', 'usage: agents list', 2);
-  if (operation !== 'list' && rest.length > 1) throw new CliError('INVALID_ARGUMENT', `usage: agents ${operation} [agent]`, 2);
-  return { operation, ...(rest[0] ? { agent: rest[0] } : {}) };
+  if (operation === 'list' && rest.length !== 0) throw new CliError('INVALID_ARGUMENT', 'usage: subagents list', 2);
+  if (operation !== 'list' && rest.length > 1) throw new CliError('INVALID_ARGUMENT', `usage: subagents ${operation} [subagent]`, 2);
+  return { operation, ...(rest[0] ? { subagent: rest[0] } : {}) };
 }
 
-export async function agentsCommand(paths, input = {}, options = {}) {
+export async function subagentsCommand(paths, input = {}, options = {}) {
   validateInput(input);
   const operation = input.operation ?? 'list';
   const config = readConfig(paths.config);
   if (operation === 'list') {
-    return { default_agent: config.default_agent, config_revision: config.revision, agents: Object.entries(config.agents).map(([id, value]) => ({ agent: id, ...value })) };
+    return { default_subagent: config.default_subagent, config_revision: config.revision, subagents: Object.entries(config.subagents).map(([id, value]) => ({ subagent: id, ...value })) };
   }
   if (operation === 'models') {
-    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents models requires a daemon connection');
-    if (!input.agent) throw new CliError('agent_required', 'agents models requires an agent', 2);
+    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents models requires a daemon connection');
+    if (!input.subagent) throw new CliError('agent_required', 'subagents models requires an subagent', 2);
     const scope = {};
     if (input.workspace !== undefined) scope.workspace = input.workspace;
     if (input.home !== undefined) scope.home = input.home;
-    return options.callDaemon(options.socket, 'agent-models', { agent: input.agent, scope });
+    const result = await options.callDaemon(options.socket, 'agent-models', { agent: input.subagent, scope });
+    return subagentView(result);
   }
   if (operation === 'probe') {
-    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents probe requires a daemon connection');
-    if (!input.agent) throw new CliError('agent_required', 'agents probe requires an agent', 2);
+    if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents probe requires a daemon connection');
+    if (!input.subagent) throw new CliError('agent_required', 'subagents probe requires an subagent', 2);
     const scope = {};
     if (input.workspace !== undefined) scope.workspace = input.workspace;
     if (input.home !== undefined) scope.home = input.home;
-    return options.callDaemon(options.socket, 'agent-probe', { agent: input.agent, through: input.through ?? 'local', scope });
+    const result = await options.callDaemon(options.socket, 'agent-probe', { agent: input.subagent, through: input.through ?? 'local', scope });
+    return { ...result, evidence: subagentView(result.evidence), status: subagentView(result.status) };
   }
-  if (operation !== 'status') throw new CliError('INVALID_ARGUMENT', `unsupported agents operation: ${operation}`, 2);
-  if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents status requires a daemon connection');
+  if (operation !== 'status') throw new CliError('INVALID_ARGUMENT', `unsupported subagents operation: ${operation}`, 2);
+  if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents status requires a daemon connection');
   const status = await options.callDaemon(options.socket, 'status', {});
-  if (!Array.isArray(status?.agents)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include agent status');
-  const agents = input.agent === undefined ? status.agents : status.agents.filter((agent) => agent.agent === input.agent);
-  if (input.agent !== undefined && agents.length === 0) throw new CliError('agent_unknown', `daemon did not report agent: ${input.agent}`, 2);
-  return { service_generation: status.service_generation ?? null, agents };
+  if (!Array.isArray(status?.agents)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include subagent status');
+  const subagents = status.agents.filter((entry) => input.subagent === undefined || entry.agent === input.subagent).map(subagentView);
+  if (input.subagent !== undefined && subagents.length === 0) throw new CliError('agent_unknown', `daemon did not report subagent: ${input.subagent}`, 2);
+  return { service_generation: status.service_generation ?? null, subagents };
+}
+
+// Source compatibility for internal callers while the public CLI name is
+// `subagents`; wire-level agent fields remain S02's responsibility.
+export const agentsCommand = subagentsCommand;
+export const parseAgentsArgs = parseSubagentsArgs;
+
+// The daemon wire contract is migrated by S02; the CLI already exposes the
+// canonical execution-target name at its own boundary.
+function subagentView(value) {
+  if (!value) return value;
+  const { agent, ...rest } = value;
+  return { subagent: agent, ...rest };
 }

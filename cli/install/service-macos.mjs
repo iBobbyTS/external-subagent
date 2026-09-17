@@ -6,6 +6,7 @@ import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
 import { LAUNCHD_FIXED_PATH } from './path.mjs';
+import { readConfig } from '../config/read.mjs';
 
 // The one macOS service template for the product daemon.  The plist pins
 // absolute payload paths and a fixed PATH so the GUI/launchd environment can
@@ -19,15 +20,10 @@ function escapeXml(value) {
 
 export function launchAgentPlist(paths) {
   const daemon = nativeBinary('external-subagentd');
-  let dshRuntime; let dshHome; let dshProfile; let dshVersion;
-  try { const configured = JSON.parse(fs.readFileSync(paths.config, 'utf8')).agents?.dsh || {}; dshRuntime = configured.runtime_path; dshHome = configured.home; dshProfile = configured.profile; dshVersion = configured.version; } catch {}
-  let codexRuntime; let codexHome;
-  try { const configured = JSON.parse(fs.readFileSync(paths.config, 'utf8')).agents?.codex || {}; codexRuntime = configured.runtime_path; codexHome = configured.home; } catch {}
-  let configRevision = null;
-  try {
-    const config = JSON.parse(fs.readFileSync(paths.config, 'utf8'));
-    if (Number.isInteger(config.revision)) configRevision = config.revision;
-  } catch {}
+  const config = readConfig(paths.config);
+  const { runtime_path: dshRuntime, home: dshHome, profile: dshProfile, version: dshVersion } = config.subagents.dsh;
+  const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;
+  const configRevision = config.revision;
   const dshEnvironment = [
     `<key>PATH</key><string>${LAUNCHD_FIXED_PATH}</string>`,
     ...(configRevision === null ? [] : [`<key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>${configRevision}</string>`]),

@@ -1,4 +1,6 @@
-# Agent discovery, probe, and status
+# Subagent discovery, probe, and status
+
+本文中的角色命名遵循统一架构：调用 MCP 的上游应用是 `host`，被探测和调度的执行目标是 `subagent`，连接目标协议的内部实现是 `adapter`。`host.codex` 可有多个 Codex home instance，并支持 plugin 与直接 MCP 两种安装方式；任意本机 MCP client 也可作为无需注册的 `host.custom` 连接。内置 host 只负责安装和自动升级协调，不是 MCP 接入门槛。每个 subagent 名称暂时只有一个 runtime/home instance。探测结果不能用于推导同名 subagent 的其他 instance，也不能把某个 Codex home 的状态当作全局产品状态。
 
 Agent status is a passive projection of configuration plus the latest evidence produced by an explicit probe. Reading `system_status` does not inspect an executable, start a provider, authenticate, or send a prompt. An agent with no explicit probe therefore reports `UNKNOWN` and `checked_at_ms: null` for `local`, `auth`, and `hi`. The public MCP projection always includes `checked_at_ms`; the daemon's internal RPC may retain diagnostic reasons for installation health checks.
 

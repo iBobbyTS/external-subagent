@@ -52,7 +52,7 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-'));
   const paths = productPaths(home);
   const socket = path.join(os.tmpdir(), `es-r-${process.pid}-${Date.now()}.sock`);
-  configCommand(paths, { operation: 'set', patch: { default_agent: 'zcode' } });
+  configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } });
   const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
     kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
@@ -148,7 +148,7 @@ test('disabled-agent result comes from daemon canonical admission', async () => 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-disabled-'));
   const paths = productPaths(home);
   const socket = path.join(os.tmpdir(), `es-d-${process.pid}-${Date.now()}.sock`);
-  configCommand(paths, { operation: 'set', patch: { agents: { zcode: { enabled: false } } } });
+  configCommand(paths, { operation: 'set', patch: { subagents: { zcode: { enabled: false } } } });
   const fixture = await withServer(socket, () => ({ outcome: 'error', error: { code: 'agent_disabled', message: 'agent is disabled' } }),
     () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ agent: 'zcode', repository: '/repo', prompt: 'hi' })]));
   assert.equal(fixture.observed().method, 'submit_general');
@@ -194,23 +194,24 @@ test('null and unknown spawn fields fail before transport', async () => {
 test('human config and agents forms execute instead of falling through to JSON defaults', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-human-'));
   const socket = path.join(os.tmpdir(), `es-h-${process.pid}-${Date.now()}.sock`);
-  const set = await runCli(home, socket, ['config', 'set', 'default_agent', 'zcode']);
+  const set = await runCli(home, socket, ['config', 'set', 'default_subagent', 'zcode']);
   assert.equal(set.code, 0, set.stderr);
-  assert.equal(JSON.parse(set.stdout).config.default_agent, 'zcode');
-  const get = await runCli(home, socket, ['config', 'get', 'default_agent']);
+  assert.equal(JSON.parse(set.stdout).config.default_subagent, 'zcode');
+  const get = await runCli(home, socket, ['config', 'get', 'default_subagent']);
   assert.equal(get.code, 0, get.stderr);
   assert.equal(JSON.parse(get.stdout).value, 'zcode');
-  const list = await runCli(home, socket, ['agents', 'list']);
+  const list = await runCli(home, socket, ['subagents', 'list']);
   assert.equal(list.code, 0, list.stderr);
-  assert.deepEqual(JSON.parse(list.stdout).agents.map((agent) => agent.agent), ['zcode', 'dsh', 'codex']);
+  assert.deepEqual(JSON.parse(list.stdout).subagents.map((agent) => agent.subagent), ['zcode', 'dsh', 'codex']);
   const models = await withServer(socket, () => ({ outcome: 'success', result: {
     kind: 'agent_models', catalog: { agent: 'zcode', scope: {}, models: [], supported: false },
-  } }), () => runCli(home, socket, ['agents', 'models', 'zcode']));
+  } }), () => runCli(home, socket, ['subagents', 'models', 'zcode']));
   assert.equal(models.result.code, 0, models.result.stderr);
   assert.equal(models.observed().method, 'agent_models');
   assert.deepEqual(models.observed().params, { agent: 'zcode', scope: {} });
   const modelOutput = JSON.parse(models.result.stdout);
-  assert.equal(modelOutput.agent, 'zcode');
+  assert.equal(modelOutput.subagent, 'zcode');
+  assert.equal(modelOutput.agent, undefined);
   assert.equal(modelOutput.kind, undefined);
   const status = {
     service_generation: 'generation-cli',
@@ -225,16 +226,17 @@ test('human config and agents forms execute instead of falling through to JSON d
     }],
   };
   const fixture = await withServer(socket, () => ({ outcome: 'success', result: { kind: 'system_status', status } }),
-    () => runCli(home, socket, ['agents', 'status', 'zcode']));
+    () => runCli(home, socket, ['subagents', 'status', 'zcode']));
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'system_status');
-  assert.deepEqual(JSON.parse(fixture.result.stdout).agents, status.agents);
+  assert.deepEqual(JSON.parse(fixture.result.stdout).subagents, status.agents.map(({ agent, ...entry }) => ({ subagent: agent, ...entry })));
 
   const probe = await withServer(socket, (request) => ({ outcome: 'success', result: {
     kind: 'agent_probed', evidence: { agent: 'zcode' }, status: { agent: 'zcode' },
-  } }), () => runCli(home, socket, ['agents', 'probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']));
+  } }), () => runCli(home, socket, ['subagents', 'probe', 'zcode', '--hi', '--workspace', '/workspace', '--home', '/home']));
   assert.equal(probe.result.code, 0, probe.result.stderr);
   assert.equal(probe.observed().method, 'agent_probe');
+  assert.deepEqual(JSON.parse(probe.result.stdout), { ok: true, product: 'external-subagent', evidence: { subagent: 'zcode' }, status: { subagent: 'zcode' } });
   assert.deepEqual(probe.observed().params, {
     agent: 'zcode', through: 'hi', scope: { workspace: '/workspace', home: '/home' },
   });

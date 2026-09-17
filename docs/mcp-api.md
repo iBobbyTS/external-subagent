@@ -2,6 +2,24 @@
 
 本文说明本项目对外注册的全部 10 个 MCP 工具，以及每个输入、输出字段的使用时机、存在理由和省略／移除影响。核对日期：2026-09-16。
 
+## 0. 调用宿主、子代理与实例边界
+
+MCP 调用链中的上游应用称为 `host`，被调度执行的目标称为 `subagent`，连接目标协议的内部实现称为 `adapter`。例如，Codex 是一个 host，ZCode 和 DSH 是 subagent；它们不是同一层的“agent”。
+
+Host 接入不是注册制：本机任意 MCP client 都可以作为 `custom` host 直接连接
+facade 并调用公开工具。`codex` 是拥有产品特定安装和自动升级协调能力的内置 host；
+Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于这些宿主集成操作，
+不能作为 MCP 调用或 `spawn` 的前置条件。服务端不得因为 client 没有对应的
+`hosts` 条目而拒绝公开工具调用。
+
+实例能力目前不对称：
+
+- `host.codex` 支持多个 instance。每个 instance 由一个独立的 Codex `home` 标识，安装绑定使用 `hosts.codex.installations[].home`；状态、升级同步和解绑必须按 home 分开处理。
+- `host.custom` 表示未注册的本机 MCP client。它不要求持久化 instance，也没有 Codex home、安装或自动升级绑定；每个连接按 MCP session 处理。
+- 每个 `subagent` 名称目前只支持单一 instance。`subagents.zcode` 和 `subagents.dsh` 分别描述一个受管 runtime/home；`spawn` 的 `subagent` 选择的是名称，不是 instance ID。当前协议不承诺同名 subagent 的多实例路由、实例选择或实例级故障隔离。
+
+这意味着 `codex_home` 是 host 安装绑定信息，不是产品顶层运行时配置；不能把多个 Codex home 的能力误解为 subagent 多实例能力。
+
 范围是当前仓库源码定义的公开接口；不代表某台机器正在运行的 daemon 已更新到这些代码。本文依据源码、schema 和测试静态核对，未重新编译或调用已安装服务。
 
 ## 1. 阅读约定与权威来源

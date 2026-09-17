@@ -322,8 +322,8 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     assert.equal(status.ok, true);
     assert.equal(status.daemon_status.components.daemon, 'READY');
 
-    const agents = jsonOutput(run(ctx.cli, ['agents', 'status'], { env }), 'agents status');
-    const byAgent = Object.fromEntries(agents.agents.map((agent) => [agent.agent, agent]));
+    const agents = jsonOutput(run(ctx.cli, ['subagents', 'status'], { env }), 'subagents status');
+    const byAgent = Object.fromEntries(agents.subagents.map((agent) => [agent.subagent, agent]));
     assert.equal(byAgent.zcode.enabled, true);
     assert.equal(byAgent.zcode.spawn_supported, true);
     assert.equal(byAgent.dsh.enabled, false, 'DSH stays explicitly missing without any auto-install');

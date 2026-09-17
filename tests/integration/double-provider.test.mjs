@@ -73,7 +73,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { agentsCommand } from '../../cli/commands/agents.mjs';
+import { subagentsCommand } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { CliError } from '../../cli/errors.mjs';
 
@@ -104,10 +104,11 @@ function writeDualConfig(file) {
 test('dual-provider config surface keeps DSH and ZCode addressable', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'double-provider-'));
   const paths = writeDualConfig(path.join(root, 'config.json'));
-  const listed = await agentsCommand(paths, { operation: 'list' });
-  const ids = listed.agents.map((agent) => agent.agent).sort();
-  assert.deepEqual(ids, ['dsh', 'zcode']);
-  for (const agent of listed.agents) {
+  const listed = await subagentsCommand(paths, { operation: 'list' });
+  const ids = listed.subagents.map((agent) => agent.subagent).sort();
+  assert.deepEqual(ids, ['codex', 'dsh', 'zcode']);
+  assert.equal(listed.subagents.find((entry) => entry.subagent === 'codex').enabled, false);
+  for (const agent of listed.subagents.filter((entry) => entry.subagent !== 'codex')) {
     assert.equal(agent.enabled, true);
     assert.equal(agent.spawn_supported, true);
   }
@@ -116,7 +117,7 @@ test('dual-provider config surface keeps DSH and ZCode addressable', async () =>
 test('zcode explicit model selection fails closed at the config boundary', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'double-provider-'));
   const paths = writeDualConfig(path.join(root, 'config.json'));
-  const input = parseConfigArgs(['set', 'agents.zcode.default_model', 'glm-5.3']);
+  const input = parseConfigArgs(['set', 'subagents.zcode.default_model', 'glm-5.3']);
   assert.throws(() => configCommand(paths, input), (error) => {
     assert.ok(error instanceof CliError);
     assert.equal(error.code, 'model_selection_unsupported');

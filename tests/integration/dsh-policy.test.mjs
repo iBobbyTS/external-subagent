@@ -7,11 +7,11 @@ import { execFileSync } from 'node:child_process';
 
 // DSH remains discovery-only until the S04 gate is explicitly opened.
 test('dsh policy is fail-closed for unsupported spawn modes', async () => {
-  const { agentsCommand } = await import('../../cli/commands/agents.mjs');
+  const { subagentsCommand } = await import('../../cli/commands/agents.mjs');
   const config = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-policy-'));
   fs.writeFileSync(path.join(config, 'config.json'), JSON.stringify({ schema_version: 1, revision: 1, default_agent: 'zcode', agents: { zcode: { enabled: true, spawn_supported: true }, dsh: { enabled: true, spawn_supported: false } } }));
-  const result = await agentsCommand({ config: path.join(config, 'config.json') }, { operation: 'list' });
-  const dsh = result.agents.find((agent) => agent.agent === 'dsh');
+  const result = await subagentsCommand({ config: path.join(config, 'config.json') }, { operation: 'list' });
+  const dsh = result.subagents.find((agent) => agent.subagent === 'dsh');
   assert.equal(dsh.spawn_supported, false);
 });
 

@@ -2,7 +2,7 @@ use external_daemon::{
     codex::{CodexRuntimeFactory, resolve_codex_home},
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
-    rpc::ServerOptions,
+    rpc::{ServerOptions, parse_subagent_config},
     CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 use external_store::Store;
@@ -15,6 +15,10 @@ use std::{
     thread,
     time::Duration,
 };
+
+fn configured_subagent<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    value.pointer(&format!("/subagents/{name}"))
+}
 #[cfg(debug_assertions)]
 use std::{
     io::{Read, Write},
@@ -101,10 +105,10 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return false;
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Ok(value) = parse_subagent_config(&bytes) else {
         return false;
     };
-    let configured = value.pointer("/agents/dsh");
+    let configured = configured_subagent(&value, "dsh");
     configured
         .and_then(|entry| entry.get("enabled"))
         .and_then(serde_json::Value::as_bool)
@@ -145,10 +149,10 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
 fn configure_dsh_environment(path: Option<&Path>) {
     let Some(path) = path else { return };
     let Ok(bytes) = fs::read(path) else { return };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Ok(value) = parse_subagent_config(&bytes) else {
         return;
     };
-    let Some(entry) = value.pointer("/agents/dsh") else {
+    let Some(entry) = configured_subagent(&value, "dsh") else {
         return;
     };
     for (field, variable) in [
@@ -170,10 +174,10 @@ fn configure_dsh_environment(path: Option<&Path>) {
 fn configure_codex_environment(path: Option<&Path>) {
     let Some(path) = path else { return };
     let Ok(bytes) = fs::read(path) else { return };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Ok(value) = parse_subagent_config(&bytes) else {
         return;
     };
-    let Some(entry) = value.pointer("/agents/codex") else {
+    let Some(entry) = configured_subagent(&value, "codex") else {
         return;
     };
     if let Some(runtime) = entry
@@ -205,10 +209,10 @@ fn codex_production_enabled(path: Option<&Path>) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return false;
     };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+    let Ok(value) = parse_subagent_config(&bytes) else {
         return false;
     };
-    let configured = value.pointer("/agents/codex");
+    let configured = configured_subagent(&value, "codex");
     configured
         .and_then(|entry| entry.get("enabled"))
         .and_then(serde_json::Value::as_bool)
