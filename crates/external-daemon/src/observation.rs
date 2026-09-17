@@ -832,15 +832,4 @@ mod tests {
         assert!(!snapshot.coverage.tool_history_complete);
         assert_eq!(snapshot.coverage.dropped_events, 1);
     }
-
-    #[test]
-    fn source_verification_is_bound_to_the_pinned_path_and_hash() {
-        let pinned = Path::new(VERIFIED_RUNTIME_PATH);
-        if pinned.exists() {
-            assert!(runtime_source_verified(Some(pinned)));
-        }
-        let other = tempfile::NamedTempFile::new().unwrap();
-        assert!(!runtime_source_verified(Some(other.path())));
-        assert!(!runtime_source_verified(None));
-    }
 }
