@@ -180,7 +180,7 @@ export function runInit(options = {}) {
     }
     const pluginDone = completed.has('install-codex-plugin');
     if (!completed.has('claim-codex-home') && (codex.status === 'installed' || (pluginDone && !options.skipCodexPlugin))) {
-      const claim = registerCodexHome(paths, codexHome, { version: payload.version, digest: codex.digest });
+      const claim = registerCodexHome(paths, codexHome, { version: payload.version, digest: codex.digest, binding_mode: 'plugin' });
       codex = { ...codex, claim: { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes } };
       failAt('claim-codex-home');
       mark('claim-codex-home');
