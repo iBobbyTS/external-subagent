@@ -1,0 +1,1579 @@
+//! Scripted app-server contract tests for the Codex adapter: gate, launch
+//! bounds, thread identity, resume posture, turn attribution, and the
+//! shared scheduler lifecycle.
+
+use super::*;
+use crate::{
+    terminal_proves_process_group_reaped, LifecycleSink, ManagedRuntime, RuntimeFactory, Scheduler,
+    SchedulerConfig,
+};
+use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
+use external_store::{TaskOutcome, TaskPhase, TaskRecord};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+fn codex_admission(model: Option<&str>) -> AdmissionIdentity {
+    AdmissionIdentity {
+        agent: "codex".into(),
+        config_revision: 7,
+        adapter_version: "test".into(),
+        model: model.map(str::to_owned),
+        model_source: "spawn_catalog".into(),
+    }
+}
+
+/// Serialize tests that drive scripted app-server children through the
+/// whole scheduler, mirroring the DSH suite's scripted-child guard: the
+/// parallel suite already runs timing-sensitive fixture probes.
+fn scripted_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SCRIPTED_CHILD_LOCK: Mutex<()> = Mutex::new(());
+    SCRIPTED_CHILD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn codex_workspace() -> tempfile::TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/live-agent/workspace")
+        .canonicalize()
+        .unwrap();
+    tempfile::Builder::new()
+        .prefix("s01-codex-")
+        .tempdir_in(root)
+        .unwrap()
+}
+
+fn manifest_for(workspace: &Path, prompt: &str) -> GeneralTaskManifest {
+    GeneralTaskManifest {
+        schema: GENERAL_TASK_SCHEMA.into(),
+        agent_id: "codex-test".into(),
+        repository: workspace.to_path_buf(),
+        permission_mode: PermissionMode::Plan,
+        prompt: prompt.into(),
+        write_manifest: Vec::new(),
+    }
+}
+
+fn codex_scheduler(workspace: &Path, factory: CodexRuntimeFactory) -> Scheduler {
+    let store = Arc::new(external_store::Store::open(workspace.join("state.sqlite")).unwrap());
+    let zcode = crate::CommandRuntimeFactory::new(|_: &TaskRecord| {
+        Err::<Command, _>(io::Error::other("zcode factory must not spawn codex tasks"))
+    });
+    Scheduler::new(
+        "codex-test",
+        store,
+        Arc::new(crate::dsh::RoutingRuntimeFactory::with_codex(
+            zcode,
+            crate::dsh::DshRuntimeFactory::closed(),
+            factory,
+        )),
+        // Generous deadlines: the scripted children share the machine
+        // with the rest of the parallel suite.
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap()
+}
+
+fn harness_factory(script: &str, workspace: &Path) -> CodexRuntimeFactory {
+    let child = workspace.join("codex-fake.sh");
+    std::fs::write(&child, format!("#!/bin/sh\n{script}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&child).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&child, mode).unwrap();
+    }
+    let launch = CodexLaunch::new(child, workspace.join("codex-home"));
+    CodexRuntimeFactory::test_harness(Some(launch))
+}
+
+fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store::TaskRecord {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        if task.phase == TaskPhase::Terminal {
+            return task;
+        }
+        assert!(Instant::now() < deadline, "task never became terminal");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
+            return result;
+        }
+        assert!(Instant::now() < deadline, "result was never persisted");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+const THREAD_ID: &str = "codex-thread-1";
+const MODEL: &str = "gpt-5.6-terra";
+
+/// A scripted app-server speaking the strict frame sequence of a fresh
+/// task: initialize(id1), initialized notification, thread/start(id2),
+/// turn/start(id3). Every inbound frame is appended to deliveries.jsonl
+/// as it arrives.
+const HAPPY_TURN: &str = r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#;
+
+#[test]
+fn public_submit_reaches_persistent_thread_and_persists_the_id() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "inspect the repository"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "CODEX_OK");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    // The exact child contract is visible in the recorded deliveries.
+    let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+    let initialize: serde_json::Value =
+        serde_json::from_str(deliveries.lines().next().expect("at least one request")).unwrap();
+    assert_eq!(initialize["method"], "initialize");
+    let mut requests = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap());
+    let thread_start = requests
+        .find(|frame| frame["method"] == "thread/start")
+        .expect("thread/start frame");
+    assert_eq!(thread_start["params"]["ephemeral"], false);
+    assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+    assert_eq!(thread_start["params"]["sandbox"], "read-only");
+    assert_eq!(thread_start["params"]["model"], MODEL);
+    assert_eq!(
+        thread_start["params"]["cwd"],
+        workspace.path().to_string_lossy().as_ref()
+    );
+    let turn_start = requests
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("turn/start frame");
+    assert_eq!(turn_start["params"]["threadId"], THREAD_ID);
+    assert_eq!(turn_start["params"]["model"], MODEL);
+    assert!(turn_start["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("inspect the repository"));
+}
+
+#[test]
+fn closed_gate_and_plan_only_tasks_refuse_spawn_without_a_process() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(workspace.path(), CodexRuntimeFactory::closed());
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "never runs"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let error = scheduler.start_ready().unwrap_err();
+    assert!(error.to_string().contains("codex spawn gate is closed"));
+    let task = await_terminal_task(&scheduler, &submitted.agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+
+    // Write modes refuse before the prompt: at the factory seam the
+    // admitted plan-only contract is re-checked fail-closed.
+    let mut manifest = manifest_for(workspace.path(), "write mode");
+    manifest.permission_mode = PermissionMode::Build;
+    let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest)
+        .unwrap()
+        .with_admission(codex_admission(Some(MODEL)))
+        .unwrap();
+    let task = TaskRecord {
+        agent_id: "build-mode".into(),
+        repository: workspace.path().to_string_lossy().into_owned(),
+        phase: TaskPhase::Queued,
+        outcome: None,
+        workspace_path: workspace.path().to_string_lossy().into_owned(),
+        runtime_hash: None,
+        prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
+        prepared_launch_sha256: prepared.prepared_sha256.clone(),
+        initial_prompt: "prompt".into(),
+        owner_id: None,
+        owner_epoch: 0,
+        close_requested: false,
+        stop_requested: false,
+        last_event_seq: 0,
+        failure_code: None,
+        failure_message: None,
+        runtime_agent_id: None,
+        zcode_session_id: None,
+        turn_state: external_store::TurnState::Idle,
+        process_identity: None,
+        closed_at: None,
+        reaped_at: None,
+        created_at: 0,
+    };
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    for mode in [
+        PermissionMode::Build,
+        PermissionMode::Edit,
+        PermissionMode::Yolo,
+    ] {
+        let mut prepared_manifest = manifest_for(workspace.path(), "write mode");
+        prepared_manifest.permission_mode = mode;
+        let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+            .unwrap()
+            .prepare_direct_submission(&prepared_manifest)
+            .unwrap()
+            .with_admission(codex_admission(Some(MODEL)))
+            .unwrap();
+        let mut mode_task = task.clone();
+        mode_task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
+        mode_task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
+        let error = harness_factory(HAPPY_TURN, workspace.path())
+            .spawn(&mode_task, Arc::clone(&sink))
+            .err()
+            .expect("write mode must refuse the spawn");
+        assert!(
+            error.to_string().contains("only the plan permission mode"),
+            "write mode {mode:?} was not refused: {error}"
+        );
+    }
+}
+
+struct NoopSink;
+impl crate::LifecycleSink for NoopSink {
+    fn emit(&self, _record: crate::LifecycleRecord) {}
+}
+
+#[test]
+fn terminal_send_resumes_the_same_thread_in_a_new_process_without_replay() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let resume_script = r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' "{\"id\":2,\"result\":{\"thread\":{\"id\":\"codex-thread-1\",\"ephemeral\":false},\"model\":\"gpt-5.6-terra\",\"sandbox\":{\"type\":\"readOnly\",\"networkAccess\":false},\"approvalPolicy\":\"never\",\"cwd\":\"$(pwd)\"}}"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-2","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"inProgress"}}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"msg_2","text":"RESUMED_OK"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"completed","error":null}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; done
+"#;
+    struct TwoPhaseFactory {
+        first: Mutex<Option<CodexRuntimeFactory>>,
+        second: CodexRuntimeFactory,
+    }
+    impl RuntimeFactory for TwoPhaseFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let mut first = self.first.lock().unwrap();
+            match first.take() {
+                Some(factory) => factory.spawn(task, sink),
+                None => self.second.spawn(task, sink),
+            }
+        }
+    }
+    let first = harness_factory(HAPPY_TURN, &directory);
+    let second = {
+        let child = directory.join("codex-resume.sh");
+        std::fs::write(&child, format!("#!/bin/sh\n{resume_script}")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&child).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&child, mode).unwrap();
+        }
+        CodexRuntimeFactory::test_harness(Some(CodexLaunch::new(
+            child,
+            directory.join("codex-home"),
+        )))
+    };
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-test",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(first)),
+            second,
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "first turn"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // Public terminal send is the explicit recovery trigger.
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "resume-msg-1", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    // queue_message only requeues; the daemon claim loop performs the
+    // spawn. Either this call or the finishing monitor's trailing claim
+    // wins the single resume claim.
+    scheduler.start_ready().unwrap();
+    let resumed = await_result(&scheduler, &agent_id);
+    assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+    assert_eq!(resumed.result.final_text, "RESUMED_OK");
+
+    let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+        .expect("the resumed process logs its own frames");
+    let mut frames = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap());
+    let resume = frames
+        .find(|frame| frame["method"] == "thread/resume")
+        .expect("thread/resume frame");
+    assert_eq!(resume["params"]["threadId"], THREAD_ID);
+    assert_eq!(resume["params"]["excludeTurns"], true);
+    let turn_starts = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|frame| frame["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(turn_starts.len(), 1, "interrupted turn must not replay");
+    assert!(turn_starts[0]["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("follow-up question"));
+    let message = scheduler.store().message("resume-msg-1").unwrap().unwrap();
+    assert_eq!(
+        message.state,
+        external_store::MessageState::Delivered,
+        "resume message was not delivered"
+    );
+    assert_eq!(message.target_turn_id.as_deref(), Some("codex-turn-2"));
+}
+
+#[test]
+fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "completed codex task"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    await_terminal_task(&scheduler, &agent_id);
+
+    // A zcode terminal task keeps the generic rejection.
+    let zcode_task = scheduler
+        .enqueue_general(&manifest_for(workspace.path(), "zcode terminal task"))
+        .unwrap();
+    let store = scheduler.store();
+    let claim = store
+        .claim_next("terminal-reject", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, zcode_task.agent_id);
+    store
+        .mark_session_running(
+            &claim.task.agent_id,
+            claim.owner_epoch,
+            "runtime",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .store_task_result(
+            &zcode_task.agent_id,
+            &external_store::TaskResult {
+                outcome: TaskOutcome::Completed,
+                final_text: "done".into(),
+                partial: false,
+            },
+        )
+        .unwrap();
+    store
+        .transition_terminal(
+            &zcode_task.agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Completed,
+                failure_code: None,
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    let error = scheduler
+        .queue_message(&zcode_task.agent_id, "zcode-msg", "nope")
+        .unwrap_err();
+    assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+
+    // A cancelled codex terminal task is rejected even with a thread id.
+    let cancelled = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "cancelled codex task"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let store = scheduler.store();
+    let claim = store
+        .claim_next("terminal-reject", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, cancelled.agent_id);
+    store
+        .mark_session_running(
+            &claim.task.agent_id,
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some(THREAD_ID),
+            Some(external_store::TurnState::Idle),
+        )
+        .unwrap();
+    store.request_stop(&cancelled.agent_id).unwrap();
+    store
+        .transition_terminal(
+            &cancelled.agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Cancelled,
+                failure_code: None,
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    let error = scheduler
+        .queue_message(&cancelled.agent_id, "cancel-msg", "nope")
+        .unwrap_err();
+    assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+
+    // A codex terminal task without a persisted thread id is rejected.
+    let sessionless = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "sessionless codex task"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let store = scheduler.store();
+    let claim = store
+        .claim_next("terminal-reject", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, sessionless.agent_id);
+    store
+        .mark_session_running(
+            &claim.task.agent_id,
+            claim.owner_epoch,
+            "runtime",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .store_task_result(
+            &sessionless.agent_id,
+            &external_store::TaskResult {
+                outcome: TaskOutcome::Failed,
+                final_text: "never started".into(),
+                partial: true,
+            },
+        )
+        .unwrap();
+    store
+        .transition_terminal(
+            &sessionless.agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Failed,
+                failure_code: Some("SESSION_START_FAILED".into()),
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    let error = scheduler
+        .queue_message(&sessionless.agent_id, "sessionless-msg", "nope")
+        .unwrap_err();
+    assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+}
+
+#[test]
+fn server_overloaded_and_mcp_startup_failures_stay_bounded_and_diagnostic() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"mcpServer/startupStatus/updated","params":{"threadId":"codex-thread-1","name":"cloudflare-api","status":"failed","error":"requires OAuth reauthentication","failureReason":"reauthenticationRequired"}}' \
+  '{"method":"error","params":{"error":{"message":"Selected model is at capacity. Please try a different model.","codexErrorInfo":"serverOverloaded"},"willRetry":false,"threadId":"codex-thread-1","turnId":"codex-turn-1"}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"Selected model is at capacity.","codexErrorInfo":"serverOverloaded"}}}}'
+sleep 1
+"#;
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "overloaded probe"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    let record = scheduler
+        .last_error(&agent_id)
+        .expect("correlated failure record");
+    assert!(record.contains("serverOverloaded"), "record: {record}");
+    assert!(record.contains("cloudflare-api"), "record: {record}");
+}
+
+#[test]
+fn strict_envelope_missing_thread_and_model_mismatch_fail_the_start_bounded() {
+    let _guard = scripted_test_guard();
+    for (script, marker) in [
+        // Malformed envelope: a jsonrpc frame is rejected by the strict
+        // codec, then the child exits without a turn boundary.
+        (
+            r#"
+IFS= read -r line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"codexHome":"/tmp"}}'
+exit 7
+"#,
+            "SESSION_START_FAILED",
+        ),
+        // thread/start result without a thread id.
+        (
+            r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"ephemeral":false},"model":"gpt-5.6-terra"}}'
+sleep 1
+"#,
+            "thread id",
+        ),
+        // Model mismatch between admission and the started thread.
+        (
+            r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-other"}}'
+sleep 1
+"#,
+            "MODEL_MISMATCH",
+        ),
+        // Auth failure arrives as an error response to initialize.
+        (
+            r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"error":{"code":401,"message":"not logged in"}}'
+sleep 1
+"#,
+            "SESSION_START_FAILED",
+        ),
+        // EOF while a request is pending.
+        (
+            r#"
+IFS= read -r line
+exit 0
+"#,
+            "SESSION_START_FAILED",
+        ),
+    ] {
+        let workspace = codex_workspace();
+        let scheduler =
+            codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "bounded failure"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        assert!(
+            scheduler.start_ready().is_err(),
+            "start must fail closed for {marker}"
+        );
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        let record = scheduler
+            .last_error(&agent_id)
+            .expect("failure record is persisted");
+        assert!(
+            record.contains(marker) || marker == "SESSION_START_FAILED",
+            "record for {marker}: {record}"
+        );
+        assert_eq!(task.zcode_session_id, None);
+    }
+}
+
+#[test]
+fn interrupt_preserves_the_thread_identity_and_cancels_bounded() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+while [ ! -f release ]; do sleep 0.01; done
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"interrupted","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+    );
+    let scheduler = codex_scheduler(&directory, harness_factory(&script, &directory));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "interrupt me"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        if matches!(task.turn_state, external_store::TurnState::Active) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn never became active");
+        thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(directory.join("release"), "").unwrap();
+    scheduler.cancel_task(&agent_id).unwrap();
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    let deliveries = std::fs::read_to_string(directory.join("deliveries.jsonl")).unwrap();
+    let interrupt = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "turn/interrupt")
+        .expect("turn/interrupt frame");
+    assert_eq!(interrupt["params"]["threadId"], THREAD_ID);
+    assert_eq!(interrupt["params"]["turnId"], "codex-turn-1");
+}
+
+#[test]
+fn home_precedence_and_runtime_path_bounds() {
+    // Configured home wins over the inherited environment.
+    assert_eq!(
+        resolve_codex_home(Some("/cfg/home"), Some("/inherited/home")),
+        Some(Ok(PathBuf::from("/cfg/home")))
+    );
+    assert_eq!(
+        resolve_codex_home(None, Some("/inherited/home")),
+        Some(Ok(PathBuf::from("/inherited/home")))
+    );
+    assert_eq!(
+        resolve_codex_home(Some("relative"), None),
+        Some(Err("agents.codex.home must be absolute"))
+    );
+    assert_eq!(
+        resolve_codex_home(None, Some("relative")),
+        Some(Err("inherited CODEX_HOME must be absolute"))
+    );
+    // Neither source present rejects instead of falling back to ~/.codex.
+    assert_eq!(resolve_codex_home(None, None), None);
+
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("codex-runtime");
+    std::fs::write(&runtime, b"runtime").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&runtime, mode).unwrap();
+    }
+    let launch = CodexLaunch::new(runtime.clone(), directory.path().join("home"));
+    assert_eq!(launch.runtime_path(), runtime.as_path());
+    assert_eq!(launch.home(), directory.path().join("home"));
+    let script = directory.path().join("probe.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME $1 $2 $3\" > args.txt\nsleep 5\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&script, mode).unwrap();
+    }
+    let launch = CodexLaunch::new(script.clone(), directory.path().join("home"));
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    let owner = CodexRuntimeOwner::spawn(launch.command(directory.path()), sink).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(args) = std::fs::read_to_string(directory.path().join("args.txt")) {
+            assert_eq!(
+                args.trim(),
+                format!(
+                    "{} app-server --listen stdio://",
+                    directory.path().join("home").display()
+                )
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "child never recorded its argv");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let terminal = owner.stop(Duration::from_secs(2));
+    assert!(terminal_proves_process_group_reaped(&terminal));
+
+    // A non-executable or relative runtime path is rejected.
+    let plain = directory.path().join("plain.txt");
+    std::fs::write(&plain, b"plain").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&plain).unwrap().permissions();
+        mode.set_mode(0o644);
+        std::fs::set_permissions(&plain, mode).unwrap();
+    }
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    let bad = CodexLaunch::new(plain, directory.path().join("home"));
+    let error = CodexRuntimeFactory::test_harness(Some(bad))
+        .spawn(&codex_task_record(directory.path()), sink)
+        .err()
+        .expect("non-executable runtime must refuse the spawn");
+    assert!(error.to_string().contains("absolute executable file"));
+}
+
+fn codex_task_record(directory: &Path) -> TaskRecord {
+    let canonical = directory.canonicalize().unwrap();
+    let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest_for(&canonical, "launch"))
+        .unwrap()
+        .with_admission(codex_admission(Some(MODEL)))
+        .unwrap();
+    TaskRecord {
+        agent_id: "launch-check".into(),
+        repository: canonical.to_string_lossy().into_owned(),
+        phase: TaskPhase::Queued,
+        outcome: None,
+        workspace_path: canonical.to_string_lossy().into_owned(),
+        runtime_hash: None,
+        prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
+        prepared_launch_sha256: prepared.prepared_sha256.clone(),
+        initial_prompt: "prompt".into(),
+        owner_id: None,
+        owner_epoch: 0,
+        close_requested: false,
+        stop_requested: false,
+        last_event_seq: 0,
+        failure_code: None,
+        failure_message: None,
+        runtime_agent_id: None,
+        zcode_session_id: None,
+        turn_state: external_store::TurnState::Idle,
+        process_identity: None,
+        closed_at: None,
+        reaped_at: None,
+        created_at: 0,
+    }
+}
+
+#[test]
+fn routing_keeps_zcode_and_dsh_on_their_factories() {
+    let workspace = codex_workspace();
+    let zcode = crate::CommandRuntimeFactory::new(|_: &TaskRecord| {
+        Err::<Command, _>(io::Error::other("zcode factory must not spawn"))
+    });
+    let factory = crate::dsh::RoutingRuntimeFactory::with_codex(
+        zcode,
+        crate::dsh::DshRuntimeFactory::closed(),
+        CodexRuntimeFactory::closed(),
+    );
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    // No admission → legacy zcode route.
+    let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest_for(workspace.path(), "legacy"))
+        .unwrap();
+    let mut task = codex_task_record(workspace.path());
+    task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
+    task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
+    let error = factory
+        .spawn(&task, Arc::clone(&sink))
+        .err()
+        .expect("legacy route must stay on the zcode factory");
+    assert!(error.to_string().contains("zcode factory must not spawn"));
+    // dsh admission → dsh factory (closed gate).
+    let dsh_admission = AdmissionIdentity {
+        agent: "dsh".into(),
+        config_revision: 1,
+        adapter_version: "test".into(),
+        model: None,
+        model_source: "native".into(),
+    };
+    let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+        .unwrap()
+        .prepare_direct_submission(&manifest_for(workspace.path(), "dsh route"))
+        .unwrap()
+        .with_admission(dsh_admission)
+        .unwrap();
+    let mut task = codex_task_record(workspace.path());
+    task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
+    task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
+    let error = factory
+        .spawn(&task, Arc::clone(&sink))
+        .err()
+        .expect("dsh admission must stay on the dsh factory");
+    assert!(error.to_string().contains("dsh spawn gate is closed"));
+    // codex admission → codex factory (closed gate).
+    let error = factory
+        .spawn(&codex_task_record(workspace.path()), sink)
+        .err()
+        .expect("codex admission must route to the codex factory");
+    assert!(error.to_string().contains("codex spawn gate is closed"));
+}
+
+/// Serialize tests that mutate process-global environment variables.
+fn env_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn executable_script(directory: &Path, name: &str, body: &str) -> PathBuf {
+    let script = directory.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&script).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&script, mode).unwrap();
+    }
+    script
+}
+
+#[test]
+fn production_enabled_gate_spawns_a_real_executable_environment() {
+    let _env = env_test_guard();
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = executable_script(directory.path(), "codex-runtime", "sleep 5\n");
+    let home = directory.path().join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let previous_runtime = std::env::var_os("CODEX_RUNTIME_PATH");
+    let previous_home = std::env::var_os("CODEX_HOME");
+    std::env::set_var("CODEX_RUNTIME_PATH", &runtime);
+    std::env::set_var("CODEX_HOME", &home);
+
+    // F01 regression: a valid executable runtime passes the production
+    // environment predicate and the Enabled gate actually spawns it.
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    let spawned = CodexRuntimeFactory::enabled()
+        .spawn(&codex_task_record(directory.path()), Arc::clone(&sink))
+        .expect("a valid executable runtime must pass the production gate");
+    let terminal = spawned.stop(Duration::from_secs(2));
+    assert!(terminal_proves_process_group_reaped(&terminal));
+
+    let plain = directory.path().join("plain.txt");
+    std::fs::write(&plain, b"plain").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&plain).unwrap().permissions();
+        mode.set_mode(0o644);
+        std::fs::set_permissions(&plain, mode).unwrap();
+    }
+    let spawn_refusing = |marker: &str| {
+        let error = CodexRuntimeFactory::enabled()
+            .spawn(&codex_task_record(directory.path()), Arc::clone(&sink))
+            .err()
+            .unwrap_or_else(|| panic!("{marker} must fail closed"));
+        assert!(
+            error.to_string().contains(marker),
+            "expected {marker} in {error}"
+        );
+    };
+    std::env::set_var("CODEX_RUNTIME_PATH", &plain);
+    spawn_refusing("absolute executable file");
+    std::env::set_var("CODEX_RUNTIME_PATH", "relative/codex");
+    spawn_refusing("absolute executable file");
+    std::env::remove_var("CODEX_RUNTIME_PATH");
+    spawn_refusing("CODEX_RUNTIME_PATH is unavailable");
+    std::env::set_var("CODEX_RUNTIME_PATH", &runtime);
+    std::env::remove_var("CODEX_HOME");
+    spawn_refusing("CODEX_HOME is unconfigured");
+    std::env::set_var("CODEX_HOME", "relative-home");
+    spawn_refusing("CODEX_HOME must be absolute");
+
+    match previous_runtime {
+        Some(value) => std::env::set_var("CODEX_RUNTIME_PATH", value),
+        None => std::env::remove_var("CODEX_RUNTIME_PATH"),
+    }
+    match previous_home {
+        Some(value) => std::env::set_var("CODEX_HOME", value),
+        None => std::env::remove_var("CODEX_HOME"),
+    }
+}
+
+#[test]
+fn terminal_send_never_overwrites_a_committed_close_or_cancel() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    for close in [true, false] {
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(
+                    workspace.path(),
+                    if close { "close me" } else { "cancel me" },
+                ),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        await_result(&scheduler, &agent_id);
+        let before = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(before.outcome, Some(TaskOutcome::Completed));
+        assert!(before.reaped_at.is_some(), "completed task must be reaped");
+
+        let phase = if close {
+            scheduler.close_task(&agent_id)
+        } else {
+            scheduler.cancel_task(&agent_id)
+        }
+        .unwrap();
+        assert_eq!(phase, TaskPhase::Terminal);
+        let error = scheduler
+            .queue_message(&agent_id, "post-close-msg", "nope")
+            .unwrap_err();
+        assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+        let after = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(after.phase, TaskPhase::Terminal);
+        assert_eq!(after.outcome, Some(TaskOutcome::Completed));
+        if close {
+            assert!(after.close_requested);
+            assert!(after.closed_at.is_some());
+        } else {
+            assert!(after.stop_requested);
+        }
+        assert!(scheduler
+            .store()
+            .message("post-close-msg")
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn store_requeue_refuses_a_close_committed_after_the_scheduler_read() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "close race"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    await_result(&scheduler, &agent_id);
+    await_terminal_task(&scheduler, &agent_id);
+    let store = scheduler.store();
+
+    // The scheduler already read an eligible snapshot; a close commits
+    // inside the eligibility/requeue window. Only the shared
+    // transaction can still refuse the resume.
+    store.request_close(&agent_id).unwrap();
+    let requeued = store
+        .requeue_task_for_resume_with_message(&agent_id, "race-msg", "content")
+        .unwrap();
+    assert!(!requeued, "a committed close must refuse the requeue");
+    let task = store.get_task(&agent_id).unwrap().unwrap();
+    assert_eq!(task.phase, TaskPhase::Terminal);
+    assert!(task.close_requested);
+    assert!(task.closed_at.is_some());
+    assert!(store.message("race-msg").unwrap().is_none());
+}
+
+#[test]
+fn concurrent_terminal_send_and_close_never_lose_the_close() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    const RACES: usize = 4;
+    let mut agents = Vec::new();
+    for _ in 0..RACES {
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "race base"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        await_result(&scheduler, &agent_id);
+        await_terminal_task(&scheduler, &agent_id);
+        agents.push(agent_id);
+    }
+    for (index, agent_id) in agents.iter().enumerate() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let close_barrier = Arc::clone(&barrier);
+        let send_scheduler = scheduler.clone();
+        let close_scheduler = scheduler.clone();
+        let send_agent = agent_id.clone();
+        let close_agent = agent_id.clone();
+        let message_id = format!("race-msg-{index}");
+        let sender_message = message_id.clone();
+        let send_handle = thread::spawn(move || {
+            barrier.wait();
+            send_scheduler.queue_message(&send_agent, &sender_message, "follow-up")
+        });
+        let close_handle = thread::spawn(move || {
+            close_barrier.wait();
+            close_scheduler.close_task(&close_agent)
+        });
+        let send_outcome = send_handle.join().unwrap();
+        close_handle.join().unwrap().unwrap();
+
+        // Whichever side wins, the committed close must survive: the
+        // requeue transaction may never clear close evidence.
+        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        let close_survived =
+            task.close_requested || task.closed_at.is_some() || task.phase == TaskPhase::Cancelling;
+        assert!(
+            close_survived,
+            "resume overwrote a committed close for {agent_id}: {task:?}"
+        );
+        match send_outcome {
+            Ok(disposition) => {
+                assert_eq!(disposition, crate::MessageDisposition::Queued);
+                assert!(scheduler.store().message(&message_id).unwrap().is_some());
+            }
+            Err(error) => {
+                assert!(
+                    error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"),
+                    "unexpected resume error: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    let store = scheduler.store();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "orphaned codex task"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    let claim = store
+        .claim_next("orphan-owner", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, agent_id);
+    store
+        .mark_session_running(
+            &agent_id,
+            claim.owner_epoch,
+            "runtime-orphan",
+            Some(&external_store::StoredProcessIdentity {
+                pid: 4242,
+                process_group_id: 4242,
+                uid: 1000,
+                start_token: "start-token-orphan".into(),
+            }),
+            Some(THREAD_ID),
+            Some(external_store::TurnState::Idle),
+        )
+        .unwrap();
+    store
+        .store_task_result(
+            &agent_id,
+            &external_store::TaskResult {
+                outcome: TaskOutcome::Completed,
+                final_text: "orphaned".into(),
+                partial: false,
+            },
+        )
+        .unwrap();
+    store
+        .transition_terminal(
+            &agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Completed,
+                failure_code: None,
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    let task = store.get_task(&agent_id).unwrap().unwrap();
+    let identity = task.process_identity.clone().expect("persisted identity");
+    assert_eq!(task.reaped_at, None, "fixture models an unproven reap");
+
+    // The scheduler precheck passes (codex, session, completed, no
+    // close), so only the transaction's reap proof refuses this.
+    let error = scheduler
+        .queue_message(&agent_id, "orphan-msg", "nope")
+        .unwrap_err();
+    assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+    let after = store.get_task(&agent_id).unwrap().unwrap();
+    assert_eq!(after.phase, TaskPhase::Terminal);
+    let kept = after.process_identity.clone().expect("old identity kept");
+    assert_eq!(kept.pid, identity.pid);
+    assert_eq!(kept.process_group_id, identity.process_group_id);
+    assert_eq!(kept.start_token, identity.start_token);
+    assert!(store.message("orphan-msg").unwrap().is_none());
+
+    // Once the reap is proven, the same durable state admits the resume
+    // and only then may the requeue clear the old identity.
+    store.reap_task(&agent_id).unwrap();
+    assert!(store
+        .requeue_task_for_resume_with_message(&agent_id, "orphan-msg", "nope")
+        .unwrap());
+    assert_eq!(
+        store.get_task(&agent_id).unwrap().unwrap().phase,
+        TaskPhase::Queued
+    );
+}
+
+#[test]
+fn late_turn_traffic_never_pollutes_the_current_turn_result() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"GOOD_"}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","itemId":"stale_1","delta":"STALE_DELTA"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","item":{"type":"agentMessage","id":"stale_1","text":"STALE_ITEM"}}}' \
+  '{"method":"error","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","error":{"message":"old capacity failure","codexErrorInfo":"serverOverloaded"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"completed","error":null}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","itemId":"msg_1","delta":"MISSING_TURN_ID"}}' \
+  '{"method":"item/completed","params":{"turnId":"codex-turn-1","item":{"type":"agentMessage","id":"no_thread","text":"NO_THREAD_ID"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"OK"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+while IFS= read -r line; do :; done
+"#;
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "stale traffic probe"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "GOOD_OK");
+    await_terminal_task(&scheduler, &agent_id);
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "stale traffic must not label a failure: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+}
+
+#[test]
+fn turn_start_response_and_notification_must_name_the_same_turn() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-a","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-b","status":"inProgress"}}}'
+sleep 1
+"#;
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "mismatched turn ids"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert!(
+        scheduler.start_ready().is_err(),
+        "a start response that disagrees with the started turn must fail closed"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    let record = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(
+        record.contains("does not match the started turn"),
+        "record: {record}"
+    );
+}
+
+#[test]
+fn turn_start_response_without_a_turn_id_fails_closed() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // The start response omits its turn id; even a well-formed started
+    // notification cannot reconcile an unacknowledged turn.
+    let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}'
+sleep 1
+"#;
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "anonymous turn"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert!(
+        scheduler.start_ready().is_err(),
+        "a start response without a turn id must fail closed"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    let record = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(
+        record.contains("missing a bounded turn id"),
+        "record: {record}"
+    );
+}
+
+#[test]
+fn completed_turn_cannot_be_reopened_by_late_or_duplicate_started() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // After the turn completes, the server replays a duplicate started
+    // for the finished turn, a stale started for an older turn, late
+    // turn-scoped traffic, and a duplicate completion. None of it may
+    // reactivate the retired turn or touch the stored result.
+    let script = r#"
+IFS= read -r line
+printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+IFS= read -r line
+printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"inProgress"}}}' \
+  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"LATE_DELTA"}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"LATE_ITEM"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+while IFS= read -r line; do :; done
+"#;
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "late replay probe"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        result.result.final_text, "CODEX_OK",
+        "late traffic must not rewrite the completed turn's result"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "late replays must not label a failure: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+}
+
+struct TwoPhaseFactory {
+    first: Mutex<Option<CodexRuntimeFactory>>,
+    second: CodexRuntimeFactory,
+}
+impl RuntimeFactory for TwoPhaseFactory {
+    fn spawn(
+        &self,
+        task: &TaskRecord,
+        sink: Arc<dyn LifecycleSink>,
+    ) -> io::Result<Arc<dyn ManagedRuntime>> {
+        let mut first = self.first.lock().unwrap();
+        match first.take() {
+            Some(factory) => factory.spawn(task, sink),
+            None => self.second.spawn(task, sink),
+        }
+    }
+}
+
+fn resume_phase_factory(directory: &Path, script: &str, child: &str) -> CodexRuntimeFactory {
+    let path = directory.join(child);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = std::fs::metadata(&path).unwrap().permissions();
+        mode.set_mode(0o755);
+        std::fs::set_permissions(&path, mode).unwrap();
+    }
+    CodexRuntimeFactory::test_harness(Some(CodexLaunch::new(path, directory.join("codex-home"))))
+}
+
+#[test]
+fn resume_fails_closed_without_a_confirmed_plan_only_posture() {
+    let _guard = scripted_test_guard();
+    for (resume_result, marker) in [
+        // No posture fields at all: unverifiable means refused.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}"#,
+            "read-only",
+        ),
+        // A write-capable sandbox object is never accepted on resume.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"workspaceWrite","networkAccess":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "read-only",
+        ),
+        // The request-time string preset is not the resolved posture
+        // the live probe returns; it stays unconfirmed.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":"read-only","approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "read-only",
+        ),
+        // A network-capable sandbox diverges from the observed
+        // read-only posture and fails closed.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "read-only",
+        ),
+        // An approval policy other than never.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"on-request","cwd":"/elsewhere"}}"#,
+            "never",
+        ),
+        // A thread rooted somewhere other than the task workspace.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "task workspace",
+        ),
+    ] {
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let resume_script = format!(
+            r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{resume_result}'
+IFS= read -r line
+sleep 1
+"#
+        );
+        let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let scheduler = Scheduler::new(
+            "codex-resume-f05",
+            store,
+            Arc::new(TwoPhaseFactory {
+                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                second: resume_phase_factory(&directory, &resume_script, "codex-resume-fail.sh"),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(&directory, "first turn"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let first_result = await_result(&scheduler, &agent_id);
+        assert_eq!(first_result.result.final_text, "CODEX_OK");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "first runtime was never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "fail-msg", "follow-up question")
+                .unwrap(),
+            crate::MessageDisposition::Queued
+        );
+        assert!(
+            scheduler.start_ready().is_err(),
+            "an unconfirmed plan-only posture must fail the resume closed"
+        );
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(
+            task.zcode_session_id.as_deref(),
+            Some(THREAD_ID),
+            "the persisted thread identity stays durable for a retry"
+        );
+        let record = scheduler.last_error(&agent_id).expect("failure record");
+        assert!(record.contains(marker), "record: {record}");
+
+        // The resumed process really did attempt thread/resume with the
+        // persisted identity before failing closed.
+        let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+            .expect("the resumed process logs its own frames");
+        let resume = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "thread/resume")
+            .expect("thread/resume frame");
+        assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        let turn_starts = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|frame| frame["method"] == "turn/start")
+            .count();
+        assert_eq!(turn_starts, 0, "no turn may start on an unverified resume");
+    }
+}
