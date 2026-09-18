@@ -32,11 +32,13 @@ through the public install surface — all four cells COMPLETED with the
 plugin cache verified against the staged binding (`cache_verified: true`;
 see [docs/acceptance/productization.md](docs/acceptance/productization.md)).
 The managed plugin manifest is versioned per released candidate because its
-version is codex's plugin-cache identity, and each candidate's consumer runs
-cache that identity in codex's machine-global store, so any later candidate
-bumps again. The installer verifies the materialized plugin cache against the staged
-binding and managed content (file set and bytes, not just identity) before
-reporting success, failing closed on store-reused or stale bytes. DSH
+version is codex's plugin-cache identity, and codex resolves the reserved
+`personal` marketplace name machine-globally to the real user root
+(regardless of `CODEX_HOME`), so each candidate's consumer runs pin that
+identity's bytes there and any later candidate bumps again. The installer
+verifies the materialized plugin cache against the staged binding and
+managed content (file set and bytes, not just identity) before reporting
+success, failing closed on cache-reused or stale bytes. DSH
 admission currently supports `build` and strict `plan`; its model
 selection is explicit spawn model, configured default, then the native
 default. Nothing has been published to a registry
@@ -50,7 +52,9 @@ manifest all carry the same version, and `scripts/release/check-native-tarball.m
 enforces payload/package agreement. The managed Codex plugin manifest
 (`plugins/codex/external-subagent/.codex-plugin/plugin.json`, currently
 `0.1.3`) is deliberately **not** tied to the product version: it is codex's
-machine-global plugin-cache identity (`plugin@marketplace@version`), which
+plugin-cache identity (`plugin@marketplace@version`; under the reserved
+`personal` marketplace name codex resolves the real user root
+machine-globally, ignoring `CODEX_HOME`), which
 must carry a fresh version per released candidate (`0.1.1` for C1, `0.1.2`
 for C2, `0.1.3` for the boundary-fixes candidate) so no home silently
 receives another installation's cached bytes. The two numbers therefore

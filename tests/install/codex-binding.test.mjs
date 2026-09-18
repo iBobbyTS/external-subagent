@@ -1,11 +1,13 @@
 // S05 managed Codex binding and the D08 global Codex-homes registry.
 //
-// The binding oracles pin the verified codex-cli 0.153.4 interface (captured in
-// docs/compatibility/codex.md): `plugin marketplace add <root> --json`,
-// `plugin add <name> --marketplace <marketplace> --json`, and
-// `plugin remove <name>@<marketplace> --json`.  A recording fake CLI stands in
-// for codex so the tests never touch a real Codex installation; one opt-out
-// gated test exercises the real CLI against a throwaway CODEX_HOME only.
+// The binding oracles pin the verified codex-cli interface (JSON shapes
+// verified on 0.153.4; add/marketplace paths re-verified on 0.154.0 —
+// captured in docs/compatibility/codex.md): `plugin marketplace add
+// <root> --json`, `plugin add <name> --marketplace <marketplace> --json`,
+// and `plugin remove <name>@<marketplace> --json`.  A recording fake CLI
+// stands in for codex so the tests never touch a real Codex installation;
+// one opt-out gated test exercises the real CLI against a throwaway
+// CODEX_HOME only.
 // The registry oracles pin D08: claim on successful install, unclaim on
 // removal, idempotent dedupe, atomic corruption recovery, and the guarantee
 // that only registered, writable homes are ever written.  The AUD-010
@@ -233,7 +235,12 @@ test('foreign staging and drifted marketplace entries are rejected, not overwrit
 // The store-backed fake below reproduces the 0.153.4 machine-global content
 // store: one shared store across every CODEX_HOME, keyed by
 // plugin@marketplace@version, seeded by whichever binding was installed
-// first.  These tests pin the fail-closed answer to store reuse.
+// first.  codex 0.154.0 no longer behaves this way for non-reserved
+// marketplace names (it re-materializes each add from the registered root;
+// the reserved name `personal` instead resolves machine-globally to the
+// real user root), so these oracles pin the fail-closed answer to store
+// reuse as deliberate defense against freeze-behavior CLIs and future
+// regressions, not as a model of live 0.154.0 non-reserved adds.
 test('a second binding of the same plugin identity fails closed on store-reused cache bytes', () => {
   const state = fixtureHome('external-subagent-store-');
   const fake = fakeCodexCli(state, { store: true });
@@ -258,7 +265,10 @@ test('a second binding of the same plugin identity fails closed on store-reused 
     try { installPlugin(pathsB, { codexCli: fake.cli, codexHome: codexB }); } catch (error) { failure = error; }
     assert.ok(failure, 'the store-reused install must not succeed');
     assert.equal(failure.code, 'CODEX_CACHE_BINDING_MISMATCH');
-    assert.match(failure.message, /machine-global content store/u);
+    assert.match(failure.message, /machine-global content store/u, 'the store-reuse cause stays named');
+    assert.match(failure.message, /release a distinct plugin version/u, 'the store-reuse remediation stays named');
+    assert.match(failure.message, /reserved marketplace name personal/u, 'the reserved-name cause stays named');
+    assert.match(failure.message, /non-reserved marketplace name in isolated homes/u, 'the reserved-name remediation stays named');
     assert.match(failure.message, new RegExp(pathsB.socket.replace(/[/\\]/gu, '\\$&'), 'u'));
 
     // Fail-closed rollback of product-owned state from this run...
@@ -373,7 +383,9 @@ test('a same-identity cache with changed managed content fails closed through th
       assert.ok(failure, `${negative.name}: the stale-content install must not succeed`);
       assert.equal(failure.code, 'CODEX_CACHE_CONTENT_MISMATCH');
       assert.match(failure.message, new RegExp(`external-subagent@personal@${shippedVersion.replace(/\./gu, '\\.')}\\b`, 'u'), 'the error names the reused identity');
-      assert.match(failure.message, /machine-global content store/u);
+      assert.match(failure.message, /release a distinct plugin version/u, 'the freeze-behavior remediation stays named');
+      assert.match(failure.message, /codex 0\.153\.4 store behavior/u, 'the freeze-behavior cause stays scoped to the CLI shape that freezes');
+      assert.match(failure.message, /refresh the registered marketplace root and re-add/u, 'the re-materializing-CLI remediation stays named');
       assert.ok(failure.message.includes(first.cache), 'the error shows the cache that was rejected');
 
       // The failed refresh restores the prior coherent staging/marketplace
@@ -869,15 +881,18 @@ test('D08 reconcile updates only registered writable homes and never touches str
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-// codex 0.153.4 materializes a `plugin add` cache from a machine-global
-// content store keyed by the plugin identity: when the user's real ~/.codex
+// codex resolves the reserved marketplace name `personal` (the product
+// default) machine-globally to the real user root regardless of CODEX_HOME
+// (verified live on 0.154.0; the earlier 0.153.4 "store reuse" observation
+// is this same reserved-name resolution): when the user's real ~/.codex
 // already caches the same plugin@marketplace@version, an isolated CODEX_HOME
 // still receives the REAL installation's bytes (observed live: the cached
 // .mcp.json carried the real-home socket while the staged tree carried the
 // throwaway socket).  installPlugin now reads the cache back and fails
 // closed on that mismatch; the real-CLI oracle below additionally pins the
-// fresh-machine contract, so it only runs where store dedupe cannot turn
-// the run into the mismatch path it now shares with the unit oracle above.
+// fresh-machine contract, so it only runs where the reserved-name/store
+// resolution cannot turn the run into the mismatch path it now shares with
+// the unit oracle above.
 const realCodexCacheConflict = fs.existsSync(path.join(os.homedir(), '.codex', 'plugins', 'cache', 'personal', 'external-subagent'));
 
 test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { skip: !(process.platform === 'darwin' && process.env.EXTERNAL_SUBAGENT_TEST_REAL_CODEX !== '0' && !realCodexCacheConflict && spawnSync('codex', ['--version'], { encoding: 'utf8' }).status === 0) }, () => {

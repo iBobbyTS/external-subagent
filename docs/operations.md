@@ -163,15 +163,19 @@ The plist template is documented in
 `install-plugin` stages the managed plugin under `~/plugins/external-subagent`
 (with an absolute MCP entry and the daemon socket) and registers a local
 source marketplace before invoking the official codex CLI (see the
-compatibility doc). The plugin manifest's `version` is codex's machine-global
-cache identity (`plugin@marketplace@version`): it is deliberately independent
+compatibility doc). The plugin manifest's `version` is codex's plugin-cache
+identity (`plugin@marketplace@version`): it is deliberately independent
 of the package version (whose single source is `package.json`) and every
 released candidate must carry its own version (`0.1.1` from the
 productization closeout onward, currently `0.1.3`), or a home sharing that
 identity receives another installation's cached bytes — which `install-plugin`
 now rejects by comparing the materialized cache's managed content with the
 staged tree (`CODEX_CACHE_BINDING_MISMATCH`/`CODEX_CACHE_CONTENT_MISMATCH`)
-instead of trusting identity alone. Existing
+instead of trusting identity alone. The default marketplace name `personal`
+is reserved: codex resolves it machine-globally to the real user root
+regardless of `CODEX_HOME`, so installs under that name always read the real
+root's content and isolated-home verification needs a non-reserved
+marketplace name. Existing
 marketplace entries and Codex config are never
 overwritten; drift or foreign ownership is rejected (`PLUGIN_STAGING_CONFLICT`,
 `PLUGIN_MARKETPLACE_CONFLICT`). `install-mcp` provides the alternative direct
