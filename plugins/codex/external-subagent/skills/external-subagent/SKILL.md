@@ -15,5 +15,7 @@ runtime instance and no instance selector is supported. Omitting `subagent` uses
 The caller is a `host`. Any unregistered local MCP client can act as `custom` and
 call status or spawn without a host record or Codex home. Built-in `host.codex`
 exists for installation and automatic-upgrade coordination, supports multiple
-Codex home instances, and offers plugin or direct MCP bindings. This is separate
+Codex home instances, and offers plugin or direct MCP bindings; built-in
+`host.zcode` binds this same plugin through the ZCode config's inline plugin
+dirs with a single per-user instance. This is separate
 from `subagent.codex`. Protocol implementations are adapters.

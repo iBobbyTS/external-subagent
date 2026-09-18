@@ -1,6 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { LAUNCH_AGENT_LABEL } from './constants.mjs';
+import { PLUGIN_NAME } from './install/layout.mjs';
 
 export function platform() {
   return process.env.ZCODE_AS_SUBAGENT_TEST_PLATFORM || process.platform;
@@ -19,6 +20,7 @@ export function productPaths(home = os.homedir()) {
     logs: path.join(home, 'Library', 'Logs', 'external-subagent'),
     launchAgent: path.join(home, 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`),
     zcodeConfig: path.join(home, '.zcode', 'cli', 'config.json'),
+    zcodePlugin: path.join(data, 'zcode-plugin', PLUGIN_NAME),
   };
 }
 

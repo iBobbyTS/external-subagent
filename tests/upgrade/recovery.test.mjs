@@ -31,6 +31,8 @@ import { updateInstallation } from '../../cli/install/update.mjs';
 import { updateCommand } from '../../cli/commands/update.mjs';
 import { activateService } from '../../cli/install/service-activation.mjs';
 import { npmUpdateCoordination, reconcileCodexHomes, registerCodexHome } from '../../cli/install/reconcile.mjs';
+import { installZcodePlugin } from '../../cli/install/zcode.mjs';
+import { productPaths } from '../../cli/paths.mjs';
 import { packageVersion } from '../../cli/install/layout.mjs';
 
 const darwinArm64 = process.platform === 'darwin' && process.arch === 'arm64';
@@ -320,6 +322,28 @@ test('an ignore-scripts npm update stays coordinatable through the CLI with no d
     } finally {
       fs.rmSync(data, { recursive: true, force: true });
     }
+  }
+});
+
+test('a service-less update still refreshes the zcode binding (REV-002)', { skip: !darwinArm64 }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-update-'));
+  const paths = productPaths(home);
+  const skill = path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md');
+  try {
+    // A bound zcode host whose product never installed the launchd service:
+    // serviceDue is false, so the codex homes sync runs inside
+    // updateInstallation and the zcode refresh must not be gated away.
+    installZcodePlugin(paths);
+    fs.writeFileSync(skill, 'tampered\n');
+    const result = await updateCommand(paths, [], { hasInstalledService: () => false });
+    assert.equal(result.phase, 'active');
+    assert.equal(result.zcode.bound, true, 'the update reports the zcode binding');
+    assert.equal(result.zcode.status, 'updated', 'the zcode binding is refreshed even without a service');
+    assert.notEqual(fs.readFileSync(skill, 'utf8'), 'tampered\n', 'the staged tree was re-staged from the current source');
+    const server = JSON.parse(fs.readFileSync(path.join(paths.zcodePlugin, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
+    assert.equal(server.command, process.execPath);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });
 

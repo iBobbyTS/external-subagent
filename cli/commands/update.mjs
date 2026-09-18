@@ -1,4 +1,5 @@
 import { npmUpdateCoordination, reconcileCodexHomes } from '../install/reconcile.mjs';
+import { reconcileZcodeBinding } from '../install/zcode.mjs';
 import { preflightUpdate, reconcileInstallation, updateInstallation } from '../install/update.mjs';
 import { callDaemon, canonicalDaemonCode } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
@@ -92,8 +93,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
     result = (reconciling && !coordinate)
-      ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths) }
+      ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths), zcode: reconcileZcodeBinding(paths) }
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceDue });
+    // The zcode binding has neither a registry nor a service dependency, so
+    // it refreshes on every activation attempt — including service-less
+    // installs, where the codex homes sync runs inside updateInstallation
+    // instead of the service activation block below.
+    if (!result.zcode) result.zcode = reconcileZcodeBinding(paths);
     if (!result || typeof result !== 'object' || result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }

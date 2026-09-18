@@ -10,7 +10,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { mcpCommand, pluginCommand } from '../../cli/commands/plugin.mjs';
-import { installMcp, treeDigest } from '../../cli/install/codex.mjs';
+import { installMcp } from '../../cli/install/codex.mjs';
+import { treeDigest } from '../../cli/install/plugin-stage.mjs';
 import { loadCodexHomes } from '../../cli/install/reconcile.mjs';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
@@ -151,6 +152,59 @@ test('install-plugin records no registry claim when the cache cannot be verified
     assert.equal(fs.existsSync(path.join(home, '.agents', 'plugins', 'marketplace.json')), false, 'the public command surface rolls the marketplace back');
   } finally {
     process.env.PATH = priorPath;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Host dispatch: `install-plugin zcode` goes through the stateless ZCode
+// binding (no codex CLI is ever invoked), `--codex-home` is codex-only, and
+// unknown hosts are rejected at the argument parser.
+test('install-plugin zcode installs and removes the inline binding without touching codex', () => {
+  const home = fixtureHome('external-subagent-zcode-cli-');
+  const paths = productPaths(home);
+  try {
+    const dry = pluginCommand(paths, ['zcode', '--dry-run']);
+    assert.equal(dry.dry_run, true);
+    assert.equal(dry.host, 'zcode');
+    assert.equal(dry.plugin_id, 'external-subagent@inline');
+    assert.equal(fs.existsSync(paths.zcodeConfig), false, 'dry-run writes nothing');
+
+    const installed = pluginCommand(paths, ['zcode']);
+    assert.equal(installed.installed, true);
+    assert.equal(installed.plugin_id, 'external-subagent@inline');
+    const config = JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
+    assert.deepEqual(config.plugins.dirs, [path.resolve(paths.zcodePlugin)]);
+    assert.equal(fs.existsSync(path.join(home, '.codex')), false, 'the zcode host never creates a codex home');
+
+    const removed = pluginCommand(paths, ['zcode', '--uninstall']);
+    assert.equal(removed.uninstalled, true);
+    assert.equal(removed.staging_removed, true);
+    assert.equal('plugins' in JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('install-plugin rejects codex-only flags on the zcode host and unknown hosts', () => {
+  const home = fixtureHome('external-subagent-zcode-args-');
+  const paths = productPaths(home);
+  try {
+    assert.throws(() => pluginCommand(paths, ['zcode', '--codex-home', path.join(home, 'codex')]), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /applies to the codex host only/u);
+      return true;
+    });
+    assert.throws(() => pluginCommand(paths, ['claude']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /unsupported plugin host: claude/u);
+      return true;
+    });
+    assert.throws(() => pluginCommand(paths, ['zcode', 'codex']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /plugin host was already given/u);
+      return true;
+    });
+  } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

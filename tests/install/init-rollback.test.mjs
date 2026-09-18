@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runInit } from '../../cli/install/init.mjs';
-import { treeDigest } from '../../cli/install/codex.mjs';
+import { treeDigest } from '../../cli/install/plugin-stage.mjs';
 import { loadCodexHomes } from '../../cli/install/reconcile.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 

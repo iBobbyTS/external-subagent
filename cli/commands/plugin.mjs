@@ -1,18 +1,28 @@
 import { CliError } from '../errors.mjs';
 import { installMcp, installPlugin, uninstallPlugin } from '../install/codex.mjs';
+import { installZcodePlugin, uninstallZcodePlugin } from '../install/zcode.mjs';
 import { registerCodexHome, unregisterCodexHome } from '../install/reconcile.mjs';
 import { verifyPayload } from '../install/payload.mjs';
 
-// Command surface for the managed Codex bindings.  Installing claims the
-// Codex home in the D08 registry; uninstalling releases the claim.  The MCP
-// TOML binding stays an explicit alternative for hosts without plugin
-// support.
+// Command surface for the managed host bindings.  `install-plugin` takes an
+// optional host argument: codex (the default, for backward compatibility)
+// stages the plugin and goes through the official codex CLI, claiming the
+// Codex home in the D08 registry; zcode stages the same plugin into a
+// product-owned tree and registers it through the ZCode config's inline
+// plugin dirs.  The MCP TOML binding stays an explicit codex-only
+// alternative for hosts without plugin support.
+
+const PLUGIN_HOSTS = ['codex', 'zcode'];
 
 function parseCommon(args, flags) {
   const options = {};
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (flags.includes(arg)) {
+    if (!arg.startsWith('--')) {
+      if (options.host) throw new CliError('INVALID_ARGUMENT', `plugin host was already given: ${options.host}`, 2);
+      if (!PLUGIN_HOSTS.includes(arg)) throw new CliError('INVALID_ARGUMENT', `unsupported plugin host: ${arg} (expected ${PLUGIN_HOSTS.join(' or ')})`, 2);
+      options.host = arg;
+    } else if (flags.includes(arg)) {
       options[flagName(arg)] = true;
     } else if (arg === '--codex-home') {
       const value = args[index + 1];
@@ -33,6 +43,10 @@ function flagName(flag) {
 export function pluginCommand(paths, args) {
   const options = parseCommon(args, ['--dry-run', '--uninstall']);
   const installerOptions = withInstallerFlags(options);
+  if (options.host === 'zcode') {
+    if (options.codexHome) throw new CliError('INVALID_ARGUMENT', '--codex-home applies to the codex host only', 2);
+    return options.uninstall ? uninstallZcodePlugin(paths, installerOptions) : installZcodePlugin(paths, installerOptions);
+  }
   if (options.uninstall) {
     const result = uninstallPlugin(paths, installerOptions);
     if (!options.dry_run && result.uninstalled) {
