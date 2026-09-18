@@ -92,9 +92,12 @@ Missing DSH never blocks installation; `subagents status` reports it explicitly
 product never installs subagent runtimes itself.
 
 When DSH is explicitly enabled, configure its `runtime_path`, `home`, `profile`,
-and pinned `version` through the public config command. The service template
-forwards those values into the LaunchAgent environment whenever the plist is
-(re-)rendered — `init`, `update`, and `reconcile` re-render it — and the DSH
+and pinned `version` through the public config command. `init` renders the
+LaunchAgent template once with those values; after a `config set`, the service
+environment refreshes on the next service restart (`stop` + `start`, or an
+`update` that activates a new payload), because the daemon re-reads the product
+config and re-exports the DSH environment at every startup (`update`/`reconcile`
+never re-render the plist). The DSH
 adapter consumes and validates the profile/version rather than relying on the
 interactive shell.
 
