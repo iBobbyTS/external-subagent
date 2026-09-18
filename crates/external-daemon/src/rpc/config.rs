@@ -216,6 +216,24 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
                 }
             }
         }
+        // AUD-005/D1 (S02): a zcode runtime_path has no consumer — startup
+        // resolves the pinned packaged ZCode runtime from service arguments,
+        // never from this field (see main.rs) — so accepting it here would let
+        // a hand-written config pass startup/RPC admission while being
+        // silently ignored at spawn.  Node rejects the same input with
+        // `runtime_path_unsupported` (cli/config/schema.mjs); null stays
+        // allowed, and malformed or empty values keep the generic rejection
+        // above regardless of the agent.  dsh/codex stay configurable.
+        if name == "zcode"
+            && entry
+                .get("runtime_path")
+                .is_some_and(|value| !value.is_null())
+        {
+            return Err(RpcError::new(
+                RpcErrorCode::Validation,
+                "agent config runtime_path is unsupported for zcode",
+            ));
+        }
         let default_enabled = name == "zcode";
         entry
             .entry("enabled")
@@ -257,7 +275,25 @@ mod config_migration_tests {
             "../../../../tests/fixtures/subagent-config-matrix.json"
         ))
         .unwrap();
-        for case in cases.as_array().unwrap() {
+        let all = cases.as_array().unwrap();
+        let zcode_runtime_rejections = all
+            .iter()
+            .filter(|case| case["error_code"].as_str() == Some("runtime_path_unsupported"))
+            .count();
+        // AUD-005/S02: the shared fixture must keep exercising the zcode
+        // runtime_path gate in both schema shapes plus the disabled-entry
+        // variant; a matrix edit that drops them would otherwise let this
+        // filtered test pass vacuously.
+        assert!(
+            zcode_runtime_rejections >= 3,
+            "shared matrix lost its zcode runtime_path negatives"
+        );
+        eprintln!(
+            "matrix: {} cases, {} zcode runtime_path rejections",
+            all.len(),
+            zcode_runtime_rejections
+        );
+        for case in all {
             let bytes = serde_json::to_vec(&case["input"]).unwrap();
             let startup = parse_subagent_config(&bytes);
             let rpc = parse_agent_config_snapshot(&bytes);
@@ -270,6 +306,22 @@ mod config_migration_tests {
                 startup
             );
             assert_eq!(rpc.is_ok(), valid, "RPC {}: {:?}", case["name"], rpc);
+            if !valid && case["error_code"].as_str() == Some("runtime_path_unsupported") {
+                // Mirrors the Node `runtime_path_unsupported` contract: the
+                // rejection must stay diagnosable as "zcode does not support
+                // this field" through the existing RpcError message style.
+                for error in [startup.as_ref().err(), rpc.as_ref().err()] {
+                    let Some(error) = error else {
+                        panic!("{} escaped rejection", case["name"]);
+                    };
+                    assert!(
+                        error.message.contains("zcode") && error.message.contains("runtime_path"),
+                        "{} rejection is not diagnosable: {}",
+                        case["name"],
+                        error.message
+                    );
+                }
+            }
             if let Ok(value) = startup {
                 assert_eq!(value["schema_version"], 2);
                 assert!(value.get("agents").is_none());

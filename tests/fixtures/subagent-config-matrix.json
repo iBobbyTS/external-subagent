@@ -23,5 +23,17 @@
   {"name":"unknown subagent", "valid":false, "input":{"subagents":{"other":{}}}},
   {"name":"unknown entry", "valid":false, "input":{"subagents":{"codex":{"instances":[]}}}},
   {"name":"empty runtime", "valid":false, "input":{"subagents":{"codex":{"runtime_path":""}}}},
-  {"name":"disabled default", "valid":false, "input":{"default_subagent":"codex"}}
+  {"name":"disabled default", "valid":false, "input":{"default_subagent":"codex"}},
+  {"name":"zcode entry without runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"zcode","subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}},
+  {"name":"zcode runtime_path null schema 2", "valid":true, "input":{"schema_version":2,"subagents":{"zcode":{"runtime_path":null}}}},
+  {"name":"zcode runtime_path null schema 1", "valid":true, "input":{"schema_version":1,"agents":{"zcode":{"runtime_path":null}}}},
+  {"name":"zcode runtime_path rejected schema 2 (audit counterexample)", "valid":false, "error_code":"runtime_path_unsupported", "input":{"schema_version":2,"revision":0,"default_subagent":"zcode","subagents":{"zcode":{"enabled":true,"spawn_supported":true,"runtime_path":"/tmp/ignored-runtime"}}}},
+  {"name":"zcode runtime_path rejected while disabled schema 2", "valid":false, "error_code":"runtime_path_unsupported", "input":{"schema_version":2,"subagents":{"zcode":{"enabled":false,"spawn_supported":false,"runtime_path":"/opt/legacy-zcode.cjs"}}}},
+  {"name":"zcode runtime_path rejected schema 1", "valid":false, "error_code":"runtime_path_unsupported", "input":{"schema_version":1,"revision":3,"default_agent":"zcode","agents":{"zcode":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/legacy-zcode.cjs"}}}},
+  {"name":"zcode runtime_path empty string", "valid":false, "input":{"schema_version":2,"subagents":{"zcode":{"runtime_path":""}}}},
+  {"name":"zcode runtime_path number", "valid":false, "input":{"schema_version":2,"subagents":{"zcode":{"runtime_path":42}}}},
+  {"name":"codex runtime_path object", "valid":false, "input":{"schema_version":2,"subagents":{"codex":{"runtime_path":{"bin":"/opt/codex"}}}}},
+  {"name":"dsh runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"dsh","subagents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"}}}},
+  {"name":"codex runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"codex","subagents":{"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}},
+  {"name":"dsh codex runtime_path schema 1", "valid":true, "input":{"schema_version":1,"revision":2,"default_agent":"dsh","agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"},"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}}
 ]

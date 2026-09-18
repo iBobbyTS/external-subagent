@@ -21,8 +21,12 @@ test('persisted config version matrix is shared with Rust startup and RPC', () =
   for (const entry of cases) {
     fs.writeFileSync(paths.config, JSON.stringify(entry.input));
     if (!entry.valid) {
-      assert.throws(() => readConfig(paths.config), { code: 'CONFIG_INVALID' }, entry.name);
-      assert.throws(() => launchAgentPlist(paths), { code: 'CONFIG_INVALID' }, entry.name);
+      // Per-case error contract (S02/AUD-005): a zcode runtime_path keeps its
+      // dedicated `runtime_path_unsupported` code; every other rejection keeps
+      // its existing CONFIG_INVALID family code.  schema.mjs codes are frozen.
+      const code = entry.error_code ?? 'CONFIG_INVALID';
+      assert.throws(() => readConfig(paths.config), { code }, entry.name);
+      assert.throws(() => launchAgentPlist(paths), { code }, entry.name);
       continue;
     }
     const result = readConfig(paths.config);
