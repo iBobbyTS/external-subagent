@@ -388,6 +388,19 @@ fn project_arguments(input: Option<&Value>) -> (Map<String, Value>, bool, u64) {
     (projected, true, excluded_fields)
 }
 
+/// The pinned runtime file above is a proof about the ZCode adapter only.
+/// Bind observation evidence to the adapter that actually launches the task
+/// (the same `task_agent` identity the routing factory dispatches on): every
+/// adapter without a verified public-source contract is explicitly
+/// unverified, so a non-ZCode subagent can never borrow the scheduler-global
+/// ZCode proof, no matter which runtime file is configured or installed.
+pub fn adapter_runtime_source_verified(adapter: &str, runtime_source: Option<&Path>) -> bool {
+    match adapter {
+        "zcode" => runtime_source_verified(runtime_source),
+        _ => false,
+    }
+}
+
 pub fn runtime_source_verified(path: Option<&Path>) -> bool {
     let Some(path) = path else { return false };
     let Ok(canonical) = path.canonicalize() else {
@@ -798,6 +811,39 @@ mod tests {
         assert!(snapshot.reasoning.text.is_empty());
         assert!(snapshot.coverage.reasoning_complete);
         assert_eq!(snapshot.snapshot_seq, 3);
+    }
+
+    #[test]
+    fn observation_evidence_binds_to_the_launched_adapter_not_the_global_source() {
+        // Pointing the scheduler's runtime_source at the literal pinned ZCode
+        // path must not confer observation trust on any other adapter: the
+        // pin is a proof about the ZCode runtime only. These verdicts hold
+        // whether or not that file actually exists on the machine.
+        let pinned = Path::new(VERIFIED_RUNTIME_PATH);
+        for adapter in ["dsh", "codex", "dsh-preview", "codex-cli", ""] {
+            assert!(
+                !adapter_runtime_source_verified(adapter, Some(pinned)),
+                "adapter {adapter:?} must not borrow the ZCode pin"
+            );
+            assert!(!adapter_runtime_source_verified(adapter, None));
+        }
+        // The ZCode adapter keeps the pinned-file contract: an absent or
+        // arbitrary runtime source stays unverified.
+        assert!(!adapter_runtime_source_verified("zcode", None));
+        assert!(!runtime_source_verified(None));
+    }
+
+    #[test]
+    fn changed_runtime_version_or_hash_degrades_the_proof_truthfully() {
+        // A ZCode runtime whose bytes differ from the pinned digest (an
+        // updated version) is explicitly unverified until its public-source
+        // contract is re-proven; the gate is never widened to let it pass.
+        let changed = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(changed.path(), b"changed runtime bytes").unwrap();
+        assert!(!runtime_source_verified(Some(changed.path())));
+        assert!(!adapter_runtime_source_verified("zcode", Some(changed.path())));
+        assert!(!adapter_runtime_source_verified("dsh", Some(changed.path())));
+        assert!(!adapter_runtime_source_verified("codex", Some(changed.path())));
     }
 
     #[test]

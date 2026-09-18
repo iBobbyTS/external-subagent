@@ -23,6 +23,10 @@ struct PassiveActivityState {
 pub(crate) struct PassiveActivityTracker {
     state: Mutex<PassiveActivityState>,
     changed: Condvar,
+    /// Launch-scoped public-source evidence: true only when the adapter that
+    /// actually launched this task has a verified public observation source.
+    /// Constructed from the claimed task's route identity, never from a
+    /// scheduler-global proof about a different runtime.
     runtime_source_verified: AtomicBool,
 }
 
@@ -265,6 +269,9 @@ impl PassiveActivityTracker {
         self.state.lock().unwrap().observation.snapshot()
     }
 
+    /// Post-spawn re-verification of the launched adapter's public source.
+    /// Degrade-only: a changed or vanished runtime file clears trust for the
+    /// rest of the run; a later passing re-check can never resurrect it.
     pub(crate) fn confirm_runtime_source(&self, still_verified: bool) {
         if !still_verified {
             self.runtime_source_verified.store(false, Ordering::Release);
@@ -331,4 +338,27 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
         state.latest_text_truncated = true;
     }
     state.latest_text_updated_at = Some(wall_now_ms);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_scoped_evidence_only_degrades_across_reverification() {
+        let tracker = PassiveActivityTracker::new(true);
+        assert!(tracker.runtime_source_verified());
+        // A post-spawn re-verification that fails (the launched adapter's
+        // runtime file changed or vanished) clears trust for the run...
+        tracker.confirm_runtime_source(false);
+        assert!(!tracker.runtime_source_verified());
+        // ...and a later passing re-check can never resurrect it mid-run.
+        tracker.confirm_runtime_source(true);
+        assert!(!tracker.runtime_source_verified());
+        // An unverified launch (non-ZCode adapter, or absent proof) stays
+        // unverified no matter what a later re-check observes.
+        let unverified = PassiveActivityTracker::new(false);
+        unverified.confirm_runtime_source(true);
+        assert!(!unverified.runtime_source_verified());
+    }
 }

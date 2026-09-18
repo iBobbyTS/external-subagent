@@ -544,8 +544,17 @@ impl Scheduler {
         };
         let runtime_agent_id = format!("{}:{}", claim.task.agent_id, claim.owner_epoch);
         let runtime_lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
+        // Observation trust is launch-scoped: the pinned ZCode runtime proof
+        // only ever applies to the adapter the routing factory will actually
+        // launch (the same `task_agent` identity it dispatches on). DSH,
+        // Codex and unknown adapters start explicitly unverified instead of
+        // borrowing the scheduler-global ZCode proof.
+        let adapter = task_agent(&claim.task);
         let activity = Arc::new(PassiveActivityTracker::new(
-            observation::runtime_source_verified(self.inner.config.runtime_source.as_deref()),
+            observation::adapter_runtime_source_verified(
+                &adapter,
+                self.inner.config.runtime_source.as_deref(),
+            ),
         ));
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
@@ -588,7 +597,8 @@ impl Scheduler {
                 });
             }
         };
-        activity.confirm_runtime_source(observation::runtime_source_verified(
+        activity.confirm_runtime_source(observation::adapter_runtime_source_verified(
+            &adapter,
             self.inner.config.runtime_source.as_deref(),
         ));
         let mcp_servers = Vec::new();
@@ -2224,7 +2234,11 @@ impl Scheduler {
             ),
             None => (
                 observation::ObservationSnapshot::unavailable(),
-                observation::runtime_source_verified(self.inner.config.runtime_source.as_deref()),
+                // A task without a launch-scoped activity (never started, or
+                // claimed before this daemon's ownership) has no adapter
+                // evidence of its own; the scheduler-global ZCode proof must
+                // not stand in for a missing or retired activity.
+                false,
             ),
         }
     }
@@ -2595,5 +2609,226 @@ mod queued_recovery_tests {
                 .unwrap()
                 .is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_evidence_tests {
+    use super::*;
+
+    /// The literal pinned ZCode runtime path. Using it as the scheduler's
+    /// global `runtime_source` is the strongest "pinned ZCode installation
+    /// present" fixture a deterministic test can build: every assertion below
+    /// is invariant to whether that file exists or matches the pinned digest,
+    /// because the verdicts are bound to the launched adapter, not the file.
+    const PINNED_ZCODE_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    /// Mirrors observation.rs's public-argument bound (4 KiB).
+    const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
+
+    fn admission(agent: &str) -> external_core::AdmissionIdentity {
+        external_core::AdmissionIdentity {
+            agent: agent.into(),
+            config_revision: 1,
+            adapter_version: env!("CARGO_PKG_VERSION").into(),
+            model: None,
+            model_source: "catalog".into(),
+        }
+    }
+
+    fn manifest_for(directory: &std::path::Path, agent: &str) -> GeneralTaskManifest {
+        GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: format!("{agent}-observe"),
+            repository: directory.canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Build,
+            prompt: "observation evidence binding".into(),
+            write_manifest: Vec::new(),
+        }
+    }
+
+    fn workspace(prefix: &str) -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn observation_scheduler(
+        directory: &std::path::Path,
+        script: &str,
+        runtime_source: Option<PathBuf>,
+    ) -> Scheduler {
+        let directory = directory.to_owned();
+        let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
+        let script = script.to_owned();
+        // The scripted child runs for every adapter identity: this suite
+        // isolates the scheduler's launch-scoped evidence binding, while the
+        // dsh/codex suites own real adapter routing and spawn behavior.
+        let factory = Arc::new(CommandRuntimeFactory::new_prepared(
+            move |_: &TaskRecord| {
+                let mut command = Command::new("sh");
+                command.args(["-c", &script]).current_dir(&directory);
+                Ok(command)
+            },
+        ));
+        Scheduler::new(
+            "observation-evidence",
+            store,
+            factory,
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(10),
+                runtime_source,
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no terminal result");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A bootstrap plus one streaming turn whose public observation events
+    /// carry reasoning, an encrypted-content tool argument and an oversized
+    /// tool argument; the turn completes only after `release-observe` exists.
+    const OBSERVATION_PROTOCOL: &str = r#"
+read request
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"obs-session"}}}'
+read request
+printf '%s\n' '{"id":2,"result":{}}'
+read request
+printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","eventId":"e-reason","turnId":"t1","payload":{"kind":"reasoning_delta","delta":"ADAPTER-SCOPED reasoning tail"}}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","eventId":"e-tool","turnId":"t1","payload":{"kind":"tool_call","toolCallId":"c-enc","toolName":"Bash","input":{"command":"echo ok","nested":{"encrypted_content":"NEVER-SECRET"}}}}}'
+pad=$(awk 'BEGIN{for(i=0;i<12000;i++)printf "x"}')
+printf '%s\n' "{\"method\":\"session/event\",\"params\":{\"type\":\"model.streaming\",\"eventId\":\"e-big\",\"turnId\":\"t1\",\"payload\":{\"kind\":\"tool_call\",\"toolCallId\":\"c-big\",\"toolName\":\"Read\",\"input\":{\"path\":\"$pad\"}}}}"
+while [ ! -f release-observe ]; do sleep 0.01; done
+printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","payload":{"kind":"text_delta","delta":"final answer","assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"message.finished","payload":{"assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"turn.completed"}}'
+while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
+"#;
+
+    fn await_observed_content(
+        scheduler: &Scheduler,
+        agent_id: &str,
+    ) -> observation::ObservationSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (snapshot, verified) = scheduler.observation_snapshot(agent_id);
+            assert!(
+                !verified,
+                "launch-scoped evidence must stay unverified for this adapter"
+            );
+            if snapshot.tools.len() == 2 && !snapshot.reasoning.text.is_empty() {
+                return snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "observation content never arrived: {snapshot:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn non_zcode_adapters_never_inherit_the_zcode_runtime_proof() {
+        for (agent, runtime_source) in [
+            ("dsh", None),
+            ("dsh", Some(PINNED_ZCODE_SOURCE)),
+            ("codex", Some(PINNED_ZCODE_SOURCE)),
+            ("unsupported-adapter-fixture", Some(PINNED_ZCODE_SOURCE)),
+        ] {
+            let directory = workspace("s04-observation-");
+            let scheduler = observation_scheduler(
+                directory.path(),
+                OBSERVATION_PROTOCOL,
+                runtime_source.map(PathBuf::from),
+            );
+            let submitted = scheduler
+                .enqueue_general_with_admission(
+                    &manifest_for(directory.path(), agent),
+                    Some(admission(agent)),
+                )
+                .unwrap();
+            let agent_id = submitted.task.agent_id;
+            scheduler.start_ready().unwrap();
+            let snapshot = await_observed_content(&scheduler, &agent_id);
+
+            // Evidence collection itself works; the trust verdict stays
+            // bound to the launched adapter.
+            assert!(snapshot
+                .reasoning
+                .text
+                .contains("ADAPTER-SCOPED reasoning tail"));
+            let encoded = serde_json::to_string(&snapshot.tools).unwrap();
+            assert!(!encoded.contains("encrypted_content"));
+            assert!(!encoded.contains("NEVER-SECRET"));
+            let bash = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.tool_name == "Bash")
+                .expect("Bash tool observed");
+            assert_eq!(bash.recent_calls[0].redacted_fields, 1);
+            let read = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.tool_name == "Read")
+                .expect("Read tool observed");
+            assert!(read.recent_calls[0].arguments_truncated);
+            for tool in &snapshot.tools {
+                for call in &tool.recent_calls {
+                    assert!(
+                        serde_json::to_vec(&call.arguments)
+                            .unwrap()
+                            .len()
+                            <= MAX_ARGUMENT_BYTES
+                    );
+                }
+            }
+
+            std::fs::write(directory.path().join("release-observe"), "").unwrap();
+            let result = await_result(&scheduler, &agent_id);
+            assert_eq!(result.result.outcome, TaskOutcome::Completed);
+            // Trust does not appear after the run terminalizes either.
+            let (terminal_snapshot, verified) = scheduler.observation_snapshot(&agent_id);
+            assert!(!verified);
+            assert!(!terminal_snapshot.tools.is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_activity_never_borrows_the_global_runtime_proof() {
+        let directory = workspace("s04-observation-missing-");
+        // A task that was never launched has no launch-scoped activity; the
+        // scheduler-global pinned ZCode path must not stand in for it.
+        let scheduler = observation_scheduler(
+            directory.path(),
+            "exit 0",
+            Some(PathBuf::from(PINNED_ZCODE_SOURCE)),
+        );
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(directory.path(), "dsh"),
+                Some(admission("dsh")),
+            )
+            .unwrap();
+        let (queued, verified) = scheduler.observation_snapshot(&submitted.task.agent_id);
+        assert!(!verified);
+        assert_eq!(queued.snapshot_seq, 0);
+        assert!(queued.tools.is_empty());
+        // An unknown task id reports the same unavailable, untrusted verdict.
+        let (unknown, unknown_verified) = scheduler.observation_snapshot("99999999");
+        assert!(!unknown_verified);
+        assert_eq!(unknown, queued);
     }
 }

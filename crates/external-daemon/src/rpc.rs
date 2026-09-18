@@ -5149,3 +5149,80 @@ mod agent_probe_tests {
         assert!(updater_fired);
     }
 }
+
+#[cfg(test)]
+mod observe_gate_tests {
+    use super::*;
+    use crate::{CommandRuntimeFactory, Scheduler, SchedulerConfig};
+
+    /// The literal pinned ZCode runtime path: the strongest deterministic
+    /// "pinned ZCode installation present" fixture. The assertions hold
+    /// whether or not the file exists or matches the pinned digest, because
+    /// observe trust is bound to the launched adapter, never the global file.
+    const PINNED_ZCODE_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+
+    fn admission(agent: &str) -> external_core::AdmissionIdentity {
+        external_core::AdmissionIdentity {
+            agent: agent.into(),
+            config_revision: 1,
+            adapter_version: env!("CARGO_PKG_VERSION").into(),
+            model: None,
+            model_source: "catalog".into(),
+        }
+    }
+
+    fn service_with_pinned_source(
+        directory: &std::path::Path,
+    ) -> (Arc<RpcService>, external_store::TaskRecord) {
+        let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> std::io::Result<std::process::Command> {
+                panic!("observe gate test must never start a runtime");
+            },
+        ));
+        let scheduler = Scheduler::new(
+            "observe-gate",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig {
+                runtime_source: Some(PathBuf::from(PINNED_ZCODE_SOURCE)),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: directory.canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "observe gate fixture".into(),
+            write_manifest: Vec::new(),
+        };
+        // A queued DSH task was accepted for admission but never launched.
+        let submitted = scheduler
+            .enqueue_general_with_admission(&manifest, Some(admission("dsh")))
+            .unwrap();
+        let task = submitted.task;
+        let service = Arc::new(RpcService::new(scheduler, store).unwrap());
+        (service, task)
+    }
+
+    #[test]
+    fn task_observe_reports_unavailable_without_launch_scoped_evidence() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("s04-observe-gate-")
+            .tempdir_in(root)
+            .unwrap();
+        let (service, task) = service_with_pinned_source(directory.path());
+        // The never-launched DSH task has no activity; even the pinned ZCode
+        // runtime configured globally must not satisfy the observe gate.
+        let error = service
+            .dispatch(RpcMethod::TaskObserve {
+                agent_id: task.agent_id.clone(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Unavailable);
+    }
+}
