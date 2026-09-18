@@ -1023,7 +1023,7 @@ mod tests {
                 Some(dsh_admission(model)),
             )
             .unwrap();
-        submitted.task.agent_id
+        submitted.agent_id
     }
 
     fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store::TaskRecord {
@@ -1122,7 +1122,7 @@ mod tests {
             .unwrap();
         // Enqueue with plan mode stores a prepared task whose route lacks an
         // admission identity; such tasks keep the zcode route.
-        let task = store.get_task(&submitted.task.agent_id).unwrap().unwrap();
+        let task = store.get_task(&submitted.agent_id).unwrap().unwrap();
         assert_eq!(task_agent(&task), "zcode");
         let runtime = RuntimeFactory::spawn(&factory, &task, Arc::new(NoopSink))
             .expect("zcode tasks keep the zcode factory");
@@ -1878,7 +1878,6 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 "occupy the shared workspace",
             ))
             .unwrap()
-            .task
             .agent_id;
         assert_eq!(scheduler.start_ready().unwrap(), vec![first.clone()]);
         let running = scheduler.store().get_task(&first).unwrap().unwrap();
@@ -2332,7 +2331,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 Some(dsh_admission(Some("fixture-model"))),
             )
             .unwrap();
-        assert_eq!(readmitted.task.phase, TaskPhase::Queued);
+        assert_eq!(readmitted.phase, TaskPhase::Queued);
 
         // The drained task keeps its evidence: still answerable over RPC,
         // with its pending permission intact and nothing reaped underneath

@@ -18,14 +18,15 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   }
   assert.deepEqual(schema.properties.spawn.additionalProperties, false);
   assert.deepEqual(schema.properties.subagent_status.required, [
-    'subagent', 'config_revision', 'configured', 'enabled', 'spawn_supported',
-    'transport_support', 'permission_modes', 'model_selection', 'local', 'auth', 'hi',
+    'subagent', 'configured', 'enabled', 'spawn_supported',
+    'permission_modes', 'model_selection', 'local', 'auth', 'hi',
   ]);
-  assert.deepEqual(schema.properties.subagent_status.properties.transport_support.properties.transport.enum, [
-    'zcode_app_server', 'dsh_acp', 'codex_app_server',
+  assert.equal(schema.properties.subagent_status.properties.config_revision, undefined);
+  assert.equal(schema.properties.subagent_status.properties.transport_support, undefined);
+  assert.deepEqual(schema.properties.subagent_scope_status.required, ['state']);
+  assert.deepEqual(schema.properties.subagent_scope_status.properties.state.enum, [
+    'READY', 'DEGRADED', 'UNAVAILABLE', 'UNKNOWN',
   ]);
-  assert.deepEqual(schema.properties.subagent_scope_status.required, ['state', 'scope', 'checked_at_ms']);
-  assert.deepEqual(schema.properties.subagent_scope_status.properties.checked_at_ms.type, ['integer', 'null']);
   assert.deepEqual(schema.properties.subagent_status.properties.model_selection.properties.mode.enum, [
     'native_only', 'catalog_token',
   ]);
@@ -48,7 +49,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'tools', 'reasoning', 'coverage',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_status.output, [
-    'mcp_version', 'components', 'capabilities', 'subagents', 'identity',
+    'mcp_version', 'components', 'capabilities', 'subagents',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.input, [
     'agent_id', 'wait_time', 'message_id',
@@ -72,6 +73,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_respond.input, [
     'agent_id', 'request_id', 'decision', 'content',
   ]);
+  assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.output, ['agent_id', 'status']);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [
     'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'complete',

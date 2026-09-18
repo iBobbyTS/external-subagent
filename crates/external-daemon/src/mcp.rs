@@ -438,10 +438,10 @@ mod server {
     use super::internal_task_id;
     use crate::rpc::{
         AgentCapabilitiesView, AgentModelSelectionModeView, AgentPermissionModeView,
-        AgentScopeStatusView, AgentStatusView, AgentTransportView, CapabilityMaturityView,
+        AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
         ComponentStateView, GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision,
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess,
-        SubmissionDispositionView, SystemStatusView, TaskActivityView, TaskListQuery,
+        SystemStatusView, TaskActivityView, TaskListQuery,
         TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery,
         TelemetryStatusView,
     };
@@ -746,6 +746,10 @@ mod server {
         }
     }
 
+    /// Model-facing status keeps route/capability/readiness only. Deployment
+    /// identity, config revisions, adapter transport detail and per-scope
+    /// probe evidence stay on the daemon RPC view, where the CLI diagnose
+    /// owner reads them.
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct SystemStatusOutput {
@@ -754,7 +758,6 @@ mod server {
         pub capabilities: PublicAgentCapabilities,
         #[serde(rename = "subagents")]
         pub agents: Vec<PublicAgentStatus>,
-        pub identity: PublicDeploymentIdentity,
     }
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -762,32 +765,14 @@ mod server {
     pub struct PublicAgentStatus {
         #[serde(rename = "subagent")]
         pub agent: String,
-        pub config_revision: u64,
         pub configured: bool,
         pub enabled: bool,
         pub spawn_supported: bool,
-        pub transport_support: PublicAgentTransportSupport,
         pub permission_modes: Vec<PublicAgentPermissionMode>,
         pub model_selection: PublicAgentModelSelectionCapability,
         pub local: PublicAgentScopeStatus,
         pub auth: PublicAgentScopeStatus,
         pub hi: PublicAgentScopeStatus,
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    pub enum PublicAgentTransport {
-        ZcodeAppServer,
-        DshAcp,
-        CodexAppServer,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicAgentTransportSupport {
-        pub transport: PublicAgentTransport,
-        pub probe: bool,
-        pub spawn: bool,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -813,16 +798,6 @@ mod server {
         pub mode: PublicAgentModelSelectionMode,
     }
 
-    impl From<AgentTransportView> for PublicAgentTransport {
-        fn from(value: AgentTransportView) -> Self {
-            match value {
-                AgentTransportView::ZcodeAppServer => Self::ZcodeAppServer,
-                AgentTransportView::DshAcp => Self::DshAcp,
-                AgentTransportView::CodexAppServer => Self::CodexAppServer,
-            }
-        }
-    }
-
     impl From<AgentPermissionModeView> for PublicAgentPermissionMode {
         fn from(value: AgentPermissionModeView) -> Self {
             match value {
@@ -843,38 +818,18 @@ mod server {
         }
     }
 
+    /// Readiness conclusion only. The probe evidence behind it (scope paths,
+    /// version, checked_at_ms, reason) stays on the RPC view for CLI diagnose.
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct PublicAgentScopeStatus {
         pub state: PublicComponentState,
-        pub scope: PublicProbeScope,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub version: Option<String>,
-        pub checked_at_ms: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub reason: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicProbeScope {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub workspace: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub home: Option<String>,
     }
 
     impl From<AgentScopeStatusView> for PublicAgentScopeStatus {
         fn from(value: AgentScopeStatusView) -> Self {
             Self {
                 state: value.state.into(),
-                scope: PublicProbeScope {
-                    workspace: value.scope.workspace,
-                    home: value.scope.home,
-                },
-                version: value.version,
-                checked_at_ms: value.checked_at_ms,
-                reason: value.reason,
             }
         }
     }
@@ -883,15 +838,9 @@ mod server {
         fn from(value: AgentStatusView) -> Self {
             Self {
                 agent: value.agent,
-                config_revision: value.config_revision,
                 configured: value.configured,
                 enabled: value.enabled,
                 spawn_supported: value.spawn_supported,
-                transport_support: PublicAgentTransportSupport {
-                    transport: value.transport_support.transport.into(),
-                    probe: value.transport_support.probe,
-                    spawn: value.transport_support.spawn,
-                },
                 permission_modes: value.permission_modes.into_iter().map(Into::into).collect(),
                 model_selection: PublicAgentModelSelectionCapability {
                     supported: value.model_selection.supported,
@@ -905,16 +854,7 @@ mod server {
     }
 
     impl SystemStatusOutput {
-        fn from_view(value: SystemStatusView, facade: PublicComponentIdentity) -> Self {
-            let (daemon, models) = match value.identity {
-                Some(identity) => (
-                    Some(identity.daemon.into()),
-                    PublicModelIdentity {
-                        configured: identity.models.configured.map(Into::into),
-                    },
-                ),
-                None => (None, PublicModelIdentity { configured: None }),
-            };
+        fn from_view(value: SystemStatusView) -> Self {
             Self {
                 mcp_version: value.mcp_version,
                 components: value
@@ -924,66 +864,6 @@ mod server {
                     .collect(),
                 capabilities: value.capabilities.into(),
                 agents: value.agents.into_iter().map(Into::into).collect(),
-                identity: PublicDeploymentIdentity {
-                    daemon,
-                    facade,
-                    models,
-                },
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicDeploymentIdentity {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub daemon: Option<PublicComponentIdentity>,
-        pub facade: PublicComponentIdentity,
-        pub models: PublicModelIdentity,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicComponentIdentity {
-        pub artifact: PublicArtifactIdentity,
-    }
-
-    impl From<crate::rpc::ComponentIdentityView> for PublicComponentIdentity {
-        fn from(value: crate::rpc::ComponentIdentityView) -> Self {
-            Self {
-                artifact: PublicArtifactIdentity {
-                    path: value.artifact.path,
-                },
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicArtifactIdentity {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub path: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicModelIdentity {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub configured: Option<PublicModelIdentityFact>,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicModelIdentityFact {
-        pub value: String,
-        pub source: String,
-    }
-
-    impl From<crate::rpc::ModelIdentityFactView> for PublicModelIdentityFact {
-        fn from(value: crate::rpc::ModelIdentityFactView) -> Self {
-            Self {
-                value: value.value,
-                source: value.source,
             }
         }
     }
@@ -1007,19 +887,11 @@ mod server {
         pub model: Option<String>,
     }
 
-    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    pub enum SubmissionDisposition {
-        Created,
-        Existing,
-    }
-
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct AgentSpawnOutput {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
-        pub submission_disposition: SubmissionDisposition,
         pub status: String,
     }
 
@@ -1356,7 +1228,6 @@ mod server {
         timeout: Duration,
         service: Option<Arc<RpcService>>,
         next_request: Arc<AtomicU64>,
-        facade_identity: PublicComponentIdentity,
         tool_router: ToolRouter<Self>,
         #[cfg(test)]
         wait_handler_interrupted: Option<Arc<AtomicBool>>,
@@ -1369,11 +1240,6 @@ mod server {
                 timeout,
                 service: None,
                 next_request: Arc::new(AtomicU64::new(1)),
-                facade_identity: crate::rpc::running_component_identity(
-                    "facade",
-                    env!("CARGO_PKG_VERSION"),
-                )
-                .into(),
                 tool_router: Self::tool_router(),
                 #[cfg(test)]
                 wait_handler_interrupted: None,
@@ -1386,11 +1252,6 @@ mod server {
                 timeout: Duration::from_secs(5),
                 service: Some(service),
                 next_request: Arc::new(AtomicU64::new(1)),
-                facade_identity: crate::rpc::running_component_identity(
-                    "daemon",
-                    env!("CARGO_PKG_VERSION"),
-                )
-                .into(),
                 tool_router: Self::tool_router(),
                 #[cfg(test)]
                 wait_handler_interrupted: None,
@@ -1610,10 +1471,9 @@ mod server {
             Parameters(_): Parameters<EmptyInput>,
         ) -> Result<Json<SystemStatusOutput>, ToolError> {
             match self.rpc(RpcMethod::SystemStatus)? {
-                RpcSuccess::SystemStatus { status } => Ok(Json(SystemStatusOutput::from_view(
-                    status,
-                    self.facade_identity.clone(),
-                ))),
+                RpcSuccess::SystemStatus { status } => {
+                    Ok(Json(SystemStatusOutput::from_view(status)))
+                }
                 _ => Err(protocol_error().with_operation("status")),
             }
         }
@@ -1635,21 +1495,17 @@ mod server {
         ) -> Result<Json<AgentSpawnOutput>, ToolError> {
             let manifest =
                 general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
-            let (task, disposition) = match self.rpc(RpcMethod::SubmitGeneral(GeneralSubmitInput {
+            let task = match self.rpc(RpcMethod::SubmitGeneral(GeneralSubmitInput {
                 agent: input.agent.clone(),
                 model: input.model.clone(),
                 manifest,
             }))? {
-                RpcSuccess::GeneralSubmitted { task, disposition } => (task, disposition),
+                RpcSuccess::GeneralSubmitted { task } => task,
                 _ => return Err(protocol_error().with_operation("spawn")),
             };
             Ok(Json(AgentSpawnOutput {
                 agent_id: super::public_task_id(&task.agent_id)
                     .map_err(|e| e.with_operation("spawn"))?,
-                submission_disposition: match disposition {
-                    SubmissionDispositionView::Created => SubmissionDisposition::Created,
-                    SubmissionDispositionView::Existing => SubmissionDisposition::Existing,
-                },
                 status: task.status,
             }))
         }
@@ -2001,9 +1857,8 @@ mod server {
         use super::general_manifest;
         use super::{
             default_result_limit, rpc_context, AgentListInput, AgentObserveOutput,
-            AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput,
-            PublicArtifactIdentity, PublicComponentIdentity, SubagentMcp, SystemStatusOutput,
-            PUBLIC_TOOLS,
+            AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, SubagentMcp,
+            SystemStatusOutput, PUBLIC_TOOLS,
         };
         use crate::{
             observation::ObservationSnapshot,
@@ -2422,7 +2277,7 @@ mod server {
         }
 
         #[test]
-        fn legacy_daemon_status_keeps_readiness_and_real_facade_identity() {
+        fn legacy_daemon_status_keeps_readiness_and_routes_identity_to_cli_diagnose() {
             let status = SystemStatusView {
                 mcp_version: "0.1.0".into(),
                 service_generation: "legacy-generation".into(),
@@ -2444,29 +2299,22 @@ mod server {
                 agents: Vec::new(),
                 identity: None,
             };
-            let facade = PublicComponentIdentity {
-                artifact: PublicArtifactIdentity {
-                    path: Some("/running/facade".into()),
-                },
-            };
-            let output = SystemStatusOutput::from_view(status, facade);
+            let output = SystemStatusOutput::from_view(status);
             assert_eq!(output.mcp_version, "0.1.0");
             assert!(matches!(
                 output.components.get("daemon"),
                 Some(super::PublicComponentState::Ready)
             ));
-            assert!(output.identity.daemon.is_none());
-            assert!(output.identity.models.configured.is_none());
             let serialized = serde_json::to_value(output).unwrap();
             assert_eq!(serialized["mcp_version"], "0.1.0");
-            for removed in ["protocol_version", "service_generation"] {
+            for removed in [
+                "protocol_version",
+                "service_generation",
+                // Deployment identity stays on the RPC view for CLI diagnose.
+                "identity",
+            ] {
                 assert!(serialized.get(removed).is_none());
             }
-            assert!(serialized["identity"].get("daemon").is_none());
-            assert_eq!(
-                serialized["identity"]["facade"]["artifact"]["path"],
-                "/running/facade"
-            );
         }
 
         #[test]
@@ -2560,18 +2408,12 @@ mod server {
                 "tools":[], "reasoning":{"text":"","truncated":false},
                 "coverage":{"tool_history_complete":false,"reasoning_complete":false,"dropped_events":0}
             });
-            let artifact = serde_json::json!({
-                "path":"/running/component"
-            });
             let status = serde_json::json!({
                 "mcp_version":"0.1.0",
                 "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
                     "maturity":{},"observation":{"public_reasoning_default":true,
                         "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
-                "subagents":[],
-                "identity":{"daemon":{"artifact":artifact.clone()},
-                    "facade":{"artifact":artifact},
-                    "models":{}}
+                "subagents":[]
             });
             let wait = serde_json::json!({
                 "task":task.clone(),"pending_requests":[],
@@ -2583,7 +2425,7 @@ mod server {
                 ("external_subagent_status", status),
                 (
                     "external_subagent_spawn",
-                    serde_json::json!({"agent_id":10000001,"submission_disposition":"created","status":"queued"}),
+                    serde_json::json!({"agent_id":10000001,"status":"queued"}),
                 ),
                 ("external_subagent_wait", wait),
                 ("external_subagent_observe", observation),
@@ -2624,18 +2466,6 @@ mod server {
                     tool.name,
                     validator.iter_errors(success).collect::<Vec<_>>()
                 );
-                if tool.name == "external_subagent_status" {
-                    let mut legacy_status = success.clone();
-                    legacy_status["identity"]
-                        .as_object_mut()
-                        .unwrap()
-                        .remove("daemon");
-                    assert!(
-                        validator.is_valid(&legacy_status),
-                        "status rejected unknown daemon identity: {:?}",
-                        validator.iter_errors(&legacy_status).collect::<Vec<_>>()
-                    );
-                }
                 assert!(
                     validator.is_valid(&error),
                     "{} rejected error: {:?}",

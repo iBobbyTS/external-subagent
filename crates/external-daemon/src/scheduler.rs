@@ -271,7 +271,7 @@ impl Scheduler {
     pub fn enqueue_general(
         &self,
         manifest: &GeneralTaskManifest,
-    ) -> Result<SubmittedTask, SchedulerError> {
+    ) -> Result<TaskRecord, SchedulerError> {
         self.enqueue_general_with_admission(manifest, None)
     }
 
@@ -279,7 +279,7 @@ impl Scheduler {
         &self,
         manifest: &GeneralTaskManifest,
         admission: Option<external_core::AdmissionIdentity>,
-    ) -> Result<SubmittedTask, SchedulerError> {
+    ) -> Result<TaskRecord, SchedulerError> {
         // Serialize admission with begin_drain so the draining check and the
         // authoritative enqueue form one linearizable operation.
         let _admission = self.inner.admission.lock().unwrap();
@@ -314,10 +314,7 @@ impl Scheduler {
             initial_prompt,
         };
         let enqueued = self.inner.store.enqueue_task_authoritative(&task)?;
-        Ok(SubmittedTask {
-            task: enqueued.task,
-            disposition: enqueued.disposition,
-        })
+        Ok(enqueued)
     }
 
     pub fn reconcile_startup(&self) -> Result<Vec<(String, TaskOutcome)>, SchedulerError> {
@@ -2459,8 +2456,7 @@ mod queued_recovery_tests {
                 prompt: "never execute this fenced queue".into(),
                 write_manifest: vec![],
             })
-            .unwrap()
-            .task;
+            .unwrap();
         scheduler.begin_drain();
         scheduler.store().fence_queued_cancellation().unwrap();
         assert_eq!(
@@ -2575,8 +2571,7 @@ mod queued_recovery_tests {
                     prompt: "invalid runtime identity".into(),
                     write_manifest: vec![],
                 })
-                .unwrap()
-                .task;
+                .unwrap();
             if claimed {
                 scheduler
                     .store()
@@ -2760,7 +2755,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                     Some(admission(agent)),
                 )
                 .unwrap();
-            let agent_id = submitted.task.agent_id;
+            let agent_id = submitted.agent_id;
             scheduler.start_ready().unwrap();
             let snapshot = await_observed_content(&scheduler, &agent_id);
 
@@ -2822,7 +2817,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                 Some(admission("dsh")),
             )
             .unwrap();
-        let (queued, verified) = scheduler.observation_snapshot(&submitted.task.agent_id);
+        let (queued, verified) = scheduler.observation_snapshot(&submitted.agent_id);
         assert!(!verified);
         assert_eq!(queued.snapshot_seq, 0);
         assert!(queued.tools.is_empty());

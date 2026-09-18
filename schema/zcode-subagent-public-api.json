@@ -13,23 +13,12 @@
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
     "subagent_status": {
       "type": "object",
-      "required": ["subagent", "config_revision", "configured", "enabled", "spawn_supported", "transport_support", "permission_modes", "model_selection", "local", "auth", "hi"],
+      "required": ["subagent", "configured", "enabled", "spawn_supported", "permission_modes", "model_selection", "local", "auth", "hi"],
       "properties": {
         "subagent": { "enum": ["zcode", "dsh", "codex"] },
-        "config_revision": { "type": "integer", "minimum": 0 },
         "configured": { "type": "boolean" },
         "enabled": { "type": "boolean" },
         "spawn_supported": { "type": "boolean" },
-        "transport_support": {
-          "type": "object",
-          "required": ["transport", "probe", "spawn"],
-          "properties": {
-            "transport": { "enum": ["zcode_app_server", "dsh_acp", "codex_app_server"] },
-            "probe": { "type": "boolean" },
-            "spawn": { "type": "boolean" }
-          },
-          "additionalProperties": false
-        },
         "permission_modes": {
           "type": "array",
           "items": { "enum": ["build", "edit", "plan", "yolo"] },
@@ -52,20 +41,10 @@
     },
     "subagent_scope_status": {
       "type": "object",
-      "required": ["state", "scope", "checked_at_ms"],
+      "description": "Readiness conclusion only. Probe evidence (scope paths, version, checked_at_ms, reason) stays on the daemon RPC view for the CLI diagnose owner.",
+      "required": ["state"],
       "properties": {
-        "state": { "enum": ["READY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"] },
-        "scope": {
-          "type": "object",
-          "properties": {
-            "workspace": { "type": "string", "minLength": 1 },
-            "home": { "type": "string", "minLength": 1 }
-          },
-          "additionalProperties": false
-        },
-        "version": { "type": "string", "minLength": 1 },
-        "checked_at_ms": { "type": ["integer", "null"], "minimum": 0 },
-        "reason": { "type": "string", "minLength": 1 }
+        "state": { "enum": ["READY", "DEGRADED", "UNAVAILABLE", "UNKNOWN"] }
       },
       "additionalProperties": false
     },
@@ -178,8 +157,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents", "identity"] },
-        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "status"], "idempotent": false },
+        "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents"] },
+        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "status"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },

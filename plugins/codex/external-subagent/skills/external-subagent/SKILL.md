@@ -12,6 +12,15 @@ runtime instance and no instance selector is supported. Omitting `subagent` uses
 `default_subagent` or returns `subagent_required`; unknown targets return
 `subagent_unknown`, and unknown spawn fields are rejected before dispatch.
 
+Spawn is intentionally non-idempotent: every successful call creates a fresh task
+and returns `{agent_id, status}` (a duplicate workspace or id is a `conflict`
+error, never reuse of an existing task). `status` carries only routing,
+capability, and readiness facts (`subagents[]` with `configured`, `enabled`,
+`spawn_supported`, permission modes, model selection, and per-scope states);
+deployment identity, config revisions, adapter transport detail, and probe
+evidence are operator diagnostics — read them with the CLI `diagnose` command
+instead of the MCP status tool.
+
 The caller is a `host`. Any unregistered local MCP client can act as `custom` and
 call status or spawn without a host record or Codex home. Built-in `host.codex`
 exists for installation and automatic-upgrade coordination, supports multiple

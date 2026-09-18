@@ -274,18 +274,6 @@ pub struct TaskRecord {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskSubmissionDisposition {
-    Created,
-    Existing,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmittedTask {
-    pub task: TaskRecord,
-    pub disposition: TaskSubmissionDisposition,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskResult {
     pub outcome: TaskOutcome,
@@ -500,7 +488,10 @@ impl Store {
         Ok(connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?)
     }
 
-    pub fn enqueue_task_authoritative(&self, task: &NewTask) -> StoreResult<SubmittedTask> {
+    /// Enqueue a fresh task. Submission is intentionally non-idempotent:
+    /// agent-id and active-workspace collisions are conflicts, never reuse,
+    /// so the only possible outcome is the newly created record.
+    pub fn enqueue_task_authoritative(&self, task: &NewTask) -> StoreResult<TaskRecord> {
         validate_task(task)?;
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -556,10 +547,7 @@ impl Store {
         let stored = query_task(&transaction, &task.agent_id)?
             .ok_or_else(|| StoreError::InvalidState("inserted task disappeared".into()))?;
         transaction.commit()?;
-        Ok(SubmittedTask {
-            task: stored,
-            disposition: TaskSubmissionDisposition::Created,
-        })
+        Ok(stored)
     }
 
     pub fn get_task(&self, agent_id: &str) -> StoreResult<Option<TaskRecord>> {

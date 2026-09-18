@@ -108,7 +108,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 ## 4. external_subagent_status
 
-输入为 `{}`。读取状态不会代替显式 subagent probe 或真实执行验收；`hi` 等信息须结合检查时间和 scope 判断。
+输入为 `{}`。MCP 状态只保留路由／能力／就绪信息；部署身份（artifact 路径、配置模型来源）、配置版本、适配器传输细节和逐 scope 探测证据（scope 路径、版本、检查时间、原因）属于操作员诊断，保留在 daemon RPC 视图中，由既有 CLI `diagnose`（以及 `status --verbose`、`subagents status`）读取。读取状态不会代替显式 subagent probe 或真实执行验收。
 
 ### 4.1 顶层输出
 
@@ -118,7 +118,6 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `components` | map<string, ComponentState> | 判断各组件就绪情况 | 无法定位哪层不可用 |
 | `capabilities` | Capabilities | 构造有界调用和了解观测能力 | 客户端只能硬编码限制 |
 | `subagents` | SubagentStatus[] | 选择 subagent 前查看启用、启动、权限和模型能力 | 容易提交不受支持的组合 |
-| `identity` | DeploymentIdentity | 诊断：核对组件路径及配置模型来源 | 难以解释安装／运行对象不一致 |
 
 `ComponentState = READY | DEGRADED | UNAVAILABLE | UNKNOWN`。
 
@@ -144,46 +143,24 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | 字段 | 类型 | 何时使用／存在理由 | 移除影响 |
 |---|---|---|---|
 | `subagent` | string | 把状态关联到 subagent 路由，如 zcode、dsh、codex | 无法知道能力属于谁 |
-| `config_revision` | integer | 诊断：对照任务创建时配置 | 无法判断配置是否已变更 |
 | `configured` | boolean | 判断配置是否存在 | 无法区分未配置与已禁用 |
 | `enabled` | boolean | 判断配置是否允许使用 | 客户端只能通过失败获知禁用 |
 | `spawn_supported` | boolean | 判断此 subagent 配置是否支持启动 | 容易把可 probe 误当作可 spawn |
-| `transport_support` | object | 描述适配器传输与操作支持 | 丢失实现层能力边界 |
-| `transport_support.transport` | enum | 诊断：`zcode_app_server / dsh_acp / codex_app_server` | 无法识别适配器协议 |
-| `transport_support.probe` | boolean | 判断是否支持探测 | 无法预先判断 probe 支持 |
-| `transport_support.spawn` | boolean | 判断适配器是否实现启动 | 与配置 gate 的差别不可见 |
 | `permission_modes` | PermissionMode[] | 选择该 subagent 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 subagent 都支持 |
 | `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
 | `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式 | 不清楚应省略还是使用模型 token |
-| `local` | AgentScopeStatus | 查看本地 runtime 检查 | 缺少本地可用性依据 |
-| `auth` | AgentScopeStatus | 查看认证相关检查 | 无法区分认证与安装故障 |
-| `hi` | AgentScopeStatus | 查看最小真实交互检查 | 缺少端到端就绪证据 |
+| `local` | AgentScopeStatus | 查看本地 runtime 检查结论 | 缺少本地可用性依据 |
+| `auth` | AgentScopeStatus | 查看认证相关检查结论 | 无法区分认证与安装故障 |
+| `hi` | AgentScopeStatus | 查看最小真实交互检查结论 | 缺少端到端就绪证据 |
 
-三个 scope 状态共用如下结构；无值的可选字段直接省略。
+三个 scope 状态只携带结论；探测证据移至 CLI diagnose。
 
 | 字段 | 类型 | 何时使用／存在理由 | 移除影响 |
 |---|---|---|---|
 | `state` | ComponentState | 判断本项检查结论 | 无法判断检查是否成功或未知 |
-| `scope` | object | 解释检查适用范围 | 可能把其他目录的结果套用于当前任务 |
-| `scope.workspace` | string/省略 | 诊断：检查使用的 workspace | 失去工作区适用性依据 |
-| `scope.home` | string/省略 | 诊断：检查使用的 subagent home | 难以识别凭据／配置作用域差异 |
-| `version` | string/省略 | 诊断：检查发现的版本 | 无法分析 runtime 版本差异 |
-| `checked_at_ms` | integer/省略 | 判断检查结果新旧 | 无法识别陈旧状态 |
-| `reason` | string/省略 | 解释非就绪等状态 | 只能看到结论，缺少原因 |
 
-### 4.4 identity
-
-| 字段 | 类型 | 何时使用／存在理由 | 移除影响 |
-|---|---|---|---|
-| `daemon` | ComponentIdentity/省略 | 诊断：服务端运行组件身份 | 难以核对服务来源 |
-| `facade` | ComponentIdentity | 诊断：MCP 服务报告的 facade 身份 | 难以核对入口来源；嵌入 daemon 时可能就是 daemon 身份，不保证是独立 bridge |
-| `daemon.artifact`、`facade.artifact` | object | 容纳组件制品信息 | 丢失该组件的制品描述入口 |
-| `daemon.artifact.path`、`facade.artifact.path` | string/省略 | 诊断：制品路径 | 无法排查路径指向错误；路径本身不证明源码版本 |
-| `models` | object | 容纳配置模型事实 | 丢失系统级模型诊断入口 |
-| `models.configured` | object/省略 | 配置已知时报告模型事实 | 无法查看配置层模型；不等价于每个任务实际模型 |
-| `models.configured.value` | string | 模型事实的值 | 只有来源而没有内容 |
-| `models.configured.source` | string | 模型事实的来源 | 容易把配置推断当作 runtime 确认 |
+已从 MCP 状态移除、仍可经 CLI diagnose（daemon RPC 视图）获得的操作员诊断字段：`config_revision`（配置版本对照；任务级 provenance 保留在各任务 `input_identity.config_revision`）、`transport_support`（适配器协议名与 probe/spawn 实现细节；MCP 工具面没有 probe 工具，启动 gate 由 `enabled + spawn_supported` 表达）、每个 scope 的 `scope.workspace/home`、`version`、`checked_at_ms`、`reason`，以及顶层 `identity`（daemon/facade artifact 路径与配置模型事实）。
 
 ## 5. external_subagent_spawn
 
@@ -207,8 +184,9 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
 | `agent_id` | integer | 保存后用于 wait/send/respond/result/cancel/close/observe | 无法可靠操作刚创建的任务 |
-| `submission_disposition` | `created / existing` | 区分新建与匹配已有提交 | 调用方无法判断本次是否新建；不是可任意重放 spawn 的承诺 |
 | `status` | string | 获取提交后的单一生命周期状态 | 必须额外查询才能知道是否排队或运行；属于便利信息 |
+
+spawn 是有意非幂等的：每次成功提交都是新建任务（agent id 冲突或活动 workspace 冲突返回 `conflict` 错误，而不是复用已有任务），因此不再输出提交 disposition 字段。曾经存在的 `submission_disposition`（`created / existing`）的 `existing` 分支没有生产者，已随死表面一并移除。
 
 spawn 标注非幂等；返回超时不能直接推断未创建任务，不应通过无限重试推断唯一性。
 

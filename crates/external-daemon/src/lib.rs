@@ -12,8 +12,7 @@ use external_runtime::{
 };
 use external_store::{
     MessageState, NewTask, PendingRequestState, PendingResponseClaimDisposition, Store,
-    StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase, TaskRecord,
-    TaskSubmissionDisposition, TurnState,
+    StoredMessage, StoredProcessIdentity, TaskClaim, TaskOutcome, TaskPhase, TaskRecord, TurnState,
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -1494,12 +1493,6 @@ pub struct ResponseOutcome {
     pub policy_reason_code: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmittedTask {
-    pub task: TaskRecord,
-    pub disposition: TaskSubmissionDisposition,
-}
-
 struct DiagnosticLogger {
     sender: SyncSender<String>,
     dropped: Arc<AtomicU64>,
@@ -1632,7 +1625,7 @@ mod failure_log_tests {
                 write_manifest: Vec::new(),
             })
             .unwrap();
-        (workspace, scheduler, submitted.task.agent_id)
+        (workspace, scheduler, submitted.agent_id)
     }
 
     fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
@@ -1689,7 +1682,7 @@ mod failure_log_tests {
             ..invalid
         };
         let submitted = scheduler.enqueue_general(&valid).unwrap();
-        assert_eq!(submitted.task.agent_id, "10000001");
+        assert_eq!(submitted.agent_id, "10000001");
         assert!(store.get_task("10000000").unwrap().is_none());
     }
 

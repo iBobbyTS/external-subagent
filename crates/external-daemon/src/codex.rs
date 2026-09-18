@@ -1445,7 +1445,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
@@ -1498,7 +1498,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
             .unwrap();
         let error = scheduler.start_ready().unwrap_err();
         assert!(error.to_string().contains("codex spawn gate is closed"));
-        let task = await_terminal_task(&scheduler, &submitted.task.agent_id);
+        let task = await_terminal_task(&scheduler, &submitted.agent_id);
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
 
         // Write modes refuse before the prompt: at the factory seam the
@@ -1641,7 +1641,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         let first_result = await_result(&scheduler, &agent_id);
         assert_eq!(first_result.result.final_text, "CODEX_OK");
@@ -1706,7 +1706,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         await_terminal_task(&scheduler, &agent_id);
 
@@ -1716,7 +1716,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         let store = scheduler.store();
         let claim = store.claim_next("terminal-reject", usize::MAX, 1).unwrap().unwrap();
-        assert_eq!(claim.task.agent_id, zcode_task.task.agent_id);
+        assert_eq!(claim.task.agent_id, zcode_task.agent_id);
         store
             .mark_session_running(
                 &claim.task.agent_id,
@@ -1729,7 +1729,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         store
             .store_task_result(
-                &zcode_task.task.agent_id,
+                &zcode_task.agent_id,
                 &external_store::TaskResult {
                     outcome: TaskOutcome::Completed,
                     final_text: "done".into(),
@@ -1739,7 +1739,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         store
             .transition_terminal(
-                &zcode_task.task.agent_id,
+                &zcode_task.agent_id,
                 claim.owner_epoch,
                 &external_store::TerminalUpdate {
                     outcome: TaskOutcome::Completed,
@@ -1749,7 +1749,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             )
             .unwrap();
         let error = scheduler
-            .queue_message(&zcode_task.task.agent_id, "zcode-msg", "nope")
+            .queue_message(&zcode_task.agent_id, "zcode-msg", "nope")
             .unwrap_err();
         assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
 
@@ -1762,7 +1762,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         let store = scheduler.store();
         let claim = store.claim_next("terminal-reject", usize::MAX, 1).unwrap().unwrap();
-        assert_eq!(claim.task.agent_id, cancelled.task.agent_id);
+        assert_eq!(claim.task.agent_id, cancelled.agent_id);
         store
             .mark_session_running(
                 &claim.task.agent_id,
@@ -1774,11 +1774,11 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             )
             .unwrap();
         store
-            .request_stop(&cancelled.task.agent_id)
+            .request_stop(&cancelled.agent_id)
             .unwrap();
         store
             .transition_terminal(
-                &cancelled.task.agent_id,
+                &cancelled.agent_id,
                 claim.owner_epoch,
                 &external_store::TerminalUpdate {
                     outcome: TaskOutcome::Cancelled,
@@ -1788,7 +1788,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             )
             .unwrap();
         let error = scheduler
-            .queue_message(&cancelled.task.agent_id, "cancel-msg", "nope")
+            .queue_message(&cancelled.agent_id, "cancel-msg", "nope")
             .unwrap_err();
         assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
 
@@ -1801,7 +1801,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         let store = scheduler.store();
         let claim = store.claim_next("terminal-reject", usize::MAX, 1).unwrap().unwrap();
-        assert_eq!(claim.task.agent_id, sessionless.task.agent_id);
+        assert_eq!(claim.task.agent_id, sessionless.agent_id);
         store
             .mark_session_running(
                 &claim.task.agent_id,
@@ -1814,7 +1814,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         store
             .store_task_result(
-                &sessionless.task.agent_id,
+                &sessionless.agent_id,
                 &external_store::TaskResult {
                     outcome: TaskOutcome::Failed,
                     final_text: "never started".into(),
@@ -1824,7 +1824,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             .unwrap();
         store
             .transition_terminal(
-                &sessionless.task.agent_id,
+                &sessionless.agent_id,
                 claim.owner_epoch,
                 &external_store::TerminalUpdate {
                     outcome: TaskOutcome::Failed,
@@ -1834,7 +1834,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             )
             .unwrap();
         let error = scheduler
-            .queue_message(&sessionless.task.agent_id, "sessionless-msg", "nope")
+            .queue_message(&sessionless.agent_id, "sessionless-msg", "nope")
             .unwrap_err();
         assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
     }
@@ -1864,7 +1864,7 @@ sleep 1
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
@@ -1940,7 +1940,7 @@ exit 0
                     Some(codex_admission(Some(MODEL))),
                 )
                 .unwrap();
-            let agent_id = submitted.task.agent_id.clone();
+            let agent_id = submitted.agent_id.clone();
             assert!(
                 scheduler.start_ready().is_err(),
                 "start must fail closed for {marker}"
@@ -1991,7 +1991,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2281,7 +2281,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     Some(codex_admission(Some(MODEL))),
                 )
                 .unwrap();
-            let agent_id = submitted.task.agent_id.clone();
+            let agent_id = submitted.agent_id.clone();
             scheduler.start_ready().unwrap();
             await_result(&scheduler, &agent_id);
             let before = await_terminal_task(&scheduler, &agent_id);
@@ -2323,7 +2323,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         await_result(&scheduler, &agent_id);
         await_terminal_task(&scheduler, &agent_id);
@@ -2358,7 +2358,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     Some(codex_admission(Some(MODEL))),
                 )
                 .unwrap();
-            let agent_id = submitted.task.agent_id.clone();
+            let agent_id = submitted.agent_id.clone();
             scheduler.start_ready().unwrap();
             await_result(&scheduler, &agent_id);
             await_terminal_task(&scheduler, &agent_id);
@@ -2420,7 +2420,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         let claim = store.claim_next("orphan-owner", usize::MAX, 1).unwrap().unwrap();
         assert_eq!(claim.task.agent_id, agent_id);
         store
@@ -2524,7 +2524,7 @@ while IFS= read -r line; do :; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
@@ -2559,7 +2559,7 @@ sleep 1
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         assert!(
             scheduler.start_ready().is_err(),
             "a start response that disagrees with the started turn must fail closed"
@@ -2597,7 +2597,7 @@ sleep 1
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         assert!(
             scheduler.start_ready().is_err(),
             "a start response without a turn id must fail closed"
@@ -2645,7 +2645,7 @@ while IFS= read -r line; do :; done
                 Some(codex_admission(Some(MODEL))),
             )
             .unwrap();
-        let agent_id = submitted.task.agent_id.clone();
+        let agent_id = submitted.agent_id.clone();
         scheduler.start_ready().unwrap();
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
@@ -2772,7 +2772,7 @@ sleep 1
                     Some(codex_admission(Some(MODEL))),
                 )
                 .unwrap();
-            let agent_id = submitted.task.agent_id.clone();
+            let agent_id = submitted.agent_id.clone();
             scheduler.start_ready().unwrap();
             let first_result = await_result(&scheduler, &agent_id);
             assert_eq!(first_result.result.final_text, "CODEX_OK");

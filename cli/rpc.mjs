@@ -192,7 +192,7 @@ export function projectDaemonResult(command, result) {
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':
-      return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, status: result.task.status };
+      return { agent_id: publicTaskId(result.task.agent_id), status: result.task.status };
     case 'wait': {
       const { result: taskResult, task, activity, kind: _kind, ...rest } = result;
       return { ...rest, task: publicTask(task), activity, result: publicResult(taskResult) };

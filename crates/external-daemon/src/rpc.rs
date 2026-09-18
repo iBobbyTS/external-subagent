@@ -9,7 +9,7 @@ use crate::{
 use external_core::{canonical_general_repository, GeneralTaskManifest, PreparedGeneralTask};
 use external_store::{
     PendingRequestState, Store, StoreError, StoredPendingRequest, StoredTaskResult, TaskOutcome,
-    TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord, TaskSubmissionDisposition,
+    TaskPageFilter, TaskPhase, TaskQueryScope, TaskRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -301,7 +301,6 @@ pub enum RpcSuccess {
     },
     GeneralSubmitted {
         task: TaskView,
-        disposition: SubmissionDispositionView,
     },
     TaskListed {
         tasks: Vec<TaskView>,
@@ -362,22 +361,6 @@ pub enum ComponentStateView {
 pub enum CapabilityMaturityView {
     BetaReady,
     ExperimentalUnverifiedRuntime,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubmissionDispositionView {
-    Created,
-    Existing,
-}
-
-impl From<TaskSubmissionDisposition> for SubmissionDispositionView {
-    fn from(value: TaskSubmissionDisposition) -> Self {
-        match value {
-            TaskSubmissionDisposition::Created => Self::Created,
-            TaskSubmissionDisposition::Existing => Self::Existing,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1038,8 +1021,7 @@ impl RpcService {
                     .enqueue_general_with_admission(&manifest, Some(admission))
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
-                    task: task_view(submitted.task),
-                    disposition: submitted.disposition.into(),
+                    task: task_view(submitted),
                 })
             }
             RpcMethod::TaskList(query) => {
@@ -2406,7 +2388,7 @@ pub(crate) mod wait_tests {
                 write_manifest: vec![],
             })
             .unwrap();
-        let id = submitted.task.agent_id;
+        let id = submitted.agent_id;
         let claim = store.claim_next("wait-test", 10, 10).unwrap().unwrap();
         store
             .mark_session_running(&id, claim.owner_epoch, "runtime", None, None, None)
@@ -4273,8 +4255,7 @@ mod admission_tests {
         let task = service
             .scheduler
             .enqueue_general_with_admission(&input.manifest, Some(identity.clone()))
-            .unwrap()
-            .task;
+            .unwrap();
         config.revision = 42;
         config.subagents.get_mut("zcode").unwrap().enabled = false;
         assert!(resolve_admission(&input, &config).is_err());
@@ -5202,7 +5183,7 @@ mod observe_gate_tests {
         let submitted = scheduler
             .enqueue_general_with_admission(&manifest, Some(admission("dsh")))
             .unwrap();
-        let task = submitted.task;
+        let task = submitted;
         let service = Arc::new(RpcService::new(scheduler, store).unwrap());
         (service, task)
     }

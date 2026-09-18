@@ -43,8 +43,13 @@ test('stale probe evidence is never projected as current readiness', () => {
 test('packaged status schema requires every capability owner field', () => {
   const root = path.resolve(import.meta.dirname, '../..');
   const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/zcode-subagent-public-api.json'), 'utf8'));
-  for (const field of schema.properties.agent_status.required) {
-    assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(fixturePath, 'utf8')), field), true, field);
+  // The packaged schema documents the public MCP projection, whose route key
+  // is `subagent`; the daemon RPC view (this fixture) names the same field
+  // `agent`. Every schema-required field must exist in the daemon-side view.
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+  for (const field of schema.properties.subagent_status.required) {
+    const ownerField = field === 'subagent' ? 'agent' : field;
+    assert.equal(Object.hasOwn(fixture, ownerField), true, field);
   }
 });
 
