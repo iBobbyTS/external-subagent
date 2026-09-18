@@ -8,7 +8,11 @@
 // gated test exercises the real CLI against a throwaway CODEX_HOME only.
 // The registry oracles pin D08: claim on successful install, unclaim on
 // removal, idempotent dedupe, atomic corruption recovery, and the guarantee
-// that only registered, writable homes are ever written.
+// that only registered, writable homes are ever written.  The AUD-010
+// store oracles pin that a same-identity cache whose MANAGED CONTENT is not
+// this candidate's (older SKILL, missing file, retained source-deleted file)
+// fails closed with CODEX_CACHE_CONTENT_MISMATCH and never records success,
+// while a never-used identity with correct materialized content verifies.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -310,6 +314,141 @@ test('store reuse is answered by a distinct release identity, and a repeat of th
     );
   } finally {
     for (const dir of [state, homeA, homeB]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// AUD-010: same plugin identity, same marketplace, same binding (same home,
+// socket, and facade command) must still fail closed when the store's cached
+// managed CONTENT is not this candidate's.  The store fake seeds the
+// machine-global store from the FIRST install's staged tree, so the second
+// install of the same identity materializes the old bytes while its own
+// staging carries the new candidate — exactly the shape the metadata/binding
+// comparison alone used to accept as `cache_verified: true`.  Each negative
+// pins exactly ONE difference between the seeded bytes and the candidate.
+test('a same-identity cache with changed managed content fails closed through the store (AUD-010)', () => {
+  const shippedVersion = JSON.parse(fs.readFileSync(path.join(pluginSourceRoot(), '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const skillAt = (root) => path.join(root, 'skills', 'external-subagent', 'SKILL.md');
+  const negatives = [
+    {
+      name: 'older cached SKILL',
+      seed: (dir) => fs.writeFileSync(skillAt(dir), 'OLD SKILL bytes\n'),
+      candidate: (dir) => fs.writeFileSync(skillAt(dir), 'NEW SKILL bytes\n'),
+      staleProof: (cache) => assert.equal(fs.readFileSync(skillAt(cache), 'utf8'), 'OLD SKILL bytes\n', 'the cache keeps the older SKILL'),
+    },
+    {
+      name: 'managed file missing from the cache',
+      seed: () => {},
+      candidate: (dir) => fs.writeFileSync(path.join(dir, 'skills', 'external-subagent', 'reference.md'), 'new managed file\n'),
+      staleProof: (cache) => assert.equal(fs.existsSync(path.join(cache, 'skills', 'external-subagent', 'reference.md')), false, 'the cache lacks the candidate\'s new managed file'),
+    },
+    {
+      name: 'source-deleted file the cache still retains',
+      seed: (dir) => fs.writeFileSync(path.join(dir, 'obsolete-managed-file.txt'), 'stale retained bytes\n'),
+      // The candidate is a fresh copy of the shipped source, which never
+      // carried the seeded file — its absence IS the source deletion.
+      candidate: () => {},
+      staleProof: (cache) => assert.equal(fs.existsSync(path.join(cache, 'obsolete-managed-file.txt')), true, 'the cache retains the file this candidate deleted'),
+    },
+  ];
+  for (const negative of negatives) {
+    const state = fixtureHome('external-subagent-aud010-');
+    const fake = fakeCodexCli(state, { store: true });
+    const home = fixtureHome('external-subagent-aud010-home-');
+    const codexHome = path.join(state, 'codex-home');
+    const staging = path.join(home, 'plugins', 'external-subagent');
+    const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+    try {
+      const paths = productPaths(home);
+      const options = { codexCli: fake.cli, codexHome };
+      const first = installPlugin(paths, { ...options, source: tempSource(negative.seed) });
+      assert.equal(first.cache_verified, true, `${negative.name}: the seeding install of the old content succeeds`);
+      const treeBefore = snapshotTree(staging);
+      const marketBefore = fs.readFileSync(marketplace);
+
+      // Same identity (version untouched), same binding — only the managed
+      // content moved.  The store hands back the old bytes; the install must
+      // fail closed instead of reporting this candidate as verified.
+      let failure = null;
+      try { installPlugin(paths, { ...options, source: tempSource(negative.candidate) }); } catch (error) { failure = error; }
+      assert.ok(failure, `${negative.name}: the stale-content install must not succeed`);
+      assert.equal(failure.code, 'CODEX_CACHE_CONTENT_MISMATCH');
+      assert.match(failure.message, new RegExp(`external-subagent@personal@${shippedVersion.replace(/\./gu, '\\.')}\\b`, 'u'), 'the error names the reused identity');
+      assert.match(failure.message, /machine-global content store/u);
+      assert.ok(failure.message.includes(first.cache), 'the error shows the cache that was rejected');
+
+      // The failed refresh restores the prior coherent staging/marketplace
+      // bytes (S01), and the codex-owned cache is left exactly as codex wrote
+      // it — still carrying the stale content this product rejected.
+      assert.deepEqual(snapshotTree(staging), treeBefore, `${negative.name}: the prior staging tree is restored`);
+      assert.deepEqual(fs.readFileSync(marketplace), marketBefore, `${negative.name}: the marketplace keeps its exact prior bytes`);
+      negative.staleProof(first.cache);
+    } finally {
+      for (const dir of [state, home]) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+// The same stale-content failure must not record success anywhere: reconcile
+// reports the home as failed with CODEX_CACHE_CONTENT_MISMATCH, and the prior
+// claim's digest survives untouched.
+test('a stale-content reconcile records failure, never a successful claim (AUD-010)', () => {
+  const state = fixtureHome('external-subagent-aud010-claim-');
+  const fake = fakeCodexCli(state, { store: true });
+  const home = fixtureHome('external-subagent-aud010-claim-home-');
+  const codexHome = path.join(state, 'codex-home');
+  const skillAt = path.join('skills', 'external-subagent', 'SKILL.md');
+  try {
+    const paths = productPaths(home);
+    installPlugin(paths, { codexCli: fake.cli, codexHome, source: tempSource((dir) => fs.appendFileSync(path.join(dir, skillAt), '\nOLD CANDIDATE\n')) });
+    registerCodexHome(paths, codexHome, { version: '0.1.0', digest: 'sentinel-digest', status: 'claimed' });
+    const candidate = tempSource((dir) => fs.appendFileSync(path.join(dir, skillAt), '\nNEW CANDIDATE\n'));
+    const report = reconcileCodexHomes(paths, { codexCli: fake.cli, source: candidate });
+    assert.equal(report.homes.length, 1);
+    assert.equal(report.homes[0].status, 'failed');
+    assert.equal(report.homes[0].error.code, 'CODEX_CACHE_CONTENT_MISMATCH');
+    assert.equal(report.all_updated, false);
+    const entry = loadCodexHomes(paths).registry.homes[0];
+    assert.equal(entry.last_status, 'failed', 'reconcile must not record updated for stale content');
+    assert.equal(entry.digest, 'sentinel-digest', 'a failed sync must not overwrite the recorded digest');
+    assert.equal(entry.last_sync_ms, null, 'a failed sync must not record a sync timestamp');
+  } finally {
+    for (const dir of [state, home]) fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The positive counterpart: a plugin version identity no store has ever
+// cached gets its own store entry seeded from THIS run's staged tree, so
+// changed content under a fresh identity with the SAME binding verifies.
+test('a never-used candidate identity with correct materialized content verifies (AUD-010)', () => {
+  const state = fixtureHome('external-subagent-aud010-fresh-');
+  const fake = fakeCodexCli(state, { store: true });
+  const home = fixtureHome('external-subagent-aud010-fresh-home-');
+  const codexHome = path.join(state, 'codex-home');
+  const skillAt = path.join('skills', 'external-subagent', 'SKILL.md');
+  try {
+    const paths = productPaths(home);
+    // Burn the shipped identity in the store with older content first.
+    installPlugin(paths, { codexCli: fake.cli, codexHome, source: tempSource((dir) => fs.writeFileSync(path.join(dir, skillAt), 'OLD CANDIDATE SKILL\n')) });
+    // The remediation: a distinct, never-cached plugin version carrying the
+    // new content installs cleanly under the same binding.
+    const source = tempSource((dir) => {
+      fs.writeFileSync(path.join(dir, skillAt), 'FRESH CANDIDATE SKILL\n');
+      const manifestFile = path.join(dir, '.codex-plugin', 'plugin.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+      const [major, minor, patch] = manifest.version.split('.').map(Number);
+      manifest.version = `${major}.${minor}.${patch + 1}`;
+      fs.writeFileSync(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+    });
+    const result = installPlugin(paths, { codexCli: fake.cli, codexHome, source });
+    assert.equal(result.installed, true);
+    assert.equal(result.cache_verified, true);
+    assert.equal(typeof result.digest, 'string', 'the successful install carries the digest the claim records');
+    assert.equal(path.basename(result.cache), JSON.parse(fs.readFileSync(path.join(source, '.codex-plugin', 'plugin.json'), 'utf8')).version, 'the fresh identity materializes its own cache directory');
+    assert.equal(fs.readFileSync(path.join(result.cache, skillAt), 'utf8'), 'FRESH CANDIDATE SKILL\n', 'the cache carries this candidate\'s content, not the store\'s previous bytes');
+    const server = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
+    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket, 'the same binding verifies alongside the new content');
+  } finally {
+    for (const dir of [state, home]) fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

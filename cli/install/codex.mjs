@@ -111,12 +111,14 @@ function readCacheJson(file, cache, identity) {
 // codex 0.153.4 materializes `plugin add` caches from a machine-global
 // content store keyed by plugin@marketplace@version, so when the same
 // identity was first cached from a different binding (another staging root,
-// installed facade, or daemon socket), this home receives those foreign
+// installed facade, or daemon socket) or from older managed content (a
+// previous candidate's skill/file set), this home receives those foreign
 // bytes while `plugin add` still reports success.  Before installPlugin may
 // return success, the materialized cache is read back and compared with this
-// run's staged binding; any surprise fails closed below.  The cache is only
-// ever READ here — codex-owned state is never edited, and the remediation
-// for store-reused bytes is a distinct release identity, not a rewrite.
+// run's staged binding AND staged managed content; any surprise fails closed
+// below.  The cache is only ever READ here — codex-owned state is never
+// edited, and the remediation for store-reused bytes is a distinct release
+// identity, not a rewrite.
 function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
   const expected = stagedManagedBinding(staging);
   const identity = `${PLUGIN_NAME}@${marketplaceName}@${expected.manifest.version}`;
@@ -136,6 +138,27 @@ function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
     const socket = server?.env?.ZCODE_AGENTD_SOCKET;
     if (!server || server.command !== expected.command || socket !== expected.socket) {
       throw new CliError('CODEX_CACHE_BINDING_MISMATCH', `codex plugin cache for ${identity} carries a different managed binding (command=${server?.command}, socket=${socket}); expected this install's staged binding (command=${expected.command}, socket=${expected.socket}). The machine-global content store reused another installation's bytes for the same identity (${cache}); release a distinct plugin version instead of accepting them`);
+    }
+    // AUD-010: identity and binding alone do not prove the cache carries THIS
+    // candidate.  The machine-global store keyed by plugin@marketplace@version
+    // keeps whatever bytes the FIRST install of that identity staged, so a
+    // same-identity refresh can meet every metadata/binding check above while
+    // the materialized tree still holds an older SKILL, lacks a file this
+    // candidate added, or retains a file the source deleted.  The managed
+    // content is therefore compared with this run's staged tree via treeDigest
+    // (every file and byte, except .mcp.json — whose command/socket binding
+    // was just verified above; that exclusion is treeDigest's existing rule
+    // and is NOT a reason to drop the binding checks).  Real codex
+    // materializes the cache as a verbatim copy of the staged plugin tree
+    // with no host-generated additions inside it (see
+    // docs/compatibility/codex.md), so the staged file set IS the managed
+    // set; any difference fails closed through the existing error chain
+    // (S01 keeps staging/marketplace recoverable) instead of reporting
+    // cache_verified for stale bytes.
+    const stagedDigest = treeDigest(staging);
+    const cacheDigest = treeDigest(cache);
+    if (cacheDigest !== stagedDigest) {
+      throw new CliError('CODEX_CACHE_CONTENT_MISMATCH', `codex plugin cache for ${identity} does not carry this candidate's managed content (staged tree digest ${stagedDigest}, cache digest ${cacheDigest}; ${cache}). The machine-global content store retained another installation's content for the same identity; release a distinct plugin version instead of accepting it`);
     }
     return cache;
   }

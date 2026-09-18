@@ -34,9 +34,10 @@ see [docs/acceptance/productization.md](docs/acceptance/productization.md)).
 The managed plugin manifest is versioned per released candidate because its
 version is codex's plugin-cache identity, and each candidate's consumer runs
 cache that identity in codex's machine-global store, so any later candidate
-bumps again. The installer verifies the materialized plugin cache against
-the staged binding before reporting success, failing closed on store-reused
-bytes. DSH admission currently supports `build` and strict `plan`; its model
+bumps again. The installer verifies the materialized plugin cache against the staged
+binding and managed content (file set and bytes, not just identity) before
+reporting success, failing closed on store-reused or stale bytes. DSH
+admission currently supports `build` and strict `plan`; its model
 selection is explicit spawn model, configured default, then the native
 default. Nothing has been published to a registry
 (`REGISTRY_PUBLICATION_PENDING`).
@@ -48,18 +49,20 @@ constant (`cli/constants.mjs`), the daemon crates, and the native payload
 manifest all carry the same version, and `scripts/release/check-native-tarball.mjs`
 enforces payload/package agreement. The managed Codex plugin manifest
 (`plugins/codex/external-subagent/.codex-plugin/plugin.json`, currently
-`0.1.2`) is deliberately **not** tied to the product version: it is codex's
+`0.1.3`) is deliberately **not** tied to the product version: it is codex's
 machine-global plugin-cache identity (`plugin@marketplace@version`), which
 must carry a fresh version per released candidate (`0.1.1` for C1, `0.1.2`
-for C2) so no home silently receives another installation's cached bytes.
-The two numbers therefore intentionally diverge; see
+for C2, `0.1.3` for the boundary-fixes candidate) so no home silently
+receives another installation's cached bytes. The two numbers therefore
+intentionally diverge; see
 [docs/operations.md](docs/operations.md) for the full rule.
 
 ## Install (from a packed artifact)
 
 ```
-npm pack                                                # build the tarball (payload must be staged first)
-node scripts/release/build-native-payload.mjs           # cargo release build + payload manifest
+node scripts/release/build-native-payload.mjs           # cargo release build + payload manifest (must run BEFORE npm pack)
+npm pack                                                # build the tarball from the freshly staged payload
+node scripts/release/check-native-tarball.mjs           # static tarball checks (entries, payload/package version, Mach-O)
 npm install -g <external-subagent-0.1.0.tgz>            # stages package + payload only
 external-subagent init                                  # explicit: standalone daemon service only
 external-subagent install-plugin codex                  # optional: bind the Codex host (or: install-plugin zcode / install-mcp)
@@ -72,7 +75,12 @@ binding), and any custom local MCP client may connect without either. On an
 already initialized installation, npm's postinstall hook detects a local
 version drift and reuses
 the existing reconcile/update owner; it never initializes a fresh home or
-probes a provider. `init` remains the explicit first activation step. A
+probes a provider. A same-version reinstall does not drift and therefore
+does not trigger that update path — rebind hosts explicitly with
+`external-subagent reconcile` and restart the service per
+[docs/operations.md](docs/operations.md) instead of expecting npm reinstall
+to refresh a running daemon. `init` remains the explicit first activation
+step. A
 completed update whose registered Codex homes only partially rebind reports
 `CODEX_SYNC_PARTIAL` per home and keeps the verified activation; the public
 `stop` confirms launchd removal before returning, and `uninstall` boots out

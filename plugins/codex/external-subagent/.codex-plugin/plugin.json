@@ -1,6 +1,6 @@
 {
   "name": "external-subagent",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Manage bounded external agent tasks through the external-subagent MCP service.",
   "author": { "name": "external-subagent maintainers" },
   "skills": "./skills/",
