@@ -841,9 +841,18 @@ mod tests {
         let changed = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(changed.path(), b"changed runtime bytes").unwrap();
         assert!(!runtime_source_verified(Some(changed.path())));
-        assert!(!adapter_runtime_source_verified("zcode", Some(changed.path())));
-        assert!(!adapter_runtime_source_verified("dsh", Some(changed.path())));
-        assert!(!adapter_runtime_source_verified("codex", Some(changed.path())));
+        assert!(!adapter_runtime_source_verified(
+            "zcode",
+            Some(changed.path())
+        ));
+        assert!(!adapter_runtime_source_verified(
+            "dsh",
+            Some(changed.path())
+        ));
+        assert!(!adapter_runtime_source_verified(
+            "codex",
+            Some(changed.path())
+        ));
     }
 
     #[test]

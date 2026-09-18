@@ -29,15 +29,41 @@ test('agent status fixture keeps layer evidence scoped and failure reasons expli
 });
 
 test('stale probe evidence is never projected as current readiness', () => {
-  const stale = {
-    state: 'UNKNOWN',
-    scope: { workspace: '/fixtures/workspace-a' },
-    version: '3.8.1',
-    checked_at_ms: 1234,
-    reason: 'stale_config_revision',
-  };
-  assert.equal(stale.state, 'UNKNOWN');
-  assert.equal(stale.reason, 'stale_config_revision');
+  // Product surfaces: the packaged public schema and the daemon-view fixture.
+  // The daemon carries evidence a later config revision did not re-probe as
+  // UNKNOWN with reason `stale_config_revision`, keeping the probe facts for
+  // diagnosis (preserved_or_stale in crates/external-daemon/src/agent_status.rs).
+  // Hold that projection against the public contract the schema packages.
+  const root = path.resolve(import.meta.dirname, '../..');
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
+  const layerSchema = schema.properties.subagent_scope_status;
+  const states = layerSchema.properties.state.enum;
+  const readiness = states.filter((state) => state !== 'UNKNOWN');
+  // UNKNOWN must remain the enum's non-conclusive state, so a stale
+  // carry-over always has a legal landing place that is not a readiness
+  // conclusion.
+  assert.equal(states.includes('UNKNOWN'), true, 'public state enum lost UNKNOWN');
+  // The public layer view exposes the readiness conclusion and nothing else:
+  // probe evidence stays on the daemon view, so stale facts cannot leak onto
+  // the public readiness surface.
+  assert.equal(layerSchema.additionalProperties, false, 'public layer view accepts extra properties');
+  for (const field of ['scope', 'version', 'checked_at_ms', 'reason']) {
+    assert.equal(Object.hasOwn(layerSchema.properties, field), false, `${field} leaked into the public layer view`);
+  }
+  const status = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+  for (const layer of ['local', 'auth', 'hi']) {
+    const fresh = status[layer];
+    // Fresh fixture evidence concludes in states the public enum accepts.
+    assert.equal(states.includes(fresh.state), true, `${layer}: fixture state ${fresh.state} outside the public enum`);
+    // Model the carry-over across a config revision: probe facts survive for
+    // daemon-side diagnosis, but the conclusion degrades to the one
+    // non-conclusive state.
+    const carried = { ...fresh, state: 'UNKNOWN', reason: 'stale_config_revision' };
+    assert.equal(readiness.includes(carried.state), false, `${layer}: stale evidence projects as readiness`);
+    for (const field of ['scope', 'version', 'checked_at_ms']) {
+      assert.notEqual(carried[field], undefined, `${layer}: ${field} evidence dropped by the carry-over`);
+    }
+  }
 });
 
 test('packaged status schema requires every capability owner field', () => {

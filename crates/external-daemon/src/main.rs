@@ -1,8 +1,8 @@
 use external_daemon::{
-    codex::{CodexRuntimeFactory, resolve_codex_home},
+    codex::{resolve_codex_home, CodexRuntimeFactory},
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
-    rpc::{ServerOptions, parse_subagent_config},
+    rpc::{parse_subagent_config, ServerOptions},
     CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 use external_store::Store;
@@ -16,7 +16,10 @@ use std::{
     time::Duration,
 };
 
-fn configured_subagent<'a>(value: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+fn configured_subagent<'a>(
+    value: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Value> {
     value.pointer(&format!("/subagents/{name}"))
 }
 #[cfg(debug_assertions)]
@@ -226,20 +229,17 @@ fn codex_production_enabled(path: Option<&Path>) -> bool {
             .and_then(serde_json::Value::as_str)
             .map(Path::new)
             .is_some_and(|runtime| {
-                runtime.is_absolute()
-                    && runtime.is_file()
-                    && {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            fs::metadata(runtime)
-                                .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            true
-                        }
+                runtime.is_absolute() && runtime.is_file() && {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
                     }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                }
             })
 }
 
@@ -412,8 +412,7 @@ mod tests {
             assert!(!codex_production_enabled(Some(&config_path)));
         }
         let mut relative = base.clone();
-        relative["agents"]["codex"]["runtime_path"] =
-            serde_json::json!("relative/codex");
+        relative["agents"]["codex"]["runtime_path"] = serde_json::json!("relative/codex");
         std::fs::write(&config_path, serde_json::to_vec(&relative).unwrap()).unwrap();
         assert!(!codex_production_enabled(Some(&config_path)));
         assert!(!codex_production_enabled(None));

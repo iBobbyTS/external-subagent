@@ -180,11 +180,26 @@ impl AgentEvidenceStore {
             // prerequisite for auth/hi probes.
             match input.through {
                 ProbeLayer::Local => {
-                    evidence.auth = preserved_or_stale(previous.auth, &input.scope, previous.config_revision, config_revision);
-                    evidence.hi = preserved_or_stale(previous.hi, &input.scope, previous.config_revision, config_revision);
+                    evidence.auth = preserved_or_stale(
+                        previous.auth,
+                        &input.scope,
+                        previous.config_revision,
+                        config_revision,
+                    );
+                    evidence.hi = preserved_or_stale(
+                        previous.hi,
+                        &input.scope,
+                        previous.config_revision,
+                        config_revision,
+                    );
                 }
                 ProbeLayer::Auth => {
-                    evidence.hi = preserved_or_stale(previous.hi, &input.scope, previous.config_revision, config_revision);
+                    evidence.hi = preserved_or_stale(
+                        previous.hi,
+                        &input.scope,
+                        previous.config_revision,
+                        config_revision,
+                    );
                 }
                 ProbeLayer::Hi => {}
             }
@@ -1697,30 +1712,93 @@ mod tests {
             evidence: evidence(ProbeScope::default()),
         }));
         let scope = ProbeScope::default();
-        let hi = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: scope.clone() }, 7);
+        let hi = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Hi,
+                scope: scope.clone(),
+            },
+            7,
+        );
         assert_eq!(hi.hi.checked_at_ms, 30);
-        let local = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: scope.clone() }, 7);
+        let local = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Local,
+                scope: scope.clone(),
+            },
+            7,
+        );
         assert_eq!(local.local.checked_at_ms, 10);
         assert_eq!(local.auth.checked_at_ms, 30);
         assert_eq!(local.hi.checked_at_ms, 30);
-        let auth = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Auth, scope }, 7);
+        let auth = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Auth,
+                scope,
+            },
+            7,
+        );
         assert_eq!(auth.auth.checked_at_ms, 20);
         assert_eq!(auth.hi.checked_at_ms, 30);
         assert_eq!(auth.config_revision, 7);
 
-        let hi_again = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: ProbeScope::default() }, 7);
+        let hi_again = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Hi,
+                scope: ProbeScope::default(),
+            },
+            7,
+        );
         assert_eq!(hi_again.hi.checked_at_ms, 30);
-        let revision_changed = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: ProbeScope::default() }, 8);
+        let revision_changed = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Local,
+                scope: ProbeScope::default(),
+            },
+            8,
+        );
         assert_eq!(revision_changed.config_revision, 8);
         assert_eq!(revision_changed.auth.state, EvidenceState::Unknown);
         assert_eq!(revision_changed.hi.state, EvidenceState::Unknown);
-        assert_eq!(revision_changed.auth.reason.as_deref(), Some("stale_config_revision"));
-        assert_eq!(revision_changed.hi.reason.as_deref(), Some("stale_config_revision"));
+        assert_eq!(
+            revision_changed.auth.reason.as_deref(),
+            Some("stale_config_revision")
+        );
+        assert_eq!(
+            revision_changed.hi.reason.as_deref(),
+            Some("stale_config_revision")
+        );
 
-        let scope_a = ProbeScope { workspace: Some("/a".into()), home: Some("/ha".into()), ..ProbeScope::default() };
-        let scope_b = ProbeScope { workspace: Some("/b".into()), home: Some("/hb".into()), ..ProbeScope::default() };
-        let _ = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Hi, scope: scope_a }, 9);
-        let across_scope = store.probe(&AgentProbeInput { agent: "zcode".into(), through: ProbeLayer::Local, scope: scope_b }, 9);
+        let scope_a = ProbeScope {
+            workspace: Some("/a".into()),
+            home: Some("/ha".into()),
+            ..ProbeScope::default()
+        };
+        let scope_b = ProbeScope {
+            workspace: Some("/b".into()),
+            home: Some("/hb".into()),
+            ..ProbeScope::default()
+        };
+        let _ = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Hi,
+                scope: scope_a,
+            },
+            9,
+        );
+        let across_scope = store.probe(
+            &AgentProbeInput {
+                agent: "zcode".into(),
+                through: ProbeLayer::Local,
+                scope: scope_b,
+            },
+            9,
+        );
         assert_eq!(across_scope.auth.state, EvidenceState::Unknown);
         assert_eq!(across_scope.hi.state, EvidenceState::Unknown);
         assert_eq!(across_scope.auth.reason.as_deref(), Some("not_probed"));
@@ -2391,7 +2469,14 @@ process.stdin.on('data', (chunk) => {
                 .iter()
                 .map(|request| request["method"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["initialize", "session/new", "models/list", "initialize", "session/new", "models/list"]
+            [
+                "initialize",
+                "session/new",
+                "models/list",
+                "initialize",
+                "session/new",
+                "models/list"
+            ]
         );
     }
 
