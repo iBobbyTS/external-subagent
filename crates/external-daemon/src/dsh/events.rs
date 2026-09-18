@@ -26,6 +26,21 @@ use crate::{Publisher, TurnBoundary, TurnTracker};
 
 const MAX_TRACKED_TOOLS: usize = 128;
 
+/// One prompt settlement parsed off the wire, waiting to be folded.
+///
+/// The settlement watcher deposits its result here instead of applying it:
+/// the shared pump is the only folder, and only after it has proven it
+/// projected every inbound frame that preceded the settlement response on
+/// the wire (the driver resolves a prompt response while frames sent before
+/// it may still be queued for the pump, so folding from the watcher races
+/// those frames and can settle a turn without its verified final message).
+pub(super) enum SettledTurn {
+    /// The prompt response settled the turn.
+    Settled(transport::PromptSettlement),
+    /// The response never arrived or violated the settlement shape.
+    Failed(String),
+}
+
 pub(super) struct DshRuntimeShared {
     pub(super) publisher: Arc<Publisher>,
     pub(super) turn_tracker: Arc<TurnTracker>,
@@ -34,6 +49,7 @@ pub(super) struct DshRuntimeShared {
     pub(super) messages: Mutex<MessageAggregation>,
     pub(super) session_id: Mutex<Option<String>>,
     pub(super) current_prompt: Mutex<Option<String>>,
+    pub(super) settled_turn: Mutex<Option<SettledTurn>>,
     pub(super) sequence: AtomicU64,
     pub(super) stop_boundaries: AtomicU64,
 }
@@ -66,6 +82,21 @@ impl DshRuntimeShared {
             },
             None,
         );
+    }
+
+    pub(super) fn deposit_settled_turn(&self, settled: SettledTurn) {
+        *self.settled_turn.lock().unwrap() = Some(settled);
+    }
+
+    pub(super) fn take_settled_turn(&self) -> Option<SettledTurn> {
+        self.settled_turn.lock().unwrap().take()
+    }
+
+    pub(super) fn apply_settled_turn(&self, settled: SettledTurn) {
+        match settled {
+            SettledTurn::Settled(settlement) => self.apply_settlement(&settlement),
+            SettledTurn::Failed(message) => self.apply_failed_settlement(&message),
+        }
     }
 
     pub(super) fn begin_turn(&self, prompt_id: u64) {

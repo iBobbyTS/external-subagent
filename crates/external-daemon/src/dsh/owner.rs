@@ -59,6 +59,7 @@ impl DshRuntimeOwner {
             messages: Mutex::new(MessageAggregation::default()),
             session_id: Mutex::new(None),
             current_prompt: Mutex::new(None),
+            settled_turn: Mutex::new(None),
             sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
         });

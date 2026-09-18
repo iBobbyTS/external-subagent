@@ -12,13 +12,17 @@ use std::{
 use external_agent_dsh::acp::{session::SessionError, transport};
 use external_store::TaskRecord;
 
+use super::events::SettledTurn;
 use super::owner::DshRuntimeOwner;
 use crate::{task_route, RuntimeCommandError, SessionReady};
 
 impl DshRuntimeOwner {
     /// Begin one prompt turn and register its settlement watcher. Returns
     /// once the request is on the wire; the agent turn runs to settlement on
-    /// the watcher thread so control-plane operations never block on it.
+    /// the watcher thread so control-plane operations never block on it. The
+    /// watcher never folds: it deposits the parsed settlement for the pump,
+    /// which applies it strictly after every frame that preceded the
+    /// response on the wire has been projected.
     pub(super) fn send_prompt(&self, prompt: &str) -> Result<(), RuntimeCommandError> {
         let snapshot = self.shared.turn_tracker.snapshot();
         if snapshot.active {
@@ -37,20 +41,19 @@ impl DshRuntimeOwner {
         thread::Builder::new()
             .name("dsh-settlement".into())
             .spawn(move || {
-                let settlement = match pending.wait(Duration::from_secs(24 * 60 * 60)) {
+                let settled = match pending.wait(Duration::from_secs(24 * 60 * 60)) {
                     Ok(response) => match response.result.as_ref() {
                         Some(result) => match transport::parse_prompt_settlement(result) {
-                            Ok(settlement) => Ok(settlement),
-                            Err(error) => Err(error.to_string()),
+                            Ok(settlement) => SettledTurn::Settled(settlement),
+                            Err(error) => SettledTurn::Failed(error.to_string()),
                         },
-                        None => Err("session/prompt settled without a result".into()),
+                        None => {
+                            SettledTurn::Failed("session/prompt settled without a result".into())
+                        }
                     },
-                    Err(error) => Err(error.to_string()),
+                    Err(error) => SettledTurn::Failed(error.to_string()),
                 };
-                match settlement {
-                    Ok(settlement) => shared.apply_settlement(&settlement),
-                    Err(message) => shared.apply_failed_settlement(&message),
-                }
+                shared.deposit_settled_turn(settled);
             })
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         Ok(())
