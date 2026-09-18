@@ -10,6 +10,27 @@ import { activateService, hasInstalledService } from '../install/service-activat
 
 const receiptPath = (paths) => `${paths.state}.activation.json`;
 
+// AUD-003: the ONE bounded reducer over the two supported host integrations.
+// Codex homes and the ZCode binding refresh as part of the same activation,
+// so the top-level verdict must reduce BOTH outcomes on every
+// update/reconcile path — including pure reconcile and service-less runs,
+// where a failed host integration used to hide behind a success receipt.
+// Per-host detail is preserved verbatim for the receipt and the error; an
+// absent zcode binding is not a failure, and an unbound host is never
+// touched.  Returns null when every host is fully reconciled.
+function partialHostSync(result) {
+  const homes = Array.isArray(result?.homes?.homes) ? result.homes.homes : [];
+  const failures = (homes.length > 0 && !result.homes.all_updated
+    ? homes.filter((home) => home.status !== 'updated')
+    : []).map((home) => `codex ${home.home}: ${home.status}${home.error ? ` (${home.error.code}: ${home.error.message})` : ''}`);
+  const zcodeFailed = result?.zcode?.status === 'failed';
+  if (zcodeFailed) {
+    const { error } = result.zcode;
+    failures.push(`zcode: ${error ? `${error.code}: ${error.message}` : 'binding refresh failed'}`);
+  }
+  return failures.length > 0 ? { zcodeFailed, failures } : null;
+}
+
 export async function updateCommand(paths, args = [], daemon = {}) {
   const cancelActive = args.includes('--cancel-active');
   const yes = args.includes('--yes');
@@ -83,12 +104,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     ? { path: previousActive.retained.daemon_entry, sha256: previousActive.retained.daemon_entry_sha256 ?? previousActive.daemon_entry_sha256 }
     : (previousActive?.daemon_entry ? { path: previousActive.daemon_entry, sha256: previousActive.daemon_entry_sha256 } : null);
   let result;
-  // Set when the verified activation completed but the Codex-home sync is
-  // partial: the homes are per-home retryable through the public reconcile
-  // owner, so the completed activation stays published and the partial sync
-  // is reported AFTER the guarded block — never as success, and never as a
-  // reason to roll a healthy service back.
-  let partialHomes = null;
+  // Set when the verified activation completed but a host binding sync
+  // (Codex homes, ZCode config) is partial or failed: every such host is
+  // retryable through the public reconcile owner, so the completed
+  // activation stays published and the partial sync is reported AFTER the
+  // guarded block — never as success, and never as a reason to roll a
+  // healthy service or payload back.
+  let partialHosts = null;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
@@ -125,13 +147,13 @@ export async function updateCommand(paths, args = [], daemon = {}) {
         version: result.active.version,
       }, { ...daemon, rollbackPayload });
       result.homes = reconcileCodexHomes(paths);
-      if (result.homes.homes.length > 0 && !result.homes.all_updated) partialHomes = result.homes;
     }
     const receiptVersion = result?.active?.version || result?.version || requestedVersion;
-    atomicWrite(receiptPath(paths), jsonBytes(partialHomes
-      ? { claim, version: receiptVersion, status: 'partial', retryable: true, homes: partialHomes, result }
+    partialHosts = partialHostSync(result);
+    atomicWrite(receiptPath(paths), jsonBytes(partialHosts
+      ? { claim, version: receiptVersion, status: 'partial', retryable: true, homes: result.homes, zcode: result.zcode, result }
       : { claim, version: receiptVersion, status: 'success', result }));
-    if (partialHomes === null) return result;
+    if (partialHosts === null) return result;
   } catch (error) {
     // Snapshot what the updater recorded before rollback replaces it, so the
     // receipt keeps the candidate and active evidence the retry will need.
@@ -187,13 +209,11 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     atomicWrite(receiptPath(paths), jsonBytes(receipt));
     throw error;
   }
-  // Reached only with a completed, verified activation whose home sync is
-  // partial.  The per-home facts stay actionable — in the error, the receipt,
-  // and the registry reconcileCodexHomes already persisted — and the public
-  // reconcile command finishes the remaining homes idempotently.
-  const notUpdated = partialHomes.homes
-    .filter((home) => home.status !== 'updated')
-    .map((home) => `${home.home}: ${home.status}${home.error ? ` (${home.error.code}: ${home.error.message})` : ''}`);
-  throw new CliError('CODEX_SYNC_PARTIAL',
-    `service activation completed at ${result?.active?.version || requestedVersion}, but Codex home reconciliation is partial — ${notUpdated.join('; ')}; run 'external-subagent reconcile' after fixing the listed homes`);
+  // Reached only with a completed, verified activation whose host binding
+  // sync is partial (AUD-003).  The per-host facts stay actionable — in the
+  // error, the receipt, and the per-host registries the reconcile owners
+  // already persisted — and the public reconcile command finishes the
+  // remaining hosts idempotently.  The activation itself stays published.
+  throw new CliError(partialHosts.zcodeFailed ? 'ZCODE_SYNC_PARTIAL' : 'CODEX_SYNC_PARTIAL',
+    `activation completed at ${result?.active?.version || requestedVersion}, but host binding reconciliation is partial — ${partialHosts.failures.join('; ')}; run 'external-subagent reconcile' after fixing the listed hosts`);
 }
