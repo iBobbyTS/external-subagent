@@ -3,9 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { CliError } from '../errors.mjs';
-import { atomicWrite, readOptional } from '../fs-atomic.mjs';
+import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
-import { pluginManifest, treeDigest, preparePluginStage } from './plugin-stage.mjs';
+import { pluginManifest, treeDigest, preparePluginStage, guardedRestores } from './plugin-stage.mjs';
 
 // Managed Codex binding.  The staging tree plus a local source marketplace are
 // the product-owned half; every installation/removal goes through the official
@@ -80,7 +80,10 @@ function updateMarketplace(file, staging) {
     return { marketplace: file, marketplace_name: doc.name || MARKETPLACE_NAME, entry: currentPath, digest: treeDigest(staging) };
   }
   doc.plugins.push(entry);
-  fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+  // atomicWrite, not a bare writeFileSync: a failed/partial write either
+  // lands whole or leaves the prior bytes untouched, so the rollback below
+  // never inherits a half-written manifest it might skip restoring.
+  atomicWrite(file, jsonBytes(doc));
   return { marketplace: file, marketplace_name: doc.name || MARKETPLACE_NAME, entry: rel, digest: treeDigest(staging) };
 }
 
@@ -179,18 +182,33 @@ export function installPlugin(paths, options = {}) {
   if (options.uninstall) return uninstallPlugin(paths, options);
   pluginManifest(source);
   const priorMarketplace = fs.existsSync(marketplace) ? fs.readFileSync(marketplace) : null;
+  const staged = preparePluginStage(source, staging, paths);
   // AUD-002: stage by validated replacement.  publish() is self-contained
   // (a failed copy/parse/swap never leaves the live tree moved or damaged);
   // every later failure rolls the marketplace back to its prior bytes and
-  // restores the prior coherent staging tree.
-  const staged = preparePluginStage(source, staging, paths);
+  // restores the prior coherent staging tree — each as an INDEPENDENT
+  // guarded attempt, so a restore that itself fails (a marketplace parent
+  // that stays read-only) neither skips the staging restore nor masks the
+  // original error, and the unrestored resources ride the thrown error.
+  const restoreStaging = () => {
+    if (!staged.restore()) {
+      throw new CliError('PLUGIN_STAGING_RESTORE_FAILED', `the prior staging tree could not be restored at ${staging}; the retained prior copy is left beside it as recovery material`);
+    }
+  };
+  const restoreMarketplace = () => restoreOptional(marketplace, priorMarketplace);
   let market;
   try {
     staged.publish();
     market = updateMarketplace(marketplace, staging);
   } catch (error) {
-    staged.restore();
-    throw error;
+    // The marketplace restore runs here too: updateMarketplace may already
+    // have written the managed entry (its write is atomic, but a later step
+    // in it can still fail), and those bytes must go back to the prior
+    // backup — foreign entries included — alongside the staging restore.
+    throw guardedRestores(error, [
+      { resource: marketplace, restore: restoreMarketplace },
+      { resource: staging, restore: restoreStaging },
+    ]);
   }
   // Explicitly configured marketplaces must be registered; the personal
   // default is implicit. Both registrations are idempotent in codex.
@@ -201,9 +219,10 @@ export function installPlugin(paths, options = {}) {
     add = runCodex(['plugin', 'add', PLUGIN_NAME, '--marketplace', market.marketplace_name, '--json'], cli);
     verifiedCache = verifyCodexCache(add, { codexHome, staging, marketplaceName: market.marketplace_name });
   } catch (error) {
-    if (priorMarketplace === null) fs.rmSync(marketplace, { force: true }); else fs.writeFileSync(marketplace, priorMarketplace, { mode: 0o600 });
-    staged.restore();
-    throw error;
+    throw guardedRestores(error, [
+      { resource: marketplace, restore: restoreMarketplace },
+      { resource: staging, restore: restoreStaging },
+    ]);
   }
   staged.complete();
   return {

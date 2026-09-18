@@ -4,7 +4,7 @@ import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
-import { pluginManifest, treeDigest, preparePluginStage } from './plugin-stage.mjs';
+import { pluginManifest, treeDigest, preparePluginStage, guardedRestores } from './plugin-stage.mjs';
 
 // Managed ZCode host binding.  ZCode has no headless CLI for plugin
 // management (the GUI drives internal IPC only), but its user config
@@ -149,9 +149,20 @@ export function installZcodePlugin(paths, options = {}) {
     staged.complete();
     return result;
   } catch (error) {
-    restoreOptional(config, prior.bytes);
-    staged.restore();
-    throw error;
+    // AUD-002: the config restore and the staging restore are INDEPENDENT
+    // guarded attempts.  A config parent that stays read-only fails the
+    // install write and then the config restore too, but that must neither
+    // skip the staging restore nor mask this original error; whatever could
+    // not be restored is attached to the thrown error instead of only being
+    // logged.
+    throw guardedRestores(error, [
+      { resource: config, restore: () => restoreOptional(config, prior.bytes) },
+      { resource: staging, restore: () => {
+        if (!staged.restore()) {
+          throw new CliError('PLUGIN_STAGING_RESTORE_FAILED', `the prior staging tree could not be restored at ${staging}; the retained prior copy is left beside it as recovery material`);
+        }
+      } },
+    ]);
   }
 }
 

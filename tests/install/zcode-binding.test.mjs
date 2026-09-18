@@ -280,6 +280,98 @@ test('a verification failure after commit restores the prior binding and tree (A
   }
 });
 
+// Real permission bits only bind for ordinary users; root bypasses them,
+// so the persistent-denial oracle below skips instead of pretending its
+// chmod verified anything.
+const notRoot = process.getuid?.() !== 0 ? false : 'permission bits are not enforced for root';
+
+// The AUD-002 reopened counterexample (audit 20260918-1319): the rollback
+// used to be a sequential chain, so a config parent that STAYS read-only
+// failed the config restore and thereby skipped the staging restore — the
+// command failed while the old binding's path silently held the NEW tree.
+// Both restores are now independent guarded attempts: the staging restore
+// must still run and succeed, the config keeps its exact prior bytes, and
+// the unrestored config is named on the thrown error, not just logged.
+test('a persistently read-only config parent still restores the prior staging tree and reports the unrestored config (AUD-002)', { skip: notRoot }, () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  const source = tempSource((dir) => fs.appendFileSync(path.join(dir, 'skills', 'external-subagent', 'SKILL.md'), '\ncandidate marker\n'));
+  const configParent = path.dirname(paths.zcodeConfig);
+  try {
+    installZcodePlugin(paths);
+    fs.writeFileSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    fs.chmodSync(configParent, 0o500);
+    let failure = null;
+    try { installZcodePlugin(paths, { source }); } catch (error) { failure = error; }
+    assert.ok(failure, 'the refresh must fail while the config parent is read-only');
+    assert.equal(failure.code, 'EACCES', 'the original install failure surfaces, not a secondary restore error');
+    assert.ok(Array.isArray(failure.restoreFailures), 'the error carries the unrestored-resource list');
+    assert.deepEqual(failure.restoreFailures.map((entry) => entry.resource), [paths.zcodeConfig], 'exactly the config restore is reported unrestored');
+    assert.equal(failure.restoreFailures[0].code, 'EACCES');
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the staging restore ran despite the denied config restore and returned the prior tree');
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the config keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'the restored prior tree leaves no sibling residue');
+  } finally {
+    fs.chmodSync(configParent, 0o700);
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+// The mirror image of the counterexample: when the restore that fails is
+// the STAGING one, the retained prior tree must survive as the last-good
+// recovery material (complete() must never run to delete it), and the
+// unrestored staging path must ride the original error.
+test('a failed staging restore keeps the retained prior tree and is reported on the error (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  try {
+    installZcodePlugin(paths);
+    fs.writeFileSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    // Two injections: fail the post-commit verification (2nd read of the
+    // staged `.mcp.json`), then fail restore()'s prior -> staging rename —
+    // identified by its source path, the retained prior sibling, so the
+    // injection cannot be confused with publish's own renames or the
+    // config rollback's atomic rename.
+    const realRead = fs.readFileSync;
+    const realRename = fs.renameSync;
+    const verifyTarget = path.join(paths.zcodePlugin, '.mcp.json');
+    let reads = 0;
+    fs.readFileSync = function injectedRead(file, ...rest) {
+      if (path.resolve(String(file)) === verifyTarget) {
+        reads += 1;
+        if (reads === 2) throw Object.assign(new Error('injected verify read failure'), { code: 'EIO' });
+      }
+      return realRead(file, ...rest);
+    };
+    fs.renameSync = function injectedRename(from, to) {
+      if (path.basename(String(from)).startsWith('.external-subagent.prior.')) {
+        throw Object.assign(new Error(`injected restore rename failure (${from} -> ${to})`), { code: 'EACCES' });
+      }
+      return realRename(from, to);
+    };
+    let failure = null;
+    try {
+      try { installZcodePlugin(paths); } catch (error) { failure = error; }
+    } finally {
+      fs.readFileSync = realRead;
+      fs.renameSync = realRename;
+    }
+    assert.ok(failure, 'the refresh must fail at the injected verification');
+    assert.equal(failure.code, 'EIO', 'the original verification failure surfaces, not a secondary restore error');
+    assert.deepEqual(failure.restoreFailures.map((entry) => entry.code), ['PLUGIN_STAGING_RESTORE_FAILED'], 'the failed staging restore is reported on the error');
+    assert.equal(failure.restoreFailures[0].resource, paths.zcodePlugin);
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the independent config restore still succeeded');
+    assert.equal(fs.existsSync(paths.zcodePlugin), false, 'the freshly published tree was discarded');
+    const siblings = fs.readdirSync(path.dirname(paths.zcodePlugin));
+    assert.equal(siblings.length, 1, 'exactly one retained tree remains beside the staging path');
+    assert.match(siblings[0], /^\.external-subagent\.prior\./u, 'the last-good prior copy is kept as recovery material');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a failed first install leaves no binding behind (AUD-002)', () => {
   const { home, paths } = fixture();
   try {

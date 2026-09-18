@@ -173,14 +173,21 @@ export function preparePluginStage(source, staging, paths, binding = {}) {
     // retained prior tree back (or remove the target entirely when this was
     // a first install).  Best-effort by design — the caller's original
     // failure is the one that must surface, so secondary cleanup errors
-    // here are suppressed rather than thrown.
+    // here are suppressed rather than thrown; the boolean return reports
+    // whether the pre-publish state was actually restored, so the caller
+    // can attach an unrestored staging tree to its error chain (AUD-002)
+    // instead of letting the failed restore pass silently.  A restore that
+    // cannot put the prior tree back never discards it: the retained
+    // sibling stays on disk as the last-good recovery material.
     restore() {
-      if (!published) return;
+      if (!published) return true;
+      const hadPrior = fs.existsSync(prior);
       discardTree(staging);
-      if (fs.existsSync(prior)) {
-        try { fs.renameSync(prior, staging); } catch { /* see the crash boundary */ }
+      if (hadPrior) {
+        try { fs.renameSync(prior, staging); } catch { /* prior stays at its sibling path; see the crash boundary */ }
       }
       published = false;
+      return hadPrior ? !fs.existsSync(prior) : !fs.existsSync(staging);
     },
     // Drop the retained prior tree once the host transaction committed; a
     // cleanup failure never fails a verified install.
@@ -196,4 +203,24 @@ export function stagePlugin(source, staging, paths, binding = {}) {
   const staged = preparePluginStage(source, staging, paths, binding);
   staged.publish();
   staged.complete();
+}
+
+// AUD-002: a failed install must still attempt every independent restore.
+// Each attempt runs guarded — one restore throwing (a host config or
+// marketplace parent that STAYS read-only, say) neither skips the remaining
+// restores nor replaces the caller's original error.  Attempts that failed
+// are attached to that error as `restoreFailures: [{ resource, code,
+// message }]`, so the unrestored-resource list rides the thrown error chain
+// where callers and tests can assert it; this is not a log line.
+export function guardedRestores(error, attempts) {
+  const restoreFailures = [];
+  for (const attempt of attempts) {
+    try {
+      attempt.restore();
+    } catch (restoreError) {
+      restoreFailures.push({ resource: attempt.resource, code: restoreError.code || 'RESTORE_FAILED', message: restoreError.message });
+    }
+  }
+  if (restoreFailures.length > 0) error.restoreFailures = restoreFailures;
+  return error;
 }

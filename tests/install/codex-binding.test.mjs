@@ -430,6 +430,196 @@ test('a failed codex refresh restores the prior staging tree and marketplace byt
   }
 });
 
+// Real permission bits only bind for ordinary users; root bypasses them,
+// so the persistent-denial oracles below skip instead of pretending their
+// chmod verified anything.
+const notRoot = process.getuid?.() !== 0 ? false : 'permission bits are not enforced for root';
+
+// The AUD-002 reopened counterexample, codex shape (catch one: the
+// publish/updateMarketplace transaction): a marketplace parent that STAYS
+// read-only fails the marketplace write and then the marketplace restore
+// too, but the staging restore is an independent attempt that must still
+// run and succeed, and the unrestored marketplace must be named on the
+// thrown error rather than inferred from logs.
+test('a persistently unwritable marketplace parent still restores the prior staging tree when the marketplace write fails (AUD-002)', { skip: notRoot }, () => {
+  const home = fixtureHome('external-subagent-market-locked-');
+  const fake = fakeCodexCli(home);
+  const { paths, options } = binding(home, { cli: fake.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  const marketParent = path.dirname(marketplace);
+  const source = tempSource((dir) => fs.appendFileSync(path.join(dir, 'skills', 'external-subagent', 'SKILL.md'), '\ncandidate marker\n'));
+  try {
+    installPlugin(paths, options);
+    fs.writeFileSync(path.join(staging, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(staging);
+    // Drop the managed entry so the refresh must REWRITE the marketplace,
+    // then keep the marketplace parent persistently read-only.
+    const doc = JSON.parse(fs.readFileSync(marketplace, 'utf8'));
+    doc.plugins = doc.plugins.filter((entry) => entry.name !== 'external-subagent');
+    fs.writeFileSync(marketplace, `${JSON.stringify(doc, null, 2)}\n`, { mode: 0o600 });
+    const marketBefore = fs.readFileSync(marketplace);
+    fs.chmodSync(marketParent, 0o500);
+    let failure = null;
+    try { installPlugin(paths, { ...options, source }); } catch (error) { failure = error; }
+    assert.ok(failure, 'the refresh must fail while the marketplace parent is read-only');
+    assert.equal(failure.code, 'EACCES', 'the original marketplace write failure surfaces, not a secondary restore error');
+    assert.ok(Array.isArray(failure.restoreFailures), 'the error carries the unrestored-resource list');
+    assert.deepEqual(failure.restoreFailures.map((entry) => entry.resource), [marketplace], 'exactly the marketplace restore is reported unrestored');
+    assert.equal(failure.restoreFailures[0].code, 'EACCES');
+    assert.deepEqual(snapshotTree(staging), treeBefore, 'the staging restore ran despite the denied marketplace restore and returned the prior tree');
+    assert.deepEqual(fs.readFileSync(marketplace), marketBefore, 'the marketplace keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(staging)), ['external-subagent'], 'the restored prior tree leaves no sibling residue');
+  } finally {
+    fs.chmodSync(marketParent, 0o700);
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+// The same persistent denial against the second catch (marketplace
+// registration / plugin add / cache verification): the primary failure is
+// the unverifiable cache, and the denied marketplace restore must neither
+// skip the staging restore nor replace the original error.
+test('a persistently unwritable marketplace parent still restores the prior staging tree when cache verification fails (AUD-002)', { skip: notRoot }, () => {
+  const home = fixtureHome('external-subagent-verify-locked-');
+  const goodDir = path.join(home, 'fake-good');
+  const lyingDir = path.join(home, 'fake-lying');
+  fs.mkdirSync(goodDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(lyingDir, { recursive: true, mode: 0o700 });
+  const good = fakeCodexCli(goodDir);
+  const lying = fakeCodexCli(lyingDir, { materialize: false });
+  const { paths, options } = binding(home, { cli: good.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  const marketParent = path.dirname(marketplace);
+  try {
+    const first = installPlugin(paths, options);
+    fs.writeFileSync(path.join(staging, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(staging);
+    const marketBefore = fs.readFileSync(marketplace);
+    // The cache disappears (codex-owned state this product never rewrites);
+    // the lying fake then reports a cache-less `plugin add` success on
+    // refresh, so verification must fail closed after the swap.
+    fs.rmSync(first.cache, { recursive: true, force: true });
+    fs.chmodSync(marketParent, 0o500);
+    let failure = null;
+    try { installPlugin(paths, { ...options, codexCli: lying.cli }); } catch (error) { failure = error; }
+    assert.ok(failure, 'the refresh must fail on the cache-less plugin-add success');
+    assert.equal(failure.code, 'CODEX_CACHE_UNVERIFIABLE', 'the original verification failure surfaces, not a secondary restore error');
+    assert.ok(Array.isArray(failure.restoreFailures), 'the error carries the unrestored-resource list');
+    assert.deepEqual(failure.restoreFailures.map((entry) => entry.resource), [marketplace], 'exactly the marketplace restore is reported unrestored');
+    assert.equal(failure.restoreFailures[0].code, 'EACCES');
+    assert.deepEqual(snapshotTree(staging), treeBefore, 'the staging restore ran despite the denied marketplace restore and returned the prior tree');
+    assert.deepEqual(fs.readFileSync(marketplace), marketBefore, 'the marketplace keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(staging)), ['external-subagent'], 'the restored prior tree leaves no sibling residue');
+  } finally {
+    fs.chmodSync(marketParent, 0o700);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// The codex analogue of the audit's zcode counterexample, pinned at the
+// exact sequential-skip symptom the base code produced.  The base catch #2
+// restored the marketplace IN PLACE (writeFileSync on the existing file),
+// which needs the file's own write bit — not parent-dir permission — so a
+// persistently read-only marketplace FILE made that restore throw EACCES
+// BEFORE staged.restore() ever ran: the command failed while the old
+// binding's staging silently held the NEW tree.  The file is denied for
+// that base path; the parent directory is denied as well because the
+// FIXED code replaces the manifest atomically (temp file beside the target
+// plus rename, which needs only parent-dir permission — a read-only file
+// alone would not stop it).
+test('a persistently read-only marketplace file cannot skip the staging restore when verification fails (AUD-002)', { skip: notRoot }, () => {
+  const home = fixtureHome('external-subagent-market-file-locked-');
+  const goodDir = path.join(home, 'fake-good');
+  const lyingDir = path.join(home, 'fake-lying');
+  fs.mkdirSync(goodDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(lyingDir, { recursive: true, mode: 0o700 });
+  const good = fakeCodexCli(goodDir);
+  const lying = fakeCodexCli(lyingDir, { materialize: false });
+  const { paths, options } = binding(home, { cli: good.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  const marketParent = path.dirname(marketplace);
+  try {
+    const first = installPlugin(paths, options);
+    fs.writeFileSync(path.join(staging, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(staging);
+    const marketBefore = fs.readFileSync(marketplace);
+    // The cache disappears (codex-owned state this product never rewrites);
+    // the lying fake then reports a cache-less `plugin add` success on
+    // refresh, so verification fails closed after the swap.
+    fs.rmSync(first.cache, { recursive: true, force: true });
+    fs.chmodSync(marketplace, 0o400);
+    fs.chmodSync(marketParent, 0o500);
+    let failure = null;
+    try { installPlugin(paths, { ...options, codexCli: lying.cli }); } catch (error) { failure = error; }
+    assert.ok(failure, 'the refresh must fail on the cache-less plugin-add success');
+    // THE BASE FAILURE POINT: with the restores chained, the denied
+    // marketplace restore skipped staged.restore() entirely and the staging
+    // path kept the freshly published candidate.
+    assert.deepEqual(snapshotTree(staging), treeBefore, 'the staging restore must run despite the denied marketplace restore');
+    assert.equal(failure.code, 'CODEX_CACHE_UNVERIFIABLE', 'the original verification failure surfaces, not the secondary restore denial');
+    assert.deepEqual(failure.restoreFailures.map((entry) => entry.resource), [marketplace], 'exactly the marketplace restore is reported unrestored');
+    assert.equal(failure.restoreFailures[0].code, 'EACCES');
+    assert.deepEqual(fs.readFileSync(marketplace), marketBefore, 'the marketplace keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(staging)), ['external-subagent'], 'the restored prior tree leaves no sibling residue');
+  } finally {
+    fs.chmodSync(marketplace, 0o600);
+    fs.chmodSync(marketParent, 0o700);
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// updateMarketplace now writes atomically, so a LATER failure inside it
+// (here: the post-write tree digest) must still roll the already-written
+// managed marketplace content back to the prior backup bytes — foreign
+// entries intact — alongside the staging restore, with the original error
+// unmasked and no unrestored resources to report.
+test('a marketplace write that succeeded before a later failure rolls back to the prior bytes with foreign entries intact (AUD-002)', () => {
+  const home = fixtureHome('external-subagent-market-rollback-');
+  const fake = fakeCodexCli(home);
+  const { paths, options } = binding(home, { cli: fake.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  fs.mkdirSync(path.dirname(marketplace), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(marketplace, `${JSON.stringify({
+    name: 'personal',
+    interface: { displayName: 'Personal' },
+    plugins: [{ name: 'other-tool', source: { source: 'local', path: './plugins/other-tool' }, policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' }, category: 'Productivity' }],
+  }, null, 2)}\n`, { mode: 0o600 });
+  const foreignOnly = fs.readFileSync(marketplace);
+  try {
+    // Fail the first read of the published tree's SKILL.md — the tree digest
+    // inside updateMarketplace, i.e. AFTER the managed entry was written.
+    const realRead = fs.readFileSync;
+    const skillAt = path.join(staging, 'skills', 'external-subagent', 'SKILL.md');
+    fs.readFileSync = function injectedRead(file, ...rest) {
+      if (path.resolve(String(file)) === skillAt) {
+        throw Object.assign(new Error('injected tree digest failure'), { code: 'EIO' });
+      }
+      return realRead(file, ...rest);
+    };
+    let failure = null;
+    try {
+      try { installPlugin(paths, options); } catch (error) { failure = error; }
+    } finally {
+      fs.readFileSync = realRead;
+    }
+    assert.ok(failure, 'the install must fail at the injected digest read');
+    assert.equal(failure.code, 'EIO', 'the original digest failure surfaces');
+    assert.equal(failure.restoreFailures, undefined, 'both restores succeeded, so nothing is reported unrestored');
+    assert.deepEqual(fs.readFileSync(marketplace), foreignOnly, 'the managed entry is rolled back to the prior bytes and the foreign entry survives');
+    assert.equal(fs.existsSync(staging), false, 'the first install leaves no staging tree behind');
+    assert.deepEqual(fs.readdirSync(path.dirname(staging)), [], 'no candidate or prior residue remains');
+    // The failure predates every codex side effect: only the --help probe ran.
+    assert.ok(invocations(fake.log).every((call) => call.args.includes('--help')), 'no marketplace registration or plugin add happened');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('uninstall uses the verified name@marketplace removal form', () => {
   const home = fixtureHome('external-subagent-remove-');
   const fake = fakeCodexCli(home);
