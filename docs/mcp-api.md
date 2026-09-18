@@ -40,8 +40,10 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | 工具清单、输入、输出、注册和错误映射 | [mcp.rs](../crates/external-daemon/src/mcp.rs)：`PUBLIC_TOOLS`、`SubagentMcp`、各 `Agent*Input/Output` |
 | 分页、等待、消息、请求响应的实际语义 | [rpc.rs](../crates/external-daemon/src/rpc.rs)：`RpcService`、`paged_text_bounds` |
 | 仓库和写入范围约束 | [general.rs](../crates/external-core/src/general.rs)：`canonical_general_repository`、`validate_manifest`、`validate_write_scope` |
-| 静态公共契约摘要 | [zcode-subagent-public-api.json](../schema/zcode-subagent-public-api.json) |
+| 静态公共契约摘要 | [external-subagent-public-api.json](../schema/external-subagent-public-api.json) |
 | observe 的完整输出 schema | [zas-observation-v1.1.schema.json](../schema/zas-observation-v1.1.schema.json) |
+
+兼容性说明：`zas-observation-v1.1.schema.json` 的文件名与 observe 内部序列化信封标识 `zas-observation/1.1` 来自项目前身（zcode-as-subagent），作为既有生产者/消费者依赖的序列化契约**有意保留**；只有面向人的显示标题已改为中性名称。`zcode_session_id`、`ZCODE_AGENTD_SOCKET` 等存储/线路/环境字面量同理，不随品牌清理改名。
 
 `tools/list` 的输入和输出 schema 主要由 Rust 类型生成；输出 schema 接受成功对象或公共错误对象。静态公共契约 JSON 不是全部运行时 schema 的完整副本。
 
@@ -128,7 +130,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `max_rpc_request_frame_bytes` | integer | 发送较长 prompt 时了解内部 RPC 帧上限 | 更容易超过边界；该值不是正文可用字节数 |
 | `max_rpc_response_frame_bytes` | integer | 评估有界响应；包含编码和元数据开销 | 只能猜测响应容量 |
 | `max_wait_ms` | integer | 设置 wait 前了解最大等待毫秒数 | 需硬编码；注意输入 `wait_time` 是秒 |
-| `maturity` | map<string, enum> | 诊断：按能力区分成熟程度 | 无法区分已验证与实验能力 |
+| `maturity` | map<string, enum> | 诊断：按能力区分成熟程度（保留字段；见下方现状说明） | 无法区分已验证与实验能力 |
 | `observation` | object | 汇总 observe 能力说明 | 失去观测配置发现入口 |
 | `observation.public_reasoning_default` | boolean | 判断默认是否收集公开推理 | 难以解释推理字段为空；true 也不保证每次有数据 |
 | `observation.defaults` | object | 承载默认观测窗口 | 客户端需固定假设窗口 |
@@ -136,7 +138,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `observation.defaults.recent_calls_per_tool` | integer | 理解每类最近调用上限，当前 5 | 易把窗口当成完整历史 |
 | `observation.defaults.reasoning_chars` | integer | 理解推理字符窗口，当前 200 | 易把尾部片段当成全文 |
 
-`maturity` 值：`beta_ready | experimental_unverified_runtime`。map 的键为能力名称，不应推断固定键集合。
+`maturity` 值：`beta_ready | experimental_unverified_runtime`。map 的键为能力名称，不应推断固定键集合。**现状**：生产实现的 `agent_capabilities` 当前始终返回空 map（`{}`）——没有任何能力被分级，该枚举只在类型与测试夹具中出现。字段作为保留的诊断契约存在；消费者不得依赖任何条目，文档也不据此声称某能力“已验证/实验”。
 
 ### 4.3 subagents[]
 

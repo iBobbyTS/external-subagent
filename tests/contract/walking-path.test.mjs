@@ -10,7 +10,7 @@ const root = path.resolve(import.meta.dirname, '../..');
 const cli = path.join(root, 'bin/external-subagent.mjs');
 
 test('public schema matches the external MCP tool namespace', async () => {
-  const schema = JSON.parse(await fs.readFile(path.join(root, 'schema/zcode-subagent-public-api.json'), 'utf8'));
+  const schema = JSON.parse(await fs.readFile(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
   const names = schema.properties.tools.const;
   assert.equal(names.every((name) => name.startsWith('external_subagent_')), true);
   assert.equal(JSON.stringify(schema).includes('zcode_subagent_'), false);

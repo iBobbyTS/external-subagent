@@ -1,6 +1,6 @@
 # external-subagent 产品说明
 
-`external-subagent` 为 Codex 提供受工作区约束的外部会话生命周期管理，当前支持 ZCode 与 DeepSeek Harness（DSH）两个上游。产品边界是本地 npm 包、daemon、MCP facade 和受管宿主 plugin（Codex / ZCode），不负责安装或升级上游 provider 本体。
+`external-subagent` 是一个本地服务，管理工作区约束的外部会话生命周期并通过 MCP 暴露。调用方（`host`）与执行目标（`subagent`）是两个独立维度：本机任意 MCP client（Codex、ZCode 或自定义 client）都可以作为 host 调用；当前支持 ZCode、DeepSeek Harness（DSH）与 Codex 三个 subagent 上游。产品边界是本地 npm 包、daemon、MCP facade 和受管宿主 plugin（Codex / ZCode），不负责安装或升级上游 provider 本体。各 subagent 的实际能力限制见下文“实际能力限制”与 [mcp-api.md](mcp-api.md)。
 
 ## 角色与实例模型
 
@@ -32,27 +32,34 @@
 node scripts/release/build-native-payload.mjs
 npm pack
 npm install -g external-subagent-0.1.0.tgz
-external-subagent init --codex-home "$HOME/.codex"
+external-subagent init
+external-subagent install-plugin codex   # 可选：显式绑定 Codex 宿主（或 install-plugin zcode / install-mcp）
 ```
 
-普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它会校验 payload，写入产品配置和 LaunchAgent，安装并启用 `external-subagent@personal` Codex plugin，登记 Codex home，并发布 active/retained payload 基线。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
+普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它只安装独立的 daemon 服务：校验 payload，报告 PATH 发现与固定 ZCode runtime 的存在性观察（不做探测），写入产品配置和 LaunchAgent，启动服务，并发布 active/retained payload 基线——不安装任何宿主 plugin，不登记 Codex home，不触碰 `~/.codex`。宿主绑定由 `init` 之后的显式命令完成（`install-plugin codex|zcode` 或 `install-mcp` 的直接 TOML binding）。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
 
 ## Provider 配置
 
-ZCode 默认使用本机固定 runtime。DSH 必须通过公开配置命令启用，并提供完整的 runtime、home、profile 和版本：
+ZCode 默认启用并使用本机固定 runtime。DSH 必须通过公开配置命令启用，并提供完整的 runtime、home、profile 和版本（配置键使用 schema-2 的 `subagents.*` 前缀；旧的 `agents.*` 键已被拒绝）：
 
 ```sh
-external-subagent config set agents.zcode.enabled true
-external-subagent config set agents.zcode.spawn_supported true
-external-subagent config set agents.dsh.enabled true
-external-subagent config set agents.dsh.spawn_supported true
-external-subagent config set agents.dsh.runtime_path /opt/homebrew/bin/dsh
-external-subagent config set agents.dsh.home "$HOME/.dsh"
-external-subagent config set agents.dsh.profile acp
-external-subagent config set agents.dsh.version 0.1.5-rc.1
+external-subagent config set subagents.dsh.enabled true
+external-subagent config set subagents.dsh.spawn_supported true
+external-subagent config set subagents.dsh.runtime_path /opt/homebrew/bin/dsh
+external-subagent config set subagents.dsh.home "$HOME/.dsh"
+external-subagent config set subagents.dsh.profile acp
+external-subagent config set subagents.dsh.version 0.1.5-rc.1
 ```
 
 DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 指定 model 会被明确拒绝。
+
+## 实际能力限制（来自已验收代码）
+
+- `zcode`：默认启用且支持 spawn；四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
+- `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。
+- `codex`（作为 subagent）：默认禁用；只接受只读 `plan`（写入模式在送出 prompt 前即被拒绝）。
+- `observe`：已验证的公开推理只在 zcode 任务上存在；对非 zcode 任务调用 observe 会以 `unavailable` 如实报错。
+- MCP `status` 只携带路由／能力／就绪结论；部署身份、配置版本、适配器传输细节和逐 scope 探测证据属于操作员诊断，经 CLI `diagnose` 读取。
 
 ## CLI 生命周期
 
@@ -71,9 +78,9 @@ external-subagent close --json '{"agent_id":10000000}'
 
 完整工具与字段说明见 [MCP 工具与字段设计说明](mcp-api.md)，包含每个参数的使用时机、必填条件、默认值和省略／移除影响。
 
-内置 `codex` host 只负责宿主集成：支持两种安装方式。初始化或显式执行
+内置 `codex` host 只负责宿主集成：支持两种安装方式。显式执行
 `install-plugin`（等价 `install-plugin codex`）会调用官方 Codex CLI，将受管 plugin 安装到
-`$CODEX_HOME/plugins/cache`，并通过本地 marketplace 注册；`install-mcp` 则写入
+`$CODEX_HOME/plugins/cache`，并通过本地 marketplace 注册（`init` 不做任何宿主绑定）；`install-mcp` 则写入
 直接的 TOML MCP binding。两种方式都连接同一个 MCP facade，并由 Codex host 的
 home 绑定参与后续自动升级协调。任意 `custom` host 无需执行这些安装步骤，可直接
 连接 facade。

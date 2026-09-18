@@ -114,7 +114,10 @@ pub struct AgentObserveOutput {
 
 impl JsonSchema for AgentObserveOutput {
     fn schema_name() -> Cow<'static, str> {
-        "ZAS suspicion-only observation 4.3.1".into()
+        // Display name only: the serialized observation envelope stays the
+        // historical `zas-observation/1.1` wire identifier (rationale
+        // registered in docs/mcp-api.md).
+        "external-subagent suspicion-only observation".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {

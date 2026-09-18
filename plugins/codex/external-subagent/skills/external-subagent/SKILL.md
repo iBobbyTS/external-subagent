@@ -28,3 +28,16 @@ Codex home instances, and offers plugin or direct MCP bindings; built-in
 `host.zcode` binds this same plugin through the ZCode config's inline plugin
 dirs with a single per-user instance. This is separate
 from `subagent.codex`. Protocol implementations are adapters.
+
+Actual per-subagent limitations (from the accepted code):
+
+- `zcode` — enabled and spawn-supported by default; all four permission modes
+  (build/edit/plan/yolo); an explicit spawn `model` is rejected
+  (`model_selection_unsupported`).
+- `dsh` — disabled until explicitly enabled and configured
+  (`runtime_path`/`home`/`profile`/`version`); admits only `build` and strict
+  `plan`.
+- `codex` — disabled by default; read-only `plan` only (write modes are
+  refused before the prompt).
+- `observe` — verified public reasoning exists only for zcode tasks; observe
+  on a non-zcode task truthfully errors `unavailable`.

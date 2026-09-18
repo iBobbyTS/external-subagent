@@ -61,36 +61,42 @@ Every state-changing action belongs to an explicit `init`:
 
 ```
 external-subagent init [--dry-run] [--resume] [--install-hooks]
-    [--skip-runtime-probe] [--skip-codex-plugin] [--skip-service-start]
-    [--codex-home <path>]
+    [--skip-service-start]
 ```
 
-`init` steps, in order: verify the staged payload (manifest, digest, mode
-755, Mach-O arm64, version agreement between payload/package/CLI), probe the
-fixed ZCode runtime, report PATH findings (never write profiles), create the
+`init` installs the standalone daemon service only. Its steps, in order:
+verify the staged payload (manifest, digest, mode 755, Mach-O arm64,
+version agreement between payload/package/CLI), report PATH findings (never
+write profiles) and an honest fixed-ZCode-runtime observation
+(`runtime: {path, present}` — never a probe that can fail setup), create the
 private data/log directories, write the product config, install the
-LaunchAgent, bootstrap the service, stage and register the managed Codex
-plugin, claim the Codex home in the D08 registry, and — after all of that —
-publish the verified active payload with its retained byte-for-byte copy
-under product data, so a successful `init` itself establishes the version and
-retention baseline for every later upgrade. The publication reuses the locked
-update owner (same verification, retention, and lock rules as `update`), so
-the standard sequence `npm A → init A → use A → npm B` never depends on an
-extra "A update" step. `--resume` continues
-after an environmental failure using the step journal; failures roll tracked
-files back — including the product-owned Codex artifacts (staging tree,
-marketplace manifest, and directories the run created) and the baseline the
-same run published — while never undoing the official codex cache — so a
-partial install never looks complete.
+LaunchAgent, bootstrap the service, and — after all of that — publish the
+verified active payload with its retained byte-for-byte copy under product
+data, so a successful `init` itself establishes the version and retention
+baseline for every later upgrade. The publication reuses the locked update
+owner (same verification, retention, and lock rules as `update`), so the
+standard sequence `npm A → init A → use A → npm B` never depends on an extra
+"A update" step. `--resume` continues after an environmental failure using
+the step journal; failures roll tracked files back — including the product
+configuration, the LaunchAgent, and the baseline the same run published — so
+a partial install never looks complete.
+
+`init` binds no host. The retired `--skip-runtime-probe`,
+`--skip-codex-plugin`, and `--codex-home` flags are rejected with an
+explanatory error (there is no runtime probe to skip, init never touches
+Codex state, and a host home is chosen by the explicit install commands):
+bind a host afterwards with `install-plugin codex|zcode` or `install-mcp`.
 
 Missing DSH never blocks installation; `subagents status` reports it explicitly
 (`enabled=false`, `spawn_supported=false`, scope states `UNKNOWN`) and the
 product never installs subagent runtimes itself.
 
 When DSH is explicitly enabled, configure its `runtime_path`, `home`, `profile`,
-and pinned `version` through the public config command. `init` writes those
-values into the LaunchAgent environment, and the DSH adapter consumes and
-validates the profile/version rather than relying on the interactive shell.
+and pinned `version` through the public config command. The service template
+forwards those values into the LaunchAgent environment whenever the plist is
+(re-)rendered — `init`, `update`, and `reconcile` re-render it — and the DSH
+adapter consumes and validates the profile/version rather than relying on the
+interactive shell.
 
 ## PATH behavior
 
@@ -155,10 +161,12 @@ The plist template is documented in
 (with an absolute MCP entry and the daemon socket) and registers a local
 source marketplace before invoking the official codex CLI (see the
 compatibility doc). The plugin manifest's `version` is codex's machine-global
-cache identity (`plugin@marketplace@version`): every released candidate must
-carry its own version (`0.1.1` from the productization closeout onward), or a
-home sharing that identity silently receives another installation's cached
-bytes. Existing marketplace entries and Codex config are never
+cache identity (`plugin@marketplace@version`): it is deliberately independent
+of the package version (whose single source is `package.json`) and every
+released candidate must carry its own version (`0.1.1` from the
+productization closeout onward, currently `0.1.2`), or a home sharing that
+identity silently receives another installation's cached bytes. Existing
+marketplace entries and Codex config are never
 overwritten; drift or foreign ownership is rejected (`PLUGIN_STAGING_CONFLICT`,
 `PLUGIN_MARKETPLACE_CONFLICT`). `install-mcp` provides the alternative direct
 TOML binding with the same ten-tool surface.
@@ -208,9 +216,10 @@ stranding a running daemon without its definition. Product data, subagent
 credentials, and the legacy zcode-as-subagent installation are always
 retained; the managed Codex plugin and MCP binding are removed separately by
 `install-plugin --uninstall` / `install-mcp --uninstall`. After `npm remove`
-and a later reinstall, `init` reclaims the Codex home and restores the
-service from the retained data (configuration and database survive
-byte-for-byte; only the service config revision advances).
+and a later reinstall, `init` restores the service from the retained data
+(configuration and database survive byte-for-byte; only the service config
+revision advances), and `install-plugin` reclaims the Codex home
+explicitly.
 
 A `restore` replaces the product data directory wholesale while a daemon from
 the previous data is still running; that daemon keeps serving its old socket

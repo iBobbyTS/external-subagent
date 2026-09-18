@@ -87,6 +87,11 @@ function treeDigest(dir) {
 }
 const bridgeDigest = (target) => (fs.statSync(target).isDirectory() ? treeDigest(target) : sha256(fs.readFileSync(target)));
 
+// The fake codex CLI materializes the plugin cache like the real one (the
+// staged tree copied under plugins/cache/<marketplace>/<plugin>/<manifest
+// version> in CODEX_HOME, version taken from the staged manifest rather than
+// hardcoded) so installPlugin's read-back cache verification passes for the
+// explicit host binding below and for the update-time home rebind.
 function fakeCodexCli(directory) {
   const log = path.join(directory, 'codex-invocations.jsonl');
   const script = path.join(directory, 'codex');
@@ -95,15 +100,33 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 const log = process.env.FAKE_CODEX_LOG || path.join(path.dirname(fileURLToPath(import.meta.url)), 'codex-invocations.jsonl');
+const stateDir = path.dirname(log);
+const rootsFile = path.join(stateDir, 'marketplace-roots.json');
 const args = process.argv.slice(2);
 fs.appendFileSync(log, JSON.stringify({ args, codex_home: process.env.CODEX_HOME }) + '\\n');
 const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
+const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
 if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
-if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') { text({ marketplaceName: 'personal', installedRoot: args[3], alreadyAdded: false }); process.exit(0); }
+if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
+  const roots = loadRoots();
+  roots[process.env.CODEX_HOME] = args[3];
+  fs.writeFileSync(rootsFile, JSON.stringify(roots));
+  text({ marketplaceName: 'personal', installedRoot: args[3], alreadyAdded: false });
+  process.exit(0);
+}
 if (args[0] === 'plugin' && args[1] === 'add') {
   const name = args[2]; const marketplace = args[args.indexOf('--marketplace') + 1];
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version: '0.1.0',
-    installedPath: path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, '0.1.0'), authPolicy: 'ON_INSTALL' });
+  const root = loadRoots()[process.env.CODEX_HOME];
+  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
+  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
+  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
+  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
+  fs.rmSync(cache, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.cpSync(staging, cache, { recursive: true });
+  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version,
+    installedPath: cache, authPolicy: 'ON_INSTALL' });
   process.exit(0);
 }
 if (args[0] === 'plugin' && args[1] === 'remove') {
@@ -399,16 +422,28 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.equal(installedState.active.daemon_entry_sha256, shaA, 'the baseline daemon digest is the verified vA payload digest');
     assert.ok(fs.existsSync(path.join(paths().data, 'payload-store', VERSION_A, 'external-subagentd')), 'init retains the verified vA bytes before any update runs');
 
-    // Dual-provider daemon configuration through the product config owner,
-    // then re-render the plist so the service env matches production shape.
+    // Dual-provider daemon configuration through the product config owner in
+    // the canonical schema-2 shape (the legacy `agents` map has been rejected
+    // by validateConfig since schema-2 landed), then re-render the plist so
+    // the service env matches production shape.
     const configured = readConfig(paths().config);
     writeConfig(paths().config, {
       ...configured,
-      agents: {
+      subagents: {
         zcode: { enabled: true, spawn_supported: true, default_model: null },
         dsh: { enabled: true, spawn_supported: true, default_model: null, runtime_path: DSH_RUNTIME, home: dshHome, profile: 'acp', version: DSH_VERSION },
       },
     });
+
+    // init binds no host (S05/D1): claim the Codex home explicitly through
+    // the fake codex CLI so the update below performs a real home rebind.
+    // install-plugin prints its result flat in the CLI envelope (no
+    // `.result` wrapper), unlike the daemon commands the cli() helper reads.
+    const bindHostRun = run(cliBin(), ['install-plugin'], { env: childEnv(), timeout: 120_000 });
+    assert.equal(bindHostRun.status, 0, `install-plugin failed: ${bindHostRun.stderr || bindHostRun.stdout}`);
+    const bindHost = JSON.parse(bindHostRun.stdout);
+    assert.equal(bindHost.installed, true);
+    assert.equal(bindHost.cache_verified, true);
 
     // ---- load the REAL vA service straight from the init-published baseline
     const up = runDriver('service-up', [], { mode: 'service-up', timeout: 120_000 });

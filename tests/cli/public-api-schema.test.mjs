@@ -6,7 +6,7 @@ import test from 'node:test';
 const root = path.resolve(import.meta.dirname, '../..');
 
 test('packaged public schema is the reduced external_subagent catalog', () => {
-  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/zcode-subagent-public-api.json'), 'utf8'));
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
   assert.deepEqual(schema.properties.tools.const, [
     'external_subagent_cancel', 'external_subagent_close', 'external_subagent_list',
     'external_subagent_observe', 'external_subagent_wait', 'external_subagent_respond', 'external_subagent_result',

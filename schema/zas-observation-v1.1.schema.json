@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ZAS suspicion-only observation 4.3.1",
+  "title": "external-subagent suspicion-only observation",
   "type": "object",
   "additionalProperties": false,
   "required": ["tools", "reasoning", "coverage"],
