@@ -4,7 +4,7 @@ import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
-import { pluginManifest, treeDigest, stagePlugin } from './plugin-stage.mjs';
+import { pluginManifest, treeDigest, preparePluginStage } from './plugin-stage.mjs';
 
 // Managed ZCode host binding.  ZCode has no headless CLI for plugin
 // management (the GUI drives internal IPC only), but its user config
@@ -123,8 +123,13 @@ export function installZcodePlugin(paths, options = {}) {
       throw new CliError('ZCODE_PLUGIN_CONFLICT', `another ${PLUGIN_NAME} plugin directory is already registered in plugins.dirs (${entry})`);
     }
   }
-  const priorStagingExisted = fs.existsSync(staging);
-  stagePlugin(source, staging, paths, zcodeMcpBinding(staging));
+  // AUD-002: stage by validated replacement.  publish() is self-contained,
+  // so unlike the overlay staging it used to be, a failed copy/parse/swap
+  // never damages the live managed tree; everything that can fail after the
+  // swap stays inside the config transaction below, whose rollback restores
+  // both the prior config bytes and the prior coherent tree.
+  const staged = preparePluginStage(source, staging, paths, zcodeMcpBinding(staging));
+  staged.publish();
   try {
     const next = structuredClone(prior.doc);
     next.plugins ??= {};
@@ -141,10 +146,11 @@ export function installZcodePlugin(paths, options = {}) {
     if (prior.doc.plugins?.enabled === false) {
       result.warning = 'plugins.enabled is false in the ZCode config; the binding will not load until plugins are enabled';
     }
+    staged.complete();
     return result;
   } catch (error) {
     restoreOptional(config, prior.bytes);
-    if (!priorStagingExisted) fs.rmSync(staging, { recursive: true, force: true });
+    staged.restore();
     throw error;
   }
 }

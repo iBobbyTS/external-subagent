@@ -45,6 +45,32 @@ function fixture({ config } = {}) {
 const readConfig = (paths) => JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
 const stagedServer = (paths) => JSON.parse(fs.readFileSync(path.join(paths.zcodePlugin, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
 
+// Byte snapshot of every regular file under a root, so last-good-tree
+// claims compare real bytes instead of mere file existence.
+function snapshotTree(root) {
+  const files = new Map();
+  if (!fs.existsSync(root)) return files;
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) files.set(path.relative(root, full), fs.readFileSync(full));
+    }
+  };
+  walk(root);
+  return files;
+}
+
+// Throwaway copy of the shipped plugin source a test can mutate (delete a
+// skill, corrupt `.mcp.json`, make a file unreadable) without touching the
+// repository tree.
+function tempSource(tweak) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-source-'));
+  fs.cpSync(pluginSourceRoot(), dir, { recursive: true });
+  if (tweak) tweak(dir);
+  return dir;
+}
+
 test('install stages the plugin tree and registers one inline dirs entry, preserving foreign config keys', () => {
   const { home, paths } = fixture({ config: foreignConfig() });
   try {
@@ -88,6 +114,183 @@ test('reinstall is idempotent and refreshes tampered staging bytes from the sour
     const second = readConfig(paths);
     assert.deepEqual(second.plugins.dirs, first.plugins.dirs, 'reinstall never duplicates the dirs entry');
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// AUD-002 regression oracles: staging publishes by validated REPLACEMENT,
+// never by overlaying the live managed tree.  A skill deleted from the
+// source disappears from the published tree, unrelated user files beside
+// the staging survive, and no candidate/prior sibling residue is left.
+test('refresh publishes a replacement tree: deleted source files disappear and unrelated files survive (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  const source = tempSource();
+  try {
+    const parent = path.dirname(paths.zcodePlugin);
+    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(parent, 'unrelated-user-file.txt'), 'keep me');
+    installZcodePlugin(paths, { source });
+    assert.equal(fs.existsSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md')), true, 'the file is staged on first install');
+    fs.rmSync(path.join(source, 'skills', 'external-subagent', 'SKILL.md'));
+    const removed = path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md');
+    const result = installZcodePlugin(paths, { source });
+    assert.equal(result.installed, true);
+    assert.equal(fs.existsSync(removed), false, 'a file deleted from the source disappears from the published tree');
+    const server = stagedServer(paths);
+    assert.equal(server.command, process.execPath, 'the replacement tree still carries the final binding paths');
+    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket);
+    assert.equal(fs.readFileSync(path.join(parent, 'unrelated-user-file.txt'), 'utf8'), 'keep me', 'unrelated files beside the staging survive the swap');
+    assert.deepEqual(fs.readdirSync(parent).sort(), ['external-subagent', 'unrelated-user-file.txt'], 'no candidate or prior sibling residue remains');
+    assert.equal(readConfig(paths).plugins.dirs.length, 1, 'the binding stays a single entry');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+test('an invalid MCP JSON candidate never reaches the live tree (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  const source = tempSource((dir) => fs.writeFileSync(path.join(dir, '.mcp.json'), '{ not valid json'));
+  try {
+    installZcodePlugin(paths);
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    assert.throws(() => installZcodePlugin(paths, { source }), (error) => {
+      assert.equal(error.code, 'INVALID_PLUGIN_SOURCE');
+      assert.match(error.message, /not readable JSON/u);
+      return true;
+    });
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the last good tree keeps its exact bytes');
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the host config is untouched');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'the rejected candidate leaves no sibling residue');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+test('a copy failure preserves the prior tree and leaves no residue (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  const source = tempSource((dir) => fs.chmodSync(path.join(dir, 'skills', 'external-subagent', 'SKILL.md'), 0o000));
+  try {
+    installZcodePlugin(paths);
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    assert.throws(() => installZcodePlugin(paths, { source }), (error) => error.code === 'EACCES');
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the prior tree keeps its exact bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'the failed copy leaves no candidate residue');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.chmodSync(path.join(source, 'skills', 'external-subagent', 'SKILL.md'), 0o644);
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+test('a failed publish swap restores the prior tree in place (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  try {
+    installZcodePlugin(paths);
+    // Make the last good tree distinguishable from the candidate the next
+    // install will try to swap in.
+    fs.writeFileSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    // Inject a failure into the swap's second rename (candidate -> target),
+    // after the live tree has already moved to its retained prior sibling.
+    const realRename = fs.renameSync;
+    let renames = 0;
+    fs.renameSync = function injected(from, to) {
+      renames += 1;
+      if (renames === 2) throw Object.assign(new Error(`injected swap failure (${from} -> ${to})`), { code: 'EACCES' });
+      return realRename(from, to);
+    };
+    try {
+      assert.throws(() => installZcodePlugin(paths), (error) => error.code === 'EACCES');
+    } finally {
+      fs.renameSync = realRename;
+    }
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the prior tree is back at the staging path after the failed swap');
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the host config was never reached');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'the failed swap leaves no candidate or prior residue');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a host config failure after publish restores the prior binding and tree (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  try {
+    installZcodePlugin(paths);
+    fs.writeFileSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    // Fail exactly the first config write after the swap; the rollback's own
+    // write (restoring the prior bytes) must still go through.
+    const realWrite = fs.writeFileSync;
+    let injected = false;
+    fs.writeFileSync = function injectedWrite(file, ...rest) {
+      if (!injected && path.dirname(path.resolve(String(file))) === path.dirname(paths.zcodeConfig)) {
+        injected = true;
+        throw Object.assign(new Error('injected config write failure'), { code: 'EACCES' });
+      }
+      return realWrite(file, ...rest);
+    };
+    try {
+      assert.throws(() => installZcodePlugin(paths), (error) => error.code === 'EACCES');
+    } finally {
+      fs.writeFileSync = realWrite;
+    }
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the prior managed tree is restored byte-for-byte');
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the host config keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'no candidate or prior residue remains');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a verification failure after commit restores the prior binding and tree (AUD-002)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  try {
+    installZcodePlugin(paths);
+    fs.writeFileSync(path.join(paths.zcodePlugin, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(paths.zcodePlugin);
+    const configBefore = fs.readFileSync(paths.zcodeConfig);
+    // Fail the staged `.mcp.json` read inside verifyZcodeBinding.  The first
+    // read of that path is the prepare-time ownership probe (allowed); the
+    // second is the post-commit verification.
+    const realRead = fs.readFileSync;
+    const verifyTarget = path.join(paths.zcodePlugin, '.mcp.json');
+    let reads = 0;
+    fs.readFileSync = function injectedRead(file, ...rest) {
+      if (path.resolve(String(file)) === verifyTarget) {
+        reads += 1;
+        if (reads === 2) throw Object.assign(new Error('injected verify read failure'), { code: 'EIO' });
+      }
+      return realRead(file, ...rest);
+    };
+    try {
+      assert.throws(() => installZcodePlugin(paths), (error) => error.code === 'EIO');
+    } finally {
+      fs.readFileSync = realRead;
+    }
+    assert.deepEqual(snapshotTree(paths.zcodePlugin), treeBefore, 'the prior managed tree is restored byte-for-byte');
+    assert.deepEqual(fs.readFileSync(paths.zcodeConfig), configBefore, 'the host config is rolled back to its prior bytes');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), ['external-subagent'], 'no candidate or prior residue remains');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a failed first install leaves no binding behind (AUD-002)', () => {
+  const { home, paths } = fixture();
+  try {
+    fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true, mode: 0o700 });
+    fs.chmodSync(path.dirname(paths.zcodeConfig), 0o500);
+    assert.throws(() => installZcodePlugin(paths), (error) => error.code === 'EACCES');
+    assert.equal(fs.existsSync(paths.zcodePlugin), false, 'no staging tree is left behind');
+    assert.equal(fs.existsSync(paths.zcodeConfig), false, 'no config binding is left behind');
+    assert.deepEqual(fs.readdirSync(path.dirname(paths.zcodePlugin)), [], 'no candidate or prior residue remains');
+  } finally {
+    fs.chmodSync(path.dirname(paths.zcodeConfig), 0o700);
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

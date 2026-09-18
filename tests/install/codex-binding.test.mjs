@@ -109,6 +109,31 @@ function invocations(log) {
   return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
+// Byte snapshot of every regular file under a root, so last-good-tree
+// claims compare real bytes instead of mere file existence.
+function snapshotTree(root) {
+  const files = new Map();
+  if (!fs.existsSync(root)) return files;
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) files.set(path.relative(root, full), fs.readFileSync(full));
+    }
+  };
+  walk(root);
+  return files;
+}
+
+// Throwaway copy of the shipped plugin source a test can mutate without
+// touching the repository tree.
+function tempSource(tweak) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-source-'));
+  fs.cpSync(pluginSourceRoot(), dir, { recursive: true });
+  if (tweak) tweak(dir);
+  return dir;
+}
+
 function binding(home, extra = {}) {
   const paths = productPaths(home);
   const codexHome = extra.codexHome || path.join(home, '.codex');
@@ -333,6 +358,73 @@ test('a plugin-add success with no materialized cache fails closed and records n
     assert.equal(entry.last_sync_ms, null, 'a failed sync must not record a sync timestamp');
     assert.equal(fs.existsSync(staging), false, 'the failed reconcile attempt also rolls its staging back');
     assert.equal(fs.existsSync(marketplace), false, 'the failed reconcile attempt also rolls its marketplace back');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// AUD-002 regression oracles for the codex host: staging publishes by
+// validated replacement, so a source file deleted since the last install
+// disappears from the published tree, and a refresh whose verification
+// fails restores the prior coherent staging tree and marketplace bytes
+// instead of leaving an overlaid mix behind.
+test('a codex refresh drops source files deleted since the last install (AUD-002)', () => {
+  const home = fixtureHome('external-subagent-deletion-');
+  const fake = fakeCodexCli(home);
+  const { paths, options } = binding(home, { cli: fake.cli });
+  const source = tempSource();
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  try {
+    fs.mkdirSync(path.join(home, 'plugins'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, 'plugins', 'unrelated-user-file.txt'), 'keep me');
+    installPlugin(paths, { ...options, source });
+    const removed = path.join(staging, 'skills', 'external-subagent', 'SKILL.md');
+    assert.equal(fs.existsSync(removed), true, 'the file is staged on first install');
+    fs.rmSync(path.join(source, 'skills', 'external-subagent', 'SKILL.md'));
+    const result = installPlugin(paths, { ...options, source });
+    assert.equal(result.installed, true);
+    assert.equal(fs.existsSync(removed), false, 'a file deleted from the source disappears from the published tree');
+    const server = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
+    assert.equal(server.command, nativeBinary('external-subagent-mcp'), 'the replacement tree still carries the managed binding');
+    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket);
+    assert.equal(fs.readFileSync(path.join(home, 'plugins', 'unrelated-user-file.txt'), 'utf8'), 'keep me', 'unrelated files beside the staging survive the swap');
+    assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')).sort(), ['external-subagent', 'unrelated-user-file.txt'], 'no candidate or prior sibling residue remains');
+    const marketplace = JSON.parse(fs.readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+    assert.equal(marketplace.plugins.filter((entry) => entry.name === 'external-subagent').length, 1, 'the refresh keeps exactly one managed marketplace entry');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+});
+
+test('a failed codex refresh restores the prior staging tree and marketplace bytes (AUD-002)', () => {
+  const home = fixtureHome('external-subagent-refresh-rollback-');
+  const goodDir = path.join(home, 'fake-good');
+  const lyingDir = path.join(home, 'fake-lying');
+  fs.mkdirSync(goodDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(lyingDir, { recursive: true, mode: 0o700 });
+  const good = fakeCodexCli(goodDir);
+  const lying = fakeCodexCli(lyingDir, { materialize: false });
+  const { paths, options } = binding(home, { cli: good.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const marketplace = path.join(home, '.agents', 'plugins', 'marketplace.json');
+  try {
+    const first = installPlugin(paths, options);
+    assert.equal(first.cache_verified, true);
+    fs.writeFileSync(path.join(staging, 'skills', 'external-subagent', 'SKILL.md'), 'last-good bytes\n');
+    const treeBefore = snapshotTree(staging);
+    const marketBefore = fs.readFileSync(marketplace);
+    // The cache disappears (codex-owned state this product never rewrites);
+    // the lying fake then reports a cache-less `plugin add` success on
+    // refresh, so verification must fail closed after the swap.
+    fs.rmSync(first.cache, { recursive: true, force: true });
+    assert.throws(() => installPlugin(paths, { ...options, codexCli: lying.cli }), (error) => {
+      assert.equal(error.code, 'CODEX_CACHE_UNVERIFIABLE');
+      return true;
+    });
+    assert.deepEqual(snapshotTree(staging), treeBefore, 'the prior managed tree is restored byte-for-byte');
+    assert.deepEqual(fs.readFileSync(marketplace), marketBefore, 'the marketplace keeps its exact prior bytes');
+    assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')), ['external-subagent'], 'no candidate or prior residue remains');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

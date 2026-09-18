@@ -10,6 +10,18 @@ import { nativeBinary, PLUGIN_NAME } from './layout.mjs';
 // pins the same MCP binding — the facade command plus the daemon socket —
 // into the staged `.mcp.json`; only the registration surface around the
 // staged tree differs per host.
+//
+// Publishing is a REPLACEMENT, never an overlay (AUD-002): the candidate
+// tree is built, parsed, and rewritten with its final binding paths in an
+// owned sibling directory BESIDE the target — never inside the live managed
+// tree — so a file deleted from the source disappears from the published
+// tree and an invalid candidate never moves a managed byte.  The publish
+// itself is two same-directory renames (target -> retained prior tree,
+// candidate -> target); the prior tree survives until the caller commits,
+// and restore() puts it back when the host binding transaction fails.  The
+// boundary is honest, not journaling: a process crash between the two
+// publish renames can leave the target absent with the prior tree at its
+// sibling path, and nothing here detects or repairs that automatically.
 
 export function pluginManifest(source) {
   const manifest = JSON.parse(fs.readFileSync(path.join(source, '.codex-plugin', 'plugin.json'), 'utf8'));
@@ -55,7 +67,42 @@ export function treeDigest(root) {
 // hosts spawn the native facade directly (the default); hosts with
 // restricted spawn environments (zcode) pass an interpreter command plus
 // args — e.g. the installing node running the staged stdio bridge.
-export function stagePlugin(source, staging, paths, binding = {}) {
+//
+// The publish protocol keeps two private sibling trees beside the target,
+// named `.<target>.candidate.<pid>.<uuid>` and `.<target>.prior.<pid>.<uuid>`.
+
+const siblingSuffix = () => `${process.pid}.${crypto.randomUUID()}`;
+
+function discardTree(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+}
+
+// Parse and rewrite the CANDIDATE tree's `.mcp.json` for the final binding
+// paths.  This runs before any managed byte moves, so an unreadable or
+// incomplete MCP payload fails the refresh while the live tree stays intact.
+function bindCandidate(candidate, paths, command, args) {
+  const mcpPath = path.join(candidate, '.mcp.json');
+  let mcp;
+  try {
+    mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
+  } catch (error) {
+    throw new CliError('INVALID_PLUGIN_SOURCE', `plugin MCP config is not readable JSON (${error.message})`);
+  }
+  const server = mcp.mcpServers?.external_subagent;
+  if (!server) throw new CliError('INVALID_PLUGIN_SOURCE', 'plugin MCP server is missing');
+  server.command = command;
+  if (args !== null) server.args = args;
+  server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };
+  fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
+}
+
+// Prepare a validated replacement for `staging` (AUD-002).  Ownership of an
+// existing managed tree is checked first; publish() then builds the
+// candidate beside the target — same parent directory, so every swap step
+// is a rename — and the returned handle coordinates the publish with the
+// caller's host binding transaction: restore() undoes a published swap,
+// complete() drops the retained prior tree once the transaction committed.
+export function preparePluginStage(source, staging, paths, binding = {}) {
   const command = binding.command || nativeBinary('external-subagent-mcp');
   const args = Array.isArray(binding.args) ? binding.args : null;
   if (fs.existsSync(staging)) {
@@ -89,14 +136,64 @@ export function stagePlugin(source, staging, paths, binding = {}) {
       throw new CliError('PLUGIN_STAGING_CONFLICT', 'staging MCP binding differs from the managed product endpoint');
     }
   }
-  fs.mkdirSync(path.dirname(staging), { recursive: true, mode: 0o700 });
-  fs.cpSync(source, staging, { recursive: true, force: true });
-  const mcpPath = path.join(staging, '.mcp.json');
-  const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
-  const server = mcp.mcpServers?.external_subagent;
-  if (!server) throw new CliError('INVALID_PLUGIN_SOURCE', 'plugin MCP server is missing');
-  server.command = command;
-  if (args !== null) server.args = args;
-  server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };
-  fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
+  const parent = path.dirname(staging);
+  const candidate = path.join(parent, `.${path.basename(staging)}.candidate.${siblingSuffix()}`);
+  const prior = path.join(parent, `.${path.basename(staging)}.prior.${siblingSuffix()}`);
+  let published = false;
+  return {
+    staging,
+    // Build and validate the candidate, then swap it in with same-directory
+    // renames: target -> prior (when a managed tree exists), candidate ->
+    // target.  If the second rename fails, the first is undone before the
+    // error surfaces, so publish either replaces the target completely or
+    // leaves the prior tree live at the target path.
+    publish() {
+      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+      try {
+        fs.cpSync(source, candidate, { recursive: true });
+        bindCandidate(candidate, paths, command, args);
+        if (fs.existsSync(staging)) {
+          fs.renameSync(staging, prior);
+          try {
+            fs.renameSync(candidate, staging);
+          } catch (error) {
+            try { fs.renameSync(prior, staging); } catch { /* prior stays at its sibling path; see the crash boundary */ }
+            throw error;
+          }
+        } else {
+          fs.renameSync(candidate, staging);
+        }
+        published = true;
+      } catch (error) {
+        discardTree(candidate);
+        throw error;
+      }
+    },
+    // Undo a published swap: drop the freshly published tree and put the
+    // retained prior tree back (or remove the target entirely when this was
+    // a first install).  Best-effort by design — the caller's original
+    // failure is the one that must surface, so secondary cleanup errors
+    // here are suppressed rather than thrown.
+    restore() {
+      if (!published) return;
+      discardTree(staging);
+      if (fs.existsSync(prior)) {
+        try { fs.renameSync(prior, staging); } catch { /* see the crash boundary */ }
+      }
+      published = false;
+    },
+    // Drop the retained prior tree once the host transaction committed; a
+    // cleanup failure never fails a verified install.
+    complete() {
+      published = false;
+      discardTree(prior);
+    },
+  };
+}
+
+// One-shot form for callers without a host transaction around the swap.
+export function stagePlugin(source, staging, paths, binding = {}) {
+  const staged = preparePluginStage(source, staging, paths, binding);
+  staged.publish();
+  staged.complete();
 }

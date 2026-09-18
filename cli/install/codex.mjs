@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, readOptional } from '../fs-atomic.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
-import { pluginManifest, treeDigest, stagePlugin } from './plugin-stage.mjs';
+import { pluginManifest, treeDigest, preparePluginStage } from './plugin-stage.mjs';
 
 // Managed Codex binding.  The staging tree plus a local source marketplace are
 // the product-owned half; every installation/removal goes through the official
@@ -178,12 +178,18 @@ export function installPlugin(paths, options = {}) {
   }
   if (options.uninstall) return uninstallPlugin(paths, options);
   pluginManifest(source);
-  const priorStaging = fs.existsSync(staging);
   const priorMarketplace = fs.existsSync(marketplace) ? fs.readFileSync(marketplace) : null;
-  stagePlugin(source, staging, paths);
+  // AUD-002: stage by validated replacement.  publish() is self-contained
+  // (a failed copy/parse/swap never leaves the live tree moved or damaged);
+  // every later failure rolls the marketplace back to its prior bytes and
+  // restores the prior coherent staging tree.
+  const staged = preparePluginStage(source, staging, paths);
   let market;
-  try { market = updateMarketplace(marketplace, staging); } catch (error) {
-    if (!priorStaging) fs.rmSync(staging, { recursive: true, force: true });
+  try {
+    staged.publish();
+    market = updateMarketplace(marketplace, staging);
+  } catch (error) {
+    staged.restore();
     throw error;
   }
   // Explicitly configured marketplaces must be registered; the personal
@@ -196,9 +202,10 @@ export function installPlugin(paths, options = {}) {
     verifiedCache = verifyCodexCache(add, { codexHome, staging, marketplaceName: market.marketplace_name });
   } catch (error) {
     if (priorMarketplace === null) fs.rmSync(marketplace, { force: true }); else fs.writeFileSync(marketplace, priorMarketplace, { mode: 0o600 });
-    if (!priorStaging) fs.rmSync(staging, { recursive: true, force: true });
+    staged.restore();
     throw error;
   }
+  staged.complete();
   return {
     installed: true, source, staging, marketplace, codex_home: codexHome,
     cache: verifiedCache,
