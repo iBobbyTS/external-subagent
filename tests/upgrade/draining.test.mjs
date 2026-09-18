@@ -15,23 +15,23 @@ function runDaemonOracle(name) {
 }
 
 test('draining rejects new business send but preserves admitted messages', () => {
-  runDaemonOracle('rpc::wait_tests::draining_existing_task_message_is_idempotent_but_new_rejected');
+  runDaemonOracle('rpc::wait::wait_tests::draining_existing_task_message_is_idempotent_but_new_rejected');
 });
 
 test('draining keeps admitted lifecycle operations available', () => {
-  runDaemonOracle('rpc::wait_tests::draining_lifecycle_methods_are_not_gate_rejected');
+  runDaemonOracle('rpc::wait::wait_tests::draining_lifecycle_methods_are_not_gate_rejected');
 });
 
 test('status is read-only and explicit activation fires once', () => {
-  runDaemonOracle('rpc::agent_probe_tests::draining_status_read_is_side_effect_free_and_activation_is_once');
+  runDaemonOracle('rpc::handlers::agent_probe_tests::draining_status_read_is_side_effect_free_and_activation_is_once');
 });
 
 test('aborting a drain reopens admission and preserves task facts', () => {
-  runDaemonOracle('rpc::wait_tests::abort_drain_reopens_admission_and_preserves_task_facts');
+  runDaemonOracle('rpc::wait::wait_tests::abort_drain_reopens_admission_and_preserves_task_facts');
 });
 
 test('aborting a drain keeps the issued claim for the retry', () => {
-  runDaemonOracle('rpc::agent_probe_tests::abort_drain_preserves_the_issued_claim_for_the_retry');
+  runDaemonOracle('rpc::handlers::agent_probe_tests::abort_drain_preserves_the_issued_claim_for_the_retry');
 });
 
 test('aborting a drain reopens real provider admission while the drained task answers', () => {
