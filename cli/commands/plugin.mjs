@@ -66,6 +66,12 @@ export function pluginCommand(paths, args) {
 
 export function mcpCommand(paths, args) {
   const options = parseCommon(args, ['--dry-run', '--uninstall']);
+  // The MCP TOML binding is codex-only (see the header note): a non-codex
+  // host must fail here, before any installer or registry call, instead of
+  // being silently ignored while the codex config is rewritten.
+  if (options.host && options.host !== 'codex') {
+    throw new CliError('INVALID_ARGUMENT', `unsupported mcp host: ${options.host} (install-mcp binds the codex host only)`, 2);
+  }
   const installerOptions = withInstallerFlags(options);
   const result = installMcp(paths, installerOptions);
   if (!options.dry_run && result.installed) {

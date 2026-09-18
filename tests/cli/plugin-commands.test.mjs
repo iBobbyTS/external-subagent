@@ -12,12 +12,29 @@ import path from 'node:path';
 import { mcpCommand, pluginCommand } from '../../cli/commands/plugin.mjs';
 import { installMcp } from '../../cli/install/codex.mjs';
 import { treeDigest } from '../../cli/install/plugin-stage.mjs';
-import { loadCodexHomes } from '../../cli/install/reconcile.mjs';
+import { loadCodexHomes, codexHomesRegistryPath } from '../../cli/install/reconcile.mjs';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 function fixtureHome(prefix = 'external-subagent-cli-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+// Byte snapshot of every regular file under a root (the throwaway CLI homes
+// under test contain no symlinks), so zero-mutation claims compare real bytes
+// instead of mere file existence — and catch unwanted file creation too.
+function snapshotTree(root) {
+  const files = new Map();
+  if (!fs.existsSync(root)) return files;
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) files.set(path.relative(root, full), fs.readFileSync(full));
+    }
+  };
+  walk(root);
+  return files;
 }
 
 // Minimal stand-in for the verified codex CLI surface (0.153.4 JSON shapes).
@@ -205,6 +222,62 @@ test('install-plugin rejects codex-only flags on the zcode host and unknown host
       return true;
     });
   } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// AUD-001 regression: install-mcp is codex-only.  A zcode or unknown host —
+// for install, uninstall and dry-run alike, with or without the codex-only
+// --codex-home — must fail at the command layer before any installer or
+// registry call, leaving the targeted codex config, the zcode config, the
+// registry and every other file byte-identical.  The OBSERVED counterexample
+// argv `install-mcp zcode --uninstall --codex-home <home>` used to remove the
+// managed block from the codex config; here that config is seeded with both
+// a managed section and unrelated settings, and neither may move a byte.
+test('install-mcp rejects non-codex hosts before any codex or registry mutation', () => {
+  const home = fixtureHome('external-subagent-mcp-host-');
+  const paths = productPaths(home);
+  const codexTarget = path.join(home, 'codex-target');
+  fs.mkdirSync(codexTarget, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(codexTarget, 'config.toml'), '[mcp_servers.external_subagent]\ncommand = "/kept/managed"\n\n[user]\nname = "unrelated"\n');
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify({ plugins: { dirs: ['/unrelated/plugin'] } }, null, 2));
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.writeFileSync(codexHomesRegistryPath(paths), JSON.stringify(
+    { schema_version: 1, product: 'external-subagent', homes: [{ home: fs.realpathSync(codexTarget), binding_mode: 'mcp', last_status: 'claimed' }] }, null, 2,
+  ));
+  const priorEnvHome = process.env.CODEX_HOME;
+  delete process.env.CODEX_HOME;
+  try {
+    const baseline = snapshotTree(home);
+    const rejected = [
+      ['zcode'],
+      ['zcode', '--uninstall'],
+      ['zcode', '--dry-run'],
+      ['zcode', '--codex-home', codexTarget],
+      ['zcode', '--uninstall', '--codex-home', codexTarget], // the OBSERVED argv
+      ['claude'],
+      ['claude', '--uninstall'],
+      ['claude', '--dry-run'],
+    ];
+    for (const argv of rejected) {
+      assert.throws(() => mcpCommand(paths, argv), (error) => {
+        assert.ok(error instanceof CliError);
+        assert.equal(error.code, 'INVALID_ARGUMENT');
+        assert.equal(error.exitCode, 2);
+        assert.match(error.message, argv[0] === 'zcode' ? /unsupported mcp host: zcode/u : /unsupported plugin host: claude/u);
+        return true;
+      }, `install-mcp ${argv.join(' ')} must be rejected`);
+      assert.deepEqual(snapshotTree(home), baseline, `install-mcp ${argv.join(' ')} must mutate nothing (target host and unrelated files alike)`);
+    }
+
+    // The explicit codex host stays supported through the same surface.
+    const dry = mcpCommand(paths, ['codex', '--dry-run', '--codex-home', codexTarget]);
+    assert.equal(dry.dry_run, true);
+    assert.equal(dry.config, path.join(codexTarget, 'config.toml'));
+    assert.deepEqual(snapshotTree(home), baseline, 'a codex dry-run writes nothing');
+  } finally {
+    if (priorEnvHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = priorEnvHome;
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
