@@ -30,7 +30,7 @@ test('managed plugin manifest carries a distinct semver cache identity', () => {
   assert.match(manifest.version, /^\d+\.\d+\.\d+$/u, 'plugin version must be a plain semver identity');
   assert.notEqual(manifest.version, '0.1.0', 'identity 0.1.0 is already cached by the historical installation; a release must not reuse it');
   assert.notEqual(manifest.version, '0.1.1', 'identity 0.1.1 is candidate C1\'s, already materialized by the C1 consumer runs; a release must not reuse it');
-  assert.equal(manifest.version, '0.1.2', 'the post-installer-fix final candidate (C2) must carry its own fresh cache identity');
+  assert.equal(manifest.version, '0.1.3', 'the boundary-fixes candidate must carry its own fresh cache identity past C2\'s 0.1.2');
 });
 
 test('staged plugin MCP binding keeps exactly the managed placeholders', () => {
