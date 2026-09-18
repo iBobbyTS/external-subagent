@@ -407,6 +407,13 @@ async function doSetup() {
   assert.equal(init.status, 0, `init failed: ${init.stderr}`);
   ctx.initReport = JSON.parse(init.stdout);
   assert.equal(ctx.initReport.ok, true);
+  // AUD-005/D1: init installs the standalone service only, so the registered
+  // codex home this suite upgrades against is bound EXPLICITLY through the
+  // public install-plugin command (fake codex CLI on PATH) exactly like a
+  // user would after a standalone init.
+  const bind = run(ctx.cli, ['install-plugin'], { env: childEnv() });
+  assert.equal(bind.status, 0, `explicit install-plugin failed: ${bind.stderr}`);
+  assert.equal(JSON.parse(bind.stdout).claim.registered, true);
 }
 
 after(() => {
@@ -436,8 +443,11 @@ test('vA tarball installs stage-only; init publishes the verified vA active/rete
   assert.equal(run(ctx.cli, ['version'], { env: childEnv() }).stdout.trim(), VERSION_A, 'the installed vA CLI reports its own version');
 
   const report = ctx.initReport;
-  for (const step of ['verify-payload', 'install-launch-agent', 'install-codex-plugin', 'claim-codex-home', 'publish-active-payload']) {
+  for (const step of ['verify-payload', 'install-launch-agent', 'publish-active-payload']) {
     assert.ok(report.completed.includes(step), `init must complete ${step}`);
+  }
+  for (const retired of ['probe-runtime', 'install-codex-plugin', 'claim-codex-home']) {
+    assert.equal(report.completed.includes(retired), false, `the implicit host step ${retired} must not run`);
   }
   assert.equal(report.service.skipped, true, 'fixtures neutralize launchd through the documented seam');
   assert.equal(report.payload.status, 'verified');

@@ -268,64 +268,26 @@ function recordingLaunchctl({ loaded = false } = {}) {
   };
 }
 
-function initFixture({ failStep } = {}) {
+function initFixture({ failStep = 'publish-active-payload' } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-service-'));
   const paths = productPaths(home);
-  // The fake codex CLI materializes the plugin cache (staged manifest +
-  // .mcp.json under plugins/cache/<marketplace>/<plugin>/<version>) like the
-  // real CLI, so the init runs below get past installPlugin's read-back cache
-  // verification before their injected claim-codex-home failure.
-  const fakeCodex = path.join(home, 'codex-fake.mjs');
-  fs.writeFileSync(fakeCodex, `#!/usr/bin/env node
-import fs from 'node:fs';
-import path from 'node:path';
-const args = process.argv.slice(2);
-const rootsFile = path.join(${JSON.stringify(home)}, 'marketplace-roots.json');
-const text = (value) => { process.stdout.write(JSON.stringify(value, null, 2) + '\\n'); };
-const loadRoots = () => { try { return JSON.parse(fs.readFileSync(rootsFile, 'utf8')); } catch { return {}; } };
-if (args[0] === 'plugin' && args[1] === 'add' && args.includes('--help')) { process.stdout.write('usage\\n'); process.exit(0); }
-if (args[0] === 'plugin' && args[1] === 'marketplace' && args[2] === 'add') {
-  const roots = loadRoots();
-  roots[process.env.CODEX_HOME] = args[3];
-  fs.writeFileSync(rootsFile, JSON.stringify(roots));
-  text({ marketplaceName: 'personal' });
-  process.exit(0);
-}
-if (args[0] === 'plugin' && args[1] === 'add') {
-  const name = args[2]; const marketplace = args[args.indexOf('--marketplace') + 1];
-  const root = loadRoots()[process.env.CODEX_HOME];
-  if (!root) { process.stderr.write('no marketplace registered for this CODEX_HOME\\n'); process.exit(1); }
-  const doc = JSON.parse(fs.readFileSync(path.join(root, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
-  const staging = path.resolve(root, doc.plugins.find((plugin) => plugin.name === name).source.path);
-  const version = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8')).version;
-  const cache = path.join(process.env.CODEX_HOME || '', 'plugins', 'cache', marketplace, name, String(version));
-  fs.rmSync(cache, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(cache), { recursive: true });
-  fs.cpSync(staging, cache, { recursive: true });
-  text({ pluginId: name + '@' + marketplace, name, marketplaceName: marketplace, version, installedPath: cache });
-  process.exit(0);
-}
-process.stderr.write('unexpected codex invocation: ' + JSON.stringify(args) + '\\n');
-process.exit(1);
-`);
-  fs.chmodSync(fakeCodex, 0o755);
+  // AUD-005/D1: init installs the standalone service only, so the injected
+  // post-bootstrap failure lives at the final baseline-publication step (the
+  // payload verifies from the repo's staged native tree); no host binding and
+  // no codex CLI fake is involved anymore.
   const run = (overrides = {}) => runInit({
     paths,
-    skipRuntimeProbe: true,
-    skipPayloadProbe: true,
-    codexCli: fakeCodex,
-    codexHome: path.join(home, 'codex-home'),
-    ...(failStep ? { _failStep: failStep } : {}),
+    _failStep: failStep,
     ...overrides,
   });
   return { home, paths, run };
 }
 
 test('a failed init boots back out the service that init itself loaded', () => {
-  const { paths, run } = initFixture({ failStep: 'claim-codex-home' });
+  const { paths, run } = initFixture();
   const launchctl = recordingLaunchctl();
   try {
-    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at claim-codex-home/u);
+    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at publish-active-payload/u);
     assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'rollback must undo the bootstrap init performed');
     assert.equal(launchctl.state.loaded, false);
     assert.equal(fs.existsSync(paths.launchAgent), false, 'the LaunchAgent still rolls back with the service');
@@ -335,10 +297,10 @@ test('a failed init boots back out the service that init itself loaded', () => {
 });
 
 test('a failed init never boots out a service that was already loaded before it', () => {
-  const { paths, run } = initFixture({ failStep: 'claim-codex-home' });
+  const { paths, run } = initFixture();
   const launchctl = recordingLaunchctl({ loaded: true });
   try {
-    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at claim-codex-home/u);
+    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at publish-active-payload/u);
     assert.equal(launchctl.calls.some((call) => call.startsWith('bootstrap ')), false, 'an already-loaded label is not bootstrapped again');
     assert.equal(launchctl.calls.some((call) => call.startsWith('bootout')), false, 'rollback must not touch a service init did not load');
     assert.equal(launchctl.state.loaded, true);

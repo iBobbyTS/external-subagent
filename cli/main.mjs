@@ -17,7 +17,7 @@ import { parseConfigArgs } from './commands/config.mjs';
 import { subagentsCommand, parseSubagentsArgs } from './commands/agents.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from './commands/tasks.mjs';
 
-const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks]\n      [--skip-runtime-probe] [--skip-codex-plugin] [--skip-service-start]\n      [--codex-home <path>]    Install service, bind Codex, claim the Codex home\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
+const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] [--skip-service-start]\n                             Install the standalone daemon service only; bind a\n                             host afterwards with install-plugin or install-mcp\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
 const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  subagents list | subagents status [subagent] | subagents probe/models [subagent]\n  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function structuredInput(args, parser) {
@@ -336,27 +336,27 @@ export async function main(args) {
 
   const paths = productPaths();
   if (command === 'init') {
+    // AUD-005/D1: init installs the standalone service only.  The retired
+    // --skip-runtime-probe/--skip-codex-plugin/--codex-home flags are rejected
+    // (never silently ignored): there is no runtime probe to skip, init binds
+    // no Codex host, and a host home is chosen by the explicit install
+    // commands instead.
     const flags = args.slice(1);
-    const known = ['--dry-run', '--resume', '--install-hooks', '--skip-runtime-probe', '--skip-codex-plugin', '--skip-service-start'];
-    const codexHomeIndex = flags.indexOf('--codex-home');
-    let codexHome;
-    if (codexHomeIndex >= 0) {
-      codexHome = flags[codexHomeIndex + 1];
-      if (!codexHome || codexHome.startsWith('--')) throw new CliError('INVALID_ARGUMENT', '--codex-home requires a value', 2);
-    }
+    const known = ['--dry-run', '--resume', '--install-hooks', '--skip-service-start'];
     for (let index = 0; index < flags.length; index += 1) {
-      if (index === codexHomeIndex) { index += 1; continue; }
-      if (!known.includes(flags[index])) throw new CliError('INVALID_ARGUMENT', `unsupported init option: ${flags[index]}`, 2);
+      if (!known.includes(flags[index])) {
+        if (flags[index] === '--skip-runtime-probe' || flags[index] === '--skip-codex-plugin' || flags[index] === '--codex-home') {
+          throw new CliError('INVALID_ARGUMENT', `${flags[index]} is no longer supported: init installs the standalone service only and binds no host (use install-plugin or install-mcp)`, 2);
+        }
+        throw new CliError('INVALID_ARGUMENT', `unsupported init option: ${flags[index]}`, 2);
+      }
     }
     output(runInit({
       paths,
       dryRun: flags.includes('--dry-run'),
       resume: flags.includes('--resume'),
       installHooks: flags.includes('--install-hooks'),
-      skipRuntimeProbe: flags.includes('--skip-runtime-probe'),
-      skipCodexPlugin: flags.includes('--skip-codex-plugin'),
       skipServiceStart: flags.includes('--skip-service-start'),
-      codexHome,
     }));
     return;
   }

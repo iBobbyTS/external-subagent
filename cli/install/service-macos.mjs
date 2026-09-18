@@ -18,12 +18,32 @@ function escapeXml(value) {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-export function launchAgentPlist(paths) {
+export function launchAgentPlist(paths, options = {}) {
   const daemon = nativeBinary('external-subagentd');
   const config = readConfig(paths.config);
   const { runtime_path: dshRuntime, home: dshHome, profile: dshProfile, version: dshVersion } = config.subagents.dsh;
   const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;
   const configRevision = config.revision;
+  // AUD-005/D1: the standalone service never depends on an unrelated runtime.
+  // The pinned ZCode runtime is forwarded only when that installation exists;
+  // without it the daemon still starts and the zcode adapter fails closed at
+  // spawn ("ZCODE_RUNTIME_PATH is unavailable") instead of the whole service
+  // dying on launchd because --runtime cannot canonicalize.  Installing (or
+  // removing) ZCode later is picked up by the next init, which rewrites the
+  // plist.  The seam exists so tests can pin both branches deterministically.
+  const zcodeRuntime = options.zcodeRuntime ?? ZCODE_RUNTIME;
+  const programArguments = [
+    `<string>${escapeXml(daemon)}</string>`,
+    '<string>--database</string>',
+    `<string>${escapeXml(paths.database)}</string>`,
+    '<string>--socket</string>',
+    `<string>${escapeXml(paths.socket)}</string>`,
+    ...(fs.existsSync(zcodeRuntime)
+      ? ['<string>--runtime</string>', `<string>${escapeXml(zcodeRuntime)}</string>`]
+      : []),
+    '<string>--diagnostic-log</string>',
+    `<string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string>`,
+  ];
   const dshEnvironment = [
     `<key>PATH</key><string>${LAUNCHD_FIXED_PATH}</string>`,
     ...(configRevision === null ? [] : [`<key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>${configRevision}</string>`]),
@@ -39,7 +59,7 @@ export function launchAgentPlist(paths) {
     ...(codexRuntime ? [`<key>CODEX_RUNTIME_PATH</key><string>${escapeXml(codexRuntime)}</string>`] : []),
     ...(codexHome ? [`<key>CODEX_HOME</key><string>${escapeXml(codexHome)}</string>`] : []),
   ].join('');
-  return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>\n<key>ProgramArguments</key><array><string>${escapeXml(daemon)}</string><string>--database</string><string>${escapeXml(paths.database)}</string><string>--socket</string><string>${escapeXml(paths.socket)}</string><string>--runtime</string><string>${escapeXml(ZCODE_RUNTIME)}</string><string>--diagnostic-log</string><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string></array>\n<key>EnvironmentVariables</key><dict>${dshEnvironment}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${escapeXml(path.join(paths.logs, 'daemon.log'))}</string>\n<key>StandardErrorPath</key><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string>\n</dict></plist>\n`);
+  return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>\n<key>ProgramArguments</key><array>${programArguments.join('')}</array>\n<key>EnvironmentVariables</key><dict>${dshEnvironment}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${escapeXml(path.join(paths.logs, 'daemon.log'))}</string>\n<key>StandardErrorPath</key><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string>\n</dict></plist>\n`);
 }
 
 export function installLaunchAgent(paths, options = {}) {

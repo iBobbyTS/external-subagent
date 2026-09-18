@@ -3,31 +3,25 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
-import { atomicWrite, jsonBytes } from '../fs-atomic.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
-import { codexHomeFor, installPlugin, resolveStaging } from './codex.mjs';
 import { verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
 import { packageRoot } from './layout.mjs';
-import { registerCodexHome } from './reconcile.mjs';
 import { updateInstallation } from './update.mjs';
-import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackCodexArtifacts, rollbackFiles, snapshotFile } from './recovery.mjs';
+import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
 import { bootstrapService, bootoutService, installLaunchAgent } from './service-macos.mjs';
 
-// Fresh-install coordination (S05).  A plain npm install only stages the
-// package and payload; every state-changing action below belongs to an
-// explicit `init`:
+// Standalone-install coordination (S05, AUD-005 decision D1).  A plain npm
+// install only stages the package and payload; an explicit `init` installs
+// the STANDALONE SERVICE ONLY — every state-changing step below is
+// host-neutral:
 //   verify-payload     the staged native payload matches the package version
-//   probe-runtime      the fixed ZCode runtime exists (DSH stays optional and
-//                      missing DSH never blocks installation)
 //   check-path         PATH findings are reported, never written
 //   create-data        private data/log directories
-//   write-product-config  publish the current agent config schema
+//   write-product-config  republish the current agent config schema
 //   install-launch-agent  the one macOS service template
 //   start-service      launchctl bootstrap (best-effort, reported)
-//   install-codex-plugin managed staging + official codex add
-//   claim-codex-home   D08 registry claim after a successful binding
 //   publish-active-payload  the verified active identity and retained bytes
 //                      (B-3): a successful init establishes the version and
 //                      retention baseline itself, so the standard `npm A ->
@@ -36,12 +30,18 @@ import { bootstrapService, bootoutService, installLaunchAgent } from './service-
 //                      publication reuses the existing locked update owner —
 //                      no second lifecycle or scheduler — and only runs when
 //                      this init verified the payload it installed.
-// Failures roll tracked files back through recovery.mjs, including the
-// product-owned Codex artifacts (staging tree, marketplace manifest, and
-// directories this run created) — the official codex cache is never rolled
-// back; a resumable journal lets `init --resume` continue after environmental
-// failures.
-
+// init no longer probes a fixed ZCode runtime, no longer installs the managed
+// Codex plugin, and no longer claims a Codex home (the pre-D1 steps
+// probe-runtime, install-codex-plugin, and claim-codex-home are gone).  A
+// host is bound through the existing EXPLICIT commands — `install-plugin
+// codex|zcode` or `install-mcp` — which own staging, the official codex add,
+// and the D08 registry claim.  The pinned ZCode runtime is forwarded to the
+// service only when that installation exists (see service-macos.mjs), so a
+// missing ZCode app or Codex home never blocks standalone setup.
+// Failures roll tracked files back through recovery.mjs; a resumable journal
+// lets `init --resume` continue after environmental failures.  Journals from
+// pre-D1 inits may still list the retired codex steps; unknown completed ids
+// are simply never consulted again.
 const HOOK_INSTALLER = ['plugins', 'codex', 'external-subagent', 'scripts', 'install-agent-hooks.mjs'];
 
 function hookInstallerPath() {
@@ -50,15 +50,12 @@ function hookInstallerPath() {
 
 export function installPlan(paths, options = {}) {
   const plan = [
-    { id: 'probe-runtime', action: 'verify fixed ZCode runtime', path: ZCODE_RUNTIME },
     { id: 'verify-payload', action: 'verify staged native payload', path: path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json') },
     { id: 'check-path', action: 'report PATH availability without writing profiles' },
     { id: 'create-data', action: 'create private product data and log directories', paths: [paths.data, paths.logs] },
-    { id: 'write-product-config', action: 'write product paths and fixed runtime', path: paths.config },
+    { id: 'write-product-config', action: 'republish the product agent config schema', path: paths.config },
     { id: 'install-launch-agent', action: 'install daemon LaunchAgent', path: paths.launchAgent, label: 'com.external-subagent.daemon' },
     { id: 'start-service', action: 'bootstrap the daemon service', path: paths.launchAgent, label: 'com.external-subagent.daemon' },
-    { id: 'install-codex-plugin', action: 'stage and register the managed Codex plugin', path: path.join(paths.home, 'plugins', 'external-subagent') },
-    { id: 'claim-codex-home', action: 'register the claimed Codex home', path: path.join(paths.data, 'codex-homes.json') },
     { id: 'publish-active-payload', action: 'publish the verified active payload and retained-byte baseline', path: paths.state },
   ];
   if (options.installHooks) plan.splice(plan.findIndex((step) => step.id === 'publish-active-payload'), 0, { id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });
@@ -85,9 +82,6 @@ export function runInit(options = {}) {
 
   const skipPayload = Boolean(options.skipPayloadProbe);
   const payload = skipPayload ? { status: 'skipped', platform: null, version: null, files: [] } : verifyPayload();
-  if (!fs.existsSync(ZCODE_RUNTIME) && !options.skipRuntimeProbe) {
-    throw new CliError('ZCODE_RUNTIME_NOT_FOUND', `required ZCode runtime is missing: ${ZCODE_RUNTIME}`);
-  }
   const pathFindings = pathReport();
 
   const tracked = {
@@ -96,7 +90,6 @@ export function runInit(options = {}) {
     state: { file: paths.state, snapshot: snapshotFile(paths.state) },
     config: { file: paths.config, snapshot: snapshotFile(paths.config) },
     launchAgent: { file: paths.launchAgent, snapshot: snapshotFile(paths.launchAgent) },
-    registry: { file: path.join(paths.data, 'codex-homes.json'), snapshot: snapshotFile(path.join(paths.data, 'codex-homes.json')) },
   };
   const directories = {
     data: { path: paths.data, existed: fs.existsSync(paths.data) },
@@ -117,33 +110,7 @@ export function runInit(options = {}) {
   // A service that was already loaded before this init is never touched.
   let serviceLoadedByThisRun = false;
   let baseline = null;
-  const codexHome = codexHomeFor({ codexHome: options.codexHome }, paths);
-  // Product-owned Codex artifacts the init may create, snapshotted before any
-  // step runs so a later failure can restore them (see rollbackCodexArtifacts).
-  const stagingSite = resolveStaging(paths.home, {});
-  const codexArtifactDirectories = (target) => {
-    const stop = path.resolve(paths.home);
-    const levels = [];
-    let current = path.resolve(target);
-    while (current.startsWith(`${stop}${path.sep}`)) { levels.push(current); current = path.dirname(current); }
-    return levels;
-  };
-  const codexArtifactDirs = new Set([
-    path.resolve(codexHome),
-    ...codexArtifactDirectories(codexHome),
-    ...codexArtifactDirectories(stagingSite.staging),
-    ...codexArtifactDirectories(stagingSite.marketplace),
-  ]);
-  const codexArtifacts = {
-    staging: { path: stagingSite.staging, existed: fs.existsSync(stagingSite.staging) },
-    marketplace: { file: stagingSite.marketplace, snapshot: snapshotFile(stagingSite.marketplace) },
-    directories: [...codexArtifactDirs],
-    preexisting: new Set([...codexArtifactDirs].filter((directory) => fs.existsSync(directory))),
-    productRoot: path.resolve(path.join(paths.home, '.external-subagent-marketplace')),
-  };
-  let codex = { status: 'skipped', codex_home: codexHome, reason: options.skipCodexPlugin ? 'skipped by request' : 'not attempted' };
   try {
-    if (!completed.has('probe-runtime')) mark('probe-runtime');
     if (!completed.has('verify-payload')) mark('verify-payload');
     if (!completed.has('check-path')) mark('check-path');
     if (!completed.has('create-data')) {
@@ -155,10 +122,17 @@ export function runInit(options = {}) {
       // The daemon takes its database/socket/runtime from service arguments,
       // never from this file; drop the retired top-level path fields so an
       // install over an older local config republishes the current schema.
+      // S05-F01: `subagents.zcode.runtime_path` was a first-class config key
+      // before D1 rejected it, so a pre-S05 install can carry it in either
+      // the schema-2 or the legacy schema-1 shape.  Retire it here — before
+      // parseConfig migrates/validates — so `npm new -> init` self-heals such
+      // configs instead of failing closed at the read gate (which stays
+      // fully strict for every other read/write path).
       const prior = fs.existsSync(paths.config)
         ? JSON.parse(fs.readFileSync(paths.config, 'utf8'))
         : {};
       for (const field of ['runtime', 'database', 'socket']) delete prior[field];
+      for (const map of ['subagents', 'agents']) delete prior[map]?.zcode?.runtime_path;
       writeConfig(paths.config, parseConfig(prior));
       failAt('write-product-config');
       mark('write-product-config');
@@ -173,19 +147,6 @@ export function runInit(options = {}) {
       serviceLoadedByThisRun = !service.skipped && !service.already_loaded;
       mark('start-service');
     }
-    if (!completed.has('install-codex-plugin') && !options.skipCodexPlugin) {
-      const install = installPlugin(paths, { codexCli: options.codexCli, codexHome });
-      codex = { status: 'installed', codex_home: codexHome, cache: install.cache || null, marketplace: install.marketplace_name, digest: install.digest || null };
-      failAt('install-codex-plugin');
-      mark('install-codex-plugin');
-    }
-    const pluginDone = completed.has('install-codex-plugin');
-    if (!completed.has('claim-codex-home') && (codex.status === 'installed' || (pluginDone && !options.skipCodexPlugin))) {
-      const claim = registerCodexHome(paths, codexHome, { version: payload.version, digest: codex.digest, binding_mode: 'plugin' });
-      codex = { ...codex, claim: { registered: claim.registered, deduplicated: claim.deduplicated, homes: claim.homes } };
-      failAt('claim-codex-home');
-      mark('claim-codex-home');
-    }
     if (options.installHooks && !completed.has('install-hooks')) {
       installHooks(paths);
       mark('install-hooks');
@@ -195,11 +156,13 @@ export function runInit(options = {}) {
     // leaves the resume journal as the sole state).  It reuses the locked
     // update owner, so the active identity and retained bytes are published
     // under the exact verification/retention rules every later update
-    // follows; the Codex homes were just bound by this init's own steps, so
-    // the update's home sync is deferred to the next reconcile.  The step is
+    // follows.  The Codex-home sync stays deferred: init binds no host, so
+    // any registered homes belong to explicit install-plugin/install-mcp
+    // bindings and remain the reconcile owner's to refresh.  The step is
     // recorded in the in-memory report only — writing the schema-1 journal
     // here would clobber the schema-2 activation state it just published.
     if (payload.status === 'verified') {
+      failAt('publish-active-payload');
       const published = updateInstallation(paths, { deferCodexSync: true });
       if (published.phase !== 'active' || !published.active) {
         throw new CliError('INIT_BASELINE_FAILED', `activation baseline publication did not complete (phase=${published.phase ?? 'none'})`);
@@ -216,7 +179,6 @@ export function runInit(options = {}) {
   } catch (error) {
     const rollbackErrors = [
       ...rollbackFiles(tracked),
-      ...rollbackCodexArtifacts(codexArtifacts),
       ...removeCreatedDirectories(directories),
     ];
     if (serviceLoadedByThisRun) {
@@ -231,11 +193,13 @@ export function runInit(options = {}) {
     installed: true,
     resumed: Boolean(options.resume),
     completed: [...completed],
-    runtime: ZCODE_RUNTIME,
+    // Honest runtime report instead of a hard dependency: the pinned ZCode
+    // runtime is an adapter capability, observed and forwarded by the service
+    // template only when present.
+    runtime: { path: ZCODE_RUNTIME, present: fs.existsSync(ZCODE_RUNTIME) },
     payload,
     baseline,
     path_report: pathFindings,
     service,
-    codex,
   };
 }

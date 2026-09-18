@@ -34,6 +34,16 @@ function rejectModel(agent, value, field) {
   }
 }
 
+// AUD-005/D1: a zcode runtime_path has no consumer — the service resolves the
+// pinned packaged ZCode runtime itself (see service-macos.mjs) — so the config
+// gate must reject it instead of silently accepting a no-op.  dsh and codex
+// consume runtime_path on every service path and stay configurable.
+function rejectZcodeRuntimePath(agent, value) {
+  if (agent === 'zcode' && value != null) {
+    throw new CliError('runtime_path_unsupported', 'runtime_path is unsupported for zcode: the service resolves the pinned packaged ZCode runtime; only dsh and codex consume runtime_path', 2);
+  }
+}
+
 export function validateConfig(input) {
   if (!plainObject(input)) throw new CliError('CONFIG_INVALID', 'config must be an object', 2);
   rejectUnknownFields(input, CONFIG_FIELDS, 'config');
@@ -57,6 +67,7 @@ export function validateConfig(input) {
     if (value.default_model !== undefined && value.default_model !== null && (typeof value.default_model !== 'string' || value.default_model.length === 0)) throw new CliError('CONFIG_INVALID', `subagents.${agent}.default_model must be a non-empty string or null`, 2);
     for (const field of ['runtime_path', 'home', 'profile', 'version']) { if (value[field] !== undefined && value[field] !== null && (typeof value[field] !== 'string' || value[field].length === 0)) throw new CliError('CONFIG_INVALID', `subagents.${agent}.${field} must be a non-empty string or null`, 2); }
     rejectModel(agent, value.default_model, 'default_model');
+    rejectZcodeRuntimePath(agent, value.runtime_path);
     config.subagents[agent] = { ...config.subagents[agent], ...value };
   }
   if (config.default_subagent && !config.subagents[config.default_subagent].enabled) throw new CliError('CONFIG_INVALID', 'default_subagent must be enabled', 2);

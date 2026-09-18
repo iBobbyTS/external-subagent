@@ -132,6 +132,60 @@ test('LaunchAgent forwards the persisted Codex runtime and home exactly', () => 
   assert.doesNotMatch(barePlist, /CODEX_HOME/u);
 });
 
+test('a zcode runtime_path is rejected explicitly instead of silently accepted (AUD-005/D1)', () => {
+  const { paths } = fixture();
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { subagents: { zcode: { runtime_path: '/opt/zcode.cjs' } } } }), (error) => error.code === 'runtime_path_unsupported');
+  assert.throws(() => configCommand(paths, parseConfigArgs(['set', 'subagents.zcode.runtime_path', '/opt/zcode.cjs'])), (error) => error.code === 'runtime_path_unsupported');
+  // A hand-written config carrying the unused field fails every read closed,
+  // so no service path can quietly accept a no-op configuration.
+  fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, subagents: { zcode: { runtime_path: '/opt/zcode.cjs' } } }));
+  assert.throws(() => readConfig(paths.config), (error) => error.code === 'runtime_path_unsupported');
+  assert.throws(() => launchAgentPlist(paths), (error) => error.code === 'runtime_path_unsupported');
+  assert.equal(fs.readFileSync(paths.config, 'utf8'), JSON.stringify({ schema_version: 2, subagents: { zcode: { runtime_path: '/opt/zcode.cjs' } } }), 'the rejected config is never rewritten');
+});
+
+test('the service template stays adapter-neutral per configured adapter (AUD-005/D1)', () => {
+  // DSH-only: the plist forwards the persisted DSH launch contract and omits
+  // every Codex entry; the pinned ZCode runtime argument disappears with the
+  // (here absent) ZCode installation instead of becoming a hard dependency.
+  const dshOnly = fixture();
+  configCommand(dshOnly.paths, { operation: 'set', patch: { subagents: { dsh: {
+    enabled: true, spawn_supported: true, runtime_path: '/opt/dsh/acp', home: '/var/lib/dsh', profile: 'acp', version: '0.1.5',
+  } } } });
+  const dshPlist = launchAgentPlist(dshOnly.paths, { zcodeRuntime: '/definitely/absent/zcode.cjs' }).toString('utf8');
+  assert.match(dshPlist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/acp<\/string>/u);
+  assert.match(dshPlist, /<key>DSH_HOME<\/key><string>\/var\/lib\/dsh<\/string>/u);
+  assert.doesNotMatch(dshPlist, /CODEX_RUNTIME_PATH/u);
+  assert.doesNotMatch(dshPlist, /CODEX_HOME/u);
+  assert.doesNotMatch(dshPlist, /--runtime/u, 'no ZCode installation means no runtime argument, never a broken one');
+
+  // Codex-subagent-only: the persisted Codex runtime/home pair is forwarded
+  // and no DSH entry appears.
+  const codexOnly = fixture();
+  configCommand(codexOnly.paths, { operation: 'set', patch: { subagents: { codex: {
+    enabled: true, spawn_supported: true, runtime_path: '/opt/homebrew/bin/codex', home: '/Users/fixture/.codex-sub',
+  } } } });
+  const codexPlist = launchAgentPlist(codexOnly.paths, { zcodeRuntime: '/definitely/absent/zcode.cjs' }).toString('utf8');
+  assert.match(codexPlist, /<key>CODEX_RUNTIME_PATH<\/key><string>\/opt\/homebrew\/bin\/codex<\/string>/u);
+  assert.match(codexPlist, /<key>CODEX_HOME<\/key><string>\/Users\/fixture\/\.codex-sub<\/string>/u);
+  assert.doesNotMatch(codexPlist, /DSH_RUNTIME_PATH/u);
+  assert.doesNotMatch(codexPlist, /--runtime/u);
+
+  // ZCode-only (no other adapter configured): a present pinned runtime is
+  // forwarded so the zcode adapter keeps its launch contract, and nothing
+  // else is injected.
+  const zcodeOnly = fixture();
+  const present = fixture();
+  const pinnedRuntime = path.join(present.home, 'zcode.cjs');
+  fs.writeFileSync(pinnedRuntime, 'runtime');
+  const zcodePlist = launchAgentPlist(zcodeOnly.paths, { zcodeRuntime: pinnedRuntime }).toString('utf8');
+  assert.match(zcodePlist, new RegExp(`<string>--runtime</string><string>${pinnedRuntime.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`, 'u'));
+  assert.doesNotMatch(zcodePlist, /DSH_RUNTIME_PATH/u);
+  assert.doesNotMatch(zcodePlist, /CODEX_RUNTIME_PATH/u);
+  fs.rmSync(present.home, { recursive: true, force: true });
+});
+
 test('config writes a revision and keeps existing task snapshots independent', () => {
   const { paths } = fixture();
   const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;

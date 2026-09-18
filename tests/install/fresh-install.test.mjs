@@ -1,10 +1,13 @@
 // S05 fresh npm install acceptance: the packed artifact installs into a
 // throwaway npm prefix, a plain install only stages the package and payload
 // (no daemon, no Codex writes, no provider probes), and an explicit `init`
-// coordinates the LaunchAgent service, the managed Codex plugin/MCP binding,
-// and the D08 Codex-homes claim.  The installed native payload then runs the
-// real daemon, answers CLI status with both agents (DSH explicitly missing),
-// and exposes exactly ten MCP tools through the stable binary facade.
+// installs the STANDALONE SERVICE ONLY (AUD-005 decision D1): no ZCode
+// runtime requirement, no managed Codex plugin/MCP binding, no D08 claim.
+// A host is bound afterwards through the explicit `install-plugin` command,
+// which stages the managed plugin and claims the Codex home.  The installed
+// native payload then runs the real daemon, answers CLI status with both
+// agents (DSH explicitly missing), and exposes exactly ten MCP tools through
+// the stable binary facade.
 //
 // All writes stay inside mkdtemp fixtures: npm prefix/cache and HOME are
 // per-test temp directories; launchd is neutralized through the documented
@@ -20,6 +23,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
@@ -192,7 +196,7 @@ test('unsupported platforms allow help/version but reject business commands with
   assert.equal(run(ctx.cli, ['version'], { env }).status, 0);
 });
 
-test('explicit init installs service, binds Codex, and claims the codex home', { skip: !testable }, async () => {
+test('explicit init installs the standalone service only and binds no host', { skip: !testable }, async () => {
   await ensureInstalled();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-init-'));
   const shimDir = path.join(home, '.shim');
@@ -201,11 +205,15 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
   const env = fixtureEnv(home, { env: { PATH: `${fake.dir}:${process.env.PATH}`, FAKE_CODEX_LOG: fake.log } });
   const report = jsonOutput(run(ctx.cli, ['init'], { env }), 'init');
   assert.equal(report.ok, true);
-  for (const step of ['verify-payload', 'install-launch-agent', 'install-codex-plugin', 'claim-codex-home']) {
+  for (const step of ['verify-payload', 'install-launch-agent', 'start-service', 'publish-active-payload']) {
     assert.ok(report.completed.includes(step), `init must complete ${step}`);
+  }
+  for (const retired of ['probe-runtime', 'install-codex-plugin', 'claim-codex-home']) {
+    assert.equal(report.completed.includes(retired), false, `the implicit host step ${retired} must not run`);
   }
   assert.equal(report.service.skipped, true, 'fixture runs neutralize launchd explicitly');
   assert.equal(report.payload.status, 'verified');
+  assert.equal(report.runtime.present, fs.existsSync(ZCODE_RUNTIME), 'the runtime is reported, never required');
 
   const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
   const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.external-subagent.daemon.plist');
@@ -213,28 +221,21 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
   assert.ok(plist.includes(ctx.daemon), 'LaunchAgent must point at the installed daemon payload');
   assert.ok(plist.includes(path.join(data, 'external-subagent.sqlite3')));
   assert.ok(plist.includes(path.join(data, 'external-subagent.sock')));
-  assert.ok(plist.includes('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'));
+  assert.equal(plist.includes('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'), fs.existsSync(ZCODE_RUNTIME),
+    'the pinned ZCode runtime is forwarded exactly when that installation exists');
   assert.ok(plist.includes('/usr/bin:/bin'), 'GUI environment must not inherit the shell PATH');
   const config = JSON.parse(fs.readFileSync(path.join(data, 'config.json'), 'utf8'));
   for (const field of ['runtime', 'database', 'socket']) {
     assert.equal(config[field], undefined, `config must not persist the retired ${field} field`);
   }
 
-  const staging = path.join(home, 'plugins', 'external-subagent');
-  const staged = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
-  // Node resolves the CLI through its realpath (/private/var under tmpdirs),
-  // which is the stable entry the staging must pin.
-  assert.equal(staged.mcpServers.external_subagent.command, fs.realpathSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagent-mcp')));
-  assert.equal(staged.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, path.join(data, 'external-subagent.sock'));
-
-  const calls = fs.readFileSync(fake.log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-  const add = calls.find((call) => call.args[0] === 'plugin' && call.args[1] === 'add' && !call.args.includes('--help'));
-  assert.equal(add.args[2], 'external-subagent');
-  assert.equal(add.codex_home, path.join(home, '.codex'));
-
-  const registry = JSON.parse(fs.readFileSync(path.join(data, 'codex-homes.json'), 'utf8'));
-  assert.deepEqual(registry.homes.map((entry) => entry.home), [fs.realpathSync(path.join(home, '.codex'))], 'init claims exactly the configured codex home');
-  assert.equal(registry.homes[0].version, report.payload.version);
+  // No implicit host binding happened: the recording fake was never invoked
+  // and no codex-owned or product-staged host artifact exists.
+  assert.equal(fs.existsSync(fake.log), false, 'init must never invoke the codex CLI');
+  assert.equal(fs.existsSync(path.join(home, 'plugins', 'external-subagent')), false, 'no managed staging tree');
+  assert.equal(fs.existsSync(path.join(home, '.agents')), false, 'no marketplace manifest');
+  assert.equal(fs.existsSync(path.join(data, 'codex-homes.json')), false, 'no D08 registry claim');
+  assert.equal(fs.existsSync(path.join(home, '.codex')), false, 'no codex home was created');
 
   // B-3: init itself publishes the active/retention baseline, so the standard
   // `npm A -> init A -> use A -> npm B` sequence never depends on an extra
@@ -257,11 +258,52 @@ test('explicit init installs service, binds Codex, and claims the codex home', {
 
   const again = jsonOutput(run(ctx.cli, ['init'], { env }), 'repeat init');
   assert.equal(again.ok, true);
-  const registryAfter = JSON.parse(fs.readFileSync(path.join(data, 'codex-homes.json'), 'utf8'));
-  assert.equal(registryAfter.homes.length, 1, 'repeat init stays idempotent in the D08 registry');
+  assert.equal(fs.existsSync(fake.log), false, 'a repeat init still never invokes the codex CLI');
+  assert.equal(fs.existsSync(path.join(data, 'codex-homes.json')), false, 'a repeat init still claims nothing');
   const stateAfter = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   assert.equal(stateAfter.active.version, report.payload.version, 'repeat init reaffirms the same baseline');
   assert.equal(stateAfter.active.daemon_entry_sha256, daemonSha);
+
+  // The retired init flags are rejected explicitly, never silently ignored.
+  for (const flag of ['--skip-runtime-probe', '--skip-codex-plugin']) {
+    const rejected = run(ctx.cli, ['init', flag], { env });
+    assert.equal(rejected.status, 2, `${flag} must fail closed`);
+    assert.equal(JSON.parse(rejected.stderr).error.code, 'INVALID_ARGUMENT');
+  }
+  const codexHomeRejected = run(ctx.cli, ['init', '--codex-home', path.join(home, '.codex')], { env });
+  assert.equal(codexHomeRejected.status, 2, '--codex-home must fail closed on init');
+  assert.equal(JSON.parse(codexHomeRejected.stderr).error.code, 'INVALID_ARGUMENT');
+});
+
+test('an explicit install-plugin after standalone init binds the codex host and claims the home', { skip: !testable }, async () => {
+  await ensureInstalled();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-init-host-'));
+  const shimDir = path.join(home, '.shim');
+  fs.mkdirSync(shimDir, { recursive: true });
+  const fake = fakeCodexCli(shimDir);
+  const env = fixtureEnv(home, { env: { PATH: `${fake.dir}:${process.env.PATH}`, FAKE_CODEX_LOG: fake.log } });
+  assert.equal(jsonOutput(run(ctx.cli, ['init'], { env }), 'init').ok, true);
+
+  const bound = jsonOutput(run(ctx.cli, ['install-plugin'], { env }), 'install-plugin');
+  assert.equal(bound.ok, true);
+  assert.equal(bound.installed, true);
+  assert.equal(bound.claim.registered, true, 'the explicit plugin install claims the D08 registry');
+
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  const staged = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
+  // Node resolves the CLI through its realpath (/private/var under tmpdirs),
+  // which is the stable entry the staging must pin.
+  assert.equal(staged.mcpServers.external_subagent.command, fs.realpathSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagent-mcp')));
+  assert.equal(staged.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, path.join(home, 'Library', 'Application Support', 'external-subagent', 'external-subagent.sock'));
+
+  const calls = fs.readFileSync(fake.log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+  const add = calls.find((call) => call.args[0] === 'plugin' && call.args[1] === 'add' && !call.args.includes('--help'));
+  assert.equal(add.args[2], 'external-subagent');
+  assert.equal(add.codex_home, path.join(home, '.codex'));
+
+  const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
+  const registry = JSON.parse(fs.readFileSync(path.join(data, 'codex-homes.json'), 'utf8'));
+  assert.deepEqual(registry.homes.map((entry) => entry.home), [fs.realpathSync(path.join(home, '.codex'))], 'the explicit install claims exactly the targeted codex home');
   const marketplace = JSON.parse(fs.readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
   assert.equal(marketplace.plugins.filter((entry) => entry.name === 'external-subagent').length, 1);
 });
@@ -279,8 +321,8 @@ test('unicode and spaces in the install home keep working', { skip: !testable },
   const report = jsonOutput(result, 'unicode init');
   assert.equal(report.ok, true);
   assert.ok(fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'com.external-subagent.daemon.plist')));
-  const registry = JSON.parse(fs.readFileSync(path.join(home, 'Library', 'Application Support', 'external-subagent', 'codex-homes.json'), 'utf8'));
-  assert.equal(registry.homes.length, 1);
+  assert.equal(fs.existsSync(path.join(home, 'Library', 'Application Support', 'external-subagent', 'codex-homes.json')), false,
+    'a standalone init claims no codex home regardless of the home spelling');
 });
 
 test('installed daemon payload serves status, agent states, and ten MCP tools', { skip: !testable }, async () => {
