@@ -27,5 +27,8 @@ target
 npm/native/darwin-arm64/
 *.tgz
 
+# Live-agent test run residue (per-run daemon state, wire logs)
+tests/live-agent/workspace/
+
 # Coding Agent
 .zcode
