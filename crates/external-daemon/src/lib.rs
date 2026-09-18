@@ -168,9 +168,9 @@ pub struct PassiveActivitySnapshot {
     pub latest_text_tail: String,
     pub latest_text_updated_at: Option<u64>,
     pub latest_text_truncated: bool,
-    /// Latest assistant message that has reached an explicit finish/done
-    /// boundary. In-flight deltas are deliberately excluded.
-    pub latest_progress: Option<String>,
+    /// Verified-public reasoning tail (bounded Unicode chars); empty when the
+    /// runtime source is not verified.
+    pub latest_reasoning: String,
     pub active_tools: Vec<PassiveActiveTool>,
     pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,

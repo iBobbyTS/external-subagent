@@ -42,11 +42,10 @@ test('CLI sends daemon RPC and preserves success result', async () => {
         outcome: 'success',
         result: {
           kind: 'task_wait',
-          task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
-          pending_requests: [{ request_id: 'read-1', kind: 'permission', state: 'pending', respondable: true, tool_name: 'Read', operation: 'read', summary: 'target input.txt', policy_preview: 'official_permission_request' }],
+          task: { agent_id: '10000001', status: 'running', session_id: null, input_identity: null },
+          pending_requests: [{ request_id: 'read-1', kind: 'permission', tool_name: 'Read', operation: 'read', summary: 'target input.txt' }],
           result_available: false,
-          activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' },
-          latest_progress: null,
+          activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
           result: null,
           instruction: 'A permission request is pending; respond now with external_subagent_respond using decision allow or deny.',
           timed_out: false,
@@ -58,12 +57,10 @@ test('CLI sends daemon RPC and preserves success result', async () => {
   try {
     const result = await callDaemon(socketPath, 'wait', { agent_id: 10000001, wait_time: 0 });
     assert.equal(clientEnded, false, 'sending a request must not half-close the RPC socket');
-    assert.equal(result.task.cancel_requested, false);
-    assert.equal(result.task.resources_reaped, false);
-    assert.equal(result.activity.latest_progress, undefined);
+    assert.deepEqual(result.task, { agent_id: 10000001, status: 'running', session_id: null, input_identity: null });
     assert.equal(result.result, null);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
-    assert.equal(result.pending_requests[0].respondable, true);
+    assert.equal(result.activity.latest_reasoning, '');
     assert.equal(result.timed_out, false);
     assert.equal(result.kind, undefined);
   }
@@ -97,22 +94,33 @@ test('CLI rejects obsolete protocol fields before connecting', () => {
   assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'respond', { agent_id: 10000001, request_id: 'r', decision: 'deny', reason: 'because' }), /reason/);
 });
 
-test('CLI forwards supports_answer only when declared', async () => {
-  const observed = [];
-  const respond = (request) => {
-    observed.push(request.params);
-    return { request_id: request.request_id, outcome: 'success', result: { kind: 'task_wait', task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false }, pending_requests: [], result_available: false, activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' }, latest_progress: null, result: null, instruction: null, timed_out: true } };
-  };
-  for (const input of [{ agent_id: 10000001, wait_time: 0 }, { agent_id: 10000001, wait_time: 0, supports_answer: true }]) {
-    const socketPath = path.join(os.tmpdir(), `zcode-cli-wait-cap-${process.pid}-${Date.now()}-${observed.length}.sock`);
-    const server = net.createServer((socket) => { socket.once('data', (chunk) => socket.end(`${JSON.stringify(respond(JSON.parse(chunk)))}\n`)); });
-    await new Promise((resolve) => server.listen(socketPath, resolve));
-    try { await callDaemon(socketPath, 'wait', input); }
-    finally { await new Promise((resolve) => server.close(resolve)); }
-  }
-  assert.equal(observed[0].supports_answer, undefined);
-  assert.equal(observed[1].supports_answer, true);
-  assert.equal(observed.every((params) => params.after_revision === undefined), true);
+test('CLI rejects the removed wait capability handshake before connecting', () => {
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: 10000001, supports_answer: true }), /supports_answer/u);
+});
+
+test('CLI forwards wait message_id when declared', async () => {
+  const socketPath = path.join(os.tmpdir(), `zcode-cli-wait-receipt-${process.pid}-${Date.now()}.sock`);
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    assert.deepEqual(request.params, { agent_id: '10000001', wait_time: 0, message_id: 'message-1' });
+    socket.end(JSON.stringify({
+      request_id: request.request_id,
+      outcome: 'success',
+      result: {
+        kind: 'task_wait',
+        task: { agent_id: '10000001', status: 'running', session_id: null, input_identity: null },
+        pending_requests: [], result_available: false,
+        activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+        result: null, instruction: null, timed_out: true,
+        message_receipt: { message_id: 'message-1', state: 'queued', failure_code: null },
+      },
+    }) + '\n');
+  }); });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const result = await callDaemon(socketPath, 'wait', { agent_id: 10000001, wait_time: 0, message_id: 'message-1' });
+    assert.deepEqual(result.message_receipt, { message_id: 'message-1', state: 'queued', failure_code: null });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
 test('CLI omits send message_id for daemon generation and projects the returned id', async () => {
@@ -146,7 +154,7 @@ test('CLI maps workspace list scope to daemon repository scope', async () => {
 test('CLI passes list agent filter and projects persisted input identity', async () => {
   const socketPath = path.join(os.tmpdir(), `external-cli-list-identity-${process.pid}-${Date.now()}.sock`);
   const identity = {
-    admission: { agent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null, model_source: 'native' },
+    subagent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null, model_source: 'native',
     workspace_path: '/workspace', permission_mode: 'build',
   };
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -154,17 +162,13 @@ test('CLI passes list agent filter and projects persisted input identity', async
     assert.equal(request.method, 'task_list');
     assert.equal(request.params.subagent, 'future-provider');
     socket.end(`${JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
-      kind: 'task_listed', tasks: [{ agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null,
-        stop_requested: false, close_requested: false, closed: false, reaped: false, input_identity: identity }], next_cursor: null,
+      kind: 'task_listed', tasks: [{ agent_id: '10000001', status: 'running', session_id: null, input_identity: identity }], next_cursor: null,
     } })}\n`);
   }));
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
     const result = await callDaemon(socketPath, 'list', { subagent: 'future-provider', repository: '/workspace' });
-    assert.deepEqual(result.tasks[0].input_identity, {
-      subagent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null,
-      model_source: 'native', workspace_path: '/workspace', permission_mode: 'build',
-    });
+    assert.deepEqual(result.tasks[0].input_identity, identity);
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
@@ -179,7 +183,7 @@ test('CLI applies documented list and result defaults before connecting', async 
       for (const [name, value] of Object.entries(expected)) assert.deepEqual(request.params[name], value);
       const result = command === 'list'
         ? { kind: 'task_listed', tasks: [], next_cursor: null }
-        : { kind: 'task_result', task: { agent_id: '10000001', phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false }, result: null };
+        : { kind: 'task_result', task: { agent_id: '10000001', status: 'running', session_id: null, input_identity: null }, result: null };
       socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result }) + '\n');
     }); });
     await new Promise((resolve) => server.listen(socketPath, resolve));
@@ -209,57 +213,28 @@ test('CLI observe uses the shared read-only daemon snapshot without adding field
 });
 
 test('CLI public projection removes private RPC fields and result digest', () => {
-  const task = { agent_id: '10000001', phase: 'TERMINAL', outcome: 'COMPLETED', reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: true };
+  const task = { agent_id: '10000001', status: 'completed', session_id: null, input_identity: null };
   const projected = projectDaemonResult('result', {
     kind: 'task_result',
     task,
     result: { outcome: 'COMPLETED', final_text: 'ok', partial: false, result_sha256: 'private', offset: 0, total_bytes: 2, next_offset: null, complete: true },
   });
-  assert.deepEqual(Object.keys(projected).sort(), ['question', 'result', 'task']);
-  assert.equal(projected.task.resources_reaped, true);
-  assert.equal(projected.task.reaped, undefined);
+  assert.deepEqual(Object.keys(projected).sort(), ['result', 'task']);
+  assert.deepEqual(projected.task, { agent_id: 10000001, status: 'completed', session_id: null, input_identity: null });
   // A legacy daemon frame may still carry the retired digest; the projection
   // must not forward it even if one appears.
   assert.equal(projected.result.result_sha256, undefined);
-  assert.equal(projected.question, null);
 });
 
-test('CLI result pages a recoverable pending question by request_id', async () => {
-  const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-question-${process.pid}-${Date.now()}.sock`);
-  const question = {
-    text: 'Deploy to which environment? options: [production, staging]',
-    offset: 2048,
-    total_bytes: 2548,
-    next_offset: null,
-    complete: true,
-  };
-  const server = net.createServer((socket) => { socket.once('data', (chunk) => {
-    const request = JSON.parse(chunk);
-    assert.equal(request.method, 'task_result');
-    assert.equal(request.params.agent_id, '10000001');
-    assert.equal(request.params.request_id, 'question-1');
-    assert.equal(request.params.offset, 2048);
-    socket.end(JSON.stringify({
-      request_id: request.request_id,
-      outcome: 'success',
-      result: {
-        kind: 'task_result',
-        task: { agent_id: '10000001', phase: 'WAITING_INPUT', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
-        result: null,
-        question,
-      },
-    }) + '\n');
-  }); });
-  await new Promise((resolve) => server.listen(socketPath, resolve));
-  try {
-    const projected = await callDaemon(socketPath, 'result', { agent_id: 10000001, request_id: 'question-1', offset: 2048 });
-    assert.deepEqual(projected.question, question);
-    assert.equal(projected.result, null);
-    assert.throws(
-      () => callDaemon(socketPath, 'result', { agent_id: 10000001, bogus: true }),
-      (error) => error.code === 'INVALID_ARGUMENT' && /unsupported field/.test(error.message),
-    );
-  } finally { await new Promise((resolve) => server.close(resolve)); }
+test('CLI rejects the removed result question paging before connecting', () => {
+  assert.throws(
+    () => callDaemon(path.join(os.tmpdir(), 'x'), 'result', { agent_id: 10000001, request_id: 'question-1' }),
+    (error) => error.code === 'INVALID_ARGUMENT' && /unsupported field/.test(error.message),
+  );
+  assert.throws(
+    () => callDaemon(path.join(os.tmpdir(), 'x'), 'result', { agent_id: 10000001, bogus: true }),
+    (error) => error.code === 'INVALID_ARGUMENT' && /unsupported field/.test(error.message),
+  );
 });
 
 test('CLI reports unavailable daemon socket', async () => {
@@ -306,7 +281,7 @@ test('CLI preserves a maximum control and Unicode result page', async () => {
   const expected = '\u0001'.repeat(100000) + '你好🙂';
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
-    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'task_result', task: { agent_id: '10000001', phase: 'TERMINAL', outcome: 'COMPLETED', reason_code: null, stop_requested: false, close_requested: false, reaped: true }, result: { outcome: 'COMPLETED', final_text: expected, partial: false, offset: 0, total_bytes: Buffer.byteLength(expected), next_offset: null, complete: true } } }) + '\n');
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'task_result', task: { agent_id: '10000001', status: 'completed', session_id: null, input_identity: null }, result: { outcome: 'COMPLETED', final_text: expected, partial: false, offset: 0, total_bytes: Buffer.byteLength(expected), next_offset: null, complete: true } } }) + '\n');
   }));
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try { const result = await callDaemon(socketPath, 'result', { agent_id: 10000001, limit: 100000 }); assert.equal(result.result.final_text, expected); }

@@ -4,8 +4,7 @@ use crate::{
         AgentProbeInput, EvidenceState, ProbeScope, ScopeEvidence,
     },
     observation::{ObservationCoverage, ObservedReasoning, ObservedTool, OBSERVATION_SCHEMA},
-    MessageDisposition, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
-    ResponseDisposition, Scheduler, SchedulerError,
+    MessageDisposition, PassiveActivitySnapshot, ResponseDisposition, Scheduler, SchedulerError,
 };
 use external_core::{canonical_general_repository, GeneralTaskManifest, PreparedGeneralTask};
 use external_store::{
@@ -86,10 +85,6 @@ pub enum RpcMethod {
     },
     TaskResult {
         agent_id: String,
-        /// Pages the stored question of this pending user-input request
-        /// instead of the task's terminal result.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        request_id: Option<String>,
         #[serde(default)]
         offset: usize,
         #[serde(default = "default_result_limit")]
@@ -207,11 +202,6 @@ pub struct TaskWaitQuery {
     pub wait_time: u64,
     #[serde(default)]
     pub message_id: Option<String>,
-    /// Declares whether the caller can answer `interaction/requestUserInput`
-    /// requests. Without it, only allow/deny permission requests are treated
-    /// as respondable wake targets.
-    #[serde(default)]
-    pub supports_answer: bool,
 }
 
 fn default_wait_time() -> u64 {
@@ -322,7 +312,6 @@ pub enum RpcSuccess {
         pending_requests: Vec<PendingRequestView>,
         result_available: bool,
         activity: TaskActivityView,
-        latest_progress: Option<String>,
         result: Option<TaskResultView>,
         instruction: Option<String>,
         timed_out: bool,
@@ -331,7 +320,6 @@ pub enum RpcSuccess {
     TaskResult {
         task: TaskView,
         result: Option<TaskResultView>,
-        question: Option<QuestionView>,
     },
     Message {
         message_id: String,
@@ -357,10 +345,7 @@ pub enum RpcSuccess {
 pub struct MessageReceiptView {
     pub message_id: String,
     pub state: String,
-    pub target_turn_id: Option<String>,
     pub failure_code: Option<String>,
-    pub created_at_ms: i64,
-    pub delivered_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -617,36 +602,40 @@ pub struct TaskObservationView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskView {
     pub agent_id: String,
+    /// Single lifecycle status: queued | preparing | running | waiting_input |
+    /// cancelling | completed | failed | cancelled | timed_out | runtime_lost |
+    /// result_invalid | closed. `closed` subsumes the terminal outcome; the
+    /// stored result keeps it queryable through task_result.
+    pub status: String,
     pub session_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub phase: String,
-    pub outcome: Option<TaskOutcome>,
-    pub reason_code: Option<String>,
-    pub stop_requested: bool,
-    pub close_requested: bool,
-    pub closed: bool,
-    pub reaped: bool,
     pub input_identity: InputIdentityView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputIdentityView {
     #[serde(default)]
-    pub admission: Option<external_core::AdmissionIdentity>,
+    pub subagent: Option<String>,
+    #[serde(default)]
+    pub config_revision: Option<u64>,
+    #[serde(default)]
+    pub adapter_version: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_source: Option<String>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskActivityStateView {
-    Queued,
-    Preparing,
-    Active,
-    WaitingInput,
-    Cancelling,
-    Idle,
-    Terminal,
+#[cfg(test)]
+pub(crate) fn flat_identity(view: &InputIdentityView) -> Option<external_core::AdmissionIdentity> {
+    Some(external_core::AdmissionIdentity {
+        agent: view.subagent.clone()?,
+        config_revision: view.config_revision?,
+        adapter_version: view.adapter_version.clone()?,
+        model: view.model.clone(),
+        model_source: view.model_source.clone()?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -657,45 +646,15 @@ pub enum TelemetryStatusView {
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivityToolKindView {
-    Read,
-    Bash,
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActiveToolView {
-    pub tool_call_id: String,
-    pub kind: ActivityToolKindView,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ActivityWindowView {
-    pub reasoning_delta_events: u64,
-    pub text_delta_events: u64,
-    pub tool_calls_started: u64,
-    pub tool_calls_completed: u64,
-    pub tool_calls_failed: u64,
-    pub read_calls: u64,
-    pub bash_calls: u64,
-    pub other_tool_calls: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskActivityView {
-    pub state: TaskActivityStateView,
-    pub last_runtime_event_at: Option<u64>,
-    pub last_activity_age_ms: Option<u64>,
-    pub model_request_active: bool,
-    pub model_request_age_ms: Option<u64>,
-    pub model_last_delta_age_ms: Option<u64>,
     pub latest_text_tail: String,
-    pub latest_text_updated_at: Option<u64>,
     pub latest_text_truncated: bool,
-    pub active_tools: Vec<ActiveToolView>,
-    pub window_60s: ActivityWindowView,
+    /// Verified-public reasoning tail (bounded to 200 Unicode characters);
+    /// empty when the runtime source is not verified.
+    pub latest_reasoning: String,
+    /// Tool calls started in the last 60 seconds, across all tools.
+    pub tool_calls_last_60s: u64,
     pub telemetry_status: TelemetryStatusView,
 }
 
@@ -714,17 +673,12 @@ fn default_result_limit() -> usize {
     MAX_RESULT_CHUNK_BYTES
 }
 
-/// Recoverable paged view of an answerable user-input question, using the
-/// same continuation contract as result pages. The wait projection embeds
-/// only the first bounded page; callers continue from next_offset through
-/// task_result with the pending request_id.
+/// Embedded view of an answerable user-input question. wait is the only
+/// retrieval surface; `truncated` marks questions beyond the embed cap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionView {
     pub text: String,
-    pub offset: usize,
-    pub total_bytes: usize,
-    pub next_offset: Option<usize>,
-    pub complete: bool,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -829,27 +783,16 @@ impl From<crate::ResponseOutcome> for ResponseOutcomeView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingRequestStateView {
-    Pending,
-    Sending,
-    Responded,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRequestView {
     pub request_id: String,
     pub kind: String,
-    pub state: PendingRequestStateView,
-    pub respondable: bool,
     pub tool_name: Option<String>,
     pub operation: String,
     pub summary: String,
-    /// First bounded page of the question for user_input requests; the
-    /// summary marker alone is not recoverable without it.
+    /// Full embedded question for user_input requests (the only retrieval
+    /// surface); truncated marks questions beyond the embed cap.
     pub question: Option<QuestionView>,
-    pub policy_preview: String,
 }
 
 #[derive(Clone)]
@@ -1240,7 +1183,6 @@ impl RpcService {
             }
             RpcMethod::TaskResult {
                 agent_id,
-                request_id,
                 offset,
                 limit,
             } => {
@@ -1253,41 +1195,6 @@ impl RpcService {
                         ),
                     ));
                 }
-                // The recoverable continuation for question summaries: the
-                // same paging contract as result text, keyed by the pending
-                // request the caller already holds.
-                if let Some(request_id) = request_id.as_deref() {
-                    validate_id(request_id, "request_id")?;
-                    let request = self
-                        .store
-                        .pending_request(&task.agent_id, request_id)
-                        .map_err(map_store)?
-                        .ok_or_else(|| {
-                            RpcError::new(
-                                RpcErrorCode::NotFound,
-                                "pending request was not found",
-                            )
-                        })?;
-                    let question = recoverable_user_input_question(&request).ok_or_else(|| {
-                        RpcError::new(
-                            RpcErrorCode::Validation,
-                            "request does not expose recoverable question content",
-                        )
-                    })?;
-                    let (end, next_offset) =
-                        paged_text_bounds(&question, offset, limit, "question")?;
-                    return Ok(RpcSuccess::TaskResult {
-                        task: task_view(task),
-                        result: None,
-                        question: Some(QuestionView {
-                            text: question[offset..end].to_owned(),
-                            offset,
-                            total_bytes: question.len(),
-                            next_offset,
-                            complete: next_offset.is_none(),
-                        }),
-                    });
-                }
                 let result = self
                     .store
                     .task_result(&task.agent_id)
@@ -1297,7 +1204,6 @@ impl RpcService {
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(task),
                     result,
-                    question: None,
                 })
             }
             RpcMethod::TaskClose { agent_id } => {
@@ -1420,47 +1326,36 @@ impl RpcService {
                     (m.agent_id == query.agent_id).then(|| MessageReceiptView {
                         message_id: m.message_id,
                         state: format!("{:?}", m.state).to_lowercase(),
-                        target_turn_id: m.target_turn_id,
                         failure_code: m.failure_code,
-                        created_at_ms: m.created_at,
-                        delivered_at_ms: m.delivered_at,
                     })
                 })
             } else {
                 None
             };
-            // The wake decision scans the real pending owner so a respondable
+            // The wake decision scans the real pending owner so an actionable
             // request beyond the 100-record output projection still wakes this
-            // wait; only ordinary progress, message receipts, and requests the
-            // caller cannot respond to keep it blocked.
+            // wait; only ordinary progress, message receipts, and records the
+            // caller cannot act on (already responded, unsupported kinds)
+            // keep it blocked.
             let all_pending = self
                 .store
                 .pending_requests(&task.agent_id)
                 .map_err(map_store)?;
-            let wake_request = all_pending
+            let actionable: Vec<_> = all_pending
                 .iter()
-                .find(|request| wake_pending_request(request, query.supports_answer))
-                .cloned();
-            // The bounded projection always contains the request that woke
-            // this wait: when the wake target sits beyond the cap it replaces
-            // the last projected slot, so the caller can respond using the
-            // returned request_id without a second lookup.
-            let mut pending_requests = all_pending
+                .filter(|request| wake_pending_request(request))
+                .cloned()
+                .collect();
+            let wake_request = actionable.first().cloned();
+            // The projection carries only actionable records and is capped;
+            // the wake target is the first actionable record, so it is always
+            // part of the returned projection.
+            let pending_requests = actionable
                 .iter()
                 .take(MAX_PENDING_REQUESTS)
                 .cloned()
-                .map(|request| pending_request_view(request, query.supports_answer))
+                .map(pending_request_view)
                 .collect::<Vec<_>>();
-            if let Some(wake) = wake_request.as_ref() {
-                if pending_requests
-                    .iter()
-                    .all(|view| view.request_id != wake.request_id)
-                {
-                    pending_requests.truncate(MAX_PENDING_REQUESTS - 1);
-                    pending_requests
-                        .push(pending_request_view(wake.clone(), query.supports_answer));
-                }
-            }
             let wake_respondable = wake_request.is_some();
             let stored_result = self.store.task_result(&task.agent_id).map_err(map_store)?;
             let result_available = stored_result.is_some();
@@ -1473,21 +1368,13 @@ impl RpcService {
                     .filter(|_| terminal)
                     .map(|stored| self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES))
                     .transpose()?;
-                let instruction = wait_instruction(
-                    terminal,
-                    result_page.as_ref(),
-                    wake_request.as_ref(),
-                    query.supports_answer,
-                );
+                let instruction =
+                    wait_instruction(terminal, result_page.as_ref(), wake_request.as_ref());
                 let mut response = RpcSuccess::TaskWait {
                     activity: task_activity_view(task.phase, activity),
                     task: task_view(task.clone()),
                     pending_requests,
                     result_available,
-                    latest_progress: self
-                        .scheduler
-                        .passive_activity_snapshot(&task.agent_id)
-                        .and_then(|a| a.latest_progress),
                     result: result_page,
                     instruction,
                     timed_out,
@@ -1507,7 +1394,6 @@ fn wait_instruction(
     terminal: bool,
     result_page: Option<&TaskResultView>,
     wake_request: Option<&external_store::StoredPendingRequest>,
-    supports_answer: bool,
 ) -> Option<String> {
     if terminal {
         return match result_page {
@@ -1526,7 +1412,7 @@ fn wait_instruction(
         };
     }
     match wake_request.map(|request| request.request_type.as_str()) {
-        Some("user_input") if supports_answer => Some(
+        Some("user_input") => Some(
             "The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content."
                 .to_owned(),
         ),
@@ -1541,17 +1427,12 @@ fn wait_instruction(
     }
 }
 
-/// A pending request wakes (and is respondable for this caller) only when its
-/// state is pending and the caller can actually respond to it: permission
-/// requests need allow/deny, user-input requests need the declared answer
-/// capability.
-fn wake_pending_request(request: &external_store::StoredPendingRequest, supports_answer: bool) -> bool {
+/// A pending request wakes (and is projected) only when the caller can act
+/// on it: still pending, and a known kind with a respond contract
+/// (permission needs allow/deny, user_input needs answer with content).
+fn wake_pending_request(request: &external_store::StoredPendingRequest) -> bool {
     request.state == PendingRequestState::Pending
-        && match request.request_type.as_str() {
-            "permission" => true,
-            "user_input" => supports_answer,
-            _ => false,
-        }
+        && matches!(request.request_type.as_str(), "permission" | "user_input")
 }
 
 fn configured_agent_statuses(
@@ -2158,14 +2039,13 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// Bounded question exposure for answerable user-input requests. The byte cap
-/// keeps even a worst-case 100-request wait projection inside the response
-/// frame cap — the summary prefix and the question first page each carry at
-/// most these bytes — and the marker keeps the cut observable: the caller
-/// sees how many question chars were omitted instead of a silently
-/// shortened question. The cut is recoverable: the projection's question
-/// page continues from next_offset through task_result with the request_id.
+/// Bounded question exposure for answerable user-input requests. The summary
+/// prefix keeps even a worst-case 100-request wait projection inside the
+/// response frame cap, while the embedded question carries a generous page —
+/// wait is its only retrieval surface, so a cut is marked truncated instead
+/// of silently shortened.
 const MAX_QUESTION_SUMMARY_BYTES: usize = 2048;
+const MAX_QUESTION_EMBED_BYTES: usize = 16 * 1024;
 
 fn user_input_question(payload_json: &str) -> Option<String> {
     serde_json::from_str::<Value>(payload_json)
@@ -2176,16 +2056,6 @@ fn user_input_question(payload_json: &str) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-}
-
-/// Only answerable user_input requests expose a recoverable question;
-/// permission and unsupported requests have no question payload to page.
-fn recoverable_user_input_question(
-    request: &external_store::StoredPendingRequest,
-) -> Option<String> {
-    (request.request_type == "user_input")
-        .then(|| user_input_question(&request.payload_json))
-        .flatten()
 }
 
 fn sanitized_user_input_summary(payload_json: &str) -> String {
@@ -2205,14 +2075,12 @@ fn sanitized_user_input_summary(payload_json: &str) -> String {
 
 fn user_input_question_page(payload_json: &str) -> Option<QuestionView> {
     let question = user_input_question(payload_json)?;
-    let (end, next_offset) =
-        paged_text_bounds(&question, 0, MAX_QUESTION_SUMMARY_BYTES, "question").ok()?;
+    // wait is the only retrieval surface for questions, so embed generously;
+    // a question beyond the cap is honestly marked truncated.
+    let text = truncate_at_char_boundary(&question, MAX_QUESTION_EMBED_BYTES);
     Some(QuestionView {
-        text: question[..end].to_owned(),
-        offset: 0,
-        total_bytes: question.len(),
-        next_offset,
-        complete: next_offset.is_none(),
+        truncated: text.len() < question.len(),
+        text,
     })
 }
 
@@ -2228,8 +2096,9 @@ fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> String {
 }
 
 // Measure the complete envelope with the largest valid request ID. Large result
-// text falls back to the existing first-page contract; oversized metadata still
-// uses the transport's existing Oversized response.
+// text falls back to the existing first-page contract; embedded questions
+// degrade to a bounded prefix so actionable request_ids stay reachable. Only
+// metadata that still exceeds the cap uses the transport's Oversized response.
 fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
     let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
     let fits = serde_json::to_vec(&envelope)
@@ -2239,15 +2108,27 @@ fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
         <= MAX_RESPONSE_FRAME_BYTES;
     if !fits {
         if let RpcSuccess::TaskWait {
-            result: Some(result),
+            result,
+            pending_requests,
             ..
         } = response
         {
-            let (end, next_offset) =
-                result_page_bounds(&result.final_text, 0, MAX_RESULT_CHUNK_BYTES)?;
-            result.final_text.truncate(end);
-            result.next_offset = next_offset;
-            result.complete = next_offset.is_none();
+            // Degrade each bounded page independently: a non-terminal wait has
+            // no result to shrink, but its embedded questions still must.
+            if let Some(result) = result.as_mut() {
+                let (end, next_offset) =
+                    result_page_bounds(&result.final_text, 0, MAX_RESULT_CHUNK_BYTES)?;
+                result.final_text.truncate(end);
+                result.next_offset = next_offset;
+                result.complete = next_offset.is_none();
+            }
+            for request in pending_requests {
+                if let Some(question) = request.question.as_mut() {
+                    let full = std::mem::take(&mut question.text);
+                    question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
+                    question.truncated |= question.text.len() < full.len();
+                }
+            }
         }
         let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
         if serde_json::to_vec(&envelope)
@@ -2367,8 +2248,7 @@ pub(crate) mod wait_tests {
             panic!("wait")
         };
         assert_eq!(task.agent_id, id);
-        assert!(!task.stop_requested);
-        assert!(!task.reaped);
+        assert_ne!(task.status, "closed");
         // Bounded: aborting without an active drain is a state error, never
         // a second reset.
         let repeated = service
@@ -2486,7 +2366,6 @@ pub(crate) mod wait_tests {
             },
             RpcMethod::TaskResult {
                 agent_id: id.clone(),
-                request_id: None,
                 offset: 0,
                 limit: 10,
             },
@@ -2544,14 +2423,6 @@ pub(crate) mod wait_tests {
             agent_id: id.into(),
             wait_time,
             message_id: None,
-            supports_answer: false,
-        }
-    }
-
-    pub(crate) fn answer_query(id: &str, wait_time: u64) -> TaskWaitQuery {
-        TaskWaitQuery {
-            supports_answer: true,
-            ..query(id, wait_time)
         }
     }
 
@@ -2561,7 +2432,6 @@ pub(crate) mod wait_tests {
         let parsed: TaskWaitQuery =
             serde_json::from_value(serde_json::json!({"agent_id":id})).unwrap();
         assert_eq!(parsed.wait_time, 290);
-        assert!(!parsed.supports_answer);
         assert_eq!(agent_capabilities().max_wait_ms, 299000);
         for value in [-1, 300] {
             let response = service.handle_bytes(
@@ -2696,11 +2566,11 @@ pub(crate) mod wait_tests {
             panic!("ordinary activity ended wait")
         };
         assert_eq!(activity.latest_text_tail, "ordinary text");
+        assert_eq!(activity.tool_calls_last_60s, 1);
         assert_eq!(
             instruction.as_deref(),
             Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
         );
-        assert_eq!(activity.active_tools.len(), 1);
         assert_eq!(before, service.store.get_task(&id).unwrap());
     }
 
@@ -2722,26 +2592,19 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn wait_wake_predicate_matches_request_type_state_and_answer_capability() {
-        for (request_type, state, supports_answer, wakes) in [
-            ("permission", PendingRequestState::Pending, false, true),
-            ("permission", PendingRequestState::Pending, true, true),
-            ("user_input", PendingRequestState::Pending, false, false),
-            ("user_input", PendingRequestState::Pending, true, true),
-            (
-                "unsupported_input",
-                PendingRequestState::Pending,
-                true,
-                false,
-            ),
-            ("permission", PendingRequestState::Sending, true, false),
-            ("permission", PendingRequestState::Responded, true, false),
-            ("user_input", PendingRequestState::Responded, true, false),
+    fn wait_wake_predicate_matches_actionable_pending_requests() {
+        for (request_type, state, wakes) in [
+            ("permission", PendingRequestState::Pending, true),
+            ("user_input", PendingRequestState::Pending, true),
+            ("unsupported_input", PendingRequestState::Pending, false),
+            ("permission", PendingRequestState::Sending, false),
+            ("permission", PendingRequestState::Responded, false),
+            ("user_input", PendingRequestState::Responded, false),
         ] {
             assert_eq!(
-                wake_pending_request(&stored_pending(request_type, state), supports_answer),
+                wake_pending_request(&stored_pending(request_type, state)),
                 wakes,
-                "{request_type}/{state:?}/supports_answer={supports_answer}"
+                "{request_type}/{state:?}"
             );
         }
     }
@@ -2773,7 +2636,6 @@ pub(crate) mod wait_tests {
         assert!(!timed_out);
         assert_eq!(pending_requests.len(), 1);
         assert_eq!(pending_requests[0].tool_name.as_deref(), Some("Read"));
-        assert!(pending_requests[0].respondable);
         assert_eq!(
             instruction.as_deref(),
             Some("A permission request is pending; respond now with external_subagent_respond using decision allow or deny.")
@@ -2781,7 +2643,7 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn wait_wakes_only_declared_answerable_requests() {
+    fn wait_wakes_for_user_input_with_the_full_embedded_question() {
         let (_, service, id) = fixture();
         service
             .store
@@ -2793,39 +2655,26 @@ pub(crate) mod wait_tests {
                 r#"{"question":"which branch?"}"#,
             )
             .unwrap();
-        // Without the answer capability the request is neither a wake target
-        // nor projected as respondable for this caller.
-        let start = Instant::now();
-        let RpcSuccess::TaskWait {
-            pending_requests,
-            timed_out,
-            ..
-        } = service
-            .task_wait(query(&id, 0), start + Duration::from_millis(30), &|| false)
-            .unwrap()
-        else {
-            panic!("expected wait response")
-        };
-        assert!(timed_out);
-        assert_eq!(pending_requests.len(), 1);
-        assert_eq!(pending_requests[0].kind, "user_input");
-        assert!(!pending_requests[0].respondable);
-        // Declaring the capability wakes immediately and projects the request
-        // as respondable with answer guidance.
+        // Every actionable request wakes without a capability handshake; the
+        // question is embedded in full in the projection.
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
             instruction,
             ..
         } = service
-            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
             panic!("expected wait response")
         };
         assert!(!timed_out);
-        assert!(pending_requests[0].respondable);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].kind, "user_input");
         assert_eq!(pending_requests[0].summary, "question which branch?");
+        let question = pending_requests[0].question.as_ref().expect("question");
+        assert_eq!(question.text, "which branch?");
+        assert!(!question.truncated);
         assert_eq!(
             instruction.as_deref(),
             Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
@@ -2833,7 +2682,7 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn wait_never_wakes_for_unsupported_input_even_with_answer_capability() {
+    fn wait_never_wakes_for_or_projects_unsupported_input() {
         let (_, service, id) = fixture();
         service
             .store
@@ -2845,9 +2694,8 @@ pub(crate) mod wait_tests {
                 r#"{"origin":"dsh_acp","reason":"dsh server request is not a supported interaction"}"#,
             )
             .unwrap();
-        // The unsupported sentinel is not answerable for any caller: even a
-        // declared answer capability neither wakes the wait nor projects the
-        // record as respondable.
+        // The unsupported sentinel is not actionable for any caller: it
+        // neither wakes the wait nor appears in the projection.
         let start = Instant::now();
         let RpcSuccess::TaskWait {
             pending_requests,
@@ -2856,7 +2704,7 @@ pub(crate) mod wait_tests {
             ..
         } = service
             .task_wait(
-                answer_query(&id, 0),
+                query(&id, 0),
                 start + Duration::from_millis(30),
                 &|| false,
             )
@@ -2865,9 +2713,7 @@ pub(crate) mod wait_tests {
             panic!("expected wait response")
         };
         assert!(timed_out);
-        assert_eq!(pending_requests.len(), 1);
-        assert_eq!(pending_requests[0].kind, "unsupported_input");
-        assert!(!pending_requests[0].respondable);
+        assert!(pending_requests.is_empty());
         assert_eq!(
             instruction.as_deref(),
             Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
@@ -2891,7 +2737,7 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests, ..
         } = service
-            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
             panic!("expected wait response")
@@ -2922,7 +2768,7 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests, ..
         } = service
-            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
+            .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
             panic!("expected wait response")
@@ -2941,11 +2787,11 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn question_content_beyond_the_summary_cut_is_recoverable_through_result_paging() {
+    fn oversized_questions_embed_a_truncated_prefix_without_continuation() {
         let (_, service, id) = fixture();
-        // The decisive option sits entirely beyond the former 2048-byte cut.
+        // The decisive option sits entirely beyond the 16 KiB embed cap.
         let option = "Deploy to which environment? options: [production, staging]";
-        let question = format!("{}{}", "x".repeat(2500), option);
+        let question = format!("{}{}", "x".repeat(MAX_QUESTION_EMBED_BYTES + 500), option);
         service
             .store
             .insert_pending_request(
@@ -2959,57 +2805,19 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests, ..
         } = service
-            .dispatch(RpcMethod::TaskWait(answer_query(&id, 299)))
-        .unwrap()
+            .dispatch(RpcMethod::TaskWait(query(&id, 299)))
+            .unwrap()
         else {
             panic!("expected wait response")
         };
         let view = &pending_requests[0];
-        // The bounded marker stays observable exactly as before ...
-        assert_eq!(
-            view.summary,
-            format!(
-                "question {} [+{} more chars]",
-                "x".repeat(2048),
-                question.chars().count() - 2048
-            )
-        );
-        // ... and the same projection now carries a recoverable first page
-        // that stops at the cut instead of losing it.
-        let page = view.question.as_ref().expect("question first page");
-        assert_eq!(page.text, "x".repeat(2048));
-        assert_eq!(page.offset, 0);
-        assert_eq!(page.total_bytes, question.len());
-        assert_eq!(page.next_offset, Some(2048));
-        assert!(!page.complete);
-        assert!(!page.text.contains("production"));
-        // The continuation retrieves the content beyond the cut through the
-        // existing result paging contract, keyed by the pending request_id.
-        let RpcSuccess::TaskResult {
-            result,
-            question: fetched,
-            ..
-        } = service
-            .dispatch(RpcMethod::TaskResult {
-                agent_id: id.clone(),
-                request_id: Some("request".into()),
-                offset: page.next_offset.unwrap(),
-                limit: MAX_RESULT_CHUNK_BYTES,
-            })
-            .unwrap()
-        else {
-            panic!("expected result response")
-        };
-        assert!(result.is_none());
-        let fetched = fetched.expect("retrieved question page");
-        assert_eq!(fetched.offset, 2048);
-        assert_eq!(fetched.total_bytes, question.len());
-        assert_eq!(fetched.next_offset, None);
-        assert!(fetched.complete);
-        assert!(fetched.text.contains(option));
+        // wait is the only question surface: the embed is generous but
+        // honestly truncated, and there is no continuation contract.
+        let page = view.question.as_ref().expect("embedded question");
+        assert_eq!(page.text.len(), MAX_QUESTION_EMBED_BYTES);
+        assert_eq!(page.text, "x".repeat(MAX_QUESTION_EMBED_BYTES));
+        assert!(page.truncated);
         assert!(!page.text.contains(option));
-        // Reassembling both pages reproduces the stored question exactly.
-        assert_eq!(format!("{}{}", page.text, fetched.text), question);
     }
 
     #[test]
@@ -3029,7 +2837,7 @@ pub(crate) mod wait_tests {
                 .unwrap();
         }
         let response = service
-            .dispatch(RpcMethod::TaskWait(answer_query(&id, 0)))
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap();
         let envelope = RpcResponse::success("\u{1}".repeat(128), response);
         assert!(
@@ -3038,45 +2846,77 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn question_paging_is_request_scoped_and_rejects_unknown_fields() {
+    fn oversized_question_projections_degrade_to_bounded_prefixes_instead_of_erroring() {
         let (_, service, id) = fixture();
-        service
-            .store
-            .insert_pending_request(
-                "permission-request",
-                &id,
-                "correlation-permission",
-                "permission",
-                r#"{"toolName":"Read"}"#,
-            )
+        // Escape-dense questions: each embeds 16 KiB of quotes, so a full
+        // 100-record projection serializes far past the response frame cap.
+        // Before the degradation path the wait itself returned Oversized,
+        // hiding every request_id from the caller.
+        let question = "\"".repeat(MAX_QUESTION_EMBED_BYTES);
+        for index in 0..MAX_PENDING_REQUESTS {
+            service
+                .store
+                .insert_pending_request(
+                    &format!("request-{index}"),
+                    &id,
+                    &format!("correlation-{index}"),
+                    "user_input",
+                    &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
+                )
+                .unwrap();
+        }
+        let response = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap();
-        // A permission request has no recoverable question to page.
-        let error = service
-            .dispatch(RpcMethod::TaskResult {
-                agent_id: id.clone(),
-                request_id: Some("permission-request".into()),
-                offset: 0,
-                limit: 1024,
-            })
-            .unwrap_err();
-        assert!(matches!(error.code, RpcErrorCode::Validation));
-        // Unknown request ids are reported as missing, scoped to this task.
-        let error = service
-            .dispatch(RpcMethod::TaskResult {
-                agent_id: id.clone(),
-                request_id: Some("missing".into()),
-                offset: 0,
-                limit: 1024,
-            })
-            .unwrap_err();
-        assert!(matches!(error.code, RpcErrorCode::NotFound));
-        // The wire decoder still rejects unknown params on the extended
-        // method, preserving the unknown-field contract.
+        let RpcSuccess::TaskWait {
+            pending_requests, ..
+        } = &response
+        else {
+            panic!("expected wait response")
+        };
+        assert_eq!(pending_requests.len(), MAX_PENDING_REQUESTS);
+        for request in pending_requests {
+            let degraded = request.question.as_ref().expect("embedded question");
+            assert!(
+                degraded.text.len() <= MAX_QUESTION_SUMMARY_BYTES,
+                "degraded question stays bounded"
+            );
+            assert!(degraded.truncated);
+            assert!(!request.request_id.is_empty());
+        }
+        let envelope = RpcResponse::success("\u{1}".repeat(128), response);
+        assert!(
+            serde_json::to_vec(&envelope).unwrap().len() + 1 <= MAX_RESPONSE_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn result_rejects_the_removed_request_id_param_and_unknown_fields() {
+        let (_, service, id) = fixture();
+        // Question retrieval moved fully into wait: request_id is no longer
+        // part of the task_result contract and the wire rejects it verbatim.
         let response = service.handle_bytes(
             &serde_json::to_vec(&serde_json::json!({
                 "request_id":"wire",
                 "method":"task_result",
-                "params":{"agent_id":id,"request_id":"missing","bogus":true}
+                "params":{"agent_id":id,"request_id":"missing"}
+            }))
+            .unwrap(),
+        );
+        assert!(matches!(
+            response.outcome,
+            RpcOutcome::Error {
+                error: RpcError {
+                    code: RpcErrorCode::Validation,
+                    ..
+                }
+            }
+        ));
+        let response = service.handle_bytes(
+            &serde_json::to_vec(&serde_json::json!({
+                "request_id":"wire",
+                "method":"task_result",
+                "params":{"agent_id":id,"bogus":true}
             }))
             .unwrap(),
         );
@@ -3092,7 +2932,7 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn wait_wakes_for_the_101st_respondable_request_beyond_the_projection_cap() {
+    fn wait_wakes_for_an_actionable_request_beyond_unsupported_noise() {
         let (_, service, id) = fixture();
         for index in 0..=MAX_PENDING_REQUESTS {
             let (request_type, payload) = if index < MAX_PENDING_REQUESTS {
@@ -3123,18 +2963,15 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected wait response")
         };
-        // The output projection stays capped at 100, the wake decision scans
-        // the real pending owner, and the request that woke the wait is part
-        // of the returned projection so its id can be used to respond.
+        // The wake decision scans the real pending owner while the projection
+        // carries only actionable records: the 100 unsupported sentinels stay
+        // invisible and the actionable 101st is the projected wake target.
         assert!(!timed_out);
         assert!(start.elapsed() < Duration::from_millis(500));
-        assert_eq!(pending_requests.len(), MAX_PENDING_REQUESTS);
-        assert_eq!(pending_requests[0].request_id, "request-0");
-        assert!(!pending_requests[0].respondable);
-        let wake = pending_requests.last().unwrap();
+        assert_eq!(pending_requests.len(), 1);
+        let wake = &pending_requests[0];
         assert_eq!(wake.request_id, "request-100");
         assert_eq!(wake.kind, "permission");
-        assert!(wake.respondable);
         // The returned id addresses the real 101st store row, not a
         // projection-only copy.
         assert_eq!(
@@ -3146,11 +2983,8 @@ pub(crate) mod wait_tests {
                 .request_type,
             "permission"
         );
-        assert!(pending_requests[..MAX_PENDING_REQUESTS - 1]
-            .iter()
-            .all(|request| !request.respondable));
-        // The same 101st request, answerable-only, still needs the declared
-        // capability before it can wake this wait.
+        // User-input requests are actionable for every caller now: the same
+        // layout wakes without a capability handshake and embeds the question.
         let (_, service, id) = fixture();
         for index in 0..=MAX_PENDING_REQUESTS {
             let (request_type, payload) = if index < MAX_PENDING_REQUESTS {
@@ -3170,14 +3004,23 @@ pub(crate) mod wait_tests {
                 .unwrap();
         }
         let start = Instant::now();
-        let RpcSuccess::TaskWait { timed_out, .. } = service
+        let RpcSuccess::TaskWait {
+            pending_requests,
+            timed_out,
+            ..
+        } = service
             .task_wait(query(&id, 1), start + Duration::from_millis(60), &|| false)
             .unwrap()
         else {
             panic!("expected wait response")
         };
-        assert!(timed_out);
-        assert!(start.elapsed() >= Duration::from_millis(40));
+        assert!(!timed_out);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].kind, "user_input");
+        assert_eq!(
+            pending_requests[0].question.as_ref().unwrap().text,
+            "continue?"
+        );
     }
 
     #[test]
@@ -3592,30 +3435,44 @@ fn task_view(task: TaskRecord) -> TaskView {
             .map(str::to_owned)
     });
     let workspace_path = Some(task.workspace_path.clone());
+    let admission: Option<external_core::AdmissionIdentity> = prepared
+        .as_ref()
+        .and_then(|v| v.get("admission"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let status = if task.closed_at.is_some() {
+        "closed".to_owned()
+    } else {
+        match task.phase {
+            TaskPhase::Queued => "queued".to_owned(),
+            TaskPhase::Preparing => "preparing".to_owned(),
+            TaskPhase::Running => "running".to_owned(),
+            TaskPhase::WaitingInput => "waiting_input".to_owned(),
+            TaskPhase::Cancelling => "cancelling".to_owned(),
+            TaskPhase::Terminal => match task.outcome {
+                Some(TaskOutcome::Completed) => "completed".to_owned(),
+                Some(TaskOutcome::Failed) => "failed".to_owned(),
+                Some(TaskOutcome::Cancelled) => "cancelled".to_owned(),
+                Some(TaskOutcome::TimedOut) => "timed_out".to_owned(),
+                Some(TaskOutcome::RuntimeLost) => "runtime_lost".to_owned(),
+                Some(TaskOutcome::ResultInvalid) => "result_invalid".to_owned(),
+                None => "terminal".to_owned(),
+            },
+        }
+    };
     TaskView {
         agent_id: task.agent_id,
+        status,
         session_id: task.zcode_session_id,
-        turn_id: None,
-        phase: match task.phase {
-            TaskPhase::Queued => "QUEUED",
-            TaskPhase::Preparing => "PREPARING",
-            TaskPhase::Running => "RUNNING",
-            TaskPhase::WaitingInput => "WAITING_INPUT",
-            TaskPhase::Cancelling => "CANCELLING",
-            TaskPhase::Terminal => "TERMINAL",
-        }
-        .into(),
-        outcome: task.outcome,
-        reason_code: task.failure_code,
-        stop_requested: task.stop_requested,
-        close_requested: task.close_requested,
-        closed: task.closed_at.is_some(),
-        reaped: task.reaped_at.is_some(),
         input_identity: InputIdentityView {
-            admission: prepared
+            subagent: admission.as_ref().map(|identity| identity.agent.clone()),
+            config_revision: admission.as_ref().map(|identity| identity.config_revision),
+            adapter_version: admission
                 .as_ref()
-                .and_then(|v| v.get("admission"))
-                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                .map(|identity| identity.adapter_version.clone()),
+            model: admission.as_ref().and_then(|identity| identity.model.clone()),
+            model_source: admission
+                .as_ref()
+                .map(|identity| identity.model_source.clone()),
             workspace_path,
             permission_mode,
         },
@@ -3623,61 +3480,23 @@ fn task_view(task: TaskRecord) -> TaskView {
 }
 
 fn task_activity_view(
-    phase: TaskPhase,
+    _phase: TaskPhase,
     snapshot: Option<PassiveActivitySnapshot>,
 ) -> TaskActivityView {
-    let terminal = phase == TaskPhase::Terminal;
-    let state = match phase {
-        TaskPhase::Queued => TaskActivityStateView::Queued,
-        TaskPhase::Preparing => TaskActivityStateView::Preparing,
-        TaskPhase::Running => TaskActivityStateView::Active,
-        TaskPhase::WaitingInput => TaskActivityStateView::WaitingInput,
-        TaskPhase::Cancelling => TaskActivityStateView::Cancelling,
-        TaskPhase::Terminal => TaskActivityStateView::Terminal,
-    };
     let Some(snapshot) = snapshot else {
         return TaskActivityView {
-            state,
-            last_runtime_event_at: None,
-            last_activity_age_ms: None,
-            model_request_active: false,
-            model_request_age_ms: None,
-            model_last_delta_age_ms: None,
             latest_text_tail: String::new(),
-            latest_text_updated_at: None,
             latest_text_truncated: false,
-            active_tools: Vec::new(),
-            window_60s: ActivityWindowView::default(),
+            latest_reasoning: String::new(),
+            tool_calls_last_60s: 0,
             telemetry_status: TelemetryStatusView::Unavailable,
         };
     };
     TaskActivityView {
-        state,
-        last_runtime_event_at: snapshot.last_runtime_event_at,
-        last_activity_age_ms: snapshot.last_activity_age_ms,
-        model_request_active: !terminal && snapshot.model_request_active,
-        model_request_age_ms: if terminal {
-            None
-        } else {
-            snapshot.model_request_age_ms
-        },
-        model_last_delta_age_ms: snapshot.model_last_delta_age_ms,
         latest_text_tail: snapshot.latest_text_tail,
-        latest_text_updated_at: snapshot.latest_text_updated_at,
         latest_text_truncated: snapshot.latest_text_truncated,
-        active_tools: snapshot
-            .active_tools
-            .into_iter()
-            .map(|tool| ActiveToolView {
-                tool_call_id: tool.tool_call_id,
-                kind: match tool.kind {
-                    PassiveToolKind::Read => ActivityToolKindView::Read,
-                    PassiveToolKind::Bash => ActivityToolKindView::Bash,
-                    PassiveToolKind::Other => ActivityToolKindView::Other,
-                },
-            })
-            .collect(),
-        window_60s: activity_window_view(snapshot.window_60s),
+        latest_reasoning: snapshot.latest_reasoning,
+        tool_calls_last_60s: snapshot.window_60s.tool_calls_started,
         telemetry_status: if snapshot.telemetry_degraded {
             TelemetryStatusView::Degraded
         } else {
@@ -3688,11 +3507,11 @@ fn task_activity_view(
 
 #[cfg(test)]
 mod activity_projection_tests {
-    use super::{agent_capabilities, task_activity_view, TaskActivityStateView};
+    use super::{agent_capabilities, task_activity_view, TelemetryStatusView};
     use crate::{PassiveActivitySnapshot, PassiveActivityWindow};
     use external_store::TaskPhase;
 
-    fn active_model_request_snapshot() -> PassiveActivitySnapshot {
+    fn snapshot() -> PassiveActivitySnapshot {
         PassiveActivitySnapshot {
             revision: 7,
             last_runtime_event_at: Some(1_000),
@@ -3702,12 +3521,12 @@ mod activity_projection_tests {
             model_last_delta_age_ms: Some(300),
             latest_text_tail: "preserved tail".into(),
             latest_text_updated_at: Some(950),
-            latest_text_truncated: false,
-            latest_progress: Some("preserved progress".into()),
+            latest_text_truncated: true,
+            latest_reasoning: "recent reasoning".into(),
             active_tools: Vec::new(),
             oldest_active_tool_age_ms: None,
             window_60s: PassiveActivityWindow {
-                reasoning_delta_events: 2,
+                tool_calls_started: 4,
                 ..PassiveActivityWindow::default()
             },
             telemetry_degraded: true,
@@ -3715,45 +3534,36 @@ mod activity_projection_tests {
     }
 
     #[test]
-    fn terminal_phase_clears_stale_model_request_activity_and_preserves_history() {
-        let activity =
-            task_activity_view(TaskPhase::Terminal, Some(active_model_request_snapshot()));
-
-        assert_eq!(activity.state, TaskActivityStateView::Terminal);
-        assert!(!activity.model_request_active);
-        assert_eq!(activity.model_request_age_ms, None);
-        assert_eq!(activity.last_runtime_event_at, Some(1_000));
-        assert_eq!(activity.last_activity_age_ms, Some(250));
-        assert_eq!(activity.model_last_delta_age_ms, Some(300));
+    fn activity_projection_is_the_slim_liveness_surface() {
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot()));
         assert_eq!(activity.latest_text_tail, "preserved tail");
-        // The duplicated activity.latest_progress projection is gone; wait
-        // exposes progress only through its top-level latest_progress field.
-        assert_eq!(
-            serde_json::to_value(&activity)
-                .unwrap()
-                .get("latest_progress"),
-            None
-        );
-        assert_eq!(activity.window_60s.reasoning_delta_events, 2);
+        assert!(activity.latest_text_truncated);
+        assert_eq!(activity.latest_reasoning, "recent reasoning");
+        assert_eq!(activity.tool_calls_last_60s, 4);
+        assert_eq!(activity.telemetry_status, TelemetryStatusView::Degraded);
+        // The dropped signals never leak into the serialized projection.
+        let encoded = serde_json::to_value(&activity).unwrap();
+        for gone in [
+            "state",
+            "model_request_active",
+            "model_request_age_ms",
+            "active_tools",
+            "window_60s",
+            "latest_progress",
+            "last_activity_age_ms",
+        ] {
+            assert_eq!(encoded.get(gone), None, "{gone} must not leak");
+        }
     }
 
     #[test]
-    fn running_phase_preserves_live_model_request_activity() {
-        let activity =
-            task_activity_view(TaskPhase::Running, Some(active_model_request_snapshot()));
-
-        assert_eq!(activity.state, TaskActivityStateView::Active);
-        assert!(activity.model_request_active);
-        assert_eq!(activity.model_request_age_ms, Some(900));
-    }
-
-    #[test]
-    fn terminal_phase_without_runtime_snapshot_is_inactive() {
-        let activity = task_activity_view(TaskPhase::Terminal, None);
-
-        assert_eq!(activity.state, TaskActivityStateView::Terminal);
-        assert!(!activity.model_request_active);
-        assert_eq!(activity.model_request_age_ms, None);
+    fn missing_runtime_snapshot_reports_unavailable_telemetry() {
+        let activity = task_activity_view(TaskPhase::Queued, None);
+        assert_eq!(activity.latest_text_tail, "");
+        assert!(!activity.latest_text_truncated);
+        assert_eq!(activity.latest_reasoning, "");
+        assert_eq!(activity.tool_calls_last_60s, 0);
+        assert_eq!(activity.telemetry_status, TelemetryStatusView::Unavailable);
     }
 
     #[test]
@@ -3763,19 +3573,6 @@ mod activity_projection_tests {
         assert_eq!(observation.defaults.top_tools, 3);
         assert_eq!(observation.defaults.recent_calls_per_tool, 5);
         assert_eq!(observation.defaults.reasoning_chars, 200);
-    }
-}
-
-fn activity_window_view(value: PassiveActivityWindow) -> ActivityWindowView {
-    ActivityWindowView {
-        reasoning_delta_events: value.reasoning_delta_events,
-        text_delta_events: value.text_delta_events,
-        tool_calls_started: value.tool_calls_started,
-        tool_calls_completed: value.tool_calls_completed,
-        tool_calls_failed: value.tool_calls_failed,
-        read_calls: value.read_calls,
-        bash_calls: value.bash_calls,
-        other_tool_calls: value.other_tool_calls,
     }
 }
 
@@ -3794,41 +3591,15 @@ impl From<StoredTaskResult> for TaskResultView {
     }
 }
 
-fn pending_request_view(
-    request: StoredPendingRequest,
-    supports_answer: bool,
-) -> PendingRequestView {
-    let state = match request.state {
-        PendingRequestState::Pending => PendingRequestStateView::Pending,
-        PendingRequestState::Sending => PendingRequestStateView::Sending,
-        PendingRequestState::Responded => PendingRequestStateView::Responded,
-    };
+fn pending_request_view(request: StoredPendingRequest) -> PendingRequestView {
     if request.request_type == "user_input" {
         return PendingRequestView {
             request_id: request.request_id,
             kind: "user_input".into(),
-            state,
-            // An answerable request is only actionable for callers that
-            // declared the answer capability on their wait.
-            respondable: supports_answer,
             tool_name: None,
             operation: "user_input".into(),
             summary: sanitized_user_input_summary(&request.payload_json),
             question: user_input_question_page(&request.payload_json),
-            policy_preview: "unknown".into(),
-        };
-    }
-    if request.request_type != "permission" {
-        return PendingRequestView {
-            request_id: request.request_id,
-            kind: "unsupported_input".into(),
-            state,
-            respondable: false,
-            tool_name: None,
-            operation: "user_input".into(),
-            summary: "unsupported user input request".into(),
-            question: None,
-            policy_preview: "unknown".into(),
         };
     }
     let params = serde_json::from_str::<Value>(&request.payload_json).ok();
@@ -3846,17 +3617,13 @@ fn pending_request_view(
         .as_ref()
         .map(sanitized_permission_summary)
         .unwrap_or_else(|| "unrecognized permission request".into());
-    let policy_preview = "official_permission_request".to_owned();
     PendingRequestView {
         request_id: request.request_id,
         kind: "permission".into(),
-        state,
-        respondable: true,
         tool_name,
         operation,
         summary,
         question: None,
-        policy_preview,
     }
 }
 
@@ -3871,17 +3638,14 @@ mod result_paging_tests {
     fn task() -> TaskView {
         TaskView {
             agent_id: "a".repeat(256),
+            status: "completed".into(),
             session_id: None,
-            turn_id: None,
-            phase: "TERMINAL".into(),
-            outcome: Some(TaskOutcome::Completed),
-            reason_code: Some("r".repeat(256)),
-            stop_requested: false,
-            close_requested: false,
-            closed: false,
-            reaped: true,
             input_identity: InputIdentityView {
-                admission: None,
+                subagent: None,
+                config_revision: None,
+                adapter_version: None,
+                model: None,
+                model_source: None,
                 workspace_path: None,
                 permission_mode: None,
             },
@@ -3918,7 +3682,7 @@ mod result_paging_tests {
                     next_offset: Some(MAX_RESULT_CHUNK_BYTES),
                     complete: false,
                 }),
-                question: None,
+
             },
         );
         assert!(serde_json::to_vec(&response).unwrap().len() + 1 <= MAX_RESPONSE_FRAME_BYTES);
@@ -4520,7 +4284,7 @@ mod admission_tests {
             serde_json::from_str(&stored.prepared_launch_json).unwrap();
         prepared.validate_digest().unwrap();
         assert_eq!(prepared.admission.as_ref(), Some(&identity));
-        assert_eq!(task_view(stored).input_identity.admission, Some(identity));
+        assert_eq!(flat_identity(&task_view(stored).input_identity), Some(identity));
         let query = |agent: &str| TaskListQuery {
             agent: Some(agent.into()),
             repository: Some(directory.path().to_string_lossy().into_owned()),
@@ -4907,7 +4671,7 @@ mod admission_policy_tests {
         let RpcSuccess::GeneralSubmitted { task, .. } = *result else {
             panic!("expected a submitted task")
         };
-        let explicit_identity = task.input_identity.admission.clone().unwrap();
+        let explicit_identity = flat_identity(&task.input_identity).unwrap();
         assert_eq!(explicit_identity.model.as_deref(), Some("spawn-token"));
         assert_eq!(explicit_identity.model_source, "spawn_catalog");
 
@@ -4931,7 +4695,7 @@ mod admission_policy_tests {
         else {
             panic!("expected a submitted task")
         };
-        let default_identity = default_task.input_identity.admission.clone().unwrap();
+        let default_identity = flat_identity(&default_task.input_identity).unwrap();
         assert_eq!(
             default_identity.model.as_deref(),
             Some("configured-default-token")
@@ -5020,7 +4784,7 @@ mod admission_policy_tests {
             let RpcSuccess::GeneralSubmitted { task, .. } = *result else {
                 panic!("expected a submitted task")
             };
-            let identity = task.input_identity.admission.clone().unwrap();
+            let identity = flat_identity(&task.input_identity).unwrap();
             assert_eq!(identity.agent, "zcode");
             assert_eq!(identity.model, None);
             assert_eq!(identity.model_source, "native");

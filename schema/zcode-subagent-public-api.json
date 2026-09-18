@@ -101,13 +101,12 @@
     },
     "wait": {
       "type": "object",
-      "description": "Wait returns early only for a respondable pending request in the caller's declared capability scope (permission requests always; answerable user-input requests only with supports_answer=true) or a terminal result; ordinary progress, message receipts, and non-respondable requests never wake it. The pending_requests output projection is capped at 100 records, while the wake decision scans the full pending set and the request that woke the wait is always part of the returned projection. Each answerable user-input entry also embeds a bounded first question page; when its next_offset is set, page the remaining question content through the result tool with that request_id.",
+      "description": "Wait returns early only for an actionable pending request (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or a terminal result; ordinary progress, message receipts, already-responded and unsupported requests never wake it. The pending_requests output projection is capped at 100 actionable records, while the wake decision scans the full pending set. activity carries the latest text tail, a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status.",
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "type": "integer", "minimum": 10000000, "maximum": 99999999 },
         "wait_time": { "type": "integer", "minimum": 0, "maximum": 299, "default": 290 }
         ,"message_id": { "type": ["string", "null"] }
-        ,"supports_answer": { "type": "boolean", "default": false }
       },
       "additionalProperties": false
     },
@@ -121,11 +120,10 @@
     },
     "result": {
       "type": "object",
-      "description": "Pages bounded task-owned text with the shared offset and limit continuation contract. Without request_id it reads the terminal task result; with request_id it pages the stored question of that pending user-input request, so content beyond the bounded wait-projection question page stays recoverable.",
+      "description": "Pages bounded terminal task-owned text with the offset and limit continuation contract. Questions from user-input requests are embedded in full in wait projections, not paged here.",
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "type": "integer", "minimum": 10000000, "maximum": 99999999 },
-        "request_id": { "type": "string", "minLength": 1 },
         "offset": { "type": "integer", "minimum": 0, "default": 0 },
         "limit": { "type": "integer", "minimum": 1, "maximum": 262144, "default": 262144 }
       },
@@ -147,14 +145,11 @@
     },
     "question_projection": {
       "type": "object",
-      "description": "Bounded recoverable page of an answerable user-input question, embedded as the first page in the wait projection's pending_requests entries and continued through the result tool with that request_id.",
-      "required": ["text", "offset", "total_bytes", "next_offset", "complete"],
+      "description": "Embedded question of an answerable user-input request in the wait projection's pending_requests entries; wait is the only retrieval surface, so a question beyond the embed cap is marked truncated instead of paged.",
+      "required": ["text", "truncated"],
       "properties": {
         "text": { "type": "string" },
-        "offset": { "type": "integer", "minimum": 0 },
-        "total_bytes": { "type": "integer", "minimum": 0 },
-        "next_offset": { "type": ["integer", "null"], "minimum": 0 },
-        "complete": { "type": "boolean" }
+        "truncated": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -184,14 +179,14 @@
       "additionalProperties": false,
       "properties": {
         "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents", "identity"] },
-        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "phase"], "idempotent": false },
-        "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id", "supports_answer"], "output": ["task", "pending_requests", "result_available", "activity", "latest_progress", "result", "instruction", "timed_out", "message_receipt"] },
+        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "submission_disposition", "status"], "idempotent": false },
+        "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
         "external_subagent_send": { "input": ["agent_id", "message_id", "content"], "output": ["message_id", "disposition"] },
         "external_subagent_respond": { "input": ["agent_id", "request_id", "decision", "content"], "output": ["disposition", "requested_decision", "effective_decision", "policy_overrode", "policy_reason_code"] },
         "external_subagent_cancel": { "input": ["agent_id"], "output": ["task"] },
-        "external_subagent_result": { "input": ["agent_id", "request_id", "offset", "limit"], "output": ["task", "result", "question"] },
+        "external_subagent_result": { "input": ["agent_id", "offset", "limit"], "output": ["task", "result"] },
         "external_subagent_close": { "input": ["agent_id"], "output": ["task"] }
       }
     }

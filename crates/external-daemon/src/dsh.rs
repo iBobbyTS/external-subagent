@@ -1345,29 +1345,8 @@ while IFS= read -r line; do :; done
             }
         };
         let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
-        // A caller without the answer capability is not woken and must not see
-        // the request advertised as respondable.
-        let RpcSuccess::TaskWait {
-            pending_requests,
-            timed_out,
-            ..
-        } = service
-            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-                agent_id: agent_id.clone(),
-                wait_time: 0,
-                message_id: None,
-                supports_answer: false,
-            }))
-            .unwrap()
-        else {
-            panic!("expected wait response")
-        };
-        assert!(timed_out);
-        assert_eq!(pending_requests.len(), 1);
-        assert!(!pending_requests[0].respondable);
-        assert_eq!(pending_requests[0].kind, "user_input");
-        // The declared capability wakes immediately with answer guidance and
-        // the preserved question.
+        // Every actionable user-input request wakes without a capability
+        // handshake and carries the embedded question.
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
@@ -1378,15 +1357,19 @@ while IFS= read -r line; do :; done
                 agent_id: agent_id.clone(),
                 wait_time: 299,
                 message_id: None,
-                supports_answer: true,
             }))
             .unwrap()
         else {
             panic!("expected wait response")
         };
         assert!(!timed_out);
-        assert!(pending_requests[0].respondable);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(pending_requests[0].kind, "user_input");
         assert_eq!(pending_requests[0].summary, "question pick a scope");
+        assert_eq!(
+            pending_requests[0].question.as_ref().unwrap().text,
+            "pick a scope"
+        );
         assert_eq!(
             instruction.as_deref(),
             Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
@@ -1476,8 +1459,8 @@ while IFS= read -r line; do :; done
             .iter()
             .all(|request| request.request_type == "unsupported_input"));
         let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
-        // Even a caller that declared the answer capability is not woken and
-        // cannot act on the sentinel records.
+        // The sentinel records are neither woken on nor conveyed: the wait
+        // times out with an empty projection, and answering them fails closed.
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
@@ -1487,17 +1470,13 @@ while IFS= read -r line; do :; done
                 agent_id: agent_id.clone(),
                 wait_time: 0,
                 message_id: None,
-                supports_answer: true,
             }))
             .unwrap()
         else {
             panic!("expected wait response")
         };
         assert!(timed_out);
-        assert_eq!(pending_requests.len(), 2);
-        assert!(pending_requests
-            .iter()
-            .all(|request| request.kind == "unsupported_input" && !request.respondable));
+        assert!(pending_requests.is_empty());
         assert!(scheduler
             .respond_request(&agent_id, &requests[0].request_id, "answer", Some("guess"))
             .is_err());
@@ -1511,7 +1490,7 @@ while IFS= read -r line; do :; done
     }
 
     #[test]
-    fn answerable_request_beyond_the_projection_cap_is_returned_and_answerable() {
+    fn answerable_request_among_unsupported_noise_is_returned_and_answerable() {
         use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
         let _guard = scripted_test_guard();
         let workspace = dsh_workspace();
@@ -1569,23 +1548,20 @@ while IFS= read -r line; do :; done
                 agent_id: agent_id.clone(),
                 wait_time: 299,
                 message_id: None,
-                supports_answer: true,
             }))
             .unwrap()
         else {
             panic!("expected wait response")
         };
-        // The projection stays capped at 100 while the wake-causing 101st
-        // request is part of the returned page.
+        // The unsupported fillers stay invisible; the actionable request is
+        // the sole projected record and is directly answerable.
         assert!(!timed_out);
-        assert_eq!(pending_requests.len(), crate::rpc::MAX_PENDING_REQUESTS);
-        assert_eq!(pending_requests[0].request_id, "filler-0");
-        assert_eq!(pending_requests[0].kind, "unsupported_input");
-        let wake = pending_requests.last().unwrap();
+        assert_eq!(pending_requests.len(), 1);
+        let wake = &pending_requests[0];
         assert!(!wake.request_id.starts_with("filler-"));
         assert_eq!(wake.kind, "user_input");
-        assert!(wake.respondable);
         assert_eq!(wake.summary, "question pick a scope");
+        assert_eq!(wake.question.as_ref().unwrap().text, "pick a scope");
         // Answering through the returned id settles the parked ACP request.
         assert_eq!(
             scheduler
@@ -2135,13 +2111,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 agent_id: agent_id.clone(),
                 wait_time: 0,
                 message_id: None,
-                supports_answer: false,
             }))
             .unwrap();
         service
             .dispatch(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
-                request_id: None,
                 offset: 0,
                 limit: 1024,
             })
@@ -2252,13 +2226,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 agent_id: agent_id.clone(),
                 wait_time: 0,
                 message_id: None,
-                supports_answer: false,
             }))
             .unwrap();
         service
             .dispatch(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
-                request_id: None,
                 offset: 0,
                 limit: 1024,
             })
@@ -2322,7 +2294,6 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 agent_id: agent_id.clone(),
                 wait_time: 0,
                 message_id: None,
-                supports_answer: false,
             }))
             .unwrap();
         let fresh = dsh_workspace();
@@ -2371,14 +2342,13 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
                 agent_id: agent_id.clone(),
                 wait_time: 0,
                 message_id: None,
-                supports_answer: false,
             }))
             .unwrap()
         else {
             panic!("wait")
         };
         assert_eq!(task.agent_id, agent_id);
-        assert!(!task.reaped);
+        assert_ne!(task.status, "closed");
         let still = scheduler.store().pending_requests(&agent_id).unwrap();
         assert_eq!(
             still.first().map(|pending| pending.request_id.clone()),

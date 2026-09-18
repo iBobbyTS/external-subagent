@@ -92,9 +92,9 @@ test('agent diagnose reads only the public wait projection and exports a bounded
     }
     assert.equal(request.method, 'task_wait');
     socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
-      kind: 'task_wait', task: { agent_id: 10000001, phase: 'RUNNING', outcome: null, reason_code: null, stop_requested: false, close_requested: false, closed: false, reaped: false },
+      kind: 'task_wait', task: { agent_id: 10000001, status: 'running', session_id: null, input_identity: null },
       pending_requests: [], result_available: false,
-      activity: { state: 'active', active_tools: [], window_60s: {}, telemetry_status: 'healthy' }, latest_progress: null,
+      activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
       result: null, instruction: 'Not finished yet, call wait again', timed_out: false,
     } }) + '\n');
   }));
@@ -192,7 +192,7 @@ function statusOrTask(request, agentId = '10000001') {
   assert.equal(request.method, 'task_wait');
   assert.equal(request.params.agent_id, agentId);
   return { outcome: 'success', result: {
-    task: { agent_id: agentId, phase: 'TERMINAL', outcome: 'FAILED', reason_code: 'RUNTIME_START_FAILED', reaped: true },
+    task: { agent_id: agentId, status: 'failed', session_id: null, input_identity: null },
     activity: {}, pending_requests: [], result_available: true,
   } };
 }
@@ -241,7 +241,7 @@ test('Agent A diagnostics survive Agent B displacing global tails and finite rot
         }
         const report = await diagnose(paths, ['--agent', '10000001', '--output', path.join(home, 'export')]);
         assert.doesNotMatch(report.logs.files.map((file) => file.tail).join(''), /A-owned-failure/u);
-        assert.equal(report.agent.task.reason_code, 'RUNTIME_START_FAILED');
+        assert.equal(report.agent.task.status, 'failed');
         assert.equal(report.agent.diagnostics.status, 'found');
         assert.equal(report.agent.diagnostics.record.file, rotated ? 'daemon-error.log.1' : 'daemon-error.log');
         const decoded = JSON.parse(report.agent.diagnostics.record.text);

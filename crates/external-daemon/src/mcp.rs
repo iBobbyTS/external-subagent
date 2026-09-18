@@ -1,6 +1,4 @@
-use crate::rpc::{
-    PendingRequestStateView, PendingRequestView, QuestionView, RpcError, RpcErrorCode,
-};
+use crate::rpc::{PendingRequestView, QuestionView, RpcError, RpcErrorCode};
 use rmcp::{
     handler::server::tool::IntoCallToolResult,
     model::{CallToolResponse, CallToolResult, ContentBlock},
@@ -13,23 +11,6 @@ use serde::{Deserialize, Serialize};
 pub enum PublicPendingKind {
     Permission,
     UserInput,
-    UnsupportedInput,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicPendingState {
-    Pending,
-    Sending,
-    Responded,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PublicPolicyPreview {
-    ExternallyDecidable,
-    HardDeny,
-    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -49,36 +30,26 @@ pub enum PublicOperation {
 pub struct PublicPendingRequest {
     pub request_id: String,
     pub kind: PublicPendingKind,
-    pub state: PublicPendingState,
-    pub respondable: bool,
     pub tool_name: Option<String>,
     pub operation: PublicOperation,
     pub summary: String,
-    /// First bounded page of the question for answerable user-input
-    /// requests; continuation pages come from external_subagent_result
-    /// with this request_id when next_offset is set.
+    /// Full embedded question for user_input requests; truncated marks
+    /// questions beyond the embed cap.
     pub question: Option<PublicQuestion>,
-    pub policy_preview: PublicPolicyPreview,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicQuestion {
     pub text: String,
-    pub offset: usize,
-    pub total_bytes: usize,
-    pub next_offset: Option<usize>,
-    pub complete: bool,
+    pub truncated: bool,
 }
 
 impl From<QuestionView> for PublicQuestion {
     fn from(value: QuestionView) -> Self {
         Self {
             text: value.text,
-            offset: value.offset,
-            total_bytes: value.total_bytes,
-            next_offset: value.next_offset,
-            complete: value.complete,
+            truncated: value.truncated,
         }
     }
 }
@@ -89,15 +60,8 @@ impl From<PendingRequestView> for PublicPendingRequest {
             request_id: value.request_id,
             kind: match value.kind.as_str() {
                 "permission" => PublicPendingKind::Permission,
-                "user_input" => PublicPendingKind::UserInput,
-                _ => PublicPendingKind::UnsupportedInput,
+                _ => PublicPendingKind::UserInput,
             },
-            state: match value.state {
-                PendingRequestStateView::Pending => PublicPendingState::Pending,
-                PendingRequestStateView::Sending => PublicPendingState::Sending,
-                PendingRequestStateView::Responded => PublicPendingState::Responded,
-            },
-            respondable: value.respondable,
             tool_name: value.tool_name,
             operation: match value.operation.as_str() {
                 "read" => PublicOperation::Read,
@@ -110,11 +74,6 @@ impl From<PendingRequestView> for PublicPendingRequest {
             },
             summary: value.summary,
             question: value.question.map(Into::into),
-            policy_preview: match value.policy_preview.as_str() {
-                "externally_decidable" => PublicPolicyPreview::ExternallyDecidable,
-                "hard_deny" => PublicPolicyPreview::HardDeny,
-                _ => PublicPolicyPreview::Unknown,
-            },
         }
     }
 }
@@ -458,20 +417,20 @@ mod tests {
         let view = PendingRequestView {
             request_id: "read-request".into(),
             kind: "permission".into(),
-            state: PendingRequestStateView::Pending,
-            respondable: true,
             tool_name: Some("Read".into()),
             operation: "read".into(),
             summary: "target input.txt".into(),
             question: None,
-            policy_preview: "official_permission_request".into(),
         };
         let projected: PublicPendingRequest = view.into();
         assert_eq!(projected.kind, PublicPendingKind::Permission);
-        assert_eq!(projected.state, PublicPendingState::Pending);
-        assert!(projected.respondable);
         assert_eq!(projected.tool_name.as_deref(), Some("Read"));
         assert_eq!(projected.operation, PublicOperation::Read);
+        // The removed handshake fields never leak into the public projection.
+        let encoded = serde_json::to_value(&projected).unwrap();
+        for gone in ["state", "respondable", "policy_preview"] {
+            assert_eq!(encoded.get(gone), None, "{gone} must not leak");
+        }
     }
 }
 
@@ -482,9 +441,9 @@ mod server {
         AgentScopeStatusView, AgentStatusView, AgentTransportView, CapabilityMaturityView,
         ComponentStateView, GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision,
         ResponseOutcomeView, RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess,
-        SubmissionDispositionView, SystemStatusView, TaskActivityStateView, TaskActivityView,
-        TaskListQuery, TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView,
-        TaskWaitQuery, TelemetryStatusView,
+        SubmissionDispositionView, SystemStatusView, TaskActivityView, TaskListQuery,
+        TaskObservationView, TaskPhaseFilter, TaskResultView, TaskView, TaskWaitQuery,
+        TelemetryStatusView,
     };
     use external_core::{GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
     use external_store::TaskOutcome;
@@ -509,8 +468,7 @@ mod server {
 
     use super::{
         protocol_error, public_error, public_transport_error, validation_error, PublicDecision,
-        PublicErrorEnvelope, PublicPendingRequest, PublicQuestion, PublicResponseDisposition,
-        ToolError,
+        PublicErrorEnvelope, PublicPendingRequest, PublicResponseDisposition, ToolError,
     };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -1062,7 +1020,7 @@ mod server {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
         pub submission_disposition: SubmissionDisposition,
-        pub phase: String,
+        pub status: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1078,20 +1036,14 @@ mod server {
     pub struct PublicTask {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
-        pub phase: String,
-        pub outcome: Option<PublicOutcome>,
-        pub reason_code: Option<String>,
-        pub cancel_requested: bool,
-        pub close_requested: bool,
-        pub closed: bool,
-        pub resources_reaped: bool,
-        pub input_identity: Option<PublicInputIdentity>,
+        pub status: String,
+        pub session_id: Option<String>,
+        pub input_identity: PublicInputIdentity,
     }
 
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     pub struct PublicInputIdentity {
-        #[serde(rename = "subagent")]
-        pub agent: Option<String>,
+        pub subagent: Option<String>,
         pub config_revision: Option<u64>,
         pub adapter_version: Option<String>,
         pub model: Option<String>,
@@ -1106,42 +1058,17 @@ mod server {
         fn try_from(value: TaskView) -> Result<Self, Self::Error> {
             Ok(Self {
                 agent_id: super::public_task_id(&value.agent_id)?,
-                phase: value.phase,
-                outcome: value.outcome.map(Into::into),
-                reason_code: value.reason_code,
-                cancel_requested: value.stop_requested,
-                close_requested: value.close_requested,
-                closed: value.closed,
-                resources_reaped: value.reaped,
-                input_identity: Some(PublicInputIdentity {
-                    agent: value
-                        .input_identity
-                        .admission
-                        .as_ref()
-                        .map(|v| v.agent.clone()),
-                    config_revision: value
-                        .input_identity
-                        .admission
-                        .as_ref()
-                        .map(|v| v.config_revision),
-                    adapter_version: value
-                        .input_identity
-                        .admission
-                        .as_ref()
-                        .map(|v| v.adapter_version.clone()),
-                    model: value
-                        .input_identity
-                        .admission
-                        .as_ref()
-                        .and_then(|v| v.model.clone()),
-                    model_source: value
-                        .input_identity
-                        .admission
-                        .as_ref()
-                        .map(|v| v.model_source.clone()),
+                status: value.status,
+                session_id: value.session_id,
+                input_identity: PublicInputIdentity {
+                    subagent: value.input_identity.subagent,
+                    config_revision: value.input_identity.config_revision,
+                    adapter_version: value.input_identity.adapter_version,
+                    model: value.input_identity.model,
+                    model_source: value.input_identity.model_source,
                     workspace_path: value.input_identity.workspace_path,
                     permission_mode: value.input_identity.permission_mode,
-                }),
+                },
             })
         }
     }
@@ -1287,23 +1214,6 @@ mod server {
         pub wait_time: u64,
         #[serde(default)]
         pub message_id: Option<String>,
-        /// Declare support for answering `interaction/requestUserInput`
-        /// requests. Without it (the default) only allow/deny permission
-        /// requests are treated as respondable wake targets.
-        #[serde(default)]
-        pub supports_answer: bool,
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    pub enum PublicActivityState {
-        Queued,
-        Preparing,
-        Active,
-        WaitingInput,
-        Cancelling,
-        Idle,
-        Terminal,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -1314,95 +1224,26 @@ mod server {
         Unavailable,
     }
 
-    #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    pub enum PublicActivityToolKind {
-        Read,
-        Bash,
-        Other,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicActiveTool {
-        pub tool_call_id: String,
-        pub kind: PublicActivityToolKind,
-    }
-
-    #[derive(Debug, Clone, Serialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    pub struct PublicActivityWindow {
-        pub reasoning_delta_events: u64,
-        pub text_delta_events: u64,
-        pub tool_calls_started: u64,
-        pub tool_calls_completed: u64,
-        pub tool_calls_failed: u64,
-        pub read_calls: u64,
-        pub bash_calls: u64,
-        pub other_tool_calls: u64,
-    }
-
     #[derive(Debug, Clone, Serialize, JsonSchema)]
     #[schemars(deny_unknown_fields)]
     pub struct PublicActivity {
-        pub state: PublicActivityState,
-        pub last_runtime_event_at: Option<u64>,
-        pub last_activity_age_ms: Option<u64>,
-        pub model_request_active: bool,
-        pub model_request_age_ms: Option<u64>,
-        pub model_last_delta_age_ms: Option<u64>,
         pub latest_text_tail: String,
-        pub latest_text_updated_at: Option<u64>,
         pub latest_text_truncated: bool,
-        pub active_tools: Vec<PublicActiveTool>,
-        pub window_60s: PublicActivityWindow,
+        /// Verified-public reasoning tail (bounded to 200 Unicode
+        /// characters); empty when the runtime source is not verified.
+        pub latest_reasoning: String,
+        /// Tool calls started in the last 60 seconds, across all tools.
+        pub tool_calls_last_60s: u64,
         pub telemetry_status: PublicTelemetryStatus,
     }
 
     impl From<TaskActivityView> for PublicActivity {
         fn from(value: TaskActivityView) -> Self {
             Self {
-                state: match value.state {
-                    TaskActivityStateView::Queued => PublicActivityState::Queued,
-                    TaskActivityStateView::Preparing => PublicActivityState::Preparing,
-                    TaskActivityStateView::Active => PublicActivityState::Active,
-                    TaskActivityStateView::WaitingInput => PublicActivityState::WaitingInput,
-                    TaskActivityStateView::Cancelling => PublicActivityState::Cancelling,
-                    TaskActivityStateView::Idle => PublicActivityState::Idle,
-                    TaskActivityStateView::Terminal => PublicActivityState::Terminal,
-                },
-                last_runtime_event_at: value.last_runtime_event_at,
-                last_activity_age_ms: value.last_activity_age_ms,
-                model_request_active: value.model_request_active,
-                model_request_age_ms: value.model_request_age_ms,
-                model_last_delta_age_ms: value.model_last_delta_age_ms,
                 latest_text_tail: value.latest_text_tail,
-                latest_text_updated_at: value.latest_text_updated_at,
                 latest_text_truncated: value.latest_text_truncated,
-                active_tools: value
-                    .active_tools
-                    .into_iter()
-                    .map(|tool| PublicActiveTool {
-                        tool_call_id: tool.tool_call_id,
-                        kind: match tool.kind {
-                            crate::rpc::ActivityToolKindView::Read => PublicActivityToolKind::Read,
-                            crate::rpc::ActivityToolKindView::Bash => PublicActivityToolKind::Bash,
-                            crate::rpc::ActivityToolKindView::Other => {
-                                PublicActivityToolKind::Other
-                            }
-                        },
-                    })
-                    .collect(),
-                window_60s: PublicActivityWindow {
-                    reasoning_delta_events: value.window_60s.reasoning_delta_events,
-                    text_delta_events: value.window_60s.text_delta_events,
-                    tool_calls_started: value.window_60s.tool_calls_started,
-                    tool_calls_completed: value.window_60s.tool_calls_completed,
-                    tool_calls_failed: value.window_60s.tool_calls_failed,
-                    read_calls: value.window_60s.read_calls,
-                    bash_calls: value.window_60s.bash_calls,
-                    other_tool_calls: value.window_60s.other_tool_calls,
-                },
+                latest_reasoning: value.latest_reasoning,
+                tool_calls_last_60s: value.tool_calls_last_60s,
                 telemetry_status: match value.telemetry_status {
                     TelemetryStatusView::Healthy => PublicTelemetryStatus::Healthy,
                     TelemetryStatusView::Degraded => PublicTelemetryStatus::Degraded,
@@ -1419,7 +1260,6 @@ mod server {
         pub pending_requests: Vec<PublicPendingRequest>,
         pub result_available: bool,
         pub activity: PublicActivity,
-        pub latest_progress: Option<String>,
         pub result: Option<PublicResult>,
         pub instruction: Option<String>,
         pub timed_out: bool,
@@ -1429,10 +1269,7 @@ mod server {
     pub struct PublicMessageReceipt {
         pub message_id: String,
         pub state: String,
-        pub target_turn_id: Option<String>,
         pub failure_code: Option<String>,
-        pub created_at_ms: i64,
-        pub delivered_at_ms: Option<i64>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1495,10 +1332,6 @@ mod server {
     pub struct AgentResultInput {
         #[schemars(range(min = 10000000, max = 99999999))]
         pub agent_id: u64,
-        /// Pending user-input request whose stored question should be paged
-        /// instead of the terminal result.
-        #[serde(default, deserialize_with = "optional_non_null")]
-        pub request_id: Option<String>,
         #[serde(default)]
         pub offset: usize,
         #[serde(default = "default_result_limit")]
@@ -1515,7 +1348,6 @@ mod server {
     pub struct AgentResultOutput {
         pub task: PublicTask,
         pub result: Option<PublicResult>,
-        pub question: Option<PublicQuestion>,
     }
 
     #[derive(Clone)]
@@ -1671,24 +1503,17 @@ mod server {
         fn result(
             &self,
             agent_id: String,
-            request_id: Option<String>,
             offset: usize,
             limit: usize,
-        ) -> Result<(PublicTask, Option<PublicResult>, Option<PublicQuestion>), ToolError> {
+        ) -> Result<(PublicTask, Option<PublicResult>), ToolError> {
             match self.rpc(RpcMethod::TaskResult {
                 agent_id: agent_id.clone(),
-                request_id,
                 offset,
                 limit,
             })? {
-                RpcSuccess::TaskResult {
-                    task,
-                    result,
-                    question,
-                } => Ok((
+                RpcSuccess::TaskResult { task, result } => Ok((
                     task.try_into()?,
                     result.map(TryInto::try_into).transpose()?,
-                    question.map(Into::into),
                 )),
                 _ => Err(protocol_error()
                     .with_operation("result")
@@ -1825,14 +1650,14 @@ mod server {
                     SubmissionDispositionView::Created => SubmissionDisposition::Created,
                     SubmissionDispositionView::Existing => SubmissionDisposition::Existing,
                 },
-                phase: task.phase,
+                status: task.status,
             }))
         }
 
         #[tool(
         name = "external_subagent_wait",
         output_schema = tool_output_schema::<AgentWaitOutput>(),
-        description = "Wait up to 290 seconds by default. Returns early only when a respondable pending request exists in the caller's declared capability scope (permission requests always; answerable user-input requests only with supports_answer=true) or the terminal result is available; ordinary progress, message receipts, and non-respondable requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. Each answerable user-input request carries a bounded first question page with the same contract; when its next_offset is set, page the remaining question content with external_subagent_result passing that request_id. Set supports_answer=true only if you can answer user-input questions with decision answer and non-empty content; the pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly.",
+        description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the latest text tail, a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status; use observe only when these suggest a meaningless loop.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1858,7 +1683,6 @@ mod server {
                         agent_id,
                         wait_time: input.wait_time,
                         message_id: input.message_id,
-                        supports_answer: input.supports_answer,
                     },
                     move || context.ct.is_cancelled(),
                 )
@@ -1869,7 +1693,6 @@ mod server {
                     pending_requests,
                     result_available,
                     activity,
-                    latest_progress,
                     result,
                     instruction,
                     timed_out,
@@ -1879,17 +1702,13 @@ mod server {
                     pending_requests: pending_requests.into_iter().map(Into::into).collect(),
                     result_available,
                     activity: activity.into(),
-                    latest_progress,
                     result: result.map(TryInto::try_into).transpose()?,
                     instruction,
                     timed_out,
                     message_receipt: message_receipt.map(|r| PublicMessageReceipt {
                         message_id: r.message_id,
                         state: r.state,
-                        target_turn_id: r.target_turn_id,
                         failure_code: r.failure_code,
-                        created_at_ms: r.created_at_ms,
-                        delivered_at_ms: r.delivered_at_ms,
                     }),
                 })),
                 _ => Err(protocol_error().with_operation("wait")),
@@ -2117,7 +1936,7 @@ mod server {
         #[tool(
         name = "external_subagent_result",
         output_schema = tool_output_schema::<AgentResultOutput>(),
-        description = "Read a terminal task result with stable outcome, partial status, reason code, and bounded final-text segments. Returns null result while the task is non-terminal. With request_id set, pages the stored question of that pending user-input request instead, using the same offset and limit continuation contract; continue from the next_offset carried by a wait projection's question page.",
+        description = "Read a terminal task result with stable outcome, partial status, and bounded final-text segments. Returns null result while the task is non-terminal. Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2131,16 +1950,8 @@ mod server {
         ) -> Result<Json<AgentResultOutput>, ToolError> {
             let agent_id =
                 internal_task_id(input.agent_id).map_err(|error| error.with_operation("result"))?;
-            if let Some(request_id) = input.request_id.as_deref() {
-                if request_id.is_empty() || request_id.len() > 256 || request_id.contains('\0') {
-                    return Err(validation_error("request_id is invalid")
-                        .with_operation("result")
-                        .with_agent_id(Some(agent_id)));
-                }
-            }
-            let (task, result, question) =
-                self.result(agent_id, input.request_id, input.offset, input.limit)?;
-            Ok(Json(AgentResultOutput { task, result, question }))
+            let (task, result) = self.result(agent_id, input.offset, input.limit)?;
+            Ok(Json(AgentResultOutput { task, result }))
         }
 
         #[tool(
@@ -2227,29 +2038,33 @@ mod server {
 
             let wait: AgentWaitInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
-            assert!(!wait.supports_answer);
             assert_eq!(wait.wait_time, 290);
+            assert!(wait.message_id.is_none());
             let immediate: AgentWaitInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000, "wait_time": 0}))
                     .unwrap();
             assert_eq!(immediate.wait_time, 0);
-            assert!(
-                serde_json::from_value::<AgentWaitInput>(serde_json::json!({
-                    "agent_id": 10000000, "after_revision": 0
-                }))
-                .is_err(),
-                "removed after_revision must be rejected"
-            );
-            let answering: AgentWaitInput = serde_json::from_value(serde_json::json!({
-                "agent_id": 10000000, "supports_answer": true
-            }))
-            .unwrap();
-            assert!(answering.supports_answer);
+            for removed in ["after_revision", "supports_answer"] {
+                assert!(
+                    serde_json::from_value::<AgentWaitInput>(serde_json::json!({
+                        "agent_id": 10000000, removed: true
+                    }))
+                    .is_err(),
+                    "removed {removed} must be rejected"
+                );
+            }
 
             let result: AgentResultInput =
                 serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
             assert_eq!(result.offset, 0);
             assert_eq!(result.limit, default_result_limit());
+            assert!(
+                serde_json::from_value::<AgentResultInput>(serde_json::json!({
+                    "agent_id": 10000000, "request_id": "r"
+                }))
+                .is_err(),
+                "removed result request_id must be rejected"
+            );
 
             let send: AgentSendInput = serde_json::from_value(serde_json::json!({
                 "agent_id": 10000000,
@@ -2362,10 +2177,14 @@ mod server {
             assert_eq!(response["id"], 2);
             assert_eq!(wait["timed_out"], false);
             assert_eq!(wait["pending_requests"][0]["kind"], "permission");
-            assert_eq!(wait["pending_requests"][0]["state"], "pending");
-            assert_eq!(wait["pending_requests"][0]["respondable"], true);
             assert_eq!(wait["pending_requests"][0]["tool_name"], "Read");
             assert_eq!(wait["pending_requests"][0]["operation"], "read");
+            // The handshake fields are gone from the public projection.
+            assert_eq!(wait["pending_requests"][0]["state"], serde_json::Value::Null);
+            assert_eq!(
+                wait["pending_requests"][0]["respondable"],
+                serde_json::Value::Null
+            );
             assert!(wait["instruction"]
                 .as_str()
                 .expect("respond instruction")
@@ -2725,20 +2544,17 @@ mod server {
             let facade =
                 SubagentMcp::new(PathBuf::from("/tmp/schema.sock"), Duration::from_secs(1));
             let task = serde_json::json!({
-                "agent_id":10000001, "phase":"RUNNING", "outcome":null,
-                "reason_code":null, "cancel_requested":false, "close_requested":false,
-                "closed":false, "resources_reaped":false
+                "agent_id":10000001, "status":"running", "session_id":null,
+                "input_identity":{
+                    "subagent":null,"config_revision":null,"adapter_version":null,
+                    "model":null,"model_source":null,"workspace_path":"/tmp/repo",
+                    "permission_mode":"build"
+                }
             });
             let activity = serde_json::json!({
-                "state":"active", "last_runtime_event_at":null, "last_activity_age_ms":null,
-                "model_request_active":false, "model_request_age_ms":null,
-                "model_last_delta_age_ms":null, "latest_text_tail":"",
-                "latest_text_updated_at":null, "latest_text_truncated":false,
-                "active_tools":[], "window_60s":{
-                    "reasoning_delta_events":0,"text_delta_events":0,
-                    "tool_calls_started":0,"tool_calls_completed":0,
-                    "tool_calls_failed":0,"read_calls":0,"bash_calls":0,"other_tool_calls":0
-                }, "telemetry_status":"healthy"
+                "latest_text_tail":"", "latest_text_truncated":false,
+                "latest_reasoning":"", "tool_calls_last_60s":0,
+                "telemetry_status":"healthy"
             });
             let observation = serde_json::json!({
                 "tools":[], "reasoning":{"text":"","truncated":false},
@@ -2760,13 +2576,14 @@ mod server {
             let wait = serde_json::json!({
                 "task":task.clone(),"pending_requests":[],
                 "result_available":false,"activity":activity,
-                "latest_progress":null,"result":null,"instruction":null,"timed_out":false
+                "result":null,"instruction":null,"timed_out":false,
+                "message_receipt":{"message_id":"message-1","state":"queued","failure_code":null}
             });
             let successes = BTreeMap::from([
                 ("external_subagent_status", status),
                 (
                     "external_subagent_spawn",
-                    serde_json::json!({"agent_id":10000001,"submission_disposition":"created","phase":"RUNNING"}),
+                    serde_json::json!({"agent_id":10000001,"submission_disposition":"created","status":"queued"}),
                 ),
                 ("external_subagent_wait", wait),
                 ("external_subagent_observe", observation),
@@ -2788,7 +2605,7 @@ mod server {
                 ),
                 (
                     "external_subagent_result",
-                    serde_json::json!({"task":task.clone(),"result":null,"question":null}),
+                    serde_json::json!({"task":task.clone(),"result":null}),
                 ),
                 ("external_subagent_close", serde_json::json!({"task":task})),
             ]);

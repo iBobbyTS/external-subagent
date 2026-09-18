@@ -45,6 +45,8 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 `tools/list` 的输入和输出 schema 主要由 Rust 类型生成；输出 schema 接受成功对象或公共错误对象。静态公共契约 JSON 不是全部运行时 schema 的完整副本。
 
+**CLI 与 MCP 同构**：`external-subagent <command> --json '<object>'` 与同名 `external_subagent_<command>` 工具使用相同的输入字段和输出投影（差异仅限 CLI 外层的 `ok/product/command` 包裹与 `agent_id` 的数字形式）。CLI 投影逻辑见 [rpc.mjs](../cli/rpc.mjs) 的 `projectDaemonResult`；两处必须同步修改。
+
 已知需按实现理解的差异：`list.repository` 在 Rust 输入中可省略，但 handler 强制要求提供；静态 JSON 允许 `list.phase/outcome/cursor=null`，实际自定义反序列化拒绝显式 `null`。调用方应省略无过滤条件的键。某些生成 schema 对 `Option<T>` 的可空表达也不能替代实际反序列化约束。
 
 ## 2. 协议外层与通用输入约束
@@ -99,7 +101,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `external_subagent_send` | 向运行中任务排队发送消息 | 非只读、非幂等 |
 | `external_subagent_respond` | 响应权限或用户问题 | 非只读、幂等 |
 | `external_subagent_cancel` | 取消任务，保留历史 | 非只读、破坏性、幂等 |
-| `external_subagent_result` | 分页取结果或问题正文 | 只读、幂等 |
+| `external_subagent_result` | 分页取终态结果正文 | 只读、幂等 |
 | `external_subagent_close` | 关闭任务并回收运行资源 | 非只读、破坏性、幂等 |
 
 所有工具的 `open_world_hint=false`；annotations 是接口提示，不能取代实际权限校验。以下各节列出的返回均为成功时的 `structuredContent`。
@@ -206,7 +208,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 |---|---|---|---|
 | `agent_id` | integer | 保存后用于 wait/send/respond/result/cancel/close/observe | 无法可靠操作刚创建的任务 |
 | `submission_disposition` | `created / existing` | 区分新建与匹配已有提交 | 调用方无法判断本次是否新建；不是可任意重放 spawn 的承诺 |
-| `phase` | string | 获取提交后阶段 | 必须额外查询才能知道是否排队或运行；属于便利信息 |
+| `status` | string | 获取提交后的单一生命周期状态 | 必须额外查询才能知道是否排队或运行；属于便利信息 |
 
 spawn 标注非幂等；返回超时不能直接推断未创建任务，不应通过无限重试推断唯一性。
 
@@ -219,22 +221,20 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | `agent_id` | integer；必填 | 选择要等待的持久任务 | 缺少报错；无目标无法等待 |
 | `wait_time` | integer，0–299 秒；默认 290 | 适配调用方超时预算；0 用于立即取快照 | 省略仍可能等 290 秒；移除后客户端不能调整等待预算 |
 | `message_id` | string/null；默认无 | 需要一起查看某条 send 消息回执时使用 | 省略不请求该回执；移除后失去按消息关联反馈的入口 |
-| `supports_answer` | boolean；默认 false | 调用方能以 answer+content 回答用户问题时声明 | false 时用户输入不会作为可回答的提前唤醒目标；移除后无法区分支持与不支持回答的客户端 |
 
-普通进度、消息回执、不可响应请求不提前唤醒。权限请求和调用方声明能处理的用户问题、终态结果才构成提前返回条件。`pending_requests` 投影最多 100 条，但唤醒判断扫描完整 pending 集合，并确保触发唤醒的请求在返回中。取消本次 MCP 等待不等于取消持久任务；取消任务应调用 cancel。
+普通进度、消息回执、已响应记录和不可操作类型不提前唤醒。权限请求与用户问题对所有调用方都是可操作的：没有能力握手参数，出现即唤醒。终态结果同样构成提前返回条件。`pending_requests` 投影只含可操作记录、最多 100 条，但唤醒判断扫描完整 pending 集合。取消本次 MCP 等待不等于取消持久任务；取消任务应调用 cancel。
 
 ### 6.2 输出
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `task` | PublicTask | 检查持久阶段、终态和资源状态 | 无法从等待响应直接判断任务生命周期 |
+| `task` | PublicTask | 检查单一生命周期状态 | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
 | `result_available` | boolean | 快速判断有无终态结果 | 客户端须从结果等字段推导；属于显式便利信号 |
-| `activity` | PublicActivity | 诊断当前活动和遥测可信程度 | 难以判断运行中是在工作、等待还是观测失效 |
-| `latest_progress` | string/null | 给人看的最新进度摘要 | 降低可读性；不应作为终态判断依据 |
+| `activity` | PublicActivity | 查看文本尾部、推理尾部、近期工具频度与遥测可信度 | 难以判断运行中是在工作还是停滞 |
 | `result` | PublicResult/null | 内嵌结果，避免再请求首段 | 必须额外调用 result，长结果仍需分页 |
 | `instruction` | string/null | 给出下一步响应或取分页的提示 | 客户端需自行从结构化字段实现同一判断；不能只解析该自然语言字段 |
-| `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 outcome=TIMED_OUT |
+| `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
 嵌入结果 `complete=true` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。
@@ -341,30 +341,26 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | 工具／字段 | 要求／类型 | 什么时候用、为什么有 | 省略／移除影响 |
 |---|---|---|---|
 | cancel 输入 `agent_id` | integer；必填 | 需要中止任务时指定目标 | 缺少报错；无法确定取消哪个任务 |
-| cancel 输出 `task` | PublicTask | 判断取消请求是否记录、当前阶段及资源状态 | 无法从本次返回判断取消进展，需额外查询 |
+| cancel 输出 `task` | PublicTask | 判断取消是否生效（status=cancelling/cancelled） | 无法从本次返回判断取消进展，需额外查询 |
 | close 输入 `agent_id` | integer；必填 | 用完任务或需要关闭运行资源时指定目标 | 缺少报错；无法确定回收目标 |
-| close 输出 `task` | PublicTask | 查看关闭与回收状态 | 无法确认 close_requested、closed、resources_reaped |
+| close 输出 `task` | PublicTask | 确认关闭事实（status=closed） | 无法确认关闭是否完成 |
 
-cancel 不删除历史；close 也保留历史。不要把取消请求已记录、任务已终态、任务已关闭和资源已回收视为同一事实。两个工具都标记幂等和破坏性。
+cancel 不删除历史；close 也保留历史。close 之后的存储结果仍可用 result 读取。两个工具都标记幂等和破坏性。
 
 ## 12. external_subagent_result
 
 | 输入参数 | 类型／要求 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
-| `agent_id` | integer；必填 | 选择任务结果或任务所属问题 | 缺少报错；无目标 |
-| `request_id` | string；可选 | 读取 wait 中被分页的问题正文 | 省略读取任务终态结果；移除后长问题超出首段部分不可恢复 |
+| `agent_id` | integer；必填 | 选择任务 | 缺少报错；无目标 |
 | `offset` | integer ≥0；默认0 | 以 next_offset 继续读取 | 省略重取首页；移除后不能连续取全文 |
 | `limit` | integer，1–262144字节；默认262144 | 控制响应页大小 | 省略用最大页；移除后客户端失去页大小控制 |
 
-request_id 若提供须非空、无 NUL、最多256字节。offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 next_offset，不要按字符数或固定 limit 自行累加。limit 太小无法容纳下一个完整字符时可能报校验错误。
+offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 next_offset，不要按字符数或固定 limit 自行累加。limit 太小无法容纳下一个完整字符时可能报校验错误。问题正文不再经 result 分页：wait 的 pending_requests 已内嵌完整问题（超长问题以 truncated 标记截断）。
 
 | 输出字段 | 类型 | 使用理由 | 移除影响 |
 |---|---|---|---|
 | `task` | PublicTask | 与读取的文本一起获得任务生命周期 | 单凭 null result 无法判断任务所处阶段 |
-| `result` | PublicResult/null | 不带 request_id 时返回终态文本；非终态为 null | 无法取得任务产物正文 |
-| `question` | PublicQuestion/null | 带 request_id 时返回问题页 | 无法恢复长问题正文 |
-
-问题分页模式的 result 为 null；任务结果模式的 question 为 null。两者不是要求同时有值。
+| `result` | PublicResult/null | 终态文本；非终态为 null | 无法取得任务产物正文 |
 
 ## 13. 复用输出结构
 
@@ -375,16 +371,11 @@ request_id 若提供须非空、无 NUL、最多256字节。offset 是 UTF-8 **�
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
 | `agent_id` | integer | 确认快照所属任务，特别是列表与并发返回 | 无法把快照可靠关联到操作目标 |
-| `phase` | string，当前值见 Phase | 判断任务执行阶段 | 只能看到结果时才知道是否结束 |
-| `outcome` | Outcome/null | 判断终态是成功、失败、取消等 | TERMINAL 无法表达成功与否 |
-| `reason_code` | string/null | 诊断：解释终态或异常原因 | 只能获知粗粒度 outcome |
-| `cancel_requested` | boolean | 判断取消意图是否已记录 | 无法区分尚未申请与正在取消 |
-| `close_requested` | boolean | 判断关闭意图是否已记录 | 无法判断正在关闭的过程 |
-| `closed` | boolean | 判断关闭事实是否成立 | 不能把 close_requested 当关闭完成 |
-| `resources_reaped` | boolean | 确认运行资源是否回收 | 任务终态不再能说明资源清理进度 |
-| `input_identity` | InputIdentity/null | 诊断：追溯任务接纳时配置与执行范围 | 只能看当前系统配置，无法解释历史任务 |
+| `status` | string，单一状态机 | 判断任务生命周期位置与终态类别 | 只能靠多次查询拼凑状态 |
+| `session_id` | string/null | 诊断：关联宿主会话 | 难以把任务与宿主会话对齐 |
+| `input_identity` | InputIdentity | 诊断：追溯任务接纳时配置与执行范围 | 只能看当前系统配置，无法解释历史任务 |
 
-phase 在输出类型中是 string，而非强制枚举。不要把 phase、activity.state、outcome 三者混为同一状态机。
+`status` 是折叠后的单一状态：`queued / preparing / running / waiting_input / cancelling`（非终态）与 `completed / failed / cancelled / timed_out / runtime_lost / result_invalid`（终态）及 `closed`（close 之后，含回收）。失败原因细码不再出现在公共视图；深入诊断使用 diagnose（日志中的 failure 记录保留完整信息）。status 在输出类型中是 string，而非强制枚举。
 
 ### 13.2 InputIdentity
 
@@ -407,65 +398,41 @@ phase 在输出类型中是 string，而非强制枚举。不要把 phase、acti
 | Result.`outcome` | Outcome | 独立消费结果页时判断任务成功与否 | 需依赖外层 task；属于随结果携带的冗余上下文 |
 | Result.`final_text` | string | 当前页结果正文 | 没有结果内容 |
 | Result.`partial` | boolean | 标识任务产物本身是否不完整 | 可能把中断后的片段当完整任务产物 |
-| Question.`text` | string | 当前页问题正文 | 无法作出有上下文的回答 |
-| 两者的 `offset` | integer | 识别本页字节起点，避免拼接错位 | 难以检测重复／错页 |
-| 两者的 `total_bytes` | integer | 知道全文长度、检查累计读取量 | 失去长度校验和进度信息；仍可用 next_offset 翻页 |
-| 两者的 `next_offset` | integer/null | 获取下一页的合法字节起点 | 无法可靠按服务端分页继续，尤其涉及 UTF-8 边界 |
-| 两者的 `complete` | boolean | 直接标识全文分页结束 | 可由 next_offset 为 null 推导；是便利字段，不表示任务成功 |
+| Question.`text` | string | 问题正文（完整内嵌，最多16KiB） | 无法作出有上下文的回答 |
+| Question.`truncated` | boolean | 标识问题是否超出内嵌上限 | 易把截断问题当完整题目 |
+| Result 的 `offset` | integer | 识别本页字节起点，避免拼接错位 | 难以检测重复／错页 |
+| Result 的 `total_bytes` | integer | 知道全文长度、检查累计读取量 | 失去长度校验和进度信息；仍可用 next_offset 翻页 |
+| Result 的 `next_offset` | integer/null | 获取下一页的合法字节起点 | 无法可靠按服务端分页继续，尤其涉及 UTF-8 边界 |
+| Result 的 `complete` | boolean | 直接标识全文分页结束 | 可由 next_offset 为 null 推导；是便利字段，不表示任务成功 |
 
-`partial` 与 `complete` 含义不同：可能 `partial=true` 且 `complete=true`，表示已取完一个不完整任务产物的全部文本。wait 内嵌问题首段最多2048字节，超过后按 question.next_offset 调 result 并带上该 request_id。
+`partial` 与 `complete` 含义不同：可能 `partial=true` 且 `complete=true`，表示已取完一个不完整任务产物的全部文本。PublicQuestion 只出现在 wait 的 pending_requests 里且无分页契约——wait 是问题正文的唯一获取面。当整个 wait 响应逼近 2MiB 帧上限时，服务端会把内嵌问题降级为更短的有界前缀并保持 `truncated=true`（request_id 始终可达）；`truncated` 因此表示“文本不完整”，不承诺 16KiB 全长。
 
 ### 13.4 PublicPendingRequest
 
+投影只包含可操作（仍 pending 且类型可响应）的记录；已响应／发送中／不支持类型不出现在列表中。
+
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `request_id` | string | 响应／分页特定问题 | 无法精确 respond 或读长问题 |
-| `kind` | `permission / user_input / unsupported_input` | 选择审批、回答或标记不支持 | 容易把用户问题当权限决定 |
-| `state` | `pending / sending / responded` | 区分响应所处阶段 | 容易重复处理仍在发送中的请求 |
-| `respondable` | boolean | 判断当前公开接口能否处理 | 可能对不可响应类型盲目提交 |
+| `request_id` | string | 响应特定请求 | 无法精确 respond |
+| `kind` | `permission / user_input` | 选择审批（allow/deny）或回答（answer+content） | 容易把用户问题当权限决定 |
 | `tool_name` | string/null | 权限审批时识别触发工具 | 缺少具体动作来源 |
 | `operation` | `read / write / command / network / git_ref_mutation / user_input / unknown` | 从语义上理解请求操作 | 必须猜工具名或解析摘要 |
 | `summary` | string | 快速展示请求概要 | 可读性下降；摘要不能替代完整问题 |
-| `question` | PublicQuestion/null | 可回答问题的有界首段 | 需额外请求才能了解题目；没有 request_id 则无法补读 |
-| `policy_preview` | `externally_decidable / hard_deny / unknown` | 判断外部决定是否可能生效 | 容易误认为 allow 能越过硬拒绝；preview 不是最终决定 |
+| `question` | PublicQuestion/null | 用户问题的完整内嵌正文 | 需额外请求才能了解题目 |
 
 ### 13.5 PublicActivity
 
-这些是诊断事实，不是自动检测循环、成功或失败的结论。
+这些是诊断事实，不是自动检测循环、成功或失败的结论。任务生命周期状态在 `task.status`，不在此处重复。
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `state` | `queued / preparing / active / waiting_input / cancelling / idle / terminal` | 快速理解活动状态 | 需要拼接其他遥测字段推断 |
-| `last_runtime_event_at` | integer/null | 对照 runtime 最近事件时点 | 无法与外部日志对齐 |
-| `last_activity_age_ms` | integer/null | 判断距最近活动多久 | 需自行依据时钟计算或无法判断 |
-| `model_request_active` | boolean | 区分模型请求活跃与其他阶段 | 不清楚是否正在等模型 |
-| `model_request_age_ms` | integer/null | 诊断当前模型请求持续时间 | 缺少慢请求依据 |
-| `model_last_delta_age_ms` | integer/null | 区分长请求持续输出与长时间无 delta | 只看请求总时长容易误判停滞 |
 | `latest_text_tail` | string | 展示近期公开文本尾部 | 缺少人可读活动线索 |
-| `latest_text_updated_at` | integer/null | 判断尾部文本新旧 | 易把旧文本当新进展 |
 | `latest_text_truncated` | boolean | 判断尾部是否省略了前文 | 易把片段当完整输出 |
-| `active_tools` | ActiveTool[] | 查看尚在进行的工具 | 难以区分工具执行与模型计算 |
-| `active_tools[].tool_call_id` | string | 关联正在执行的具体调用 | 同类工具无法区分 |
-| `active_tools[].kind` | `read / bash / other` | 粗分类活动工具 | 只剩不透明 ID |
-| `window_60s` | ActivityWindow | 把近期活动放在固定时间窗口比较 | 累计值不能直接反映近期工作 |
+| `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；runtime 未验证时为空串 |
+| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数 | 看不出近期是否有工具活动 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
 
-时间 age 字段单位为毫秒。`*_at` 用于事件时点，未知值为 null；调用方不能把 null 转换成0后推断已静默很久。
-
-ActivityWindow 的所有字段均为 integer，单位是最近60秒内的事件／调用计数：
-
-| 字段 | 什么时候用、为什么有 | 移除影响 |
-|---|---|---|
-| `reasoning_delta_events` | 判断公开推理 delta 活动 | 缺少推理流活动线索 |
-| `text_delta_events` | 判断文本流活动 | 缺少文本输出频度线索 |
-| `tool_calls_started` | 判断工具发起频度 | 看不出近期启动了多少调用 |
-| `tool_calls_completed` | 区分启动和完成 | 只有启动不能说明已有完成 |
-| `tool_calls_failed` | 识别近期失败频度 | 难以发现失败重试模式 |
-| `read_calls` | 判断读取类工具活动 | 失去读取类统计 |
-| `bash_calls` | 判断命令类工具活动 | 失去命令类统计 |
-| `other_tool_calls` | 保留其他类别统计 | 可能把非 read/bash 工具漏算 |
-
-这些计数不能证明产生了有效任务进展，跨窗口的开始与结束也不能简单相减得出当前活动工具数。
+计数不能证明产生了有效任务进展。深度诊断（逐工具调用参数、覆盖率缺口）使用 observe。
 
 ### 13.6 MessageReceipt
 
@@ -473,10 +440,7 @@ ActivityWindow 的所有字段均为 integer，单位是最近60秒内的事件�
 |---|---|---|---|
 | `message_id` | string | 确认回执对应哪条消息 | 无法关联发送行为 |
 | `state` | string | 查看持久化投递状态 | 无法判断排队／交付过程；公开类型不是固定 enum |
-| `target_turn_id` | string/null | 诊断消息关联的上游 turn | 难以追查投递位置 |
 | `failure_code` | string/null | 诊断消息投递失败 | 只能知道失败但不知道原因 |
-| `created_at_ms` | integer | 记录消息创建时点 | 无法计算排队时间 |
-| `delivered_at_ms` | integer/null | 记录交付时点 | 缺少交付耗时与时间线；null 不能视为已交付 |
 
 ## 14. 所有工具的公共错误结构
 
@@ -532,16 +496,10 @@ unavailable, daemon_unavailable
 将其交给 `external_subagent_spawn`，保存返回 agent_id，再调用 wait：
 
 ```json
-{ "agent_id": 12345678, "wait_time": 30, "supports_answer": true }
+{ "agent_id": 12345678, "wait_time": 30 }
 ```
 
-出现可回答问题时，读取 question；有 next_offset 则补读剩余问题：
-
-```json
-{ "agent_id": 12345678, "request_id": "request-from-wait", "offset": 2048 }
-```
-
-其中2048只是示例，实际必须使用服务端返回的 next_offset。随后 respond：
+出现可回答问题时，问题正文已完整内嵌在 wait 返回的 `pending_requests[].question` 中，直接 respond：
 
 ```json
 {

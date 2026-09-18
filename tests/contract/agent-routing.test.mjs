@@ -54,7 +54,7 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   const socket = path.join(os.tmpdir(), `es-r-${process.pid}-${Date.now()}.sock`);
   configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } });
   const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
-    kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
+    kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'queued' },
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'submit_general');
@@ -78,7 +78,7 @@ test('spawn and create flags produce the same daemon DTO as JSON', async () => {
   for (let index = 0; index < invocations.length; index += 1) {
     const socket = path.join(os.tmpdir(), `es-f-${process.pid}-${index}-${Date.now()}.sock`);
     const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
-      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
+      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'queued' },
     } }), () => runCli(home, socket, invocations[index]));
     assert.equal(fixture.result.code, 0, fixture.result.stderr);
     const params = structuredClone(fixture.observed().params);
@@ -99,7 +99,7 @@ test('spawn and create JSON stdin preserve the same daemon wire DTO', async () =
   for (const [index, command] of ['spawn', 'create'].entries()) {
     const socket = path.join(os.tmpdir(), `es-i-${process.pid}-${index}-${Date.now()}.sock`);
     const fixture = await withServer(socket, () => ({ outcome: 'success', result: {
-      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', phase: 'QUEUED' },
+      kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'queued' },
     } }), () => runCliWithStdin(home, socket, command, jsonInput));
     assert.equal(fixture.result.code, 0, fixture.result.stderr);
     const params = structuredClone(fixture.observed().params);

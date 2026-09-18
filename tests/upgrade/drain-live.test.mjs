@@ -423,10 +423,10 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.ok(fs.readFileSync(paths().launchAgent, 'utf8').includes(DSH_RUNTIME), 'the re-rendered plist pins the DSH runtime environment');
 
     // ---- two REAL tasks on the vA daemon
-    const taskA = cli(['spawn', '--agent', 'zcode', '--repository', wsZcode, '--permission-mode', 'build',
+    const taskA = cli(['spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'build',
       '--prompt', 'Use the Bash tool to run exactly: sleep 25 && echo DRAIN_LIVE_A_OK > zcode-marker.txt — after it finishes, reply with just: DONE']);
     assert.ok(taskA.agent_id > 0, 'the ZCode task was admitted');
-    const taskB = cli(['spawn', '--agent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
+    const taskB = cli(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
       '--prompt', 'Use the Bash tool to run: sleep 600 — then reply with just: SLEPT']);
     assert.ok(taskB.agent_id > 0, 'the DSH task was admitted');
 
@@ -435,8 +435,8 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     let sawBRunning = false;
     while (!sawBRunning && Date.now() < deadlineRunning) {
       const polled = await waitOn(taskB.agent_id, 2);
-      if (polled.task.phase === 'RUNNING') sawBRunning = true;
-      else assert.notEqual(polled.task.phase, 'TERMINAL', 'the DSH task reached terminal before RUNNING');
+      if (polled.task.status === 'running') sawBRunning = true;
+      else assert.notEqual(polled.task.status, 'completed', 'the DSH task reached terminal before running');
     }
     assert.equal(sawBRunning, true, 'the DSH task never observed RUNNING');
     daemonPid = launchctlState().pid;
@@ -481,7 +481,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.equal(draining, true, 'the update never started draining the daemon');
 
     // During drain: new spawns are rejected.
-    const rejected = cliRaw(['spawn', '--agent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build', '--prompt', 'hi'], 30_000);
+    const rejected = cliRaw(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build', '--prompt', 'hi'], 30_000);
     assert.notEqual(rejected.status, 0, 'a new spawn during drain must fail');
     const rejection = JSON.parse(rejected.stderr);
     assert.match(rejection.error.message, /daemon_draining/, `new spawn during drain must be rejected as draining, got: ${rejected.stderr}`);
@@ -494,7 +494,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
       const polled = await waitOn(taskA.agent_id, 2);
       const pending = Array.isArray(polled.pending_requests) ? polled.pending_requests : [];
       if (pending.length > 0) requestId = pending[0].request_id;
-      else assert.notEqual(polled.task.phase, 'TERMINAL', `the ZCode task reached terminal without a pending request (${polled.task.outcome})`);
+      else assert.notEqual(polled.task.status, 'completed', `the ZCode task reached terminal without a pending request (${polled.task.status})`);
     }
     assert.ok(requestId, 'the ZCode task never surfaced a pending permission request');
     cli(['respond', '--json', JSON.stringify({ agent_id: taskA.agent_id, request_id: requestId, decision: 'allow' })]);
@@ -504,24 +504,22 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     let terminal = null;
     while (!terminal && Date.now() < deadlineTerminal) {
       const polled = await waitOn(taskA.agent_id, 3);
-      if (polled.task.phase === 'TERMINAL') terminal = polled;
+      if (polled.task.status === 'completed') terminal = polled;
     }
     assert.ok(terminal, 'the ZCode task never completed during the drain');
-    assert.equal(terminal.task.outcome, 'COMPLETED');
-    assert.equal(terminal.task.resources_reaped, true);
+    assert.equal(terminal.task.status, 'completed');
     const taskAResult = cli(['result', '--json', JSON.stringify({ agent_id: taskA.agent_id })]);
     assert.equal(typeof taskAResult.result.final_text, 'string');
     assert.ok(taskAResult.result.final_text.length > 0, 'the completed task produced a final result during drain');
     const taskAClosed = cli(['close', '--json', JSON.stringify({ agent_id: taskA.agent_id })]);
-    assert.equal(taskAClosed.task.closed, true, 'close stays available during drain');
+    assert.equal(taskAClosed.task.status, 'closed', 'close stays available during drain');
     assert.equal(fs.readFileSync(path.join(wsZcode, 'zcode-marker.txt'), 'utf8'), 'DRAIN_LIVE_A_OK\n', 'the ZCode task performed its real work');
 
     // During drain: the long DSH task is cancelled mid-run and reaped.
     const taskBCancelled = cli(['cancel', '--json', JSON.stringify({ agent_id: taskB.agent_id })]);
-    assert.equal(taskBCancelled.task.outcome, 'CANCELLED');
-    assert.equal(taskBCancelled.task.resources_reaped, true);
+    assert.equal(taskBCancelled.task.status, 'cancelled');
     const taskBClosed = cli(['close', '--json', JSON.stringify({ agent_id: taskB.agent_id })]);
-    assert.equal(taskBClosed.task.closed, true);
+    assert.equal(taskBClosed.task.status, 'closed');
 
     // ---- the same update run activates vB automatically after the reap
     const updateExit = await updateDone;
@@ -564,28 +562,28 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.equal(sha256(fs.readFileSync(retainedB)), shaB);
 
     // ---- the NEW daemon serves both upstreams again
-    const postZcode = cli(['spawn', '--agent', 'zcode', '--repository', path.join(workDir, 'ws-post-z'), '--permission-mode', 'yolo',
+    const postZcode = cli(['spawn', '--subagent', 'zcode', '--repository', path.join(workDir, 'ws-post-z'), '--permission-mode', 'yolo',
       '--prompt', 'Reply with exactly the single word POST_ZCODE_OK and nothing else. Do not use any tools.']);
     const waitForTerminal = async (agentId, budgetMs = 240_000) => {
       const deadline = Date.now() + budgetMs;
       for (;;) {
         const polled = await waitOn(agentId, 5);
-        if (polled.task.phase === 'TERMINAL') return polled;
+        if (polled.task.status === 'completed') return polled;
         if (Date.now() > deadline) return null;
       }
     };
     const postZcodeDone = await waitForTerminal(postZcode.agent_id);
     assert.ok(postZcodeDone, 'the post-upgrade ZCode task never completed');
-    assert.equal(postZcodeDone.task.outcome, 'COMPLETED');
+    assert.equal(postZcodeDone.task.status, 'completed');
     assert.equal(postZcodeDone.task.input_identity.model_source, 'native');
-    assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.closed);
+    assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.status === 'closed');
 
-    const postDsh = cli(['spawn', '--agent', 'dsh', '--repository', path.join(workDir, 'ws-post-d'), '--permission-mode', 'build',
+    const postDsh = cli(['spawn', '--subagent', 'dsh', '--repository', path.join(workDir, 'ws-post-d'), '--permission-mode', 'build',
       '--prompt', 'Reply with just: POST_DSH_OK']);
     const postDshDone = await waitForTerminal(postDsh.agent_id);
     assert.ok(postDshDone, 'the post-upgrade DSH task never completed');
-    assert.equal(postDshDone.task.outcome, 'COMPLETED');
-    assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postDsh.agent_id })]).task.closed);
+    assert.equal(postDshDone.task.status, 'completed');
+    assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postDsh.agent_id })]).task.status === 'closed');
 
     settled = true;
     console.log([

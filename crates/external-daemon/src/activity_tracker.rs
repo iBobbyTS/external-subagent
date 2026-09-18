@@ -9,8 +9,6 @@ struct PassiveActivityState {
     latest_text_tail: String,
     latest_text_updated_at: Option<u64>,
     latest_text_truncated: bool,
-    assistant_buffers: HashMap<String, String>,
-    latest_progress: Option<String>,
     terminal_text: String,
     /// The current turn's terminal text was set by a boundary carrying the
     /// turn's verified final text; later streaming echoes must not pollute it.
@@ -111,27 +109,6 @@ impl PassiveActivityTracker {
         if admitted {
             if let Some(delta) = parsed.text_delta.as_deref() {
                 append_latest_text(&mut state, delta, wall_now_ms);
-                if let Some(message_id) = parsed.assistant_message_id.as_deref() {
-                    let buffer = state
-                        .assistant_buffers
-                        .entry(message_id.to_owned())
-                        .or_default();
-                    buffer.push_str(delta);
-                    if buffer.len() > MAX_LATEST_TEXT_BYTES {
-                        let mut keep_from = buffer.len().saturating_sub(MAX_LATEST_TEXT_BYTES);
-                        while keep_from < buffer.len() && !buffer.is_char_boundary(keep_from) {
-                            keep_from += 1;
-                        }
-                        *buffer = buffer[keep_from..].to_owned();
-                    }
-                }
-            }
-            if parsed.message_finished {
-                if let Some(message_id) = parsed.assistant_message_id.as_deref() {
-                    if let Some(buffer) = state.assistant_buffers.remove(message_id) {
-                        state.latest_progress = Some(buffer);
-                    }
-                }
             }
             if let Some(response) = parsed.terminal_response.as_deref() {
                 // A boundary that carries the turn's verified final text
@@ -258,7 +235,11 @@ impl PassiveActivityTracker {
             latest_text_tail: state.latest_text_tail.clone(),
             latest_text_updated_at: state.latest_text_updated_at,
             latest_text_truncated: state.latest_text_truncated,
-            latest_progress: state.latest_progress.clone(),
+            latest_reasoning: if self.runtime_source_verified() {
+                state.observation.snapshot().reasoning.text
+            } else {
+                String::new()
+            },
             active_tools,
             oldest_active_tool_age_ms: state
                 .active_tools
@@ -299,11 +280,21 @@ impl PassiveActivityTracker {
         let mut state = self.state.lock().unwrap();
         state.revision = 900;
         state.latest_text_tail = "ordinary text".into();
-        state.latest_progress = Some("ordinary progress".into());
         state.last_model_delta_at = Some(now);
         state
             .active_tools
             .insert("tool".into(), (PassiveToolKind::Bash, now));
+        state.samples.insert(
+            "tool".into(),
+            ActivitySample {
+                source: ActivitySource::Session,
+                observed_at: now,
+                kind: ActivitySampleKind::ToolStarted {
+                    kind: PassiveToolKind::Bash,
+                },
+            },
+        );
+        state.sample_order.push_back("tool".into());
     }
 }
 

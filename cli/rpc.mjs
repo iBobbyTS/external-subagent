@@ -104,17 +104,13 @@ function methodFor(command, input) {
       },
     };
     case 'wait': {
-      rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id', 'supports_answer']));
-      if (input.supports_answer !== undefined && typeof input.supports_answer !== 'boolean') {
-        throw new CliError('INVALID_ARGUMENT', 'supports_answer must be a boolean', 2);
-      }
+      rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id']));
       return {
         method: 'task_wait',
         params: {
           agent_id: daemonTaskId(input.agent_id),
           wait_time: input.wait_time ?? 290,
           ...(input.message_id ? { message_id: input.message_id } : {}),
-          ...(input.supports_answer !== undefined ? { supports_answer: input.supports_answer } : {}),
         },
       };
     }
@@ -151,13 +147,9 @@ function methodFor(command, input) {
     }
     case 'cancel': return { method: 'task_cancel', params: { agent_id: daemonTaskId(input.agent_id) } };
     case 'result': {
-      rejectUnknownFields('result', input, new Set(['agent_id', 'request_id', 'offset', 'limit']));
-      if (input.request_id !== undefined && (typeof input.request_id !== 'string' || input.request_id.length === 0)) {
-        throw new CliError('INVALID_ARGUMENT', 'request_id must be a non-empty string', 2);
-      }
+      rejectUnknownFields('result', input, new Set(['agent_id', 'offset', 'limit']));
       return { method: 'task_result', params: {
         agent_id: daemonTaskId(input.agent_id),
-        ...(input.request_id !== undefined ? { request_id: input.request_id } : {}),
         offset: input.offset ?? 0,
         limit: input.limit ?? MAX_RESULT_CHUNK_BYTES,
       } };
@@ -168,28 +160,15 @@ function methodFor(command, input) {
   }
 }
 
+// The CLI projection is field-for-field identical to the MCP tool outputs:
+// both pass the daemon's public wire views through unchanged, except the
+// numeric agent_id coercion.
 function publicTask(task) {
-  const admission = task.input_identity?.admission;
   return {
     agent_id: publicTaskId(task.agent_id),
+    status: task.status,
     session_id: task.session_id ?? null,
-    turn_id: task.turn_id ?? null,
-    phase: task.phase,
-    outcome: task.outcome ?? null,
-    reason_code: task.reason_code ?? null,
-    cancel_requested: task.stop_requested,
-    close_requested: task.close_requested,
-    closed: task.closed,
-    resources_reaped: task.reaped,
-    input_identity: task.input_identity ? {
-      subagent: admission?.agent ?? null,
-      config_revision: admission?.config_revision ?? null,
-      adapter_version: admission?.adapter_version ?? null,
-      model: admission?.model ?? null,
-      model_source: admission?.model_source ?? null,
-      workspace_path: task.input_identity.workspace_path ?? null,
-      permission_mode: task.input_identity.permission_mode ?? null,
-    } : null,
+    input_identity: task.input_identity ?? null,
   };
 }
 
@@ -206,17 +185,6 @@ function publicResult(result) {
   };
 }
 
-function publicQuestion(question) {
-  if (question == null) return null;
-  return {
-    text: question.text,
-    offset: question.offset,
-    total_bytes: question.total_bytes,
-    next_offset: question.next_offset ?? null,
-    complete: question.complete,
-  };
-}
-
 export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
@@ -224,16 +192,16 @@ export function projectDaemonResult(command, result) {
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':
-      return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, phase: result.task.phase };
+      return { agent_id: publicTaskId(result.task.agent_id), submission_disposition: result.disposition, status: result.task.status };
     case 'wait': {
-      const { latest_progress, result: taskResult, task, activity, kind: _kind, ...rest } = result;
-      return { ...rest, task: publicTask(task), activity, latest_progress, result: publicResult(taskResult) };
+      const { result: taskResult, task, activity, kind: _kind, ...rest } = result;
+      return { ...rest, task: publicTask(task), activity, result: publicResult(taskResult) };
     }
     case 'list': return { tasks: result.tasks.map(publicTask), next_cursor: result.next_cursor ?? null };
     case 'send': return { message_id: result.message_id, disposition: result.disposition };
     case 'respond': return { ...result.outcome, policy_reason_code: result.outcome.policy_reason_code ?? null };
     case 'cancel': case 'close': return { task: publicTask(result.task) };
-    case 'result': return { task: publicTask(result.task), result: publicResult(result.result), question: publicQuestion(result.question) };
+    case 'result': return { task: publicTask(result.task), result: publicResult(result.result) };
     case 'observe': return { ...result.observation, agent_id: publicTaskId(result.observation.agent_id) };
     default: throw new CliError('PROTOCOL_ERROR', `daemon returned an unsupported result for ${command}`);
   }

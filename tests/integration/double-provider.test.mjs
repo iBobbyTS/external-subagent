@@ -399,43 +399,40 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
 
     const lifecycle = (agentId) => {
       const waited = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: agentId, wait_time: 240 })])).result;
-      assert.equal(waited.task.phase, 'TERMINAL');
-      assert.equal(waited.task.outcome, 'COMPLETED');
-      assert.equal(waited.task.resources_reaped, true);
+      assert.equal(waited.task.status, 'completed');
       assert.equal(waited.result.final_text.length > 0, true);
       const closed = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: agentId })])).result;
-      assert.equal(closed.task.closed, true);
+      assert.equal(closed.task.status, 'closed');
     };
 
     // Real DSH build task (workspace-write composition).
     fs.writeFileSync(path.join(wsDsh, 'seed.txt'), 'seed');
-    const dshBuild = jsonOut(cli(['spawn', '--agent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
+    const dshBuild = jsonOut(cli(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
       '--prompt', 'Write the exact text LIVE_BUILD_OK into marker.txt in the current directory, then reply with just: DONE'])).result;
     lifecycle(dshBuild.agent_id);
     assert.equal(fs.readFileSync(path.join(wsDsh, 'marker.txt'), 'utf8'), 'LIVE_BUILD_OK');
 
     // Real DSH strict-plan task (read-only first-launch scope).
     const beforePlan = fs.readdirSync(wsDsh).sort().join(',');
-    const dshPlan = jsonOut(cli(['spawn', '--agent', 'dsh', '--repository', wsDsh, '--permission-mode', 'plan',
+    const dshPlan = jsonOut(cli(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'plan',
       '--prompt', 'How many files are in the current directory? Reply with only the number.'])).result;
     lifecycle(dshPlan.agent_id);
     assert.equal(fs.readdirSync(wsDsh).sort().join(','), beforePlan, 'strict-plan must not mutate the workspace');
 
     // Real ZCode task with its native model.
-    const zcodeTask = jsonOut(cli(['spawn', '--agent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
+    const zcodeTask = jsonOut(cli(['spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
       '--prompt', 'Reply with exactly the single word LIVE_ZCODE_OK and nothing else. Do not use any tools.'])).result;
     const zcodeWaited = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id, wait_time: 240 })])).result;
-    assert.equal(zcodeWaited.task.phase, 'TERMINAL');
-    assert.equal(zcodeWaited.task.outcome, 'COMPLETED');
+    assert.equal(zcodeWaited.task.status, 'completed');
     assert.equal(zcodeWaited.task.input_identity.model_source, 'native');
     assert.equal(zcodeWaited.result.final_text.includes('LIVE_ZCODE_OK'), true);
     const zcodeClosed = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
-    assert.equal(zcodeClosed.task.closed, true);
+    assert.equal(zcodeClosed.task.status, 'closed');
 
     // ZCode explicit model rejection (daemon-enforced boundary). The CLI
     // shim writes its error JSON to stderr and exits 1.
     const rejected = spawnSync(path.join(prefix, 'bin', 'external-subagent'), [
-      'spawn', '--agent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
+      'spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
       '--model', 'glm-5.3', '--prompt', 'hi',
     ], { encoding: 'utf8', timeout: 30_000, env: { ...cleanDaemonEnv(home), ZCODE_AGENTD_SOCKET: socket } });
     assert.equal(rejected.status, 1);
@@ -446,20 +443,20 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     // Mid-run cancel with reaping on DSH. The poll loop must actually
     // observe RUNNING: cancelling a task that never left QUEUED would not
     // be mid-run evidence.
-    const cancellable = jsonOut(cli(['spawn', '--agent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
+    const cancellable = jsonOut(cli(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
       '--prompt', 'Use the Bash tool to run: sleep 45 — then reply with just: SLEPT'])).result;
     let sawRunning = false;
+    const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timed_out', 'runtime_lost', 'result_invalid', 'closed']);
     for (let attempt = 0; attempt < 30 && !sawRunning; attempt += 1) {
       const polled = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: cancellable.agent_id, wait_time: 3 })])).result;
-      if (polled.task.phase === 'RUNNING') sawRunning = true;
-      else assert.notEqual(polled.task.phase, 'TERMINAL', 'cancel target reached terminal before RUNNING');
+      if (polled.task.status === 'running') sawRunning = true;
+      else assert.equal(TERMINAL_STATUSES.has(polled.task.status), false, 'cancel target reached terminal before running');
     }
     assert.equal(sawRunning, true, 'cancel target never observed RUNNING');
     const cancelled = jsonOut(cli(['cancel', '--json', JSON.stringify({ agent_id: cancellable.agent_id })])).result;
-    assert.equal(cancelled.task.outcome, 'CANCELLED');
-    assert.equal(cancelled.task.resources_reaped, true);
+    assert.equal(cancelled.task.status, 'cancelled');
     const closedCancelled = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: cancellable.agent_id })])).result;
-    assert.equal(closedCancelled.task.closed, true);
+    assert.equal(closedCancelled.task.status, 'closed');
 
     // Bounded evidence output (states only — no secrets, no digests), one
     // line per live-asserted boundary plus the explicit not-asserted list,
