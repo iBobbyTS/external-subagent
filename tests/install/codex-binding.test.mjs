@@ -140,6 +140,17 @@ function tempSource(tweak) {
   return dir;
 }
 
+// Rewrite the shipped template's MCP args — the managed binding field the
+// command/socket verification does not name — so a stale cache can diverge
+// in exactly that field while identity, binding, and every other managed
+// byte stay identical.
+function rewriteMcpArgs(dir, args) {
+  const file = path.join(dir, '.mcp.json');
+  const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+  doc.mcpServers.external_subagent.args = args;
+  fs.writeFileSync(file, `${JSON.stringify(doc, null, 2)}\n`);
+}
+
 function binding(home, extra = {}) {
   const paths = productPaths(home);
   const codexHome = extra.codexHome || path.join(home, '.codex');
@@ -358,6 +369,19 @@ test('a same-identity cache with changed managed content fails closed through th
       // carried the seeded file — its absence IS the source deletion.
       candidate: () => {},
       staleProof: (cache) => assert.equal(fs.existsSync(path.join(cache, 'obsolete-managed-file.txt')), true, 'the cache retains the file this candidate deleted'),
+    },
+    {
+      // The .mcp.json divergence treeDigest cannot see: same identity,
+      // same command and socket, only the managed args moved.  The cache
+      // document comparison must still fail the install closed.
+      name: 'older cached MCP args beyond command and socket',
+      seed: (dir) => rewriteMcpArgs(dir, ['--old-bridge-flag']),
+      candidate: () => {},
+      staleProof: (cache) => assert.deepEqual(
+        JSON.parse(fs.readFileSync(path.join(cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.args,
+        ['--old-bridge-flag'],
+        'the cache keeps the older managed MCP args',
+      ),
     },
   ];
   for (const negative of negatives) {

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { isDeepStrictEqual } from 'node:util';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
@@ -109,6 +110,11 @@ function readCacheJson(file, cache, identity) {
   }
 }
 
+// Shared remediation for any cache that kept another installation's bytes
+// for this identity: the identity (plugin version) must move, or the
+// resolved root must be refreshed — the codex-owned cache is never edited.
+const CACHE_REUSE_REMEDIATION = 'The cache kept another installation\'s content for the same identity: when the CLI freezes cached content for an identity (codex 0.153.4 store behavior), release a distinct plugin version instead of accepting it; when the CLI re-materializes the cache from the registered root (codex 0.154.0, non-reserved marketplace names), refresh the registered marketplace root and re-add';
+
 // codex materializes `plugin add` caches from a resolved root, and the
 // resolution differs by codex version and marketplace name (verified on
 // 0.153.4 and 0.154.0, see docs/compatibility/codex.md).  0.153.4 froze the
@@ -158,21 +164,28 @@ function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
     // the source deleted.  codex 0.154.0 re-materializes non-reserved names
     // from the registered root before this read, so on that baseline this
     // comparison is defense-in-depth rather than a live stale-content
-    // catch; it stays for freeze-behavior CLIs and future regressions.  The managed
-    // content is therefore compared with this run's staged tree via treeDigest
-    // (every file and byte, except .mcp.json — whose command/socket binding
-    // was just verified above; that exclusion is treeDigest's existing rule
-    // and is NOT a reason to drop the binding checks).  Real codex
-    // materializes the cache as a verbatim copy of the staged plugin tree
-    // with no host-generated additions inside it (see
+    // catch; it stays for freeze-behavior CLIs and future regressions.  The
+    // managed content is therefore compared with this run's staged tree via
+    // treeDigest (every file and byte except `.mcp.json` — that exclusion
+    // is treeDigest's existing rule, because the machine-local binding must
+    // not churn the content digest).  The `.mcp.json` gap that exclusion
+    // would leave is closed by a direct comparison right after the binding
+    // check: command and socket there, then the whole managed document.
+    // Real codex materializes the cache as a verbatim copy of the staged
+    // plugin tree with no host-generated additions inside it (see
     // docs/compatibility/codex.md), so the staged file set IS the managed
     // set; any difference fails closed through the existing error chain
     // (S01 keeps staging/marketplace recoverable) instead of reporting
     // cache_verified for stale bytes.
+    const stagedMcp = readCacheJson(path.join(staging, '.mcp.json'), staging, identity);
+    const cacheMcp = readCacheJson(path.join(cache, '.mcp.json'), cache, identity);
+    if (!isDeepStrictEqual(cacheMcp, stagedMcp)) {
+      throw new CliError('CODEX_CACHE_CONTENT_MISMATCH', `codex plugin cache for ${identity} carries a different managed MCP config (command and socket already matched, so the divergence is in the remaining .mcp.json fields such as args or env; ${cache}). ${CACHE_REUSE_REMEDIATION}`);
+    }
     const stagedDigest = treeDigest(staging);
     const cacheDigest = treeDigest(cache);
     if (cacheDigest !== stagedDigest) {
-      throw new CliError('CODEX_CACHE_CONTENT_MISMATCH', `codex plugin cache for ${identity} does not carry this candidate's managed content (staged tree digest ${stagedDigest}, cache digest ${cacheDigest}; ${cache}). The cache kept another installation's content for the same identity: when the CLI freezes cached content for an identity (codex 0.153.4 store behavior), release a distinct plugin version instead of accepting it; when the CLI re-materializes the cache from the registered root (codex 0.154.0, non-reserved marketplace names), refresh the registered marketplace root and re-add`);
+      throw new CliError('CODEX_CACHE_CONTENT_MISMATCH', `codex plugin cache for ${identity} does not carry this candidate's managed content (staged tree digest ${stagedDigest}, cache digest ${cacheDigest}; ${cache}). ${CACHE_REUSE_REMEDIATION}`);
     }
     return cache;
   }
