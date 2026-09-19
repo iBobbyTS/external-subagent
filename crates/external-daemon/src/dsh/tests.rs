@@ -25,13 +25,17 @@ use std::time::{Duration, Instant};
 const SESSION_ID: &str = "dsh-build-session";
 
 fn dsh_admission(model: Option<&str>) -> AdmissionIdentity {
+    dsh_admission_with_effort(model, None)
+}
+
+fn dsh_admission_with_effort(model: Option<&str>, effort: Option<&str>) -> AdmissionIdentity {
     AdmissionIdentity {
         agent: "dsh".into(),
         config_revision: 1,
         adapter_version: env!("CARGO_PKG_VERSION").into(),
         model: model.map(str::to_owned),
         model_source: "catalog".into(),
-        effort: None,
+        effort: effort.map(str::to_owned),
     }
 }
 
@@ -143,10 +147,19 @@ fn manifest_for(workspace: &std::path::Path, prompt: &str) -> GeneralTaskManifes
 }
 
 fn enqueue_dsh(scheduler: &Scheduler, workspace: &std::path::Path, model: Option<&str>) -> String {
+    enqueue_dsh_with_effort(scheduler, workspace, model, None)
+}
+
+fn enqueue_dsh_with_effort(
+    scheduler: &Scheduler,
+    workspace: &std::path::Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace, "build the fixture"),
-            Some(dsh_admission(model)),
+            Some(dsh_admission_with_effort(model, effort)),
         )
         .unwrap();
     submitted.agent_id
@@ -839,6 +852,171 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         request_methods(&frames),
         vec!["initialize", "session/new", "session/set_config_option"],
         "no prompt may follow a refused model selection"
+    );
+}
+
+#[test]
+fn admitted_effort_is_sent_after_the_model_and_before_the_first_prompt() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    // The scripted session advertises both config options, verifies the
+    // model (id3) and the reasoning effort (id4), and only then settles the
+    // single prompt turn (id5).
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}},{{"configId":"reasoning_effort"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"result":{{"configOptions":[]}}}}'
+read_frame
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-final","content":[{{"type":"text","text":"effort applied"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":5,"result":{{"stopReason":"end_turn","messageId":"message-final"}}}}'
+"#
+    )
+    .replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh_with_effort(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-model"),
+        Some("high"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "effort applied");
+    let frames = wait_for_frames(workspace.path(), 5);
+    assert_eq!(
+        request_methods(&frames),
+        vec![
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+    assert_eq!(frames[2]["params"]["configId"], "model");
+    assert_eq!(frames[2]["params"]["value"], "fixture-model");
+    assert_eq!(frames[3]["params"]["configId"], "reasoning_effort");
+    assert_eq!(frames[3]["params"]["value"], "high");
+    assert_eq!(frames[4]["method"], "session/prompt");
+}
+
+#[test]
+fn tasks_without_admitted_effort_emit_no_reasoning_effort_frame() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    // The server offers reasoning_effort, but the admission carries no
+    // effort token: the wire must stay exactly at the pre-effort shape.
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}},{{"configId":"reasoning_effort"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+printf '%s\n' \
+  '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"type":"agent_message","messageId":"message-final","content":[{{"type":"text","text":"default effort kept"}}]}}}}}}' \
+  '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn","messageId":"message-final"}}}}'
+"#
+    )
+    .replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    let frames = wait_for_frames(workspace.path(), 4);
+    assert_eq!(
+        request_methods(&frames),
+        vec![
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/prompt"
+        ]
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["params"]["configId"] == "reasoning_effort")
+            .count(),
+        0,
+        "no reasoning_effort frame may exist without an admitted effort"
+    );
+}
+
+#[test]
+fn rejected_effort_selection_fails_before_any_prompt_is_sent() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    // The model selection verifies, the reasoning-effort selection is
+    // rejected by the server, and the task must fail without any prompt.
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}},{{"configId":"reasoning_effort"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32602,"message":"unknown reasoning_effort option: high"}}}}'
+"#
+    )
+    .replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh_with_effort(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-model"),
+        Some("high"),
+    );
+    let error = scheduler.start_ready().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unknown reasoning_effort option"),
+        "{error}"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    let failure = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(failure.contains("SESSION_START_FAILED"), "{failure}");
+    assert!(
+        failure.contains("unknown reasoning_effort option"),
+        "{failure}"
+    );
+    let frames = wire_frames(workspace.path());
+    assert_eq!(
+        request_methods(&frames),
+        vec![
+            "initialize",
+            "session/new",
+            "session/set_config_option",
+            "session/set_config_option"
+        ],
+        "no prompt may follow a refused reasoning-effort selection"
     );
 }
 

@@ -1,6 +1,6 @@
 //! The DSH session control plane: prompt turns with their settlement
-//! watchers, and the initialize/session-new/model bootstrap sequence whose
-//! verification gates the first prompt.
+//! watchers, and the initialize/session-new/model/reasoning-effort bootstrap
+//! sequence whose verification gates the first prompt.
 
 use std::{
     path::PathBuf,
@@ -67,11 +67,14 @@ impl DshRuntimeOwner {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(RuntimeCommandError::Timeout)?;
-        let model = match task_route(task) {
-            Ok(crate::TaskRoute::General(prepared)) => prepared
-                .admission
-                .as_ref()
-                .and_then(|identity| identity.model.clone()),
+        let (model, effort) = match task_route(task) {
+            Ok(crate::TaskRoute::General(prepared)) => {
+                let admission = prepared.admission.as_ref();
+                (
+                    admission.and_then(|identity| identity.model.clone()),
+                    admission.and_then(|identity| identity.effort.clone()),
+                )
+            }
             Err(message) => {
                 return Err(RuntimeCommandError::InvalidSession(message));
             }
@@ -100,8 +103,22 @@ impl DshRuntimeOwner {
         } else {
             None
         };
+        // The admitted reasoning effort rides the same verified config
+        // option channel as the model (X05): applied after the model
+        // selection and strictly before the first prompt, and never sent
+        // when the admission carries no effort token. A DSH task has no
+        // separate resume entry point — every claim re-enters this
+        // bootstrap — so the session-scoped setting cannot go stale.
+        if let Some(token) = effort.as_deref() {
+            session
+                .set_reasoning_effort(token, remaining()?)
+                .map_err(|error| {
+                    RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+                })?;
+        }
         // The initial prompt only leaves after initialize, session/new, and
-        // any model selection have all been verified (X05/P02).
+        // any model or reasoning-effort selection have all been verified
+        // (X05/P02).
         let prompt = task.initial_prompt.clone();
         drop(session);
         self.send_prompt(&prompt)?;
