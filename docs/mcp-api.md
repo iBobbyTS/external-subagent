@@ -152,6 +152,9 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
 | `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式 | 不清楚应省略还是使用模型 token |
+| `effort_selection` | object | 描述推理力度（reasoning effort）选择能力 | 无法按 subagent 选择 effort 参数策略 |
+| `effort_selection.supported` | boolean | 是否应传 spawn.effort（随 `spawn_supported` 门） | 更容易触发不支持 effort 的错误 |
+| `effort_selection.mode` | enum | `closed_set / passthrough_token`，说明选择方式 | 不清楚应使用闭集值还是有界透传 token |
 | `local` | AgentScopeStatus | 查看本地 runtime 检查结论 | 缺少本地可用性依据 |
 | `auth` | AgentScopeStatus | 查看认证相关检查结论 | 无法区分认证与安装故障 |
 | `hi` | AgentScopeStatus | 查看最小真实交互检查结论 | 缺少端到端就绪证据 |
@@ -176,6 +179,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
 | `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | 非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
 | `model` | string；可选 | subagent 支持时指定任务模型 | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝 |
+| `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh`（`minimal`/`max` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
 
 `PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
 
@@ -368,6 +372,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `adapter_version` | string/null | 排查适配器版本行为差异 | 缺少适配器证据 |
 | `model` | string/null | 查看已记录模型选择；null 不应猜测为某个模型 | 无法追溯已知模型选择 |
 | `model_source` | string/null | 区分模型信息来源 | 容易把默认配置当作实测确认 |
+| `effort` | string/null | 查看已接纳的推理力度选择；null 表示任务未显式指定（与其余字段一致，显式序列化为 null 而非省略） | 无法追溯已知 effort 选择 |
 | `workspace_path` | string/null | 核对实际工作目录 | 难以确定执行位置 |
 | `permission_mode` | string/null | 追溯任务采用权限模式 | 无法解释读写限制来源 |
 

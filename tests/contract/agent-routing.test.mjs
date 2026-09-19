@@ -220,6 +220,7 @@ test('human config and agents forms execute instead of falling through to JSON d
       transport_support: { transport: 'zcode_app_server', probe: true, spawn: true },
       permission_modes: ['build', 'edit', 'plan', 'yolo'],
       model_selection: { supported: false, mode: 'native_only' },
+      effort_selection: { supported: true, mode: 'passthrough_token' },
       local: { state: 'READY', version: '1.0.0', checked_at_ms: 10, scope: {} },
       auth: { state: 'UNKNOWN', checked_at_ms: null, scope: {} },
       hi: { state: 'UNKNOWN', checked_at_ms: null, scope: {} },

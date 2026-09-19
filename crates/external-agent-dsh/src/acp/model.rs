@@ -46,9 +46,10 @@ impl std::fmt::Display for ModelSetError {
 impl std::error::Error for ModelSetError {}
 
 /// Why a requested reasoning-effort token was refused before any prompt was
-/// sent. The failure stages mirror [`ModelSetError`] exactly (X05); only the
-/// error text names the reasoning-effort selection so refusals stay
-/// distinguishable in diagnostics.
+/// sent. The failure stages follow [`ModelSetError`] (X05) minus the
+/// server-rejection variant — a rejected set-option response surfaces as the
+/// shared request error instead — and only the error text names the
+/// reasoning-effort selection so refusals stay distinguishable in diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReasoningEffortSetError {
     /// The token does not satisfy the opaque-token bounds.

@@ -183,6 +183,45 @@ model-behavior facts:
 - A thread is only resumable after a turn persists its rollout;
   `thread/resume` before that errors with `no rollout found for thread id`.
 
+## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED; live turn NOT_RUN)
+
+The spawn `effort` parameter (admission closed set
+`low | medium | high | xhigh`; `minimal` and `max` are rejected) is driven as
+the top-level `effort` of every `turn/start`; an omitted spawn effort keeps
+the pre-existing wire default. Evidence layers:
+
+- **SOURCE_INSPECTED** (codex-cli 0.154.0 binary strings): the
+  `low/medium/high/xhigh` ladder sits next to `reasoningEffort` /
+  `model_reasoning_effort` and the `ThreadStart`/`ResumeResponse` types. The
+  binary also serializes a `minimal` variant
+  (`core/src/session/reasoning_effort.rs`), but no observed model advertises
+  it (next bullet), so it stays out of the admitted set.
+- **OBSERVED** (`models/list` probe 2026-09-15, `.agent-work/tmp/codex-app-server-probe/result-20260915-persistent.json`): all 8 models advertise one of
+  three `supportedReasoningEfforts` shapes — `{low,medium,high,xhigh}`,
+  `{low,medium,high,xhigh,max}`, `{low,medium,high,xhigh,max,ultra}` — none
+  contains `minimal`, and the catalog tokens `max`/`ultra` have no verified
+  mapping onto the wire enum. The closed set therefore remains the four
+  values and `minimal`/`max` are pinned as rejected at admission.
+- **OBSERVED** (same probe): the `thread/start` result's `reasoningEffort`
+  echo is the **model default, not an acknowledgement of any requested
+  effort** — gpt-5.6-terra echoed `medium`, exactly its
+  `defaultReasoningEffort`. The daemon treats the start echo as
+  diagnostic-only and never compares against it.
+- **OBSERVED** (same probe): `thread/resume` (and `thread/read`) echo the
+  **last turn's effective effort** (`low` after a `low` turn). The daemon
+  fail-closes with `InvalidSession` when a resume echo exists, an explicit
+  effort was admitted, and the two differ.
+- **OBSERVED** (`start-posture-20260919.json`, same directory): a resume
+  with no leading turn fails outright — the response is the JSON-RPC error
+  branch (keys `code`/`message`, the no-rollout shape recorded above), not
+  a success result that merely lacks the echo. The daemon's "an absent
+  resume echo is diagnostic-only and passes through" branch is therefore a
+  defensive implementation pinned by the fixture tests, not a live-observed
+  success shape.
+- Live verification that a driven `turn/start` effort is actually applied by
+  the model is **NOT_RUN** (user prohibition on production spawns); the
+  evidence above is static-binary and unauthenticated-probe only.
+
 ## NOT_RUN
 
 - Installation into a real user `~/.codex` (requires explicit authorization).

@@ -911,6 +911,21 @@ mod admission_tests {
                 .effort,
             None
         );
+        // dsh passes through the same non-codex branch once its production
+        // gate admits the task, so the test name carries a real dsh case.
+        let root = admission_fixtures::gated_dsh_config(None);
+        let dsh_config = admission_fixtures::gated_dsh_snapshot(&root);
+        let mut dsh_input = input.clone();
+        dsh_input.agent = Some("dsh".into());
+        dsh_input.effort = Some("high".into());
+        assert_eq!(
+            resolve_admission(&dsh_input, &dsh_config)
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("high"),
+            "dsh effort must pass through the gated config"
+        );
     }
 
     #[test]

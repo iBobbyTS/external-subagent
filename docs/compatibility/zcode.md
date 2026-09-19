@@ -112,6 +112,50 @@ bundled and marketplace plugins: **inline directories** — every path in
   `install-plugin zcode` still installs and reports a `warning` instead
   of silently binding into a disabled subsystem.
 
+## Session thought level (SOURCE_INSPECTED; live NOT_RUN)
+
+The spawn `effort` token is carried as the optional `thoughtLevel` field of
+the session frames (camelCase; the key is omitted entirely when no effort
+was admitted), established by inspecting the client's bundled `zcode.cjs`
+(25.6.0).
+
+The minified symbol names cited below (`hKe`, `gKe`, `E8e`, `S9t`/`f1s`)
+come from the 2026-09-19 08:5x bundle snapshot and **drift with every
+client build** — the same-day 09:51 hot update already rebinds them to
+unrelated constructs. The behavioral claims were re-confirmed on the new
+bundle; when re-verifying, match the stable strings
+(`session_create.thought_level_skipped`, the `.strict()` schema shape,
+`settings.thoughtLevel.current`) rather than symbol names.
+
+- Both the `session/create` (`hKe`, 08:5x snapshot) and `session/resume`
+  (`gKe`, 08:5x snapshot) request
+  schemas parse an optional `thoughtLevel` via `.strict()`.
+- An unsupported value is **silently skipped**: the client emits a
+  `session_create.thought_level_skipped` notice and proceeds. The supported
+  set is the selected model's `optionSpecs.reasoningLevel.values`, known
+  only at runtime — which is why this product admits effort for zcode as a
+  bounded passthrough token rather than a closed set.
+- The effective level reads back from
+  `result.settings.thoughtLevel.current`; the settings projection includes
+  `current` only when the effective value is in the supported list (the
+  `E8e` projection, 08:5x snapshot).
+- **Resume parses but ignores `thoughtLevel`** — the parsed field
+  (`S9t`/`f1s`, 08:5x snapshot) has no consumer on the resume path
+  (`setThoughtLevel`'s
+  consumers are the create flow, `setModel`/fork, and the `setThoughtLevel`
+  command). The daemon still sends the field on resume and still guards the
+  read-back fail-closed, because the settings read-back reflects what the
+  session actually runs.
+- The daemon fail-closes with an `InvalidSession` error carrying the bare
+  code `EFFORT_MISMATCH` (mirroring the existing `MODEL_MISMATCH` posture)
+  when an explicit effort was admitted, the read-back exists, and the two
+  differ. A missing read-back is diagnostic-only and passes through — the
+  silent-skip notice above makes a missing `current` the expected shape
+  whenever the requested level was not applied.
+- Live read-back verification against a real ZCode session is **NOT_RUN**
+  (user prohibition on production spawns); the chain above is
+  static-inspection evidence pinned by the fake-runtime protocol tests.
+
 ## Oracles
 
 `tests/install/zcode-binding.test.mjs` pins the fail-closed config merge

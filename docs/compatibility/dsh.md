@@ -21,6 +21,24 @@ requested shell/write activity received no shell or write tool and the model
 declined to claim the write; the task was reaped and the workspace remained
 empty. This confirms the safety refusal path for the installed runtime.
 
+## Reasoning effort via ACP set_config_option (implemented; live NOT_RUN)
+
+The spawn `effort` token for dsh is applied through the same
+`session/set_config_option` (X05) contract as model selection: one call
+after `session/new` and before the first `session/prompt`, omitted entirely
+when no effort was admitted. Three branches, mirroring `set_model`: a token
+failing the bounded opaque-token validation refuses with no wire traffic; a
+server that advertised `configOptions` without a `reasoning_effort` entry
+fails closed as `NotOffered` (no set-option frame is sent); a server that
+did not advertise `configOptions` at all gets the set option forwarded and
+the server's verdict decides. Every failure sets `effort_refused`, which
+permanently blocks `prompt` for that session exactly like a refused model
+selection. There is no resume re-application point: the dsh runtime owner
+has no resume entry and re-runs the full bootstrap sequence on every claim.
+Live verification against a real DSH provider is **NOT_RUN** (user
+prohibition on production spawns); the branches are pinned by the ACP
+fixture tests.
+
 The explicit daemon probe currently records local discovery as
 `READY/0.1.5-rc.1`, auth as `UNKNOWN/auth_not_probed`, and the strict no-tool
 hi request as `UNAVAILABLE/remote`; no credentials are modified. A successful

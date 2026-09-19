@@ -21,6 +21,17 @@ deployment identity, config revisions, adapter transport detail, and probe
 evidence are operator diagnostics — read them with the CLI `diagnose` command
 instead of the MCP status tool.
 
+Spawn accepts an optional `effort` token that steers the task's reasoning
+effort. Omit it to keep each agent's current default (codex keeps its existing
+wire default; zcode and dsh send no effort field or call at all). `codex`
+admits only the closed set
+`low | medium | high | xhigh` — `minimal` and `max` are rejected;
+`zcode` and `dsh` accept any bounded token (1..24 bytes of `[a-z0-9_]`) and
+pass it through to the runtime, because the supported set is only known at
+runtime. A malformed or unsupported token is rejected before dispatch, so no
+task is created. Example: spawn with
+`{"subagent": "zcode", "repository": "/absolute/path", "prompt": "...", "effort": "high"}`.
+
 The caller is a `host`. Any unregistered local MCP client can act as `custom` and
 call status or spawn without a host record or Codex home. Built-in `host.codex`
 exists for installation and automatic-upgrade coordination, supports multiple

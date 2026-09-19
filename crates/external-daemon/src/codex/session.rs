@@ -343,7 +343,7 @@ fn note_start_effort_echo(requested_effort: Option<&str>, result: &serde_json::V
     };
     if let Some(echo) = thread_result_field(result, "reasoningEffort") {
         eprintln!(
-            "codex thread/start echoed reasoningEffort {} (the model default, not the admitted effort); turn/start still names the admitted {requested_effort}",
+            "codex thread/start echoed reasoningEffort {} (the model default, not an acknowledgement of the request); turn/start still names the admitted {requested_effort}",
             echo.as_str().unwrap_or("<non-string>")
         );
     }
