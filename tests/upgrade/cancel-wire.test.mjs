@@ -6,7 +6,9 @@ import path from 'node:path';
 import { updateCommand } from '../../cli/commands/update.mjs';
 
 test('update cancel-active survives the real CLI RPC encoder', async (t) => {
-  const base = path.resolve('tests/live-agent/workspace');
+  // macOS SUN_LEN (104 bytes) caps unix socket paths; a repo-rooted
+  // workspace exceeds it on CI runners whose checkout path is long.
+  const base = '/tmp/external-subagent-wire';
   fs.mkdirSync(base, { recursive: true });
   const root = fs.mkdtempSync(path.join(base, 'cancel-'));
   const socketPath = path.join(root, 'd.sock');
@@ -41,7 +43,9 @@ test('update cancel-active survives the real CLI RPC encoder', async (t) => {
 });
 
 test('a failed update aborts the drain through the real CLI RPC encoder', async (t) => {
-  const base = path.resolve('tests/live-agent/workspace');
+  // macOS SUN_LEN (104 bytes) caps unix socket paths; a repo-rooted
+  // workspace exceeds it on CI runners whose checkout path is long.
+  const base = '/tmp/external-subagent-wire';
   fs.mkdirSync(base, { recursive: true });
   const root = fs.mkdtempSync(path.join(base, 'abort-'));
   const socketPath = path.join(root, 'd.sock');
@@ -88,7 +92,9 @@ test('a failed update aborts the drain through the real CLI RPC encoder', async 
 // fixture running through the REAL CLI encoder/parser — compatibility
 // evidence, not a full old-binary proof.
 test('a legacy daemon without drain-abort keeps the original failure and the still-draining evidence over the real wire', async (t) => {
-  const base = path.resolve('tests/live-agent/workspace');
+  // macOS SUN_LEN (104 bytes) caps unix socket paths; a repo-rooted
+  // workspace exceeds it on CI runners whose checkout path is long.
+  const base = '/tmp/external-subagent-wire';
   fs.mkdirSync(base, { recursive: true });
   const root = fs.mkdtempSync(path.join(base, 'legacy-abort-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -134,7 +140,9 @@ test('a legacy daemon without drain-abort keeps the original failure and the sti
 });
 
 test('legacy daemon accepts default drain and rejects explicit cancellation without fallback', async (t) => {
-  const base = path.resolve('tests/live-agent/workspace');
+  // macOS SUN_LEN (104 bytes) caps unix socket paths; a repo-rooted
+  // workspace exceeds it on CI runners whose checkout path is long.
+  const base = '/tmp/external-subagent-wire';
   fs.mkdirSync(base, { recursive: true });
   const root = fs.mkdtempSync(path.join(base, 'legacy-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
