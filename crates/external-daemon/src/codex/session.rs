@@ -117,6 +117,35 @@ impl CodexRuntimeOwner {
             ));
         }
         validate_thread_model(model, result.get("model"))?;
+        // The start result echoes the posture the server actually applied —
+        // verified on codex-cli 0.154.0 for BOTH admitted presets: plan
+        // resolves `{"type":"readOnly","networkAccess":false}`, yolo
+        // `{"type":"dangerFullAccess"}`, each with `approvalPolicy` and
+        // `cwd` at the result root (see docs/compatibility/codex.md).
+        // Request params alone are therefore no more trusted for the first
+        // executable turn than they are on resume: an unconfirmed or
+        // divergent posture fails closed before any `turn/start` is sent.
+        if thread_result_field(&result, "approvalPolicy").and_then(|value| value.as_str())
+            != Some("never")
+        {
+            return Err(RuntimeCommandError::InvalidSession(
+                "start approvalPolicy was not confirmed as never".into(),
+            ));
+        }
+        let confirmed = thread_result_field(&result, "sandbox")
+            .is_some_and(|value| sandbox_confirmed(value, permission_mode));
+        if !confirmed {
+            return Err(RuntimeCommandError::InvalidSession(format!(
+                "start sandbox was not confirmed as the {}",
+                posture.label
+            )));
+        }
+        let cwd = thread_result_field(&result, "cwd").and_then(|value| value.as_str());
+        if !cwd.is_some_and(|cwd| Path::new(cwd) == Path::new(workspace_path)) {
+            return Err(RuntimeCommandError::InvalidSession(
+                "start cwd does not match the task workspace".into(),
+            ));
+        }
         Ok(thread_id.to_owned())
     }
 
@@ -157,12 +186,12 @@ impl CodexRuntimeOwner {
             ));
         }
         validate_thread_model(model, result.get("model"))?;
-        // A resumed thread runs on a fresh process, so the admitted
-        // posture must be re-confirmed from the resume result before any
-        // turn is trusted: never-approve policy plus the sandbox matching
-        // the admitted permission mode. An unconfirmed or divergent
-        // posture fails closed instead of resuming with a different
-        // capability.
+        // A resumed thread runs on a fresh process, so the admitted posture
+        // must be re-confirmed from the resume result before any turn is
+        // trusted — the same confirmation start_thread applies to the first
+        // launch: never-approve policy plus the sandbox matching the
+        // admitted permission mode. An unconfirmed or divergent posture
+        // fails closed instead of resuming with a different capability.
         //
         // The live probes resolve the resumed sandbox as an object
         // (plan: `{"type":"readOnly","networkAccess":false}`; a yolo
@@ -174,22 +203,22 @@ impl CodexRuntimeOwner {
         // permission mode, an unknown representation, or a
         // network-capable sandbox are all unconfirmed and fail closed.
         let posture = codex_posture(permission_mode)?;
-        let sandbox_confirmed = resume_thread_field(&result, "sandbox")
-            .is_some_and(|value| resumed_sandbox_confirmed(value, permission_mode));
-        if !sandbox_confirmed {
+        let confirmed = thread_result_field(&result, "sandbox")
+            .is_some_and(|value| sandbox_confirmed(value, permission_mode));
+        if !confirmed {
             return Err(RuntimeCommandError::InvalidSession(format!(
                 "resume sandbox was not confirmed as the {}",
                 posture.label
             )));
         }
-        if resume_thread_field(&result, "approvalPolicy").and_then(|value| value.as_str())
+        if thread_result_field(&result, "approvalPolicy").and_then(|value| value.as_str())
             != Some("never")
         {
             return Err(RuntimeCommandError::InvalidSession(
                 "resume approvalPolicy was not confirmed as never".into(),
             ));
         }
-        let cwd = resume_thread_field(&result, "cwd").and_then(|value| value.as_str());
+        let cwd = thread_result_field(&result, "cwd").and_then(|value| value.as_str());
         if !cwd.is_some_and(|cwd| Path::new(cwd) == Path::new(workspace_path)) {
             return Err(RuntimeCommandError::InvalidSession(
                 "resume cwd does not match the task workspace".into(),
@@ -311,17 +340,16 @@ pub(super) fn codex_posture(
     }
 }
 
-/// Confirm a resumed sandbox against the admitted permission mode. Plan
-/// threads must resume as the observed read-only object. A yolo thread
-/// must resume as the faithful `{"type":"dangerFullAccess"}` object or as
-/// the exact narrowed workspace-write reconstruction codex-cli 0.154.0
-/// returns for a persisted danger-full-access rollout; both confirmed
-/// shapes are the requested posture or strictly narrower (no network, no
-/// extra writable roots), so any other object fails closed.
-fn resumed_sandbox_confirmed(
-    sandbox: &serde_json::Value,
-    mode: external_core::PermissionMode,
-) -> bool {
+/// Confirm a thread-result sandbox against the admitted permission mode,
+/// for the first launch and every resume alike. Plan threads must resolve
+/// the read-only object. A yolo thread must resolve the faithful
+/// `{"type":"dangerFullAccess"}` object — the shape a real 0.154.0 start
+/// echoes — or the exact narrowed workspace-write reconstruction codex-cli
+/// 0.154.0 returns when resuming a persisted danger-full-access rollout;
+/// both confirmed yolo shapes are the requested posture or strictly
+/// narrower (no network, no extra writable roots), so any other object
+/// fails closed.
+fn sandbox_confirmed(sandbox: &serde_json::Value, mode: external_core::PermissionMode) -> bool {
     match mode {
         external_core::PermissionMode::Plan => {
             sandbox.get("type").and_then(|value| value.as_str()) == Some("readOnly")
@@ -345,9 +373,9 @@ fn resumed_sandbox_confirmed(
     }
 }
 
-/// A resumed-thread posture field, accepted from the thread object or the
-/// result root, mirroring how the resume result carries the model.
-fn resume_thread_field<'a>(
+/// A thread-result posture field, accepted from the thread object or the
+/// result root, mirroring how the start/resume results carry the model.
+fn thread_result_field<'a>(
     result: &'a serde_json::Value,
     key: &str,
 ) -> Option<&'a serde_json::Value> {

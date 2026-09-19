@@ -83,8 +83,9 @@ cache was byte-identical to the staged binding (see
 [docs/acceptance/productization.md](../acceptance/productization.md)).
 Because versioning alone is a release discipline rather than a runtime
 guarantee, `install-plugin` also **reads the materialized cache back before
-reporting success** and compares its `.mcp.json` (facade command +
-`ZCODE_AGENTD_SOCKET`), its `.codex-plugin/plugin.json` identity, and its
+reporting success** and compares its `.mcp.json` (the full managed MCP
+document — facade command, `ZCODE_AGENTD_SOCKET`, and every other server
+field such as args), its `.codex-plugin/plugin.json` identity, and its
 full managed content (file set and bytes) with this run's staged binding;
 foreign or unreadable bytes fail closed with
 `CODEX_CACHE_BINDING_MISMATCH` / `CODEX_CACHE_CONTENT_MISMATCH`, and a
@@ -163,7 +164,12 @@ model-behavior facts:
   `danger-full-access` alongside `approvalPolicy: "never"`. The start
   result resolves the sandbox as an object:
   `{"type":"readOnly","networkAccess":false}` and
-  `{"type":"dangerFullAccess"}` respectively.
+  `{"type":"dangerFullAccess"}` respectively. Re-probed 2026-09-19 on
+  0.154.0 with a throwaway `CODEX_HOME` and no turn driven: both presets
+  echo `approvalPolicy` (`"never"`), the resolved sandbox object, and
+  `cwd` (the requested workspace) at the result root, so the daemon
+  confirms all three from the start result before sending any
+  `turn/start` — the same fail-closed confirmation it applies to resume.
 - `thread/resume` of a read-only thread returns the same read-only object
   (re-verified on 0.154.0; first observed on 0.153.4).
 - `thread/resume` of a danger-full-access thread returns the **narrowed

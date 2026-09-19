@@ -13,9 +13,10 @@
 //! Production spawn is selected only by the explicit configuration gate; the
 //! closed factory remains the fail-closed default. Only `plan` and `yolo`
 //! tasks are admitted, both pinning `approvalPolicy=never` (`plan` maps to
-//! `sandbox=read-only`, `yolo` to `sandbox=danger-full-access`), and the child
-//! always runs with an explicitly resolved `CODEX_HOME` — never a silent
-//! `~/.codex` fallback.
+//! `sandbox=read-only`, `yolo` to `sandbox=danger-full-access`); the
+//! `thread/start` and `thread/resume` results must confirm the applied
+//! posture before any turn runs, and the child always runs with an
+//! explicitly resolved `CODEX_HOME` — never a silent `~/.codex` fallback.
 
 mod events;
 mod factory;

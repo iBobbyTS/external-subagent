@@ -132,28 +132,62 @@ fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::Stored
 const THREAD_ID: &str = "codex-thread-1";
 const MODEL: &str = "gpt-5.6-terra";
 
+/// The posture echo a confirmed `thread/start` result carries at the result
+/// root for one admitted permission mode, as the real app-server returns it
+/// (verified on codex-cli 0.154.0: plan resolves the read-only object, yolo
+/// the faithful dangerFullAccess object; both echo `approvalPolicy` and
+/// `cwd`).
+fn start_echo(directory: &Path, mode: PermissionMode) -> String {
+    let sandbox = match mode {
+        PermissionMode::Plan => r#"{"type":"readOnly","networkAccess":false}"#,
+        PermissionMode::Yolo => r#"{"type":"dangerFullAccess"}"#,
+        _ => panic!("only plan and yolo tasks are admitted"),
+    };
+    format!(
+        r#""sandbox":{sandbox},"approvalPolicy":"never","cwd":"{}""#,
+        directory.to_string_lossy()
+    )
+}
+
 /// A scripted app-server speaking the strict frame sequence of a fresh
 /// task: initialize(id1), initialized notification, thread/start(id2),
 /// turn/start(id3). Every inbound frame is appended to deliveries.jsonl
-/// as it arrives.
-const HAPPY_TURN: &str = r#"
+/// as it arrives. The thread/start result echoes the confirmed posture
+/// for `mode` (see [`start_echo`]).
+fn happy_turn(directory: &Path, mode: PermissionMode) -> String {
+    happy_turn_with_echo(&start_echo(directory, mode))
+}
+
+/// [`happy_turn`] with a caller-supplied thread/start posture echo, so a
+/// test can pin exactly one divergence from the confirmed posture; an
+/// empty echo is a start result that carries no posture fields at all.
+fn happy_turn_with_echo(echo: &str) -> String {
+    let start_fields = if echo.is_empty() {
+        r#""model":"gpt-5.6-terra""#.to_owned()
+    } else {
+        format!(r#""model":"gpt-5.6-terra",{echo}"#)
+    };
+    format!(
+        r#"
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},{start_fields}}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
-printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}' \
-  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
 while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
-"#;
+"#
+    )
+}
 
 #[test]
 fn public_submit_reaches_persistent_thread_and_persists_the_id() {
@@ -161,7 +195,10 @@ fn public_submit_reaches_persistent_thread_and_persists_the_id() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     let submitted = scheduler
         .enqueue_general_with_admission(
@@ -212,7 +249,10 @@ fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Yolo),
+            workspace.path(),
+        ),
     );
     let submitted = scheduler
         .enqueue_general_with_admission(
@@ -236,6 +276,166 @@ fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
     assert_eq!(thread_start["params"]["approvalPolicy"], "never");
     assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
     assert_eq!(thread_start["params"]["model"], MODEL);
+}
+
+#[test]
+fn start_fails_closed_without_a_confirmed_posture() {
+    let _guard = scripted_test_guard();
+    // The thread/start result is the posture the server actually applied,
+    // echoed at the result root (verified live on codex-cli 0.154.0 for
+    // both admitted presets). Request params alone are not trusted for
+    // the first executable turn: each negative pins exactly one divergence
+    // from the confirmed echo and must fail closed BEFORE any turn/start
+    // is sent, while both confirmed yolo shapes — the faithful
+    // dangerFullAccess object a real start echoes and the narrowed
+    // workspace-write reconstruction resume also accepts — start the turn.
+    let cases: Vec<(PermissionMode, Option<String>, &str, Option<&str>, bool, &str)> = vec![
+        // No posture fields at all: unverifiable means refused.
+        (
+            PermissionMode::Plan,
+            None,
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the read-only object",
+        ),
+        // A write-capable sandbox object is never accepted for a plan task.
+        (
+            PermissionMode::Plan,
+            Some(r#"{"type":"workspaceWrite","networkAccess":false}"#.into()),
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the read-only object",
+        ),
+        // A network-capable read-only object diverges from the observed
+        // plan posture.
+        (
+            PermissionMode::Plan,
+            Some(r#"{"type":"readOnly","networkAccess":true}"#.into()),
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the read-only object",
+        ),
+        // An approval policy other than never.
+        (
+            PermissionMode::Plan,
+            Some(r#"{"type":"readOnly","networkAccess":false}"#.into()),
+            "on-request",
+            None,
+            false,
+            "start approvalPolicy was not confirmed as never",
+        ),
+        // A thread rooted somewhere other than the task workspace.
+        (
+            PermissionMode::Plan,
+            Some(r#"{"type":"readOnly","networkAccess":false}"#.into()),
+            "never",
+            Some("/elsewhere"),
+            false,
+            "start cwd does not match the task workspace",
+        ),
+        // The plan posture is another permission mode's shape and is never
+        // accepted for a yolo task.
+        (
+            PermissionMode::Yolo,
+            Some(r#"{"type":"readOnly","networkAccess":false}"#.into()),
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the danger-full-access posture",
+        ),
+        // The request-time string preset is not the resolved posture the
+        // live probe returns; it stays unconfirmed.
+        (
+            PermissionMode::Yolo,
+            Some(r#""danger-full-access""#.into()),
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the danger-full-access posture",
+        ),
+        // The faithful yolo echo starts the turn.
+        (
+            PermissionMode::Yolo,
+            Some(r#"{"type":"dangerFullAccess"}"#.into()),
+            "never",
+            None,
+            true,
+            "",
+        ),
+        // The narrowed workspace-write reconstruction (strictly narrower
+        // than the requested posture) starts the turn as well.
+        (
+            PermissionMode::Yolo,
+            Some(
+                r#"{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}"#
+                    .into(),
+            ),
+            "never",
+            None,
+            true,
+            "",
+        ),
+    ];
+    for (index, (mode, sandbox, approval, cwd_override, accepts, marker)) in
+        cases.into_iter().enumerate()
+    {
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let cwd = cwd_override
+            .map(str::to_string)
+            .unwrap_or_else(|| directory.to_string_lossy().into_owned());
+        let sandbox_fields = sandbox
+            .map(|value| format!(r#""sandbox":{value},"#))
+            .unwrap_or_default();
+        let echo = format!(r#"{sandbox_fields}"approvalPolicy":"{approval}","cwd":"{cwd}""#);
+        let scheduler = codex_scheduler(
+            &directory,
+            harness_factory(&happy_turn_with_echo(&echo), &directory),
+        );
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(&directory, &format!("posture case {index}"), mode),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        if accepts {
+            scheduler.start_ready().unwrap();
+            let result = await_result(&scheduler, &agent_id);
+            assert_eq!(
+                result.result.outcome,
+                TaskOutcome::Completed,
+                "confirmed posture case {index} must start the turn"
+            );
+            assert_eq!(result.result.final_text, "CODEX_OK");
+        } else {
+            assert!(
+                scheduler.start_ready().is_err(),
+                "an unconfirmed start posture must fail closed (case {index})"
+            );
+            let task = await_terminal_task(&scheduler, &agent_id);
+            assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+            assert_eq!(
+                task.zcode_session_id, None,
+                "no thread may be persisted on an unconfirmed start (case {index})"
+            );
+            let record = scheduler.last_error(&agent_id).expect("failure record");
+            assert!(record.contains(marker), "case {index} record: {record}");
+            let deliveries = std::fs::read_to_string(directory.join("deliveries.jsonl"))
+                .expect("the scripted child logs its frames");
+            let turn_starts = deliveries
+                .lines()
+                .filter(|line| line.contains(r#""method":"turn/start""#))
+                .count();
+            assert_eq!(
+                turn_starts, 0,
+                "no turn may start on an unconfirmed posture (case {index})"
+            );
+        }
+    }
 }
 
 #[test]
@@ -302,10 +502,13 @@ fn closed_gate_and_unproven_write_modes_refuse_spawn_without_a_process() {
         let mut mode_task = task.clone();
         mode_task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
         mode_task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
-        let error = harness_factory(HAPPY_TURN, workspace.path())
-            .spawn(&mode_task, Arc::clone(&sink))
-            .err()
-            .expect("unproven write mode must refuse the spawn");
+        let error = harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        )
+        .spawn(&mode_task, Arc::clone(&sink))
+        .err()
+        .expect("unproven write mode must refuse the spawn");
         assert!(
             error
                 .to_string()
@@ -359,7 +562,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
             }
         }
     }
-    let first = harness_factory(HAPPY_TURN, &directory);
+    let first = harness_factory(&happy_turn(&directory, PermissionMode::Plan), &directory);
     let second = {
         let child = directory.join("codex-resume.sh");
         std::fs::write(&child, format!("#!/bin/sh\n{resume_script}")).unwrap();
@@ -459,7 +662,10 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     let submitted = scheduler
         .enqueue_general_with_admission(
@@ -611,21 +817,24 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
 fn server_overloaded_and_mcp_startup_failures_stay_bounded_and_diagnostic() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
-    let script = r#"
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
 IFS= read -r line
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home","userAgent":"fake"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
 IFS= read -r line
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
 IFS= read -r line
 IFS= read -r line
-printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"mcpServer/startupStatus/updated","params":{"threadId":"codex-thread-1","name":"cloudflare-api","status":"failed","error":"requires OAuth reauthentication","failureReason":"reauthenticationRequired"}}' \
-  '{"method":"error","params":{"error":{"message":"Selected model is at capacity. Please try a different model.","codexErrorInfo":"serverOverloaded"},"willRetry":false,"threadId":"codex-thread-1","turnId":"codex-turn-1"}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"failed","error":{"message":"Selected model is at capacity.","codexErrorInfo":"serverOverloaded"}}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"mcpServer/startupStatus/updated","params":{{"threadId":"codex-thread-1","name":"cloudflare-api","status":"failed","error":"requires OAuth reauthentication","failureReason":"reauthenticationRequired"}}}}' \
+  '{{"method":"error","params":{{"error":{{"message":"Selected model is at capacity. Please try a different model.","codexErrorInfo":"serverOverloaded"}},"willRetry":false,"threadId":"codex-thread-1","turnId":"codex-turn-1"}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"failed","error":{{"message":"Selected model is at capacity.","codexErrorInfo":"serverOverloaded"}}}}}}}}'
 sleep 1
-"#;
-    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+"#
+    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "overloaded probe"),
@@ -701,7 +910,7 @@ exit 0
     ] {
         let workspace = codex_workspace();
         let scheduler =
-            codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+            codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
         let submitted = scheduler
             .enqueue_general_with_admission(
                 &manifest_for(workspace.path(), "bounded failure"),
@@ -731,6 +940,7 @@ fn interrupt_preserves_the_thread_identity_and_cancels_bounded() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let directory = workspace.path().to_owned();
+    let echo = start_echo(&directory, PermissionMode::Plan);
     let script = format!(
         r#"
 IFS= read -r line
@@ -738,7 +948,7 @@ printf '%s\n' "$line" >> deliveries.jsonl
 printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
-printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}"}}}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
 IFS= read -r line
@@ -1052,7 +1262,10 @@ fn terminal_send_never_overwrites_a_committed_close_or_cancel() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     for close in [true, false] {
         let submitted = scheduler
@@ -1105,7 +1318,10 @@ fn store_requeue_refuses_a_close_committed_after_the_scheduler_read() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     let submitted = scheduler
         .enqueue_general_with_admission(
@@ -1140,7 +1356,10 @@ fn concurrent_terminal_send_and_close_never_lose_the_close() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     const RACES: usize = 4;
     let mut agents = Vec::new();
@@ -1206,7 +1425,10 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(
         workspace.path(),
-        harness_factory(HAPPY_TURN, workspace.path()),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
     );
     let store = scheduler.store();
     let submitted = scheduler
@@ -1291,29 +1513,32 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
 fn late_turn_traffic_never_pollutes_the_current_turn_result() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
-    let script = r#"
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
 IFS= read -r line
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
 IFS= read -r line
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
 IFS= read -r line
 IFS= read -r line
-printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"GOOD_"}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"inProgress"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","itemId":"stale_1","delta":"STALE_DELTA"}}' \
-  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","item":{"type":"agentMessage","id":"stale_1","text":"STALE_ITEM"}}}' \
-  '{"method":"error","params":{"threadId":"codex-thread-1","turnId":"codex-turn-0","error":{"message":"old capacity failure","codexErrorInfo":"serverOverloaded"}}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"completed","error":null}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","itemId":"msg_1","delta":"MISSING_TURN_ID"}}' \
-  '{"method":"item/completed","params":{"turnId":"codex-turn-1","item":{"type":"agentMessage","id":"no_thread","text":"NO_THREAD_ID"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"OK"}}' \
-  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1"}}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"GOOD_"}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-0","status":"inProgress"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-0","itemId":"stale_1","delta":"STALE_DELTA"}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-0","item":{{"type":"agentMessage","id":"stale_1","text":"STALE_ITEM"}}}}}}' \
+  '{{"method":"error","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-0","error":{{"message":"old capacity failure","codexErrorInfo":"serverOverloaded"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-0","status":"completed","error":null}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","itemId":"msg_1","delta":"MISSING_TURN_ID"}}}}' \
+  '{{"method":"item/completed","params":{{"turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"no_thread","text":"NO_THREAD_ID"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"OK"}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
 while IFS= read -r line; do :; done
-"#;
-    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+"#
+    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "stale traffic probe"),
@@ -1337,18 +1562,21 @@ while IFS= read -r line; do :; done
 fn turn_start_response_and_notification_must_name_the_same_turn() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
-    let script = r#"
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
 IFS= read -r line
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
 IFS= read -r line
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
 IFS= read -r line
 IFS= read -r line
-printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-a","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-b","status":"inProgress"}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-a","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-b","status":"inProgress"}}}}}}'
 sleep 1
-"#;
-    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+"#
+    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "mismatched turn ids"),
@@ -1375,18 +1603,21 @@ fn turn_start_response_without_a_turn_id_fails_closed() {
     let workspace = codex_workspace();
     // The start response omits its turn id; even a well-formed started
     // notification cannot reconcile an unacknowledged turn.
-    let script = r#"
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
 IFS= read -r line
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
 IFS= read -r line
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
 IFS= read -r line
 IFS= read -r line
-printf '%s\n' '{"id":3,"result":{"turn":{"status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
 sleep 1
-"#;
-    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+"#
+    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "anonymous turn"),
@@ -1415,26 +1646,29 @@ fn completed_turn_cannot_be_reopened_by_late_or_duplicate_started() {
     // for the finished turn, a stale started for an older turn, late
     // turn-scoped traffic, and a duplicate completion. None of it may
     // reactivate the retired turn or touch the stored result.
-    let script = r#"
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
 IFS= read -r line
-printf '%s\n' '{"id":1,"result":{"codexHome":"/tmp/codex-home"}}'
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
 IFS= read -r line
-printf '%s\n' '{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}'
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
 IFS= read -r line
 IFS= read -r line
-printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}' \
-  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"inProgress"}}}' \
-  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-0","status":"inProgress"}}}' \
-  '{"method":"item/agentMessage/delta","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"LATE_DELTA"}}' \
-  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{"type":"agentMessage","id":"msg_1","text":"LATE_ITEM"}}}' \
-  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}'
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"CODEX_OK"}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"CODEX_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-0","status":"inProgress"}}}}}}' \
+  '{{"method":"item/agentMessage/delta","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","itemId":"msg_1","delta":"LATE_DELTA"}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"LATE_ITEM"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
 while IFS= read -r line; do :; done
-"#;
-    let scheduler = codex_scheduler(workspace.path(), harness_factory(script, workspace.path()));
+"#
+    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "late replay probe"),
@@ -1548,7 +1782,10 @@ sleep 1
             "codex-resume-f05",
             store,
             Arc::new(TwoPhaseFactory {
-                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                first: Mutex::new(Some(harness_factory(
+                    &happy_turn(&directory, PermissionMode::Plan),
+                    &directory,
+                ))),
                 second: resume_phase_factory(&directory, &resume_script, "codex-resume-fail.sh"),
             }),
             SchedulerConfig {
@@ -1667,7 +1904,10 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
             "codex-resume-yolo-ok",
             store,
             Arc::new(TwoPhaseFactory {
-                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                first: Mutex::new(Some(harness_factory(
+                    &happy_turn(&directory, PermissionMode::Yolo),
+                    &directory,
+                ))),
                 second: yolo_resume_case(
                     &directory,
                     &resume_result,
@@ -1790,7 +2030,10 @@ sleep 1
             "codex-resume-yolo-fail",
             store,
             Arc::new(TwoPhaseFactory {
-                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                first: Mutex::new(Some(harness_factory(
+                    &happy_turn(&directory, PermissionMode::Yolo),
+                    &directory,
+                ))),
                 second: resume_phase_factory(
                     &directory,
                     &resume_script,
