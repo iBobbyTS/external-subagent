@@ -1,12 +1,13 @@
 import { CliError } from '../errors.mjs';
 
-const SPAWN_FIELDS = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
+const SPAWN_FIELDS = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest']);
 const FLAG_FIELDS = new Map([
   ['--subagent', 'subagent'],
   ['--repository', 'repository'],
   ['--prompt', 'prompt'],
   ['--permission-mode', 'permission_mode'],
   ['--model', 'model'],
+  ['--effort', 'effort'],
 ]);
 
 function flagValue(args, option) {
@@ -52,6 +53,12 @@ export function prepareSpawnInput(input) {
   }
   if (input.model !== undefined && (typeof input.model !== 'string' || input.model.length === 0)) {
     throw new CliError('INVALID_ARGUMENT', 'model must be a non-empty string', 2);
+  }
+  if (Object.prototype.hasOwnProperty.call(input, 'effort') && input.effort === null) {
+    throw new CliError('INVALID_ARGUMENT', 'effort must be omitted or a non-null effort token', 2);
+  }
+  if (input.effort !== undefined && (typeof input.effort !== 'string' || input.effort.length === 0)) {
+    throw new CliError('INVALID_ARGUMENT', 'effort must be a non-empty string', 2);
   }
   return { ...input };
 }

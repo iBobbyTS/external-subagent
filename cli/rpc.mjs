@@ -64,12 +64,13 @@ function readJsonInput(args) {
 function requestId() { return `cli-${process.pid}-${crypto.randomUUID()}`; }
 
 function manifest(input) {
-  const allowed = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'write_manifest']);
+  const allowed = new Set(['subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest']);
   for (const key of Object.keys(input)) {
     if (!allowed.has(key)) throw new CliError('INVALID_ARGUMENT', `spawn contains unsupported field: ${key}`, 2);
   }
   if (input.subagent !== undefined && (typeof input.subagent !== 'string' || input.subagent.length === 0)) throw new CliError('INVALID_ARGUMENT', 'subagent must be a non-empty string', 2);
   if (input.model !== undefined && (typeof input.model !== 'string' || input.model.length === 0)) throw new CliError('INVALID_ARGUMENT', 'model must be a non-empty string', 2);
+  if (input.effort !== undefined && (typeof input.effort !== 'string' || input.effort.length === 0)) throw new CliError('INVALID_ARGUMENT', 'effort must be a non-empty string', 2);
   if (typeof input.repository !== 'string' || input.repository.length === 0 || typeof input.prompt !== 'string' || input.prompt.length === 0) throw new CliError('INVALID_ARGUMENT', 'create requires non-empty repository and prompt strings', 2);
   if (input.permission_mode !== undefined && (typeof input.permission_mode !== 'string' || input.permission_mode.length === 0)) throw new CliError('INVALID_ARGUMENT', 'permission_mode must be a non-empty string', 2);
   if (input.write_manifest !== undefined && (!Array.isArray(input.write_manifest) || input.write_manifest.some((value) => typeof value !== 'string' || value.length === 0))) throw new CliError('INVALID_ARGUMENT', 'write_manifest must contain non-empty strings', 2);
@@ -100,6 +101,7 @@ function methodFor(command, input) {
       params: {
         ...(input.subagent !== undefined ? { subagent: input.subagent } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.effort !== undefined ? { effort: input.effort } : {}),
         manifest: manifest(input),
       },
     };

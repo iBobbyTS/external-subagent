@@ -931,6 +931,7 @@ mod observe_gate_tests {
             adapter_version: env!("CARGO_PKG_VERSION").into(),
             model: None,
             model_source: "catalog".into(),
+            effort: None,
         }
     }
 

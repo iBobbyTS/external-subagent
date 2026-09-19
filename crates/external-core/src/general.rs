@@ -81,6 +81,13 @@ pub struct AdmissionIdentity {
     pub adapter_version: String,
     pub model: Option<String>,
     pub model_source: String,
+    /// Reasoning-effort token admitted at submit time. Omitted entirely for
+    /// legacy rows and spawns without a selection: the field carries both
+    /// `#[serde(default)]` (old persisted rows decode with None) and
+    /// `skip_serializing_if` (round-tripping those rows keeps the digest-
+    /// covered bytes free of a synthetic `"effort": null`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

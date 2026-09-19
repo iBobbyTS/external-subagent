@@ -31,6 +31,7 @@ fn dsh_admission(model: Option<&str>) -> AdmissionIdentity {
         adapter_version: env!("CARGO_PKG_VERSION").into(),
         model: model.map(str::to_owned),
         model_source: "catalog".into(),
+        effort: None,
     }
 }
 

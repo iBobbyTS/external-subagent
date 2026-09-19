@@ -13,7 +13,7 @@
     "permission_mode": { "enum": ["build", "edit", "plan", "yolo"], "default": "build" },
     "subagent_status": {
       "type": "object",
-      "required": ["subagent", "configured", "enabled", "spawn_supported", "permission_modes", "model_selection", "local", "auth", "hi"],
+      "required": ["subagent", "configured", "enabled", "spawn_supported", "permission_modes", "model_selection", "effort_selection", "local", "auth", "hi"],
       "properties": {
         "subagent": { "enum": ["zcode", "dsh", "codex"] },
         "configured": { "type": "boolean" },
@@ -30,6 +30,16 @@
           "properties": {
             "supported": { "type": "boolean" },
             "mode": { "enum": ["native_only", "catalog_token"] }
+          },
+          "additionalProperties": false
+        },
+        "effort_selection": {
+          "type": "object",
+          "description": "Reasoning-effort steering capability. codex admits only its closed set; zcode and dsh pass a bounded [a-z0-9_] token through to the runtime.",
+          "required": ["supported", "mode"],
+          "properties": {
+            "supported": { "type": "boolean" },
+            "mode": { "enum": ["closed_set", "passthrough_token"] }
           },
           "additionalProperties": false
         },
@@ -57,6 +67,7 @@
         "permission_mode": { "$ref": "#/properties/permission_mode" },
         "prompt": { "type": "string", "minLength": 1 },
         "model": { "type": "string", "minLength": 1 },
+        "effort": { "type": "string", "minLength": 1, "maxLength": 24, "pattern": "^[a-z0-9_]+$", "description": "Reasoning-effort token: 1..24 bytes of [a-z0-9_]. codex admits only low, medium, high or xhigh; zcode and dsh pass the bounded token through. Omission keeps the runtime default." },
         "write_manifest": { "type": "array", "items": { "type": "string", "minLength": 1 } }
       },
       "allOf": [
@@ -158,7 +169,7 @@
       "additionalProperties": false,
       "properties": {
         "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents"] },
-        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "write_manifest"], "output": ["agent_id", "status"], "idempotent": false },
+        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "effort", "write_manifest"], "output": ["agent_id", "status"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },

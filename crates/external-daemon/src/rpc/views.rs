@@ -65,6 +65,7 @@ pub struct AgentStatusView {
     pub transport_support: AgentTransportSupportView,
     pub permission_modes: Vec<AgentPermissionModeView>,
     pub model_selection: AgentModelSelectionCapabilityView,
+    pub effort_selection: AgentEffortSelectionCapabilityView,
     pub local: AgentScopeStatusView,
     pub auth: AgentScopeStatusView,
     pub hi: AgentScopeStatusView,
@@ -105,6 +106,19 @@ pub enum AgentModelSelectionModeView {
 pub struct AgentModelSelectionCapabilityView {
     pub supported: bool,
     pub mode: AgentModelSelectionModeView,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEffortSelectionModeView {
+    ClosedSet,
+    PassthroughToken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEffortSelectionCapabilityView {
+    pub supported: bool,
+    pub mode: AgentEffortSelectionModeView,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +221,8 @@ pub struct InputIdentityView {
     pub model: Option<String>,
     #[serde(default)]
     pub model_source: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
 }
@@ -219,6 +235,7 @@ pub(crate) fn flat_identity(view: &InputIdentityView) -> Option<external_core::A
         adapter_version: view.adapter_version.clone()?,
         model: view.model.clone(),
         model_source: view.model_source.clone()?,
+        effort: view.effort.clone(),
     })
 }
 
@@ -491,6 +508,9 @@ pub(super) fn task_view(task: TaskRecord) -> TaskView {
             model_source: admission
                 .as_ref()
                 .map(|identity| identity.model_source.clone()),
+            effort: admission
+                .as_ref()
+                .and_then(|identity| identity.effort.clone()),
             workspace_path,
             permission_mode,
         },
@@ -662,6 +682,7 @@ mod result_paging_tests {
                 adapter_version: None,
                 model: None,
                 model_source: None,
+                effort: None,
                 workspace_path: None,
                 permission_mode: None,
             },

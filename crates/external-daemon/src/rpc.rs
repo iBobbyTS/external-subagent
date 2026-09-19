@@ -32,14 +32,15 @@ pub use types::{
     RPC_TRANSPORT_SUPPORTED,
 };
 pub use views::{
-    running_component_identity, AgentCapabilitiesView, AgentModelSelectionCapabilityView,
-    AgentModelSelectionModeView, AgentPermissionModeView, AgentScopeStatusView, AgentStatusView,
-    AgentTransportSupportView, AgentTransportView, ArtifactIdentityView, CapabilityMaturityView,
-    ComponentIdentityView, ComponentStateView, DaemonIdentityView, InputIdentityView,
-    MessageDispositionView, MessageReceiptView, ModelIdentityFactView, ModelIdentityView,
-    ObservationCapabilityView, ObservationDefaultsView, PendingRequestView, QuestionView,
-    ResponseDispositionView, ResponseOutcomeView, SystemStatusView, TaskActivityView,
-    TaskObservationView, TaskResultView, TaskView, TelemetryStatusView,
+    running_component_identity, AgentCapabilitiesView, AgentEffortSelectionCapabilityView,
+    AgentEffortSelectionModeView, AgentModelSelectionCapabilityView, AgentModelSelectionModeView,
+    AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, AgentTransportSupportView,
+    AgentTransportView, ArtifactIdentityView, CapabilityMaturityView, ComponentIdentityView,
+    ComponentStateView, DaemonIdentityView, InputIdentityView, MessageDispositionView,
+    MessageReceiptView, ModelIdentityFactView, ModelIdentityView, ObservationCapabilityView,
+    ObservationDefaultsView, PendingRequestView, QuestionView, ResponseDispositionView,
+    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView,
+    TaskView, TelemetryStatusView,
 };
 
 #[cfg(test)]

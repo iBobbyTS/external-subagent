@@ -309,7 +309,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high or xhigh, zcode and dsh pass a bounded token through to the runtime. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -325,6 +325,7 @@ impl SubagentMcp {
         let task = match self.rpc(RpcMethod::SubmitGeneral(GeneralSubmitInput {
             agent: input.agent.clone(),
             model: input.model.clone(),
+            effort: input.effort.clone(),
             manifest,
         }))? {
             RpcSuccess::GeneralSubmitted { task } => task,
@@ -1032,7 +1033,7 @@ mod contract_default_tests {
         .unwrap();
         // Admission is owned by daemon, including disabled versus unsupported order.
         assert!(general_manifest(&dsh).is_ok());
-        for field in ["subagent", "model"] {
+        for field in ["subagent", "model", "effort"] {
             let mut null_input = base.clone();
             null_input[field] = serde_json::Value::Null;
             assert!(serde_json::from_value::<AgentSpawnInput>(null_input).is_err());
@@ -1066,6 +1067,7 @@ mod contract_default_tests {
             let input = AgentSpawnInput {
                 agent: Some(agent.into()),
                 model: model.map(str::to_owned),
+                effort: None,
                 repository: "invalid-relative-path".into(),
                 prompt: "".into(),
                 permission_mode: PublicPermissionMode::Plan,
@@ -1082,11 +1084,46 @@ mod contract_default_tests {
         assert_eq!(before, store.get_task(&id).unwrap());
     }
 
+    #[tokio::test]
+    async fn spawn_passes_effort_through_the_submit_general_wire() {
+        // Serialize with the admission oracles that install a process-wide
+        // agent-config file: this dispatch-based test must keep reading the
+        // default snapshot.
+        let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let (_directory, service, _id) = crate::rpc::wait_tests::fixture();
+        let store = service.store_for_wait_test();
+        let repository = tempfile::tempdir().unwrap();
+        let facade = SubagentMcp::from_service(service);
+        let input = AgentSpawnInput {
+            agent: Some("zcode".into()),
+            model: None,
+            effort: Some("high".into()),
+            repository: repository.path().to_string_lossy().into_owned(),
+            prompt: "effort passthrough".into(),
+            permission_mode: PublicPermissionMode::Plan,
+            write_manifest: Vec::new(),
+        };
+        let output = facade
+            .agent_spawn(rmcp::handler::server::wrapper::Parameters(input))
+            .await
+            .unwrap();
+        let stored = store
+            .get_task(&output.0.agent_id.to_string())
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.prepared_launch_json.contains("\"effort\":\"high\""),
+            "spawn effort must reach the persisted admission identity: {}",
+            stored.prepared_launch_json
+        );
+    }
+
     #[test]
     fn spawn_rpc_context_omits_the_preallocation_placeholder() {
         let method = RpcMethod::SubmitGeneral(GeneralSubmitInput {
             agent: Some("zcode".into()),
             model: None,
+            effort: None,
             manifest: external_core::GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
@@ -1220,7 +1257,7 @@ mod contract_default_tests {
             "agent_id":10000001, "status":"running", "session_id":null,
             "input_identity":{
                 "subagent":null,"config_revision":null,"adapter_version":null,
-                "model":null,"model_source":null,"workspace_path":"/tmp/repo",
+                "model":null,"model_source":null,"effort":null,"workspace_path":"/tmp/repo",
                 "permission_mode":"build"
             }
         });

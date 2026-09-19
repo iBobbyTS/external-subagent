@@ -25,6 +25,7 @@ fn codex_admission(model: Option<&str>) -> AdmissionIdentity {
         adapter_version: "test".into(),
         model: model.map(str::to_owned),
         model_source: "spawn_catalog".into(),
+        effort: None,
     }
 }
 
@@ -1150,6 +1151,7 @@ fn routing_keeps_zcode_and_dsh_on_their_factories() {
         adapter_version: "test".into(),
         model: None,
         model_source: "native".into(),
+        effort: None,
     };
     let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
         .unwrap()

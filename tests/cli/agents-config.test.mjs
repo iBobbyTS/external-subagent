@@ -355,23 +355,31 @@ test('agents status projects daemon evidence and rejects absent identities', asy
 test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {
   assert.throws(() => prepareSpawnInput({ subagent: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => prepareSpawnInput({ subagent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => prepareSpawnInput({ subagent: 'zcode', effort: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => prepareSpawnInput({ subagent: 'zcode', effort: '', repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
   assert.equal(Object.hasOwn(omitted, 'subagent'), false);
   assert.equal(Object.hasOwn(omitted, 'model'), false);
+  assert.equal(Object.hasOwn(omitted, 'effort'), false);
+  assert.deepEqual(prepareSpawnInput({ subagent: 'zcode', effort: 'high', repository: '/repo', prompt: 'hi' }), {
+    subagent: 'zcode', effort: 'high', repository: '/repo', prompt: 'hi',
+  });
 });
 
 test('spawn flags build the shared DTO and reject malformed values', () => {
   assert.deepEqual(parseSpawnArgs([
     '--subagent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build',
-    '--model', 'catalog-token', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
+    '--model', 'catalog-token', '--effort', 'high', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
   ]), {
     subagent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
-    model: 'catalog-token', write_manifest: ['src/**', 'tests/**'],
+    model: 'catalog-token', effort: 'high', write_manifest: ['src/**', 'tests/**'],
   });
   assert.throws(() => parseSpawnArgs(['--repository', '/repo']), /--prompt is required/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt']), /requires a non-null value/u);
   assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'null']).prompt, 'null');
   assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--model', 'null']).model, 'null');
+  assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--effort', 'null']).effort, 'null');
+  assert.equal(Object.hasOwn(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi']), 'effort'), false);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--unknown', 'x']), /unsupported spawn option/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--repository', '/other', '--prompt', 'hi']), /only once/u);
 });

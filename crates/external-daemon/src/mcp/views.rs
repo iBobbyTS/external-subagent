@@ -7,10 +7,10 @@ use super::types::{
     public_task_id, PublicDecision, PublicPendingRequest, PublicResponseDisposition,
 };
 use crate::rpc::{
-    AgentCapabilitiesView, AgentModelSelectionModeView, AgentPermissionModeView,
-    AgentScopeStatusView, AgentStatusView, CapabilityMaturityView, ComponentStateView,
-    SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView, TaskView,
-    TelemetryStatusView,
+    AgentCapabilitiesView, AgentEffortSelectionModeView, AgentModelSelectionModeView,
+    AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
+    ComponentStateView, SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView,
+    TaskView, TelemetryStatusView,
 };
 use external_store::TaskOutcome;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -244,6 +244,7 @@ pub struct PublicAgentStatus {
     pub spawn_supported: bool,
     pub permission_modes: Vec<PublicAgentPermissionMode>,
     pub model_selection: PublicAgentModelSelectionCapability,
+    pub effort_selection: PublicEffortSelectionCapability,
     pub local: PublicAgentScopeStatus,
     pub auth: PublicAgentScopeStatus,
     pub hi: PublicAgentScopeStatus,
@@ -272,6 +273,20 @@ pub struct PublicAgentModelSelectionCapability {
     pub mode: PublicAgentModelSelectionMode,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicEffortSelectionMode {
+    ClosedSet,
+    PassthroughToken,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicEffortSelectionCapability {
+    pub supported: bool,
+    pub mode: PublicEffortSelectionMode,
+}
+
 impl From<AgentPermissionModeView> for PublicAgentPermissionMode {
     fn from(value: AgentPermissionModeView) -> Self {
         match value {
@@ -288,6 +303,15 @@ impl From<AgentModelSelectionModeView> for PublicAgentModelSelectionMode {
         match value {
             AgentModelSelectionModeView::NativeOnly => Self::NativeOnly,
             AgentModelSelectionModeView::CatalogToken => Self::CatalogToken,
+        }
+    }
+}
+
+impl From<AgentEffortSelectionModeView> for PublicEffortSelectionMode {
+    fn from(value: AgentEffortSelectionModeView) -> Self {
+        match value {
+            AgentEffortSelectionModeView::ClosedSet => Self::ClosedSet,
+            AgentEffortSelectionModeView::PassthroughToken => Self::PassthroughToken,
         }
     }
 }
@@ -319,6 +343,10 @@ impl From<AgentStatusView> for PublicAgentStatus {
             model_selection: PublicAgentModelSelectionCapability {
                 supported: value.model_selection.supported,
                 mode: value.model_selection.mode.into(),
+            },
+            effort_selection: PublicEffortSelectionCapability {
+                supported: value.effort_selection.supported,
+                mode: value.effort_selection.mode.into(),
             },
             local: value.local.into(),
             auth: value.auth.into(),
@@ -367,6 +395,7 @@ pub struct PublicInputIdentity {
     pub adapter_version: Option<String>,
     pub model: Option<String>,
     pub model_source: Option<String>,
+    pub effort: Option<String>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
 }
@@ -385,6 +414,7 @@ impl TryFrom<TaskView> for PublicTask {
                 adapter_version: value.input_identity.adapter_version,
                 model: value.input_identity.model,
                 model_source: value.input_identity.model_source,
+                effort: value.input_identity.effort,
                 workspace_path: value.input_identity.workspace_path,
                 permission_mode: value.input_identity.permission_mode,
             },
@@ -545,4 +575,90 @@ pub struct AgentStateOutput {
 pub struct AgentResultOutput {
     pub task: PublicTask,
     pub result: Option<PublicResult>,
+}
+
+#[cfg(test)]
+mod effort_projection_tests {
+    use super::*;
+    use crate::agent_status::ProbeScope;
+    use crate::rpc::AgentEffortSelectionCapabilityView;
+
+    fn scope_status() -> crate::rpc::AgentScopeStatusView {
+        crate::rpc::AgentScopeStatusView {
+            state: crate::rpc::ComponentStateView::Unknown,
+            scope: ProbeScope::default(),
+            version: None,
+            checked_at_ms: None,
+            reason: None,
+        }
+    }
+
+    fn status(agent: &str, supported: bool) -> AgentStatusView {
+        AgentStatusView {
+            agent: agent.into(),
+            config_revision: 1,
+            configured: true,
+            enabled: supported,
+            spawn_supported: supported,
+            transport_support: crate::rpc::AgentTransportSupportView {
+                transport: crate::rpc::AgentTransportView::ZcodeAppServer,
+                probe: true,
+                spawn: supported,
+            },
+            permission_modes: Vec::new(),
+            model_selection: crate::rpc::AgentModelSelectionCapabilityView {
+                supported: false,
+                mode: crate::rpc::AgentModelSelectionModeView::NativeOnly,
+            },
+            effort_selection: AgentEffortSelectionCapabilityView {
+                supported,
+                mode: crate::rpc::AgentEffortSelectionModeView::PassthroughToken,
+            },
+            local: scope_status(),
+            auth: scope_status(),
+            hi: scope_status(),
+        }
+    }
+
+    #[test]
+    fn public_status_mirrors_effort_selection_and_input_identity_effort() {
+        let mut view = status("zcode", true);
+        view.effort_selection.mode = crate::rpc::AgentEffortSelectionModeView::ClosedSet;
+        let projected = PublicAgentStatus::from(view.clone());
+        assert_eq!(projected.effort_selection.supported, true);
+        assert!(matches!(
+            projected.effort_selection.mode,
+            PublicEffortSelectionMode::ClosedSet
+        ));
+        // Passthrough mode and the unsupported state both survive the mirror.
+        view.effort_selection.mode = crate::rpc::AgentEffortSelectionModeView::PassthroughToken;
+        view.effort_selection.supported = false;
+        let projected = PublicAgentStatus::from(view);
+        assert_eq!(projected.effort_selection.supported, false);
+        assert!(matches!(
+            projected.effort_selection.mode,
+            PublicEffortSelectionMode::PassthroughToken
+        ));
+
+        // The public task projection carries the admitted effort slot.
+        let task = TaskView {
+            agent_id: "10000001".into(),
+            status: "queued".into(),
+            session_id: None,
+            input_identity: crate::rpc::InputIdentityView {
+                subagent: Some("zcode".into()),
+                config_revision: Some(1),
+                adapter_version: Some("test".into()),
+                model: None,
+                model_source: Some("native".into()),
+                effort: Some("high".into()),
+                workspace_path: Some("/tmp/repo".into()),
+                permission_mode: Some("plan".into()),
+            },
+        };
+        let public = PublicTask::try_from(task).unwrap();
+        assert_eq!(public.input_identity.effort.as_deref(), Some("high"));
+        let encoded = serde_json::to_value(&public).unwrap();
+        assert_eq!(encoded["input_identity"]["effort"], "high");
+    }
 }

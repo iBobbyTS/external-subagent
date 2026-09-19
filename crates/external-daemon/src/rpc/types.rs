@@ -167,6 +167,12 @@ pub struct GeneralSubmitInput {
         skip_serializing_if = "Option::is_none"
     )]
     pub model: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub effort: Option<String>,
     pub manifest: GeneralTaskManifest,
 }
 

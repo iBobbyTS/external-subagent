@@ -93,6 +93,9 @@ pub struct AgentSpawnInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
     pub model: Option<String>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    #[schemars(with = "String")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

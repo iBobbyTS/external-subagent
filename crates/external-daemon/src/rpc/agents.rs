@@ -7,6 +7,7 @@ use super::errors::{RpcError, RpcErrorCode};
 use super::handlers::validate_text;
 use super::types::GeneralSubmitInput;
 use super::views::{
+    AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
     AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentPermissionModeView,
     AgentScopeStatusView, AgentStatusView, AgentTransportSupportView, AgentTransportView,
     ComponentStateView,
@@ -52,6 +53,7 @@ pub(super) fn configured_agent_statuses(
                 transport_support: transport_support(agent, entry),
                 permission_modes: permission_modes(agent, entry),
                 model_selection: model_selection(agent, entry),
+                effort_selection: effort_selection(agent, entry),
                 local: current_scope(&observed, config.revision, |evidence| &evidence.local),
                 auth: current_scope(&observed, config.revision, |evidence| &evidence.auth),
                 hi: current_scope(&observed, config.revision, |evidence| &evidence.hi),
@@ -83,6 +85,18 @@ pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
             ),
             permission_modes: Vec::new(),
             model_selection: model_selection(
+                agent,
+                &AgentConfigEntry {
+                    enabled: false,
+                    spawn_supported: false,
+                    default_model: None,
+                    runtime_path: None,
+                    home: None,
+                    profile: None,
+                    version: None,
+                },
+            ),
+            effort_selection: effort_selection(
                 agent,
                 &AgentConfigEntry {
                     enabled: false,
@@ -208,6 +222,17 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
             supported: matches!(agent, "dsh" | "codex") && effective_spawn_supported(agent, entry),
             mode: AgentModelSelectionModeView::CatalogToken,
         }
+    }
+}
+
+fn effort_selection(agent: &str, entry: &AgentConfigEntry) -> AgentEffortSelectionCapabilityView {
+    AgentEffortSelectionCapabilityView {
+        supported: effective_spawn_supported(agent, entry),
+        mode: if agent == "codex" {
+            AgentEffortSelectionModeView::ClosedSet
+        } else {
+            AgentEffortSelectionModeView::PassthroughToken
+        },
     }
 }
 
@@ -350,6 +375,7 @@ pub(super) fn resolve_admission(
             format!("agent {agent} is unsupported; prompt_count=0"),
         ));
     }
+    let effort = resolve_effort_selection(agent, input)?;
     let (model, model_source) = if agent == "dsh" {
         // Explicit spawn token, then the configured default, then the
         // provider-native model. The configured default is a selection too:
@@ -452,7 +478,40 @@ pub(super) fn resolve_admission(
         adapter_version: env!("CARGO_PKG_VERSION").into(),
         model,
         model_source: model_source.into(),
+        effort,
     })
+}
+
+/// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
+/// NUL. Codex additionally admits only its closed effort set; zcode/dsh are
+/// bounded passthrough tokens because their supported sets are only known
+/// at runtime and admission must not fabricate a catalog.
+fn resolve_effort_selection(
+    agent: &str,
+    input: &GeneralSubmitInput,
+) -> Result<Option<String>, RpcError> {
+    let Some(token) = input.effort.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if token.is_empty()
+        || token.len() > 24
+        || token.contains('\0')
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL; prompt_count=0",
+        ));
+    }
+    if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh") {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "codex effort must be one of low, medium, high, xhigh; prompt_count=0",
+        ));
+    }
+    Ok(Some(token.to_owned()))
 }
 
 #[cfg(test)]
@@ -463,6 +522,7 @@ mod admission_tests {
         GeneralSubmitInput {
             agent: Some("zcode".into()),
             model: None,
+            effort: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
@@ -582,6 +642,7 @@ mod admission_tests {
         let input = GeneralSubmitInput {
             agent: Some("dsh".into()),
             model: None,
+            effort: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "gate-test".into(),
@@ -625,6 +686,7 @@ mod admission_tests {
         GeneralSubmitInput {
             agent: Some("codex".into()),
             model: Some("gpt-5.6-terra".into()),
+            effort: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "codex-gate-test".into(),
@@ -746,6 +808,173 @@ mod admission_tests {
                 supported: true,
                 mode: AgentModelSelectionModeView::CatalogToken,
             }
+        );
+    }
+
+    #[test]
+    fn effort_admission_bounds_tokens_and_pins_the_codex_closed_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = codex_gate_config(directory.path());
+        let mut input = codex_input(directory.path(), external_core::PermissionMode::Plan);
+        for admitted in ["low", "medium", "high", "xhigh"] {
+            input.effort = Some(admitted.into());
+            assert_eq!(
+                resolve_admission(&input, &config)
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some(admitted),
+                "codex effort {admitted} must admit"
+            );
+        }
+        input.effort = None;
+        assert_eq!(resolve_admission(&input, &config).unwrap().effort, None);
+        // Tokens trim exactly like the model selection: surrounding blanks
+        // never reject an otherwise bounded closed-set value.
+        input.effort = Some(" high ".into());
+        assert_eq!(
+            resolve_admission(&input, &config)
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+        for invalid in [
+            "ultra",
+            "HIGH",
+            "hi gh",
+            "",
+            "t".repeat(25).as_str(),
+            "high\0",
+        ] {
+            input.effort = Some(invalid.into());
+            let error = resolve_admission(&input, &config).unwrap_err();
+            assert_eq!(
+                error.code,
+                RpcErrorCode::Validation,
+                "codex effort {invalid:?}"
+            );
+            assert!(error.message.contains("prompt_count=0"));
+        }
+    }
+
+    #[test]
+    fn zcode_and_dsh_effort_admits_bounded_passthrough_tokens() {
+        // zcode keeps its default admission: an unknown but well-formed value
+        // passes through instead of being checked against a fabricated catalog.
+        let mut input = input(Path::new("/repository"));
+        for passthrough in ["high", "turbo_deep", "v9_max", "t".repeat(24).as_str()] {
+            input.effort = Some(passthrough.into());
+            assert_eq!(
+                resolve_admission(&input, &AgentConfigSnapshot::default())
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some(passthrough),
+                "zcode effort {passthrough} must pass through"
+            );
+        }
+        for invalid in [
+            "High",
+            "hi gh",
+            "",
+            "t".repeat(25).as_str(),
+            "max-effort",
+            "effort\0",
+        ] {
+            input.effort = Some(invalid.into());
+            assert_eq!(
+                resolve_admission(&input, &AgentConfigSnapshot::default())
+                    .unwrap_err()
+                    .code,
+                RpcErrorCode::Validation,
+                "zcode effort {invalid:?}"
+            );
+        }
+        input.effort = None;
+        assert_eq!(
+            resolve_admission(&input, &AgentConfigSnapshot::default())
+                .unwrap()
+                .effort,
+            None
+        );
+    }
+
+    #[test]
+    fn effort_selection_capability_follows_the_spawn_gate_per_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = codex_gate_config(directory.path());
+        let evidence = AgentEvidenceStore::new(None);
+        let statuses = configured_agent_statuses(&config, &evidence);
+        let codex = statuses.iter().find(|s| s.agent == "codex").unwrap();
+        assert_eq!(
+            codex.effort_selection,
+            AgentEffortSelectionCapabilityView {
+                supported: true,
+                mode: AgentEffortSelectionModeView::ClosedSet,
+            }
+        );
+        let zcode = statuses.iter().find(|s| s.agent == "zcode").unwrap();
+        assert_eq!(
+            zcode.effort_selection,
+            AgentEffortSelectionCapabilityView {
+                supported: true,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
+            }
+        );
+        // dsh stays passthrough too, but unsupported until the spawn gate opens.
+        let dsh = statuses.iter().find(|s| s.agent == "dsh").unwrap();
+        assert_eq!(
+            dsh.effort_selection,
+            AgentEffortSelectionCapabilityView {
+                supported: false,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
+            }
+        );
+        // The unavailable projection keeps the same modes with support off.
+        for status in unavailable_agent_statuses() {
+            assert!(!status.effort_selection.supported, "{}", status.agent);
+        }
+    }
+
+    #[test]
+    fn admitted_effort_is_persisted_and_projected_into_input_identity() {
+        let (directory, service, previous_id) = wait_tests::fixture();
+        service
+            .store
+            .store_task_result(
+                &previous_id,
+                &external_store::TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "done".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let mut input = input(directory.path());
+        input.effort = Some("high".into());
+        let mut config = AgentConfigSnapshot::default();
+        config.revision = 41;
+        let identity = resolve_admission(&input, &config).unwrap();
+        assert_eq!(identity.effort.as_deref(), Some("high"));
+        let task = service
+            .scheduler
+            .enqueue_general_with_admission(&input.manifest, Some(identity.clone()))
+            .unwrap();
+        let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
+        let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
+        let prepared: external_core::PreparedGeneralTask =
+            serde_json::from_str(&stored.prepared_launch_json).unwrap();
+        prepared.validate_digest().unwrap();
+        assert_eq!(prepared.admission.as_ref(), Some(&identity));
+        assert!(
+            stored.prepared_launch_json.contains("\"effort\":\"high\""),
+            "effort must be persisted inside admission: {}",
+            stored.prepared_launch_json
+        );
+        assert_eq!(
+            flat_identity(&task_view(stored).input_identity),
+            Some(identity)
         );
     }
 
@@ -921,6 +1150,7 @@ mod admission_policy_tests {
         GeneralSubmitInput {
             agent: agent.map(str::to_owned),
             model: model.map(str::to_owned),
+            effort: None,
             manifest: external_core::GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "admission-oracle".into(),

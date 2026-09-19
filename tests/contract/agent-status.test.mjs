@@ -15,6 +15,7 @@ test('agent status fixture keeps layer evidence scoped and failure reasons expli
   });
   assert.deepEqual(status.permission_modes, ['build', 'edit', 'plan', 'yolo']);
   assert.deepEqual(status.model_selection, { supported: false, mode: 'native_only' });
+  assert.deepEqual(status.effort_selection, { supported: true, mode: 'passthrough_token' });
   assert.equal(status.local.state, 'READY');
   assert.equal(status.auth.reason, 'auth_401');
   assert.equal(status.hi.reason, 'auth_401');

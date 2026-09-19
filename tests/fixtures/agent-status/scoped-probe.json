@@ -14,6 +14,10 @@
     "supported": false,
     "mode": "native_only"
   },
+  "effort_selection": {
+    "supported": true,
+    "mode": "passthrough_token"
+  },
   "local": {
     "state": "READY",
     "scope": {

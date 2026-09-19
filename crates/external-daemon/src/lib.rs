@@ -1249,3 +1249,81 @@ fn route_policy(
 mod daemon;
 #[cfg(unix)]
 pub use daemon::Daemon;
+
+#[cfg(test)]
+mod task_route_tests {
+    use super::*;
+    use external_store::{TaskPhase, TaskRecord, TurnState};
+
+    fn record(prepared: &PreparedGeneralTask) -> TaskRecord {
+        TaskRecord {
+            agent_id: prepared.agent_id.clone(),
+            repository: prepared.repository.to_string_lossy().into_owned(),
+            phase: TaskPhase::Queued,
+            outcome: None,
+            workspace_path: prepared.workspace.path.to_string_lossy().into_owned(),
+            runtime_hash: None,
+            prepared_launch_json: serde_json::to_string(prepared).unwrap(),
+            prepared_launch_sha256: prepared.prepared_sha256.clone(),
+            initial_prompt: String::new(),
+            owner_id: None,
+            owner_epoch: 0,
+            close_requested: false,
+            stop_requested: false,
+            last_event_seq: 0,
+            failure_code: None,
+            failure_message: None,
+            runtime_agent_id: None,
+            zcode_session_id: None,
+            turn_state: TurnState::Idle,
+            process_identity: None,
+            closed_at: None,
+            reaped_at: None,
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_prepared_launch_without_effort_still_routes_with_none() {
+        let repository = tempfile::tempdir().unwrap();
+        let manifest = external_core::GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: "s01-legacy-row".into(),
+            repository: repository.path().to_path_buf(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "legacy row".into(),
+            write_manifest: Vec::new(),
+        };
+        // Build the persisted row exactly as a pre-effort daemon wrote it:
+        // admission has no effort key at all, and the digest covers those
+        // bytes. A later re-serialization must not insert a synthetic
+        // `"effort": null` or the digest breaks on resume.
+        let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+            .unwrap()
+            .prepare_direct_submission(&manifest)
+            .unwrap()
+            .with_admission(external_core::AdmissionIdentity {
+                agent: "zcode".into(),
+                config_revision: 1,
+                adapter_version: "legacy".into(),
+                model: None,
+                model_source: "native".into(),
+                effort: None,
+            })
+            .unwrap();
+        let legacy_json = serde_json::to_string(&prepared).unwrap();
+        let encoded: serde_json::Value = serde_json::from_str(&legacy_json).unwrap();
+        assert!(
+            encoded["admission"].get("effort").is_none(),
+            "legacy row must not carry an effort key: {legacy_json}"
+        );
+        let record = record(&prepared);
+        assert_eq!(record.prepared_launch_json, legacy_json);
+        let TaskRoute::General(routed) = task_route(&record).expect("legacy row must still route")
+        else {
+            panic!("expected the general route");
+        };
+        routed.validate_digest().expect("legacy digest stays valid");
+        assert_eq!(routed.admission.as_ref().unwrap().effort, None);
+    }
+}

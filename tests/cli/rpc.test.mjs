@@ -155,7 +155,7 @@ test('CLI passes list agent filter and projects persisted input identity', async
   const socketPath = path.join(os.tmpdir(), `external-cli-list-identity-${process.pid}-${Date.now()}.sock`);
   const identity = {
     subagent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null, model_source: 'native',
-    workspace_path: '/workspace', permission_mode: 'build',
+    effort: null, workspace_path: '/workspace', permission_mode: 'build',
   };
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
@@ -170,6 +170,27 @@ test('CLI passes list agent filter and projects persisted input identity', async
     const result = await callDaemon(socketPath, 'list', { subagent: 'future-provider', repository: '/workspace' });
     assert.deepEqual(result.tasks[0].input_identity, identity);
   } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('CLI spawn wire forwards effort beside the manifest without leaking it inside', async () => {
+  const socketPath = path.join(os.tmpdir(), `external-cli-spawn-effort-${process.pid}-${Date.now()}.sock`);
+  const seen = [];
+  const server = net.createServer((socket) => socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    seen.push(request);
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'general_submitted', task: { agent_id: '10000001', status: 'queued', session_id: null, input_identity: null } } }) + '\n');
+  }));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi', effort: 'high' });
+    await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi' });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+  assert.equal(seen[0].method, 'submit_general');
+  assert.equal(seen[0].params.effort, 'high');
+  assert.equal(Object.hasOwn(seen[0].params.manifest, 'effort'), false);
+  assert.equal(seen[1].params.effort, undefined);
+  assert.equal(Object.hasOwn(seen[1].params, 'effort'), false);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), `missing-spawn-effort-${process.pid}.sock`), 'spawn', { repository: '/r', prompt: 'hi', effort: null }), (error) => error instanceof CliError && error.code === 'INVALID_ARGUMENT');
 });
 
 test('CLI applies documented list and result defaults before connecting', async () => {
