@@ -30,6 +30,12 @@ jobs:
   publish:
     runs-on: macos-latest
     timeout-minutes: 30
+    # The fresh-install tests run npm pack under an ISOLATED HOME, and the
+    # rustup cargo shim resolves its default toolchain through $HOME/.rustup
+    # — with HOME swapped, cargo fails with "no default is configured" unless
+    # the toolchain is pinned by environment instead.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v4
 
