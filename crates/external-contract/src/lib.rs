@@ -115,6 +115,7 @@ impl std::error::Error for ProjectionError {}
 pub struct SessionCreateProjection {
     pub session_id: String,
     pub requested_model: Option<String>,
+    pub configured_thought_level: Option<String>,
 }
 
 impl SessionCreateProjection {
@@ -162,8 +163,22 @@ impl SessionCreateProjection {
         Ok(Self {
             session_id,
             requested_model,
+            configured_thought_level: settings_thought_level(root)?,
         })
     }
+}
+
+/// Effective thought level projected by a session/create or session/resume
+/// result: `result.settings.thoughtLevel.current`. The official settings state
+/// schema only carries `current` when the effective level is one of the
+/// model's supported levels, so absence is a distinct observed state.
+pub fn configured_thought_level_from_result(
+    result: &Value,
+) -> Result<Option<String>, ProjectionError> {
+    result
+        .as_object()
+        .ok_or(ProjectionError::Invalid("result"))
+        .and_then(|root| settings_thought_level(root))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +290,28 @@ fn settings_current_model(
     Ok(Some(value.to_owned()))
 }
 
+fn settings_thought_level(
+    root: &serde_json::Map<String, Value>,
+) -> Result<Option<String>, ProjectionError> {
+    let Some(settings) = optional_object(root, "settings", "result.settings")? else {
+        return Ok(None);
+    };
+    // The effective thought level lives under the settings state schema's
+    // `thoughtLevel` section only; a sibling `thought` key is an unobserved
+    // alternate shape and fails closed like every other projection fallback.
+    reject_alternate(settings, "thought", "result.settings.thought")?;
+    let Some(thought_level) =
+        optional_object(settings, "thoughtLevel", "result.settings.thoughtLevel")?
+    else {
+        return Ok(None);
+    };
+    let Some(value) = thought_level.get("current") else {
+        return Ok(None);
+    };
+    let value = required_bounded_string(Some(value), "result.settings.thoughtLevel.current", 128)?;
+    Ok(Some(value.to_owned()))
+}
+
 fn session_consistency_model(
     session: &serde_json::Map<String, Value>,
 ) -> Result<Option<String>, ProjectionError> {
@@ -333,6 +370,8 @@ pub struct CreateSessionParams<'a> {
     pub workspace: WorkspaceRef<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<&'a str>,
     #[serde(skip_serializing_if = "is_empty_mcp_servers")]
     pub mcp_servers: &'a [StdioMcpServer],
 }
@@ -343,6 +382,8 @@ pub struct ResumeSessionParams<'a> {
     pub session_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceRef<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<&'a str>,
     #[serde(skip_serializing_if = "is_empty_mcp_servers")]
     pub mcp_servers: &'a [StdioMcpServer],
 }
@@ -660,6 +701,7 @@ mod tests {
             SessionCreateProjection {
                 session_id: "s1".into(),
                 requested_model: None,
+                configured_thought_level: None,
             }
         );
         assert_eq!(turn_id_from_result(&nested), Some("t1"));
@@ -854,6 +896,7 @@ mod tests {
                 workspace_path: "/work",
             },
             mode: None,
+            thought_level: None,
             mcp_servers: &servers,
         })
         .unwrap();
@@ -867,6 +910,127 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn create_and_resume_params_carry_thought_level_only_when_admitted() {
+        let workspace = WorkspaceRef {
+            workspace_key: "/work",
+            workspace_path: "/work",
+        };
+        assert_eq!(
+            serde_json::to_value(CreateSessionParams {
+                workspace,
+                mode: Some("build"),
+                thought_level: Some("high"),
+                mcp_servers: &[],
+            })
+            .unwrap(),
+            serde_json::json!({
+                "workspace":{"workspaceKey":"/work","workspacePath":"/work"},
+                "mode":"build",
+                "thoughtLevel":"high"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ResumeSessionParams {
+                session_id: "s1",
+                workspace: None,
+                thought_level: Some("high"),
+                mcp_servers: &[],
+            })
+            .unwrap(),
+            serde_json::json!({"sessionId":"s1","thoughtLevel":"high"})
+        );
+        // A task without an admitted effort must stay byte-identical to the
+        // pre-effort wire: no thoughtLevel key on either command.
+        assert_eq!(
+            serde_json::to_value(ResumeSessionParams {
+                session_id: "s1",
+                workspace: None,
+                thought_level: None,
+                mcp_servers: &[],
+            })
+            .unwrap(),
+            serde_json::json!({"sessionId":"s1"})
+        );
+    }
+
+    #[test]
+    fn thought_level_projection_reads_settings_current_with_bounded_tokens() {
+        let echo = serde_json::json!({
+            "session": {"sessionId": "session"},
+            "settings": {
+                "thoughtLevel": {
+                    "enabled": true,
+                    "current": "high",
+                    "available": [{"value": "high", "label": "high"}]
+                }
+            }
+        });
+        assert_eq!(
+            SessionCreateProjection::from_result(&echo)
+                .unwrap()
+                .configured_thought_level
+                .as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            configured_thought_level_from_result(&echo)
+                .unwrap()
+                .as_deref(),
+            Some("high")
+        );
+
+        // Absence is a distinct observed state: no settings at all, no
+        // thoughtLevel section, or a section without a current level.
+        for missing in [
+            serde_json::json!({"session": {"sessionId": "session"}}),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"model": {"current": {"modelId": "glm-5.3"}}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"thoughtLevel": {"enabled": false}}
+            }),
+        ] {
+            assert_eq!(
+                SessionCreateProjection::from_result(&missing)
+                    .unwrap()
+                    .configured_thought_level,
+                None,
+                "absence must project to None: {missing}"
+            );
+            assert_eq!(
+                configured_thought_level_from_result(&missing).unwrap(),
+                None
+            );
+        }
+
+        for invalid in [
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"thoughtLevel": {"current": "high"}, "thought": "high"}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"thoughtLevel": {"current": 7}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"thoughtLevel": {"current": ""}}
+            }),
+            serde_json::json!({
+                "session": {"sessionId": "session"},
+                "settings": {"thoughtLevel": null}
+            }),
+        ] {
+            assert!(
+                configured_thought_level_from_result(&invalid).is_err(),
+                "unbounded or alternate thought echo must fail closed: {invalid}"
+            );
+        }
     }
 
     #[test]

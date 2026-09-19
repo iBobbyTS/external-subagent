@@ -74,7 +74,14 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
                     })
         }
         "session/create" => {
-            if !exact_keys(params, &["workspace"], &["mcpServers"]) {
+            // The official session/create schema is strict with optional
+            // `mode` and `thoughtLevel` string inputs alongside the observed
+            // workspace/mcpServers shape; anything else is a protocol drift.
+            if !exact_keys(
+                params,
+                &["workspace"],
+                &["mode", "thoughtLevel", "mcpServers"],
+            ) {
                 return false;
             }
             let Some(workspace) = params.get("workspace").and_then(Value::as_object) else {
@@ -83,6 +90,10 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
             let workspace_valid = exact_keys(workspace, &["workspaceKey", "workspacePath"], &[])
                 && workspace.get("workspaceKey").is_some_and(Value::is_string)
                 && workspace.get("workspacePath").is_some_and(Value::is_string);
+            let non_empty_string =
+                |value: &Value| value.as_str().is_some_and(|token| !token.trim().is_empty());
+            let mode_valid = params.get("mode").is_none_or(non_empty_string);
+            let thought_level_valid = params.get("thoughtLevel").is_none_or(non_empty_string);
             let mcp_valid = params.get("mcpServers").is_none_or(|servers| {
                 servers.as_array().is_some_and(|servers| {
                     !servers.is_empty()
@@ -97,7 +108,7 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
                         })
                 })
             });
-            workspace_valid && mcp_valid
+            workspace_valid && mode_valid && thought_level_valid && mcp_valid
         }
         "session/subscribe" => {
             exact_keys(
@@ -245,13 +256,32 @@ fn main() {
                 }) {
                     std::process::exit(24);
                 }
+                // Controlled effective-thought echo: the official settings
+                // state only projects `thoughtLevel.current` when the level is
+                // supported, so an unset ZCODE_FAKE_EFFORT_ECHO keeps the
+                // whole section absent (the UNKNOWN state), while a set value
+                // pins the echoed level (equal or diverging).
+                let mut settings = json!({"model":{"current":{"modelId":"fixture-model"}}});
+                if let Some(echo) = std::env::var("ZCODE_FAKE_EFFORT_ECHO")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                {
+                    settings["thoughtLevel"] = json!({
+                        "enabled": true,
+                        "current": echo,
+                        "available": [
+                            {"value": "high", "label": "high"},
+                            {"value": "low", "label": "low"}
+                        ]
+                    });
+                }
                 let _ = write_value(
                     &mut out,
                     response(
                         id,
                         json!({
                             "session": {"sessionId": &session_id},
-                            "settings":{"model":{"current":{"modelId":"fixture-model"}}}
+                            "settings": settings
                         }),
                     ),
                 );
@@ -440,6 +470,47 @@ mod tests {
                 .insert(key.into(), json!("invented"));
             assert!(!valid_params("session/send", &params, "fake-session-7f3a",));
         }
+    }
+
+    #[test]
+    fn session_create_accepts_the_official_optional_mode_and_thought_level_keys() {
+        let base = json!({
+            "workspace": {
+                "workspaceKey": "workspace-key",
+                "workspacePath": "/workspace"
+            }
+        });
+        let mut with_optional = base.clone();
+        with_optional["mode"] = json!("build");
+        with_optional["thoughtLevel"] = json!("high");
+        assert!(valid_params(
+            "session/create",
+            &with_optional,
+            "fake-session-7f3a",
+        ));
+        // A task without an admitted effort sends the byte-identical frame.
+        assert!(valid_params("session/create", &base, "fake-session-7f3a",));
+        for key in ["mode", "thoughtLevel"] {
+            let mut wrong_type = with_optional.clone();
+            wrong_type[key] = json!(7);
+            assert!(
+                !valid_params("session/create", &wrong_type, "fake-session-7f3a",),
+                "{key} must stay a non-empty string"
+            );
+            let mut empty = with_optional.clone();
+            empty[key] = json!("  ");
+            assert!(
+                !valid_params("session/create", &empty, "fake-session-7f3a",),
+                "{key} must not be blank"
+            );
+        }
+        let mut invented = with_optional.clone();
+        invented["reasoningEffort"] = json!("high");
+        assert!(!valid_params(
+            "session/create",
+            &invented,
+            "fake-session-7f3a",
+        ));
     }
 
     #[test]

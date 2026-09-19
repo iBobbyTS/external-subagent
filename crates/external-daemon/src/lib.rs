@@ -1,10 +1,11 @@
 use external_contract::{
-    event_type, normalized_zai_model, offered_permission_response, turn_id_from_result,
-    CreateSessionParams, ResumeSessionParams, RuntimePreferences, SendParams,
-    SessionCreateProjection, SessionParams, StdioMcpServer, SubscribeParams, WireId, WireMessage,
-    WorkspaceRef, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
-    INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_REQUEST_RUNTIME_PREFERENCES,
-    SESSION_RESUME, SESSION_SEND, SESSION_STOP, SESSION_SUBSCRIBE,
+    configured_thought_level_from_result, event_type, normalized_zai_model,
+    offered_permission_response, turn_id_from_result, CreateSessionParams, ResumeSessionParams,
+    RuntimePreferences, SendParams, SessionCreateProjection, SessionParams, StdioMcpServer,
+    SubscribeParams, WireId, WireMessage, WorkspaceRef, INTERACTION_REQUEST_PERMISSION,
+    INTERACTION_REQUEST_UNSUPPORTED_INPUT, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
+    SESSION_SUBSCRIBE,
 };
 use external_runtime::{
     observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
@@ -658,6 +659,7 @@ impl RuntimeOwner {
             &[],
             None,
             None,
+            None,
             timeout,
         )
     }
@@ -673,6 +675,7 @@ impl RuntimeOwner {
             workspace_path,
             initial_prompt,
             mcp_servers,
+            None,
             None,
             None,
             timeout,
@@ -696,14 +699,36 @@ impl RuntimeOwner {
             workspace_key: &task.workspace_path,
             workspace_path: &task.workspace_path,
         };
+        // The official resume schema accepts an optional `thoughtLevel`
+        // (strict validation passes, so sending it is wire-harmless), but
+        // zcode 25.6.x parses-and-ignores it on resume — the only
+        // setThoughtLevel consumers are the create flow, session/setModel,
+        // session/fork and session/setThoughtLevel. The persisted session's
+        // effective level is still read back and guarded fail-closed below.
+        let requested_effort = admitted_effort_from_task(task);
         let params = serde_json::to_value(ResumeSessionParams {
             session_id,
             workspace: Some(workspace),
+            thought_level: requested_effort.as_deref(),
             mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
-        self.driver
-            .request(SESSION_RESUME, params, remaining_runtime_time(deadline)?)?;
+        let resumed =
+            self.driver
+                .request(SESSION_RESUME, params, remaining_runtime_time(deadline)?)?;
+        if let Some(result) = resumed.result.as_ref() {
+            let observed = configured_thought_level_from_result(result).map_err(|error| {
+                RuntimeCommandError::InvalidSession(format!(
+                    "session/resume projection is invalid: {error}"
+                ))
+            })?;
+            validate_requested_effort(
+                SESSION_RESUME,
+                requested_effort.as_deref(),
+                observed.as_deref(),
+            )
+            .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
+        }
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id,
             delivery_kind: "desktop-continuous",
@@ -736,6 +761,7 @@ impl RuntimeOwner {
             &task.initial_prompt,
             mcp_servers,
             requested_model.as_deref(),
+            admitted_effort_from_task(task).as_deref(),
             permission_mode_from_task(task),
             timeout,
         )
@@ -747,6 +773,7 @@ impl RuntimeOwner {
         initial_prompt: &str,
         mcp_servers: &[StdioMcpServer],
         requested_model: Option<&str>,
+        requested_effort: Option<&str>,
         mode: Option<&str>,
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
@@ -760,6 +787,7 @@ impl RuntimeOwner {
         let create_params = serde_json::to_value(CreateSessionParams {
             workspace,
             mode,
+            thought_level: requested_effort,
             mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
@@ -783,6 +811,12 @@ impl RuntimeOwner {
         let configured_model = projection.requested_model;
         validate_requested_model(requested_model, configured_model.as_deref())
             .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
+        validate_requested_effort(
+            SESSION_CREATE,
+            requested_effort,
+            projection.configured_thought_level.as_deref(),
+        )
+        .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
@@ -1012,6 +1046,47 @@ fn validate_requested_model(
         return Err("MODEL_MISMATCH");
     }
     Ok(())
+}
+
+/// Confirm the effective thought level a session/create or session/resume
+/// result projected against the admitted effort. ZCode silently skips an
+/// unsupported `thoughtLevel` request, so an echo that exists and diverges
+/// fails closed (`EFFORT_MISMATCH`, message style aligned with
+/// `MODEL_MISMATCH`), while a missing echo stays a diagnostic-only UNKNOWN
+/// (stderr reaches logs/daemon-error.log through launchd) and proceeds.
+fn validate_requested_effort(
+    command: &'static str,
+    requested: Option<&str>,
+    observed: Option<&str>,
+) -> Result<(), &'static str> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let Some(observed) = observed else {
+        eprintln!(
+            "external-subagent: {command} did not project a thought level for the admitted \
+             effort {requested:?}; the effective reasoning level is UNKNOWN and the task proceeds"
+        );
+        return Ok(());
+    };
+    if requested != observed {
+        return Err("EFFORT_MISMATCH");
+    }
+    Ok(())
+}
+
+/// Admitted effort for a task, read from the strongly typed preparation
+/// (`prepared_launch_json.admission.effort`). Deliberately unlike
+/// `requested_model_from_prepared_launch`, which reads the legacy top-level
+/// `model` key that the preparation no longer writes.
+fn admitted_effort_from_task(task: &TaskRecord) -> Option<String> {
+    match task_route(task) {
+        Ok(TaskRoute::General(prepared)) => prepared
+            .admission
+            .as_ref()
+            .and_then(|identity| identity.effort.clone()),
+        Err(_) => None,
+    }
 }
 
 fn requested_model_from_prepared_launch(prepared_launch_json: Option<&str>) -> Option<String> {
@@ -1249,6 +1324,408 @@ fn route_policy(
 mod daemon;
 #[cfg(unix)]
 pub use daemon::Daemon;
+
+#[cfg(test)]
+mod zcode_effort_tests {
+    use super::*;
+    use external_store::{TaskOutcome, TaskPhase, TaskRecord, TurnState};
+
+    struct NoopSink;
+    impl crate::LifecycleSink for NoopSink {
+        fn emit(&self, _record: crate::LifecycleRecord) {}
+    }
+
+    fn workspace(prefix: &str) -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn admission(effort: Option<&str>) -> external_core::AdmissionIdentity {
+        external_core::AdmissionIdentity {
+            agent: "zcode".into(),
+            config_revision: 1,
+            adapter_version: env!("CARGO_PKG_VERSION").into(),
+            model: None,
+            model_source: "catalog".into(),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
+    fn effort_task(
+        directory: &std::path::Path,
+        agent_id: &str,
+        effort: Option<&str>,
+        session: Option<&str>,
+    ) -> TaskRecord {
+        let manifest = external_core::GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: agent_id.into(),
+            repository: directory.canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "effort passthrough".into(),
+            write_manifest: Vec::new(),
+        };
+        let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+            .unwrap()
+            .prepare_direct_submission(&manifest)
+            .unwrap()
+            .with_admission(admission(effort))
+            .unwrap();
+        TaskRecord {
+            agent_id: prepared.agent_id.clone(),
+            repository: prepared.repository.to_string_lossy().into_owned(),
+            phase: TaskPhase::Queued,
+            outcome: None,
+            workspace_path: prepared.workspace.path.to_string_lossy().into_owned(),
+            runtime_hash: None,
+            prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
+            prepared_launch_sha256: prepared.prepared_sha256.clone(),
+            initial_prompt: "effort passthrough".into(),
+            owner_id: None,
+            owner_epoch: 0,
+            close_requested: false,
+            stop_requested: false,
+            last_event_seq: 0,
+            failure_code: None,
+            failure_message: None,
+            runtime_agent_id: None,
+            zcode_session_id: session.map(str::to_owned),
+            turn_state: TurnState::Idle,
+            process_identity: None,
+            closed_at: None,
+            reaped_at: None,
+            created_at: 0,
+        }
+    }
+
+    /// Scripted ZCode child speaking the strict bootstrap sequence:
+    /// session/create(id1), session/subscribe(id2), session/send(id3). The
+    /// create result's settings echo is caller-controlled (`thought_echo`:
+    /// Some(value) pins `settings.thoughtLevel.current`, None keeps the whole
+    /// section absent); every inbound frame lands in deliveries.jsonl.
+    fn effort_bootstrap_script(thought_echo: Option<&str>) -> String {
+        let mut settings = String::from(r#"{"model":{"current":{"modelId":"fixture-model"}}}"#);
+        if let Some(echo) = thought_echo {
+            settings = format!(
+                r#"{{"model":{{"current":{{"modelId":"fixture-model"}}}},"thoughtLevel":{{"enabled":true,"current":"{echo}","available":[{{"value":"high","label":"high"}}]}}}}"#
+            );
+        }
+        format!(
+            r#"IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"session":{{"sessionId":"effort-session"}},"settings":{settings}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turnId":"t1"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"effort ok","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+        )
+    }
+
+    fn effort_scheduler(directory: &std::path::Path, script: &str) -> Scheduler {
+        let directory = directory.to_owned();
+        let script = script.to_owned();
+        let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
+        let factory = CommandRuntimeFactory::new(move |_: &TaskRecord| {
+            let mut command = Command::new("sh");
+            command.args(["-c", &script]).current_dir(&directory);
+            Ok(command)
+        });
+        Scheduler::new(
+            "zcode-effort-test",
+            store,
+            Arc::new(factory),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no terminal result");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn delivered_frames(directory: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(directory.join("deliveries.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn create_frame(frames: &[serde_json::Value]) -> &serde_json::Value {
+        frames
+            .iter()
+            .find(|frame| frame["method"] == "session/create")
+            .expect("create frame recorded")
+    }
+
+    #[test]
+    fn admitted_effort_reaches_the_create_frame_and_an_equal_echo_proceeds() {
+        let workspace = workspace("s03-effort-equal-");
+        let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("high")));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: workspace.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "effort passthrough".into(),
+                    write_manifest: Vec::new(),
+                },
+                Some(admission(Some("high"))),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![submitted.agent_id.clone()]
+        );
+        let result = await_result(&scheduler, &submitted.agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+
+        let frames = delivered_frames(workspace.path());
+        let create = create_frame(&frames);
+        assert_eq!(create["params"]["thoughtLevel"], "high");
+        // Pin the daemon's current mode emission alongside the new field.
+        assert_eq!(create["params"]["mode"], "plan");
+        assert!(
+            frames.iter().any(|frame| frame["method"] == "session/send"),
+            "the confirmed session must take its turn: {frames:?}"
+        );
+    }
+
+    #[test]
+    fn a_diverging_thought_echo_fails_closed_before_any_turn() {
+        let workspace = workspace("s03-effort-mismatch-");
+        let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("low")));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: workspace.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "effort passthrough".into(),
+                    write_manifest: Vec::new(),
+                },
+                Some(admission(Some("high"))),
+            )
+            .unwrap();
+        // A failed bootstrap propagates the activation error; the task itself
+        // must terminalize as failed exactly like any other start refusal.
+        assert!(scheduler.start_ready().is_err());
+        let result = await_result(&scheduler, &submitted.agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .get_task(&submitted.agent_id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            TaskPhase::Terminal
+        );
+        let failure = scheduler.last_error(&submitted.agent_id).unwrap();
+        assert!(
+            failure.contains("EFFORT_MISMATCH"),
+            "failure must name the effort mismatch: {failure}"
+        );
+
+        let frames = delivered_frames(workspace.path());
+        assert_eq!(
+            frames.len(),
+            1,
+            "a mismatched effort must stop at the create handshake: {frames:?}"
+        );
+        assert_eq!(frames[0]["method"], "session/create");
+        assert!(
+            !frames.iter().any(|frame| frame["method"] == "session/send"),
+            "no turn may start on an unconfirmed effort"
+        );
+    }
+
+    #[test]
+    fn a_missing_thought_echo_is_diagnostic_only_and_proceeds() {
+        let workspace = workspace("s03-effort-missing-");
+        let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(None));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: workspace.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "effort passthrough".into(),
+                    write_manifest: Vec::new(),
+                },
+                Some(admission(Some("high"))),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![submitted.agent_id.clone()]
+        );
+        let result = await_result(&scheduler, &submitted.agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+
+        let frames = delivered_frames(workspace.path());
+        let create = create_frame(&frames);
+        assert_eq!(
+            create["params"]["thoughtLevel"], "high",
+            "the admitted effort is still requested even without an echo"
+        );
+    }
+
+    #[test]
+    fn a_task_without_an_admitted_effort_keeps_the_byte_identical_create_frame() {
+        let workspace = workspace("s03-effort-none-");
+        let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("high")));
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: workspace.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "effort passthrough".into(),
+                    write_manifest: Vec::new(),
+                },
+                Some(admission(None)),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler.start_ready().unwrap(),
+            vec![submitted.agent_id.clone()]
+        );
+        let result = await_result(&scheduler, &submitted.agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+
+        let frames = delivered_frames(workspace.path());
+        let create = create_frame(&frames);
+        assert!(
+            create["params"].get("thoughtLevel").is_none(),
+            "no admitted effort must not serialize a thoughtLevel key: {create}"
+        );
+    }
+
+    /// Scripted ZCode child for the resume handshake: session/resume(id1)
+    /// answering with a settings echo, then session/subscribe(id2).
+    fn effort_resume_script(thought_echo: Option<&str>) -> String {
+        let settings = match thought_echo {
+            Some(echo) => {
+                format!(r#","settings":{{"thoughtLevel":{{"enabled":true,"current":"{echo}"}}}}"#)
+            }
+            None => String::new(),
+        };
+        format!(
+            r#"IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"session":{{"sessionId":"effort-session"}}{settings}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+        )
+    }
+
+    fn resume_owner(
+        directory: &std::path::Path,
+        script: &str,
+    ) -> (Arc<RuntimeOwner>, std::path::PathBuf) {
+        let child = directory.join("zcode-resume.sh");
+        std::fs::write(&child, format!("#!/bin/sh\n{script}")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&child).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&child, mode).unwrap();
+        }
+        let mut command = Command::new(&child);
+        command.current_dir(directory);
+        let owner = RuntimeOwner::spawn(command, Arc::new(NoopSink)).unwrap();
+        (Arc::new(owner), directory.join("deliveries.jsonl"))
+    }
+
+    #[test]
+    fn resume_carries_the_admitted_effort_and_confirms_the_same_echo_helper() {
+        let workspace = workspace("s03-effort-resume-");
+        let task = effort_task(
+            workspace.path(),
+            "s03-resume-equal",
+            Some("high"),
+            Some("effort-session"),
+        );
+        let (owner, deliveries) =
+            resume_owner(workspace.path(), &effort_resume_script(Some("high")));
+        let ready = owner
+            .resume_session_with_mcp(&task, &[], Duration::from_secs(10))
+            .expect("equal echo resumes");
+        assert_eq!(ready.session_id, "effort-session");
+        let frames: Vec<serde_json::Value> = std::fs::read_to_string(&deliveries)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let resume = frames
+            .iter()
+            .find(|frame| frame["method"] == "session/resume")
+            .expect("resume frame recorded");
+        assert_eq!(resume["params"]["thoughtLevel"], "high");
+    }
+
+    #[test]
+    fn a_diverging_resume_echo_fails_closed_and_a_missing_one_proceeds() {
+        let diverge = workspace("s03-effort-resume-diverge-");
+        let task = effort_task(
+            diverge.path(),
+            "s03-resume-diverge",
+            Some("high"),
+            Some("effort-session"),
+        );
+        let (owner, _deliveries) = resume_owner(diverge.path(), &effort_resume_script(Some("low")));
+        match owner.resume_session_with_mcp(&task, &[], Duration::from_secs(10)) {
+            Err(RuntimeCommandError::InvalidSession(message)) => {
+                assert_eq!(message, "EFFORT_MISMATCH");
+            }
+            other => panic!("diverging resume echo must fail closed: {other:?}"),
+        }
+
+        let missing = workspace("s03-effort-resume-missing-");
+        let task = effort_task(
+            missing.path(),
+            "s03-resume-missing",
+            Some("high"),
+            Some("effort-session"),
+        );
+        let (owner, _deliveries) = resume_owner(missing.path(), &effort_resume_script(None));
+        let ready = owner
+            .resume_session_with_mcp(&task, &[], Duration::from_secs(10))
+            .expect("missing resume echo stays diagnostic-only");
+        assert_eq!(ready.session_id, "effort-session");
+    }
+}
 
 #[cfg(test)]
 mod task_route_tests {

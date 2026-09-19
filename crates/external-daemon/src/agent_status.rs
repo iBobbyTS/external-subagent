@@ -1249,6 +1249,7 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
         serde_json::to_value(CreateSessionParams {
             workspace: workspace_ref,
             mode: Some("plan"),
+            thought_level: None,
             mcp_servers: &[],
         })
         .map_err(|_| "transport".to_owned())?,
