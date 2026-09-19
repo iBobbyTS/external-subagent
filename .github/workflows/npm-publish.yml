@@ -11,7 +11,9 @@
 #
 # The runner must be Apple Silicon: the prepack lifecycle builds the
 # darwin-arm64 native payload with cargo, and the pack checks verify the
-# Mach-O arm64 binaries before anything is uploaded.
+# Mach-O arm64 binaries before anything is uploaded.  A tag push publishes;
+# a manual workflow_dispatch run exercises the build and the full test gate
+# without publishing, so the release chain can be verified between releases.
 name: npm publish
 
 on:
@@ -49,9 +51,25 @@ jobs:
             exit 1
           fi
 
+      # The release-only pipeline segments — npm pack/install/bin links, the
+      # postinstall hook, first init on a fresh home, and the upgrade
+      # reconcile — are exercised only by these suites.  They run against
+      # packed tarballs in isolated prefixes and homes (the launchd and codex
+      # seams are neutralized by test fixtures), so they need no external
+      # subagent runtimes on the runner.  Publishing requires them green on
+      # this exact commit and this exact build: everything below runs against
+      # the binaries prepack will publish, closing the dev-machine/CI gap.
+      - name: Run release-path test suites
+        run: |
+          npm run test:install
+          node --test tests/cli/*.test.mjs tests/upgrade/*.test.mjs
+
       # prepack (cargo release build + payload manifest), the npm pack
       # checks (postpack), and the staged payload gate (prepublishOnly) all
       # run as package lifecycle scripts.  No NODE_AUTH_TOKEN is set: the
-      # OIDC identity from id-token: write is the only credential.
+      # OIDC identity from id-token: write is the only credential.  Tag runs
+      # publish; manual dispatch runs the build and tests only, so the whole
+      # gate chain can be verified without burning a release.
       - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
         run: npm publish --access public
