@@ -8,7 +8,7 @@ import test from 'node:test';
 import { configCommand } from '../../cli/commands/config.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
-const cli = path.resolve('bin/zas.mjs');
+const cli = path.resolve('bin/external-subagent.mjs');
 
 function runCli(home, socket, args) {
   return new Promise((resolve) => {
