@@ -66,7 +66,10 @@ export function treeDigest(root) {
 // `binding` overrides what gets pinned as the staged MCP command.  Codex
 // hosts spawn the native facade directly (the default); hosts with
 // restricted spawn environments (zcode) pass an interpreter command plus
-// args — e.g. the installing node running the staged stdio bridge.
+// args — e.g. the installing node running the staged stdio bridge.  A
+// binding may also carry `timeoutMs`, pinned onto the server entry for
+// hosts whose MCP client caps tool calls at a short default (zcode:
+// 30000ms) that a long `external_subagent_wait` would exceed.
 //
 // The publish protocol keeps two private sibling trees beside the target,
 // named `.<target>.candidate.<pid>.<uuid>` and `.<target>.prior.<pid>.<uuid>`.
@@ -80,7 +83,7 @@ function discardTree(dir) {
 // Parse and rewrite the CANDIDATE tree's `.mcp.json` for the final binding
 // paths.  This runs before any managed byte moves, so an unreadable or
 // incomplete MCP payload fails the refresh while the live tree stays intact.
-function bindCandidate(candidate, paths, command, args) {
+function bindCandidate(candidate, paths, command, args, timeoutMs) {
   const mcpPath = path.join(candidate, '.mcp.json');
   let mcp;
   try {
@@ -92,6 +95,7 @@ function bindCandidate(candidate, paths, command, args) {
   if (!server) throw new CliError('INVALID_PLUGIN_SOURCE', 'plugin MCP server is missing');
   server.command = command;
   if (args !== null) server.args = args;
+  if (timeoutMs !== null) server.timeoutMs = timeoutMs;
   server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };
   fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
 }
@@ -105,6 +109,7 @@ function bindCandidate(candidate, paths, command, args) {
 export function preparePluginStage(source, staging, paths, binding = {}) {
   const command = binding.command || nativeBinary('external-subagent-mcp');
   const args = Array.isArray(binding.args) ? binding.args : null;
+  const timeoutMs = Number.isFinite(binding.timeoutMs) ? binding.timeoutMs : null;
   if (fs.existsSync(staging)) {
     const existing = path.join(staging, '.codex-plugin', 'plugin.json');
     if (!fs.existsSync(existing) || JSON.parse(fs.readFileSync(existing, 'utf8')).name !== PLUGIN_NAME) {
@@ -151,7 +156,7 @@ export function preparePluginStage(source, staging, paths, binding = {}) {
       fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
       try {
         fs.cpSync(source, candidate, { recursive: true });
-        bindCandidate(candidate, paths, command, args);
+        bindCandidate(candidate, paths, command, args, timeoutMs);
         if (fs.existsSync(staging)) {
           fs.renameSync(staging, prior);
           try {

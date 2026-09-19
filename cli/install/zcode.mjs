@@ -26,9 +26,15 @@ const MANIFEST_PROBES = ['.zcode-plugin/plugin.json', '.claude-plugin/plugin.jso
 // that kills ad-hoc-signed native binaries (observed live: SIGKILL,
 // "Connection closed"), while node processes and unix sockets are
 // allowed.  The zcode binding therefore pins the installing node running
-// the staged stdio bridge instead of the native facade binary.
+// the staged stdio bridge instead of the native facade binary.  It also
+// pins `timeoutMs` on the server entry: the zcode host's MCP client caps
+// every tool call at a default 30000ms unless the server config overrides
+// it, which would cut `external_subagent_wait` (default 290s, ceiling
+// 299s) at 30s; 300000ms covers that ceiling with margin.
+const ZCODE_MCP_TIMEOUT_MS = 300000;
+
 export function zcodeMcpBinding(staging) {
-  return { command: process.execPath, args: [path.join(staging, 'scripts', 'mcp-stdio-bridge.mjs')] };
+  return { command: process.execPath, args: [path.join(staging, 'scripts', 'mcp-stdio-bridge.mjs')], timeoutMs: ZCODE_MCP_TIMEOUT_MS };
 }
 
 export function zcodeConfigFor(options = {}, paths) {
@@ -98,6 +104,7 @@ function verifyZcodeBinding({ config, staging, dir }) {
   const server = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8')).mcpServers?.external_subagent;
   const binding = zcodeMcpBinding(staging);
   if (!server || server.command !== binding.command || JSON.stringify(server.args || []) !== JSON.stringify(binding.args)
+    || server.timeoutMs !== binding.timeoutMs
     || server.env?.ZCODE_AGENTD_SOCKET === undefined) {
     throw new CliError('ZCODE_BINDING_UNVERIFIABLE', `the staged plugin MCP binding is not the managed endpoint (${staging})`);
   }

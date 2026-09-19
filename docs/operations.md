@@ -106,7 +106,10 @@ interactive shell.
 The launchd/GUI environment does not inherit the interactive shell PATH, so
 every managed entry is absolute: the LaunchAgent pins the daemon binary, and
 the staged plugin `.mcp.json` pins the MCP facade inside the installed
-package. The daemon itself runs with the fixed PATH
+package. That staged `.mcp.json` also sets `timeoutMs: 300000` on the
+zcode-side server entry, because the zcode host caps MCP tool calls at a
+default 30000ms — below the product's 299s `external_subagent_wait` ceiling.
+The daemon itself runs with the fixed PATH
 `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
 `init` reports whether `external-subagent` is on the shell PATH; repairing a
 user profile stays an explicit user action (the product never edits shell

@@ -342,6 +342,7 @@ test('a service-less update still refreshes the zcode binding (REV-002)', { skip
     assert.notEqual(fs.readFileSync(skill, 'utf8'), 'tampered\n', 'the staged tree was re-staged from the current source');
     const server = JSON.parse(fs.readFileSync(path.join(paths.zcodePlugin, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
     assert.equal(server.command, process.execPath);
+    assert.equal(server.timeoutMs, 300000, 'the re-staged binding still pins the managed tool timeout');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }
