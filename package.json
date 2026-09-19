@@ -33,8 +33,7 @@
     "external-subagent-debug-mcp": "bin/external-subagent-debug-mcp.mjs"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "files": [
     "bin/",
