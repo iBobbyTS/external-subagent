@@ -73,6 +73,17 @@ stale or missing binaries) and `postpack` runs the static tarball checks. A
 development checkout packs the same way (`npm pack` after `cargo` is
 available); see [docs/operations.md](docs/operations.md) for release checks.
 
+## Publishing
+
+Releases publish from CI via npm Trusted Publishing (OIDC): pushing a `vX.Y.Z`
+tag runs [.github/workflows/npm-publish.yml](.github/workflows/npm-publish.yml)
+on an Apple Silicon runner, which rebuilds the payload, runs the pack gates,
+and publishes with no npm token in the environment — the runner's OIDC
+identity is the credential. npm does not support trusted publishing for a
+package's first release, so the initial version was published manually once
+and the trusted publisher was then linked on npmjs.com; the workflow filename
+is part of that link and must not be renamed.
+
 A plain install stages the package and payload only. `init` never binds a
 host or touches Codex state; host binding is a separate explicit step
 (`install-plugin codex|zcode`, or `install-mcp` for the direct Codex TOML
