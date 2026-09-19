@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { CliError } from '../errors.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
+import { MCP_BIN_NAME, PRODUCT_ID } from '../constants.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
 import { pluginManifest, treeDigest, preparePluginStage, guardedRestores } from './plugin-stage.mjs';
 
@@ -18,7 +19,7 @@ import { pluginManifest, treeDigest, preparePluginStage, guardedRestores } from 
 // The codex CLI owns its own config/cache writes; this module never edits the
 // Codex cache directly.
 
-const CODEX_MCP_SECTION = 'mcp_servers.external_subagent';
+const CODEX_MCP_SECTION = `mcp_servers.${PRODUCT_ID}`;
 const MARKETPLACE_NAME = 'personal';
 
 export const CODEX_TOOLS = Object.freeze([
@@ -306,7 +307,7 @@ export function uninstallPlugin(paths, options = {}) {
 }
 
 function codexMcpConfig(paths) {
-  const command = nativeBinary('external-subagent-mcp');
+  const command = nativeBinary(MCP_BIN_NAME);
   const tools = CODEX_TOOLS.map((tool) => `  "${tool}",`).join('\n');
   return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n${tools}\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nZCODE_AGENTD_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
 }
@@ -328,7 +329,7 @@ export function installMcp(paths, options = {}) {
   // (then CODEX_HOME) selects the config file for install and removal alike.
   const config = options.configPath || path.join(codexHomeFor(options, paths), 'config.toml');
   const codexHome = codexHomeFor(options, paths);
-  const command = nativeBinary('external-subagent-mcp');
+  const command = nativeBinary(MCP_BIN_NAME);
   if (options.dryRun) {
     return { dry_run: true, operation: options.uninstall ? 'uninstall' : 'install', platform: 'codex', config, codex_home: codexHome, command, socket: paths.socket };
   }

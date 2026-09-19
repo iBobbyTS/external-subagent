@@ -28,7 +28,9 @@
   ],
   "bin": {
     "external-subagent": "bin/external-subagent.mjs",
-    "external-subagent-mcp": "bin/external-subagent-mcp.mjs"
+    "external-subagent-mcp": "bin/external-subagent-mcp.mjs",
+    "external-subagent-debug": "bin/external-subagent-debug.mjs",
+    "external-subagent-debug-mcp": "bin/external-subagent-debug-mcp.mjs"
   },
   "publishConfig": {
     "access": "public",
@@ -49,8 +51,9 @@
     "postinstall": "node cli/install/npm-hook.mjs",
     "prepack": "node scripts/release/build-native-payload.mjs",
     "postpack": "node scripts/release/check-native-tarball.mjs",
+    "prepublishOnly": "node scripts/release/check-native-tarball.mjs --staged",
     "test:install": "node --test tests/install/*.test.mjs",
-    "check": "node --check bin/external-subagent.mjs && node --check bin/external-subagent-mcp.mjs && node --check cli/main.mjs"
+    "check": "node --check bin/external-subagent.mjs && node --check bin/external-subagent-mcp.mjs && node --check bin/external-subagent-debug.mjs && node --check bin/external-subagent-debug-mcp.mjs && node --check cli/main.mjs"
   },
   "engines": {
     "node": ">=20"

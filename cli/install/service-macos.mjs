@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from '../constants.mjs';
+import { DAEMON_BIN_NAME, LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
@@ -19,7 +19,7 @@ function escapeXml(value) {
 }
 
 export function launchAgentPlist(paths, options = {}) {
-  const daemon = nativeBinary('external-subagentd');
+  const daemon = nativeBinary(DAEMON_BIN_NAME);
   const config = readConfig(paths.config);
   const { runtime_path: dshRuntime, home: dshHome, profile: dshProfile, version: dshVersion } = config.subagents.dsh;
   const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;

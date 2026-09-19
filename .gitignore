@@ -32,3 +32,10 @@ tests/live-agent/workspace/
 
 # Coding Agent
 .zcode
+
+# Debug-variant build outputs (scripts/release/build-native-payload.mjs --variant debug)
+npm/native-debug/
+plugins/codex/external-subagent-debug/
+
+# Kilo agent worktrees
+.kilo/

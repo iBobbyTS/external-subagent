@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { atomicWrite, jsonBytes, sha256 } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
+import { CLI_ENTRY_NAME, DAEMON_BIN_NAME, NATIVE_DIR_NAME } from '../constants.mjs';
 import { reconcileCodexHomes } from './reconcile.mjs';
 import { packageVersion, packageRoot } from './layout.mjs';
 import { loadUpdateState } from './recovery.mjs';
@@ -44,17 +45,17 @@ function readState(paths) {
 function retainPayload(paths, candidateRoot, verified) {
   const root = path.join(paths.data, 'payload-store', verified.version);
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const platformDir = path.join(fs.realpathSync(candidateRoot), 'npm', 'native', verified.payload.platform);
+  const platformDir = path.join(fs.realpathSync(candidateRoot), 'npm', NATIVE_DIR_NAME, verified.payload.platform);
   for (const file of verified.payload.files) {
     atomicWrite(path.join(root, file.name), fs.readFileSync(path.join(platformDir, file.name)), 0o755);
   }
-  atomicWrite(path.join(root, 'external-subagent.mjs'), fs.readFileSync(verified.stable.entry), 0o755);
+  atomicWrite(path.join(root, CLI_ENTRY_NAME), fs.readFileSync(verified.stable.entry), 0o755);
   atomicWrite(path.join(root, 'payload.json'), fs.readFileSync(path.join(platformDir, 'payload.json')));
   const retained = {
     root,
-    entry: path.join(root, 'external-subagent.mjs'),
+    entry: path.join(root, CLI_ENTRY_NAME),
     entry_sha256: verified.stable.digest,
-    daemon_entry: path.join(root, 'external-subagentd'),
+    daemon_entry: path.join(root, DAEMON_BIN_NAME),
     daemon_entry_sha256: verified.daemon.digest,
   };
   for (const [file, digest] of [[retained.daemon_entry, verified.daemon.digest], [retained.entry, verified.stable.digest]]) {
@@ -67,7 +68,7 @@ function retainPayload(paths, candidateRoot, verified) {
 
 function verifyStableEntry(candidateRoot) {
   const root = fs.realpathSync(candidateRoot);
-  const entry = path.join(root, 'bin', 'external-subagent.mjs');
+  const entry = path.join(root, 'bin', CLI_ENTRY_NAME);
   let stat;
   try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_ENTRY_MISSING', 'candidate stable entry is missing'); }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be a regular file');
@@ -82,10 +83,10 @@ function verifyStableEntry(candidateRoot) {
 // activation identity is the external-subagentd payload artifact whose digest
 // verifyPayload already checked against the release manifest.
 function verifyDaemonArtifact(candidateRoot, payload) {
-  const record = payload.files.find((file) => file.name === 'external-subagentd');
+  const record = payload.files.find((file) => file.name === DAEMON_BIN_NAME);
   if (!record) throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate payload does not carry the daemon artifact');
   const root = fs.realpathSync(candidateRoot);
-  const entry = path.join(root, 'npm', 'native', payload.platform, record.name);
+  const entry = path.join(root, 'npm', NATIVE_DIR_NAME, payload.platform, record.name);
   let stat;
   try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate daemon artifact is missing'); }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be a regular file');

@@ -29,14 +29,26 @@
 ## 安装与初始化
 
 ```sh
-node scripts/release/build-native-payload.mjs
-npm pack
-npm install -g external-subagent-0.1.0.tgz
+npm install -g external-subagent
 external-subagent init
 external-subagent install-plugin codex   # 可选：显式绑定 Codex 宿主（或 install-plugin zcode / install-mcp）
 ```
 
+`npm pack`/`npm publish` 由生命周期脚本门禁：`prepack` 总是从源码重建 native payload（干净 checkout 永远打不出缺二进制的坏包），`postpack` 对产物做静态检查（含拒绝 debug 产物混入发布包），`prepublishOnly` 在发布前校验 staged payload 与包版本一致。包通过 `os`/`cpu` 字段声明仅支持 macOS arm64，npm 会在安装期直接拒绝其他平台。
+
 普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它只安装独立的 daemon 服务：校验 payload，报告 PATH 发现与固定 ZCode runtime 的存在性观察（不做探测），写入产品配置和 LaunchAgent，启动服务，并发布 active/retained payload 基线——不安装任何宿主 plugin，不登记 Codex home，不触碰 `~/.codex`。宿主绑定由 `init` 之后的显式命令完成（`install-plugin codex|zcode` 或 `install-mcp` 的直接 TOML binding）。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
+
+### Debug 变体（开发机并行实例）
+
+开发 checkout 可以构建并安装一个与正式安装完全并行的 debug 实例，互不影响：
+
+```sh
+node scripts/release/build-native-payload.mjs --variant debug   # 构建到 npm/native-debug/ 并生成 debug 插件源
+bin/external-subagent-debug.mjs init                            # 独立 LaunchAgent/状态目录/socket
+bin/external-subagent-debug.mjs install-plugin zcode            # 第二个 plugins.dirs 条目，插件名 external-subagent-debug
+```
+
+变体身份由 `EXTERNAL_SUBAGENT_VARIANT=debug` 派生：二进制名（`external-subagent-debugd`、`external-subagent-debug-mcp`）、payload 目录（`npm/native-debug/`）、状态目录（`~/Library/Application Support/external-subagent-debug/`）、LaunchAgent label（`com.external-subagent-debug.daemon`）、插件身份与 Codex TOML section 全部独立命名；两个实例可同时运行。debug payload 与 debug 插件源是构建产物（gitignored），且被 tarball 静态检查拒绝进入发布包。
 
 ## Provider 配置
 

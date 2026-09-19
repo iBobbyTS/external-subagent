@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
+import { MCP_BIN_NAME } from '../constants.mjs';
 import { nativeBinary, PLUGIN_NAME } from './layout.mjs';
 
 // Host-agnostic plugin staging: validating the shipped plugin source,
@@ -107,7 +108,7 @@ function bindCandidate(candidate, paths, command, args, timeoutMs) {
 // caller's host binding transaction: restore() undoes a published swap,
 // complete() drops the retained prior tree once the transaction committed.
 export function preparePluginStage(source, staging, paths, binding = {}) {
-  const command = binding.command || nativeBinary('external-subagent-mcp');
+  const command = binding.command || nativeBinary(MCP_BIN_NAME);
   const args = Array.isArray(binding.args) ? binding.args : null;
   const timeoutMs = Number.isFinite(binding.timeoutMs) ? binding.timeoutMs : null;
   if (fs.existsSync(staging)) {
@@ -124,7 +125,7 @@ export function preparePluginStage(source, staging, paths, binding = {}) {
     // Refreshable when the prior binding is any form this product wrote:
     // the requested binding, the native facade (earlier managed binding),
     // or the shipped placeholder.
-    const managedCommands = new Set([command, nativeBinary('external-subagent-mcp'), '__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__']);
+    const managedCommands = new Set([command, nativeBinary(MCP_BIN_NAME), '__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__']);
     const commandMatches = managedCommands.has(priorCommand);
     // An interpreter-form binding also pins its script inside the staged
     // tree itself, so a prior args[0] living in this staging proves the

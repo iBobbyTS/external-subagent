@@ -5,6 +5,13 @@
 // (version, platform, per-file bytes/sha256/mode).  Installed-package code
 // verifies against this manifest, so it must never contain volatile fields.
 //
+// `--variant debug` stages the parallel development payload instead: the same
+// cargo artifacts are copied under debug names into npm/native-debug/darwin-arm64
+// (manifest product external-subagent-debug), and the debug plugin source is
+// staged at plugins/codex/external-subagent-debug.  The debug payload is a
+// development checkout product and is rejected from release tarballs by
+// scripts/release/check-native-tarball.mjs.
+//
 // --if-stale skips the cargo build when the staged binaries are newer than
 // every source input and the manifest already matches the package version.
 import fs from 'node:fs';
@@ -12,11 +19,23 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { stageDebugPlugin } from './stage-debug-plugin.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const platformDir = path.join(packageRoot, 'npm', 'native', 'darwin-arm64');
+const variantIndex = process.argv.indexOf('--variant');
+const variant = variantIndex === -1 ? '' : (process.argv[variantIndex + 1] ?? '');
+if (variant !== '' && variant !== 'debug') {
+  process.stderr.write(`unknown variant: ${variant} (supported: debug)\n`);
+  process.exit(2);
+}
+const isDebug = variant === 'debug';
+const nativeDirName = isDebug ? 'native-debug' : 'native';
+const productName = isDebug ? 'external-subagent-debug' : 'external-subagent';
+const binaries = isDebug
+  ? [['external-subagentd', 'external-subagent-debugd'], ['external-subagent-mcp', 'external-subagent-debug-mcp']]
+  : [['external-subagentd', 'external-subagentd'], ['external-subagent-mcp', 'external-subagent-mcp']];
+const platformDir = path.join(packageRoot, 'npm', nativeDirName, 'darwin-arm64');
 const manifestPath = path.join(platformDir, 'payload.json');
-const binaries = ['external-subagentd', 'external-subagent-mcp'];
 const sourceRoots = ['crates', 'profiles'].map((dir) => path.join(packageRoot, dir))
   .concat([path.join(packageRoot, 'Cargo.toml'), path.join(packageRoot, 'Cargo.lock')]);
 
@@ -46,7 +65,7 @@ function stagedIsCurrent(version) {
   if (!fs.existsSync(manifestPath)) return false;
   let manifest;
   try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { return false; }
-  if (manifest.version !== version || manifest.platform !== 'darwin-arm64') return false;
+  if (manifest.version !== version || manifest.platform !== 'darwin-arm64' || manifest.product !== productName) return false;
   const inputs = newestInputMs();
   for (const file of manifest.files) {
     const target = path.join(platformDir, file.name);
@@ -59,8 +78,11 @@ function stagedIsCurrent(version) {
 }
 
 const version = packageVersion();
+// Under an npm lifecycle (prepack) stdout belongs to npm's `--json` protocol;
+// diagnostics go to stderr there so pack output stays machine-parseable.
+const note = (text) => (process.env.npm_lifecycle_event ? process.stderr : process.stdout).write(text);
 if (process.argv.includes('--if-stale') && stagedIsCurrent(version)) {
-  process.stdout.write(`native payload already current at ${version}\n`);
+  note(`native payload already current at ${version}${isDebug ? ' (debug)' : ''}\n`);
   process.exit(0);
 }
 
@@ -74,19 +96,24 @@ if (build.status !== 0) {
 
 fs.mkdirSync(platformDir, { recursive: true });
 const files = [];
-for (const name of binaries) {
-  const source = path.join(packageRoot, 'target', 'release', name);
-  if (!fs.existsSync(source)) {
-    process.stderr.write(`release binary missing: ${source}\n`);
+for (const [source, name] of binaries) {
+  const sourcePath = path.join(packageRoot, 'target', 'release', source);
+  if (!fs.existsSync(sourcePath)) {
+    process.stderr.write(`release binary missing: ${sourcePath}\n`);
     process.exit(1);
   }
   const target = path.join(platformDir, name);
-  fs.copyFileSync(source, target);
+  fs.copyFileSync(sourcePath, target);
   fs.chmodSync(target, 0o755);
   const bytes = fs.readFileSync(target);
   files.push({ name, bytes: bytes.length, mode: '755', sha256: sha256(bytes) });
 }
 
-const manifest = { schema_version: 1, product: 'external-subagent', version, platform: 'darwin-arm64', files };
+const manifest = { schema_version: 1, product: productName, version, platform: 'darwin-arm64', files };
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
-process.stdout.write(`native payload ${version} staged: ${files.map((file) => file.name).join(', ')}\n`);
+if (isDebug) {
+  const stagedPlugin = stageDebugPlugin(packageRoot);
+  note(`native payload ${version} (debug) staged: ${files.map((file) => file.name).join(', ')}\nplugin source staged: ${stagedPlugin}\n`);
+} else {
+  note(`native payload ${version} staged: ${files.map((file) => file.name).join(', ')}\n`);
+}

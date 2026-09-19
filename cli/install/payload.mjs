@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { sha256 } from '../fs-atomic.mjs';
+import { NATIVE_DIR_NAME, PRODUCT_NAME } from '../constants.mjs';
 import {
   NATIVE_PLATFORM, cliVersion, nativePayloadDir, nativePlatform, packageVersion, payloadManifestPath,
 } from './layout.mjs';
@@ -18,7 +19,7 @@ export function machoArch(bytes) {
 export function readPayloadManifest(options = {}) {
   const platform = options.platform || nativePlatform();
   const root = options.root || undefined;
-  const file = root ? path.join(root, 'npm', 'native', platform || '', 'payload.json') : payloadManifestPath(platform);
+  const file = root ? path.join(root, 'npm', NATIVE_DIR_NAME, platform || '', 'payload.json') : payloadManifestPath(platform);
   if (file === null || !fs.existsSync(file)) {
     throw new CliError('PAYLOAD_MANIFEST_MISSING', `the ${platform || 'current'} platform payload manifest is missing from this package`);
   }
@@ -28,7 +29,7 @@ export function readPayloadManifest(options = {}) {
   } catch (error) {
     throw new CliError('PAYLOAD_MANIFEST_INVALID', `payload manifest is not valid JSON: ${error.message}`);
   }
-  if (manifest?.schema_version !== 1 || manifest?.product !== 'external-subagent' || !Array.isArray(manifest.files)) {
+  if (manifest?.schema_version !== 1 || manifest?.product !== PRODUCT_NAME || !Array.isArray(manifest.files)) {
     throw new CliError('PAYLOAD_MANIFEST_INVALID', 'payload manifest identity or file table is invalid');
   }
   return manifest;
@@ -56,7 +57,7 @@ export function verifyPayload(options = {}) {
   if (versions.package !== versions.cli || versions.payload !== versions.cli) {
     throw new CliError('PAYLOAD_VERSION_MISMATCH', `payload ${versions.payload}, package ${versions.package}, and CLI ${versions.cli} versions disagree`);
   }
-  const dir = options.root ? path.join(options.root, 'npm', 'native', platform) : nativePayloadDir(platform);
+  const dir = options.root ? path.join(options.root, 'npm', NATIVE_DIR_NAME, platform) : nativePayloadDir(platform);
   const files = manifest.files.map((record) => {
     if (!record || typeof record.name !== 'string' || path.basename(record.name) !== record.name || record.name.includes('..')) {
       throw new CliError('PAYLOAD_MANIFEST_INVALID', 'payload file name must be a direct child');

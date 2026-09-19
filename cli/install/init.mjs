@@ -1,13 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { ZCODE_RUNTIME } from '../constants.mjs';
+import { LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
 import { verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
-import { packageRoot } from './layout.mjs';
+import { packageRoot, payloadManifestPath } from './layout.mjs';
 import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
 import { bootstrapService, bootoutService, installLaunchAgent } from './service-macos.mjs';
@@ -49,13 +49,14 @@ function hookInstallerPath() {
 }
 
 export function installPlan(paths, options = {}) {
+  const manifest = payloadManifestPath() ?? path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json');
   const plan = [
-    { id: 'verify-payload', action: 'verify staged native payload', path: path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json') },
+    { id: 'verify-payload', action: 'verify staged native payload', path: manifest },
     { id: 'check-path', action: 'report PATH availability without writing profiles' },
     { id: 'create-data', action: 'create private product data and log directories', paths: [paths.data, paths.logs] },
     { id: 'write-product-config', action: 'republish the product agent config schema', path: paths.config },
-    { id: 'install-launch-agent', action: 'install daemon LaunchAgent', path: paths.launchAgent, label: 'com.external-subagent.daemon' },
-    { id: 'start-service', action: 'bootstrap the daemon service', path: paths.launchAgent, label: 'com.external-subagent.daemon' },
+    { id: 'install-launch-agent', action: 'install daemon LaunchAgent', path: paths.launchAgent, label: LAUNCH_AGENT_LABEL },
+    { id: 'start-service', action: 'bootstrap the daemon service', path: paths.launchAgent, label: LAUNCH_AGENT_LABEL },
     { id: 'publish-active-payload', action: 'publish the verified active payload and retained-byte baseline', path: paths.state },
   ];
   if (options.installHooks) plan.splice(plan.findIndex((step) => step.id === 'publish-active-payload'), 0, { id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });

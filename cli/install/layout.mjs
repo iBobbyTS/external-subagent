@@ -1,15 +1,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { VERSION } from '../constants.mjs';
+import { DAEMON_BIN_NAME, MCP_BIN_NAME, NATIVE_DIR_NAME, PRODUCT_NAME, VERSION } from '../constants.mjs';
 
 // Package and payload layout is the single source of truth for where the
 // staged npm artifact keeps its managed entry points.  The MCP binding and
 // the LaunchAgent reference absolute paths below this root, never a shell or
-// GUI PATH lookup.
-export const PLUGIN_NAME = 'external-subagent';
+// GUI PATH lookup.  Identity names derive from the variant token in
+// constants.mjs, so the debug variant resolves its own payload directory,
+// binary names, and plugin source without a parallel code path.
+export const PLUGIN_NAME = PRODUCT_NAME;
 export const NATIVE_PLATFORM = 'darwin-arm64';
-export const NATIVE_BINARIES = Object.freeze(['external-subagentd', 'external-subagent-mcp']);
+export const NATIVE_BINARIES = Object.freeze([DAEMON_BIN_NAME, MCP_BIN_NAME]);
 
 export function packageRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -22,7 +24,7 @@ export function nativePlatform(platform = process.platform, arch = process.arch)
 
 export function nativePayloadDir(platform = nativePlatform()) {
   if (platform !== NATIVE_PLATFORM) return null;
-  return path.join(packageRoot(), 'npm', 'native', platform);
+  return path.join(packageRoot(), 'npm', NATIVE_DIR_NAME, platform);
 }
 
 export function nativeBinary(name, platform = nativePlatform()) {
