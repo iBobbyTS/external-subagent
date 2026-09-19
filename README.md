@@ -36,13 +36,11 @@ version is codex's plugin-cache identity, and codex resolves the reserved
 `personal` marketplace name machine-globally to the real user root
 (regardless of `CODEX_HOME`), so each candidate's consumer runs pin that
 identity's bytes there and any later candidate bumps again. The installer
-verifies the materialized plugin cache against the staged binding and
-managed content (file set and bytes, not just identity) before reporting
-success, failing closed on cache-reused or stale bytes. DSH
-admission currently supports `build` and strict `plan`; its model
-selection is explicit spawn model, configured default, then the native
-default. Nothing has been published to a registry
-(`REGISTRY_PUBLICATION_PENDING`).
+re-verified on 0.154.0; DSH admission currently supports `build` and strict
+`plan`; its model selection is explicit spawn model, configured default, then
+the native default. The package is published to the public npm registry as
+`external-subagent@0.1.0` (macOS arm64 only; `os`/`cpu` in `package.json`
+reject installation on other platforms at npm install time).
 
 ## Versioning
 
@@ -61,16 +59,19 @@ receives another installation's cached bytes. The two numbers therefore
 intentionally diverge; see
 [docs/operations.md](docs/operations.md) for the full rule.
 
-## Install (from a packed artifact)
+## Install
 
 ```
-node scripts/release/build-native-payload.mjs           # cargo release build + payload manifest (must run BEFORE npm pack)
-npm pack                                                # build the tarball from the freshly staged payload
-node scripts/release/check-native-tarball.mjs           # static tarball checks (entries, payload/package version, Mach-O)
-npm install -g <external-subagent-0.1.0.tgz>            # stages package + payload only
-external-subagent init                                  # explicit: standalone daemon service only
-external-subagent install-plugin codex                  # optional: bind the Codex host (or: install-plugin zcode / install-mcp)
+npm install -g external-subagent     # stages package + payload only (macOS arm64)
+external-subagent init               # explicit: standalone daemon service only
+external-subagent install-plugin zcode   # optional host binding (or: install-plugin codex / install-mcp)
 ```
+
+Packing and publishing are gated by npm lifecycle scripts: `prepack` always
+rebuilds the native payload from source (so a tarball can never silently ship
+stale or missing binaries) and `postpack` runs the static tarball checks. A
+development checkout packs the same way (`npm pack` after `cargo` is
+available); see [docs/operations.md](docs/operations.md) for release checks.
 
 A plain install stages the package and payload only. `init` never binds a
 host or touches Codex state; host binding is a separate explicit step
@@ -89,8 +90,10 @@ completed update whose registered Codex homes only partially rebind reports
 `CODEX_SYNC_PARTIAL` per home and keeps the verified activation; the public
 `stop` confirms launchd removal before returning, and `uninstall` boots out
 the ES-owned service before removing its registration while retaining all
-data. Supported platform: macOS arm64; other platforms keep `help`/`version`
-working and reject business commands without writing HOME.
+data. Supported platform: macOS arm64 — `os`/`cpu` in `package.json` make npm
+refuse installation elsewhere up front; the CLI additionally keeps
+`help`/`version` working on other platforms and rejects business commands
+without writing HOME.
 
 See [docs/operations.md](docs/operations.md) for service control, PATH
 behavior, the Codex homes registry, backup/removal, and release checks; and

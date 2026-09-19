@@ -4,9 +4,35 @@
   "description": "Manage bounded ZCode, DeepSeek Harness (DSH), and Codex subagent tasks through a local MCP service for any local host (Codex, ZCode, or a custom MCP client)",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iBobbyTS/external-subagent.git"
+  },
+  "homepage": "https://github.com/iBobbyTS/external-subagent#readme",
+  "bugs": {
+    "url": "https://github.com/iBobbyTS/external-subagent/issues"
+  },
+  "keywords": [
+    "mcp",
+    "subagent",
+    "codex",
+    "zcode",
+    "dsh",
+    "agent-tasks"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
   "bin": {
     "external-subagent": "bin/external-subagent.mjs",
     "external-subagent-mcp": "bin/external-subagent-mcp.mjs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "files": [
     "bin/",
@@ -21,6 +47,8 @@
   ],
   "scripts": {
     "postinstall": "node cli/install/npm-hook.mjs",
+    "prepack": "node scripts/release/build-native-payload.mjs",
+    "postpack": "node scripts/release/check-native-tarball.mjs",
     "test:install": "node --test tests/install/*.test.mjs",
     "check": "node --check bin/external-subagent.mjs && node --check bin/external-subagent-mcp.mjs && node --check cli/main.mjs"
   },
