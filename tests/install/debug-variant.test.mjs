@@ -104,7 +104,9 @@ test('codex TOML binding section is variant-scoped', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'es-variant-codex-'));
   try {
     const releaseConfig = path.join(home, 'release.config.toml');
-    installMcp(productPaths(home), { configPath: releaseConfig, codexHome: home });
+    // skipNativeProbe: this test asserts section naming only — a fresh CI
+    // checkout carries no staged native payload until something builds it.
+    installMcp(productPaths(home), { configPath: releaseConfig, codexHome: home, skipNativeProbe: true });
     assert.match(fs.readFileSync(releaseConfig, 'utf8'), /\[mcp_servers\.external_subagent\]/u);
 
     const debugConfig = path.join(home, 'debug.config.toml');

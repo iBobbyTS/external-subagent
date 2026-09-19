@@ -344,11 +344,18 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
   fs.copyFileSync(path.join(repoRoot, 'tests/fixtures/dsh-hi-probe.mjs'), runtime);
   assert.equal(fs.existsSync(path.join(ctx.packageRoot, 'crates')), false);
   assert.equal(fs.existsSync(path.join(ctx.packageRoot, 'profiles')), false);
+  // The daemon canonicalizes --runtime at startup and refuses to boot on a
+  // missing path; a CI runner has no ZCode.app, so fall back to an existing
+  // file (the adapter is never spawned as zcode in this test — provider
+  // probes below run through the DSH fixture).
+  const zcodeRuntime = fs.existsSync('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')
+    ? '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'
+    : runtime;
 
   const daemon = spawn(ctx.daemon, [
     '--database', path.join(data, 'external-subagent.sqlite3'),
     '--socket', socket,
-    '--runtime', '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs',
+    '--runtime', zcodeRuntime,
     '--diagnostic-log', path.join(logs, 'daemon-error.log'),
   ], { cwd: ctx.packageRoot, env: fixtureEnv(home, { env: { DSH_RUNTIME_PATH: runtime } }), stdio: ['ignore', 'pipe', 'pipe'] });
   let daemonStderr = '';
