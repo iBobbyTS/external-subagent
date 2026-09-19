@@ -26,6 +26,7 @@ pub(super) struct CodexShared {
     pub(super) turn_tracker: Arc<TurnTracker>,
     pub(super) session_id: Mutex<Option<String>>,
     pub(super) admitted_model: Mutex<Option<String>>,
+    pub(super) admitted_effort: Mutex<Option<String>>,
     pub(super) diagnostic_session_id: Mutex<Option<String>>,
     pub(super) current_turn: Mutex<Option<String>>,
     pub(super) retired_turns: Mutex<Vec<String>>,

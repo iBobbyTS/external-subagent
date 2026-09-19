@@ -483,9 +483,17 @@ pub(super) fn resolve_admission(
 }
 
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
-/// NUL. Codex additionally admits only its closed effort set; zcode/dsh are
-/// bounded passthrough tokens because their supported sets are only known
-/// at runtime and admission must not fabricate a catalog.
+/// NUL. Codex additionally admits only its closed effort set {low, medium,
+/// high, xhigh}. Evidence notes for the values left OUT (S02 handoff): the
+/// wire enum on codex-cli 0.154.0 also serializes `minimal` (binary strings
+/// adjacency), but every model in the OBSERVED probe catalog
+/// (.agent-work/tmp/codex-app-server-probe/result-20260915-persistent.json,
+/// models/result/data[*]/supportedReasoningEfforts) lists only low..xhigh
+/// (some add the catalog tokens `max`/`ultra`, whose mapping onto the wire
+/// enum is unverified), so minimal/max/ultra stay out until a live run
+/// proves a model accepts them; zcode/dsh are bounded passthrough tokens
+/// because their supported sets are only known at runtime and admission
+/// must not fabricate a catalog.
 fn resolve_effort_selection(
     agent: &str,
     input: &GeneralSubmitInput,
@@ -839,7 +847,12 @@ mod admission_tests {
                 .as_deref(),
             Some("high")
         );
+        // `minimal` serializes on the codex wire enum but no OBSERVED model
+        // catalog lists it, and `max` is a catalog token whose wire mapping
+        // is unverified — both stay outside the admitted closed set.
         for invalid in [
+            "minimal",
+            "max",
             "ultra",
             "HIGH",
             "hi gh",

@@ -39,6 +39,7 @@ impl CodexRuntimeOwner {
             turn_tracker: Arc::new(TurnTracker::new()),
             session_id: Mutex::new(None),
             admitted_model: Mutex::new(None),
+            admitted_effort: Mutex::new(None),
             diagnostic_session_id: Mutex::new(None),
             current_turn: Mutex::new(None),
             retired_turns: Mutex::new(Vec::new()),
@@ -148,13 +149,23 @@ impl ManagedRuntime for CodexRuntimeOwner {
             &admitted.model,
             &task.workspace_path,
             admitted.permission_mode,
+            admitted.effort.as_deref(),
             deadline,
         )?;
         *self.shared.session_id.lock().unwrap() = Some(thread_id.clone());
         *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
+        // The admitted effort is stored beside the model so every follow-up
+        // turn keeps naming it instead of falling back to the low default.
+        *self.shared.admitted_effort.lock().unwrap() = admitted.effort.clone();
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.clone());
         let prompt = task.initial_prompt.clone();
-        let initial_turn_id = self.start_turn(&thread_id, &admitted.model, &prompt, deadline)?;
+        let initial_turn_id = self.start_turn(
+            &thread_id,
+            &admitted.model,
+            admitted.effort.as_deref(),
+            &prompt,
+            deadline,
+        )?;
         Ok(SessionReady {
             session_id: thread_id,
             initial_turn_id,
@@ -186,10 +197,14 @@ impl ManagedRuntime for CodexRuntimeOwner {
             &admitted.model,
             &task.workspace_path,
             admitted.permission_mode,
+            admitted.effort.as_deref(),
             deadline,
         )?;
         *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
         *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
+        // A resumed process must keep admitting the same effort, or the
+        // follow-up turn below would silently drop back to low.
+        *self.shared.admitted_effort.lock().unwrap() = admitted.effort.clone();
         // A resumed thread never replays the interrupted pre-crash turn: the
         // queued message below is the sole trigger for the next turn.
         Ok(SessionReady {
@@ -214,7 +229,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(RuntimeCommandError::Timeout)?;
-        let admitted = self
+        let admitted_model = self
             .shared
             .admitted_model
             .lock()
@@ -225,7 +240,16 @@ impl ManagedRuntime for CodexRuntimeOwner {
                     "codex thread has no admitted model for a follow-up turn".into(),
                 )
             })?;
-        self.start_turn(session_id, &admitted, content, deadline)
+        // The follow-up effort is stored at bootstrap/resume; a None keeps
+        // the historical low default rather than re-deriving anything.
+        let admitted_effort = self.shared.admitted_effort.lock().unwrap().clone();
+        self.start_turn(
+            session_id,
+            &admitted_model,
+            admitted_effort.as_deref(),
+            content,
+            deadline,
+        )
     }
 
     fn stop_turn(

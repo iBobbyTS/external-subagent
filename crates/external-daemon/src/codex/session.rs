@@ -70,6 +70,12 @@ impl CodexRuntimeOwner {
                             "codex task is missing its admitted model".into(),
                         )
                     })?,
+                    // The admitted effort lives at admission.effort
+                    // (prepared_launch_json.admission.effort). Reading it
+                    // from the prepared-launch top level instead would copy
+                    // the known requested_model_from_prepared_launch defect
+                    // (lib.rs) where the field is not actually persisted.
+                    effort: admission.effort.clone(),
                     permission_mode: prepared.permission_mode,
                 })
             }
@@ -82,6 +88,7 @@ impl CodexRuntimeOwner {
         model: &str,
         workspace_path: &str,
         permission_mode: external_core::PermissionMode,
+        requested_effort: Option<&str>,
         deadline: Instant,
     ) -> Result<String, RuntimeCommandError> {
         let posture = codex_posture(permission_mode)?;
@@ -146,6 +153,14 @@ impl CodexRuntimeOwner {
                 "start cwd does not match the task workspace".into(),
             ));
         }
+        // The start-side reasoningEffort echo is diagnostic-only: OBSERVED on
+        // codex-cli 0.154.0, a thread/start that carries no effort echoes
+        // the model default (gpt-5.6-terra: reasoningEffort="medium",
+        // defaultReasoningEffort="medium" — .agent-work/tmp/codex-app-server-
+        // probe/result-20260915-persistent.json), not an acknowledgement of
+        // the admitted selection, so comparing them would fail healthy
+        // starts. The turn itself still names the admitted effort.
+        note_start_effort_echo(requested_effort, &result);
         Ok(thread_id.to_owned())
     }
 
@@ -155,6 +170,7 @@ impl CodexRuntimeOwner {
         model: &str,
         workspace_path: &str,
         permission_mode: external_core::PermissionMode,
+        requested_effort: Option<&str>,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         let params = serde_json::json!({
@@ -224,6 +240,7 @@ impl CodexRuntimeOwner {
                 "resume cwd does not match the task workspace".into(),
             ));
         }
+        confirm_resumed_thread_effort(requested_effort, &result)?;
         Ok(())
     }
 
@@ -231,14 +248,17 @@ impl CodexRuntimeOwner {
         &self,
         thread_id: &str,
         model: &str,
+        admitted_effort: Option<&str>,
         input: &str,
         deadline: Instant,
     ) -> Result<Option<String>, RuntimeCommandError> {
         let previous = self.shared.turn_tracker.snapshot().generation;
+        // A task without an admitted effort keeps the historical default:
+        // its turn/start wire stays byte-identical with `"effort":"low"`.
         let params = serde_json::json!({
             "threadId": thread_id,
             "model": model,
-            "effort": "low",
+            "effort": admitted_effort.unwrap_or("low"),
             "input": [{"type": "text", "text": input}],
         });
         // A started notification is attributable only while the start
@@ -306,11 +326,71 @@ fn validate_thread_model(
     Ok(())
 }
 
-/// The admitted Codex thread identity: the model every turn must name and
-/// the permission mode whose posture pins the thread launch and every
-/// later resume.
+/// Record the thread/start `reasoningEffort` echo as a diagnostic only.
+/// A fresh thread has no prior turn, so the echo is the model's default
+/// effort rather than an acknowledgement of the admitted selection (OBSERVED
+/// on codex-cli 0.154.0: a start without an effort echoes "medium" for
+/// gpt-5.6-terra). Only a task that explicitly selected an effort is worth
+/// a note; an omitted effort keeps its low default silently.
+///
+/// Production code in this crate historically had no eprintln sites (the
+/// rpc/config.rs one is `cfg(test)`); these diagnostics go to stderr, which
+/// launchd captures into logs/daemon-error.log, and deliberately do not
+/// open a new observable field.
+fn note_start_effort_echo(requested_effort: Option<&str>, result: &serde_json::Value) {
+    let Some(requested_effort) = requested_effort else {
+        return;
+    };
+    if let Some(echo) = thread_result_field(result, "reasoningEffort") {
+        eprintln!(
+            "codex thread/start echoed reasoningEffort {} (the model default, not the admitted effort); turn/start still names the admitted {requested_effort}",
+            echo.as_str().unwrap_or("<non-string>")
+        );
+    }
+}
+
+/// Confirm the thread/resume-result `reasoningEffort` echo against the
+/// admitted effort. Unlike a fresh start, a resumed thread's echo reflects
+/// the effort its previous turn actually ran with (OBSERVED on codex-cli
+/// 0.154.0: a persistent thread resumed after a low turn echoes "low"), so
+/// a task that explicitly admitted an effort must see that effort echoed:
+/// a divergent echo fails closed before any follow-up `turn/start` is sent,
+/// while a missing echo (e.g. a thread resumed before any turn) is never
+/// compared against anything and only reaches the daemon diagnostic log.
+fn confirm_resumed_thread_effort(
+    requested_effort: Option<&str>,
+    result: &serde_json::Value,
+) -> Result<(), RuntimeCommandError> {
+    let Some(requested_effort) = requested_effort else {
+        return Ok(());
+    };
+    match thread_result_field(result, "reasoningEffort") {
+        Some(echo) => {
+            if echo.as_str() != Some(requested_effort) {
+                return Err(RuntimeCommandError::InvalidSession(format!(
+                    "resume reasoningEffort was not confirmed as the admitted {requested_effort}"
+                )));
+            }
+        }
+        None => {
+            // No echo to compare: record the unconfirmed admission as a
+            // stderr diagnostic (launchd captures it into
+            // logs/daemon-error.log) instead of fabricating a confirmation
+            // or opening a new observable field.
+            eprintln!(
+                "codex thread/resume result carried no reasoningEffort echo; the admitted effort {requested_effort} stays unconfirmed"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The admitted Codex thread identity: the model and optional reasoning
+/// effort every turn must name, and the permission mode whose posture pins
+/// the thread launch and every later resume.
 pub(super) struct AdmittedThread {
     pub(super) model: String,
+    pub(super) effort: Option<String>,
     pub(super) permission_mode: external_core::PermissionMode,
 }
 

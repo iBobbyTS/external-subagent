@@ -19,13 +19,19 @@ use std::{
 };
 
 fn codex_admission(model: Option<&str>) -> AdmissionIdentity {
+    codex_admission_with_effort(model, None)
+}
+
+/// [`codex_admission`] with an explicit admitted reasoning effort, mirroring
+/// the `prepared_launch_json.admission.effort` persistence shape.
+fn codex_admission_with_effort(model: Option<&str>, effort: Option<&str>) -> AdmissionIdentity {
     AdmissionIdentity {
         agent: "codex".into(),
         config_revision: 7,
         adapter_version: "test".into(),
         model: model.map(str::to_owned),
         model_source: "spawn_catalog".into(),
-        effort: None,
+        effort: effort.map(str::to_owned),
     }
 }
 
@@ -163,11 +169,23 @@ fn happy_turn(directory: &Path, mode: PermissionMode) -> String {
 /// test can pin exactly one divergence from the confirmed posture; an
 /// empty echo is a start result that carries no posture fields at all.
 fn happy_turn_with_echo(echo: &str) -> String {
-    let start_fields = if echo.is_empty() {
+    happy_turn_with_effort(echo, None)
+}
+
+/// [`happy_turn_with_echo`] plus a controllable `reasoningEffort` echo on
+/// the thread/start result: `Some(effort)` pins the echoed token (equal to
+/// or diverging from the admitted request), `None` is a result that does
+/// not carry the field at all — the three states the start-side effort
+/// confirmation has to distinguish.
+fn happy_turn_with_effort(echo: &str, effort_echo: Option<&str>) -> String {
+    let mut start_fields = if echo.is_empty() {
         r#""model":"gpt-5.6-terra""#.to_owned()
     } else {
         format!(r#""model":"gpt-5.6-terra",{echo}"#)
     };
+    if let Some(effort) = effort_echo {
+        start_fields.push_str(&format!(r#","reasoningEffort":"{effort}""#));
+    }
     format!(
         r#"
 IFS= read -r line
@@ -437,6 +455,180 @@ fn start_fails_closed_without_a_confirmed_posture() {
             );
         }
     }
+}
+
+#[test]
+fn start_effort_echo_is_diagnostic_only_and_never_blocks_the_turn() {
+    let _guard = scripted_test_guard();
+    // OBSERVED on codex-cli 0.154.0 (.agent-work/tmp/codex-app-server-probe/
+    // result-20260915-persistent.json): a thread/start without an effort
+    // echoes reasoningEffort="medium" — the gpt-5.6-terra model default
+    // (defaultReasoningEffort="medium"), not an acknowledgement of the
+    // admitted selection. The start-side echo is therefore diagnostic-only:
+    // whether the echo names the model default (medium), matches the
+    // admission (high), or is missing entirely, the first turn must still
+    // start and its turn/start frame must name the admitted effort.
+    for (index, effort_echo) in [Some("medium"), Some("high"), None].iter().enumerate() {
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let echo = start_echo(&directory, PermissionMode::Plan);
+        let scheduler = codex_scheduler(
+            &directory,
+            harness_factory(&happy_turn_with_effort(&echo, *effort_echo), &directory),
+        );
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(&directory, &format!("effort case {index}")),
+                Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(
+            result.result.outcome,
+            TaskOutcome::Completed,
+            "start echo case {index} must never block the turn"
+        );
+        assert_eq!(result.result.final_text, "CODEX_OK");
+        let deliveries = std::fs::read_to_string(directory.join("deliveries.jsonl")).unwrap();
+        let turn_start = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("turn/start frame");
+        assert_eq!(
+            turn_start["params"]["effort"], "high",
+            "the admitted effort must reach the turn/start frame (case {index})"
+        );
+    }
+}
+
+#[test]
+fn an_omitted_effort_keeps_the_low_default_on_the_turn_start_frame() {
+    let _guard = scripted_test_guard();
+    // No admitted effort: nothing is compared against the thread result and
+    // the turn/start wire keeps its historical `"effort":"low"` default.
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "default effort probe"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+    let turn_start = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("turn/start frame");
+    assert_eq!(turn_start["params"]["effort"], "low");
+}
+
+#[test]
+fn a_queued_followup_turn_in_the_same_process_keeps_the_admitted_effort() {
+    let _guard = scripted_test_guard();
+    // A message queued while the first turn is still active is delivered
+    // through the same live runtime (the first turn's natural completion
+    // defers to the queued message instead of terminating): the follow-up
+    // turn/start comes from send_turn reading the shared admitted effort,
+    // so both frames of the same process must name the admitted effort,
+    // never the low default.
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let echo = start_echo(&directory, PermissionMode::Plan);
+    // The scripted child pauses after the first turn/started and only
+    // finishes the turn once the follow-up message is queued, so the
+    // natural completion of turn 1 always sees the queued message and
+    // defers to it inside the same live process. The turn-2 frames are
+    // emitted only after the daemon's own follow-up turn/start request
+    // arrives: a started notification that precedes the start request in
+    // flight is dropped as unsolicited traffic by the attribution gate.
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+while [ ! -f release ]; do sleep 0.01; done
+printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"FIRST_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{{"type":"agentMessage","id":"msg_2","text":"SECOND_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"completed","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+    );
+    let scheduler = codex_scheduler(&directory, harness_factory(&script, &directory));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "first turn"),
+            Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    // With the first turn active the runtime is live: queueing now makes
+    // the first turn's natural completion defer to the message and deliver
+    // it through send_turn in the same process.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        if matches!(task.turn_state, external_store::TurnState::Active) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "first turn never became active");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "same-process-msg", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    std::fs::write(directory.join("release"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "SECOND_OK");
+
+    let deliveries = std::fs::read_to_string(directory.join("deliveries.jsonl")).unwrap();
+    let turn_starts = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|frame| frame["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert_eq!(turn_starts.len(), 2, "both turns run in the same process");
+    assert_eq!(turn_starts[0]["params"]["effort"], "high");
+    assert_eq!(
+        turn_starts[1]["params"]["effort"], "high",
+        "the same-process follow-up turn must not fall back to low"
+    );
+    assert!(turn_starts[1]["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("follow-up question"));
 }
 
 #[test]
@@ -1968,6 +2160,281 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
             .count();
         assert_eq!(turn_starts, 1, "the follow-up turn starts exactly once");
     }
+}
+
+/// A scripted resume phase with a controllable `reasoningEffort` echo on
+/// the id2 thread/resume result: `Some(effort)` pins the echoed token
+/// (equal to or diverging from the admitted request), `None` is a resume
+/// result that does not carry the field at all — the three states the
+/// resume-side effort confirmation has to distinguish.
+fn effort_resume_case(
+    directory: &Path,
+    effort_echo: Option<&str>,
+    child: &str,
+) -> CodexRuntimeFactory {
+    let echo = start_echo(directory, PermissionMode::Plan);
+    let effort_fields = effort_echo
+        .map(|effort| format!(r#","reasoningEffort":"{effort}""#))
+        .unwrap_or_default();
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}{effort_fields}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{{"type":"agentMessage","id":"msg_2","text":"RESUMED_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"completed","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; done
+"#
+    );
+    resume_phase_factory(directory, &script, child)
+}
+
+#[test]
+fn resume_keeps_the_admitted_effort_for_followup_turns() {
+    let _guard = scripted_test_guard();
+    // The admitted effort survives the process boundary. The resume echo is
+    // meaningful here unlike the start echo (OBSERVED on codex-cli 0.154.0:
+    // a persistent thread resumed after a low turn echoes "low"): it names
+    // the effort the previous turn actually ran with, so an equal echo
+    // confirms the admission and the follow-up turn keeps naming the
+    // admitted effort instead of falling back to low.
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-effort-ok",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(harness_factory(
+                &happy_turn_with_effort(
+                    &start_echo(&directory, PermissionMode::Plan),
+                    Some("high"),
+                ),
+                &directory,
+            ))),
+            second: effort_resume_case(&directory, Some("high"), "codex-resume-effort-ok.sh"),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "first turn"),
+            Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let first_turn_start = std::fs::read_to_string(directory.join("deliveries.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("first turn/start frame");
+    assert_eq!(first_turn_start["params"]["effort"], "high");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "effort-resume-msg", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    scheduler.start_ready().unwrap();
+    let resumed = await_result(&scheduler, &agent_id);
+    assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+    assert_eq!(resumed.result.final_text, "RESUMED_OK");
+
+    let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+        .expect("the resumed process logs its own frames");
+    let followup_turn_start = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("follow-up turn/start frame");
+    assert_eq!(
+        followup_turn_start["params"]["effort"], "high",
+        "a follow-up turn must not fall back to low"
+    );
+}
+
+#[test]
+fn resume_without_an_effort_echo_proceeds_with_a_diagnostic() {
+    let _guard = scripted_test_guard();
+    // A resume result that carries no reasoningEffort echo at all (a thread
+    // resumed before any turn ran): nothing is compared against anything
+    // and no echo is fabricated — the admission proceeds with a diagnostic
+    // note and the follow-up turn still names the admitted effort.
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-effort-none",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(harness_factory(
+                &happy_turn_with_effort(
+                    &start_echo(&directory, PermissionMode::Plan),
+                    Some("high"),
+                ),
+                &directory,
+            ))),
+            second: effort_resume_case(&directory, None, "codex-resume-effort-none.sh"),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "first turn"),
+            Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "effort-none-msg", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    scheduler.start_ready().unwrap();
+    let resumed = await_result(&scheduler, &agent_id);
+    assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+    assert_eq!(resumed.result.final_text, "RESUMED_OK");
+
+    let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+        .expect("the resumed process logs its own frames");
+    let followup_turn_start = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("follow-up turn/start frame");
+    assert_eq!(
+        followup_turn_start["params"]["effort"], "high",
+        "a missing echo must not demote the admitted effort"
+    );
+}
+
+#[test]
+fn resume_fails_closed_when_the_effort_echo_diverges() {
+    let _guard = scripted_test_guard();
+    // The resume result echoes a different reasoning effort than the one
+    // admitted at submit time: the resume fails closed before any follow-up
+    // turn is sent, while the persisted thread identity stays durable for
+    // a retry — mirroring the resume posture confirmation semantics.
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-effort-fail",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(harness_factory(
+                &happy_turn_with_effort(
+                    &start_echo(&directory, PermissionMode::Plan),
+                    Some("high"),
+                ),
+                &directory,
+            ))),
+            second: effort_resume_case(&directory, Some("low"), "codex-resume-effort-fail.sh"),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(30),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "first turn"),
+            Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "effort-fail-msg", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    assert!(
+        scheduler.start_ready().is_err(),
+        "a divergent resume effort echo must fail closed"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(
+        task.zcode_session_id.as_deref(),
+        Some(THREAD_ID),
+        "the persisted thread identity stays durable for a retry"
+    );
+    let record = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(
+        record.contains("resume reasoningEffort was not confirmed as the admitted high"),
+        "record: {record}"
+    );
+    let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+        .expect("the resumed process logs its own frames");
+    let turn_starts = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|frame| frame["method"] == "turn/start")
+        .count();
+    assert_eq!(
+        turn_starts, 0,
+        "no follow-up turn may start on an unconfirmed resume effort"
+    );
 }
 
 #[test]
