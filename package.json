@@ -39,8 +39,8 @@
   "files": [
     "bin/",
     "cli/",
-    "npm/",
-    "plugins/",
+    "npm/native/",
+    "plugins/codex/external-subagent/",
     "schema/",
     "launchd/",
     "scripts/release/",
