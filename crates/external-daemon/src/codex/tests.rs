@@ -50,11 +50,19 @@ fn codex_workspace() -> tempfile::TempDir {
 }
 
 fn manifest_for(workspace: &Path, prompt: &str) -> GeneralTaskManifest {
+    manifest_for_mode(workspace, prompt, PermissionMode::Plan)
+}
+
+fn manifest_for_mode(
+    workspace: &Path,
+    prompt: &str,
+    permission_mode: PermissionMode,
+) -> GeneralTaskManifest {
     GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: "codex-test".into(),
         repository: workspace.to_path_buf(),
-        permission_mode: PermissionMode::Plan,
+        permission_mode,
         prompt: prompt.into(),
         write_manifest: Vec::new(),
     }
@@ -199,7 +207,39 @@ fn public_submit_reaches_persistent_thread_and_persists_the_id() {
 }
 
 #[test]
-fn closed_gate_and_plan_only_tasks_refuse_spawn_without_a_process() {
+fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(HAPPY_TURN, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for_mode(workspace.path(), "run freely", PermissionMode::Yolo),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "CODEX_OK");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+    let thread_start = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|frame| frame["method"] == "thread/start")
+        .expect("thread/start frame");
+    assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+    assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
+    assert_eq!(thread_start["params"]["model"], MODEL);
+}
+
+#[test]
+fn closed_gate_and_unproven_write_modes_refuse_spawn_without_a_process() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(workspace.path(), CodexRuntimeFactory::closed());
@@ -214,8 +254,8 @@ fn closed_gate_and_plan_only_tasks_refuse_spawn_without_a_process() {
     let task = await_terminal_task(&scheduler, &submitted.agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Failed));
 
-    // Write modes refuse before the prompt: at the factory seam the
-    // admitted plan-only contract is re-checked fail-closed.
+    // build/edit refuse before the prompt: at the factory seam the
+    // admitted plan/yolo contract is re-checked fail-closed.
     let mut manifest = manifest_for(workspace.path(), "write mode");
     manifest.permission_mode = PermissionMode::Build;
     let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
@@ -250,11 +290,7 @@ fn closed_gate_and_plan_only_tasks_refuse_spawn_without_a_process() {
         created_at: 0,
     };
     let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
-    for mode in [
-        PermissionMode::Build,
-        PermissionMode::Edit,
-        PermissionMode::Yolo,
-    ] {
+    for mode in [PermissionMode::Build, PermissionMode::Edit] {
         let mut prepared_manifest = manifest_for(workspace.path(), "write mode");
         prepared_manifest.permission_mode = mode;
         let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
@@ -269,9 +305,11 @@ fn closed_gate_and_plan_only_tasks_refuse_spawn_without_a_process() {
         let error = harness_factory(HAPPY_TURN, workspace.path())
             .spawn(&mode_task, Arc::clone(&sink))
             .err()
-            .expect("write mode must refuse the spawn");
+            .expect("unproven write mode must refuse the spawn");
         assert!(
-            error.to_string().contains("only the plan permission mode"),
+            error
+                .to_string()
+                .contains("only the plan and yolo permission modes"),
             "write mode {mode:?} was not refused: {error}"
         );
     }
@@ -1569,6 +1607,244 @@ sleep 1
             .find(|frame| frame["method"] == "thread/resume")
             .expect("thread/resume frame");
         assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        let turn_starts = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|frame| frame["method"] == "turn/start")
+            .count();
+        assert_eq!(turn_starts, 0, "no turn may start on an unverified resume");
+    }
+}
+
+/// A scripted resume phase for a yolo task: the daemon resumes the
+/// persisted thread and drives one follow-up turn. `resume_result` is the
+/// id2 thread/resume result the fake server returns.
+fn yolo_resume_case(directory: &Path, resume_result: &str, child: &str) -> CodexRuntimeFactory {
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{resume_result}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{{"type":"agentMessage","id":"msg_2","text":"RESUMED_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"completed","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; done
+"#
+    );
+    resume_phase_factory(directory, &script, child)
+}
+
+#[test]
+fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
+    let _guard = scripted_test_guard();
+    // The live probe on codex-cli 0.154.0 resolved a persisted
+    // danger-full-access rollout as a narrowed workspace-write object;
+    // the faithful dangerFullAccess shape is accepted equally.
+    for (index, sandbox) in [
+        r#""sandbox":{"type":"dangerFullAccess"}"#,
+        r#""sandbox":{"excludeSlashTmp":false,"excludeTmpdirEnvVar":false,"networkAccess":false,"type":"workspaceWrite","writableRoots":[]}"#,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let resume_result = format!(
+            r#"{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{sandbox},"approvalPolicy":"never","cwd":"{}"}}}}"#,
+            directory.to_string_lossy()
+        );
+        let store =
+            Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let scheduler = Scheduler::new(
+            "codex-resume-yolo-ok",
+            store,
+            Arc::new(TwoPhaseFactory {
+                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                second: yolo_resume_case(
+                    &directory,
+                    &resume_result,
+                    &format!("codex-resume-yolo-ok-{index}.sh"),
+                ),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(&directory, "first turn", PermissionMode::Yolo),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let first_result = await_result(&scheduler, &agent_id);
+        assert_eq!(first_result.result.final_text, "CODEX_OK");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "first runtime was never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "yolo-resume-msg", "follow-up question")
+                .unwrap(),
+            crate::MessageDisposition::Queued
+        );
+        scheduler.start_ready().unwrap();
+        let resumed = await_result(&scheduler, &agent_id);
+        assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+        assert_eq!(resumed.result.final_text, "RESUMED_OK");
+
+        let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+            .expect("the resumed process logs its own frames");
+        let resume = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "thread/resume")
+            .expect("thread/resume frame");
+        assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        let turn_starts = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|frame| frame["method"] == "turn/start")
+            .count();
+        assert_eq!(turn_starts, 1, "the follow-up turn starts exactly once");
+    }
+}
+
+#[test]
+fn yolo_resume_fails_closed_without_a_confirmed_posture() {
+    let _guard = scripted_test_guard();
+    for (resume_result, marker) in [
+        // No posture fields at all: unverifiable means refused.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra"}}"#,
+            "danger-full-access",
+        ),
+        // The plan read-only object is a different permission mode's
+        // posture and is never accepted for a yolo task.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "danger-full-access",
+        ),
+        // The request-time string preset is not the resolved posture the
+        // live probe returns; it stays unconfirmed.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":"danger-full-access","approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "danger-full-access",
+        ),
+        // A network-capable reconstruction diverges from the observed
+        // no-network posture and fails closed.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"workspaceWrite","networkAccess":true,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "danger-full-access",
+        ),
+        // Extra writable roots are unconfirmed drift.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"workspaceWrite","networkAccess":false,"writableRoots":["/etc"],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "danger-full-access",
+        ),
+        // An approval policy other than never.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"on-request","cwd":"/elsewhere"}}"#,
+            "never",
+        ),
+        // A thread rooted somewhere other than the task workspace.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "task workspace",
+        ),
+    ] {
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let resume_script = format!(
+            r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{resume_result}'
+IFS= read -r line
+sleep 1
+"#
+        );
+        let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let scheduler = Scheduler::new(
+            "codex-resume-yolo-fail",
+            store,
+            Arc::new(TwoPhaseFactory {
+                first: Mutex::new(Some(harness_factory(HAPPY_TURN, &directory))),
+                second: resume_phase_factory(
+                    &directory,
+                    &resume_script,
+                    "codex-resume-yolo-fail.sh",
+                ),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(&directory, "first turn", PermissionMode::Yolo),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let first_result = await_result(&scheduler, &agent_id);
+        assert_eq!(first_result.result.final_text, "CODEX_OK");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "first runtime was never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "fail-msg", "follow-up question")
+                .unwrap(),
+            crate::MessageDisposition::Queued
+        );
+        assert!(
+            scheduler.start_ready().is_err(),
+            "an unconfirmed yolo posture must fail the resume closed"
+        );
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(
+            task.zcode_session_id.as_deref(),
+            Some(THREAD_ID),
+            "the persisted thread identity stays durable for a retry"
+        );
+        let record = scheduler.last_error(&agent_id).expect("failure record");
+        assert!(record.contains(marker), "record: {record}");
+
+        let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+            .expect("the resumed process logs its own frames");
         let turn_starts = deliveries
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())

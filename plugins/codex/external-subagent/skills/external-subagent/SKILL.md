@@ -37,7 +37,8 @@ Actual per-subagent limitations (from the accepted code):
 - `dsh` — disabled until explicitly enabled and configured
   (`runtime_path`/`home`/`profile`/`version`); admits only `build` and strict
   `plan`.
-- `codex` — disabled by default; read-only `plan` only (write modes are
-  refused before the prompt).
+- `codex` — disabled by default; `plan` (sandbox=read-only) and `yolo`
+  (sandbox=danger-full-access), both pinning approvalPolicy=never;
+  `build`/`edit` are refused before the prompt.
 - `observe` — verified public reasoning exists only for zcode tasks; observe
   on a non-zcode task truthfully errors `unavailable`.

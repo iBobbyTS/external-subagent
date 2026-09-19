@@ -183,11 +183,11 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
         ];
     }
     if agent == "codex" {
-        // Codex admission is deliberately read-only: plan maps to
-        // sandbox=read-only with approvalPolicy=never. The write modes stay
-        // refused before the prompt until an equivalent workspace-write
-        // confinement is proven.
-        return vec![AgentPermissionModeView::Plan];
+        // Codex admission is posture-pinned with approvalPolicy=never:
+        // plan maps to sandbox=read-only and yolo maps to
+        // sandbox=danger-full-access. build/edit stay refused before the
+        // prompt until a workspace-write confinement is proven equivalent.
+        return vec![AgentPermissionModeView::Plan, AgentPermissionModeView::Yolo];
     }
     vec![
         AgentPermissionModeView::Build,
@@ -423,17 +423,18 @@ pub(super) fn resolve_admission(
         }
     }
     if agent == "codex" {
-        // Codex admission is read-only: plan maps to sandbox=read-only with
-        // approvalPolicy=never. build/edit/yolo are refused before the prompt
-        // because the native workspace-write policy is not proven equivalent
-        // to this daemon's protected workspace confinement.
+        // Codex admission is posture-pinned with approvalPolicy=never:
+        // plan maps to sandbox=read-only and yolo maps to
+        // sandbox=danger-full-access. build/edit are refused before the
+        // prompt because the native workspace-write policy is not proven
+        // equivalent to this daemon's protected workspace confinement.
         if !matches!(
             input.manifest.permission_mode,
-            external_core::PermissionMode::Plan
+            external_core::PermissionMode::Plan | external_core::PermissionMode::Yolo
         ) {
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
-                "codex admission supports only the plan permission mode; prompt_count=0",
+                "codex admission supports only the plan and yolo permission modes; prompt_count=0",
             ));
         }
         // Home precedence is agents.codex.home over the inherited CODEX_HOME;
@@ -636,7 +637,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn codex_admission_accepts_plan_only_with_a_model_and_configured_home() {
+    fn codex_admission_accepts_plan_and_yolo_with_a_model_and_configured_home() {
         let directory = tempfile::tempdir().unwrap();
         let config = codex_gate_config(directory.path());
         let input = codex_input(directory.path(), external_core::PermissionMode::Plan);
@@ -644,6 +645,18 @@ mod admission_tests {
         assert_eq!(identity.agent, "codex");
         assert_eq!(identity.model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(identity.model_source, "spawn_catalog");
+
+        // Yolo admits too: it pins sandbox=danger-full-access with
+        // approvalPolicy=never at the thread boundary.
+        assert_eq!(
+            resolve_admission(
+                &codex_input(directory.path(), external_core::PermissionMode::Yolo),
+                &config
+            )
+            .unwrap()
+            .agent,
+            "codex"
+        );
 
         // The configured default is an equally valid selection.
         let mut default_model_input =
@@ -660,16 +673,17 @@ mod admission_tests {
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert!(error.message.contains("agents.codex.default_model"));
 
-        // Every write mode is refused before the prompt.
+        // The unproven write modes are refused before the prompt.
         for mode in [
             external_core::PermissionMode::Build,
             external_core::PermissionMode::Edit,
-            external_core::PermissionMode::Yolo,
         ] {
             let error =
                 resolve_admission(&codex_input(directory.path(), mode), &config).unwrap_err();
             assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
-            assert!(error.message.contains("only the plan permission mode"));
+            assert!(error
+                .message
+                .contains("only the plan and yolo permission modes"));
         }
 
         // No home from either source rejects before the prompt.
@@ -711,7 +725,7 @@ mod admission_tests {
             RpcErrorCode::AgentUnsupported
         );
 
-        // Capability projection is plan-only over the codex transport.
+        // Capability projection is plan+yolo over the codex transport.
         let evidence = AgentEvidenceStore::new(None);
         let status = configured_agent_statuses(&config, &evidence)
             .into_iter()
@@ -722,7 +736,10 @@ mod admission_tests {
             AgentTransportView::CodexAppServer
         );
         assert!(status.transport_support.spawn);
-        assert_eq!(status.permission_modes, vec![AgentPermissionModeView::Plan]);
+        assert_eq!(
+            status.permission_modes,
+            vec![AgentPermissionModeView::Plan, AgentPermissionModeView::Yolo]
+        );
         assert_eq!(
             status.model_selection,
             AgentModelSelectionCapabilityView {

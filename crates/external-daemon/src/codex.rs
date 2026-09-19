@@ -11,8 +11,9 @@
 //! existing scheduler, result, storage, and observation consumers keep working.
 //!
 //! Production spawn is selected only by the explicit configuration gate; the
-//! closed factory remains the fail-closed default. Only `plan` tasks are
-//! admitted (`sandbox=read-only`, `approvalPolicy=never`), and the child
+//! closed factory remains the fail-closed default. Only `plan` and `yolo`
+//! tasks are admitted, both pinning `approvalPolicy=never` (`plan` maps to
+//! `sandbox=read-only`, `yolo` to `sandbox=danger-full-access`), and the child
 //! always runs with an explicitly resolved `CODEX_HOME` — never a silent
 //! `~/.codex` fallback.
 

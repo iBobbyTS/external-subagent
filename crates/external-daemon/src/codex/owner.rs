@@ -142,18 +142,23 @@ impl ManagedRuntime for CodexRuntimeOwner {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(RuntimeCommandError::Timeout)?;
-        let model = Self::admitted_model(task)?;
+        let admitted = Self::admitted_thread(task)?;
         self.initialize_before_threads(deadline)?;
-        let thread_id = self.start_thread(&model, &task.workspace_path, deadline)?;
+        let thread_id = self.start_thread(
+            &admitted.model,
+            &task.workspace_path,
+            admitted.permission_mode,
+            deadline,
+        )?;
         *self.shared.session_id.lock().unwrap() = Some(thread_id.clone());
-        *self.shared.admitted_model.lock().unwrap() = Some(model.clone());
+        *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.clone());
         let prompt = task.initial_prompt.clone();
-        let initial_turn_id = self.start_turn(&thread_id, &model, &prompt, deadline)?;
+        let initial_turn_id = self.start_turn(&thread_id, &admitted.model, &prompt, deadline)?;
         Ok(SessionReady {
             session_id: thread_id,
             initial_turn_id,
-            configured_model: Some(model),
+            configured_model: Some(admitted.model),
         })
     }
 
@@ -173,18 +178,24 @@ impl ManagedRuntime for CodexRuntimeOwner {
             .ok_or_else(|| {
                 RuntimeCommandError::InvalidSession("task has no persisted session id".into())
             })?;
-        let model = Self::admitted_model(task)?;
+        let admitted = Self::admitted_thread(task)?;
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.initialize_before_threads(deadline)?;
-        self.resume_thread(thread_id, &model, &task.workspace_path, deadline)?;
+        self.resume_thread(
+            thread_id,
+            &admitted.model,
+            &task.workspace_path,
+            admitted.permission_mode,
+            deadline,
+        )?;
         *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
-        *self.shared.admitted_model.lock().unwrap() = Some(model.clone());
+        *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
         // A resumed thread never replays the interrupted pre-crash turn: the
         // queued message below is the sole trigger for the next turn.
         Ok(SessionReady {
             session_id: thread_id.to_owned(),
             initial_turn_id: None,
-            configured_model: Some(model),
+            configured_model: Some(admitted.model),
         })
     }
 

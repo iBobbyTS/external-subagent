@@ -152,6 +152,31 @@ only read; byte-identical before/after):
   `CODEX_CACHE_BINDING_MISMATCH` (the materialized cache carries the real
   root's different version/binding) with full staging/marketplace rollback.
 
+## App-server thread posture (verified 2026-09-18, codex-cli 0.154.0)
+
+Probed against `codex app-server --listen stdio://` with throwaway
+`CODEX_HOME` directories; no authenticated turn was driven (the one probe
+turn failed 401 as expected), so these are transport/posture facts, not
+model-behavior facts:
+
+- `thread/start` accepts the string sandbox presets `read-only` and
+  `danger-full-access` alongside `approvalPolicy: "never"`. The start
+  result resolves the sandbox as an object:
+  `{"type":"readOnly","networkAccess":false}` and
+  `{"type":"dangerFullAccess"}` respectively.
+- `thread/resume` of a read-only thread returns the same read-only object
+  (re-verified on 0.154.0; first observed on 0.153.4).
+- `thread/resume` of a danger-full-access thread returns the **narrowed
+  workspace-write reconstruction**
+  `{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}`
+  even though the rollout's `session_meta` persists
+  `"sandbox_policy":{"type":"danger-full-access"}`. The daemon therefore
+  confirms a yolo resume against either the faithful `dangerFullAccess`
+  object or that exact narrowed object (never wider: no network, no extra
+  writable roots); any other shape fails closed.
+- A thread is only resumable after a turn persists its rollout;
+  `thread/resume` before that errors with `no rollout found for thread id`.
+
 ## NOT_RUN
 
 - Installation into a real user `~/.codex` (requires explicit authorization).

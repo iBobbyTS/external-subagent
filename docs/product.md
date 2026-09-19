@@ -57,7 +57,7 @@ DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spaw
 
 - `zcode`：默认启用且支持 spawn；四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
 - `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。
-- `codex`（作为 subagent）：默认禁用；只接受只读 `plan`（写入模式在送出 prompt 前即被拒绝）。
+- `codex`（作为 subagent）：默认禁用；接受 `plan`（sandbox=read-only）与 `yolo`（sandbox=danger-full-access），两者都钉死 approvalPolicy=never；`build`/`edit` 在送出 prompt 前即被拒绝。
 - `observe`：已验证的公开推理只在 zcode 任务上存在；对非 zcode 任务调用 observe 会以 `unavailable` 如实报错。
 - MCP `status` 只携带路由／能力／就绪结论；部署身份、配置版本、适配器传输细节和逐 scope 探测证据属于操作员诊断，经 CLI `diagnose` 读取。
 

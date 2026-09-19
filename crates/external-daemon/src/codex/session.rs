@@ -48,7 +48,9 @@ impl CodexRuntimeOwner {
         Ok(())
     }
 
-    pub(super) fn admitted_model(task: &TaskRecord) -> Result<String, RuntimeCommandError> {
+    pub(super) fn admitted_thread(
+        task: &TaskRecord,
+    ) -> Result<AdmittedThread, RuntimeCommandError> {
         match task_route(task) {
             Ok(crate::TaskRoute::General(prepared)) => {
                 let admission = prepared.admission.as_ref().ok_or_else(|| {
@@ -61,18 +63,14 @@ impl CodexRuntimeOwner {
                         "runtime is not the admitted codex agent".into(),
                     ));
                 }
-                if !matches!(
-                    prepared.permission_mode,
-                    external_core::PermissionMode::Plan
-                ) {
-                    return Err(RuntimeCommandError::InvalidSession(
-                        "codex runtime supports only the plan permission mode".into(),
-                    ));
-                }
-                admission.model.clone().ok_or_else(|| {
-                    RuntimeCommandError::InvalidSession(
-                        "codex task is missing its admitted model".into(),
-                    )
+                codex_posture(prepared.permission_mode)?;
+                Ok(AdmittedThread {
+                    model: admission.model.clone().ok_or_else(|| {
+                        RuntimeCommandError::InvalidSession(
+                            "codex task is missing its admitted model".into(),
+                        )
+                    })?,
+                    permission_mode: prepared.permission_mode,
                 })
             }
             Err(message) => Err(RuntimeCommandError::InvalidSession(message)),
@@ -83,13 +81,15 @@ impl CodexRuntimeOwner {
         &self,
         model: &str,
         workspace_path: &str,
+        permission_mode: external_core::PermissionMode,
         deadline: Instant,
     ) -> Result<String, RuntimeCommandError> {
+        let posture = codex_posture(permission_mode)?;
         let params = serde_json::json!({
             "model": model,
             "cwd": workspace_path,
             "approvalPolicy": "never",
-            "sandbox": "read-only",
+            "sandbox": posture.sandbox,
             "ephemeral": false,
         });
         let response = self
@@ -125,6 +125,7 @@ impl CodexRuntimeOwner {
         thread_id: &str,
         model: &str,
         workspace_path: &str,
+        permission_mode: external_core::PermissionMode,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
         let params = serde_json::json!({
@@ -156,28 +157,30 @@ impl CodexRuntimeOwner {
             ));
         }
         validate_thread_model(model, result.get("model"))?;
-        // A resumed thread runs on a fresh process, so the plan-only
+        // A resumed thread runs on a fresh process, so the admitted
         // posture must be re-confirmed from the resume result before any
-        // turn is trusted: read-only sandbox, never-approve policy, and the
-        // persisted task workspace. An unconfirmed or divergent posture
-        // fails closed instead of resuming with write capability.
+        // turn is trusted: never-approve policy plus the sandbox matching
+        // the admitted permission mode. An unconfirmed or divergent
+        // posture fails closed instead of resuming with a different
+        // capability.
         //
-        // The live probe resolves the resumed sandbox as the object
-        // `{"type":"readOnly","networkAccess":false}`; only that exact
-        // read-only posture is accepted. Request-time string presets, any
-        // write mode, an unknown representation, or a network-capable
-        // sandbox are all unconfirmed and fail closed.
-        let sandbox_confirmed = resume_thread_field(&result, "sandbox").is_some_and(|value| {
-            value.get("type").and_then(|mode| mode.as_str()) == Some("readOnly")
-                && value
-                    .get("networkAccess")
-                    .and_then(|access| access.as_bool())
-                    == Some(false)
-        });
+        // The live probes resolve the resumed sandbox as an object
+        // (plan: `{"type":"readOnly","networkAccess":false}`; a yolo
+        // thread on codex-cli 0.154.0 resumes as the narrowed
+        // workspace-write reconstruction of its persisted
+        // danger-full-access rollout — the faithful
+        // `{"type":"dangerFullAccess"}` shape is accepted too).
+        // Request-time string presets, any posture belonging to another
+        // permission mode, an unknown representation, or a
+        // network-capable sandbox are all unconfirmed and fail closed.
+        let posture = codex_posture(permission_mode)?;
+        let sandbox_confirmed = resume_thread_field(&result, "sandbox")
+            .is_some_and(|value| resumed_sandbox_confirmed(value, permission_mode));
         if !sandbox_confirmed {
-            return Err(RuntimeCommandError::InvalidSession(
-                "resume sandbox was not confirmed as the read-only object".into(),
-            ));
+            return Err(RuntimeCommandError::InvalidSession(format!(
+                "resume sandbox was not confirmed as the {}",
+                posture.label
+            )));
         }
         if resume_thread_field(&result, "approvalPolicy").and_then(|value| value.as_str())
             != Some("never")
@@ -274,9 +277,76 @@ fn validate_thread_model(
     Ok(())
 }
 
-/// A plan-only posture field of the resumed thread, accepted from the
-/// thread object or the result root, mirroring how the resume result
-/// carries the model.
+/// The admitted Codex thread identity: the model every turn must name and
+/// the permission mode whose posture pins the thread launch and every
+/// later resume.
+pub(super) struct AdmittedThread {
+    pub(super) model: String,
+    pub(super) permission_mode: external_core::PermissionMode,
+}
+
+/// The pinned Codex thread posture for one admitted permission mode. Both
+/// admitted modes pin `approvalPolicy=never`: plan runs the read-only
+/// sandbox, yolo runs `danger-full-access` with no codex-side confinement.
+pub(super) struct CodexPosture {
+    pub(super) sandbox: &'static str,
+    pub(super) label: &'static str,
+}
+
+pub(super) fn codex_posture(
+    mode: external_core::PermissionMode,
+) -> Result<CodexPosture, RuntimeCommandError> {
+    match mode {
+        external_core::PermissionMode::Plan => Ok(CodexPosture {
+            sandbox: "read-only",
+            label: "read-only object",
+        }),
+        external_core::PermissionMode::Yolo => Ok(CodexPosture {
+            sandbox: "danger-full-access",
+            label: "danger-full-access posture",
+        }),
+        _ => Err(RuntimeCommandError::InvalidSession(
+            "codex runtime supports only the plan and yolo permission modes".into(),
+        )),
+    }
+}
+
+/// Confirm a resumed sandbox against the admitted permission mode. Plan
+/// threads must resume as the observed read-only object. A yolo thread
+/// must resume as the faithful `{"type":"dangerFullAccess"}` object or as
+/// the exact narrowed workspace-write reconstruction codex-cli 0.154.0
+/// returns for a persisted danger-full-access rollout; both confirmed
+/// shapes are the requested posture or strictly narrower (no network, no
+/// extra writable roots), so any other object fails closed.
+fn resumed_sandbox_confirmed(
+    sandbox: &serde_json::Value,
+    mode: external_core::PermissionMode,
+) -> bool {
+    match mode {
+        external_core::PermissionMode::Plan => {
+            sandbox.get("type").and_then(|value| value.as_str()) == Some("readOnly")
+                && sandbox
+                    .get("networkAccess")
+                    .and_then(|access| access.as_bool())
+                    == Some(false)
+        }
+        external_core::PermissionMode::Yolo => {
+            *sandbox == serde_json::json!({"type": "dangerFullAccess"})
+                || *sandbox
+                    == serde_json::json!({
+                        "type": "workspaceWrite",
+                        "networkAccess": false,
+                        "writableRoots": [],
+                        "excludeSlashTmp": false,
+                        "excludeTmpdirEnvVar": false,
+                    })
+        }
+        _ => false,
+    }
+}
+
+/// A resumed-thread posture field, accepted from the thread object or the
+/// result root, mirroring how the resume result carries the model.
 fn resume_thread_field<'a>(
     result: &'a serde_json::Value,
     key: &str,

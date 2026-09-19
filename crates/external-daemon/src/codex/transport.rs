@@ -35,9 +35,10 @@ pub(super) fn spawn_codex_pump(
                     }
                 }
                 if let Inbound::Message(WireMessage::Request(request)) = &event {
-                    // Plan-mode Codex (approvalPolicy=never) should not issue
-                    // interaction requests; anything it does issue stays an
-                    // observable, non-respondable record instead of hanging.
+                    // Every admitted Codex thread pins approvalPolicy=never
+                    // (plan read-only, yolo danger-full-access) and should not
+                    // issue interaction requests; anything it does issue stays
+                    // an observable, non-respondable record instead of hanging.
                     let unsupported = RequestEnvelope::new(
                         request.id.clone(),
                         external_contract::INTERACTION_REQUEST_UNSUPPORTED_INPUT,
