@@ -368,14 +368,22 @@ impl Scheduler {
                 activity.observation_snapshot(),
                 activity.runtime_source_verified(),
             ),
-            None => (
-                observation::ObservationSnapshot::unavailable(),
-                // A task without a launch-scoped activity (never started, or
-                // claimed before this daemon's ownership) has no adapter
-                // evidence of its own; the scheduler-global ZCode proof must
-                // not stand in for a missing or retired activity.
-                false,
-            ),
+            None => {
+                // No activity means no captured history, even when the adapter
+                // has a public protocol. Never borrow a global runtime proof.
+                let mut snapshot = observation::ObservationSnapshot::unavailable();
+                if self
+                    .inner
+                    .store
+                    .get_task(agent_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|task| task_agent(&task) == "dsh")
+                {
+                    snapshot.reasoning.source = observation::ReasoningSource::dsh();
+                }
+                (snapshot, false)
+            }
         }
     }
 

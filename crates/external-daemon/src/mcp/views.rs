@@ -109,7 +109,7 @@ impl From<AgentCapabilitiesView> for PublicAgentCapabilities {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentObserveOutput {
     pub tools: Vec<PublicObservedTool>,
-    pub reasoning: PublicObservedReasoning,
+    pub reasoning: Option<PublicObservedReasoning>,
     pub coverage: PublicObservationCoverage,
 }
 
@@ -122,10 +122,9 @@ impl JsonSchema for AgentObserveOutput {
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-        let mut value: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../schema/observation.schema.json"
-        ))
-        .expect("packaged observation schema must be valid JSON");
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../schema/observation.schema.json"))
+                .expect("packaged observation schema must be valid JSON");
         value
             .as_object_mut()
             .expect("packaged observation schema must be an object")
@@ -181,10 +180,10 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
     fn try_from(value: TaskObservationView) -> Result<Self, Self::Error> {
         if value.schema != OBSERVATION_SCHEMA
             || value.count_scope != "agent_lifetime"
-            || value.reasoning.source.status != "VERIFIED_RUNTIME_PUBLIC"
-            || value.reasoning.source.runtime_version != "3.11.2"
-            || value.reasoning.source.event_type != "model.streaming"
-            || value.reasoning.source.delta_pointer != "/params/payload/delta"
+            || value.reasoning.as_ref().is_some_and(|reasoning| {
+                !reasoning.source.is_verified_public() || reasoning.text.chars().count() > 200
+            })
+            || (value.reasoning.is_none() && value.coverage.reasoning_complete)
         {
             return Err(protocol_error());
         }
@@ -208,10 +207,10 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
                         .collect(),
                 })
                 .collect(),
-            reasoning: PublicObservedReasoning {
-                text: value.reasoning.text,
-                truncated: value.reasoning.truncated,
-            },
+            reasoning: value.reasoning.map(|reasoning| PublicObservedReasoning {
+                text: reasoning.text,
+                truncated: reasoning.truncated,
+            }),
             coverage: PublicObservationCoverage {
                 tool_history_complete: value.coverage.tool_history_complete,
                 reasoning_complete: value.coverage.reasoning_complete,
@@ -663,5 +662,62 @@ mod effort_projection_tests {
         assert_eq!(public.input_identity.effort.as_deref(), Some("high"));
         let encoded = serde_json::to_value(&public).unwrap();
         assert_eq!(encoded["input_identity"]["effort"], "high");
+    }
+}
+
+#[cfg(test)]
+mod observation_contract_tests {
+    use super::*;
+    use crate::observation::{ObservationSnapshot, ReasoningSource};
+
+    #[test]
+    fn three_adapter_projections_match_schema_and_reject_source_drift() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../schema/observation.schema.json"))
+                .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        for source in [
+            Some(ReasoningSource::verified()),
+            Some(ReasoningSource::dsh()),
+            None,
+        ] {
+            let snapshot = ObservationSnapshot::unavailable();
+            let mut reasoning = snapshot.reasoning;
+            reasoning.text = "中🙂".repeat(100);
+            let view = TaskObservationView {
+                schema: OBSERVATION_SCHEMA.into(),
+                agent_id: "10000000".into(),
+                count_scope: "agent_lifetime".into(),
+                tools: snapshot.tools,
+                reasoning: source.map(|source| {
+                    reasoning.source = source;
+                    reasoning
+                }),
+                coverage: snapshot.coverage,
+            };
+            let output = AgentObserveOutput::try_from(view.clone()).unwrap();
+            let value = serde_json::to_value(output).unwrap();
+            assert!(validator.is_valid(&value));
+            if view.reasoning.is_none() {
+                assert!(value["reasoning"].is_null());
+                let mut false_coverage = view;
+                false_coverage.coverage.reasoning_complete = true;
+                assert!(AgentObserveOutput::try_from(false_coverage).is_err());
+            } else {
+                assert_eq!(
+                    value["reasoning"]["text"].as_str().unwrap().chars().count(),
+                    200
+                );
+                for field in ["status", "runtime_version", "event_type", "delta_pointer"] {
+                    let mut drifted = serde_json::to_value(&view).unwrap();
+                    drifted["reasoning"]["source"][field] = "unverified".into();
+                    let drifted: TaskObservationView = serde_json::from_value(drifted).unwrap();
+                    assert!(AgentObserveOutput::try_from(drifted).is_err());
+                }
+                let mut oversized = view;
+                oversized.reasoning.as_mut().unwrap().text.push('x');
+                assert!(AgentObserveOutput::try_from(oversized).is_err());
+            }
+        }
     }
 }

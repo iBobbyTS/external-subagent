@@ -103,6 +103,7 @@
       "additionalProperties": false
     },
     "observe": {
+      "description": "Read captured task observations for zcode, dsh or codex. zcode and dsh expose at most 200 Unicode characters of public reasoning; codex reasoning is null. Coverage reports capture gaps and unsupported history truthfully.",
       "type": "object",
       "required": ["agent_id"],
       "properties": {

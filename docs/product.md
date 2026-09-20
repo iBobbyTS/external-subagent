@@ -72,7 +72,7 @@ spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 
 - `zcode`：默认启用且支持 spawn；四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
 - `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。
 - `codex`（作为 subagent）：默认禁用；支持四模式：`build`/`edit` → sandbox=workspace-write，`plan` → sandbox=read-only，`yolo` → sandbox=danger-full-access；全部钉死 approvalPolicy=never。不支持非空 `write_manifest`，在创建任务前以 `codex_write_manifest_unsupported` 拒绝。
-- `observe`：已验证的公开推理只在 zcode 任务上存在；对非 zcode 任务调用 observe 会以 `unavailable` 如实报错。
+- `observe`：三种 subagent 均可调用；zcode（保留运行时来源校验）与 dsh 返回公开推理尾部最多 200 字符，codex 不采集推理，整个 `reasoning` 字段为 `null`。工具历史和 coverage 按 adapter 能力与实际采集缺口返回。
 - MCP `status` 只携带路由／能力／就绪结论；部署身份、配置版本、适配器传输细节和逐 scope 探测证据属于操作员诊断，经 CLI `diagnose` 读取。
 
 ## CLI 生命周期

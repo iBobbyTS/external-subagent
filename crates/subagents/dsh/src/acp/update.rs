@@ -27,7 +27,8 @@ pub enum UpdateKind {
         committed: bool,
     },
     AgentThoughtChunk {
-        text: String,
+        /// None records an extraction failure; Some("") is a valid empty chunk.
+        text: Option<String>,
     },
     ToolCall {
         tool_call_id: String,
@@ -103,7 +104,7 @@ pub fn parse_update(params: &Value) -> Option<SessionUpdate> {
             committed: false,
         },
         "agent_thought_chunk" | "agent_thought" | "thought" => UpdateKind::AgentThoughtChunk {
-            text: block_text(update.get("content").unwrap_or(&Value::Null)).unwrap_or_default(),
+            text: block_text(update.get("content").unwrap_or(&Value::Null)),
         },
         "tool_call" => UpdateKind::ToolCall {
             tool_call_id: bounded_id(update.get("toolCallId"))?,
@@ -180,7 +181,9 @@ pub fn canonical_event_payloads(
             }
             events
         }
-        UpdateKind::AgentThoughtChunk { text } if !text.is_empty() => {
+        UpdateKind::AgentThoughtChunk { text } if text.as_deref() != Some("") => {
+            // A null delta carries the failed extraction through the publisher
+            // to observation's existing malformed-reasoning coverage accounting.
             vec![base(json!({"kind": "reasoning_delta", "delta": text}))]
         }
         UpdateKind::ToolCall {
@@ -297,7 +300,9 @@ mod tests {
         let thought = parse_update(&upstream_thought()).unwrap();
         assert_eq!(
             thought.kind,
-            UpdateKind::AgentThoughtChunk { text: "hmm".into() }
+            UpdateKind::AgentThoughtChunk {
+                text: Some("hmm".into())
+            }
         );
     }
 

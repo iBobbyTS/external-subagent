@@ -75,6 +75,20 @@ impl ReasoningSource {
             delta_pointer: VERIFIED_DELTA_POINTER.into(),
         }
     }
+
+    /// DSH's public ACP thought contract, independent of the ZCode file pin.
+    pub fn dsh() -> Self {
+        Self {
+            status: "VERIFIED_PROTOCOL_PUBLIC".into(),
+            runtime_version: "acp/1".into(),
+            event_type: "agent_thought_chunk".into(),
+            delta_pointer: "/params/update/content/text".into(),
+        }
+    }
+
+    pub fn is_verified_public(&self) -> bool {
+        *self == Self::verified() || *self == Self::dsh()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +125,8 @@ struct ToolGroup {
 }
 
 pub struct ObservationState {
+    collect_reasoning: bool,
+    reasoning_source: ReasoningSource,
     snapshot_seq: u64,
     next_call_seq: u64,
     seen_source_events: HashSet<String>,
@@ -127,6 +143,8 @@ pub struct ObservationState {
 impl Default for ObservationState {
     fn default() -> Self {
         Self {
+            collect_reasoning: true,
+            reasoning_source: ReasoningSource::verified(),
             snapshot_seq: 0,
             next_call_seq: 0,
             seen_source_events: HashSet::new(),
@@ -143,6 +161,23 @@ impl Default for ObservationState {
 }
 
 impl ObservationState {
+    pub fn for_adapter(adapter: &str) -> Self {
+        let public = matches!(adapter, "zcode" | "dsh");
+        Self {
+            collect_reasoning: public,
+            reasoning_complete: public,
+            // DSH projects calls without their inputs; Codex does not
+            // project canonical tool history at all. Neither is complete.
+            tool_history_complete: adapter == "zcode",
+            reasoning_source: if adapter == "dsh" {
+                ReasoningSource::dsh()
+            } else {
+                ReasoningSource::verified()
+            },
+            ..Self::default()
+        }
+    }
+
     pub fn observe_message(&mut self, method: &str, params: &Value) {
         if method != "session/event"
             || params.get("type").and_then(Value::as_str) != Some(VERIFIED_EVENT_TYPE)
@@ -152,6 +187,9 @@ impl ObservationState {
         let payload = params.get("payload").unwrap_or(&Value::Null);
         let kind = payload.get("kind").and_then(Value::as_str);
         if !matches!(kind, Some("reasoning_delta" | "tool_call")) {
+            return;
+        }
+        if kind == Some("reasoning_delta") && !self.collect_reasoning {
             return;
         }
         let Some(event_id) = valid_id(params.get("eventId")) else {
@@ -216,8 +254,14 @@ impl ObservationState {
         };
         let turn_id = valid_id(params.get("turnId")).unwrap_or("");
         let identity = format!("{turn_id}\0{call_id}");
-        let (arguments, arguments_truncated, redacted_fields) =
+        let (arguments, mut arguments_truncated, redacted_fields) =
             project_arguments(payload.get("input"));
+        if self.reasoning_source == ReasoningSource::dsh()
+            && !payload.get("input").is_some_and(Value::is_object)
+        {
+            // An absent ACP input is unknown, not an observed empty object.
+            arguments_truncated = true;
+        }
 
         if let Some((original_name, seq)) = self.seen_calls.get(&identity).cloned() {
             if let Some(call) = self
@@ -309,7 +353,7 @@ impl ObservationState {
             reasoning: ObservedReasoning {
                 text,
                 truncated: self.reasoning_truncated,
-                source: ReasoningSource::verified(),
+                source: self.reasoning_source.clone(),
             },
             coverage: ObservationCoverage {
                 tool_history_complete: self.tool_history_complete,
@@ -388,15 +432,12 @@ fn project_arguments(input: Option<&Value>) -> (Map<String, Value>, bool, u64) {
     (projected, true, excluded_fields)
 }
 
-/// The pinned runtime file above is a proof about the ZCode adapter only.
-/// Bind observation evidence to the adapter that actually launches the task
-/// (the same `task_agent` identity the routing factory dispatches on): every
-/// adapter without a verified public-source contract is explicitly
-/// unverified, so a non-ZCode subagent can never borrow the scheduler-global
-/// ZCode proof, no matter which runtime file is configured or installed.
+/// ZCode retains its pinned runtime evidence; DSH uses its public ACP
+/// thought contract. Codex has no public reasoning source.
 pub fn adapter_runtime_source_verified(adapter: &str, runtime_source: Option<&Path>) -> bool {
     match adapter {
         "zcode" => runtime_source_verified(runtime_source),
+        "dsh" => true,
         _ => false,
     }
 }
@@ -820,7 +861,7 @@ mod tests {
         // pin is a proof about the ZCode runtime only. These verdicts hold
         // whether or not that file actually exists on the machine.
         let pinned = Path::new(VERIFIED_RUNTIME_PATH);
-        for adapter in ["dsh", "codex", "dsh-preview", "codex-cli", ""] {
+        for adapter in ["codex", "dsh-preview", "codex-cli", ""] {
             assert!(
                 !adapter_runtime_source_verified(adapter, Some(pinned)),
                 "adapter {adapter:?} must not borrow the ZCode pin"
@@ -845,10 +886,7 @@ mod tests {
             "zcode",
             Some(changed.path())
         ));
-        assert!(!adapter_runtime_source_verified(
-            "dsh",
-            Some(changed.path())
-        ));
+        assert!(adapter_runtime_source_verified("dsh", Some(changed.path())));
         assert!(!adapter_runtime_source_verified(
             "codex",
             Some(changed.path())

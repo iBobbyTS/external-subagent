@@ -227,7 +227,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 
 ## 7. external_subagent_observe
 
-仅在怀疑 ZCode 任务无进展循环时使用，不作为健康任务的常规轮询。读取已捕获的公开数据，不启动模型、不执行工具、不自动判定循环或取消。
+仅在怀疑 subagent 任务无进展循环时使用，不作为健康任务的常规轮询。读取已捕获的公开数据，不启动模型、不执行工具、不自动判定循环或取消。
 
 输入：
 
@@ -248,13 +248,15 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | `recent_calls[].arguments` | object | 判断是否重复相同输入、是否在探索新路径 | 只有名称无法判断动作是否等价 |
 | `recent_calls[].arguments_truncated` | boolean | 判断参数是否完整 | 易把被截断参数误当作完整输入 |
 | `recent_calls[].redacted_fields` | integer | 说明字段脱敏数量 | 易把缺失数据误当作没有提供 |
-| `reasoning` | object | 公开推理尾部的容器 | 缺少动作上下文 |
+| `reasoning` | object 或 null | zcode/dsh 公开推理尾部的容器；codex 整个字段为 null | 缺少动作上下文 |
 | `reasoning.text` | string，最多 200 Unicode 字符 | 理解最近公开思路 | 判断上下文减少；不含加密内容或私有推理 |
 | `reasoning.truncated` | boolean | 提醒只看到了尾部片段 | 易把片段当作完整解释 |
 | `coverage` | object | 描述采集完整性 | 无法评估观测证据的局限 |
 | `coverage.tool_history_complete` | boolean | 判断工具历史采集是否完整 | 易把未观测到当作没发生；不意味着有限窗口返回所有调用 |
 | `coverage.reasoning_complete` | boolean | 判断推理采集覆盖 | 易对缺失片段过度推断 |
 | `coverage.dropped_events` | integer | 量化丢弃事件 | 无法衡量证据缺口 |
+
+zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；工具调用计数可见，但当前 adapter 不投影工具输入，返回空参数对象并标记 `arguments_truncated: true`，`coverage.tool_history_complete: false`。codex 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`；其工具输入历史当前未由 adapter 完整投影，`coverage.tool_history_complete: false`。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
 
 不返回工具结果，因而不能据此证明执行成功、文件没有变化或任务失败。公开描述中的 `PROGRESSING / EXPECTED_WAIT / NEEDS_CLARIFICATION / NO_PROGRESS_LOOP / INSUFFICIENT_OBSERVABILITY` 是调用方判断用语，**不是返回字段或服务端分类结果**。
 

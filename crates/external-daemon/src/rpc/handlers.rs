@@ -470,7 +470,8 @@ impl RpcService {
                 let task = self.require_task(&agent_id)?;
                 let (snapshot, runtime_source_verified) =
                     self.scheduler.observation_snapshot(&task.agent_id);
-                if !runtime_source_verified {
+                let adapter = crate::task_agent(&task);
+                if !runtime_source_verified && adapter != "dsh" && adapter != "codex" {
                     return Err(RpcError::new(
                         RpcErrorCode::Unavailable,
                         "observation runtime source is not verified",
@@ -482,7 +483,7 @@ impl RpcService {
                         agent_id: task.agent_id,
                         count_scope: "agent_lifetime".into(),
                         tools: snapshot.tools,
-                        reasoning: snapshot.reasoning,
+                        reasoning: (adapter != "codex").then_some(snapshot.reasoning),
                         coverage: snapshot.coverage,
                     },
                 })
@@ -940,6 +941,7 @@ mod observe_gate_tests {
 
     fn service_with_pinned_source(
         directory: &std::path::Path,
+        adapter: &str,
     ) -> (Arc<RpcService>, external_store::TaskRecord) {
         let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
         let factory = Arc::new(CommandRuntimeFactory::new(
@@ -965,9 +967,9 @@ mod observe_gate_tests {
             prompt: "observe gate fixture".into(),
             write_manifest: Vec::new(),
         };
-        // A queued DSH task was accepted for admission but never launched.
+        // The task was accepted for admission but never launched.
         let submitted = scheduler
-            .enqueue_general_with_admission(&manifest, Some(admission("dsh")))
+            .enqueue_general_with_admission(&manifest, Some(admission(adapter)))
             .unwrap();
         let task = submitted;
         let service = Arc::new(RpcService::new(scheduler, store).unwrap());
@@ -975,21 +977,95 @@ mod observe_gate_tests {
     }
 
     #[test]
-    fn task_observe_reports_unavailable_without_launch_scoped_evidence() {
+    fn task_observe_active_trackers_publish_only_adapter_public_reasoning() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
-        let directory = tempfile::Builder::new()
-            .prefix("s04-observe-gate-")
-            .tempdir_in(root)
-            .unwrap();
-        let (service, task) = service_with_pinned_source(directory.path());
-        // The never-launched DSH task has no activity; even the pinned ZCode
-        // runtime configured globally must not satisfy the observe gate.
-        let error = service
-            .dispatch(RpcMethod::TaskObserve {
-                agent_id: task.agent_id.clone(),
-            })
-            .unwrap_err();
-        assert_eq!(error.code, RpcErrorCode::Unavailable);
+        for adapter in ["zcode", "dsh", "codex"] {
+            let directory = tempfile::Builder::new()
+                .prefix("s07-active-")
+                .tempdir_in(&root)
+                .unwrap();
+            let (service, task) = service_with_pinned_source(directory.path(), adapter);
+            // Supply the launch-scoped verdict; production obtains it from
+            // the pinned file (zcode) or the public ACP contract (dsh).
+            let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter(
+                adapter,
+                adapter != "codex",
+            ));
+            tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+                external_contract::WireMessage::UnknownEvent {
+                    method: "session/event".into(),
+                    raw: serde_json::json!({"params":{
+                        "type":"model.streaming", "eventId":"e1", "turnId":"t1",
+                        "payload":{"kind":"reasoning_delta", "delta":"中🙂".repeat(110), "encrypted_content":"SECRET"}
+                    }}),
+                }
+            )));
+            service
+                .scheduler
+                .inner
+                .state
+                .lock()
+                .unwrap()
+                .activities
+                .insert(task.agent_id.clone(), tracker);
+            let RpcSuccess::TaskObserved { observation } = service
+                .dispatch(RpcMethod::TaskObserve {
+                    agent_id: task.agent_id,
+                })
+                .unwrap()
+            else {
+                panic!("expected observation");
+            };
+            assert!(observation.tools.is_empty());
+            assert_eq!(
+                observation.coverage.tool_history_complete,
+                adapter == "zcode"
+            );
+            assert_eq!(observation.coverage.reasoning_complete, adapter != "codex");
+            assert_eq!(observation.coverage.dropped_events, 0);
+            let encoded = serde_json::to_value(observation).unwrap();
+            assert!(!encoded.to_string().contains("SECRET"));
+            if adapter == "codex" {
+                assert!(encoded["reasoning"].is_null());
+            } else {
+                assert_eq!(encoded["reasoning"]["text"], "中🙂".repeat(100));
+                assert_eq!(encoded["reasoning"]["truncated"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn task_observe_missing_activity_preserves_adapter_policy_and_coverage() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        for adapter in ["zcode", "dsh", "codex"] {
+            let directory = tempfile::Builder::new()
+                .prefix("s07-observe-")
+                .tempdir_in(&root)
+                .unwrap();
+            let (service, task) = service_with_pinned_source(directory.path(), adapter);
+            let result = service.dispatch(RpcMethod::TaskObserve {
+                agent_id: task.agent_id,
+            });
+            if adapter == "zcode" {
+                assert_eq!(result.unwrap_err().code, RpcErrorCode::Unavailable);
+                continue;
+            }
+            let RpcSuccess::TaskObserved { observation } = result.unwrap() else {
+                panic!("expected observation");
+            };
+            assert!(observation.tools.is_empty());
+            assert!(!observation.coverage.tool_history_complete);
+            assert!(!observation.coverage.reasoning_complete);
+            assert_eq!(observation.coverage.dropped_events, 0);
+            if adapter == "codex" {
+                assert!(serde_json::to_value(&observation).unwrap()["reasoning"].is_null());
+            } else {
+                let reasoning = observation.reasoning.as_ref().unwrap();
+                assert!(reasoning.text.is_empty());
+                assert_eq!(reasoning.source, crate::observation::ReasoningSource::dsh());
+            }
+        }
     }
 }

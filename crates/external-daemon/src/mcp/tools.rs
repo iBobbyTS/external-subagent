@@ -401,7 +401,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_observe",
     output_schema = tool_output_schema::<AgentObserveOutput>(),
-    description = "仅在怀疑 zcode subagent 陷入无意义循环时才调用，检查最近公开推理和工具调用过程；不要用于健康任务的例行轮询。只读已捕获的本 Agent 数据，不启动模型或工具。默认按本 Agent 任务生命周期内的调用次数选最多的 3 类工具，每类返回最近最多 5 次调用（名称、ID、参数，不含结果），并返回已验证公开 reasoning delta 合并后的最新 200 个 Unicode 字符。encrypted_content 始终排除。本工具不判断循环、不返回进展标签、不自动取消。调用方结合当前任务与这些事实判断：PROGRESSING（新增事实或有效推进）；EXPECTED_WAIT（有目的的计算、权限或外部等待）；NEEDS_CLARIFICATION（具体输入或决定缺失）；NO_PROGRESS_LOOP（无新信息的等价行动循环，且合理重读、等待、状态变化等解释已排除）；INSUFFICIENT_OBSERVABILITY（截断、缺口或缺少上下文，不能断言循环）。相同文本、重复 read 或 true/echo 本身不是循环；没有工具结果也不能推断工具成功、文件未变化或任务失败。判断和取消由调用方独立决定。",
+    description = "仅在怀疑 subagent 陷入无意义循环时才调用，检查最近公开推理和工具调用过程；不要用于健康任务的例行轮询。只读已捕获的本 Agent 数据，不启动模型或工具。默认按本 Agent 任务生命周期内的调用次数选最多的 3 类工具，每类返回最近最多 5 次调用（名称、ID、参数，不含结果），zcode/dsh 返回已验证公开 reasoning delta 合并后的最新 200 个 Unicode 字符；codex 不采集推理，整个 reasoning 字段为 null，coverage 如实标记未采集能力。encrypted_content 始终排除。本工具不判断循环、不返回进展标签、不自动取消。调用方结合当前任务与这些事实判断：PROGRESSING（新增事实或有效推进）；EXPECTED_WAIT（有目的的计算、权限或外部等待）；NEEDS_CLARIFICATION（具体输入或决定缺失）；NO_PROGRESS_LOOP（无新信息的等价行动循环，且合理重读、等待、状态变化等解释已排除）；INSUFFICIENT_OBSERVABILITY（截断、缺口或缺少上下文，不能断言循环）。相同文本、重复 read 或 true/echo 本身不是循环；没有工具结果也不能推断工具成功、文件未变化或任务失败。判断和取消由调用方独立决定。",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -1228,11 +1228,10 @@ mod contract_default_tests {
             .find(|tool| tool.name == "external_subagent_observe")
             .unwrap();
         let description = observe.description.as_deref().unwrap();
-        // Frozen so any wording change is deliberate (S12 re-branded the
-        // legacy self-reference to 本工具; the digest was re-derived then).
+        // Frozen description, re-derived for the three-adapter observation contract.
         assert_eq!(
             format!("{:x}", Sha256::digest(description.as_bytes())),
-            "4b2e476ff5c704fa6b16e2be849bdd8abc3147d21323fe52bbe274efac45f9b9"
+            "c78ea8e6c8677dc3f5e4ab9fbba376e65eb069459486951b467123aff58fdfd8"
         );
         let input = serde_json::to_value(&observe.input_schema).unwrap();
         assert_eq!(input["additionalProperties"], false);
@@ -1253,12 +1252,12 @@ mod contract_default_tests {
             agent_id: "10000000".into(),
             count_scope: "agent_lifetime".into(),
             tools: snapshot.tools,
-            reasoning: snapshot.reasoning,
+            reasoning: Some(snapshot.reasoning),
             coverage: snapshot.coverage,
         };
         assert!(AgentObserveOutput::try_from(view.clone()).is_ok());
         let mut drifted = view;
-        drifted.reasoning.source.delta_pointer = "/private/field".into();
+        drifted.reasoning.as_mut().unwrap().source.delta_pointer = "/private/field".into();
         assert!(AgentObserveOutput::try_from(drifted).is_err());
     }
 

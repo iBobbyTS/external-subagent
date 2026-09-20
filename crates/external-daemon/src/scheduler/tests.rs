@@ -309,15 +309,19 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     fn await_observed_content(
         scheduler: &Scheduler,
         agent_id: &str,
+        adapter: &str,
     ) -> observation::ObservationSnapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let (snapshot, verified) = scheduler.observation_snapshot(agent_id);
-            assert!(
-                !verified,
-                "launch-scoped evidence must stay unverified for this adapter"
+            assert_eq!(
+                verified,
+                adapter == "dsh",
+                "only DSH has its own public source"
             );
-            if snapshot.tools.len() == 2 && !snapshot.reasoning.text.is_empty() {
+            // The fixture emits both tools after reasoning; hidden adapters
+            // must not wait for reasoning that must never be collected.
+            if snapshot.tools.len() == 2 {
                 return snapshot;
             }
             assert!(
@@ -350,14 +354,25 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                 .unwrap();
             let agent_id = submitted.agent_id;
             scheduler.start_ready().unwrap();
-            let snapshot = await_observed_content(&scheduler, &agent_id);
+            let snapshot = await_observed_content(&scheduler, &agent_id, agent);
 
-            // Evidence collection itself works; the trust verdict stays
-            // bound to the launched adapter.
-            assert!(snapshot
-                .reasoning
-                .text
-                .contains("ADAPTER-SCOPED reasoning tail"));
+            // DSH's public ACP evidence is independent of the ZCode pin.
+            // Codex and unknown adapters never collect reasoning.
+            if agent == "dsh" {
+                assert!(snapshot
+                    .reasoning
+                    .text
+                    .contains("ADAPTER-SCOPED reasoning tail"));
+                assert_eq!(
+                    snapshot.reasoning.source,
+                    observation::ReasoningSource::dsh()
+                );
+                assert!(snapshot.coverage.reasoning_complete);
+            } else {
+                assert!(snapshot.reasoning.text.is_empty());
+                assert!(!snapshot.coverage.reasoning_complete);
+            }
+            assert!(!snapshot.coverage.tool_history_complete);
             let encoded = serde_json::to_string(&snapshot.tools).unwrap();
             assert!(!encoded.contains("encrypted_content"));
             assert!(!encoded.contains("NEVER-SECRET"));
@@ -384,9 +399,11 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             std::fs::write(directory.path().join("release-observe"), "").unwrap();
             let result = await_result(&scheduler, &agent_id);
             assert_eq!(result.result.outcome, TaskOutcome::Completed);
-            // Trust does not appear after the run terminalizes either.
+            // Terminalization preserves the same adapter-scoped evidence.
             let (terminal_snapshot, verified) = scheduler.observation_snapshot(&agent_id);
-            assert!(!verified);
+            assert_eq!(verified, agent == "dsh");
+            assert_eq!(terminal_snapshot.reasoning, snapshot.reasoning);
+            assert_eq!(terminal_snapshot.coverage, snapshot.coverage);
             assert!(!terminal_snapshot.tools.is_empty());
         }
     }
@@ -414,7 +431,16 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         // An unknown task id reports the same unavailable, untrusted verdict.
         let (unknown, unknown_verified) = scheduler.observation_snapshot("99999999");
         assert!(!unknown_verified);
-        assert_eq!(unknown, queued);
+        assert_eq!(unknown.snapshot_seq, queued.snapshot_seq);
+        assert_eq!(unknown.tools, queued.tools);
+        assert_eq!(unknown.coverage, queued.coverage);
+        assert!(!queued.coverage.tool_history_complete);
+        assert!(!queued.coverage.reasoning_complete);
+        assert_eq!(unknown.reasoning.text, queued.reasoning.text);
+        assert!(queued.reasoning.text.is_empty());
+        assert_eq!(unknown.reasoning.truncated, queued.reasoning.truncated);
+        assert_eq!(queued.reasoning.source, observation::ReasoningSource::dsh());
+        assert_ne!(unknown.reasoning.source, queued.reasoning.source);
     }
 }
 

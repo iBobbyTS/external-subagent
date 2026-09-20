@@ -40,6 +40,13 @@ impl PassiveActivityTracker {
         }
     }
 
+    pub(crate) fn for_adapter(adapter: &str, runtime_source_verified: bool) -> Self {
+        let tracker = Self::new(runtime_source_verified);
+        tracker.state.lock().unwrap().observation =
+            observation::ObservationState::for_adapter(adapter);
+        tracker
+    }
+
     pub(crate) fn observe(&self, event: &RuntimeEvent) {
         self.observe_at(event, Instant::now(), activity_wall_now_millis());
     }
@@ -348,6 +355,115 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsh_acp_invalid_thoughts_report_loss_but_empty_text_does_not() {
+        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
+
+        for content in [
+            None,
+            Some(serde_json::json!({"type": "text"})),
+            Some(serde_json::json!({"type": "text", "text": 42})),
+            Some(serde_json::json!({"type": "text", "text": "bad\0text"})),
+            Some(serde_json::json!({"type": "text", "text": ""})),
+        ] {
+            let valid_empty =
+                content.as_ref().and_then(|c| c.get("text")) == Some(&serde_json::json!(""));
+            let dsh = PassiveActivityTracker::for_adapter("dsh", true);
+            let codex = PassiveActivityTracker::for_adapter("codex", false);
+            let mut params = serde_json::json!({
+                "sessionId": "s1", "update": {"sessionUpdate": "agent_thought_chunk"}
+            });
+            if let Some(content) = content {
+                params["update"]["content"] = content;
+            }
+            let update = parse_update(&params).unwrap();
+            for payload in canonical_event_payloads(&update, "e1", "t1") {
+                let event = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
+                    method: "session/event".into(),
+                    raw: serde_json::json!({"method": "session/event", "params": payload}),
+                }));
+                // Re-delivery must not count the same lost chunk twice.
+                dsh.observe(&event);
+                dsh.observe(&event);
+                codex.observe(&event);
+            }
+            let snapshot = dsh.observation_snapshot();
+            assert_eq!(
+                snapshot.coverage.reasoning_complete, valid_empty,
+                "{params}"
+            );
+            assert_eq!(snapshot.coverage.dropped_events, u64::from(!valid_empty));
+            assert!(snapshot.reasoning.text.is_empty());
+            assert!(dsh.snapshot().latest_reasoning.is_empty());
+            let hidden = codex.observation_snapshot();
+            assert_eq!(hidden.coverage.dropped_events, 0);
+            assert_eq!(hidden.snapshot_seq, 0);
+        }
+    }
+
+    #[test]
+    fn dsh_public_acp_thoughts_reach_observe_and_wait_but_codex_never_collects() {
+        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
+        let dsh = PassiveActivityTracker::for_adapter("dsh", true);
+        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let delta = format!("prefix{}", "中🙂".repeat(110));
+        let update = parse_update(&serde_json::json!({
+            "sessionId": "s1", "update": {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": delta, "encrypted_content": "SECRET"}
+            }
+        }))
+        .unwrap();
+        for params in canonical_event_payloads(&update, "e1", "t1") {
+            let event = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"method":"session/event", "params":params}),
+            }));
+            dsh.observe(&event);
+            codex.observe(&event);
+        }
+        let tool = parse_update(&serde_json::json!({
+            "sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "call-1", "kind": "read",
+                "rawInput": {"path":"not currently projected", "encrypted_content":"SECRET"}
+            }
+        }))
+        .unwrap();
+        for params in canonical_event_payloads(&tool, "e2", "t1") {
+            dsh.observe(&RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::UnknownEvent {
+                    method: "session/event".into(),
+                    raw: serde_json::json!({"method":"session/event", "params":params}),
+                },
+            )));
+        }
+        let snapshot = dsh.observation_snapshot();
+        assert_eq!(snapshot.tools.len(), 1);
+        assert_eq!(snapshot.tools[0].call_count, 1);
+        assert!(snapshot.tools[0].recent_calls[0].arguments.is_empty());
+        assert!(snapshot.tools[0].recent_calls[0].arguments_truncated);
+        assert!(!serde_json::to_string(&snapshot).unwrap().contains("SECRET"));
+        assert_eq!(snapshot.reasoning.text, "中🙂".repeat(100));
+        assert!(snapshot.reasoning.truncated);
+        assert_eq!(
+            snapshot.reasoning.source,
+            observation::ReasoningSource::dsh()
+        );
+        assert!(snapshot.coverage.reasoning_complete);
+        assert!(!snapshot.coverage.tool_history_complete);
+        assert_eq!(snapshot.coverage.dropped_events, 0);
+        assert_eq!(dsh.snapshot().latest_reasoning, snapshot.reasoning.text);
+        let hidden = codex.observation_snapshot();
+        assert!(hidden.reasoning.text.is_empty());
+        assert_eq!(
+            hidden.snapshot_seq, 0,
+            "hidden reasoning never enters observation state"
+        );
+        assert!(!hidden.coverage.reasoning_complete);
+        assert!(!hidden.coverage.tool_history_complete);
+        assert!(codex.snapshot().latest_reasoning.is_empty());
+    }
 
     #[test]
     fn launch_scoped_evidence_only_degrades_across_reverification() {

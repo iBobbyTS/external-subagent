@@ -95,13 +95,11 @@ impl Scheduler {
         };
         let runtime_agent_id = format!("{}:{}", claim.task.agent_id, claim.owner_epoch);
         let runtime_lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
-        // Observation trust is launch-scoped: the pinned ZCode runtime proof
-        // only ever applies to the adapter the routing factory will actually
-        // launch (the same `task_agent` identity it dispatches on). DSH,
-        // Codex and unknown adapters start explicitly unverified instead of
-        // borrowing the scheduler-global ZCode proof.
+        // Public-source policy follows the launched adapter: pinned ZCode,
+        // public DSH ACP thoughts, and no Codex reasoning collection.
         let adapter = task_agent(&claim.task);
-        let activity = Arc::new(PassiveActivityTracker::new(
+        let activity = Arc::new(PassiveActivityTracker::for_adapter(
+            &adapter,
             observation::adapter_runtime_source_verified(
                 &adapter,
                 self.inner.config.runtime_source.as_deref(),

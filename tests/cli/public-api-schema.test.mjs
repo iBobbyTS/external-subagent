@@ -109,3 +109,22 @@ test('codex spawn contract exposes four postures and rejects non-empty manifests
   assert.equal(rule.then.properties.write_manifest.maxItems, 0);
   assert.equal(spawn.allOf.find((rule) => rule.if.properties.permission_mode?.const === 'plan').then.properties.write_manifest.maxItems, 0);
 });
+
+
+test('observation contract preserves public tails and object-level hidden reasoning', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/observation.schema.json'), 'utf8'));
+  assert.deepEqual(schema.properties.reasoning.type, ['object', 'null']);
+  assert.equal(schema.properties.reasoning.properties.text.maxLength, 200);
+  assert.deepEqual(schema.properties.reasoning.required, ['text', 'truncated']);
+  const { subagents } = JSON.parse(fs.readFileSync(path.join(root, 'schema/public-reasoning-source.json'), 'utf8'));
+  assert.deepEqual(Object.keys(subagents), ['zcode', 'dsh', 'codex']);
+  assert.equal(subagents.zcode.status, 'VERIFIED_RUNTIME_PUBLIC');
+  assert.equal(subagents.zcode.runtime_version, '3.11.2');
+  assert.equal(subagents.zcode.runtime_sha256, 'e9f1868c0fdb863537ed910ee3828b9be96b8c2fd805473f63b439e1113266b8');
+  assert.equal(subagents.zcode.delta_pointer, '/params/payload/delta');
+  assert.equal(subagents.dsh.public, true);
+  assert.equal(subagents.dsh.status, 'VERIFIED_PROTOCOL_PUBLIC');
+  assert.equal(subagents.codex.public, false);
+  assert.equal(subagents.codex.collected, false);
+  assert.equal(subagents.codex.reasoning, null);
+});

@@ -197,7 +197,7 @@ pub struct TaskObservationView {
     pub agent_id: String,
     pub count_scope: String,
     pub tools: Vec<ObservedTool>,
-    pub reasoning: ObservedReasoning,
+    pub reasoning: Option<ObservedReasoning>,
     pub coverage: ObservationCoverage,
 }
 
