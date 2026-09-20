@@ -202,15 +202,6 @@ impl CodexRuntimeFactory {
                         "codex factory received a non-codex task",
                     ));
                 }
-                if !matches!(
-                    prepared.permission_mode,
-                    external_core::PermissionMode::Plan | external_core::PermissionMode::Yolo
-                ) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "codex runtime supports only the plan and yolo permission modes",
-                    ));
-                }
                 if admission.model.as_deref().is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,

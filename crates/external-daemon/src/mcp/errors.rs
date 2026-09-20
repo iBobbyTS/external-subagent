@@ -115,6 +115,10 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
         RpcErrorCode::AgentRequired => ("subagent_required", "subagent is required"),
         RpcErrorCode::AgentUnknown => ("subagent_unknown", "subagent is unknown"),
         RpcErrorCode::AgentDisabled => ("agent_disabled", "agent is disabled"),
+        RpcErrorCode::AgentUnsupported if detail == "CODEX_WRITE_MANIFEST_UNSUPPORTED" => (
+            "codex_write_manifest_unsupported",
+            "codex does not support non-empty write_manifest",
+        ),
         RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
         RpcErrorCode::ModelSelectionUnsupported => (
             "model_selection_unsupported",
@@ -212,6 +216,17 @@ pub(crate) fn protocol_error() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_manifest_rejection_has_a_distinct_public_code_and_zero_prompts() {
+        let error = public_error(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            "CODEX_WRITE_MANIFEST_UNSUPPORTED",
+        ));
+        assert_eq!(error.body.code, "codex_write_manifest_unsupported");
+        assert_eq!(error.body.prompt_count, Some(0));
+        assert_eq!(error.body.agent_id, None);
+    }
 
     #[test]
     fn errors_distinguish_conflicts_rejections_and_unreachable_socket() {

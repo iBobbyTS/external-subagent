@@ -148,7 +148,9 @@ fn start_echo(directory: &Path, mode: PermissionMode) -> String {
     let sandbox = match mode {
         PermissionMode::Plan => r#"{"type":"readOnly","networkAccess":false}"#,
         PermissionMode::Yolo => r#"{"type":"dangerFullAccess"}"#,
-        _ => panic!("only plan and yolo tasks are admitted"),
+        PermissionMode::Build | PermissionMode::Edit => {
+            r#"{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}"#
+        }
     };
     format!(
         r#""sandbox":{sandbox},"approvalPolicy":"never","cwd":"{}""#,
@@ -298,6 +300,41 @@ fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
 }
 
 #[test]
+fn write_modes_pin_workspace_write_and_persist_the_id() {
+    let _guard = scripted_test_guard();
+    for mode in [PermissionMode::Build, PermissionMode::Edit] {
+        let workspace = codex_workspace();
+        let scheduler = codex_scheduler(
+            workspace.path(),
+            harness_factory(&happy_turn(workspace.path(), mode), workspace.path()),
+        );
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(workspace.path(), "run freely", mode),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Completed);
+        assert_eq!(result.result.final_text, "CODEX_OK");
+        let task = await_terminal_task(&scheduler, &agent_id);
+        assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
+        let deliveries =
+            std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+        let thread_start = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("thread/start frame");
+        assert_eq!(thread_start["params"]["approvalPolicy"], "never");
+        assert_eq!(thread_start["params"]["sandbox"], "workspace-write");
+        assert_eq!(thread_start["params"]["model"], MODEL);
+    }
+}
+
+#[test]
 fn start_fails_closed_without_a_confirmed_posture() {
     let _guard = scripted_test_guard();
     // The thread/start result is the posture the server actually applied,
@@ -308,7 +345,7 @@ fn start_fails_closed_without_a_confirmed_posture() {
     // is sent, while both confirmed yolo shapes — the faithful
     // dangerFullAccess object a real start echoes and the narrowed
     // workspace-write reconstruction resume also accepts — start the turn.
-    let cases: Vec<(PermissionMode, Option<String>, &str, Option<&str>, bool, &str)> = vec![
+    let mut cases: Vec<(PermissionMode, Option<String>, &str, Option<&str>, bool, &str)> = vec![
         // No posture fields at all: unverifiable means refused.
         (
             PermissionMode::Plan,
@@ -398,6 +435,18 @@ fn start_fails_closed_without_a_confirmed_posture() {
             "",
         ),
     ];
+    for mode in [PermissionMode::Build, PermissionMode::Edit] {
+        cases.push((
+            mode,
+            Some(r#"{"type":"dangerFullAccess"}"#.into()),
+            "never",
+            None,
+            false,
+            "start sandbox was not confirmed as the workspace-write object",
+        ));
+        cases.push((mode, Some(r#"{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}"#.into()), "on-request", None, false,
+            "start approvalPolicy was not confirmed as never"));
+    }
     for (index, (mode, sandbox, approval, cwd_override, accepts, marker)) in
         cases.into_iter().enumerate()
     {
@@ -632,7 +681,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 }
 
 #[test]
-fn closed_gate_and_unproven_write_modes_refuse_spawn_without_a_process() {
+fn closed_gate_refuses_spawn_without_a_process() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let scheduler = codex_scheduler(workspace.path(), CodexRuntimeFactory::closed());
@@ -646,69 +695,6 @@ fn closed_gate_and_unproven_write_modes_refuse_spawn_without_a_process() {
     assert!(error.to_string().contains("codex spawn gate is closed"));
     let task = await_terminal_task(&scheduler, &submitted.agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Failed));
-
-    // build/edit refuse before the prompt: at the factory seam the
-    // admitted plan/yolo contract is re-checked fail-closed.
-    let mut manifest = manifest_for(workspace.path(), "write mode");
-    manifest.permission_mode = PermissionMode::Build;
-    let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
-        .unwrap()
-        .prepare_direct_submission(&manifest)
-        .unwrap()
-        .with_admission(codex_admission(Some(MODEL)))
-        .unwrap();
-    let task = TaskRecord {
-        agent_id: "build-mode".into(),
-        repository: workspace.path().to_string_lossy().into_owned(),
-        phase: TaskPhase::Queued,
-        outcome: None,
-        workspace_path: workspace.path().to_string_lossy().into_owned(),
-        runtime_hash: None,
-        prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
-        prepared_launch_sha256: prepared.prepared_sha256.clone(),
-        initial_prompt: "prompt".into(),
-        owner_id: None,
-        owner_epoch: 0,
-        close_requested: false,
-        stop_requested: false,
-        last_event_seq: 0,
-        failure_code: None,
-        failure_message: None,
-        runtime_agent_id: None,
-        session_id: None,
-        turn_state: external_store::TurnState::Idle,
-        process_identity: None,
-        closed_at: None,
-        reaped_at: None,
-        created_at: 0,
-    };
-    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
-    for mode in [PermissionMode::Build, PermissionMode::Edit] {
-        let mut prepared_manifest = manifest_for(workspace.path(), "write mode");
-        prepared_manifest.permission_mode = mode;
-        let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
-            .unwrap()
-            .prepare_direct_submission(&prepared_manifest)
-            .unwrap()
-            .with_admission(codex_admission(Some(MODEL)))
-            .unwrap();
-        let mut mode_task = task.clone();
-        mode_task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
-        mode_task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
-        let error = harness_factory(
-            &happy_turn(workspace.path(), PermissionMode::Plan),
-            workspace.path(),
-        )
-        .spawn(&mode_task, Arc::clone(&sink))
-        .err()
-        .expect("unproven write mode must refuse the spawn");
-        assert!(
-            error
-                .to_string()
-                .contains("only the plan and yolo permission modes"),
-            "write mode {mode:?} was not refused: {error}"
-        );
-    }
 }
 
 struct NoopSink;
@@ -2153,6 +2139,86 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
             .find(|frame| frame["method"] == "thread/resume")
             .expect("thread/resume frame");
         assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        let turn_starts = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|frame| frame["method"] == "turn/start")
+            .count();
+        assert_eq!(turn_starts, 1, "the follow-up turn starts exactly once");
+    }
+}
+
+#[test]
+fn write_modes_resume_with_confirmed_workspace_write() {
+    let _guard = scripted_test_guard();
+    for mode in [PermissionMode::Build, PermissionMode::Edit] {
+        let sandbox = r#""sandbox":{"excludeSlashTmp":false,"excludeTmpdirEnvVar":false,"networkAccess":false,"type":"workspaceWrite","writableRoots":[]}"#;
+        let workspace = codex_workspace();
+        let directory = workspace.path().to_owned();
+        let resume_result = format!(
+            r#"{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{sandbox},"approvalPolicy":"never","cwd":"{}"}}}}"#,
+            directory.to_string_lossy()
+        );
+        let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let scheduler = Scheduler::new(
+            "codex-resume-write-ok",
+            store,
+            Arc::new(TwoPhaseFactory {
+                first: Mutex::new(Some(harness_factory(
+                    &happy_turn(&directory, mode),
+                    &directory,
+                ))),
+                second: yolo_resume_case(&directory, &resume_result, "codex-resume-write-ok.sh"),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(&directory, "first turn", mode),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let agent_id = submitted.agent_id.clone();
+        scheduler.start_ready().unwrap();
+        let first_result = await_result(&scheduler, &agent_id);
+        assert_eq!(first_result.result.final_text, "CODEX_OK");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.active_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "first runtime was never released"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_eq!(
+            scheduler
+                .queue_message(&agent_id, "write-resume-msg", "follow-up question")
+                .unwrap(),
+            crate::MessageDisposition::Queued
+        );
+        scheduler.start_ready().unwrap();
+        let resumed = await_result(&scheduler, &agent_id);
+        assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+        assert_eq!(resumed.result.final_text, "RESUMED_OK");
+
+        let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+            .expect("the resumed process logs its own frames");
+        let resume = deliveries
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "thread/resume")
+            .expect("thread/resume frame");
+        assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        // Resume confirms the persisted posture from the result; it must not
+        // override it through request parameters.
+        assert!(resume["params"].get("sandbox").is_none());
+        assert!(resume["params"].get("approvalPolicy").is_none());
         let turn_starts = deliveries
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())

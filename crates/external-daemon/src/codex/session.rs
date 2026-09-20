@@ -83,13 +83,14 @@ impl CodexRuntimeOwner {
                 }
                 // The permission-mode seam: the daemon's four-value
                 // external_core::PermissionMode narrows to the crate's
-                // binary CodexPermissionMode here, at the admitted-thread
-                // boundary; every non-admitted mode fails closed with the
-                // crate's session-level message verbatim.
+                // CodexPermissionMode here, at the admitted-thread
+                // boundary; build and edit share the workspace-write
+                // posture.
                 let permission_mode = match prepared.permission_mode {
                     external_core::PermissionMode::Plan => CodexPermissionMode::Plan,
+                    external_core::PermissionMode::Build
+                    | external_core::PermissionMode::Edit => CodexPermissionMode::WorkspaceWrite,
                     external_core::PermissionMode::Yolo => CodexPermissionMode::Yolo,
-                    _ => return Err(runtime_command_error(CodexPermissionMode::unsupported())),
                 };
                 Ok(AdmittedThread {
                     model: admission.model.clone().ok_or_else(|| {

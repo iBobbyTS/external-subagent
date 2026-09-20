@@ -97,3 +97,15 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     assert.ok(Array.isArray(contract.output));
   }
 });
+
+test('codex spawn contract exposes four postures and rejects non-empty manifests', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
+  const spawn = schema.properties.spawn;
+  assert.match(spawn.properties.permission_mode.description, /build\/edit \(workspace-write\)/u);
+  assert.match(spawn.properties.permission_mode.description, /approvalPolicy=never/u);
+  assert.match(spawn.properties.write_manifest.description, /codex_write_manifest_unsupported/u);
+  const rule = spawn.allOf.find((rule) => rule.if.properties.subagent?.const === 'codex');
+  assert.deepEqual(rule.if.required, ['subagent']);
+  assert.equal(rule.then.properties.write_manifest.maxItems, 0);
+  assert.equal(spawn.allOf.find((rule) => rule.if.properties.permission_mode?.const === 'plan').then.properties.write_manifest.maxItems, 0);
+});

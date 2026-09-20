@@ -202,13 +202,6 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
             AgentPermissionModeView::Plan,
         ];
     }
-    if agent == "codex" {
-        // Codex admission is posture-pinned with approvalPolicy=never:
-        // plan maps to sandbox=read-only and yolo maps to
-        // sandbox=danger-full-access. build/edit stay refused before the
-        // prompt until a workspace-write confinement is proven equivalent.
-        return vec![AgentPermissionModeView::Plan, AgentPermissionModeView::Yolo];
-    }
     vec![
         AgentPermissionModeView::Build,
         AgentPermissionModeView::Edit,
@@ -459,18 +452,10 @@ pub(super) fn resolve_admission(
         }
     }
     if agent == "codex" {
-        // Codex admission is posture-pinned with approvalPolicy=never:
-        // plan maps to sandbox=read-only and yolo maps to
-        // sandbox=danger-full-access. build/edit are refused before the
-        // prompt because the native workspace-write policy is not proven
-        // equivalent to this daemon's protected workspace confinement.
-        if !matches!(
-            input.manifest.permission_mode,
-            external_core::PermissionMode::Plan | external_core::PermissionMode::Yolo
-        ) {
+        if !input.manifest.write_manifest.is_empty() {
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
-                "codex admission supports only the plan and yolo permission modes; prompt_count=0",
+                "CODEX_WRITE_MANIFEST_UNSUPPORTED",
             ));
         }
         // Home precedence is agents.codex.home over the inherited CODEX_HOME;
@@ -721,7 +706,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn codex_admission_accepts_plan_and_yolo_with_a_model_and_configured_home() {
+    fn codex_admission_accepts_four_modes_with_a_model_and_configured_home() {
         let directory = tempfile::tempdir().unwrap();
         let config = codex_gate_config(directory.path());
         let input = codex_input(directory.path(), external_core::PermissionMode::Plan);
@@ -757,17 +742,11 @@ mod admission_tests {
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert!(error.message.contains("agents.codex.default_model"));
 
-        // The unproven write modes are refused before the prompt.
         for mode in [
             external_core::PermissionMode::Build,
             external_core::PermissionMode::Edit,
         ] {
-            let error =
-                resolve_admission(&codex_input(directory.path(), mode), &config).unwrap_err();
-            assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
-            assert!(error
-                .message
-                .contains("only the plan and yolo permission modes"));
+            assert!(resolve_admission(&codex_input(directory.path(), mode), &config).is_ok());
         }
 
         // No home from either source rejects before the prompt.
@@ -809,7 +788,7 @@ mod admission_tests {
             RpcErrorCode::AgentUnsupported
         );
 
-        // Capability projection is plan+yolo over the codex transport.
+        // Capability projection exposes all four modes over the codex transport.
         let evidence = AgentEvidenceStore::new(None);
         let status = configured_agent_statuses(&config, &evidence)
             .into_iter()
@@ -822,7 +801,12 @@ mod admission_tests {
         assert!(status.transport_support.spawn);
         assert_eq!(
             status.permission_modes,
-            vec![AgentPermissionModeView::Plan, AgentPermissionModeView::Yolo]
+            vec![
+                AgentPermissionModeView::Build,
+                AgentPermissionModeView::Edit,
+                AgentPermissionModeView::Plan,
+                AgentPermissionModeView::Yolo
+            ]
         );
         assert_eq!(
             status.model_selection,
@@ -1405,6 +1389,49 @@ mod admission_policy_tests {
             .unwrap()
             .tasks
             .len()
+    }
+
+    #[test]
+    fn codex_manifest_rejected_before_task_creation_for_explicit_and_default_route() {
+        let _env_guard = config_env_guard();
+        let root = gated_dsh_config(None);
+        let config_path = root.path().join("agents.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        config["subagents"]["codex"] = serde_json::json!({
+            "enabled": true, "spawn_supported": true,
+            "runtime_path": root.path().join("dsh-runtime"),
+            "home": root.path().join("codex-home"), "default_model": "gpt-5.6-terra"
+        });
+        config["default_subagent"] = serde_json::json!("codex");
+        fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let _config_env = ConfigEnvScope::install(&config_path);
+        let (_directory, service, _id) = wait_tests::fixture();
+        let store = service.store_for_wait_test();
+        let workspace = admission_root("s06-codex-manifest-");
+        for mode in ["build", "edit", "plan", "yolo"] {
+            for explicit in [true, false] {
+                let mut frame: serde_json::Value = serde_json::from_slice(&cli_submit_frame(
+                    "codex-manifest",
+                    "codex",
+                    None,
+                    workspace.path(),
+                    mode,
+                    &["src/main.rs"],
+                ))
+                .unwrap();
+                if !explicit {
+                    frame["params"].as_object_mut().unwrap().remove("agent");
+                }
+                let response = service.handle_bytes(&serde_json::to_vec(&frame).unwrap());
+                let RpcOutcome::Error { error } = response.outcome else {
+                    panic!("must reject {mode}")
+                };
+                assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
+                assert_eq!(error.message, "CODEX_WRITE_MANIFEST_UNSUPPORTED");
+                assert_eq!(scoped_task_count(&store, workspace.path()), 0);
+            }
+        }
     }
 
     #[test]

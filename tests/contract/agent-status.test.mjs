@@ -86,3 +86,10 @@ test('failure vocabulary distinguishes evidence-producing paths', () => {
   assert.equal(reasons.has('auth_401'), true);
   assert.equal(reasons.has('rate_limit'), true);
 });
+
+test('status contract can represent all four codex permission modes', () => {
+  const root = path.resolve(import.meta.dirname, '../..');
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
+  assert.deepEqual(schema.properties.subagent_status.properties.permission_modes.items.enum, ['build', 'edit', 'plan', 'yolo']);
+  assert.match(schema.properties.spawn.properties.permission_mode.description, /codex supports build\/edit/u);
+});

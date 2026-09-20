@@ -1,7 +1,8 @@
 //! The pure Codex thread and turn control-plane shapes: the
 //! `thread/start`, `thread/resume`, and `turn/start` parameter shapes,
-//! posture admission for the two admitted permission modes, and the
-//! fail-closed echo validation of thread results. The daemon drives the
+//! posture admission for the admitted permission modes (plan, the
+//! build/edit workspace-write posture, and yolo), and the fail-closed
+//! echo validation of thread results. The daemon drives the
 //! requests and maps every [`CodexError`] onto its own
 //! `RuntimeCommandError` variant, variant for variant, with the payload
 //! verbatim.
@@ -11,26 +12,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The two admitted Codex postures. The daemon's four-value permission
-/// mode narrows to this binary pair at the admitted-thread boundary; every
-/// other mode fails closed there with [`CodexPermissionMode::unsupported`].
+/// The admitted Codex postures. The daemon's four-value permission mode
+/// narrows to this trio at the admitted-thread boundary: plan keeps the
+/// read-only sandbox, build and edit share the workspace-write posture,
+/// and yolo runs danger-full-access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexPermissionMode {
     Plan,
+    WorkspaceWrite,
     Yolo,
-}
-
-impl CodexPermissionMode {
-    /// The fail-closed refusal for any posture outside the admitted pair.
-    /// The daemon glue's four-value-to-two-value seam maps every
-    /// non-admitted permission mode onto exactly this error, whose message
-    /// is the session-level admission oracle (moved verbatim from the
-    /// daemon session glue).
-    pub fn unsupported() -> CodexError {
-        CodexError::InvalidSession(
-            "codex runtime supports only the plan and yolo permission modes".into(),
-        )
-    }
 }
 
 /// The Codex control-plane error surface, variant for variant with the
@@ -45,9 +35,10 @@ pub enum CodexError {
     InvalidSession(String),
 }
 
-/// The pinned Codex thread posture for one admitted permission mode. Both
+/// The pinned Codex thread posture for one admitted permission mode. All
 /// admitted modes pin `approvalPolicy=never`: plan runs the read-only
-/// sandbox, yolo runs `danger-full-access` with no codex-side confinement.
+/// sandbox, build/edit run workspace-write, and yolo runs
+/// `danger-full-access` with no codex-side confinement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodexPosture {
     pub sandbox: &'static str,
@@ -63,6 +54,10 @@ pub fn codex_posture(mode: CodexPermissionMode) -> CodexPosture {
         CodexPermissionMode::Yolo => CodexPosture {
             sandbox: "danger-full-access",
             label: "danger-full-access posture",
+        },
+        CodexPermissionMode::WorkspaceWrite => CodexPosture {
+            sandbox: "workspace-write",
+            label: "workspace-write object",
         },
     }
 }
@@ -112,8 +107,8 @@ pub fn turn_start_params(
 
 /// Validate a `thread/start` result against the admitted request and
 /// return its bounded thread id. The result echoes the posture the server
-/// actually applied — verified on codex-cli 0.154.0 for BOTH admitted
-/// presets: plan resolves `{"type":"readOnly","networkAccess":false}`,
+/// actually applied — verified on codex-cli 0.154.0 for plan/yolo: plan
+/// resolves `{"type":"readOnly","networkAccess":false}`,
 /// yolo `{"type":"dangerFullAccess"}`, each with `approvalPolicy` and
 /// `cwd` at the result root (see docs/compatibility/codex.md). Request
 /// params alone are therefore no more trusted for the first executable
@@ -330,7 +325,9 @@ pub fn confirm_resumed_thread_effort(
 
 /// Confirm a thread-result sandbox against the admitted permission mode,
 /// for the first launch and every resume alike. Plan threads must resolve
-/// the read-only object. A yolo thread must resolve the faithful
+/// the read-only object. Build/edit must resolve workspaceWrite with no
+/// network or extra writable roots and the default temporary-directory
+/// flags. A yolo thread must resolve the faithful
 /// `{"type":"dangerFullAccess"}` object — the shape a real 0.154.0 start
 /// echoes — or the exact narrowed workspace-write reconstruction codex-cli
 /// 0.154.0 returns when resuming a persisted danger-full-access rollout;
@@ -356,6 +353,16 @@ pub fn sandbox_confirmed(sandbox: &serde_json::Value, mode: CodexPermissionMode)
                         "excludeSlashTmp": false,
                         "excludeTmpdirEnvVar": false,
                     })
+        }
+        CodexPermissionMode::WorkspaceWrite => {
+            *sandbox
+                == serde_json::json!({
+                    "type": "workspaceWrite",
+                    "networkAccess": false,
+                    "writableRoots": [],
+                    "excludeSlashTmp": false,
+                    "excludeTmpdirEnvVar": false,
+                })
         }
     }
 }
@@ -384,6 +391,7 @@ mod tests {
 
     const PLAN: CodexPermissionMode = CodexPermissionMode::Plan;
     const YOLO: CodexPermissionMode = CodexPermissionMode::Yolo;
+    const WRITE: CodexPermissionMode = CodexPermissionMode::WorkspaceWrite;
     const WORKSPACE: &str = "/tmp/codex-echo-workspace";
 
     fn plan_start_result() -> serde_json::Value {
@@ -412,13 +420,39 @@ mod tests {
         })
     }
 
+    fn workspace_write_start_result() -> serde_json::Value {
+        serde_json::json!({
+            "thread": {
+                "id": "thread-ww",
+                "ephemeral": false,
+                "sandbox": {
+                    "type": "workspaceWrite",
+                    "networkAccess": false,
+                    "writableRoots": [],
+                    "excludeSlashTmp": false,
+                    "excludeTmpdirEnvVar": false,
+                },
+            },
+            "model": "gpt-test",
+            "approvalPolicy": "never",
+            "cwd": WORKSPACE,
+        })
+    }
+
     #[test]
-    fn posture_maps_the_two_admitted_modes() {
+    fn posture_maps_the_admitted_modes() {
         assert_eq!(
             codex_posture(PLAN),
             CodexPosture {
                 sandbox: "read-only",
                 label: "read-only object",
+            }
+        );
+        assert_eq!(
+            codex_posture(WRITE),
+            CodexPosture {
+                sandbox: "workspace-write",
+                label: "workspace-write object",
             }
         );
         assert_eq!(
@@ -431,13 +465,26 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_permission_modes_fail_closed_with_the_session_message() {
-        assert_eq!(
-            CodexPermissionMode::unsupported(),
-            CodexError::InvalidSession(
-                "codex runtime supports only the plan and yolo permission modes".into()
-            )
-        );
+    fn workspace_write_confirmation_rejects_expanded_or_unconfirmed_sandboxes() {
+        let expected = serde_json::json!({"type":"workspaceWrite", "networkAccess":false,
+            "writableRoots":[], "excludeSlashTmp":false, "excludeTmpdirEnvVar":false});
+        assert_eq!(codex_posture(WRITE).sandbox, "workspace-write");
+        assert!(sandbox_confirmed(&expected, WRITE));
+        for bad in [
+            serde_json::json!("workspace-write"),
+            serde_json::json!({"type":"dangerFullAccess"}),
+            serde_json::json!({"type":"workspaceWrite"}),
+            serde_json::json!({"type":"readOnly", "networkAccess":false}),
+            serde_json::Value::Null,
+        ] {
+            assert!(!sandbox_confirmed(&bad, WRITE));
+        }
+        let mut network = expected.clone();
+        network["networkAccess"] = serde_json::json!(true);
+        assert!(!sandbox_confirmed(&network, WRITE));
+        let mut roots = expected.clone();
+        roots["writableRoots"] = serde_json::json!(["/outside"]);
+        assert!(!sandbox_confirmed(&roots, WRITE));
     }
 
     #[test]
@@ -572,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn start_result_echo_validation_accepts_both_admitted_postures() {
+    fn start_result_echo_validation_accepts_all_admitted_postures() {
         assert_eq!(
             start_result_thread_id(&plan_start_result(), "gpt-test", WORKSPACE, PLAN, None),
             Ok("thread-1".into())
@@ -580,6 +627,16 @@ mod tests {
         assert_eq!(
             start_result_thread_id(&yolo_start_result(), "gpt-test", WORKSPACE, YOLO, None),
             Ok("thread-2".into())
+        );
+        assert_eq!(
+            start_result_thread_id(
+                &workspace_write_start_result(),
+                "gpt-test",
+                WORKSPACE,
+                WRITE,
+                None
+            ),
+            Ok("thread-ww".into())
         );
     }
 
@@ -676,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_result_echo_validation_accepts_both_admitted_postures() {
+    fn resume_result_echo_validation_accepts_all_admitted_postures() {
         let mut resumed = plan_start_result();
         resumed["thread"]["id"] = serde_json::json!("resumed-1");
         assert_eq!(
@@ -700,6 +757,20 @@ mod tests {
                 "gpt-test",
                 WORKSPACE,
                 YOLO,
+                None
+            ),
+            Ok(())
+        );
+
+        let mut resumed_write = workspace_write_start_result();
+        resumed_write["thread"]["id"] = serde_json::json!("resumed-ww");
+        assert_eq!(
+            validate_resume_result(
+                &resumed_write,
+                "resumed-ww",
+                "gpt-test",
+                WORKSPACE,
+                WRITE,
                 None
             ),
             Ok(())

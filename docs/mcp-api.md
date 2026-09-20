@@ -177,11 +177,11 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
-| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | 非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
+| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 不支持非空清单（创建任务前返回 `codex_write_manifest_unsupported`）；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
 | `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`） | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝；codex 使用自有模型 ID |
 | `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh`（`minimal`/`max` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
 
-`PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
+`PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。Codex 支持四模式：build/edit 映射 workspace-write，plan 映射 read-only，yolo 映射 danger-full-access；全部固定 approvalPolicy=never。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
 
 dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** `:` 分割，第一个 `:` 之后的全部内容（可再含 `:`）归属 model；两侧不限字符集。缺少 `:`、provider 侧为空（`:m`）、model 侧为空（`p:`）、含 NUL、总长超过 512 字节，都会在派发前以 `validation` 拒绝并给出格式示例，不产生任务；`agents.dsh.default_model` 走同一校验路径。daemon 下发 ACP 前用 serde_json 把两侧重组为字节精确的 `["provider","model"]` 字符串（`session/set_config_option` 的 `value`），不会手工拼接；`input_identity.model` 保存 trim 后的冒号串，`model_source` 语义不变。`subagents models`（daemon RPC `agent_models`）输出层把这种 wire 元组反序列化为「恰好两个字符串的数组」后以 `p:m` 展示，解析失败、非二元组或 provider 侧含 `:` 的条目保留原样。模型是否真的存在于 provider 目录仍由 dsh 在 `session_start` 判定：未知元组以 `-32602` 失败，不发 prompt。
 
