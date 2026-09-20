@@ -13,6 +13,7 @@ path = "src/main.rs"
 external-runtime = { path = "../external-runtime" }
 external-store = { path = "../external-store" }
 external-core = { path = "../external-core" }
+external-agent-codex = { path = "../subagents/codex" }
 external-agent-dsh = { path = "../subagents/dsh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -1,14 +1,15 @@
 //! Codex upstream app-server runtime owner, gated factory, and launch
 //! resolution.
 //!
-//! The Codex app-server speaks NDJSON over stdio with the same strict
-//! no-`jsonrpc` envelope the ZCode driver already pins, so this owner reuses
-//! [`external_runtime::Driver`] with the `ZcodeStrict` codec. What is
-//! Codex-specific lives here: the `initialize`/`initialized` handshake, the
-//! persistent `thread/start`/`thread/resume` identity, `turn/start` and
-//! `turn/interrupt`, and the normalization of Codex `item/*` and `turn/*`
-//! notifications into the canonical internal `session/event` lifecycle so the
-//! existing scheduler, result, storage, and observation consumers keep working.
+//! The pure Codex protocol face lives in the `external-agent-codex` crate
+//! (`crates/subagents/codex`): the `thread/start`, `thread/resume`, and
+//! `turn/start` parameter shapes, posture admission, fail-closed result
+//! echo validation, and the folding of `item/*` and `turn/*`
+//! notifications into the canonical internal `session/event` lifecycle.
+//! This module keeps the lifecycle composition on top of it: the stdio
+//! transport (the `ZcodeStrict`-codec [`external_runtime::Driver`] pump
+//! and Publisher), the persistent thread and turn control-plane glue, and
+//! the normalization entry point the scheduler consumes.
 //!
 //! Production spawn is selected only by the explicit configuration gate; the
 //! closed factory remains the fail-closed default. Only `plan` and `yolo`
