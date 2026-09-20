@@ -31,7 +31,7 @@ export function updateConfig(file, updater) {
   try {
     const current = readConfig(file);
     const next = updater(current);
-    return writeConfig(file, next);
+    return next === current ? current : writeConfig(file, next);
   } finally {
     try { process.kill(-helper.pid, 'SIGTERM'); } catch {}
     try { fs.unlinkSync(ready); } catch {}

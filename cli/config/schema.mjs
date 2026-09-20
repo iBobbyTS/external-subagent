@@ -21,7 +21,7 @@ export function defaultConfig() {
     revision: 0,
     default_subagent: null,
     subagents: {
-      zcode: { enabled: true, spawn_supported: true, default_model: null },
+      zcode: { enabled: false, spawn_supported: false, default_model: null },
       dsh: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
       codex: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
     },

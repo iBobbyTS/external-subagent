@@ -36,7 +36,7 @@ external-subagent install-plugin codex   # 可选：显式绑定 Codex 宿主（
 
 `npm pack`/`npm publish` 由生命周期脚本门禁：`prepack` 总是从源码重建 native payload（干净 checkout 永远打不出缺二进制的坏包），`postpack` 对产物做静态检查（含拒绝 debug 产物混入发布包），`prepublishOnly` 在发布前校验 staged payload 与包版本一致。包通过 `os`/`cpu` 字段声明仅支持 macOS arm64，npm 会在安装期直接拒绝其他平台。
 
-普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它只安装独立的 daemon 服务：校验 payload，报告 PATH 发现与固定 ZCode runtime 的存在性观察（不做探测），写入产品配置和 LaunchAgent，启动服务，并发布 active/retained payload 基线——不安装任何宿主 plugin，不登记 Codex home，不触碰 `~/.codex`。宿主绑定由 `init` 之后的显式命令完成（`install-plugin codex|zcode` 或 `install-mcp` 的直接 TOML binding）。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
+普通 npm 安装只放置 CLI、MCP facade 和版本化 native payload。首次激活必须显式执行 `init`；它只安装独立的 daemon 服务：校验 payload，报告 PATH 与三种 subagent runtime 的存在性观察（不做探测、不自动启用），写入产品配置和 LaunchAgent，启动服务，并发布 active/retained payload 基线——不安装任何宿主 plugin，不登记 Codex home，不触碰 `~/.codex`。宿主绑定由 `init` 之后的显式命令完成（`install-plugin codex|zcode` 或 `install-mcp` 的直接 TOML binding）。重复执行 `init`/`start` 幂等：已加载的 launchd 服务会以 `already_loaded` 和当前 PID 上报，不会出现第二个 daemon 进程。
 
 ### Debug 变体（开发机并行实例）
 
@@ -52,7 +52,7 @@ bin/external-subagent-debug.mjs install-plugin zcode            # 第二个 plug
 
 ## Provider 配置
 
-ZCode 默认启用并使用本机固定 runtime。DSH 必须通过公开配置命令启用，并提供完整的 runtime、home、profile 和版本（配置键使用 schema-2 的 `subagents.*` 前缀；旧的 `agents.*` 键已被拒绝）：
+所有 subagent（zcode、dsh、codex）默认禁用。运行 `external-subagent agents enable zcode|dsh|codex` 先做 local probe，再经配置 writer 原子落盘；失败不写配置，重复启用幂等。ZCode 使用固定 runtime，启用后新任务即时生效。DSH/Codex 在 daemon 未设置 runtime 环境变量时从 daemon 的 PATH 发现可执行文件与版本，配置保存后必须重启 daemon 才生效（回执明确提示）；probe 本身不会启用任何 subagent。Codex 需要显式配置 home 或在 daemon 启动前设置 CODEX_HOME。也可使用下列配置命令手动写入 DSH 六键（schema-2 的 `subagents.*` 前缀）：
 
 ```sh
 external-subagent config set subagents.dsh.enabled true

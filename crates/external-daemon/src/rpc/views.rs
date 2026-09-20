@@ -58,6 +58,8 @@ pub struct SystemStatusView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStatusView {
     pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_version: Option<String>,
     pub config_revision: u64,
     pub configured: bool,
     pub enabled: bool,
@@ -123,6 +125,8 @@ pub struct AgentEffortSelectionCapabilityView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentScopeStatusView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_path: Option<String>,
     pub state: ComponentStateView,
     pub scope: ProbeScope,
     #[serde(skip_serializing_if = "Option::is_none")]

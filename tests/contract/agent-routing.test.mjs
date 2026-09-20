@@ -52,7 +52,7 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-routing-'));
   const paths = productPaths(home);
   const socket = path.join(os.tmpdir(), `es-r-${process.pid}-${Date.now()}.sock`);
-  configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } });
+  configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } });
   const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
     kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'queued' },
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
@@ -194,6 +194,8 @@ test('null and unknown spawn fields fail before transport', async () => {
 test('human config and agents forms execute instead of falling through to JSON defaults', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-human-'));
   const socket = path.join(os.tmpdir(), `es-h-${process.pid}-${Date.now()}.sock`);
+  const enabled = await runCli(home, socket, ['config', 'set', 'subagents.zcode.enabled', 'true']);
+  assert.equal(enabled.code, 0, enabled.stderr);
   const set = await runCli(home, socket, ['config', 'set', 'default_subagent', 'zcode']);
   assert.equal(set.code, 0, set.stderr);
   assert.equal(JSON.parse(set.stdout).config.default_subagent, 'zcode');

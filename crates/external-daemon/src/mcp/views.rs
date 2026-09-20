@@ -586,6 +586,7 @@ mod effort_projection_tests {
 
     fn scope_status() -> crate::rpc::AgentScopeStatusView {
         crate::rpc::AgentScopeStatusView {
+            runtime_path: None,
             state: crate::rpc::ComponentStateView::Unknown,
             scope: ProbeScope::default(),
             version: None,
@@ -596,6 +597,7 @@ mod effort_projection_tests {
 
     fn status(agent: &str, supported: bool) -> AgentStatusView {
         AgentStatusView {
+            required_version: None,
             agent: agent.into(),
             config_revision: 1,
             configured: true,

@@ -46,6 +46,7 @@ pub(super) fn configured_agent_statuses(
             let observed = evidence.latest(agent);
             AgentStatusView {
                 agent: agent.into(),
+                required_version: required_version(agent),
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
@@ -67,6 +68,7 @@ pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
         .into_iter()
         .map(|agent| AgentStatusView {
             agent: agent.into(),
+            required_version: required_version(agent),
             config_revision: 0,
             configured: false,
             enabled: false,
@@ -113,6 +115,10 @@ pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
             hi: unprobed_scope(),
         })
         .collect()
+}
+
+fn required_version(agent: &str) -> Option<String> {
+    (agent == "dsh").then(|| external_agent_dsh::profile::PINNED_DSH_VERSION.into())
 }
 
 fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
@@ -257,6 +263,7 @@ fn stale_scope(value: &ScopeEvidence) -> AgentScopeStatusView {
         .map_or(true, |reason| !reason.contains("not_probed"));
     AgentScopeStatusView {
         state: ComponentStateView::Unknown,
+        runtime_path: value.runtime_path.clone(),
         scope: value.scope.clone(),
         version: value.version.clone(),
         checked_at_ms: was_checked.then_some(value.checked_at_ms),
@@ -267,6 +274,7 @@ fn stale_scope(value: &ScopeEvidence) -> AgentScopeStatusView {
 fn unprobed_scope() -> AgentScopeStatusView {
     AgentScopeStatusView {
         state: ComponentStateView::Unknown,
+        runtime_path: None,
         scope: ProbeScope::default(),
         version: None,
         checked_at_ms: None,
@@ -286,6 +294,7 @@ fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
             EvidenceState::Unavailable => ComponentStateView::Unavailable,
             EvidenceState::Unknown => ComponentStateView::Unknown,
         },
+        runtime_path: value.runtime_path.clone(),
         scope: value.scope.clone(),
         version: value.version.clone(),
         checked_at_ms: was_checked.then_some(value.checked_at_ms),
@@ -619,6 +628,7 @@ mod admission_tests {
         }
         drop(env_guard);
         input.agent = Some("zcode".into());
+        config.subagents.get_mut("zcode").unwrap().enabled = true;
         input.model = Some("model".into());
         config.subagents.get_mut("zcode").unwrap().spawn_supported = false;
         assert_eq!(
@@ -880,10 +890,13 @@ mod admission_tests {
         // zcode keeps its default admission: an unknown but well-formed value
         // passes through instead of being checked against a fabricated catalog.
         let mut input = input(Path::new("/repository"));
+        let mut config = AgentConfigSnapshot::default();
+        config.subagents.get_mut("zcode").unwrap().enabled = true;
+        config.subagents.get_mut("zcode").unwrap().spawn_supported = true;
         for passthrough in ["high", "turbo_deep", "v9_max", "t".repeat(24).as_str()] {
             input.effort = Some(passthrough.into());
             assert_eq!(
-                resolve_admission(&input, &AgentConfigSnapshot::default())
+                resolve_admission(&input, &config)
                     .unwrap()
                     .effort
                     .as_deref(),
@@ -901,20 +914,13 @@ mod admission_tests {
         ] {
             input.effort = Some(invalid.into());
             assert_eq!(
-                resolve_admission(&input, &AgentConfigSnapshot::default())
-                    .unwrap_err()
-                    .code,
+                resolve_admission(&input, &config).unwrap_err().code,
                 RpcErrorCode::Validation,
                 "zcode effort {invalid:?}"
             );
         }
         input.effort = None;
-        assert_eq!(
-            resolve_admission(&input, &AgentConfigSnapshot::default())
-                .unwrap()
-                .effort,
-            None
-        );
+        assert_eq!(resolve_admission(&input, &config).unwrap().effort, None);
         // dsh passes through the same non-codex branch once its production
         // gate admits the task, so the test name carries a real dsh case.
         let root = admission_fixtures::gated_dsh_config(None);
@@ -950,7 +956,7 @@ mod admission_tests {
         assert_eq!(
             zcode.effort_selection,
             AgentEffortSelectionCapabilityView {
-                supported: true,
+                supported: false,
                 mode: AgentEffortSelectionModeView::PassthroughToken,
             }
         );
@@ -987,6 +993,8 @@ mod admission_tests {
         input.effort = Some("high".into());
         let mut config = AgentConfigSnapshot::default();
         config.revision = 41;
+        config.subagents.get_mut("zcode").unwrap().enabled = true;
+        config.subagents.get_mut("zcode").unwrap().spawn_supported = true;
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.effort.as_deref(), Some("high"));
         let task = service
@@ -1027,6 +1035,8 @@ mod admission_tests {
         let input = input(directory.path());
         let mut config = AgentConfigSnapshot::default();
         config.revision = 41;
+        config.subagents.get_mut("zcode").unwrap().enabled = true;
+        config.subagents.get_mut("zcode").unwrap().spawn_supported = true;
         let identity = resolve_admission(&input, &config).unwrap();
         let task = service
             .scheduler
@@ -1558,9 +1568,10 @@ mod admission_policy_tests {
 
     #[test]
     fn zcode_admission_capabilities_are_unchanged() {
-        // No EXTERNAL_SUBAGENT_CONFIG: the default snapshot keeps zcode
-        // enabled with all four modes, exact caller manifests, and the
-        // empty-manifest expansion to the protected workspace scope.
+        // Explicit enable preserves all four modes and caller manifests.
+        let _env_guard = config_env_guard();
+        let config_root = gated_dsh_config(None);
+        let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (directory, service, _id) = wait_tests::fixture();
         let zcode_root = admission_root("s04a-cli-zcode-");
         for (request_id, mode, manifest) in [

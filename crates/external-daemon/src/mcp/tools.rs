@@ -1051,10 +1051,16 @@ mod contract_default_tests {
 
     #[tokio::test]
     async fn spawn_routes_admission_errors_through_daemon_before_manifest_preparation() {
-        // Serialize with the admission oracles that install a
-        // process-wide agent-config file: this dispatch-based test must
-        // keep reading the default snapshot.
+        // Keep ZCode enabled for model admission while DSH remains disabled.
         let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
         let (_directory, service, id) = crate::rpc::wait_tests::fixture();
         let store = service.store_for_wait_test();
         let before = store.get_task(&id).unwrap();
@@ -1086,10 +1092,16 @@ mod contract_default_tests {
 
     #[tokio::test]
     async fn spawn_passes_effort_through_the_submit_general_wire() {
-        // Serialize with the admission oracles that install a process-wide
-        // agent-config file: this dispatch-based test must keep reading the
-        // default snapshot.
+        // Enable ZCode explicitly so this test reaches effort persistence.
         let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
         let (_directory, service, _id) = crate::rpc::wait_tests::fixture();
         let store = service.store_for_wait_test();
         let repository = tempfile::tempdir().unwrap();

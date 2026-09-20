@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { EventEmitter } from 'node:events';
 import { subagentsCommand } from '../../cli/commands/agents.mjs';
 import { parseSubagentsArgs } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
@@ -36,6 +37,7 @@ test('persisted config version matrix is shared with Rust startup and RPC', () =
     const source = entry.input.agents ?? entry.input.subagents ?? {};
     for (const [name, value] of Object.entries(source)) {
       for (const [key, expected] of Object.entries(value)) assert.equal(result.subagents[name][key], expected, entry.name);
+      for (const flag of ['enabled', 'spawn_supported']) if (value[flag] === undefined) assert.equal(result.subagents[name][flag], false, entry.name);
     }
     assert.equal(result.default_subagent, entry.input.default_agent ?? entry.input.default_subagent ?? null, entry.name);
   }
@@ -71,7 +73,7 @@ test('config has no default and lists layered agent support', async () => {
   const { paths } = fixture();
   const listed = await subagentsCommand(paths);
   assert.equal(listed.default_subagent, null);
-  assert.deepEqual(listed.subagents.map((agent) => [agent.subagent, agent.spawn_supported]), [['zcode', true], ['dsh', false], ['codex', false]]);
+  assert.deepEqual(listed.subagents.map((agent) => [agent.subagent, agent.spawn_supported]), [['zcode', false], ['dsh', false], ['codex', false]]);
 });
 
 test('zcode model is rejected before prompt and dsh remains discovery-only', () => {
@@ -192,7 +194,7 @@ test('the service template stays adapter-neutral per configured adapter (AUD-005
 
 test('config writes a revision and keeps existing task snapshots independent', () => {
   const { paths } = fixture();
-  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;
+  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
   const second = configCommand(paths, { operation: 'set', patch: { subagents: { dsh: { enabled: true } } } }).config;
   assert.equal(first.revision, 1);
   assert.equal(second.revision, 2);
@@ -212,7 +214,7 @@ test('per-agent patch preserves fields outside the patch', () => {
 
 test('human config forms parse typed values and get one key', () => {
   const { paths } = fixture();
-  configCommand(paths, parseConfigArgs(['set', 'default_subagent', 'zcode']));
+  configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true } } } });
   assert.deepEqual(configCommand(paths, parseConfigArgs(['get', 'default_subagent'])), { key: 'default_subagent', value: 'zcode', revision: 1 });
   configCommand(paths, parseConfigArgs(['set', 'subagents.dsh.enabled', 'true']));
   assert.equal(readConfig(paths.config).subagents.dsh.enabled, true);
@@ -221,14 +223,14 @@ test('human config forms parse typed values and get one key', () => {
 
 test('config show and unset use the same validated revision path', () => {
   const { paths } = fixture();
-  configCommand(paths, parseConfigArgs(['set', 'default_subagent', 'zcode']));
+  configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true } } } });
   const shown = configCommand(paths, parseConfigArgs(['show']));
   assert.equal(shown.config.default_subagent, 'zcode');
   assert.equal(shown.config.revision, 1);
   const unset = configCommand(paths, parseConfigArgs(['unset', 'default_subagent']));
   assert.equal(unset.config.default_subagent, null);
   assert.equal(unset.config.revision, 2);
-  assert.equal(configCommand(paths, parseConfigArgs(['unset', 'subagents.zcode.enabled'])).config.subagents.zcode.enabled, true);
+  assert.equal(configCommand(paths, parseConfigArgs(['unset', 'subagents.zcode.enabled'])).config.subagents.zcode.enabled, false);
   assert.throws(() => parseConfigArgs(['unset', 'revision']), /unsupported config key/u);
 });
 
@@ -237,14 +239,14 @@ test('config set cannot override revision or merge an agent null patch', () => {
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { revision: 999, default_subagent: 'zcode' } }), /managed by the writer/u);
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { subagents: { zcode: null } } }), /must be an object/u);
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { subagents: { zcode: ['bad'] } } }), /must be an object/u);
-  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;
+  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
   assert.equal(first.revision, 1);
   assert.throws(() => configCommand(paths, { operation: 'set', patch: { revision: first.revision } }), /managed by the writer/u);
 });
 
 test('JSON unset accepts only a supported key and cannot reuse revision or null agent patches', () => {
   const { paths } = fixture();
-  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;
+  const first = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
   assert.equal(first.revision, 1);
   assert.throws(() => configCommand(paths, { operation: 'unset', patch: { revision: 0, default_subagent: null } }), /exactly one supported key/u);
   assert.throws(() => configCommand(paths, { operation: 'unset', patch: { subagents: { zcode: null } } }), /exactly one supported key/u);
@@ -260,7 +262,7 @@ test('concurrent config writers serialize revision and preserve both updates', a
     const child = spawn(process.execPath, ['--input-type=module', '-e', script, JSON.stringify({ operation: 'set', patch })], { cwd: path.resolve('.') });
     child.on('error', reject); child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)));
   });
-  await Promise.all([run({ default_subagent: 'zcode' }), run({ subagents: { dsh: { enabled: true } } })]);
+  await Promise.all([run({ default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } }), run({ subagents: { dsh: { enabled: true } } })]);
   const final = readConfig(paths.config);
   assert.equal(final.revision, 2);
   assert.equal(final.default_subagent, 'zcode');
@@ -272,7 +274,7 @@ test('config writer recovers a stale lock from a dead owner', () => {
   fs.mkdirSync(path.dirname(paths.config), { recursive: true });
   fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, revision: 4, default_subagent: null, subagents: { zcode: { enabled: true, spawn_supported: true, default_model: null }, dsh: { enabled: false, spawn_supported: false, default_model: null } } }));
   fs.writeFileSync(`${paths.config}.lock`, '999999\n');
-  const result = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }).config;
+  const result = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
   assert.equal(result.revision, 5);
   assert.equal(result.default_subagent, 'zcode');
 });
@@ -289,7 +291,7 @@ test('retired top-level product path fields fail closed as unknown config fields
   const { paths } = fixture();
   fs.mkdirSync(path.dirname(paths.config), { recursive: true });
   fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, runtime: '/runtime', database: '/database', socket: '/socket' }));
-  assert.throws(() => configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode' } }), (error) => error.code === 'CONFIG_INVALID');
+  assert.throws(() => configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }), (error) => error.code === 'CONFIG_INVALID');
 });
 
 test('agents human operations are strict and unsupported actions are explicit', async () => {
@@ -383,4 +385,134 @@ test('spawn flags build the shared DTO and reject malformed values', () => {
   assert.equal(Object.hasOwn(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi']), 'effort'), false);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--unknown', 'x']), /unsupported spawn option/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--repository', '/other', '--prompt', 'hi']), /only once/u);
+});
+
+test('enable rejects failed or incomplete observations without writing config', async () => {
+  const { paths } = fixture();
+  for (const local of [
+    { state: 'UNAVAILABLE', reason: 'missing' },
+    { state: 'READY', version: '1', scope: { home: '/home' } },
+    { state: 'READY', runtime_path: '/runtime', version: '1', scope: {} },
+  ]) {
+    await assert.rejects(() => subagentsCommand(paths, { operation: 'enable', subagent: 'codex' }, {
+      socket: '/socket', callDaemon: async () => ({ evidence: { local } }),
+    }), { code: 'agent_probe_failed' });
+    assert.equal(fs.existsSync(paths.config), false);
+  }
+  for (const args of [['enable'], ['enable', 'future'], ['enable', 'dsh', '--hi']]) {
+    assert.throws(() => parseSubagentsArgs(args), { code: 'INVALID_ARGUMENT' });
+  }
+});
+
+test('dsh enable rejects incompatible or absent daemon version requirements without writes', async () => {
+  const { paths } = fixture();
+  for (const required_version of ['0.1.5-rc.1', undefined]) {
+    await assert.rejects(() => subagentsCommand(paths, { operation: 'enable', subagent: 'dsh' }, {
+      socket: '/socket', callDaemon: async () => ({
+        status: { required_version },
+        evidence: { local: { state: 'READY', runtime_path: '/runtime/dsh', version: '9.9.9', scope: { home: '/runtime/home' } } },
+      }),
+    }), (error) => {
+      assert.equal(error.code, 'agent_probe_failed');
+      assert.match(error.message, required_version ? /expected version 0\.1\.5-rc\.1, observed 9\.9\.9.*install/u : /required_version.*restart/u);
+      return true;
+    });
+    assert.equal(fs.existsSync(paths.config), false);
+  }
+});
+
+test('daemon startup timeout reaps the child, escalating ignored SIGTERM to SIGKILL', async () => {
+  const { daemonHarness } = await import('../fixtures/restart-daemon.mjs');
+  for (const ignoreTerm of [false, true]) {
+    const { home } = fixture();
+    const child = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    const signals = [];
+    child.kill = (signal) => {
+      signals.push(signal);
+      if (signal === 'SIGTERM' && ignoreTerm) return true;
+      setTimeout(() => { child.signalCode = signal; child.emit('exit', null, signal); }, 5);
+      return true;
+    };
+    await assert.rejects(() => daemonHarness({ root: home, home, runtime: '/runtime', spawnProcess: () => child, timeoutMs: 20 }), /daemon startup timeout/u);
+    assert.deepEqual(signals, ignoreTerm ? ['SIGTERM', 'SIGKILL'] : ['SIGTERM']);
+    assert.equal(child.signalCode, ignoreTerm ? 'SIGKILL' : 'SIGTERM', 'must await exit before rejecting startup');
+  }
+});
+
+test('fresh init and enable use PATH evidence, live admission, and restarted factories', { timeout: 60000 }, async (t) => {
+  const { runInit } = await import('../../cli/install/init.mjs');
+  const { callDaemon } = await import('../../cli/rpc.mjs');
+  const { daemonHarness } = await import('../fixtures/restart-daemon.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'en-'));
+  const home = path.join(root, 'h');
+  const paths = productPaths(home);
+  const bin = path.join(root, 'bin');
+  const providerHome = path.join(root, 'provider');
+  const workspace = path.join(root, 'repo');
+  for (const dir of [home, bin, providerHome, workspace]) fs.mkdirSync(dir, { recursive: true });
+  // Absolute Node shebang prevents a host runtime from being discovered accidentally.
+  const fixtureSource = path.resolve('tests/fixtures/dsh-hi-probe.mjs');
+  fs.writeFileSync(path.join(bin, 'dsh'), '#!' + process.execPath + '\n' + fs.readFileSync(fixtureSource, 'utf8'), { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'codex'), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo codex-cli 1.2.3; exit 0; fi\nexit 42\n', { mode: 0o755 });
+  fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  const init = runInit({ paths, skipPayloadProbe: true, skipServiceStart: true });
+  assert.deepEqual(Object.keys(init.runtimes), ['zcode', 'dsh', 'codex']);
+  assert.ok(Object.values(readConfig(paths.config).subagents).every((entry) => !entry.enabled && !entry.spawn_supported));
+  const daemon = await daemonHarness({ root, home, runtime: path.resolve('tests/fixtures/zcode-general.mjs'), env: {
+    PATH: bin, DSH_HOME: providerHome, CODEX_HOME: providerHome, S05_DSH_SPAWN_FIXTURE: '1',
+  } });
+  t.after(() => daemon.stop());
+  const options = { socket: daemon.socket, callDaemon };
+  const spawnTask = (subagent) => callDaemon(daemon.socket, 'spawn', {
+    subagent, ...(subagent === 'codex' ? { model: 'fixture-model' } : {}), repository: workspace, prompt: 'fixture complete', permission_mode: subagent === 'codex' ? 'yolo' : 'build',
+  });
+  const status = await callDaemon(daemon.socket, 'status', {});
+  assert.ok((status.subagents ?? status.agents).every((entry) => !entry.enabled && !entry.spawn_supported));
+  for (const entry of status.subagents ?? status.agents) {
+    assert.equal(entry.required_version, (entry.subagent ?? entry.agent) === 'dsh' ? '0.1.5-rc.1' : undefined);
+  }
+  await assert.rejects(() => spawnTask('zcode'), { code: 'agent_disabled' });
+  const listed = await callDaemon(daemon.socket, 'list', { repository: workspace });
+  assert.equal(listed.tasks.length, 0);
+  const initialBytes = fs.readFileSync(paths.config, 'utf8');
+  const observed = await subagentsCommand(paths, { operation: 'probe', subagent: 'dsh' }, options);
+  assert.equal(observed.evidence.local.runtime_path, path.join(bin, 'dsh'));
+  assert.equal(observed.evidence.local.version, '0.1.5-rc.1');
+  assert.equal(observed.status.required_version, '0.1.5-rc.1');
+  assert.equal(observed.status.local.runtime_path, path.join(bin, 'dsh'));
+  assert.equal(observed.status.spawn_supported, false);
+  assert.equal(fs.readFileSync(paths.config, 'utf8'), initialBytes, 'probe must never persist or promote');
+
+  const zcode = await subagentsCommand(paths, parseSubagentsArgs(['enable', 'zcode']), options);
+  assert.equal(zcode.restart_required, false);
+  const ztask = await spawnTask('zcode');
+  const zwait = await callDaemon(daemon.socket, 'wait', { agent_id: ztask.agent_id, wait_time: 10 });
+  assert.equal(zwait.task.status, 'completed', JSON.stringify(zwait));
+
+  const dsh = await subagentsCommand(paths, parseSubagentsArgs(['enable', 'dsh']), options);
+  assert.match(dsh.message, /重启 daemon 后生效/);
+  const saved = readConfig(paths.config).subagents.dsh;
+  assert.deepEqual(saved, { enabled: true, spawn_supported: true, default_model: null,
+    runtime_path: path.join(bin, 'dsh'), home: providerHome, profile: 'acp', version: '0.1.5-rc.1' });
+  const bytes = fs.readFileSync(paths.config, 'utf8');
+  await subagentsCommand(paths, parseSubagentsArgs(['enable', 'dsh']), options);
+  assert.equal(fs.readFileSync(paths.config, 'utf8'), bytes, 'repeat enable preserves revision and bytes');
+  const codex = await subagentsCommand(paths, parseSubagentsArgs(['enable', 'codex']), options);
+  assert.equal(codex.restart_required, true);
+  assert.match(codex.message, /重启 daemon 后生效/);
+  assert.deepEqual(readConfig(paths.config).subagents.codex, {
+    enabled: true, spawn_supported: true, default_model: null, runtime_path: path.join(bin, 'codex'),
+    home: providerHome, profile: null, version: '1.2.3',
+  });
+  await daemon.restart();
+  const dtask = await spawnTask('dsh');
+  const dwait = await callDaemon(daemon.socket, 'wait', { agent_id: dtask.agent_id, wait_time: 10 });
+  assert.equal(dwait.task.status, 'completed', JSON.stringify(dwait));
+  // The Codex fixture deliberately has no app-server. Admission must still open;
+  // main.rs unit tests separately assert the production factory selection.
+  const ctask = await spawnTask('codex');
+  assert.ok(ctask.agent_id);
 });

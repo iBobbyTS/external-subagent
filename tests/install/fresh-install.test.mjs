@@ -217,7 +217,7 @@ test('explicit init installs the standalone service only and binds no host', { s
   }
   assert.equal(report.service.skipped, true, 'fixture runs neutralize launchd explicitly');
   assert.equal(report.payload.status, 'verified');
-  assert.equal(report.runtime.present, fs.existsSync(ZCODE_RUNTIME), 'the runtime is reported, never required');
+  assert.equal(report.runtimes.zcode.present, fs.existsSync(ZCODE_RUNTIME), 'the runtime is reported, never required');
 
   const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
   const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.external-subagent.daemon.plist');
@@ -379,8 +379,8 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
 
     const agents = jsonOutput(run(ctx.cli, ['subagents', 'status'], { env }), 'subagents status');
     const byAgent = Object.fromEntries(agents.subagents.map((agent) => [agent.subagent, agent]));
-    assert.equal(byAgent.zcode.enabled, true);
-    assert.equal(byAgent.zcode.spawn_supported, true);
+    assert.equal(byAgent.zcode.enabled, false);
+    assert.equal(byAgent.zcode.spawn_supported, false);
     assert.equal(byAgent.dsh.enabled, false, 'DSH stays explicitly missing without any auto-install');
     assert.equal(byAgent.dsh.spawn_supported, false);
     assert.equal(byAgent.dsh.local.state, 'UNKNOWN', 'missing DSH must surface as unknown, never as valid');
@@ -401,7 +401,7 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
       assert.equal(fs.realpathSync(event.home), fs.realpathSync(providerHome));
       assert.equal(event.mode, 'read-only');
       assert.equal(fs.existsSync(event.patch), false, 'probe patch must be reaped');
-      assert.equal(event.patch.startsWith(repoRoot), false);
+      assert.equal(event.patch.startsWith(path.join(repoRoot, 'profiles')), false, 'must use the disposable embedded patch, never source resources');
     }
     assert.deepEqual(fs.readdirSync(workspace), []);
 

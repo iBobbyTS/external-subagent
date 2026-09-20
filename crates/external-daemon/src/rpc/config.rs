@@ -47,8 +47,8 @@ impl Default for AgentConfigSnapshot {
                 (
                     "zcode".into(),
                     AgentConfigEntry {
-                        enabled: true,
-                        spawn_supported: true,
+                        enabled: false,
+                        spawn_supported: false,
                         default_model: None,
                         runtime_path: None,
                         home: None,
@@ -234,7 +234,7 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
                 "agent config runtime_path is unsupported for zcode",
             ));
         }
-        let default_enabled = name == "zcode";
+        let default_enabled = false;
         entry
             .entry("enabled")
             .or_insert(Value::Bool(default_enabled));
@@ -268,6 +268,20 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
 #[cfg(test)]
 mod config_migration_tests {
     use super::*;
+
+    #[test]
+    fn omitted_flags_never_enable_a_subagent() {
+        for input in [
+            b"{}".as_slice(),
+            br#"{"subagents":{"zcode":{},"dsh":{},"codex":{}}}"#,
+        ] {
+            let config = parse_agent_config_snapshot(input).unwrap();
+            assert!(config
+                .subagents
+                .values()
+                .all(|entry| !entry.enabled && !entry.spawn_supported));
+        }
+    }
 
     #[test]
     fn shared_node_rust_config_matrix() {

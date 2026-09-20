@@ -36,8 +36,8 @@ function unsetPatch(key) {
   if (key === 'default_subagent') return { default_subagent: null };
   const [, agent, field] = key.split('.');
   const defaults = {
-    enabled: agent === 'zcode',
-    spawn_supported: agent === 'zcode',
+    enabled: false,
+    spawn_supported: false,
     default_model: null, runtime_path: null, home: null, profile: null, version: null,
   };
   return { subagents: { [agent]: { [field]: defaults[field] } } };

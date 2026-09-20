@@ -609,6 +609,7 @@ mod agent_probe_tests {
     impl AgentProbeBackend for FixtureProbe {
         fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
             let ready = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Ready,
                 scope: input.scope.clone(),
                 version: Some("3.8.1".into()),
@@ -616,6 +617,7 @@ mod agent_probe_tests {
                 reason: None,
             };
             let unknown_auth = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Unknown,
                 scope: input.scope.clone(),
                 version: None,
@@ -623,6 +625,7 @@ mod agent_probe_tests {
                 reason: Some("auth_not_probed".into()),
             };
             let unknown_hi = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Unknown,
                 scope: input.scope.clone(),
                 version: None,

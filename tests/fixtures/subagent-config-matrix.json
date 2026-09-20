@@ -35,5 +35,6 @@
   {"name":"codex runtime_path object", "valid":false, "input":{"schema_version":2,"subagents":{"codex":{"runtime_path":{"bin":"/opt/codex"}}}}},
   {"name":"dsh runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"dsh","subagents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"}}}},
   {"name":"codex runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"codex","subagents":{"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}},
-  {"name":"dsh codex runtime_path schema 1", "valid":true, "input":{"schema_version":1,"revision":2,"default_agent":"dsh","agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"},"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}}
+  {"name":"dsh codex runtime_path schema 1", "valid":true, "input":{"schema_version":1,"revision":2,"default_agent":"dsh","agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"},"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}},
+  {"name":"empty subagent entries remain disabled","valid":true,"input":{"schema_version":2,"subagents":{"zcode":{},"dsh":{},"codex":{}}}}
 ]

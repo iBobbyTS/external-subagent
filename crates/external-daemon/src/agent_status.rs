@@ -82,6 +82,8 @@ pub enum EvidenceState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_path: Option<String>,
     pub state: EvidenceState,
     pub scope: ProbeScope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,6 +97,7 @@ impl ScopeEvidence {
     fn unknown(scope: ProbeScope, checked_at_ms: u64, reason: &str) -> Self {
         Self {
             state: EvidenceState::Unknown,
+            runtime_path: None,
             scope,
             version: None,
             checked_at_ms,
@@ -230,6 +233,7 @@ fn preserved_or_stale(
     }
     if previous_revision == current_revision {
         return ScopeEvidence {
+            runtime_path: None,
             state: EvidenceState::Unknown,
             scope: current_scope.clone(),
             version: None,
@@ -238,6 +242,7 @@ fn preserved_or_stale(
         };
     }
     ScopeEvidence {
+        runtime_path: value.runtime_path,
         state: EvidenceState::Unknown,
         scope: value.scope,
         version: value.version,
@@ -259,7 +264,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
                 "dsh" => "DSH_HOME",
                 // Codex never falls back to ~/.codex: only an explicit home
                 // (persisted configuration or exported CODEX_HOME) counts.
-                "codex" if env::var_os("CODEX_HOME").is_some() => "CODEX_HOME",
+                "codex" => "CODEX_HOME",
                 _ => "ZCODE_HOME",
             };
             scope.home = if variable == "CODEX_HOME" {
@@ -290,8 +295,8 @@ impl AgentProbeBackend for ProcessProbeBackend {
         }
         let executable = match input.agent.as_str() {
             "zcode" => self.runtime_source.clone(),
-            "dsh" => env::var_os("DSH_RUNTIME_PATH").map(PathBuf::from),
-            "codex" => env::var_os("CODEX_RUNTIME_PATH").map(PathBuf::from),
+            "dsh" => discover_runtime("DSH_RUNTIME_PATH", "dsh"),
+            "codex" => discover_runtime("CODEX_RUNTIME_PATH", "codex"),
             _ => None,
         };
         let local = probe_local(executable.as_deref(), scope.clone(), checked_at_ms);
@@ -371,6 +376,7 @@ fn probe_dsh_hi(
 ) -> (ScopeEvidence, ScopeEvidence) {
     let unavailable = |reason: &str| {
         let e = ScopeEvidence {
+            runtime_path: None,
             state: EvidenceState::Unavailable,
             scope: scope.clone(),
             version: version.clone(),
@@ -440,6 +446,7 @@ fn probe_dsh_hi(
     match result {
         Ok(()) => {
             let hi = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Ready,
                 scope: scope.clone(),
                 version,
@@ -452,6 +459,7 @@ fn probe_dsh_hi(
         Err(e) => {
             let reason = classify_dsh_session_error(&e);
             let hi = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Unavailable,
                 scope: scope.clone(),
                 version,
@@ -896,9 +904,38 @@ fn parse_opaque_model_tokens(catalog: &Value) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+// Environment selection is authoritative; PATH discovery is observation only.
+// Keep the absolute launch path (including symlinks) so wrapper argv semantics survive.
+fn discover_runtime(variable: &str, name: &str) -> Option<PathBuf> {
+    if let Some(path) = env::var_os(variable) {
+        return Some(PathBuf::from(path));
+    }
+    discover_on_path(env::var_os("PATH").as_deref(), name)
+}
+
+fn discover_on_path(search: Option<&std::ffi::OsStr>, name: &str) -> Option<PathBuf> {
+    env::split_paths(search?).find_map(|directory| {
+        let candidate = directory.join(name);
+        let candidate = std::path::absolute(candidate).ok()?;
+        let metadata = fs::metadata(&candidate).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+        }
+        Some(candidate)
+    })
+}
+
 fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> ScopeEvidence {
     let Some(path) = path else {
         return ScopeEvidence {
+            runtime_path: path.map(|p| p.to_string_lossy().into_owned()),
             state: EvidenceState::Unavailable,
             scope,
             version: None,
@@ -908,6 +945,7 @@ fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> Sc
     };
     if !path.is_file() {
         return ScopeEvidence {
+            runtime_path: Some(path.to_string_lossy().into_owned()),
             state: EvidenceState::Unavailable,
             scope,
             version: None,
@@ -917,6 +955,7 @@ fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> Sc
     }
     match executable_version(path) {
         Ok(version) => ScopeEvidence {
+            runtime_path: Some(path.to_string_lossy().into_owned()),
             state: EvidenceState::Ready,
             scope,
             version: Some(version),
@@ -924,6 +963,7 @@ fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> Sc
             reason: None,
         },
         Err(reason) => ScopeEvidence {
+            runtime_path: Some(path.to_string_lossy().into_owned()),
             state: EvidenceState::Degraded,
             scope,
             version: None,
@@ -995,8 +1035,8 @@ fn executable_version(path: &Path) -> Result<String, String> {
     let version = text
         .lines()
         .chain(diagnostic.lines())
-        .map(str::trim)
-        .find(|line| !line.is_empty());
+        .flat_map(str::split_whitespace)
+        .find(|token| valid_version(token));
     version
         .filter(|value| valid_version(value) && !value.contains('\0'))
         .map(str::to_owned)
@@ -1142,6 +1182,7 @@ fn probe_zcode_hi(
     };
     if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
         let evidence = ScopeEvidence {
+            runtime_path: None,
             state: EvidenceState::Unavailable,
             scope: scope.clone(),
             version,
@@ -1183,6 +1224,7 @@ fn probe_zcode_hi(
                 RUNTIME_STOP_GRACE,
             );
             let evidence = ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Ready,
                 scope: scope.clone(),
                 version,
@@ -1629,6 +1671,7 @@ fn unavailable(
     reason: &str,
 ) -> ScopeEvidence {
     ScopeEvidence {
+        runtime_path: None,
         state: if reason == "rate_limit" {
             EvidenceState::Degraded
         } else {
@@ -1643,6 +1686,7 @@ fn unavailable(
 
 fn derived_failure(source: &ScopeEvidence, scope: ProbeScope, checked_at_ms: u64) -> ScopeEvidence {
     ScopeEvidence {
+        runtime_path: source.runtime_path.clone(),
         state: source.state,
         scope,
         version: source.version.clone(),
@@ -1690,6 +1734,7 @@ mod tests {
             agent: "zcode".into(),
             config_revision: 0,
             local: ScopeEvidence {
+                runtime_path: None,
                 state: EvidenceState::Ready,
                 scope: scope.clone(),
                 version: Some("1.2.3".into()),
@@ -1924,6 +1969,21 @@ mod tests {
 
     #[test]
     fn dsh_probe_never_promotes_production_spawn_support() {
+        // Isolate PATH in a subprocess; never mutate global PATH under parallel tests.
+        if env::var_os("S05_EMPTY_PATH_PROBE").is_none() {
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agent_status::tests::dsh_probe_never_promotes_production_spawn_support",
+                ])
+                .env("S05_EMPTY_PATH_PROBE", "1")
+                .env("PATH", "")
+                .env_remove("DSH_RUNTIME_PATH")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
         let backend = ProcessProbeBackend {
             runtime_source: None,
         };
@@ -2132,7 +2192,7 @@ process.stdin.on('data', (chunk) => {
             },
         });
         let records = fs::read_to_string(log)
-            .unwrap()
+            .unwrap_or_else(|error| panic!("fixture log unavailable: {error}; evidence={evidence:?}"))
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();

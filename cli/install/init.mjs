@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from '../constants.mjs';
+import { LAUNCH_AGENT_LABEL } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
@@ -10,7 +10,7 @@ import { pathReport } from './path.mjs';
 import { packageRoot, payloadManifestPath } from './layout.mjs';
 import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
-import { bootstrapService, bootoutService, installLaunchAgent } from './service-macos.mjs';
+import { bootstrapService, bootoutService, installLaunchAgent, runtimeObservations } from './service-macos.mjs';
 
 // Standalone-install coordination (S05, AUD-005 decision D1).  A plain npm
 // install only stages the package and payload; an explicit `init` installs
@@ -197,7 +197,7 @@ export function runInit(options = {}) {
     // Honest runtime report instead of a hard dependency: the pinned ZCode
     // runtime is an adapter capability, observed and forwarded by the service
     // template only when present.
-    runtime: { path: ZCODE_RUNTIME, present: fs.existsSync(ZCODE_RUNTIME) },
+    runtimes: runtimeObservations(paths),
     payload,
     baseline,
     path_report: pathFindings,

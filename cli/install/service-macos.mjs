@@ -18,6 +18,15 @@ function escapeXml(value) {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
+// Presence is diagnostic only; enabling is an explicit probe + config operation.
+export function runtimeObservations(paths, options = {}) {
+  const config = readConfig(paths.config);
+  return Object.fromEntries(['zcode', 'dsh', 'codex'].map((agent) => {
+    const runtime = agent === 'zcode' ? (options.zcodeRuntime ?? ZCODE_RUNTIME) : config.subagents[agent].runtime_path;
+    return [agent, { path: runtime, present: Boolean(runtime && fs.existsSync(runtime)), enabled: config.subagents[agent].enabled }];
+  }));
+}
+
 export function launchAgentPlist(paths, options = {}) {
   const daemon = nativeBinary(DAEMON_BIN_NAME);
   const config = readConfig(paths.config);
