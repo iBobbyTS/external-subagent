@@ -3,13 +3,14 @@
 //!
 //! The pure Codex protocol face lives in the `external-agent-codex` crate
 //! (`crates/subagents/codex`): the `thread/start`, `thread/resume`, and
-//! `turn/start` parameter shapes, posture admission, fail-closed result
-//! echo validation, and the folding of `item/*` and `turn/*`
+//! `turn/start` parameter shapes, binary posture admission, fail-closed
+//! result echo validation, and the folding of `item/*` and `turn/*`
 //! notifications into the canonical internal `session/event` lifecycle.
-//! This module keeps the lifecycle composition on top of it: the stdio
-//! transport (the `ZcodeStrict`-codec [`external_runtime::Driver`] pump
-//! and Publisher), the persistent thread and turn control-plane glue, and
-//! the normalization entry point the scheduler consumes.
+//! This module keeps the daemon lifecycle composition on top of it: the
+//! spawn gate, the runtime owner, the stdio transport (the `ZcodeStrict`-
+//! codec [`external_runtime::Driver`] pump and Publisher), the persistent
+//! thread and turn control-plane glue, and the normalization entry point
+//! the scheduler consumes.
 //!
 //! Production spawn is selected only by the explicit configuration gate; the
 //! closed factory remains the fail-closed default. Only `plan` and `yolo`

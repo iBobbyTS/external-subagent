@@ -10,6 +10,16 @@ two versions and is recorded per version below. All evidence was gathered
 with `CODEX_HOME` pointed at throwaway directories; no real user Codex home
 was modified while gathering this evidence.
 
+## Implementation layout
+
+The Codex protocol face lives in the `external-agent-codex` crate
+(`crates/subagents/codex`): the `thread/start`, `thread/resume`, and
+`turn/start` parameter shapes, the binary plan/yolo posture admission, the
+fail-closed result echo validation, and the `item/*`/`turn/*` event folding.
+The daemon side (`crates/external-daemon/src/codex`) is lifecycle
+composition only — spawn gate, runtime owner, stdio pump, and control-plane
+glue.
+
 ## Plugin interface (verified 2026-09-12)
 
 | Command | Result shape | Notes |

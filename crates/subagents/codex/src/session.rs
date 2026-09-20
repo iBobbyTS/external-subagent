@@ -3,7 +3,8 @@
 //! posture admission for the two admitted permission modes, and the
 //! fail-closed echo validation of thread results. The daemon drives the
 //! requests and maps every [`CodexError`] onto its own
-//! `RuntimeCommandError` variant for variant with the payload verbatim.
+//! `RuntimeCommandError` variant, variant for variant, with the payload
+//! verbatim.
 
 use std::{
     path::Path,
