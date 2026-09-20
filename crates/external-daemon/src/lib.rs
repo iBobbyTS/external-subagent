@@ -688,7 +688,7 @@ impl RuntimeOwner {
         mcp_servers: &[StdioMcpServer],
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        let session_id = task.zcode_session_id.as_deref().ok_or_else(|| {
+        let session_id = task.session_id.as_deref().ok_or_else(|| {
             RuntimeCommandError::InvalidSession("task has no persisted session id".into())
         })?;
         *self.diagnostic_session_id.lock().unwrap() = Some(session_id.to_owned());
@@ -1394,7 +1394,7 @@ mod zcode_effort_tests {
             failure_code: None,
             failure_message: None,
             runtime_agent_id: None,
-            zcode_session_id: session.map(str::to_owned),
+            session_id: session.map(str::to_owned),
             turn_state: TurnState::Idle,
             process_identity: None,
             closed_at: None,
@@ -1751,7 +1751,7 @@ mod task_route_tests {
             failure_code: None,
             failure_message: None,
             runtime_agent_id: None,
-            zcode_session_id: None,
+            session_id: None,
             turn_state: TurnState::Idle,
             process_identity: None,
             closed_at: None,

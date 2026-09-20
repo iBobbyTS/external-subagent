@@ -495,7 +495,7 @@ pub(super) fn task_view(task: TaskRecord) -> TaskView {
     TaskView {
         agent_id: task.agent_id,
         status,
-        session_id: task.zcode_session_id,
+        session_id: task.session_id,
         input_identity: InputIdentityView {
             subagent: admission.as_ref().map(|identity| identity.agent.clone()),
             config_revision: admission.as_ref().map(|identity| identity.config_revision),

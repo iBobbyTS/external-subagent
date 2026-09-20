@@ -282,7 +282,7 @@ impl Store {
         owner_epoch: u64,
         runtime_agent_id: &str,
         identity: Option<&StoredProcessIdentity>,
-        zcode_session_id: Option<&str>,
+        session_id: Option<&str>,
         turn_state: Option<TurnState>,
     ) -> StoreResult<bool> {
         let mut connection = self.connection.lock().unwrap();
@@ -290,7 +290,7 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks SET phase='RUNNING',runtime_agent_id=?1,pid=?2,process_group_id=?3,
                  process_uid=?4,process_start_token=?5,last_heartbeat_at=?6,
-                 zcode_session_id=COALESCE(?7,zcode_session_id),turn_state=COALESCE(?8,turn_state)
+                 session_id=COALESCE(?7,session_id),turn_state=COALESCE(?8,turn_state)
              WHERE agent_id=?9 AND owner_epoch=?10 AND phase='PREPARING'",
             params![
                 runtime_agent_id,
@@ -299,7 +299,7 @@ impl Store {
                 identity.map(|value| value.uid),
                 identity.map(|value| value.start_token.as_str()),
                 now_millis(),
-                zcode_session_id,
+                session_id,
                 turn_state.map(TurnState::as_str),
                 agent_id,
                 u64_to_i64(owner_epoch)?,
@@ -410,7 +410,7 @@ pub(crate) fn query_task(
                     workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,
                     initial_prompt,owner_id,owner_epoch,
                     close_requested,stop_requested,failure_code,failure_message,runtime_agent_id,
-                    zcode_session_id,turn_state,pid,process_group_id,process_uid,process_start_token,
+                    session_id,turn_state,pid,process_group_id,process_uid,process_start_token,
                     closed_at,reaped_at,created_at,last_event_seq
              FROM tasks WHERE agent_id=?1",
             [agent_id],
@@ -468,7 +468,7 @@ fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
         failure_code: row.13,
         failure_message: row.14,
         runtime_agent_id: row.15,
-        zcode_session_id: row.16,
+        session_id: row.16,
         turn_state: TurnState::parse(&row.17)?,
         process_identity,
         closed_at: row.22,

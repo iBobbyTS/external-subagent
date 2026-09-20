@@ -183,7 +183,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
             .checked_add(timeout)
             .ok_or(RuntimeCommandError::Timeout)?;
         let thread_id = task
-            .zcode_session_id
+            .session_id
             .as_deref()
             .filter(|id| !id.is_empty() && id.len() <= 512)
             .ok_or_else(|| {

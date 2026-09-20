@@ -110,7 +110,7 @@ pub struct TaskRecord {
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
     pub runtime_agent_id: Option<String>,
-    pub zcode_session_id: Option<String>,
+    pub session_id: Option<String>,
     pub turn_state: TurnState,
     pub process_identity: Option<StoredProcessIdentity>,
     pub closed_at: Option<i64>,

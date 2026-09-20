@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::{StoreError, StoreResult};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -17,7 +17,7 @@ CREATE TABLE tasks (
     prepared_launch_json TEXT NOT NULL,
     prepared_launch_sha256 TEXT NOT NULL,
     initial_prompt TEXT NOT NULL,
-    zcode_session_id TEXT,
+    session_id TEXT,
     turn_state TEXT NOT NULL DEFAULT 'IDLE',
     pid INTEGER,
     process_group_id INTEGER,
@@ -109,25 +109,34 @@ INSERT INTO task_id_allocator(id, next_id) VALUES (1, 10000000);
 "#;
 
 pub(crate) fn initialize_schema(connection: &mut Connection) -> StoreResult<()> {
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let user_tables: u64 = connection.query_row(
+    // Lock before reading the version so concurrent openers cannot both migrate v12.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let user_tables: u64 = transaction.query_row(
         "SELECT COUNT(*) FROM sqlite_master
          WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         [],
         |row| row.get(0),
     )?;
     if user_tables != 0 {
-        if version != SCHEMA_VERSION || !schema_is_current(connection)? {
+        if !matches!(version, 12 | SCHEMA_VERSION) || !schema_is_current(&transaction)? {
             return Err(StoreError::LegacySchemaUnsupported);
         }
-        return Ok(());
+        if version == 12 {
+            transaction.execute_batch(concat!(
+                "ALTER TABLE tasks RENAME COLUMN ",
+                "zcode_",
+                "session_id TO session_id"
+            ))?;
+            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+    } else {
+        if version != 0 {
+            return Err(StoreError::LegacySchemaUnsupported);
+        }
+        transaction.execute_batch(SCHEMA)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
-    if version != 0 {
-        return Err(StoreError::LegacySchemaUnsupported);
-    }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(SCHEMA)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
     Ok(())
 }

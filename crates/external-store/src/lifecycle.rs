@@ -253,7 +253,7 @@ impl Store {
             Option<i64>,
             Option<i64>,
         ) = transaction.query_row(
-            "SELECT phase,zcode_session_id,workspace_path,owner_epoch,outcome,
+            "SELECT phase,session_id,workspace_path,owner_epoch,outcome,
                     stop_requested,close_requested,closed_at,pid,reaped_at
              FROM tasks WHERE agent_id=?1",
             [agent_id],
@@ -396,7 +396,7 @@ impl Store {
         transaction.execute(
             "UPDATE tasks SET phase='TERMINAL',outcome=?1,owner_id=?2,lease_expires_at=NULL,
                  close_requested=?3,stop_requested=?4,failure_code=?5,failure_message=?6,
-                 runtime_agent_id=?7,zcode_session_id=?8,turn_state=?9,pid=?10,
+                 runtime_agent_id=?7,session_id=?8,turn_state=?9,pid=?10,
                  process_group_id=?11,process_uid=?12,process_start_token=?13,
                  closed_at=?14,reaped_at=?15,last_event_seq=?16
              WHERE agent_id=?17",
@@ -408,7 +408,7 @@ impl Store {
                 original.failure_code,
                 original.failure_message,
                 original.runtime_agent_id,
-                original.zcode_session_id,
+                original.session_id,
                 original.turn_state.as_str(),
                 original.process_identity.as_ref().map(|v| v.pid),
                 original

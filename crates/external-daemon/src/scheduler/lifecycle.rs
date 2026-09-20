@@ -73,7 +73,7 @@ impl Scheduler {
                 hook();
             }
         }
-        let resumed = claim.task.zcode_session_id.is_some();
+        let resumed = claim.task.session_id.is_some();
         let _policy = match route_policy(&route, resumed) {
             Ok(policy) => policy.map(Arc::new),
             Err(error) => {
@@ -122,7 +122,7 @@ impl Scheduler {
                 let message = error.to_string();
                 self.record_runtime_failure(
                     &claim.task.agent_id,
-                    claim.task.zcode_session_id.as_deref(),
+                    claim.task.session_id.as_deref(),
                     "spawn",
                     "RUNTIME_SPAWN_FAILED",
                     &message,
@@ -154,7 +154,7 @@ impl Scheduler {
         ));
         let mcp_servers = Vec::new();
         let bootstrap_timeout = self.inner.config.bootstrap_timeout;
-        let session = match if claim.task.zcode_session_id.is_some() {
+        let session = match if claim.task.session_id.is_some() {
             runtime.resume_session_with_mcp(&claim.task, &mcp_servers, bootstrap_timeout)
         } else {
             runtime.bootstrap_session_with_mcp(&claim.task, &mcp_servers, bootstrap_timeout)
@@ -167,7 +167,7 @@ impl Scheduler {
                 let (outcome, code) = (CompletionOutcome::Failed, "SESSION_START_FAILED");
                 self.record_runtime_failure(
                     &claim.task.agent_id,
-                    claim.task.zcode_session_id.as_deref(),
+                    claim.task.session_id.as_deref(),
                     "session_start",
                     code,
                     &message,

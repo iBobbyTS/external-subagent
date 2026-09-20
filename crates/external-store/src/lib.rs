@@ -10,6 +10,8 @@ mod store;
 mod tasks;
 
 #[cfg(test)]
+mod schema_tests;
+#[cfg(test)]
 mod tests;
 
 pub use error::{StoreError, StoreResult};

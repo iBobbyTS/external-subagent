@@ -34,7 +34,7 @@ impl Scheduler {
         // settle them through the same unstarted cancellation owner as RPC.
         let never_claimed_cancellation = task.phase == TaskPhase::Cancelling
             && task.owner_epoch == 0
-            && task.zcode_session_id.is_none();
+            && task.session_id.is_none();
         if (task.phase == TaskPhase::Queued || never_claimed_cancellation)
             && task.stop_requested
             && task.runtime_agent_id.is_none()

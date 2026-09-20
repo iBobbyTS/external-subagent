@@ -231,7 +231,7 @@ fn public_submit_reaches_persistent_thread_and_persists_the_id() {
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
     assert_eq!(result.result.final_text, "CODEX_OK");
     let task = await_terminal_task(&scheduler, &agent_id);
-    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
     // The exact child contract is visible in the recorded deliveries.
     let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
     let initialize: serde_json::Value =
@@ -285,7 +285,7 @@ fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
     assert_eq!(result.result.final_text, "CODEX_OK");
     let task = await_terminal_task(&scheduler, &agent_id);
-    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
     let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
     let thread_start = deliveries
         .lines()
@@ -438,7 +438,7 @@ fn start_fails_closed_without_a_confirmed_posture() {
             let task = await_terminal_task(&scheduler, &agent_id);
             assert_eq!(task.outcome, Some(TaskOutcome::Failed));
             assert_eq!(
-                task.zcode_session_id, None,
+                task.session_id, None,
                 "no thread may be persisted on an unconfirmed start (case {index})"
             );
             let record = scheduler.last_error(&agent_id).expect("failure record");
@@ -675,7 +675,7 @@ fn closed_gate_and_unproven_write_modes_refuse_spawn_without_a_process() {
         failure_code: None,
         failure_message: None,
         runtime_agent_id: None,
-        zcode_session_id: None,
+        session_id: None,
         turn_state: external_store::TurnState::Idle,
         process_identity: None,
         closed_at: None,
@@ -1039,7 +1039,7 @@ sleep 1
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Failed);
     let task = await_terminal_task(&scheduler, &agent_id);
-    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
     let record = scheduler
         .last_error(&agent_id)
         .expect("correlated failure record");
@@ -1124,7 +1124,7 @@ exit 0
             record.contains(marker) || marker == "SESSION_START_FAILED",
             "record for {marker}: {record}"
         );
-        assert_eq!(task.zcode_session_id, None);
+        assert_eq!(task.session_id, None);
     }
 }
 
@@ -1177,7 +1177,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     scheduler.cancel_task(&agent_id).unwrap();
     let task = await_terminal_task(&scheduler, &agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
-    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
     let deliveries = std::fs::read_to_string(directory.join("deliveries.jsonl")).unwrap();
     let interrupt = deliveries
         .lines()
@@ -1302,7 +1302,7 @@ fn codex_task_record(directory: &Path) -> TaskRecord {
         failure_code: None,
         failure_message: None,
         runtime_agent_id: None,
-        zcode_session_id: None,
+        session_id: None,
         turn_state: external_store::TurnState::Idle,
         process_identity: None,
         closed_at: None,
@@ -1879,7 +1879,7 @@ while IFS= read -r line; do :; done
     );
     let task = await_terminal_task(&scheduler, &agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Completed));
-    assert_eq!(task.zcode_session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
     assert!(
         scheduler.last_error(&agent_id).is_none(),
         "late replays must not label a failure: {:?}",
@@ -2021,7 +2021,7 @@ sleep 1
         let task = await_terminal_task(&scheduler, &agent_id);
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
         assert_eq!(
-            task.zcode_session_id.as_deref(),
+            task.session_id.as_deref(),
             Some(THREAD_ID),
             "the persisted thread identity stays durable for a retry"
         );
@@ -2415,7 +2415,7 @@ fn resume_fails_closed_when_the_effort_echo_diverges() {
     let task = await_terminal_task(&scheduler, &agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Failed));
     assert_eq!(
-        task.zcode_session_id.as_deref(),
+        task.session_id.as_deref(),
         Some(THREAD_ID),
         "the persisted thread identity stays durable for a retry"
     );
@@ -2548,7 +2548,7 @@ sleep 1
         let task = await_terminal_task(&scheduler, &agent_id);
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
         assert_eq!(
-            task.zcode_session_id.as_deref(),
+            task.session_id.as_deref(),
             Some(THREAD_ID),
             "the persisted thread identity stays durable for a retry"
         );

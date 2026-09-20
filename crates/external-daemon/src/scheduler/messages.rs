@@ -168,7 +168,7 @@ impl Scheduler {
         // transaction before any state changes.
         let eligible = task_agent(&task) == "codex"
             && task
-                .zcode_session_id
+                .session_id
                 .as_deref()
                 .is_some_and(|id| !id.is_empty() && id.len() <= 512)
             && task.outcome != Some(TaskOutcome::Cancelled)
