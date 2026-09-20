@@ -281,7 +281,7 @@ fn wait_for_startup_test_gate(_shutdown_requested: &AtomicBool) -> io::Result<()
 
 fn parse_config() -> io::Result<Config> {
     let mut database = env::var_os("EXTERNAL_SUBAGENT_STORE").map(PathBuf::from);
-    let mut socket = env::var_os("ZCODE_AGENTD_SOCKET").map(PathBuf::from);
+    let mut socket = env::var_os("EXTERNAL_SUBAGENT_SOCKET").map(PathBuf::from);
     let mut runtime = env::var_os("ZCODE_RUNTIME_PATH").map(PathBuf::from);
     let mut diagnostic_log = None;
     let mut agent_config = env::var_os("EXTERNAL_SUBAGENT_CONFIG").map(PathBuf::from);
@@ -318,7 +318,7 @@ fn parse_config() -> io::Result<Config> {
     let socket = absolute_path(socket.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ZCODE_AGENTD_SOCKET or --socket is required",
+            "EXTERNAL_SUBAGENT_SOCKET or --socket is required",
         )
     })?)?;
     let runtime = runtime.map(fs::canonicalize).transpose()?;

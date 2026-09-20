@@ -348,7 +348,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
         FAKE_CODEX_LOG: fake.log,
         ...extra,
       };
-      delete env.ZCODE_AGENTD_SOCKET;
+      delete env.EXTERNAL_SUBAGENT_SOCKET;
       return env;
     };
     const paths = () => productPaths(home);

@@ -201,8 +201,8 @@ test('global diagnose queries the configured effective socket without model side
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-socket-'));
   const paths = pathsFor(home);
   const configured = { socket: path.join(home, 'configured.sock') };
-  const previous = process.env.ZCODE_AGENTD_SOCKET;
-  process.env.ZCODE_AGENTD_SOCKET = configured.socket;
+  const previous = process.env.EXTERNAL_SUBAGENT_SOCKET;
+  process.env.EXTERNAL_SUBAGENT_SOCKET = configured.socket;
   try {
     await withDaemon(configured, (request) => {
       assert.equal(request.method, 'system_status');
@@ -217,8 +217,8 @@ test('global diagnose queries the configured effective socket without model side
       assert.equal(fs.existsSync(paths.socket), false);
     });
   } finally {
-    if (previous === undefined) delete process.env.ZCODE_AGENTD_SOCKET;
-    else process.env.ZCODE_AGENTD_SOCKET = previous;
+    if (previous === undefined) delete process.env.EXTERNAL_SUBAGENT_SOCKET;
+    else process.env.EXTERNAL_SUBAGENT_SOCKET = previous;
   }
 });
 

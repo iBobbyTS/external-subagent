@@ -148,7 +148,7 @@ test('zcode refresh failure after healthy activation is partial, never success (
     // A foreign MCP command in the managed staging: the next refresh must
     // refuse the tree (PLUGIN_STAGING_CONFLICT) instead of overwriting it.
     fs.writeFileSync(path.join(paths.zcodePlugin, '.mcp.json'), JSON.stringify({
-      mcpServers: { external_subagent: { command: '/usr/local/bin/other-node', args: ['/tmp/foreign-bridge.mjs'], env: { ZCODE_AGENTD_SOCKET: paths.socket } } },
+      mcpServers: { external_subagent: { command: '/usr/local/bin/other-node', args: ['/tmp/foreign-bridge.mjs'], env: { EXTERNAL_SUBAGENT_SOCKET: paths.socket } } },
     }));
     const activations = [];
     await assert.rejects(

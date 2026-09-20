@@ -204,7 +204,7 @@ const live = Boolean(LIVE_PREFIX);
 
 function cleanDaemonEnv(home) {
   const env = { ...process.env, HOME: home };
-  for (const key of ['DSH_RUNTIME_PATH', 'DSH_HOME', 'DSH_PROFILE', 'DSH_VERSION', 'ZCODE_RUNTIME_PATH', 'EXTERNAL_SUBAGENT_CONFIG', 'EXTERNAL_SUBAGENT_STORE', 'ZCODE_AGENTD_SOCKET']) {
+  for (const key of ['DSH_RUNTIME_PATH', 'DSH_HOME', 'DSH_PROFILE', 'DSH_VERSION', 'ZCODE_RUNTIME_PATH', 'EXTERNAL_SUBAGENT_CONFIG', 'EXTERNAL_SUBAGENT_STORE', 'EXTERNAL_SUBAGENT_SOCKET']) {
     delete env[key];
   }
   return env;
@@ -214,7 +214,7 @@ function liveCli(prefix, socket, home) {
   return (args) => spawnSync(path.join(prefix, 'bin', 'external-subagent'), args, {
     encoding: 'utf8',
     timeout: 300_000,
-    env: { ...cleanDaemonEnv(home), ZCODE_AGENTD_SOCKET: socket },
+    env: { ...cleanDaemonEnv(home), EXTERNAL_SUBAGENT_SOCKET: socket },
   });
 }
 
@@ -434,7 +434,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     const rejected = spawnSync(path.join(prefix, 'bin', 'external-subagent'), [
       'spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
       '--model', 'glm-5.3', '--prompt', 'hi',
-    ], { encoding: 'utf8', timeout: 30_000, env: { ...cleanDaemonEnv(home), ZCODE_AGENTD_SOCKET: socket } });
+    ], { encoding: 'utf8', timeout: 30_000, env: { ...cleanDaemonEnv(home), EXTERNAL_SUBAGENT_SOCKET: socket } });
     assert.equal(rejected.status, 1);
     const rejection = JSON.parse(rejected.stderr);
     assert.equal(rejection.error.code, 'model_selection_unsupported');

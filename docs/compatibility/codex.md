@@ -94,7 +94,7 @@ cache was byte-identical to the staged binding (see
 Because versioning alone is a release discipline rather than a runtime
 guarantee, `install-plugin` also **reads the materialized cache back before
 reporting success** and compares its `.mcp.json` (the full managed MCP
-document — facade command, `ZCODE_AGENTD_SOCKET`, and every other server
+document — facade command, `EXTERNAL_SUBAGENT_SOCKET`, and every other server
 field such as args), its `.codex-plugin/plugin.json` identity, and its
 full managed content (file set and bytes) with this run's staged binding;
 foreign or unreadable bytes fail closed with
@@ -120,7 +120,7 @@ store-simulation oracles in `tests/install/codex-binding.test.mjs`.
 
 - The staged plugin `.mcp.json` pins `command` to the absolute
   `external-subagent-mcp` facade inside the installed npm package and
-  `ZCODE_AGENTD_SOCKET` to the daemon socket — never a shell/GUI PATH
+  `EXTERNAL_SUBAGENT_SOCKET` to the daemon socket — never a shell/GUI PATH
   lookup or an nvm-relative path.
 - The direct TOML binding (`install-mcp`) writes the same ten-tool
   `mcp_servers.external_subagent` section non-destructively.

@@ -2,18 +2,18 @@ use std::{env, io, path::PathBuf};
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    let socket = env::var_os("ZCODE_AGENTD_SOCKET")
+    let socket = env::var_os("EXTERNAL_SUBAGENT_SOCKET")
         .map(PathBuf::from)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "ZCODE_AGENTD_SOCKET is required",
+                "EXTERNAL_SUBAGENT_SOCKET is required",
             )
         })?;
     if !socket.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ZCODE_AGENTD_SOCKET must be absolute",
+            "EXTERNAL_SUBAGENT_SOCKET must be absolute",
         ));
     }
     // The installer keeps the stable daemon RPC socket in configuration;

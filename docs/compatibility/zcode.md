@@ -30,7 +30,7 @@ facade. `install-plugin zcode` pins the **installing node
 (`process.execPath`) running the staged
 `scripts/mcp-stdio-bridge.mjs`** — a node reimplementation of the native
 facade's stdio↔`.mcp`-socket byte pipe (`crates/external-mcp`), with the
-same `ZCODE_AGENTD_SOCKET` → sibling `.mcp` endpoint resolution and
+same `EXTERNAL_SUBAGENT_SOCKET` → sibling `.mcp` endpoint resolution and
 either-side-EOF exit semantics. This mirrors how the product's own hook
 installation already pins `process.execPath`. The pinned path follows the
 installing interpreter (e.g. a Homebrew Cellar path); `update`/`reconcile`

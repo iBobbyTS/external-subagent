@@ -256,7 +256,7 @@ function diagnoseInput(args) {
 
 async function diagnose(paths, args) {
   const { agent, outputDirectory } = diagnoseInput(args);
-  const socket = process.env.ZCODE_AGENTD_SOCKET || paths.socket;
+  const socket = process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket;
   const report = {
     schema_version: 1,
     scope: agent ? { agent_id: agent } : { kind: 'global' },
@@ -381,7 +381,7 @@ export async function main(args) {
     // keep it out of the ordinary status projection.
     const { pid: _pid, ...service } = serviceRaw;
     try {
-      output({ ...local, service, daemon_status: publicDaemonStatus(await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, 'status', {}), { verbose }) });
+      output({ ...local, service, daemon_status: publicDaemonStatus(await callDaemon(process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket, 'status', {}), { verbose }) });
     } catch (error) {
       output({ ...local, service, daemon_status: null, daemon_error: { code: error.code || 'DAEMON_ERROR', message: error.message } });
     }
@@ -391,7 +391,7 @@ export async function main(args) {
     const input = structuredInput(args.slice(1), command === 'config' ? parseConfigArgs : parseSubagentsArgs);
     output(command === 'config'
       ? configCommand(paths, input)
-      : await subagentsCommand(paths, input, { callDaemon, socket: process.env.ZCODE_AGENTD_SOCKET || paths.socket }));
+      : await subagentsCommand(paths, input, { callDaemon, socket: process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket }));
     return;
   }
   if (command === 'diagnose') {
@@ -405,7 +405,7 @@ export async function main(args) {
   if (command === 'restore') { output(restoreData(value(args, '--input'), paths)); return; }
   if (command === 'start') { output(startDaemon(paths)); return; }
   if (command === 'stop') { output(stopDaemon(paths)); return; }
-  if (command === 'update' || command === 'reconcile') { output(await updateCommand(paths, command === 'reconcile' ? ['reconcile', ...args.slice(1)] : args.slice(1), { socket: process.env.ZCODE_AGENTD_SOCKET || paths.socket })); return; }
+  if (command === 'update' || command === 'reconcile') { output(await updateCommand(paths, command === 'reconcile' ? ['reconcile', ...args.slice(1)] : args.slice(1), { socket: process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket })); return; }
   if (command === 'uninstall') { output(uninstall(paths)); return; }
   if (command === 'purge') {
     if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'purge requires --yes');
@@ -422,7 +422,7 @@ export async function main(args) {
       ? prepareSpawnInput(parseDaemonInput(spawnArgs))
       : parseSpawnArgs(spawnArgs);
   } else input = parseDaemonInput(args.slice(1));
-  const result = await callDaemon(process.env.ZCODE_AGENTD_SOCKET || paths.socket, command, input);
+  const result = await callDaemon(process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket, command, input);
   output({ command, result });
 }
 

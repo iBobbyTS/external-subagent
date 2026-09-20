@@ -105,7 +105,7 @@ function verifyZcodeBinding({ config, staging, dir }) {
   const binding = zcodeMcpBinding(staging);
   if (!server || server.command !== binding.command || JSON.stringify(server.args || []) !== JSON.stringify(binding.args)
     || server.timeoutMs !== binding.timeoutMs
-    || server.env?.ZCODE_AGENTD_SOCKET === undefined) {
+    || server.env?.EXTERNAL_SUBAGENT_SOCKET === undefined) {
     throw new CliError('ZCODE_BINDING_UNVERIFIABLE', `the staged plugin MCP binding is not the managed endpoint (${staging})`);
   }
   return server;
@@ -148,7 +148,7 @@ export function installZcodePlugin(paths, options = {}) {
       plugin_id: ZCODE_PLUGIN_ID,
       digest: treeDigest(staging),
       config_verified: true,
-      binding: { command: server.command, socket: server.env.ZCODE_AGENTD_SOCKET },
+      binding: { command: server.command, socket: server.env.EXTERNAL_SUBAGENT_SOCKET },
     };
     if (prior.doc.plugins?.enabled === false) {
       result.warning = 'plugins.enabled is false in the ZCode config; the binding will not load until plugins are enabled';

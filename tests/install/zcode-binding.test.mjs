@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { installZcodePlugin, reconcileZcodeBinding, uninstallZcodePlugin, zcodeMcpBinding } from '../../cli/install/zcode.mjs';
-import { stagePlugin, treeDigest } from '../../cli/install/plugin-stage.mjs';
+import { LEGACY_SOCKET_ENV, SOCKET_ENV, stagePlugin, treeDigest } from '../../cli/install/plugin-stage.mjs';
 import { nativeBinary, pluginSourceRoot } from '../../cli/install/layout.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
@@ -89,7 +89,7 @@ test('install stages the plugin tree and registers one inline dirs entry, preser
     assert.deepEqual(server.args, [path.join(paths.zcodePlugin, 'scripts', 'mcp-stdio-bridge.mjs')], 'the staged MCP args run the node stdio bridge from the staged tree');
     assert.ok(fs.existsSync(server.args[0]), 'the pinned bridge script exists in the staged tree');
     assert.equal(server.timeoutMs, 300000, 'the staged MCP entry pins timeoutMs=300000 because the zcode host default tool timeout is 30000ms, below the 299s wait ceiling');
-    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket, 'the staged MCP env pins the product daemon socket');
+    assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket, 'the staged MCP env pins the product daemon socket');
 
     const config = readConfig(paths);
     assert.deepEqual(config.provider, foreignConfig().provider, 'foreign provider state survives');
@@ -139,7 +139,7 @@ test('refresh publishes a replacement tree: deleted source files disappear and u
     assert.equal(fs.existsSync(removed), false, 'a file deleted from the source disappears from the published tree');
     const server = stagedServer(paths);
     assert.equal(server.command, process.execPath, 'the replacement tree still carries the final binding paths');
-    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket);
+    assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
     assert.equal(fs.readFileSync(path.join(parent, 'unrelated-user-file.txt'), 'utf8'), 'keep me', 'unrelated files beside the staging survive the swap');
     assert.deepEqual(fs.readdirSync(parent).sort(), ['external-subagent', 'unrelated-user-file.txt'], 'no candidate or prior sibling residue remains');
     assert.equal(readConfig(paths).plugins.dirs.length, 1, 'the binding stays a single entry');
@@ -454,7 +454,7 @@ test('a foreign-owned staging tree with a different binding is refused', () => {
     fs.mkdirSync(path.join(paths.zcodePlugin, '.codex-plugin'), { recursive: true });
     fs.writeFileSync(path.join(paths.zcodePlugin, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'external-subagent' }));
     fs.writeFileSync(path.join(paths.zcodePlugin, '.mcp.json'), JSON.stringify({
-      mcpServers: { external_subagent: { command: '/usr/local/bin/something-else', env: { ZCODE_AGENTD_SOCKET: '/tmp/other.sock' } } },
+      mcpServers: { external_subagent: { command: '/usr/local/bin/something-else', env: { EXTERNAL_SUBAGENT_SOCKET: '/tmp/other.sock' } } },
     }));
     assert.throws(() => installZcodePlugin(paths), (error) => {
       assert.equal(error.code, 'PLUGIN_STAGING_CONFLICT');
@@ -475,7 +475,7 @@ test('a prior native-facade staging from this product is refreshed to the node b
     fs.mkdirSync(path.join(paths.zcodePlugin, '.codex-plugin'), { recursive: true });
     fs.writeFileSync(path.join(paths.zcodePlugin, '.codex-plugin', 'plugin.json'), JSON.stringify({ name: 'external-subagent', version: '0.1.2' }));
     fs.writeFileSync(path.join(paths.zcodePlugin, '.mcp.json'), JSON.stringify({
-      mcpServers: { external_subagent: { command: nativeBinary('external-subagent-mcp'), args: [], env: { ZCODE_AGENTD_SOCKET: paths.socket } } },
+      mcpServers: { external_subagent: { command: nativeBinary('external-subagent-mcp'), args: [], env: { EXTERNAL_SUBAGENT_SOCKET: paths.socket } } },
     }));
     const result = installZcodePlugin(paths);
     assert.equal(result.installed, true, 'an older managed binding upgrades in place');
@@ -507,12 +507,63 @@ test('an interpreter-path drift between installs refreshes in place instead of c
     // interpreter whose script lives OUTSIDE this staging still conflicts.
     stagePlugin(source, staging, paths, { command: '/opt/homebrew/Cellar/node/26.6.0/bin/node', args: [bridge] });
     fs.writeFileSync(path.join(staging, '.mcp.json'), JSON.stringify({
-      mcpServers: { external_subagent: { command: '/usr/local/bin/other-node', args: ['/tmp/foreign-bridge.mjs'], env: { ZCODE_AGENTD_SOCKET: paths.socket } } },
+      mcpServers: { external_subagent: { command: '/usr/local/bin/other-node', args: ['/tmp/foreign-bridge.mjs'], env: { EXTERNAL_SUBAGENT_SOCKET: paths.socket } } },
     }));
     assert.throws(() => stagePlugin(source, staging, paths, { command: '/opt/homebrew/Cellar/node/26.6.0/bin/node', args: [bridge] }), (error) => {
       assert.equal(error.code, 'PLUGIN_STAGING_CONFLICT');
       return true;
     });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// S03 upgrade regression: a managed staging tree written before the socket
+// env rename (its `.mcp.json` pins the socket under the retired key) must
+// reconcile in place and end up carrying ONLY the current key.  The legacy
+// literal is assembled by the module under test, never spelled here.
+test('a managed staging bound under the retired socket key upgrades through reconcile to the current key only (S03)', () => {
+  const { home, paths } = fixture({ config: foreignConfig() });
+  try {
+    installZcodePlugin(paths);
+    const mcpPath = path.join(paths.zcodePlugin, '.mcp.json');
+    const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
+    const server = mcp.mcpServers.external_subagent;
+    server.env = { ...server.env, [LEGACY_SOCKET_ENV]: server.env[SOCKET_ENV] };
+    delete server.env[SOCKET_ENV];
+    fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
+
+    const result = reconcileZcodeBinding(paths);
+    assert.equal(result.bound, true, 'the binding stays detected across the rename');
+    assert.equal(result.status, 'updated');
+    const refreshed = stagedServer(paths);
+    assert.equal(refreshed.env[SOCKET_ENV], paths.socket, 'the refreshed staging pins the socket under the current key');
+    assert.equal(Object.hasOwn(refreshed.env, LEGACY_SOCKET_ENV), false, 'the retired key is rewritten away');
+    assert.deepEqual(Object.keys(refreshed.env), [SOCKET_ENV], 'the product carries exactly the current key');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// S03 boundary: the generalized ownership rule only accepts a socket that
+// points at the product endpoint.  The same managed command pinned to a
+// stranger socket stays foreign under either env key.
+test('a staging bound to a foreign socket is still refused under either env key (S03)', () => {
+  const { home, paths } = fixture();
+  const source = pluginSourceRoot();
+  const staging = paths.zcodePlugin;
+  const mcpPath = path.join(staging, '.mcp.json');
+  try {
+    stagePlugin(source, staging, paths);
+    for (const key of [SOCKET_ENV, LEGACY_SOCKET_ENV]) {
+      const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
+      mcp.mcpServers.external_subagent.env = { [key]: '/tmp/foreign.sock' };
+      fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
+      assert.throws(() => stagePlugin(source, staging, paths), (error) => {
+        assert.equal(error.code, 'PLUGIN_STAGING_CONFLICT');
+        return true;
+      }, `a ${key} binding to a stranger socket must stay refused`);
+    }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

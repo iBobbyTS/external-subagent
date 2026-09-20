@@ -13,7 +13,7 @@ const cli = path.resolve('bin/external-subagent.mjs');
 function runCli(home, socket, args) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [cli, ...args], {
-      env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', ZCODE_AGENTD_SOCKET: socket },
+      env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', EXTERNAL_SUBAGENT_SOCKET: socket },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = ''; let stderr = '';
@@ -26,7 +26,7 @@ function runCli(home, socket, args) {
 function runCliWithStdin(home, socket, command, input) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [cli, command], {
-      env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', ZCODE_AGENTD_SOCKET: socket },
+      env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', EXTERNAL_SUBAGENT_SOCKET: socket },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = ''; let stderr = '';

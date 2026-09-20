@@ -31,7 +31,7 @@ fn forwards_bytes_and_exits_when_daemon_closes() {
         thread::sleep(Duration::from_millis(500));
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
-        .env("ZCODE_AGENTD_SOCKET", &path)
+        .env("EXTERNAL_SUBAGENT_SOCKET", &path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -54,7 +54,7 @@ fn forwards_bytes_and_exits_when_daemon_closes() {
 fn connection_failure_is_nonzero_and_explains_socket() {
     let path = socket();
     let output = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
-        .env("ZCODE_AGENTD_SOCKET", &path)
+        .env("EXTERNAL_SUBAGENT_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -82,7 +82,7 @@ fn stdin_eof_half_closes_without_hanging() {
         thread::sleep(Duration::from_millis(100));
     });
     let output = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
-        .env("ZCODE_AGENTD_SOCKET", &path)
+        .env("EXTERNAL_SUBAGENT_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -107,7 +107,7 @@ fn stdin_eof_exits_while_daemon_keeps_session_open() {
         thread::sleep(Duration::from_millis(500));
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
-        .env("ZCODE_AGENTD_SOCKET", &path)
+        .env("EXTERNAL_SUBAGENT_SOCKET", &path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -138,7 +138,7 @@ fn daemon_eof_is_transport_failure_with_nonzero_exit() {
         drop(stream);
     });
     let mut child = Command::new(env!("CARGO_BIN_EXE_external-subagent-mcp"))
-        .env("ZCODE_AGENTD_SOCKET", &path)
+        .env("EXTERNAL_SUBAGENT_SOCKET", &path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

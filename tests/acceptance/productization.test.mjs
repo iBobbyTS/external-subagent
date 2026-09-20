@@ -42,7 +42,7 @@ test('staged plugin MCP binding keeps exactly the managed placeholders', () => {
   assert.deepEqual(Object.keys(mcp.mcpServers), ['external_subagent']);
   const server = mcp.mcpServers.external_subagent;
   assert.equal(server.command, '__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__');
-  assert.equal(server.env.ZCODE_AGENTD_SOCKET, '__EXTERNAL_SUBAGENT_SOCKET__');
+  assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, '__EXTERNAL_SUBAGENT_SOCKET__');
   assert.equal(mcp.mcpServers[legacyMcpKey], undefined);
 });
 

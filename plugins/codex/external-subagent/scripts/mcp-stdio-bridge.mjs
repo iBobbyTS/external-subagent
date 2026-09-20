@@ -3,7 +3,7 @@
 //
 // Mirrors crates/external-mcp (the native facade) byte for byte in
 // behavior: resolve the daemon MCP stream endpoint from
-// ZCODE_AGENTD_SOCKET, connect, and pipe client stdio <-> socket until
+// EXTERNAL_SUBAGENT_SOCKET, connect, and pipe client stdio <-> socket until
 // either side reaches EOF.  Hosts that spawn MCP servers inside
 // restricted execution contexts (ZCode kills ad-hoc-signed native
 // binaries there, while node processes and unix sockets are allowed)
@@ -12,9 +12,9 @@
 import net from 'node:net';
 import path from 'node:path';
 
-const socket = process.env.ZCODE_AGENTD_SOCKET;
+const socket = process.env.EXTERNAL_SUBAGENT_SOCKET;
 if (!socket || !path.isAbsolute(socket)) {
-  console.error('mcp-stdio-bridge: ZCODE_AGENTD_SOCKET must be an absolute path');
+  console.error('mcp-stdio-bridge: EXTERNAL_SUBAGENT_SOCKET must be an absolute path');
   process.exit(1);
 }
 // The stable daemon RPC socket keeps its name; MCP is exposed by the

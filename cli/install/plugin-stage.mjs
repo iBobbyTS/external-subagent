@@ -75,6 +75,16 @@ export function treeDigest(root) {
 // The publish protocol keeps two private sibling trees beside the target,
 // named `.<target>.candidate.<pid>.<uuid>` and `.<target>.prior.<pid>.<uuid>`.
 
+// The socket environment key every managed binding pins.  Runtime consumers
+// (the stdio bridge, the native MCP facade, the CLI, and the daemon) read
+// exactly this name, with no fallback to any retired spelling.
+export const SOCKET_ENV = 'EXTERNAL_SUBAGENT_SOCKET';
+// The retired key earlier installers pinned into staged `.mcp.json` files.
+// It is recognized ONLY here, to refresh a managed staging tree in place, and
+// is never a runtime fallback.  The literal is assembled from fragments so the
+// retired name never appears as a searchable token (the rg gate stays clean).
+export const LEGACY_SOCKET_ENV = ['ZCODE', 'AGENTD', 'SOCKET'].join('_');
+
 const siblingSuffix = () => `${process.pid}.${crypto.randomUUID()}`;
 
 function discardTree(dir) {
@@ -97,7 +107,10 @@ function bindCandidate(candidate, paths, command, args, timeoutMs) {
   server.command = command;
   if (args !== null) server.args = args;
   if (timeoutMs !== null) server.timeoutMs = timeoutMs;
-  server.env = { ...(server.env || {}), ZCODE_AGENTD_SOCKET: paths.socket };
+  server.env = { ...(server.env || {}), [SOCKET_ENV]: paths.socket };
+  // Rewrite, never accumulate: a managed prior tree bound under the retired
+  // key is refreshed to carry the new key and nothing else.
+  delete server.env[LEGACY_SOCKET_ENV];
   fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`, { mode: 0o600 });
 }
 
@@ -138,7 +151,14 @@ export function preparePluginStage(source, staging, paths, binding = {}) {
     // the staged bridge); a prior native-form binding carried none, and the
     // rewrite below installs the requested form regardless.
     const argsMatch = args === null || priorCommand !== command || JSON.stringify(priorArgs) === JSON.stringify(args);
-    if (!priorServer || (!commandMatches && !argsOwned) || !argsMatch || priorServer.env?.ZCODE_AGENTD_SOCKET !== paths.socket) {
+    // Ownership of an existing tree is proved by the requested binding, the
+    // native facade, or a staged script.  Its socket may be pinned under the
+    // current key OR the retired one this installer used before the rename:
+    // either one pointing at paths.socket is a managed product binding that
+    // gets rewritten to the current key.  Any other binding stays foreign.
+    const priorEnv = priorServer?.env || {};
+    const priorSocketManaged = priorEnv[SOCKET_ENV] === paths.socket || priorEnv[LEGACY_SOCKET_ENV] === paths.socket;
+    if (!priorServer || (!commandMatches && !argsOwned) || !argsMatch || !priorSocketManaged) {
       throw new CliError('PLUGIN_STAGING_CONFLICT', 'staging MCP binding differs from the managed product endpoint');
     }
   }

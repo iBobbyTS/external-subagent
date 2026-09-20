@@ -165,9 +165,9 @@ test('zcode binding accepts the debug plugin beside the release plugin', () => {
     assert.deepEqual(doc.plugins.dirs.sort(), [releaseStaging, debugStaging].sort());
     const releaseServer = JSON.parse(fs.readFileSync(path.join(releaseStaging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
     const debugServer = JSON.parse(fs.readFileSync(path.join(debugStaging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
-    assert.equal(releaseServer.env.ZCODE_AGENTD_SOCKET, releasePaths.socket);
-    assert.equal(debugServer.env.ZCODE_AGENTD_SOCKET, productPathsVariantDebug(home));
-    assert.notEqual(releaseServer.env.ZCODE_AGENTD_SOCKET, debugServer.env.ZCODE_AGENTD_SOCKET);
+    assert.equal(releaseServer.env.EXTERNAL_SUBAGENT_SOCKET, releasePaths.socket);
+    assert.equal(debugServer.env.EXTERNAL_SUBAGENT_SOCKET, productPathsVariantDebug(home));
+    assert.notEqual(releaseServer.env.EXTERNAL_SUBAGENT_SOCKET, debugServer.env.EXTERNAL_SUBAGENT_SOCKET);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(debugSource, { recursive: true, force: true });

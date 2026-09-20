@@ -298,7 +298,7 @@ test('an explicit install-plugin after standalone init binds the codex host and 
   // Node resolves the CLI through its realpath (/private/var under tmpdirs),
   // which is the stable entry the staging must pin.
   assert.equal(staged.mcpServers.external_subagent.command, fs.realpathSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagent-mcp')));
-  assert.equal(staged.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, path.join(home, 'Library', 'Application Support', 'external-subagent', 'external-subagent.sock'));
+  assert.equal(staged.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, path.join(home, 'Library', 'Application Support', 'external-subagent', 'external-subagent.sock'));
 
   const calls = fs.readFileSync(fake.log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
   const add = calls.find((call) => call.args[0] === 'plugin' && call.args[1] === 'add' && !call.args.includes('--help'));
@@ -372,7 +372,7 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     while (!fs.existsSync(socket) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
     assert.ok(fs.existsSync(socket), `daemon socket must appear: ${daemonStderr}`);
 
-    const env = fixtureEnv(home, { env: { ZCODE_AGENTD_SOCKET: socket } });
+    const env = fixtureEnv(home, { env: { EXTERNAL_SUBAGENT_SOCKET: socket } });
     const status = jsonOutput(run(ctx.cli, ['status'], { env }), 'status');
     assert.equal(status.ok, true);
     assert.equal(status.daemon_status.components.daemon, 'READY');
@@ -406,7 +406,7 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     assert.deepEqual(fs.readdirSync(workspace), []);
 
     const facade = spawn(ctx.mcpFacade, [], {
-      env: fixtureEnv(home, { env: { ZCODE_AGENTD_SOCKET: socket } }),
+      env: fixtureEnv(home, { env: { EXTERNAL_SUBAGENT_SOCKET: socket } }),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let facadeStderr = '';

@@ -105,7 +105,7 @@ async function lifecycleServer(socketPath) {
 function runCli(socket, command, input) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [cli, command, '--json', JSON.stringify(input)], {
-      env: { ...process.env, ZCODE_AGENTD_SOCKET: socket }, cwd: root,
+      env: { ...process.env, EXTERNAL_SUBAGENT_SOCKET: socket }, cwd: root,
     });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (chunk) => { stdout += chunk; });

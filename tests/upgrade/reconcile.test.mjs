@@ -115,7 +115,7 @@ function childEnv(extra = {}) {
     FAKE_CODEX_LOG: ctx.fake.log,
     ...extra,
   };
-  delete env.ZCODE_AGENTD_SOCKET;
+  delete env.EXTERNAL_SUBAGENT_SOCKET;
   return env;
 }
 

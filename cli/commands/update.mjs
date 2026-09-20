@@ -40,7 +40,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   const registryPath = paths.data ? path.join(paths.data, 'codex-homes.json') : null;
   const priorRegistryBytes = (() => { try { return fs.readFileSync(registryPath); } catch { return null; } })();
   const requestedVersion = args.find((arg) => arg.startsWith('--version='))?.slice(10) || 'current';
-  const socket = daemon.socket || process.env.ZCODE_AGENTD_SOCKET || paths.socket;
+  const socket = daemon.socket || process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket;
   const rpc = daemon.callDaemon || callDaemon;
   const drainDeadline = Number.isFinite(daemon.drainTimeoutMs) && daemon.drainTimeoutMs > 0
     ? Date.now() + daemon.drainTimeoutMs : null;

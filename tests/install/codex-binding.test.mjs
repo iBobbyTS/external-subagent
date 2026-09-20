@@ -31,6 +31,7 @@ import {
   unregisterCodexHome,
 } from '../../cli/install/reconcile.mjs';
 import { nativeBinary, pluginSourceRoot } from '../../cli/install/layout.mjs';
+import { LEGACY_SOCKET_ENV, SOCKET_ENV } from '../../cli/install/plugin-stage.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
@@ -173,7 +174,7 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   assert.equal(server.command, nativeBinary('external-subagent-mcp'));
   assert.ok(path.isAbsolute(server.command), 'MCP entry must be an absolute stable path');
   assert.ok(!server.command.includes('~') && !server.command.includes('nvm'), 'MCP entry must not depend on user PATH fragments');
-  assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket);
+  assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
 
   const marketplace = JSON.parse(fs.readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
   assert.equal(marketplace.plugins.filter((entry) => entry.name === 'external-subagent').length, 1);
@@ -194,7 +195,7 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   assert.ok(result.cache.startsWith(path.join(home, '.codex')));
   const cacheMcp = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8'));
   assert.equal(cacheMcp.mcpServers.external_subagent.command, nativeBinary('external-subagent-mcp'));
-  assert.equal(cacheMcp.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, paths.socket);
+  assert.equal(cacheMcp.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
@@ -243,6 +244,40 @@ test('foreign staging and drifted marketplace entries are rejected, not overwrit
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+// S03 upgrade regression: a codex home whose managed staging was written
+// before the socket env rename (socket pinned under the retired key) must
+// reconcile through the public owner and end up carrying ONLY the current
+// key, in the staged tree and in the codex-materialized cache.  The legacy
+// literal is assembled by the module under test, never spelled here.
+test('an old-key managed staging upgrades through reconcile to the current key only (S03)', () => {
+  const home = fixtureHome('external-subagent-legacy-key-');
+  const fake = fakeCodexCli(home);
+  const { paths, options } = binding(home, { cli: fake.cli });
+  const staging = path.join(home, 'plugins', 'external-subagent');
+  try {
+    installPlugin(paths, options);
+    registerCodexHome(paths, options.codexHome, { version: '0.1.0', status: 'claimed' });
+    const mcpPath = path.join(staging, '.mcp.json');
+    const mcp = JSON.parse(fs.readFileSync(mcpPath, 'utf8'));
+    const server = mcp.mcpServers.external_subagent;
+    server.env = { ...server.env, [LEGACY_SOCKET_ENV]: server.env[SOCKET_ENV] };
+    delete server.env[SOCKET_ENV];
+    fs.writeFileSync(mcpPath, `${JSON.stringify(mcp, null, 2)}\n`);
+
+    const report = reconcileCodexHomes(paths, options);
+    assert.equal(report.all_updated, true, 'the old-key managed staging reconciles');
+    const refreshed = JSON.parse(fs.readFileSync(mcpPath, 'utf8')).mcpServers.external_subagent;
+    assert.equal(refreshed.env[SOCKET_ENV], paths.socket, 'the refreshed staging pins the socket under the current key');
+    assert.equal(Object.hasOwn(refreshed.env, LEGACY_SOCKET_ENV), false, 'the retired key is rewritten away');
+    assert.deepEqual(Object.keys(refreshed.env), [SOCKET_ENV], 'the staged product carries exactly the current key');
+    const cacheMcp = JSON.parse(fs.readFileSync(path.join(report.homes[0].cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
+    assert.equal(cacheMcp.env[SOCKET_ENV], paths.socket);
+    assert.equal(Object.hasOwn(cacheMcp.env, LEGACY_SOCKET_ENV), false, 'the materialized cache never keeps the retired key');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // The store-backed fake below reproduces the 0.153.4 machine-global content
 // store: one shared store across every CODEX_HOME, keyed by
 // plugin@marketplace@version, seeded by whichever binding was installed
@@ -265,7 +300,7 @@ test('a second binding of the same plugin identity fails closed on store-reused 
     const first = installPlugin(pathsA, { codexCli: fake.cli, codexHome: codexA });
     assert.equal(first.cache_verified, true);
     assert.equal(
-      JSON.parse(fs.readFileSync(path.join(first.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      JSON.parse(fs.readFileSync(path.join(first.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET,
       pathsA.socket,
     );
 
@@ -289,7 +324,7 @@ test('a second binding of the same plugin identity fails closed on store-reused 
     // still carries binding A's bytes, proving both the reuse and that the
     // product never edits the cache it rejected.
     const reused = JSON.parse(fs.readFileSync(path.join(codexB, 'plugins', 'cache', 'personal', 'external-subagent', JSON.parse(fs.readFileSync(path.join(first.cache, '.codex-plugin', 'plugin.json'), 'utf8')).version, '.mcp.json'), 'utf8'));
-    assert.equal(reused.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, pathsA.socket);
+    assert.equal(reused.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, pathsA.socket);
     assert.equal(pathsA.socket === pathsB.socket, false, 'the two bindings must differ for this oracle to mean anything');
   } finally {
     for (const dir of [state, homeA, homeB]) fs.rmSync(dir, { recursive: true, force: true });
@@ -313,7 +348,7 @@ test('store reuse is answered by a distinct release identity, and a repeat of th
     const repeat = installPlugin(pathsA, { codexCli: fake.cli, codexHome: codexA });
     assert.equal(repeat.cache_verified, true);
     assert.equal(
-      JSON.parse(fs.readFileSync(path.join(repeat.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      JSON.parse(fs.readFileSync(path.join(repeat.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET,
       pathsA.socket,
     );
 
@@ -329,7 +364,7 @@ test('store reuse is answered by a distinct release identity, and a repeat of th
     assert.equal(second.cache_verified, true);
     assert.equal(path.basename(second.cache), manifest.version, 'the distinct identity materializes its own cache directory');
     assert.equal(
-      JSON.parse(fs.readFileSync(path.join(second.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET,
+      JSON.parse(fs.readFileSync(path.join(second.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET,
       pathsB.socket,
       'the second home\'s cache carries the second binding, not the first\'s',
     );
@@ -482,7 +517,7 @@ test('a never-used candidate identity with correct materialized content verifies
     assert.equal(path.basename(result.cache), JSON.parse(fs.readFileSync(path.join(source, '.codex-plugin', 'plugin.json'), 'utf8')).version, 'the fresh identity materializes its own cache directory');
     assert.equal(fs.readFileSync(path.join(result.cache, skillAt), 'utf8'), 'FRESH CANDIDATE SKILL\n', 'the cache carries this candidate\'s content, not the store\'s previous bytes');
     const server = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
-    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket, 'the same binding verifies alongside the new content');
+    assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket, 'the same binding verifies alongside the new content');
   } finally {
     for (const dir of [state, home]) fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -561,7 +596,7 @@ test('a codex refresh drops source files deleted since the last install (AUD-002
     assert.equal(fs.existsSync(removed), false, 'a file deleted from the source disappears from the published tree');
     const server = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
     assert.equal(server.command, nativeBinary('external-subagent-mcp'), 'the replacement tree still carries the managed binding');
-    assert.equal(server.env.ZCODE_AGENTD_SOCKET, paths.socket);
+    assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
     assert.equal(fs.readFileSync(path.join(home, 'plugins', 'unrelated-user-file.txt'), 'utf8'), 'keep me', 'unrelated files beside the staging survive the swap');
     assert.deepEqual(fs.readdirSync(path.join(home, 'plugins')).sort(), ['external-subagent', 'unrelated-user-file.txt'], 'no candidate or prior sibling residue remains');
     const marketplace = JSON.parse(fs.readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
@@ -931,7 +966,7 @@ test('real codex CLI binds a throwaway CODEX_HOME when explicitly available', { 
   assert.ok(result.cache.startsWith(fs.realpathSync(codexHome)), 'the plugin cache must live inside the claimed CODEX_HOME');
   const cacheMcp = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8'));
   assert.equal(cacheMcp.mcpServers.external_subagent.command, nativeBinary('external-subagent-mcp'), 'cached copy keeps the absolute stable MCP entry');
-  assert.equal(cacheMcp.mcpServers.external_subagent.env.ZCODE_AGENTD_SOCKET, paths.socket);
+  assert.equal(cacheMcp.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
   const removed = uninstallPlugin(paths, { codexHome, env: { CODEX_HOME: codexHome } });
   assert.equal(removed.uninstalled, true);
   assert.equal(fs.readdirSync(path.join(fs.realpathSync(codexHome), 'plugins', 'cache', 'personal')).length, 0, 'official remove clears the cache');

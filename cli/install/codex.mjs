@@ -97,10 +97,10 @@ function updateMarketplace(file, staging) {
 function stagedManagedBinding(staging) {
   const manifest = JSON.parse(fs.readFileSync(path.join(staging, '.codex-plugin', 'plugin.json'), 'utf8'));
   const server = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8')).mcpServers?.external_subagent;
-  if (!server || typeof server.command !== 'string' || typeof server.env?.ZCODE_AGENTD_SOCKET !== 'string') {
+  if (!server || typeof server.command !== 'string' || typeof server.env?.EXTERNAL_SUBAGENT_SOCKET !== 'string') {
     throw new CliError('INVALID_PLUGIN_SOURCE', 'staged plugin MCP binding is incomplete');
   }
-  return { manifest, command: server.command, socket: server.env.ZCODE_AGENTD_SOCKET };
+  return { manifest, command: server.command, socket: server.env.EXTERNAL_SUBAGENT_SOCKET };
 }
 
 function readCacheJson(file, cache, identity) {
@@ -152,7 +152,7 @@ function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
       }
     }
     const server = readCacheJson(path.join(cache, '.mcp.json'), cache, identity).mcpServers?.external_subagent;
-    const socket = server?.env?.ZCODE_AGENTD_SOCKET;
+    const socket = server?.env?.EXTERNAL_SUBAGENT_SOCKET;
     if (!server || server.command !== expected.command || socket !== expected.socket) {
       throw new CliError('CODEX_CACHE_BINDING_MISMATCH', `codex plugin cache for ${identity} carries a different managed binding (command=${server?.command}, socket=${socket}); expected this install's staged binding (command=${expected.command}, socket=${expected.socket}). The cache resolved to another installation's bytes (${cache}); either the machine-global content store reused them for the same identity (release a distinct plugin version instead of accepting them), or the reserved marketplace name personal resolved machine-globally to the real user root regardless of CODEX_HOME (refresh or re-register that root, or use a non-reserved marketplace name in isolated homes)`);
     }
@@ -309,7 +309,7 @@ export function uninstallPlugin(paths, options = {}) {
 function codexMcpConfig(paths) {
   const command = nativeBinary(MCP_BIN_NAME);
   const tools = CODEX_TOOLS.map((tool) => `  "${tool}",`).join('\n');
-  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n${tools}\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nZCODE_AGENTD_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
+  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n${tools}\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nEXTERNAL_SUBAGENT_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
 }
 
 function removeTomlSection(text, section) {
