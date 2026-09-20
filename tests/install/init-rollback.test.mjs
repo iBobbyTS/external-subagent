@@ -93,8 +93,8 @@ test('successful init installs the standalone service only and binds no host', (
     const report = run();
     assert.equal(report.installed, true);
     assert.equal(report.codex, undefined, 'the D1 init report carries no codex binding result');
-    assert.equal(report.runtime.present, fs.existsSync(ZCODE_RUNTIME), 'the runtime report mirrors reality instead of asserting a dependency');
-    assert.equal(report.runtime.path, ZCODE_RUNTIME);
+    assert.equal(report.runtimes.zcode.present, fs.existsSync(ZCODE_RUNTIME), 'the runtime report mirrors reality instead of asserting a dependency');
+    assert.equal(report.runtimes.zcode.path, ZCODE_RUNTIME);
     // No implicit host install: no staging tree, no marketplace manifest, no
     // D08 registry, and the would-be codex home is never even created.
     assert.equal(fs.existsSync(path.join(paths.home, 'plugins', 'external-subagent')), false, 'no managed staging tree');

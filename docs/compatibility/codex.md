@@ -193,6 +193,32 @@ model-behavior facts:
 - A thread is only resumable after a turn persists its rollout;
   `thread/resume` before that errors with `no rollout found for thread id`.
 
+## Subagent permission modes and write manifest
+
+`codex` runs as a first-class subagent with all four public permission modes.
+Each mode is driven as an app-server sandbox preset and must be confirmed at
+the start/resume result before any turn is sent:
+
+| Mode | Requested preset | Confirmed sandbox posture |
+|---|---|---|
+| `build` / `edit` | `workspace-write` | `{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}` |
+| `plan` | `read-only` | `{"type":"readOnly","networkAccess":false}` |
+| `yolo` | `danger-full-access` | `{"type":"dangerFullAccess"}` |
+
+Every mode pins `approvalPolicy: "never"`. `thread/start` must echo that
+approval policy, the resolved sandbox object above, and the requested `cwd`
+at the result root or inside the embedded `thread` object (either location is
+accepted, mirroring how the results carry the model); `thread/resume`
+re-confirms the posture (a `danger-full-access` thread reconstructs as the
+narrowed `workspaceWrite` object) and any wider or mismatched shape fails
+closed before a turn starts.
+
+A non-empty spawn `write_manifest` is unsupported for `codex`. The daemon
+rejects it during admission, before any task row or prompt is created, with the
+public MCP error code `codex_write_manifest_unsupported` (internal RPC
+sentinel `CODEX_WRITE_MANIFEST_UNSUPPORTED`). `zcode`/`dsh` manifest handling
+and the global "plan must be empty" rule are unchanged.
+
 ## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED; live turn NOT_RUN)
 
 The spawn `effort` parameter (admission closed set

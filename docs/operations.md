@@ -225,9 +225,10 @@ definition; a service that was not registered is not an error
 (`service_already_stopped`). Deleting the plist alone would leave a job
 launchd already loaded running until the next logout, so a bootout that
 cannot complete fails the command (`SERVICE_UNLOAD_TIMEOUT`) rather than
-stranding a running daemon without its definition. Product data, subagent
-credentials, and the legacy zcode-as-subagent installation are always
-retained; the managed Codex plugin and MCP binding are removed separately by
+stranding a running daemon without its definition. Product data and subagent
+credentials are always retained, and installations owned by other products
+are never touched; the managed Codex plugin and MCP binding are removed
+separately by
 `install-plugin --uninstall` / `install-mcp --uninstall`. After `npm remove`
 and a later reinstall, `init` restores the service from the retained data
 (configuration and database survive byte-for-byte; only the service config

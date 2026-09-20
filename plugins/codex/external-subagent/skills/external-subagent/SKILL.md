@@ -40,16 +40,23 @@ Codex home instances, and offers plugin or direct MCP bindings; built-in
 dirs with a single per-user instance. This is separate
 from `subagent.codex`. Protocol implementations are adapters.
 
+All three subagents (`zcode`, `dsh`, `codex`) are disabled by default; enable one
+with `external-subagent agents enable <name>`, which runs a local probe and writes
+the configuration only on success (a daemon restart is required for `dsh`/`codex`).
 Actual per-subagent limitations (from the accepted code):
 
-- `zcode` — enabled and spawn-supported by default; all four permission modes
+- `zcode` — disabled until explicitly enabled; all four permission modes
   (build/edit/plan/yolo); an explicit spawn `model` is rejected
   (`model_selection_unsupported`).
 - `dsh` — disabled until explicitly enabled and configured
   (`runtime_path`/`home`/`profile`/`version`); admits only `build` and strict
   `plan`.
-- `codex` — disabled by default; `plan` (sandbox=read-only) and `yolo`
-  (sandbox=danger-full-access), both pinning approvalPolicy=never;
-  `build`/`edit` are refused before the prompt.
-- `observe` — verified public reasoning exists only for zcode tasks; observe
-  on a non-zcode task truthfully errors `unavailable`.
+- `codex` — disabled until explicitly enabled; all four permission modes:
+  `build`/`edit` map to sandbox=workspace-write, `plan` to sandbox=read-only,
+  and `yolo` to sandbox=danger-full-access, all pinning approvalPolicy=never.
+  A non-empty spawn `write_manifest` is rejected before task creation with
+  `codex_write_manifest_unsupported`.
+- `observe` — available for all three subagents; `zcode` and `dsh` return the
+  public reasoning tail (at most 200 characters), while `codex` does not collect
+  reasoning and returns `reasoning: null`. Tool history and coverage are reported
+  truthfully per adapter capability.

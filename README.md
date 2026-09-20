@@ -15,32 +15,38 @@ independent axes:
 
 ## Status
 
-Current work happens on the `audit/external-subagent-20260917` branch; the
-productization closeout below is the historical record of that stage. DSH and
-ZCode installed-artifact lifecycles, active-task upgrade, and standalone
-initialization are implemented and reviewed. `init` installs the standalone
-daemon service only — no host is bound implicitly; hosts are bound through the
-explicit `install-plugin` (Codex or ZCode) / `install-mcp` (Codex-only TOML
-binding) commands. Installing from a packed artifact and explicitly
-initializing to a launchd-resident service (idempotent repeat init/start) is
-live-verified on a real GUI session. Both productization
-candidates passed the four-cell consumer matrix — DSH/ZCode × public CLI /
-real Codex CLI via the managed plugin over MCP, each against its own tarball:
-the pre-fix candidate C1 (`0.1.1`, historical) and the post-installer-fix
-final candidate C2 (`0.1.2`), whose fresh consumer verification passed
-through the public install surface — all four cells COMPLETED with the
-plugin cache verified against the staged binding (`cache_verified: true`;
-see [docs/acceptance/productization.md](docs/acceptance/productization.md)).
-The managed plugin manifest is versioned per released candidate because its
-version is codex's plugin-cache identity, and codex resolves the reserved
-`personal` marketplace name machine-globally to the real user root
-(regardless of `CODEX_HOME`), so each candidate's consumer runs pin that
-identity's bytes there and any later candidate bumps again. The installer
-re-verified on 0.154.0; DSH admission currently supports `build` and strict
-`plan`; its model selection is explicit spawn model, configured default, then
-the native default. The package is published to the public npm registry as
+The package is published to the public npm registry as
 `external-subagent@0.1.0` (macOS arm64 only; `os`/`cpu` in `package.json`
-reject installation on other platforms at npm install time).
+reject installation on other platforms at npm install time). `init` installs
+the standalone daemon service only — no host is bound implicitly; hosts are
+bound through the explicit `install-plugin` (Codex or ZCode) /
+`install-mcp` (Codex-only TOML binding) commands. Installing from a packed
+artifact and explicitly initializing to a launchd-resident service
+(idempotent repeat init/start) is live-verified on a real GUI session;
+active-task upgrade and standalone initialization are implemented and
+reviewed.
+
+All three subagents are **disabled by default** and are enabled per name with
+`external-subagent agents enable <zcode|dsh|codex>`: a successful local probe
+writes the configuration (no write on failure), and `dsh`/`codex` need a
+daemon restart to take effect. ZCode admits all four permission modes
+(build/edit/plan/yolo) and rejects an explicit spawn `model`; DSH admits
+`build` and strict `plan`, with model selection as explicit spawn model,
+configured default, then the native default; Codex admits all four modes
+(build/edit → workspace-write, plan → read-only, yolo → danger-full-access,
+all pinning `approvalPolicy=never`) and rejects a non-empty `write_manifest`
+with `codex_write_manifest_unsupported`. `observe` works on all three: ZCode
+and DSH expose the public reasoning tail (at most 200 characters) and Codex
+reports `reasoning: null`.
+
+The daemon socket environment variable is now the neutral
+`EXTERNAL_SUBAGENT_SOCKET`, with no fallback to the retired name. An existing
+installation upgrading to this version must run the public
+`external-subagent update` (or `reconcile`) once to rewrite the host
+bindings, then restart the service; see
+[docs/operations.md](docs/operations.md). The historical productization
+acceptance matrix is recorded in
+[docs/acceptance/productization.md](docs/acceptance/productization.md).
 
 ## Versioning
 
@@ -122,3 +128,10 @@ cargo test --workspace
 node --test tests/install/*.test.mjs tests/platform/*.test.mjs tests/cli/*.test.mjs tests/contract/*.test.mjs
 node --test tests/integration/*.test.mjs tools/probes/dsh-acp/probe.test.mjs
 ```
+
+The JavaScript install/upgrade suites build the native facade through
+`scripts/release/build-native-payload.mjs`; set
+`EXTERNAL_SUBAGENT_CARGO_PROFILE=debug` to make that entry build from
+`target/debug` (no `--release`) and record `profile: debug` in the staged
+manifest. The default stays a release build for `prepack`/publishing, and
+`npm run check` is the JavaScript syntax gate.

@@ -7,7 +7,7 @@
 本项目将调用方与执行目标分为两类：
 
 - `host`（调用宿主）：通过 MCP 调用本产品的上游应用，例如 Codex。`host` 是调用侧身份，不是被调度执行的任务。
-- `subagent`（子代理）：由本产品路由并管理生命周期的执行目标，例如 ZCode 和 DSH。
+- `subagent`（子代理）：由本产品路由并管理生命周期的执行目标，例如 ZCode、DSH 和 Codex。
 - `adapter`（适配器）：连接某个 subagent 的内部协议实现，例如 ZCode app-server adapter 或 DSH ACP adapter；`adapter` 不是面向用户的配置层级。
 
 `host` 不是强制注册制。除内置的 `codex` host 外，产品接受本机任意 MCP client
@@ -22,7 +22,7 @@
 | `host.codex` | 支持多个 instance | `hosts.codex.installations[].home` | 每个 `home` 代表一个独立 Codex 安装绑定；同步、状态和解绑按 home 分别报告 |
 | `host.zcode` | 单 instance（单用户配置，无 home 概念） | `~/.zcode/cli/config.json` 的 `plugins.dirs` | 由 `install-plugin zcode` 注册一个受管 inline plugin 目录；绑定状态从 config 无状态推导，不设注册表 |
 | `host.custom` | 支持任意未注册本机 MCP client；不要求持久化 instance | 无需配置 | 连接按 MCP session 识别；不提供安装或自动升级绑定，也不要求预先登记 |
-| `subagents.zcode`、`subagents.dsh` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
+| `subagents.zcode`、`subagents.dsh`、`subagents.codex` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
 
 因此，Codex home 不属于产品顶层配置。它是 `host.codex` 的安装实例属性；产品可以同时管理多个 Codex home，但不能据此推导出 subagent 多实例能力。
 
@@ -69,7 +69,7 @@ spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 
 
 ## 实际能力限制（来自已验收代码）
 
-- `zcode`：默认启用且支持 spawn；四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
+- `zcode`：默认禁用；显式启用后支持 spawn，四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
 - `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。
 - `codex`（作为 subagent）：默认禁用；支持四模式：`build`/`edit` → sandbox=workspace-write，`plan` → sandbox=read-only，`yolo` → sandbox=danger-full-access；全部钉死 approvalPolicy=never。不支持非空 `write_manifest`，在创建任务前以 `codex_write_manifest_unsupported` 拒绝。
 - `observe`：三种 subagent 均可调用；zcode（保留运行时来源校验）与 dsh 返回公开推理尾部最多 200 字符，codex 不采集推理，整个 `reasoning` 字段为 `null`。工具历史和 coverage 按 adapter 能力与实际采集缺口返回。
@@ -103,7 +103,7 @@ home 绑定参与后续自动升级协调。任意 `custom` host 无需执行这
 该命令把同一受管 plugin 物化到产品自有目录
 （`~/Library/Application Support/external-subagent/zcode-plugin/external-subagent/`），
 并在 `~/.zcode/cli/config.json` 的 `plugins.dirs` 追加一个 inline 目录条目（插件身份
-`external-subagent@inline`，默认启用）。这是纯配置面注册，不触碰 ZCode 自有的
+`external-subagent@inline`，内联目录发现时自动加载）。这是纯配置面注册，不触碰 ZCode 自有的
 marketplace/cache/安装记录状态；配置合并原子并保留全部无关键，无法识别的结构以
 `ZCODE_CONFIG_INVALID` fail-closed，同名外部插件目录以 `ZCODE_PLUGIN_CONFLICT`
 拒绝，卸载只摘除本产品写入的条目与目录。绑定不设注册表：状态从 config 无状态

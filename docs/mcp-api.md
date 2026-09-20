@@ -417,7 +417,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 |---|---|---|---|
 | `latest_text_tail` | string | 展示近期公开文本尾部；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
 | `latest_text_truncated` | boolean | 判断尾部是否省略了前文 | 易把片段当完整输出 |
-| `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；runtime 未验证时为空串 |
+| `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex 不采集时为空串 |
 | `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数 | 看不出近期是否有工具活动 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
 
@@ -461,8 +461,8 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 ```text
 validation, subagent_required, subagent_unknown, agent_disabled,
-agent_unsupported, model_selection_unsupported, oversized,
-protocol_error, not_found, conflict, runtime_command_failed,
+agent_unsupported, model_selection_unsupported, codex_write_manifest_unsupported,
+oversized, protocol_error, not_found, conflict, runtime_command_failed,
 timeout, runtime_lost, result_invalid, persistence, internal,
 unavailable, daemon_unavailable
 ```
