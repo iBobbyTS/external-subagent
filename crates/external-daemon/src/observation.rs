@@ -8,7 +8,7 @@ use std::{
     path::Path,
 };
 
-pub const OBSERVATION_SCHEMA: &str = "zas-observation/1.1";
+pub const OBSERVATION_SCHEMA: &str = "external-subagent-observation/1.1";
 pub const VERIFIED_RUNTIME_VERSION: &str = "3.11.2";
 pub const VERIFIED_EVENT_TYPE: &str = "model.streaming";
 pub const VERIFIED_DELTA_POINTER: &str = "/params/payload/delta";

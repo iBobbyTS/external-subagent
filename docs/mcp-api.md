@@ -41,9 +41,9 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | 分页、等待、消息、请求响应的实际语义 | [rpc.rs](../crates/external-daemon/src/rpc.rs)：`RpcService`、`paged_text_bounds` |
 | 仓库和写入范围约束 | [general.rs](../crates/external-core/src/general.rs)：`canonical_general_repository`、`validate_manifest`、`validate_write_scope` |
 | 静态公共契约摘要 | [external-subagent-public-api.json](../schema/external-subagent-public-api.json) |
-| observe 的完整输出 schema | [zas-observation-v1.1.schema.json](../schema/zas-observation-v1.1.schema.json) |
+| observe 的完整输出 schema | [observation.schema.json](../schema/observation.schema.json) |
 
-兼容性说明：`zas-observation-v1.1.schema.json` 的文件名与 observe 内部序列化信封标识 `zas-observation/1.1` 来自项目前身（zcode-as-subagent），作为既有生产者/消费者依赖的序列化契约**有意保留**；只有面向人的显示标题已改为中性名称。`zcode_session_id`、`ZCODE_AGENTD_SOCKET` 等存储/线路/环境字面量同理，不随品牌清理改名。
+兼容性说明：observe 的完整输出 schema 文件名与内部序列化信封标识均为中性名称（[`observation.schema.json`](../schema/observation.schema.json)、`external-subagent-observation/1.1`，由 `OBSERVATION_SCHEMA` 常量统一定义）。存储/线路/环境字面量同样使用中性名称：任务会话标识为 `session_id`，daemon socket 环境变量为 `EXTERNAL_SUBAGENT_SOCKET`。
 
 `tools/list` 的输入和输出 schema 主要由 Rust 类型生成；输出 schema 接受成功对象或公共错误对象。静态公共契约 JSON 不是全部运行时 schema 的完整副本。
 

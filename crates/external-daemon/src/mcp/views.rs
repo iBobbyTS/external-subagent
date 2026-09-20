@@ -6,6 +6,7 @@ use super::errors::{protocol_error, ToolError};
 use super::types::{
     public_task_id, PublicDecision, PublicPendingRequest, PublicResponseDisposition,
 };
+use crate::observation::OBSERVATION_SCHEMA;
 use crate::rpc::{
     AgentCapabilitiesView, AgentEffortSelectionModeView, AgentModelSelectionModeView,
     AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
@@ -114,15 +115,15 @@ pub struct AgentObserveOutput {
 
 impl JsonSchema for AgentObserveOutput {
     fn schema_name() -> Cow<'static, str> {
-        // Display name only: the serialized observation envelope stays the
-        // historical `zas-observation/1.1` wire identifier (rationale
-        // registered in docs/mcp-api.md).
+        // Display name only: the serialized observation envelope is the
+        // neutral `external-subagent-observation/1.1` wire identifier
+        // (see docs/mcp-api.md).
         "external-subagent suspicion-only observation".into()
     }
 
     fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../schema/zas-observation-v1.1.schema.json"
+            "../../../../schema/observation.schema.json"
         ))
         .expect("packaged observation schema must be valid JSON");
         value
@@ -178,7 +179,7 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
     type Error = ToolError;
 
     fn try_from(value: TaskObservationView) -> Result<Self, Self::Error> {
-        if value.schema != "zas-observation/1.1"
+        if value.schema != OBSERVATION_SCHEMA
             || value.count_scope != "agent_lifetime"
             || value.reasoning.source.status != "VERIFIED_RUNTIME_PUBLIC"
             || value.reasoning.source.runtime_version != "3.11.2"

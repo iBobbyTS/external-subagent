@@ -49,6 +49,10 @@ import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
+
+// The user debug constraint: this feature builds only the debug profile, and
+// the shared payload entry reads the profile from EXTERNAL_SUBAGENT_CARGO_PROFILE.
+process.env.EXTERNAL_SUBAGENT_CARGO_PROFILE = 'debug';
 const VERSION_A = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 const VERSION_B = (() => { const [major, minor, patch] = VERSION_A.split('.').map(Number); return `${major}.${minor}.${patch + 1}`; })();
 const PLATFORM_DIR = path.join('npm', 'native', 'darwin-arm64');
@@ -267,12 +271,12 @@ function packVersionB(workDir) {
     fs.readFileSync(path.join(vbSrc, 'crates', 'external-daemon', 'Cargo.toml'), 'utf8').replace(/^version = "[^"]+"$/m, `version = "${VERSION_B}"`));
 
   const cargoEnv = { ...process.env, CARGO_TARGET_DIR: path.join(repoRoot, 'target'), CARGO_NET_OFFLINE: 'true' };
-  const build = run('cargo', ['build', '--release', '-p', 'external-daemon', '-p', 'external-mcp'], { cwd: vbSrc, env: cargoEnv, timeout: 600_000 });
+  const build = run('cargo', ['build', '-p', 'external-daemon', '-p', 'external-mcp'], { cwd: vbSrc, env: cargoEnv, timeout: 600_000 });
   assert.equal(build.status, 0, `vB cargo build failed: ${build.stderr}`);
-  const releaseDir = path.join(vbSrc, 'target', 'release');
-  fs.mkdirSync(releaseDir, { recursive: true });
+  const profileDir = path.join(vbSrc, 'target', 'debug');
+  fs.mkdirSync(profileDir, { recursive: true });
   for (const name of ['external-subagentd', 'external-subagent-mcp']) {
-    fs.copyFileSync(path.join(repoRoot, 'target', 'release', name), path.join(releaseDir, name));
+    fs.copyFileSync(path.join(repoRoot, 'target', 'debug', name), path.join(profileDir, name));
   }
   const stage = run(process.execPath, [path.join(vbSrc, 'scripts', 'release', 'build-native-payload.mjs')], { cwd: vbSrc, env: cargoEnv, timeout: 120_000 });
   assert.equal(stage.status, 0, `vB payload staging failed: ${stage.stderr}`);
@@ -581,7 +585,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
 
     const receipt = readReceipt();
     assert.equal(receipt.status, 'success');
-    assert.match(receipt.claim, /^agentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
+    assert.match(receipt.claim, /^external-subagentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
     assert.equal(receipt.version, VERSION_B);
     const afterState = readState();
     assert.equal(afterState.candidate, null, 'a completed activation leaves no candidate behind');

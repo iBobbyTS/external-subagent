@@ -4,7 +4,7 @@ import { LAUNCH_AGENT_LABEL, PRODUCT_NAME } from './constants.mjs';
 import { PLUGIN_NAME } from './install/layout.mjs';
 
 export function platform() {
-  return process.env.ZCODE_AS_SUBAGENT_TEST_PLATFORM || process.platform;
+  return process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM || process.platform;
 }
 
 // State paths derive from PRODUCT_NAME, so the debug variant gets a fully

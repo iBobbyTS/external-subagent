@@ -204,7 +204,7 @@ const live = Boolean(LIVE_PREFIX);
 
 function cleanDaemonEnv(home) {
   const env = { ...process.env, HOME: home };
-  for (const key of ['DSH_RUNTIME_PATH', 'DSH_HOME', 'DSH_PROFILE', 'DSH_VERSION', 'ZCODE_RUNTIME_PATH', 'EXTERNAL_SUBAGENT_CONFIG', 'ZCODE_AGENTD_STORE', 'ZCODE_AGENTD_SOCKET']) {
+  for (const key of ['DSH_RUNTIME_PATH', 'DSH_HOME', 'DSH_PROFILE', 'DSH_VERSION', 'ZCODE_RUNTIME_PATH', 'EXTERNAL_SUBAGENT_CONFIG', 'EXTERNAL_SUBAGENT_STORE', 'ZCODE_AGENTD_SOCKET']) {
     delete env[key];
   }
   return env;

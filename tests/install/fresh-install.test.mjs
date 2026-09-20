@@ -28,6 +28,10 @@ import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
 
+// The user debug constraint: this feature builds only the debug profile, and
+// the shared payload entry reads the profile from EXTERNAL_SUBAGENT_CARGO_PROFILE.
+process.env.EXTERNAL_SUBAGENT_CARGO_PROFILE = 'debug';
+
 const ctx = { workDir: null, prefix: null, packageRoot: null, cli: null, daemon: null, mcpFacade: null, tgz: null };
 
 function run(command, args, options = {}) {
@@ -188,7 +192,7 @@ test('install-only stages the package and payload without touching the home', { 
 test('unsupported platforms allow help/version but reject business commands without writes', { skip: !testable }, async () => {
   await ensureInstalled();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unsup-'));
-  const env = { ...fixtureEnv(home), ZCODE_AS_SUBAGENT_TEST_PLATFORM: 'win32' };
+  const env = { ...fixtureEnv(home), EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32' };
   const init = run(ctx.cli, ['init'], { env });
   assert.equal(init.status, 1);
   assert.equal(JSON.parse(init.stderr).error.code, 'UNSUPPORTED_PLATFORM');

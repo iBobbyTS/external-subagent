@@ -1243,7 +1243,7 @@ sleep 2
         );
         assert_eq!(
             output_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "[zcode-agentd] diagnostic_writes_dropped=100\n"
+            "[external-subagentd] diagnostic_writes_dropped=100\n"
         );
         for _ in 0..DIAGNOSTIC_QUEUE_CAPACITY {
             output_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1281,7 +1281,7 @@ sleep 2
         logger.submit("succeeds\n".into());
         assert_eq!(
             output_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "[zcode-agentd] diagnostic_writes_dropped=1\n"
+            "[external-subagentd] diagnostic_writes_dropped=1\n"
         );
         assert_eq!(
             output_rx.recv_timeout(Duration::from_secs(2)).unwrap(),

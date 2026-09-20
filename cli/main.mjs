@@ -117,7 +117,7 @@ function boundedFailureRecord(record) {
 function diagnosticTail(text) {
   let incomplete = false;
   const decoded = text.split('\n').map((line) => {
-    const match = line.match(/^(\[zcode-agentd\] failure agent=[^:\r\n]+: )(.+)$/u);
+    const match = line.match(/^(\[external-subagentd\] failure agent=[^:\r\n]+: )(.+)$/u);
     if (match && match[2].startsWith('{')) {
       try {
         const record = JSON.parse(match[2]);
@@ -166,7 +166,7 @@ function diagnosticLogs(logDirectory) {
       let decodeStart = Math.max(0, start - 256) - readStart;
       if (decodeStart > 0) {
         const lineStart = buffer.lastIndexOf(0x0a, decodeStart - 1) + 1;
-        if (buffer.subarray(lineStart, read).toString('utf8').startsWith('[zcode-agentd] failure agent=')) decodeStart = lineStart;
+        if (buffer.subarray(lineStart, read).toString('utf8').startsWith('[external-subagentd] failure agent=')) decodeStart = lineStart;
       }
       // Legacy text keeps its original lookbehind; known records are decoded
       // (or marked incomplete) before any display clipping can hide the prefix.
@@ -211,7 +211,7 @@ function agentDiagnosticLogs(logDirectory, agentId) {
       if (lines.pop()) report.incomplete.push(`record_incomplete:${name}`); // The writer may still be appending.
       for (const line of lines.reverse()) {
         if (Buffer.byteLength(line) > DIAGNOSTIC_RECORD_BYTES) { report.incomplete.push(`record_truncated:${name}`); continue; }
-        const prefix = `[zcode-agentd] failure agent=${agentId}: `;
+        const prefix = `[external-subagentd] failure agent=${agentId}: `;
         if (!line.startsWith(prefix)) continue;
         const raw = line.slice(prefix.length);
         // JSON records repeat the identifier; reject misleading prefix matches.

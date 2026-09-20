@@ -43,6 +43,10 @@ import { spawnSync } from 'node:child_process';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
+
+// The user debug constraint: this feature builds only the debug profile, and
+// the shared payload entry reads the profile from EXTERNAL_SUBAGENT_CARGO_PROFILE.
+process.env.EXTERNAL_SUBAGENT_CARGO_PROFILE = 'debug';
 const VERSION_A = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8')).version;
 const VERSION_B = (() => { const [major, minor, patch] = VERSION_A.split('.').map(Number); return `${major}.${minor}.${patch + 1}`; })();
 const PLATFORM_DIR = path.join('npm', 'native', 'darwin-arm64');
@@ -335,14 +339,14 @@ function packVersionB() {
     fs.readFileSync(path.join(vbSrc, 'crates', 'external-daemon', 'Cargo.toml'), 'utf8').replace(/^version = "[^"]+"$/m, `version = "${VERSION_B}"`));
 
   const cargoEnv = { ...process.env, CARGO_TARGET_DIR: path.join(repoRoot, 'target'), CARGO_NET_OFFLINE: 'true' };
-  const build = run('cargo', ['build', '--release', '-p', 'external-daemon', '-p', 'external-mcp'], { cwd: vbSrc, env: cargoEnv });
+  const build = run('cargo', ['build', '-p', 'external-daemon', '-p', 'external-mcp'], { cwd: vbSrc, env: cargoEnv });
   assert.equal(build.status, 0, `vB cargo build failed: ${build.stderr}`);
-  // The release script copies from <root>/target/release; stage the freshly
-  // built binaries there so its own (cached) build is a no-op.
-  const releaseDir = path.join(vbSrc, 'target', 'release');
-  fs.mkdirSync(releaseDir, { recursive: true });
+  // The payload entry copies from <root>/target/<profile>; stage the freshly
+  // built debug binaries there so its own (cached) build is a no-op.
+  const profileDir = path.join(vbSrc, 'target', 'debug');
+  fs.mkdirSync(profileDir, { recursive: true });
   for (const name of ['external-subagentd', 'external-subagent-mcp']) {
-    fs.copyFileSync(path.join(repoRoot, 'target', 'release', name), path.join(releaseDir, name));
+    fs.copyFileSync(path.join(repoRoot, 'target', 'debug', name), path.join(profileDir, name));
   }
   const stage = run(process.execPath, [path.join(vbSrc, 'scripts', 'release', 'build-native-payload.mjs')], { cwd: vbSrc, env: cargoEnv });
   assert.equal(stage.status, 0, `vB payload staging failed: ${stage.stderr}`);
@@ -680,7 +684,7 @@ test('the public update drives the real activation and health-verifies the verif
   assert.equal(plistProgram(), real.result.active.retained.daemon_entry, 'the LaunchAgent keeps pinning the daemon artifact');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'success');
-  assert.match(receipt.claim, /^agentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
+  assert.match(receipt.claim, /^external-subagentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
   const registry = JSON.parse(fs.readFileSync(path.join(paths().data, 'codex-homes.json'), 'utf8'));
   assert.equal(registry.homes[0].last_status, 'updated', 'the real update re-bound the claimed codex home');
 });
@@ -704,5 +708,5 @@ test('the retired vA version is rejected without touching the published vB activ
   assert.equal(sha256(fs.readFileSync(daemonEntry())), ctx.shaB, 'the active daemon artifact on disk still matches the verified digest');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'success');
-  assert.match(receipt.claim, /^agentd-\d+-activation$/);
+  assert.match(receipt.claim, /^external-subagentd-\d+-activation$/);
 });

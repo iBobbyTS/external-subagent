@@ -160,7 +160,7 @@ test('diagnostic marks an unfinished structured failure without publishing a par
     const logs = path.join(home, 'logs');
     fs.mkdirSync(logs);
     fs.writeFileSync(path.join(logs, 'daemon.log'),
-      'prefix'.repeat(4000) + '\n[zcode-agentd] failure agent=10000001: {"agent_id":"10000001","message":"unfinished');
+      'prefix'.repeat(4000) + '\n[external-subagentd] failure agent=10000001: {"agent_id":"10000001","message":"unfinished');
     const report = diagnosticLogs(logs);
     assert.equal(report.files[0].truncated, true);
     assert.ok(report.files[0].tail.endsWith('[INCOMPLETE_FAILURE_RECORD]'));
@@ -227,11 +227,11 @@ test('Agent A diagnostics survive Agent B displacing global tails and finite rot
   try {
     const paths = pathsFor(home);
     fs.mkdirSync(paths.logs);
-    const target = '[zcode-agentd] failure agent=10000001: ' + JSON.stringify({
+    const target = '[external-subagentd] failure agent=10000001: ' + JSON.stringify({
       agent_id: '10000001', session_id: null, stage: 'bootstrap', error_code: 'SESSION_START_FAILED',
       message: 'A-owned-failure', stderr_tail: 'A-owned-stderr',
     }) + '\n';
-    const noise = '[zcode-agentd] failure agent=10000002: B-owned-failure\n'.repeat(1000);
+    const noise = '[external-subagentd] failure agent=10000002: B-owned-failure\n'.repeat(1000);
     fs.writeFileSync(path.join(paths.logs, 'daemon-error.log'), target + noise);
     await withDaemon(paths, statusOrTask, async () => {
       for (const rotated of [false, true]) {
@@ -285,7 +285,7 @@ test('diagnostic output caps UTF-8 bytes and distinguishes unfinished target rec
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-utf8-'));
   const paths = pathsFor(home);
   fs.mkdirSync(paths.logs);
-  const target = '[zcode-agentd] failure agent=10000001: ' + JSON.stringify({ agent_id: '10000001', message: '诊断'.repeat(6000) });
+  const target = '[external-subagentd] failure agent=10000001: ' + JSON.stringify({ agent_id: '10000001', message: '诊断'.repeat(6000) });
   fs.writeFileSync(path.join(paths.logs, 'daemon-error.log'), target + '\n');
   fs.writeFileSync(path.join(paths.logs, 'daemon.log'), '诊断'.repeat(6000));
   await withDaemon(paths, statusOrTask, async () => {
@@ -310,7 +310,7 @@ for (const tail of ['x'.repeat(16384 - 18) + 'FINAL_ERROR_MARKER', '界\n"'.repe
     fs.mkdirSync(paths.logs);
     const record = { agent_id: '10000004', session_id: 's'.repeat(4096), stage: 'runtime_terminal', error_code: 'SESSION_SEND_FAILED', message: 'm'.repeat(4096), stderr_tail: tail, operation: 'session/send', remote_code: -32031, remote_message: 'model unavailable token=hide-this', cleanup_result: 'Signaled(15)' };
     // Produce a legal driver tail, then evict this record from the global tail.
-    fs.writeFileSync(path.join(paths.logs, 'daemon-error.log'), `[zcode-agentd] failure agent=10000004: ${JSON.stringify(record)}\n` + 'other agent\n'.repeat(4000));
+    fs.writeFileSync(path.join(paths.logs, 'daemon-error.log'), `[external-subagentd] failure agent=10000004: ${JSON.stringify(record)}\n` + 'other agent\n'.repeat(4000));
     const report = await diagnose(paths, ['--agent', '10000004', '--output', path.join(home, 'out')]);
     assert.equal(report.agent.diagnostics.status, 'found');
     const found = report.agent.diagnostics.record;

@@ -684,7 +684,7 @@ mod contract_default_tests {
     use crate::mcp::schemas::PublicPermissionMode;
     use crate::mcp::views::PublicComponentState;
     use crate::{
-        observation::ObservationSnapshot,
+        observation::{ObservationSnapshot, OBSERVATION_SCHEMA},
         rpc::{
             AgentCapabilitiesView, CapabilityMaturityView, ComponentStateView, GeneralSubmitInput,
             ObservationCapabilityView, ObservationDefaultsView, RpcMethod, SystemStatusView,
@@ -1217,7 +1217,7 @@ mod contract_default_tests {
             .unwrap();
         let description = observe.description.as_deref().unwrap();
         // Frozen so any wording change is deliberate (S12 re-branded the
-        // "ZAS" self-reference to 本工具; the digest was re-derived then).
+        // legacy self-reference to 本工具; the digest was re-derived then).
         assert_eq!(
             format!("{:x}", Sha256::digest(description.as_bytes())),
             "4b2e476ff5c704fa6b16e2be849bdd8abc3147d21323fe52bbe274efac45f9b9"
@@ -1237,7 +1237,7 @@ mod contract_default_tests {
     fn observation_projection_rejects_source_contract_drift() {
         let snapshot = ObservationSnapshot::unavailable();
         let view = TaskObservationView {
-            schema: "zas-observation/1.1".into(),
+            schema: OBSERVATION_SCHEMA.into(),
             agent_id: "10000000".into(),
             count_scope: "agent_lifetime".into(),
             tools: snapshot.tools,

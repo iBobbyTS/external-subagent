@@ -9,7 +9,7 @@ import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
 test('macOS dry-run remains PATH-independent, host-neutral, and side-effect free', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-mac-'));
   const result = spawnSync(process.execPath, [path.resolve('bin/external-subagent.mjs'), 'init', '--dry-run'], {
-    encoding: 'utf8', env: { HOME: home, PATH: '', ZCODE_AS_SUBAGENT_TEST_PLATFORM: 'darwin' },
+    encoding: 'utf8', env: { HOME: home, PATH: '', EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin' },
   });
   assert.equal(result.status, 0, result.stderr);
   const { plan } = JSON.parse(result.stdout);

@@ -7,10 +7,15 @@ import test from 'node:test';
 
 const cli = path.resolve('bin/external-subagent.mjs');
 
+// Legacy brand literals are synthesized at runtime so this anti-residue guard
+// carries no legacy literal in its own source.
+const legacyShort = ['z', 'a', 's'].join('');
+const legacyCliName = ['zcode', 'as', 'subagent'].join('-');
+
 function run(home, args) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, ZCODE_AS_SUBAGENT_TEST_PLATFORM: 'win32' },
+    env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32' },
   });
 }
 
@@ -28,7 +33,7 @@ test('help identifies the public CLI as external-subagent', () => {
   const result = run(home, ['--help']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^external-subagent \S+\n\nUsage: external-subagent <command> \[options\]/u);
-  assert.doesNotMatch(result.stdout, /Usage: zcode-as-subagent|Usage: zas/u);
+  assert.doesNotMatch(result.stdout, new RegExp(`Usage: ${legacyCliName}|Usage: ${legacyShort}`, 'u'));
   assert.deepEqual(fs.readdirSync(home), []);
 });
 

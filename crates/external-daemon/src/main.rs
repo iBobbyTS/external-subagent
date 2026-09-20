@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         codex_factory,
     ));
     let scheduler = Scheduler::new(
-        format!("agentd-{}", std::process::id()),
+        format!("external-subagentd-{}", std::process::id()),
         store,
         runtime_factory,
         production_scheduler_config(config.runtime.clone()),
@@ -254,7 +254,7 @@ fn production_scheduler_config(runtime_source: Option<PathBuf>) -> SchedulerConf
 
 #[cfg(debug_assertions)]
 fn wait_for_startup_test_gate(shutdown_requested: &AtomicBool) -> io::Result<()> {
-    let Some(path) = env::var_os("ZCODE_AGENTD_TEST_STARTUP_GATE") else {
+    let Some(path) = env::var_os("EXTERNAL_SUBAGENT_TEST_STARTUP_GATE") else {
         return Ok(());
     };
     let mut gate = UnixStream::connect(path)?;
@@ -280,7 +280,7 @@ fn wait_for_startup_test_gate(_shutdown_requested: &AtomicBool) -> io::Result<()
 }
 
 fn parse_config() -> io::Result<Config> {
-    let mut database = env::var_os("ZCODE_AGENTD_STORE").map(PathBuf::from);
+    let mut database = env::var_os("EXTERNAL_SUBAGENT_STORE").map(PathBuf::from);
     let mut socket = env::var_os("ZCODE_AGENTD_SOCKET").map(PathBuf::from);
     let mut runtime = env::var_os("ZCODE_RUNTIME_PATH").map(PathBuf::from);
     let mut diagnostic_log = None;
@@ -310,7 +310,7 @@ fn parse_config() -> io::Result<Config> {
     let database = absolute_path(database.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ZCODE_AGENTD_STORE or --database is required",
+            "EXTERNAL_SUBAGENT_STORE or --database is required",
         )
     })?)?;
     let agent_config =

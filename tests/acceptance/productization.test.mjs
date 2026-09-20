@@ -14,6 +14,10 @@ import { test } from 'node:test';
 const root = path.resolve(import.meta.dirname, '../..');
 const pluginRoot = path.join(root, 'plugins', 'codex', 'external-subagent');
 
+// Legacy brand literals are synthesized at runtime so this anti-residue guard
+// carries no legacy literal in its own source.
+const legacyMcpKey = ['zcode', 'as', 'subagent'].join('_');
+
 test('managed plugin manifest carries a distinct semver cache identity', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(pluginRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
   assert.equal(manifest.name, 'external-subagent');
@@ -39,7 +43,7 @@ test('staged plugin MCP binding keeps exactly the managed placeholders', () => {
   const server = mcp.mcpServers.external_subagent;
   assert.equal(server.command, '__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__');
   assert.equal(server.env.ZCODE_AGENTD_SOCKET, '__EXTERNAL_SUBAGENT_SOCKET__');
-  assert.equal(mcp.mcpServers.zcode_as_subagent, undefined);
+  assert.equal(mcp.mcpServers[legacyMcpKey], undefined);
 });
 
 test('acceptance matrix deliverable records the four live consumer cells', () => {

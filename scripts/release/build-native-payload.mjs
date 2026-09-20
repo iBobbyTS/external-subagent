@@ -29,6 +29,14 @@ if (variant !== '' && variant !== 'debug') {
   process.exit(2);
 }
 const isDebug = variant === 'debug';
+// The cargo profile is release by default so prepack/prepublish keep shipping
+// release bytes; EXTERNAL_SUBAGENT_CARGO_PROFILE=debug selects the development
+// profile without changing the payload/product naming.
+const cargoProfile = process.env.EXTERNAL_SUBAGENT_CARGO_PROFILE || 'release';
+if (cargoProfile !== 'release' && cargoProfile !== 'debug') {
+  process.stderr.write(`unknown cargo profile: ${cargoProfile} (supported: release, debug)\n`);
+  process.exit(2);
+}
 const nativeDirName = isDebug ? 'native-debug' : 'native';
 const productName = isDebug ? 'external-subagent-debug' : 'external-subagent';
 const binaries = isDebug
@@ -66,6 +74,7 @@ function stagedIsCurrent(version) {
   let manifest;
   try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { return false; }
   if (manifest.version !== version || manifest.platform !== 'darwin-arm64' || manifest.product !== productName) return false;
+  if ((manifest.profile ?? 'release') !== cargoProfile) return false;
   const inputs = newestInputMs();
   for (const file of manifest.files) {
     const target = path.join(platformDir, file.name);
@@ -82,24 +91,27 @@ const version = packageVersion();
 // diagnostics go to stderr there so pack output stays machine-parseable.
 const note = (text) => (process.env.npm_lifecycle_event ? process.stderr : process.stdout).write(text);
 if (process.argv.includes('--if-stale') && stagedIsCurrent(version)) {
-  note(`native payload already current at ${version}${isDebug ? ' (debug)' : ''}\n`);
+  note(`native payload already current at ${version}${isDebug ? ' (debug)' : ''}${cargoProfile === 'release' ? '' : ` [${cargoProfile}]`}\n`);
   process.exit(0);
 }
 
-const build = spawnSync('cargo', ['build', '--release', '-p', 'external-daemon', '-p', 'external-mcp'], {
+const cargoArguments = ['build'];
+if (cargoProfile === 'release') cargoArguments.push('--release');
+cargoArguments.push('-p', 'external-daemon', '-p', 'external-mcp');
+const build = spawnSync('cargo', cargoArguments, {
   cwd: packageRoot, stdio: 'inherit',
 });
 if (build.status !== 0) {
-  process.stderr.write('cargo release build failed\n');
+  process.stderr.write(`cargo ${cargoProfile} build failed\n`);
   process.exit(build.status ?? 1);
 }
 
 fs.mkdirSync(platformDir, { recursive: true });
 const files = [];
 for (const [source, name] of binaries) {
-  const sourcePath = path.join(packageRoot, 'target', 'release', source);
+  const sourcePath = path.join(packageRoot, 'target', cargoProfile, source);
   if (!fs.existsSync(sourcePath)) {
-    process.stderr.write(`release binary missing: ${sourcePath}\n`);
+    process.stderr.write(`${cargoProfile} binary missing: ${sourcePath}\n`);
     process.exit(1);
   }
   const target = path.join(platformDir, name);
@@ -109,11 +121,15 @@ for (const [source, name] of binaries) {
   files.push({ name, bytes: bytes.length, mode: '755', sha256: sha256(bytes) });
 }
 
-const manifest = { schema_version: 1, product: productName, version, platform: 'darwin-arm64', files };
+const manifest = { schema_version: 1, product: productName, version, platform: 'darwin-arm64' };
+// The debug profile is recorded so --if-stale can tell a debug-staged payload
+// from a release one; the release manifest stays byte-identical to before.
+if (cargoProfile !== 'release') manifest.profile = cargoProfile;
+manifest.files = files;
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
 if (isDebug) {
   const stagedPlugin = stageDebugPlugin(packageRoot);
   note(`native payload ${version} (debug) staged: ${files.map((file) => file.name).join(', ')}\nplugin source staged: ${stagedPlugin}\n`);
 } else {
-  note(`native payload ${version} staged: ${files.map((file) => file.name).join(', ')}\n`);
+  note(`native payload ${version} staged: ${files.map((file) => file.name).join(', ')}${cargoProfile === 'release' ? '' : ` [${cargoProfile}]`}\n`);
 }

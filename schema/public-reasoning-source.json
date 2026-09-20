@@ -1,5 +1,5 @@
 {
-  "schema": "zas-public-reasoning-source/1",
+  "schema": "external-subagent-public-reasoning-source/1",
   "status": "VERIFIED_RUNTIME_PUBLIC",
   "runtime_path": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
   "runtime_version": "3.11.2",
