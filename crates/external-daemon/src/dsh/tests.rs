@@ -78,8 +78,15 @@ fn wire_frames(workspace: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Synchronization budget for "eventually" polls over real child I/O.
+/// None of the waiters using it asserts deadline behavior; under the
+/// parallel suite the scripted children (real processes) can need seconds
+/// to become observable, so the budget matches the generous scheduler
+/// windows instead of a tight wall-clock guess.
+const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
+
 fn wait_for_frames(workspace: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let frames = wire_frames(workspace);
         if frames.len() >= expected {
@@ -166,7 +173,7 @@ fn enqueue_dsh_with_effort(
 }
 
 fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store::TaskRecord {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
         if task.phase.is_terminal() {
@@ -181,7 +188,7 @@ fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store:
 }
 
 fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
             return result;
@@ -195,7 +202,7 @@ fn await_pending_permission(
     scheduler: &Scheduler,
     agent_id: &str,
 ) -> external_store::StoredPendingRequest {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let requests = scheduler.store().pending_requests(agent_id).unwrap();
         if let Some(request) = requests.first() {
@@ -376,7 +383,7 @@ printf '%s\\n' \
     );
 
     // Natural completion released the runtime and terminalized the task.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() != 0 {
         assert!(Instant::now() < deadline, "runtime was not released");
         thread::sleep(Duration::from_millis(10));
@@ -500,7 +507,7 @@ while IFS= read -r line; do :; done
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     let request = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         loop {
             if let Some(request) = scheduler
                 .store()
@@ -626,7 +633,7 @@ while IFS= read -r line; do :; done
     );
     std::fs::write(workspace.path().join("ask-now"), "").unwrap();
     let requests = {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         loop {
             let requests = scheduler.store().pending_requests(&agent_id).unwrap();
             if requests.len() == 2 {
@@ -1286,7 +1293,7 @@ fn cross_provider_shared_scheduler_contract() {
             .outcome,
         TaskOutcome::Cancelled
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() != 0 {
         assert!(Instant::now() < deadline, "occupier runtime was not reaped");
         thread::sleep(Duration::from_millis(10));
@@ -1315,7 +1322,7 @@ fn cross_provider_shared_scheduler_contract() {
     assert!(matches!(phase, TaskPhase::Cancelling | TaskPhase::Terminal));
     let second_terminal = await_terminal_task(&scheduler, &second);
     assert_eq!(second_terminal.outcome, Some(TaskOutcome::Cancelled));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() != 0 {
         assert!(Instant::now() < deadline, "dsh runtime was not reaped");
         thread::sleep(Duration::from_millis(10));
@@ -1384,7 +1391,7 @@ fn dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result() {
     assert_eq!(stored.result.outcome, TaskOutcome::Cancelled);
     assert!(stored.result.partial);
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() != 0 {
         assert!(Instant::now() < deadline, "runtime was not reaped");
         thread::sleep(Duration::from_millis(10));

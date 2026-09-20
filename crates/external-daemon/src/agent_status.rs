@@ -162,7 +162,10 @@ pub struct AgentEvidenceStore {
 
 impl AgentEvidenceStore {
     pub fn new(runtime_source: Option<PathBuf>) -> Self {
-        Self::with_backend(Arc::new(ProcessProbeBackend { runtime_source }))
+        Self::with_backend(Arc::new(ProcessProbeBackend {
+            runtime_source,
+            verifier_deadline: None,
+        }))
     }
 
     pub(crate) fn with_backend(backend: Arc<dyn AgentProbeBackend>) -> Self {
@@ -253,6 +256,13 @@ fn preserved_or_stale(
 
 struct ProcessProbeBackend {
     runtime_source: Option<PathBuf>,
+    /// Budget the hi probe waits for the scope policy verifier before
+    /// declaring the policy unverified. `None` keeps the production
+    /// `LOCAL_PROBE_TIMEOUT`; tests that share the machine with a full
+    /// parallel suite widen it so a starved-but-healthy verifier is not
+    /// misjudged (the verifier is a trivial shell script, only ever slow
+    /// because the machine is busy, not because it is unhealthy).
+    verifier_deadline: Option<Duration>,
 }
 
 impl AgentProbeBackend for ProcessProbeBackend {
@@ -333,6 +343,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
                     &scope,
                     local.version.clone(),
                     checked_at_ms,
+                    self.verifier_deadline,
                 );
                 auth = auth_result;
                 hi = hi_result;
@@ -1175,6 +1186,7 @@ fn probe_zcode_hi(
     scope: &ProbeScope,
     version: Option<String>,
     checked_at_ms: u64,
+    verifier_deadline: Option<Duration>,
 ) -> (ScopeEvidence, ScopeEvidence) {
     let Some(workspace) = scope.workspace.as_deref() else {
         let evidence = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "workspace_required");
@@ -1191,7 +1203,11 @@ fn probe_zcode_hi(
         };
         return (evidence.clone(), evidence);
     }
-    if !verified_read_only_policy(scope, workspace) {
+    if !verified_read_only_policy(
+        scope,
+        workspace,
+        verifier_deadline.unwrap_or(LOCAL_PROBE_TIMEOUT),
+    ) {
         let evidence = unavailable(scope, version, checked_at_ms, "policy_unverified");
         return (evidence.clone(), evidence);
     }
@@ -1242,7 +1258,7 @@ fn probe_zcode_hi(
     (auth, hi)
 }
 
-fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
+fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Duration) -> bool {
     let Some(home) = scope.home.as_deref() else {
         return false;
     };
@@ -1284,7 +1300,12 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str) -> bool {
         return false;
     };
     let group = child.id() as i32;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The verifier is a trivial script; the budget only has to outlast a
+    // busy machine (a loaded host can starve even a millisecond script
+    // past a tight deadline), so it matches the local probe timeout
+    // instead of the historic 2s that produced load-correlated
+    // `policy_unverified` false negatives.
+    let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return status.success(),
@@ -1986,6 +2007,7 @@ mod tests {
         }
         let backend = ProcessProbeBackend {
             runtime_source: None,
+            verifier_deadline: None,
         };
         let result = backend.probe(&AgentProbeInput {
             agent: "dsh".into(),
@@ -2025,7 +2047,10 @@ mod tests {
         let started = Instant::now();
         let version = executable_version(&executable).unwrap();
         assert_eq!(version, "fixture-9.9.9");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // The bound only proves the probe did not wait for the 20s
+        // descendant's EOF, so it stays far below the sentinel while
+        // tolerating a loaded parallel suite.
+        assert!(started.elapsed() < Duration::from_secs(10));
         let pid = fs::read_to_string(descendant_pid)
             .unwrap()
             .trim()
@@ -2047,7 +2072,8 @@ mod tests {
         let started = Instant::now();
         let error = executable_version(&executable).unwrap_err();
         assert_eq!(error, "oversized");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Same 20s sentinel as the reaping test above.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     fn fake_hi_runtime(
@@ -2182,6 +2208,7 @@ process.stdin.on('data', (chunk) => {
         );
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
+            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let evidence = backend.probe(&AgentProbeInput {
             agent: "zcode".into(),
@@ -2192,7 +2219,19 @@ process.stdin.on('data', (chunk) => {
             },
         });
         let records = fs::read_to_string(log)
-            .unwrap_or_else(|error| panic!("fixture log unavailable: {error}; evidence={evidence:?}"))
+            .unwrap_or_else(|error| {
+                let proximate = evidence
+                    .hi
+                    .reason
+                    .clone()
+                    .or_else(|| evidence.auth.reason.clone())
+                    .unwrap_or_else(|| "none".into());
+                panic!(
+                    "fixture log unavailable: {error}; hi probe proximate cause: {proximate} \
+                     (a policy_unverified hi layer aborts before the fixture ever launches); \
+                     evidence={evidence:?}"
+                )
+            })
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
@@ -2236,12 +2275,55 @@ process.stdin.on('data', (chunk) => {
         );
         let evidence = ProcessProbeBackend {
             runtime_source: Some(runtime),
+            verifier_deadline: None,
         }
         .probe(&AgentProbeInput {
             agent: "zcode".into(),
             through: ProbeLayer::Hi,
             scope: ProbeScope::default(),
         });
+        assert_eq!(evidence.hi.reason.as_deref(), Some("policy_unverified"));
+        assert!(!log.exists());
+    }
+
+    #[test]
+    fn policy_verifier_deadline_override_short_circuits_the_hi_probe() {
+        // A verifier that would succeed but outlives the configured budget
+        // must fail closed before the runtime is ever spawned, proving the
+        // deadline seam reaches the gate (production keeps
+        // LOCAL_PROBE_TIMEOUT; fixture probes widen it to survive a
+        // parallel suite without weakening the fail-closed semantics).
+        let directory = tempfile::tempdir().unwrap();
+        let verifier = directory.path().join(
+            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
+        );
+        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
+        fs::write(&verifier, "#!/bin/sh\nsleep 1\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (runtime, log) = fake_hi_runtime(
+            directory.path(),
+            "turn.completed",
+            serde_json::json!({}),
+            false,
+            false,
+            "success",
+        );
+        let evidence = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+            verifier_deadline: Some(Duration::from_millis(200)),
+        }
+        .probe(&AgentProbeInput {
+            agent: "zcode".into(),
+            through: ProbeLayer::Hi,
+            scope: ProbeScope {
+                home: Some(directory.path().to_string_lossy().into_owned()),
+                ..ProbeScope::default()
+            },
+        });
+        assert_eq!(evidence.hi.state, EvidenceState::Unavailable);
         assert_eq!(evidence.hi.reason.as_deref(), Some("policy_unverified"));
         assert!(!log.exists());
     }
@@ -2304,7 +2386,7 @@ process.stdin.on('data', (chunk) => {
         ] {
             let started = Instant::now();
             let (evidence, _) = run_fixture_probe_ordered(terminal, failure, false, true);
-            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(started.elapsed() < Duration::from_secs(15));
             assert_eq!(evidence.hi.state, state);
             assert_eq!(evidence.auth.state, state);
             assert_eq!(evidence.hi.reason.as_deref(), reason);
@@ -2668,6 +2750,7 @@ process.stdin.on('data', (chunk) => {
     fn zcode_catalog_is_explicitly_native_only_without_runtime_start() {
         let backend = ProcessProbeBackend {
             runtime_source: Some(PathBuf::from("/must-not-run")),
+            verifier_deadline: None,
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),

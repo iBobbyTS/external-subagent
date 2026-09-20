@@ -45,6 +45,12 @@ fn scripted_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Synchronization budget for "eventually" polls over real child I/O
+/// (same rationale as the DSH suite's budget): none of the waiters using
+/// it asserts deadline behavior, and the parallel suite starves real
+/// children for seconds at a time.
+const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
+
 fn codex_workspace() -> tempfile::TempDir {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/live-agent/workspace")
@@ -114,7 +120,7 @@ fn harness_factory(script: &str, workspace: &Path) -> CodexRuntimeFactory {
 }
 
 fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store::TaskRecord {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
         if task.phase == TaskPhase::Terminal {
@@ -126,7 +132,7 @@ fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store:
 }
 
 fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
             return result;
@@ -642,7 +648,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     // With the first turn active the runtime is live: queueing now makes
     // the first turn's natural completion defer to the message and deliver
     // it through send_turn in the same process.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         if matches!(task.turn_state, external_store::TurnState::Active) {
@@ -782,7 +788,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
     scheduler.start_ready().unwrap();
     let first_result = await_result(&scheduler, &agent_id);
     assert_eq!(first_result.result.final_text, "CODEX_OK");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() > 0 {
         assert!(
             Instant::now() < deadline,
@@ -1150,7 +1156,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .unwrap();
     let agent_id = submitted.agent_id.clone();
     scheduler.start_ready().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         if matches!(task.turn_state, external_store::TurnState::Active) {
@@ -1225,7 +1231,7 @@ fn home_precedence_and_runtime_path_bounds() {
     let launch = CodexLaunch::new(script.clone(), directory.path().join("home"));
     let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
     let owner = CodexRuntimeOwner::spawn(launch.command(directory.path()), sink).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     loop {
         if let Ok(args) = std::fs::read_to_string(directory.path().join("args.txt")) {
             assert_eq!(
@@ -1309,7 +1315,7 @@ fn routing_keeps_zcode_and_dsh_on_their_factories() {
         CodexRuntimeFactory::closed(),
     );
     let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
-    // No admission → legacy zcode route.
+    // No admitted runtime: the manifest stays on the zcode factory.
     let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
         .unwrap()
         .prepare_direct_submission(&manifest_for(workspace.path(), "legacy"))
@@ -1985,7 +1991,7 @@ sleep 1
         scheduler.start_ready().unwrap();
         let first_result = await_result(&scheduler, &agent_id);
         assert_eq!(first_result.result.final_text, "CODEX_OK");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         while scheduler.active_count() > 0 {
             assert!(
                 Instant::now() < deadline,
@@ -2111,7 +2117,7 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
         scheduler.start_ready().unwrap();
         let first_result = await_result(&scheduler, &agent_id);
         assert_eq!(first_result.result.final_text, "CODEX_OK");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         while scheduler.active_count() > 0 {
             assert!(
                 Instant::now() < deadline,
@@ -2187,7 +2193,7 @@ fn write_modes_resume_with_confirmed_workspace_write() {
         scheduler.start_ready().unwrap();
         let first_result = await_result(&scheduler, &agent_id);
         assert_eq!(first_result.result.final_text, "CODEX_OK");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         while scheduler.active_count() > 0 {
             assert!(
                 Instant::now() < deadline,
@@ -2313,7 +2319,7 @@ fn resume_keeps_the_admitted_effort_for_followup_turns() {
         .find(|frame| frame["method"] == "turn/start")
         .expect("first turn/start frame");
     assert_eq!(first_turn_start["params"]["effort"], "high");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() > 0 {
         assert!(
             Instant::now() < deadline,
@@ -2386,7 +2392,7 @@ fn resume_without_an_effort_echo_proceeds_with_a_diagnostic() {
     scheduler.start_ready().unwrap();
     let first_result = await_result(&scheduler, &agent_id);
     assert_eq!(first_result.result.final_text, "CODEX_OK");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() > 0 {
         assert!(
             Instant::now() < deadline,
@@ -2459,7 +2465,7 @@ fn resume_fails_closed_when_the_effort_echo_diverges() {
     scheduler.start_ready().unwrap();
     let first_result = await_result(&scheduler, &agent_id);
     assert_eq!(first_result.result.final_text, "CODEX_OK");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     while scheduler.active_count() > 0 {
         assert!(
             Instant::now() < deadline,
@@ -2592,7 +2598,7 @@ sleep 1
         scheduler.start_ready().unwrap();
         let first_result = await_result(&scheduler, &agent_id);
         assert_eq!(first_result.result.final_text, "CODEX_OK");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
         while scheduler.active_count() > 0 {
             assert!(
                 Instant::now() < deadline,
