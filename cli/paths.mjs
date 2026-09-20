@@ -26,15 +26,3 @@ export function productPaths(home = os.homedir()) {
     zcodePlugin: path.join(data, 'zcode-plugin', PLUGIN_NAME),
   };
 }
-
-export function legacyPaths(home = os.homedir()) {
-  return [
-    path.join(home, 'Library', 'LaunchAgents', 'com.zcode-reviewd.plist'),
-    path.join(home, 'Library', 'LaunchAgents', 'com.zcode-review-mcp.plist'),
-    path.join(home, 'Library', 'Logs', 'zcode-reviewd'),
-    path.join(home, 'Library', 'Application Support', 'zcode-review-mcp'),
-    path.join(home, 'Library', 'Application Support', 'zcode-reviewd'),
-    path.join(home, '.local', 'bin', 'zcode-reviewd'),
-    path.join(home, '.local', 'bin', 'zcode-review-mcp'),
-  ];
-}

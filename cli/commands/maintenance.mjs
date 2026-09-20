@@ -1,4 +1,4 @@
-import { backupData, cleanupLegacy, purge, restoreData, uninstall as removeService } from '../maintenance.mjs';
+import { backupData, purge, restoreData, uninstall as removeService } from '../maintenance.mjs';
 import { unregisterAllCodexHomes } from '../install/reconcile.mjs';
 import { uninstallZcodePlugin } from '../install/zcode.mjs';
 
@@ -24,4 +24,4 @@ export function uninstall(paths, options = {}) {
   return { ...removed, codex_homes_unregistered: released.unregistered, zcode_binding: zcode };
 }
 
-export { backupData, cleanupLegacy, purge, restoreData };
+export { backupData, purge, restoreData };

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { backupData, cleanupLegacy, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
+import { backupData, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
 import { uninstall as uninstallProduct } from '../../cli/commands/maintenance.mjs';
 import { loadCodexHomes, registerCodexHome } from '../../cli/install/reconcile.mjs';
 import { bootstrapService, bootoutService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
@@ -172,17 +172,6 @@ test('product uninstall removes the service first, then releases every claim whi
       'claim release is registry-only; bound home contents are left to their owners');
   }
   fs.rmSync(home, { recursive: true, force: true });
-});
-
-test('legacy cleanup removes only enumerated old paths and creates no alias or migration', () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-legacy-'));
-  const old = path.join(home, '.local', 'bin', 'zcode-reviewd');
-  fs.mkdirSync(path.dirname(old), { recursive: true });
-  fs.writeFileSync(old, 'old');
-  const result = cleanupLegacy(home);
-  assert.equal(result.migration, false);
-  assert.deepEqual(result.aliases_created, []);
-  assert.equal(fs.existsSync(old), false);
 });
 
 // launchd answers a bootstrap over an already-loaded label with

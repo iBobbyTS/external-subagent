@@ -5,7 +5,7 @@ import { BUSINESS_COMMANDS, PRODUCT_NAME, VERSION, ZCODE_RUNTIME } from './const
 import { CliError } from './errors.mjs';
 import { installHooks, installPlan, runInit } from './install/init.mjs';
 import { nativeBinary } from './install/layout.mjs';
-import { cleanupLegacy, purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
+import { purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
 import { updateCommand } from './commands/update.mjs';
 import { localInstallStatus, startDaemon, stopDaemon } from './commands/daemon.mjs';
 import { serviceRegistrationStatus } from './install/service-macos.mjs';
@@ -17,7 +17,7 @@ import { parseConfigArgs } from './commands/config.mjs';
 import { subagentsCommand, parseSubagentsArgs } from './commands/agents.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from './commands/tasks.mjs';
 
-const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] [--skip-service-start]\n                             Install the standalone daemon service only; bind a\n                             host afterwards with install-plugin or install-mcp\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n  cleanup-legacy --yes        Delete old unpublished installation (no migration)\n`;
+const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] [--skip-service-start]\n                             Install the standalone daemon service only; bind a\n                             host afterwards with install-plugin or install-mcp\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon LaunchAgent\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n`;
 const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  subagents list | subagents status [subagent] | subagents probe/models [subagent]\n  create/spawn, wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function structuredInput(args, parser) {
@@ -410,10 +410,6 @@ export async function main(args) {
   if (command === 'purge') {
     if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'purge requires --yes');
     output(purge(paths)); return;
-  }
-  if (command === 'cleanup-legacy') {
-    if (!args.includes('--yes')) throw new CliError('CONFIRMATION_REQUIRED', 'cleanup-legacy requires --yes');
-    output(cleanupLegacy(paths.home)); return;
   }
   let input;
   if (command === 'create' || command === 'spawn') {

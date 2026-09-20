@@ -38,7 +38,7 @@ test('help identifies the public CLI as external-subagent', () => {
 });
 
 test('every business command is rejected structurally before filesystem side effects', () => {
-  const commands = ['init', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop', 'uninstall', 'purge', 'cleanup-legacy', 'create', 'wait', 'list', 'send', 'respond', 'cancel', 'result', 'close'];
+  const commands = ['init', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop', 'uninstall', 'purge', 'create', 'wait', 'list', 'send', 'respond', 'cancel', 'result', 'close'];
   for (const command of commands) {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), `external-subagent-win-${command}-`));
     const result = run(home, [command]);

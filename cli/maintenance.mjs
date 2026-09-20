@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CliError } from './errors.mjs';
 import { jsonBytes, sha256 } from './fs-atomic.mjs';
-import { legacyPaths, productPaths } from './paths.mjs';
+import { productPaths } from './paths.mjs';
 import { bootoutService } from './install/service-macos.mjs';
 
 function copyTree(source, destination, records, root = source) {
@@ -96,9 +96,4 @@ export function uninstall(paths = productPaths(), options = {}) {
 
 export function purge(paths = productPaths()) {
   return { purged: removeOne(paths.data), logs_purged: removeOne(paths.logs) };
-}
-
-export function cleanupLegacy(home) {
-  const removed = legacyPaths(home).filter(removeOne);
-  return { migration: false, aliases_created: [], removed };
 }
