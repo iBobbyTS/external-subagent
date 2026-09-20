@@ -14,7 +14,7 @@ struct Fixture {
 
 impl Fixture {
     fn spawn(echo: Option<&str>) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_external-agent-zcode"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_external-fixture-zcode"));
         command
             .arg("session")
             .stdin(Stdio::piped())

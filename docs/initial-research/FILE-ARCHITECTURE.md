@@ -53,12 +53,12 @@ external-subagent/
 │   │   ├── messages.rs / requests.rs / recovery.rs
 │   │   ├── activity.rs / observation.rs / diagnostics.rs
 │   │   └── lib.rs
-│   ├── external-agent-zcode/src/
+│   ├── fixtures/zcode/src/
 │   │   ├── protocol/                 # 原 zcode-protocol 的 wire 专属部分
 │   │   ├── driver.rs / session.rs / event.rs
 │   │   ├── preparation.rs / permission.rs
 │   │   ├── discovery.rs / probe.rs / lib.rs
-│   ├── external-agent-dsh/src/
+│   ├── subagents/dsh/src/
 │   │   ├── acp/transport.rs / session.rs / model.rs
 │   │   ├── acp/permission.rs / update.rs / result.rs
 │   │   ├── profile.rs / discovery.rs / probe.rs / lib.rs
@@ -100,7 +100,7 @@ CLI / MCP → daemon service → core → store + contract + runtime trait
 
 - `external-contract` 不依赖 provider、CLI、数据库或 OS 服务；公共字段在一处定义。
 - `external-runtime` 拥有 process identity、deadline 与回收；adapter 只控制原生协议并提交规范化事件，不能各建一套进程监控。
-- `external-core` 决定 workspace admission、消息排队、请求 PENDING/SENDING/RESPONDED 与终态优先级；不得导入 `external-agent-zcode` 或 `external-agent-dsh`。
+- `external-core` 决定 workspace admission、消息排队、请求 PENDING/SENDING/RESPONDED 与终态优先级；不得导入 `external-fixture-zcode` 或 `external-agent-dsh`。
 - `external-store` 负责事务与 durable facts；provider 私有附加状态必须带 adapter/schema identity 且无密钥，不是把任意 JSON 当公共 contract。
 - provider 的 wire method、model token 解码／映射、认证证据、工具字段和策略差异只能在 adapter 内；`ZCODE_*` 环境变量不能扩散到 core。
 - RPC 与 MCP 使用同一业务 service 与错误分类，不各自做默认 agent/model 解析、wait wake 判断或 permission 决策。

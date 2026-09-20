@@ -1,3 +1,11 @@
+//! ZCode native-protocol consistency fixture.
+//!
+//! This crate is the fake runtime (fake agent) exercised by the consistency
+//! tests for the zcode native agent protocol (ZcodeStrict, with no jsonrpc
+//! envelope); it is not a provider adapter. Production has no zcode
+//! translation layer: the external-runtime `Driver` speaks the native protocol
+//! directly, and this fixture only reproduces its wire shapes.
+
 use serde_json::{json, Map, Value};
 use std::io::{self, BufRead, Write};
 

@@ -20,10 +20,10 @@ use std::time::{Duration, Instant};
 /// The repository file is the declared source; the embedded default must stay
 /// byte-equivalent (a drift test pins this) so a missing file never widens the
 /// composition at runtime.
-pub const BUILD_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/build.json");
+pub const BUILD_PROFILE_JSON: &str = include_str!("../../../../profiles/dsh/build.json");
 pub const STRICT_PLAN_PATCH_YAML: &str =
-    include_str!("../../../profiles/dsh/strict-plan.patch.yml");
-pub const STRICT_PLAN_PROFILE_JSON: &str = include_str!("../../../profiles/dsh/strict-plan.json");
+    include_str!("../../../../profiles/dsh/strict-plan.patch.yml");
+pub const STRICT_PLAN_PROFILE_JSON: &str = include_str!("../../../../profiles/dsh/strict-plan.json");
 
 /// Launch inputs for one DSH child process.
 #[derive(Debug, Clone, PartialEq, Eq)]

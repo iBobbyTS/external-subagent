@@ -263,13 +263,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "external-agent-zcode"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
 name = "external-contract"
 version = "0.1.0"
 dependencies = [
@@ -313,6 +306,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "external-fixture-zcode"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
