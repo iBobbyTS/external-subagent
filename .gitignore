@@ -39,3 +39,6 @@ plugins/codex/external-subagent-debug/
 
 # Kilo agent worktrees
 .kilo/
+
+# Parallel worktrees (AGENTS.md convention)
+/git-worktree/
