@@ -7,9 +7,12 @@ description: 发布 external-subagent 新版本到 npm（tag 驱动的 GitHub Ac
 
 ## 常规发版（tag 驱动，全自动）
 
-1. bump 版本——**两处必须一致**（payload/包/CLI 三方一致性校验会拦截漂移）：
+1. bump 版本——**四处必须一致**（payload manifest 由 package.json 生成，门禁只校验 manifest 与包版本一致，校验不到二进制内嵌版本）：
    - `package.json` 的 `version`
    - `cli/constants.mjs` 的 `VERSION`
+   - 全部 crate 的 `Cargo.toml` `version`（daemon 自报 identity 版本来自 `env!("CARGO_PKG_VERSION")`，漏 bump 会发布出自报旧版本的二进制）
+   - 变更后跑一次 `cargo metadata` 刷新 `Cargo.lock`
+   - 教训（v0.1.1）：只 bump 前两处时，tarball 里的 daemon 自报 0.1.0，`external-subagent update` 的健康检查因 running daemon identity 与所选 payload 不匹配而 SERVICE_HEALTH_FAILED，安装卡死在旧版；v0.1.1 因此作废，由 v0.1.2 取代
 2. 提交并推送 `main`
 3. `git tag vX.Y.Z && git push origin vX.Y.Z`
 4. GitHub Actions（`.github/workflows/npm-publish.yml`）在 Apple Silicon runner 上构建并发布。环境里没有任何 npm token，凭证是运行器的 OIDC 身份（npm Trusted Publishing）
@@ -32,7 +35,7 @@ npm lifecycle 串起三道门禁，本地 `npm pack` 与 CI publish 都会全部
 - `repository.url` 必须与 GitHub 仓库精确一致（OIDC 发布校验项，fork 里发布会失败）
 - 平台是 darwin-arm64：runner 必须 Apple Silicon（`macos-latest`）；`package.json` 的 `os`/`cpu` 让 npm 在安装期直接拒绝其他平台
 - 插件 manifest 版本（`plugins/codex/external-subagent/.codex-plugin/plugin.json`，当前 0.1.x 系列）与产品版本**有意分离**：它是 codex 插件缓存身份（`plugin@marketplace@version`），插件内容变更时按 README "Versioning" 规则单独 bump，不要跟产品版本对齐
-- 版本号必须三处一致：`package.json` / `cli/constants.mjs` / payload manifest（构建时生成，不用手改）
+- 版本号必须四处一致：`package.json` / `cli/constants.mjs` / 全部 crate `Cargo.toml` / payload manifest（构建时生成，不用手改）；门禁只看 manifest，Cargo.toml 漏 bump 门禁不报错但产物自报旧版本
 
 ## 本地验证（不触 registry）
 

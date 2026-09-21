@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "external-agent-codex"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "external-contract",
  "external-runtime",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "external-agent-dsh"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "external-contract",
  "external-runtime",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "external-contract"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "external-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "jsonschema",
  "libc",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "external-daemon"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "external-agent-codex",
  "external-agent-dsh",
@@ -320,21 +320,21 @@ dependencies = [
 
 [[package]]
 name = "external-fixture-zcode"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "external-mcp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "external-runtime"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "external-contract",
  "libc",
@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "external-store"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "rusqlite",
  "serde",
