@@ -1,0 +1,40 @@
+{
+  "agent": "dsh",
+  "composition": {
+    "sandbox": "workspace-write",
+    "permission_mode": "workspace-write",
+    "unknown_entry_policy": "fail-closed",
+    "overlay": "managed-patch",
+    "write_manifest": "per-task",
+    "write_guard": {
+      "plugin": "dsh-write-guard",
+      "entry": "lib/index.js",
+      "registration": "prepend"
+    },
+    "enabled_write_tools": ["tool-fs"],
+    "disabled_entries": [
+      "tool-bash",
+      "tool-pwsh",
+      "tool-jobs",
+      "tool-skill",
+      "tool-subagent-control",
+      "tool-subagent-list-agents",
+      "tool-subagent",
+      "tool-subagent-fork",
+      "subagent",
+      "tool-workflow",
+      "tool-goal",
+      "tool-ralph",
+      "skill-filesystem",
+      "workflow-worker-thread",
+      "goal-round-driver",
+      "subagent-spawn-in-process",
+      "subagent-fork-in-process"
+    ]
+  },
+  "notes": [
+    "Managed DSH manifest-build composition: workspace-write sandbox whose only enabled write tool is tool-fs; every other write/execute/spawn tool from the strict-plan patch stays disabled.",
+    "The per-task write manifest cannot be declared statically. It is injected by the generated patch insert config and pinned there by validate_manifest_build_dump against the caller's prepared manifest; the descriptor therefore only pins the source as per-task.",
+    "The dsh-write-guard plugin is materialized per task from WRITE_GUARD_FILES and mounted by absolute path with a prepend registration on fs/write-intent and fs/edit-intent."
+  ]
+}
