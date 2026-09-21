@@ -309,7 +309,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high or xhigh, zcode and dsh pass a bounded token through to the runtime. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses its initialized native model and rejects model selection; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build; an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high or xhigh, zcode and dsh pass a bounded token through to the runtime. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,

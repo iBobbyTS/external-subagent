@@ -212,7 +212,11 @@ fn await_pending_permission(
 fn closed_gate_refuses_dsh_spawn_without_touching_any_process() {
     let workspace = dsh_workspace();
     let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     let error = scheduler.start_ready().unwrap_err();
     match &error {
         SchedulerError::RuntimeSpawn { message, .. } => {
@@ -311,7 +315,11 @@ printf '%s\\n' \
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
 
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
@@ -393,7 +401,10 @@ printf '%s\\n' \
         ]
     );
     assert_eq!(frames[2]["params"]["configId"], "model");
-    assert_eq!(frames[2]["params"]["value"], "fixture-model");
+    assert_eq!(
+        frames[2]["params"]["value"],
+        "[\"fixture-provider\",\"fixture-model\"]"
+    );
     let prompts: Vec<&serde_json::Value> = frames
         .iter()
         .filter(|frame| {
@@ -481,7 +492,11 @@ while IFS= read -r line; do :; done
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     let request = {
@@ -594,7 +609,11 @@ while IFS= read -r line; do :; done
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     assert_eq!(
         scheduler
@@ -688,7 +707,11 @@ while IFS= read -r line; do :; done
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     for index in 0..crate::rpc::MAX_PENDING_REQUESTS {
         scheduler
@@ -776,7 +799,11 @@ printf '%s\\n' \
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     let request = await_pending_permission(&scheduler, &agent_id);
@@ -832,7 +859,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("nope"));
+    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:nope"));
     // The refused model selection fails bootstrap and start_ready surfaces
     // the bounded provider rejection.
     let error = scheduler.start_ready().unwrap_err();
@@ -887,7 +914,7 @@ printf '%s\n' \
     let agent_id = enqueue_dsh_with_effort(
         &scheduler,
         workspace.path(),
-        Some("fixture-model"),
+        Some("fixture-provider:fixture-model"),
         Some("high"),
     );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
@@ -906,7 +933,10 @@ printf '%s\n' \
         ]
     );
     assert_eq!(frames[2]["params"]["configId"], "model");
-    assert_eq!(frames[2]["params"]["value"], "fixture-model");
+    assert_eq!(
+        frames[2]["params"]["value"],
+        "[\"fixture-provider\",\"fixture-model\"]"
+    );
     assert_eq!(frames[3]["params"]["configId"], "reasoning_effort");
     assert_eq!(frames[3]["params"]["value"], "high");
     assert_eq!(frames[4]["method"], "session/prompt");
@@ -938,7 +968,11 @@ printf '%s\n' \
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(stored.result.outcome, TaskOutcome::Completed);
@@ -989,7 +1023,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32602,"message":"unkno
     let agent_id = enqueue_dsh_with_effort(
         &scheduler,
         workspace.path(),
-        Some("fixture-model"),
+        Some("fixture-provider:fixture-model"),
         Some("high"),
     );
     let error = scheduler.start_ready().unwrap_err();
@@ -1221,7 +1255,7 @@ fn cross_provider_shared_scheduler_contract() {
     let conflict = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "second provider must wait"),
-            Some(dsh_admission(Some("fixture-model"))),
+            Some(dsh_admission(Some("fixture-provider:fixture-model"))),
         )
         .unwrap_err();
     match &conflict {
@@ -1264,7 +1298,11 @@ fn cross_provider_shared_scheduler_contract() {
     // After release the same workspace admits the dsh provider for real:
     // the scripted child performs the ACP bootstrap and blocks on the
     // fixture permission, holding the slot the cancelled provider lost.
-    let second = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let second = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
     let _request = await_pending_permission(&scheduler, &second);
     assert_eq!(scheduler.active_count(), 1);
@@ -1330,7 +1368,11 @@ fn dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result() {
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     let request = await_pending_permission(&scheduler, &agent_id);
@@ -1391,11 +1433,19 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let _request = await_pending_permission(&scheduler, &agent_id);
     let queued_workspace = dsh_workspace();
-    let queued_id = enqueue_dsh(&scheduler, queued_workspace.path(), Some("fixture-model"));
+    let queued_id = enqueue_dsh(
+        &scheduler,
+        queued_workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
     let passive = service.handle_bytes(
         &serde_json::to_vec(&serde_json::json!({
@@ -1428,7 +1478,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
     // specific spawn shortcut. Existing task operations remain real RPCs.
     assert!(matches!(scheduler.enqueue_general_with_admission(
         &manifest_for(workspace.path(), "new spawn rejected"),
-        Some(dsh_admission(Some("fixture-model")))),
+        Some(dsh_admission(Some("fixture-provider:fixture-model")))),
         Err(SchedulerError::InvalidConfig(ref message)) if message == "daemon_draining"));
     let send = service
         .dispatch(RpcMethod::TaskMessage(MessageInput {
@@ -1607,7 +1657,11 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let request = await_pending_permission(&scheduler, &agent_id);
     let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
@@ -1633,7 +1687,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     assert!(matches!(
         scheduler.enqueue_general_with_admission(
             &manifest_for(fresh.path(), "spawn during drain"),
-            Some(dsh_admission(Some("fixture-model")))
+            Some(dsh_admission(Some("fixture-provider:fixture-model")))
         ),
         Err(SchedulerError::InvalidConfig(ref message)) if message == "daemon_draining"
     ));
@@ -1662,7 +1716,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     let readmitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(fresh.path(), "spawn after the aborted drain"),
-            Some(dsh_admission(Some("fixture-model"))),
+            Some(dsh_admission(Some("fixture-provider:fixture-model"))),
         )
         .unwrap();
     assert_eq!(readmitted.phase, TaskPhase::Queued);
@@ -1745,7 +1799,11 @@ fn abort_drain_is_refused_while_explicit_cancellation_is_in_flight() {
         workspace.path(),
         DshRuntimeFactory::test_harness(Some(child)),
     );
-    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-model"));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let _request = await_pending_permission(&scheduler, &agent_id);
     scheduler.begin_drain();

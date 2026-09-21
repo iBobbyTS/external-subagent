@@ -555,7 +555,10 @@ fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModel
             agent: input.agent.clone(),
             config_revision: 0,
             supported: true,
-            models,
+            models: models
+                .iter()
+                .map(|token| display_catalog_model_token(token))
+                .collect(),
             evidence,
             reason: None,
         },
@@ -576,6 +579,22 @@ fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModel
             reason: Some(reason),
         },
     }
+}
+
+/// Re-project a DSH catalog wire token for display. A `model` config-option
+/// value is the byte-exact JSON tuple `["provider","model"]`; when the token
+/// deserializes to exactly two strings and the provider side contains no `:`
+/// the display form is `provider:model`. Parse failures, non-two-element
+/// arrays, and colon-bearing providers are returned verbatim so the catalog
+/// never fabricates a selection token.
+fn display_catalog_model_token(token: &str) -> String {
+    let Ok([provider, model]) = serde_json::from_str::<[String; 2]>(token) else {
+        return token.to_owned();
+    };
+    if provider.contains(':') {
+        return token.to_owned();
+    }
+    format!("{provider}:{model}")
 }
 
 fn run_dsh_catalog(
@@ -2353,6 +2372,97 @@ process.stdin.on('data', (chunk) => {
                 assert_eq!(events.len(), 1, "ACP must not start after refused dump");
             }
         }
+    }
+
+    #[test]
+    fn dsh_catalog_display_maps_wire_tuples_to_colon_tokens() {
+        assert_eq!(
+            display_catalog_model_token("[\"deepseek-official\",\"deepseek-flash\"]"),
+            "deepseek-official:deepseek-flash"
+        );
+        // The model side may itself contain colons; only provider colons are
+        // special, since joining a colon-bearing provider would be ambiguous.
+        assert_eq!(display_catalog_model_token("[\"p\",\"m:n\"]"), "p:m:n");
+        // Escaped provider/model strings are decoded before the colon join.
+        assert_eq!(
+            display_catalog_model_token("[\"pro\\\"vider\",\"m\\\\odel\"]"),
+            "pro\"vider:m\\odel"
+        );
+        // serde_json does not escape non-ASCII, so the colon join round-trips it.
+        assert_eq!(
+            display_catalog_model_token("[\"p\",\"模型\"]"),
+            "p:模型"
+        );
+        assert_eq!(
+            display_catalog_model_token("[\"p:q\",\"m\"]"),
+            "[\"p:q\",\"m\"]"
+        );
+        // Parse failures and non-two-element arrays stay verbatim.
+        for verbatim in [
+            "opaque",
+            "provider://future:model@2027?variant=a/b+c",
+            "[\"a\"]",
+            "[\"a\",\"b\",\"c\"]",
+            "[\"a\",1]",
+            "",
+        ] {
+            assert_eq!(display_catalog_model_token(verbatim), verbatim);
+        }
+    }
+
+    #[test]
+    fn dsh_catalog_output_projects_wire_tuples_and_keeps_unparseable_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("fake-dsh-display");
+        let log = directory.path().join("requests.jsonl");
+        let wire = "[\"deepseek-official\",\"deepseek-flash\"]";
+        let colon_provider = "[\"p:q\",\"m\"]";
+        let bare = "opaque";
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('dsh-fixture-1.2.3\n'); process.exit(0); }
+const log = __LOG__;
+let buffer = '';
+const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const request = JSON.parse(line);
+    fs.appendFileSync(log, JSON.stringify(request) + '\n');
+    if (request.method === 'initialize') write({ jsonrpc:'2.0', id:request.id, result:{ protocolVersion:1, capabilities:{ models:true } } });
+    else if (request.method === 'session/new') write({ jsonrpc:'2.0', id:request.id, result:{ sessionId:'display-session' } });
+    else if (request.method === 'models/list') write({ jsonrpc:'2.0', id:request.id, result:{ models:[{ id:__WIRE__ }, { id:__COLON__ }, { id:__BARE__ }] } });
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(&log).unwrap())
+        .replace("__WIRE__", &serde_json::to_string(wire).unwrap())
+        .replace("__COLON__", &serde_json::to_string(colon_provider).unwrap())
+        .replace("__BARE__", &serde_json::to_string(bare).unwrap());
+        fs::write(&runtime, source).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = probe_dsh_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "dsh".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(output.supported);
+        assert_eq!(
+            output.models,
+            vec![
+                "deepseek-official:deepseek-flash",
+                "[\"p:q\",\"m\"]",
+                "opaque"
+            ]
+        );
     }
 
     #[test]

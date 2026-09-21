@@ -1,11 +1,16 @@
 //! DSH model selection through the standard ACP config-option channel.
 //!
-//! Model values are opaque catalog tokens (`models/list` / advertised
-//! `configOptions`); this module never decodes provider-internal encodings.
-//! Selection happens with `session/set_config_option` and only a verified
-//! response allows the following `session/prompt` (X05: a token that does not
-//! exist fails before any prompt is sent, and omitting the model never
+//! A caller selects a model with a `{provider}:{model}` token, split at the
+//! first `:`. The ACP `model` config option, however, expects a byte-exact
+//! JSON tuple `["provider","model"]` as its `value` string, so [`set_model`]
+//! parses the colon token and re-serializes it with [`wire_token`] (serde_json)
+//! before `session/set_config_option`. Reasoning effort stays an opaque
+//! bounded token. Selection happens with `session/set_config_option` and only a
+//! verified response allows the following `session/prompt` (X05: a token that
+//! does not exist fails before any prompt is sent, and omitting the model never
 //! overrides the provider default).
+//!
+//! [`set_model`]: crate::acp::session::AcpSession::set_model
 
 use serde_json::Value;
 
@@ -24,7 +29,8 @@ pub const MAX_MODEL_TOKEN_BYTES: usize = 512;
 /// Why a requested model token was refused before any prompt was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSetError {
-    /// The token does not satisfy the opaque-token bounds.
+    /// The token does not satisfy the `provider:model` format: it must contain
+    /// the provider/model separator with non-empty sides.
     TokenInvalid,
     /// The session did not advertise a `model` config option.
     NotOffered,
@@ -35,7 +41,9 @@ pub enum ModelSetError {
 impl std::fmt::Display for ModelSetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TokenInvalid => write!(f, "model token is not a bounded non-empty string"),
+            Self::TokenInvalid => {
+                write!(f, "model token must be provider:model with non-empty sides")
+            }
             Self::NotOffered => write!(f, "dsh session advertised no model config option"),
             Self::Rejected(message) => {
                 write!(f, "dsh session rejected the model selection: {message}")
@@ -79,11 +87,42 @@ impl std::fmt::Display for ReasoningEffortSetError {
 impl std::error::Error for ReasoningEffortSetError {}
 
 /// Validate an opaque catalog token client-side (bounds only, no decoding).
+/// Retained for the reasoning-effort bound; model selection uses
+/// [`parse_colon_token`] instead.
 pub fn validate_catalog_token(token: &str) -> Result<(), ModelSetError> {
     if token.is_empty() || token.len() > MAX_MODEL_TOKEN_BYTES || token.contains('\0') {
         return Err(ModelSetError::TokenInvalid);
     }
     Ok(())
+}
+
+/// Parse a model selection token of the form `{provider}:{model}`. The split
+/// is at the *first* `:`, so the model side may itself contain colons; both
+/// sides may contain any non-NUL character. Refused when there is no colon, a
+/// side is empty, the token contains NUL, or it exceeds
+/// [`MAX_MODEL_TOKEN_BYTES`]. Callers trim the token before admission, keeping
+/// the historical trim-then-validate order.
+pub fn parse_colon_token(token: &str) -> Result<(&str, &str), ModelSetError> {
+    if token.is_empty() || token.len() > MAX_MODEL_TOKEN_BYTES || token.contains('\0') {
+        return Err(ModelSetError::TokenInvalid);
+    }
+    let Some(separator) = token.find(':') else {
+        return Err(ModelSetError::TokenInvalid);
+    };
+    let provider = &token[..separator];
+    let model = &token[separator + 1..];
+    if provider.is_empty() || model.is_empty() {
+        return Err(ModelSetError::TokenInvalid);
+    }
+    Ok((provider, model))
+}
+
+/// Serialize the byte-exact ACP `model` config-option value for a parsed
+/// selection: the JSON string for the two-element `[provider, model]` array,
+/// e.g. `["deepseek-official","deepseek-flash"]`. serde_json is used (never
+/// manual concatenation) so escaping matches JSON.stringify byte for byte.
+pub fn wire_token(provider: &str, model: &str) -> String {
+    serde_json::to_string(&[provider, model]).expect("a string array always serializes")
 }
 
 /// Validate a reasoning-effort token with the same opaque bounds as a model
@@ -159,6 +198,69 @@ mod tests {
             validate_catalog_token("bad\0token"),
             Err(ModelSetError::TokenInvalid)
         );
+    }
+
+    #[test]
+    fn colon_tokens_split_at_the_first_colon_and_bound_both_sides() {
+        assert_eq!(
+            parse_colon_token("deepseek-official:deepseek-flash"),
+            Ok(("deepseek-official", "deepseek-flash"))
+        );
+        // The first colon is the only separator: later colons belong to model.
+        assert_eq!(parse_colon_token("a:b:c"), Ok(("a", "b:c")));
+        assert_eq!(
+            parse_colon_token("provider:model:variant:2"),
+            Ok(("provider", "model:variant:2"))
+        );
+        // Side character sets are unrestricted.
+        assert_eq!(
+            parse_colon_token("p-1.2/3:m@4+v").unwrap(),
+            ("p-1.2/3", "m@4+v")
+        );
+        for invalid in ["", "no-colon", ":model", "provider:", "bad\0token", "p:m\0"] {
+            assert_eq!(
+                parse_colon_token(invalid),
+                Err(ModelSetError::TokenInvalid),
+                "invalid token {invalid:?}"
+            );
+        }
+        // The bound is exactly MAX_MODEL_TOKEN_BYTES on the whole token.
+        let bounded = format!("p:{}", "t".repeat(MAX_MODEL_TOKEN_BYTES - 2));
+        assert_eq!(bounded.len(), MAX_MODEL_TOKEN_BYTES);
+        assert!(parse_colon_token(&bounded).is_ok());
+        let oversized = format!("p:{}", "t".repeat(MAX_MODEL_TOKEN_BYTES - 1));
+        assert_eq!(oversized.len(), MAX_MODEL_TOKEN_BYTES + 1);
+        assert_eq!(
+            parse_colon_token(&oversized),
+            Err(ModelSetError::TokenInvalid)
+        );
+        // A bare over-long token is refused before the missing colon matters.
+        assert_eq!(
+            parse_colon_token(&"x".repeat(MAX_MODEL_TOKEN_BYTES + 1)),
+            Err(ModelSetError::TokenInvalid)
+        );
+    }
+
+    #[test]
+    fn wire_tokens_are_byte_exact_serde_json_string_arrays() {
+        assert_eq!(
+            wire_token("deepseek-official", "deepseek-flash"),
+            r#"["deepseek-official","deepseek-flash"]"#
+        );
+        // Quotes, backslashes, and non-ASCII survive exactly as JSON.stringify
+        // would emit them (serde_json leaves non-ASCII unescaped).
+        let provider = "pro\"vider\\x";
+        let model = "模型:flash";
+        let wire = wire_token(provider, model);
+        assert_eq!(wire, r#"["pro\"vider\\x","模型:flash"]"#);
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&wire).unwrap(),
+            vec![provider.to_owned(), model.to_owned()]
+        );
+        // The colon token round-trips: parse then re-emit is the same wire.
+        let token = format!("{provider}:{model}");
+        let (parsed_provider, parsed_model) = parse_colon_token(&token).unwrap();
+        assert_eq!(wire_token(parsed_provider, parsed_model), wire);
     }
 
     #[test]

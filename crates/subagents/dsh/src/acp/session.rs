@@ -100,14 +100,16 @@ impl AcpSession {
         Ok(())
     }
 
-    /// Apply a model token. The token must be a bounded opaque catalog token;
-    /// when the session advertised config options but no `model` option the
-    /// selection fails closed here. When options were not advertised at all
-    /// (some observed dialects omit them), the token is forwarded and the
-    /// server's verdict decides — the response must succeed before any prompt
-    /// is sent (X05).
+    /// Apply a model selection. The token is `{provider}:{model}` (split at
+    /// the first colon); it is re-serialized as the byte-exact ACP wire value
+    /// (`["provider","model"]`) before `session/set_config_option`. A token
+    /// that does not parse is refused here; when the session advertised config
+    /// options but no `model` option the selection fails closed. When options
+    /// were not advertised at all (some observed dialects omit them), the wire
+    /// value is forwarded and the server's verdict decides — the response must
+    /// succeed before any prompt is sent (X05).
     pub fn set_model(&mut self, token: &str, timeout: Duration) -> Result<(), SessionError> {
-        model::validate_catalog_token(token).map_err(|error| {
+        let (provider, model) = model::parse_colon_token(token).map_err(|error| {
             self.model_refused = true;
             SessionError::Model(error)
         })?;
@@ -117,12 +119,13 @@ impl AcpSession {
                 return Err(SessionError::Model(ModelSetError::NotOffered));
             }
         }
+        let wire = model::wire_token(provider, model);
         let response = self.driver.request(
             transport::SESSION_SET_CONFIG_OPTION,
             transport::set_config_option_params(
                 self.session_id.as_deref().unwrap_or(""),
                 model::MODEL_CONFIG_ID,
-                token,
+                &wire,
             ),
             timeout,
         );
@@ -371,7 +374,7 @@ sleep 5
             .unwrap();
         assert_eq!(session.session_id(), Some("sess-1"));
         session
-            .set_model("fixture-model", Duration::from_secs(2))
+            .set_model("fixture-provider:fixture-model", Duration::from_secs(2))
             .unwrap();
         let (_prompt_id, pending) = session.prompt("build it").unwrap();
         pending.cancel();
@@ -390,7 +393,10 @@ sleep 5
             ]
         );
         assert_eq!(frames[2]["params"]["configId"], "model");
-        assert_eq!(frames[2]["params"]["value"], "fixture-model");
+        assert_eq!(
+            frames[2]["params"]["value"],
+            "[\"fixture-provider\",\"fixture-model\"]"
+        );
         assert_eq!(frames[3]["params"]["sessionId"], "sess-1");
         assert_eq!(frames[3]["params"]["prompt"][0]["text"], "build it");
         for frame in &frames {
@@ -419,7 +425,7 @@ sleep 5
             .new_session(Path::new("/tmp"), Duration::from_secs(2))
             .unwrap();
         let error = session
-            .set_model("nope", Duration::from_secs(2))
+            .set_model("fixture-provider:nope", Duration::from_secs(2))
             .unwrap_err();
         assert!(matches!(error, SessionError::Remote(_)), "{error}");
         assert!(session.prompt("never sent").is_err());
@@ -476,7 +482,7 @@ sleep 5
             .new_session(Path::new("/tmp"), Duration::from_secs(2))
             .unwrap();
         session
-            .set_model("fixture-model", Duration::from_secs(2))
+            .set_model("fixture-provider:fixture-model", Duration::from_secs(2))
             .unwrap();
         session
             .set_reasoning_effort("high", Duration::from_secs(2))
@@ -499,7 +505,10 @@ sleep 5
             ]
         );
         assert_eq!(frames[2]["params"]["configId"], "model");
-        assert_eq!(frames[2]["params"]["value"], "fixture-model");
+        assert_eq!(
+            frames[2]["params"]["value"],
+            "[\"fixture-provider\",\"fixture-model\"]"
+        );
         assert_eq!(frames[3]["params"]["configId"], "reasoning_effort");
         assert_eq!(frames[3]["params"]["value"], "high");
         assert_eq!(frames[3]["params"]["sessionId"], "sess-1");
@@ -527,7 +536,7 @@ sleep 5
             .new_session(Path::new("/tmp"), Duration::from_secs(2))
             .unwrap();
         session
-            .set_model("fixture-model", Duration::from_secs(2))
+            .set_model("fixture-provider:fixture-model", Duration::from_secs(2))
             .unwrap();
         let error = session
             .set_reasoning_effort("high", Duration::from_secs(2))
@@ -622,7 +631,7 @@ sleep 5
             .new_session(Path::new("/tmp"), Duration::from_secs(2))
             .unwrap();
         session
-            .set_model("fixture-model", Duration::from_secs(2))
+            .set_model("fixture-provider:fixture-model", Duration::from_secs(2))
             .unwrap();
         let error = session
             .set_reasoning_effort("high", Duration::from_secs(2))

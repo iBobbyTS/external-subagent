@@ -380,8 +380,9 @@ pub(super) fn resolve_admission(
         // Explicit spawn token, then the configured default, then the
         // provider-native model. The configured default is a selection too:
         // an unusable token is refused here rather than silently downgraded
-        // to native, and every selection is bounded exactly like the token
-        // the ACP session will receive after the prompt gate.
+        // to native. The dsh model is `{provider}:{model}` (split at the first
+        // colon); the ACP session re-serializes it to the byte-exact wire
+        // tuple immediately before the prompt gate.
         let token = input
             .model
             .as_deref()
@@ -389,10 +390,10 @@ pub(super) fn resolve_admission(
             .or_else(|| configured.default_model.as_deref().map(str::trim));
         match token {
             Some(token) => {
-                if external_agent_dsh::acp::model::validate_catalog_token(token).is_err() {
+                if external_agent_dsh::acp::model::parse_colon_token(token).is_err() {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
-                        "model token is not a bounded non-empty string",
+                        "dsh model must be provider:model, split at the first colon, with non-empty sides, at most 512 bytes, no NUL; prompt_count=0",
                     ));
                 }
                 if input.model.is_some() {
@@ -586,7 +587,7 @@ mod admission_tests {
         config.subagents.get_mut("dsh").unwrap().profile = Some("acp".into());
         config.subagents.get_mut("dsh").unwrap().version =
             Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into());
-        input.model = Some("opaque-token".into());
+        input.model = Some("opaque-provider:opaque-token".into());
         let env_guard = static_env_guard().lock().unwrap();
         let previous_runtime = env::var_os("DSH_RUNTIME_PATH");
         env::set_var("DSH_RUNTIME_PATH", "relative/runtime");
@@ -607,7 +608,10 @@ mod admission_tests {
             Some(runtime.path().to_string_lossy().into_owned());
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
-        assert_eq!(identity.model.as_deref(), Some("opaque-token"));
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("opaque-provider:opaque-token")
+        );
         assert_eq!(identity.model_source, "spawn_catalog");
         match previous_runtime {
             Some(value) => env::set_var("DSH_RUNTIME_PATH", value),
@@ -1192,23 +1196,29 @@ mod admission_policy_tests {
 
     #[test]
     fn dsh_model_precedence_is_spawn_then_configured_default_then_native() {
-        let root = gated_dsh_config(Some("configured-default-token"));
+        let root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let config = gated_dsh_snapshot(&root);
 
         let explicit = policy_input(
             Some("dsh"),
-            Some("  spawn-token  "),
+            Some("  spawn-provider:spawn-token  "),
             external_core::PermissionMode::Build,
             &[],
         );
         let identity = resolve_admission(&explicit, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
-        assert_eq!(identity.model.as_deref(), Some("spawn-token"));
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("spawn-provider:spawn-token")
+        );
         assert_eq!(identity.model_source, "spawn_catalog");
 
         let fallback = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
         let identity = resolve_admission(&fallback, &config).unwrap();
-        assert_eq!(identity.model.as_deref(), Some("configured-default-token"));
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("configured-provider:configured-default-token")
+        );
         assert_eq!(identity.model_source, "configured_default");
 
         let native_root = gated_dsh_config(None);
@@ -1221,13 +1231,27 @@ mod admission_policy_tests {
 
     #[test]
     fn dsh_invalid_resolved_model_token_is_refused_before_the_task_exists() {
-        let root = gated_dsh_config(Some("configured-default-token"));
+        let root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let config = gated_dsh_snapshot(&root);
-        // A spawn token beyond the opaque catalog-token bound the ACP session
-        // enforces must fail admission, not the task after it is persisted.
+        // Malformed colon tokens — no colon, empty provider, empty model — are
+        // refused at admission, not persisted and re-discovered at spawn.
+        for invalid in ["no-colon", "provider:", ":model"] {
+            let input = policy_input(
+                Some("dsh"),
+                Some(invalid),
+                external_core::PermissionMode::Build,
+                &[],
+            );
+            let error = resolve_admission(&input, &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
+            assert!(error.message.contains("provider:model"), "{invalid:?}");
+            assert!(error.message.contains("prompt_count=0"), "{invalid:?}");
+        }
+        // A spawn token beyond the colon-token bound the ACP session enforces
+        // must fail admission, not the task after it is persisted.
         let oversized = policy_input(
             Some("dsh"),
-            Some(&"t".repeat(513)),
+            Some(&format!("p:{}", "t".repeat(513))),
             external_core::PermissionMode::Build,
             &[],
         );
@@ -1242,7 +1266,7 @@ mod admission_policy_tests {
             .subagents
             .get_mut("dsh")
             .unwrap()
-            .default_model = Some("   ".into());
+            .default_model = Some("provider:".into());
         let defaulted = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
         assert_eq!(
             resolve_admission(&defaulted, &invalid_default)
@@ -1250,19 +1274,26 @@ mod admission_policy_tests {
                 .code,
             RpcErrorCode::Validation
         );
-        // The bound itself stays exact: the largest bounded token admits.
+        // The bound itself stays exact: the largest bounded colon token admits.
+        let bounded_token = format!("p:{}", "t".repeat(510));
         let bounded = policy_input(
             Some("dsh"),
-            Some(&"t".repeat(512)),
+            Some(&bounded_token),
             external_core::PermissionMode::Build,
             &[],
         );
-        assert!(resolve_admission(&bounded, &config).is_ok());
+        assert_eq!(
+            resolve_admission(&bounded, &config)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some(bounded_token.as_str())
+        );
     }
 
     #[test]
     fn dsh_first_launch_scope_rejects_unproven_modes_and_exact_manifests() {
-        let root = gated_dsh_config(Some("configured-default-token"));
+        let root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let config = gated_dsh_snapshot(&root);
         for mode in [
             external_core::PermissionMode::Edit,
@@ -1369,7 +1400,7 @@ mod admission_policy_tests {
     #[test]
     fn cli_rpc_entrypoint_enforces_dsh_scope_before_any_task_or_prompt() {
         let _env_guard = config_env_guard();
-        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let config_root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (_directory, service, _id) = wait_tests::fixture();
         let store = service.store_for_wait_test();
@@ -1409,7 +1440,7 @@ mod admission_policy_tests {
     #[test]
     fn cli_rpc_entrypoint_admits_dsh_build_and_persists_the_resolved_identity() {
         let _env_guard = config_env_guard();
-        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let config_root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (directory, service, _id) = wait_tests::fixture();
         let store = service.store_for_wait_test();
@@ -1421,7 +1452,7 @@ mod admission_policy_tests {
             &service,
             "dsh-explicit",
             "dsh",
-            Some("spawn-token"),
+            Some("spawn-provider:spawn-token"),
             &explicit_workspace,
             "build",
             &[],
@@ -1433,7 +1464,10 @@ mod admission_policy_tests {
             panic!("expected a submitted task")
         };
         let explicit_identity = flat_identity(&task.input_identity).unwrap();
-        assert_eq!(explicit_identity.model.as_deref(), Some("spawn-token"));
+        assert_eq!(
+            explicit_identity.model.as_deref(),
+            Some("spawn-provider:spawn-token")
+        );
         assert_eq!(explicit_identity.model_source, "spawn_catalog");
 
         let default_workspace = spawn_root.path().join("default");
@@ -1459,7 +1493,7 @@ mod admission_policy_tests {
         let default_identity = flat_identity(&default_task.input_identity).unwrap();
         assert_eq!(
             default_identity.model.as_deref(),
-            Some("configured-default-token")
+            Some("configured-provider:configured-default-token")
         );
         assert_eq!(default_identity.model_source, "configured_default");
 
@@ -1485,7 +1519,7 @@ mod admission_policy_tests {
     #[test]
     fn status_publishes_dsh_first_launch_permission_modes_only() {
         let _env_guard = config_env_guard();
-        let config_root = gated_dsh_config(Some("configured-default-token"));
+        let config_root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (_directory, service, _id) = wait_tests::fixture();
         let RpcSuccess::SystemStatus { status } =

@@ -6,7 +6,7 @@ The probe is `tools/probes/dsh-acp/probe.mjs`. It accepts an explicit executable
 
 Observed fixture shapes cover `initialize`, `session/new`, `models/list`, `session/prompt`, `session/update`, `session/request_permission`, `session/cancel`, EOF, and malformed input. `models/list` is catalog evidence only. ACP `initialize` success is not provider authentication evidence; a real auth/hi result must be recorded separately for the exact executable, environment, workspace, and configuration revision.
 
-The product's explicit `agent_models` RPC consumes only the already observed `initialize`, `session/new`, and `models/list` shapes. It returns model IDs as opaque catalog tokens and always cleans up its bounded discovery process. Catalog success does not enable DSH production spawn or imply provider authentication.
+The product's explicit `agent_models` RPC consumes only the already observed `initialize`, `session/new`, and `models/list` shapes. A `model` option value is the byte-exact JSON tuple `["provider","model"]` (the same bytes JSON.stringify emits); the RPC re-projects such a tuple for display as `provider:model`, while parse failures, non-two-element arrays, and colon-bearing provider sides are returned verbatim. It always cleans up its bounded discovery process. Catalog success does not enable DSH production spawn or imply provider authentication.
 
 Catalog discovery isolates the provider in a process group and cleans the group with TERM/KILL plus leader wait on success and failure. Protocol stdout uses an incremental 1 MiB frame cap, and diagnostic stderr uses a 64 KiB bounded reader with a bounded receive deadline; descendants inheriting stderr cannot hold discovery open.
 
@@ -20,6 +20,25 @@ An isolated strict-plan daemon submission completed through ACP. A prompt that
 requested shell/write activity received no shell or write tool and the model
 declined to claim the write; the task was reaped and the workspace remained
 empty. This confirms the safety refusal path for the installed runtime.
+
+## Model selection via ACP set_config_option (implemented; live NOT_RUN)
+
+The spawn `model` token for dsh is `{provider}:{model}`, split at the
+**first** `:`; the model side may itself contain further colons and neither
+side is restricted to a character set. Admission (the same code path that the
+configured `agents.dsh.default_model` uses) refuses a token with no colon, an
+empty provider (`:model`), an empty model (`provider:`), a NUL byte, or more
+than 512 bytes, with an error naming the `provider:model` format; the token is
+trimmed before validation, as before. After `session/new` and before the first
+`session/prompt`, `set_model` re-serializes the parsed sides with serde_json as
+the byte-exact two-element JSON string `["provider","model"]` and sends that as
+the `session/set_config_option` `value`; the colon token itself is never sent
+raw. `input_identity.model` persists the trimmed colon token unchanged, and
+`model_source` keeps its `spawn_catalog` / `configured_default` / `native`
+semantics. Membership of the provider's real catalog is still decided by the
+session: an unknown tuple makes `session_start` fail with `-32602` before any
+prompt is sent. Codex keeps its own model id and zcode still rejects model
+selection; the reasoning-effort channel is unchanged.
 
 ## Reasoning effort via ACP set_config_option (implemented; live NOT_RUN)
 
