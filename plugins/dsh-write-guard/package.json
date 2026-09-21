@@ -1,0 +1,16 @@
+{
+  "name": "dsh-write-guard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Per-task write-manifest guard plugin for dsh (private, not published; check-in is the artifact, no build step). Its bare peer imports @deepseek-ai/dsh-fs (runtime FsError) and @deepseek-ai/cordis (type semantics only) are provided by the host dsh install closure through a node_modules symlink materialized by the daemon at spawn time.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./lib/index.js": "./lib/index.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-fs": "*"
+  }
+}
