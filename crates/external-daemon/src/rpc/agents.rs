@@ -444,10 +444,36 @@ pub(super) fn resolve_admission(
                 "dsh first-launch admission supports only the build and plan permission modes; prompt_count=0",
             ));
         }
-        if !input.manifest.write_manifest.is_empty() {
+        // A caller write manifest is admitted for build tasks: the factory
+        // routes a non-`["."]` manifest to the manifest-build composition
+        // (per-task write-guard patch) instead of refusing it. Plan + a
+        // non-empty manifest is still refused later by external-core, not here.
+        // The manifest is materialized into a patch, so the same entry/byte
+        // bounds the ZCode policy environment enforces are applied before any
+        // task is persisted. This mirrors `apply_agent_policy_environment` in
+        // `runtime_owner.rs` (entries <= 256, serialized <= 64 KiB).
+        const MAX_DSH_WRITE_MANIFEST_ENTRIES: usize = 256;
+        const MAX_DSH_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
+        let serialized = serde_json::to_string(
+            &input
+                .manifest
+                .write_manifest
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| {
+            RpcError::new(
+                RpcErrorCode::Validation,
+                format!("dsh write manifest could not be serialized: {error}; prompt_count=0"),
+            )
+        })?;
+        if input.manifest.write_manifest.len() > MAX_DSH_WRITE_MANIFEST_ENTRIES
+            || serialized.len() > MAX_DSH_WRITE_MANIFEST_BYTES
+        {
             return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "dsh first-launch admission requires the caller-empty write manifest; prompt_count=0",
+                RpcErrorCode::Validation,
+                "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB); prompt_count=0",
             ));
         }
     }
@@ -1286,7 +1312,7 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn dsh_first_launch_scope_rejects_unproven_modes_and_exact_manifests() {
+    fn dsh_first_launch_scope_rejects_unproven_modes_and_admits_caller_manifests() {
         let root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let config = gated_dsh_snapshot(&root);
         for mode in [
@@ -1300,20 +1326,22 @@ mod admission_policy_tests {
                 "dsh must refuse {mode:?} before prompt"
             );
         }
+        // A caller write manifest now clears the daemon gate for build tasks
+        // (routed to manifest-build) and for plan tasks, where external-core
+        // still refuses it later (covered at the RPC level).
         for mode in [
             external_core::PermissionMode::Build,
             external_core::PermissionMode::Plan,
         ] {
             let input = policy_input(Some("dsh"), None, mode, &["src/main.rs"]);
             assert_eq!(
-                resolve_admission(&input, &config).unwrap_err().code,
-                RpcErrorCode::AgentUnsupported,
-                "dsh must refuse an exact caller write manifest in {mode:?}"
+                resolve_admission(&input, &config).unwrap().agent,
+                "dsh",
+                "the daemon gate admits a caller manifest in {mode:?}"
             );
         }
-        // The admitted forms remain exactly build with the caller-empty
-        // write manifest (the generic layer derives the protected workspace
-        // scope from it) and strict plan.
+        // The admitted forms remain build with any manifest and strict plan
+        // with the caller-empty manifest.
         for mode in [
             external_core::PermissionMode::Build,
             external_core::PermissionMode::Plan,
@@ -1321,6 +1349,61 @@ mod admission_policy_tests {
             let input = policy_input(Some("dsh"), None, mode, &[]);
             assert_eq!(resolve_admission(&input, &config).unwrap().agent, "dsh");
         }
+    }
+
+    #[test]
+    fn dsh_write_manifest_admission_bounds_entries_and_bytes() {
+        let root = gated_dsh_config(None);
+        let config = gated_dsh_snapshot(&root);
+        // Exactly 256 entries admit.
+        let admitted: Vec<String> = (0..256).map(|index| format!("src/f{index}.rs")).collect();
+        let admitted: Vec<&str> = admitted.iter().map(String::as_str).collect();
+        assert_eq!(
+            resolve_admission(
+                &policy_input(
+                    Some("dsh"),
+                    None,
+                    external_core::PermissionMode::Build,
+                    &admitted
+                ),
+                &config
+            )
+            .unwrap()
+            .agent,
+            "dsh"
+        );
+        // 257 entries reject before any task exists.
+        let over: Vec<String> = (0..257).map(|index| format!("src/f{index}.rs")).collect();
+        let over: Vec<&str> = over.iter().map(String::as_str).collect();
+        let error = resolve_admission(
+            &policy_input(
+                Some("dsh"),
+                None,
+                external_core::PermissionMode::Build,
+                &over,
+            ),
+            &config,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert!(error.message.contains("dsh"), "{error:?}");
+        assert!(error.message.contains("prompt_count=0"), "{error:?}");
+        // A single entry whose serialization exceeds 64 KiB rejects too,
+        // mirroring the ZCode policy environment bounds.
+        let oversized = "a".repeat(64 * 1024);
+        let error = resolve_admission(
+            &policy_input(
+                Some("dsh"),
+                None,
+                external_core::PermissionMode::Build,
+                &[oversized.as_str()],
+            ),
+            &config,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert!(error.message.contains("dsh"), "{error:?}");
+        assert!(error.message.contains("prompt_count=0"), "{error:?}");
     }
 
     /// The exact `submit_general` wire frame the CLI emits over the daemon
@@ -1443,12 +1526,8 @@ mod admission_policy_tests {
         let store = service.store_for_wait_test();
         let workspace = admission_root("s04a-cli-dsh-reject-");
 
-        for (mode, manifest, request_id) in [
-            ("edit", Vec::new(), "dsh-edit"),
-            ("yolo", Vec::new(), "dsh-yolo"),
-            ("build", vec!["src/main.rs"], "dsh-build-exact"),
-            ("plan", vec!["src/main.rs"], "dsh-plan-exact"),
-        ] {
+        // Unproven permission modes are still refused by the daemon gate.
+        for (mode, request_id) in [("edit", "dsh-edit"), ("yolo", "dsh-yolo")] {
             let response = submit(
                 &service,
                 request_id,
@@ -1456,7 +1535,7 @@ mod admission_policy_tests {
                 None,
                 workspace.path(),
                 mode,
-                &manifest,
+                &[],
             );
             let RpcOutcome::Error { error } = response.outcome else {
                 panic!("{request_id} must be rejected before prompt")
@@ -1468,9 +1547,36 @@ mod admission_policy_tests {
                 error.message
             );
             let wire =
-                serde_json::to_value(&RpcResponse::error(Some(request_id.into()), error)).unwrap();
+                serde_json::to_value(RpcResponse::error(Some(request_id.into()), error)).unwrap();
             assert_eq!(wire["error"]["code"], "agent_unsupported", "{request_id}");
         }
+
+        // The daemon gate no longer refuses a caller manifest: plan + a
+        // non-empty manifest reaches external-core, which rejects it as a
+        // validation error before any task is persisted or prompt sent.
+        let response = submit(
+            &service,
+            "dsh-plan-exact",
+            "dsh",
+            None,
+            workspace.path(),
+            "plan",
+            &["src/main.rs"],
+        );
+        let RpcOutcome::Error { error } = response.outcome else {
+            panic!("plan + caller manifest must still be rejected")
+        };
+        assert_eq!(error.code, RpcErrorCode::Validation, "{}", error.message);
+        assert!(
+            error
+                .message
+                .contains("plan mode does not accept a write manifest"),
+            "{}",
+            error.message
+        );
+        let wire =
+            serde_json::to_value(RpcResponse::error(Some("dsh-plan-exact".into()), error)).unwrap();
+        assert_eq!(wire["error"]["code"], "validation");
         assert_eq!(scoped_task_count(&store, workspace.path()), 0);
     }
 
@@ -1551,6 +1657,39 @@ mod admission_policy_tests {
             assert_eq!(prepared.write_manifest, vec![PathBuf::from(".")]);
         }
         assert_eq!(scoped_task_count(&store, &explicit_workspace), 1);
+
+        // A caller write manifest is admitted and persisted verbatim (the
+        // factory routes it to the manifest-build composition); it is not
+        // rewritten to the derived `["."]` workspace scope.
+        let manifest_workspace = spawn_root.path().join("manifest");
+        fs::create_dir(&manifest_workspace).unwrap();
+        let response = submit(
+            &service,
+            "dsh-caller-manifest",
+            "dsh",
+            None,
+            &manifest_workspace,
+            "build",
+            &["src/a.rs", "docs"],
+        );
+        let RpcOutcome::Success { result } = response.outcome else {
+            panic!("gated dsh build with a caller manifest must admit")
+        };
+        let RpcSuccess::GeneralSubmitted {
+            task: manifest_task,
+            ..
+        } = *result
+        else {
+            panic!("expected a submitted task")
+        };
+        let stored = reopened.get_task(&manifest_task.agent_id).unwrap().unwrap();
+        let prepared: external_core::PreparedGeneralTask =
+            serde_json::from_str(&stored.prepared_launch_json).unwrap();
+        prepared.validate_digest().unwrap();
+        assert_eq!(
+            prepared.write_manifest,
+            vec![PathBuf::from("src/a.rs"), PathBuf::from("docs")]
+        );
     }
 
     #[test]

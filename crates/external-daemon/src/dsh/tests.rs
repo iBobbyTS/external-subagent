@@ -14,7 +14,6 @@ use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENE
 use external_runtime::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase, TaskRecord};
 use std::io;
-use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicUsize, Condvar};
@@ -50,23 +49,62 @@ fn scripted_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Write an executable scripted ACP child whose every inbound frame is
-/// appended (one JSON per line) to `<workspace>/wire.jsonl`.
-fn scripted_child(workspace: &std::path::Path, script: &str) -> std::path::PathBuf {
-    let path = workspace.join("acp-child.sh");
-    let mut file = std::fs::File::create(&path).unwrap();
-    write!(
-        file,
-        "#!/bin/sh\nLOG_PATH={:?}\nlog() {{ printf '%s\\n' \"$1\" >> \"$LOG_PATH\"; }}\nread_frame() {{ IFS= read -r line; log \"$line\"; }}\n{script}\nwhile IFS= read -r line; do log \"$line\"; done\n",
-        workspace.join("wire.jsonl").to_string_lossy()
-    )
-    .unwrap();
-    drop(file);
+/// Write the shared scripted-child harness at `path`. Besides recording every
+/// inbound frame to `<workspace>/wire.jsonl`, it records its own full argv to
+/// `<workspace>/argv.log` (one `ARG<value>` line per argument) and the content
+/// of every `--patch` it is launched with to `<workspace>/patch.log` — the
+/// observation the manifest-build factory tests need beyond the ACP wire.
+/// `script` is injected before the trailing stdin drain.
+fn write_scripted_child(path: &std::path::Path, workspace: &std::path::Path, script: &str) {
+    let template = r#"#!/bin/sh
+LOG_PATH=__WIRE__
+ARGV_PATH=__ARGV__
+PATCH_LOG=__PATCHES__
+log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
+record_invocation() {
+  for a in "$@"; do printf 'ARG%s\n' "$a" >> "$ARGV_PATH"; done
+  patch=""; prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--patch" ]; then patch="$a"; fi
+    prev="$a"
+  done
+  if [ -n "$patch" ]; then
+    printf 'PATCH %s\n' "$patch" >> "$PATCH_LOG"
+    cat "$patch" >> "$PATCH_LOG" 2>/dev/null || true
+    printf '\n' >> "$PATCH_LOG"
+  fi
+}
+record_invocation "$@"
+read_frame() { IFS= read -r line; log "$line"; }
+__SCRIPT__
+while IFS= read -r line; do log "$line"; done
+"#;
+    let harness = template
+        .replace(
+            "__WIRE__",
+            &format!("{:?}", workspace.join("wire.jsonl").to_string_lossy()),
+        )
+        .replace(
+            "__ARGV__",
+            &format!("{:?}", workspace.join("argv.log").to_string_lossy()),
+        )
+        .replace(
+            "__PATCHES__",
+            &format!("{:?}", workspace.join("patch.log").to_string_lossy()),
+        )
+        .replace("__SCRIPT__", script);
+    std::fs::write(path, harness).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+}
+
+/// Write an executable scripted ACP child at `<workspace>/acp-child.sh`.
+fn scripted_child(workspace: &std::path::Path, script: &str) -> std::path::PathBuf {
+    let path = workspace.join("acp-child.sh");
+    write_scripted_child(&path, workspace, script);
     path
 }
 
@@ -171,6 +209,172 @@ fn enqueue_dsh_with_effort(
         .unwrap();
     submitted.agent_id
 }
+
+/// Enqueue a build task carrying an explicit caller write manifest.
+fn manifest_with_write_scope(
+    workspace: &std::path::Path,
+    write_manifest: &[&str],
+) -> GeneralTaskManifest {
+    GeneralTaskManifest {
+        schema: GENERAL_TASK_SCHEMA.into(),
+        agent_id: "dsh-build".into(),
+        repository: workspace.canonicalize().unwrap(),
+        permission_mode: PermissionMode::Build,
+        prompt: "build the fixture".into(),
+        write_manifest: write_manifest
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+    }
+}
+
+fn enqueue_dsh_with_manifest(
+    scheduler: &Scheduler,
+    workspace: &std::path::Path,
+    write_manifest: &[&str],
+) -> String {
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_with_write_scope(workspace, write_manifest),
+            Some(dsh_admission(Some("fixture-provider:fixture-model"))),
+        )
+        .unwrap();
+    submitted.agent_id
+}
+
+/// A throwaway dsh installation tree the pinned derivation can walk: the outer
+/// `@deepseek-ai/dsh` package (name pinned) holding a non-`.js` scripted
+/// runtime, plus the **nested** `@deepseek-ai/dsh-fs` package the write-guard
+/// `node_modules` symlink targets. The runtime answers `--version` and
+/// `--dump-config` for the S02 manifest-build preflight and then speaks the
+/// scripted ACP bootstrap; the shared harness records its argv and patch.
+fn manifest_fake_dsh(workspace: &std::path::Path) -> (tempfile::TempDir, std::path::PathBuf) {
+    let root = dsh_workspace();
+    let dsh = root.path().join("node_modules/@deepseek-ai/dsh");
+    std::fs::create_dir_all(dsh.join("bin")).unwrap();
+    std::fs::write(
+        dsh.join("package.json"),
+        br#"{"name":"@deepseek-ai/dsh","version":"0.1.5-rc.1"}"#,
+    )
+    .unwrap();
+    let fs_pkg = dsh.join("node_modules/@deepseek-ai/dsh-fs");
+    std::fs::create_dir_all(fs_pkg.join("lib")).unwrap();
+    std::fs::write(
+        fs_pkg.join("package.json"),
+        br#"{"name":"@deepseek-ai/dsh-fs"}"#,
+    )
+    .unwrap();
+    std::fs::write(fs_pkg.join("lib/index.js"), b"// fake fs\n").unwrap();
+    let runtime = dsh.join("bin/dsh-runtime");
+    write_scripted_child(&runtime, workspace, MANIFEST_FAKE_SCRIPT);
+    (root, runtime)
+}
+
+/// The fake runtime body: preflight probes plus a one-turn ACP bootstrap. The
+/// `--dump-config` branch builds the write-guard `file://` name from the
+/// `--patch` TempDir so the S02 dump validation sees the guard the daemon just
+/// materialized, and pins `config.manifest` to the caller manifest the test
+/// enqueues (`["src/a.rs", "docs"]`).
+const MANIFEST_FAKE_SCRIPT: &str = r#"
+case "$*" in
+  *"--version"*) printf '%s\n' "0.1.5-rc.1"; exit 0;;
+esac
+case "$*" in
+  *"--dump-config"*)
+    patch=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--patch" ]; then patch="$a"; fi
+      prev="$a"
+    done
+    guard_dir=$(dirname "$patch")
+    cat <<DUMP
+- id: sandbox-policy
+  name: '@deepseek-ai/dsh-sandbox-policy'
+  config:
+    mode: workspace-write
+- id: approval
+  name: '@deepseek-ai/dsh-user-approval'
+  config:
+    policy: ask
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    presets:
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+- id: sandbox
+  name: '@deepseek-ai/dsh-sandbox-local'
+- id: fs-sandbox
+  name: '@deepseek-ai/dsh-fs-sandbox'
+- id: acp
+  name: '@deepseek-ai/dsh-acp'
+- id: acp-app-startup
+  name: '@deepseek-ai/dsh-acp-app'
+- id: bash-sandbox
+  name: '@deepseek-ai/dsh-bash-sandbox'
+  disabled: "process.platform === 'win32'"
+  config:
+    timeoutMs: 60000
+- id: pwsh-sandbox
+  name: '@deepseek-ai/dsh-pwsh-sandbox'
+  disabled: "process.platform !== 'win32'"
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: subagent
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-goal
+  disabled: true
+- id: tool-ralph
+  disabled: true
+- id: skill-filesystem
+  disabled: true
+- id: workflow-worker-thread
+  disabled: true
+- id: goal-round-driver
+  disabled: true
+- id: subagent-spawn-in-process
+  disabled: true
+- id: subagent-fork-in-process
+  disabled: true
+- name: file://$guard_dir/dsh-write-guard/lib/index.js
+  config:
+    manifest:
+    - src/a.rs
+    - docs
+DUMP
+    exit 0;;
+esac
+read_frame
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"capabilities":{"models":true,"cancel":true,"permission":true}}}'
+read_frame
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"manifest-session","configOptions":[{"configId":"model"}]}}'
+read_frame
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[]}}'
+read_frame
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"manifest-session","update":{"type":"agent_message","messageId":"manifest-message","content":[{"type":"text","text":"manifest build done"}]}}}' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","messageId":"manifest-message"}}'
+"#;
 
 fn await_terminal_task(scheduler: &Scheduler, agent_id: &str) -> external_store::TaskRecord {
     let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
@@ -464,6 +668,17 @@ printf '%s\\n' \
     for frame in &frames {
         assert_eq!(frame["jsonrpc"], "2.0");
     }
+    // The derived `["."]` manifest keeps the legacy build composition: the
+    // recorded argv proves the spawn carries no `--patch` at all.
+    let argv = std::fs::read_to_string(workspace.path().join("argv.log")).unwrap();
+    assert!(
+        argv.lines().any(|line| line == "ARG--profile"),
+        "legacy build argv must pin the profile: {argv}"
+    );
+    assert!(
+        !argv.lines().any(|line| line == "ARG--patch"),
+        "workspace-root manifest must not receive a patch: {argv}"
+    );
 }
 
 #[test]
@@ -1858,4 +2073,60 @@ fn queued_only_drain_cannot_claim_activation_but_default_drain_can_start_admitte
         .unwrap();
     assert_eq!(claim.task.agent_id, id);
     assert!(!scheduler.ready_for_activation());
+}
+
+#[test]
+fn manifest_build_spawn_materializes_a_patch_and_observes_the_caller_manifest() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let (_fake_root, runtime) = manifest_fake_dsh(workspace.path());
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(runtime)),
+    );
+    let agent_id = enqueue_dsh_with_manifest(&scheduler, workspace.path(), &["src/a.rs", "docs"]);
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "manifest build done");
+
+    // The scripted fake runtime recorded its full argv: the ACP spawn (and the
+    // preflight probes) carry an absolute `--patch` under the
+    // `external-dsh-manifest-` TempDir prefix.
+    let argv = std::fs::read_to_string(workspace.path().join("argv.log")).unwrap();
+    let args: Vec<&str> = argv
+        .lines()
+        .filter_map(|line| line.strip_prefix("ARG"))
+        .collect();
+    let patch_index = args
+        .iter()
+        .position(|arg| *arg == "--patch")
+        .expect("manifest spawn must carry --patch");
+    let patch = args[patch_index + 1];
+    assert!(std::path::Path::new(patch).is_absolute(), "{patch}");
+    assert!(
+        std::path::Path::new(patch)
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("external-dsh-manifest-"),
+        "{patch}"
+    );
+
+    // The patch content is the S02 constructor output: a guard insert line
+    // carrying the caller manifest verbatim, with tool-fs kept enabled and
+    // bash disabled. It is the daemon TempDir materialization, never a
+    // source-tree file.
+    let patch_log = std::fs::read_to_string(workspace.path().join("patch.log")).unwrap();
+    assert!(patch_log.contains("- insert:"), "{patch_log}");
+    assert!(patch_log.contains("      - src/a.rs"), "{patch_log}");
+    assert!(patch_log.contains("      - docs"), "{patch_log}");
+    assert!(!patch_log.contains("id: tool-fs"), "{patch_log}");
+    assert!(
+        patch_log.contains("- id: tool-bash\n  disabled: true"),
+        "{patch_log}"
+    );
+    assert!(!patch.contains("external-subagent/plugins"), "{patch}");
 }
