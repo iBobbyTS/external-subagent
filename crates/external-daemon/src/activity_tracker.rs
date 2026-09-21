@@ -303,6 +303,11 @@ impl PassiveActivityTracker {
         );
         state.sample_order.push_back("tool".into());
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_wait_tail_fixture(&self, tail: &str) {
+        self.state.lock().unwrap().latest_text_tail = tail.into();
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

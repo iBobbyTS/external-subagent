@@ -94,10 +94,14 @@ impl RpcService {
                     .filter(|_| terminal)
                     .map(|stored| self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES))
                     .transpose()?;
+                let mut activity = task_activity_view(task.phase, activity);
+                if let Some(page) = result_page.as_ref() {
+                    dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
+                }
                 let instruction =
                     wait_instruction(terminal, result_page.as_ref(), wake_request.as_ref());
                 let mut response = RpcSuccess::TaskWait {
-                    activity: task_activity_view(task.phase, activity),
+                    activity,
                     task: task_view(task.clone()),
                     pending_requests,
                     result_available,
@@ -150,6 +154,23 @@ fn wait_instruction(
             "Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop"
                 .to_owned(),
         ),
+    }
+}
+
+/// The terminal wait embeds the final-result page next to the activity tail;
+/// when one of the two repeats the other verbatim as a suffix (the observed
+/// shapes: tail == final, preamble + final, or the tail being the final's
+/// last window), strip the duplicate bytes so the same text is not shipped
+/// twice. Unrelated tails — multi-page finals whose page covers the head
+/// while the tail covers the end, or failure diagnostics — are kept intact.
+fn dedup_terminal_tail(tail: &mut String, final_text: &str) {
+    if tail.is_empty() || final_text.is_empty() {
+        return;
+    }
+    if tail.ends_with(final_text) {
+        tail.truncate(tail.len() - final_text.len());
+    } else if final_text.ends_with(tail.as_str()) {
+        tail.clear();
     }
 }
 
@@ -634,6 +655,68 @@ pub(crate) mod wait_tests {
             Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
         );
         assert_eq!(before, service.store.get_task(&id).unwrap());
+    }
+
+    #[test]
+    fn terminal_wait_strips_tail_bytes_repeating_the_result_page() {
+        // codex shape: preamble + final; dsh shape: tail == final; unrelated
+        // or empty inputs stay untouched. CJK content pins the char boundary.
+        for (tail, final_text, expected) in [
+            ("开场白。最终答复", "最终答复", "开场白。"),
+            ("最终答复", "最终答复", ""),
+            ("死前最后的文本", "Invalid params: unknown model", "死前最后的文本"),
+            ("", "最终答复", ""),
+            ("最终答复", "", "最终答复"),
+        ] {
+            let mut tail = tail.to_owned();
+            dedup_terminal_tail(&mut tail, final_text);
+            assert_eq!(tail, expected, "final={final_text:?}");
+        }
+        // A final larger than the 8 KiB tail window: the tail is exactly the
+        // final's last window and fully duplicated.
+        let long_final = format!("{}结尾", "x".repeat(9 * 1024));
+        let mut tail = long_final[long_final.len() - 4096..].to_owned();
+        dedup_terminal_tail(&mut tail, &long_final);
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn terminal_wait_dedups_activity_tail_against_embedded_result() {
+        let (_, service, id) = fixture();
+        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        tracker.set_wait_tail_fixture("我会按只读方式检查。HEAD 为 4cd6c57，总结……");
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id.clone(), tracker);
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "HEAD 为 4cd6c57，总结……".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            activity,
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert!(result.complete);
+        assert_eq!(activity.latest_text_tail, "我会按只读方式检查。");
+        assert!(!activity.latest_text_truncated);
     }
 
     fn stored_pending(

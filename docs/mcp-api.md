@@ -413,7 +413,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `latest_text_tail` | string | 展示近期公开文本尾部 | 缺少人可读活动线索 |
+| `latest_text_tail` | string | 展示近期公开文本尾部；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
 | `latest_text_truncated` | boolean | 判断尾部是否省略了前文 | 易把片段当完整输出 |
 | `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；runtime 未验证时为空串 |
 | `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数 | 看不出近期是否有工具活动 |
