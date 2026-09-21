@@ -1,6 +1,6 @@
 {
   "name": "external-subagent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Manage bounded ZCode, DeepSeek Harness (DSH), and Codex subagent tasks through a local MCP service for any local host (Codex, ZCode, or a custom MCP client)",
   "type": "module",
   "license": "MIT",
