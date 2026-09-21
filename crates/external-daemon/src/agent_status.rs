@@ -2531,10 +2531,7 @@ process.stdin.on('data', (chunk) => {
             "pro\"vider:m\\odel"
         );
         // serde_json does not escape non-ASCII, so the colon join round-trips it.
-        assert_eq!(
-            display_catalog_model_token("[\"p\",\"模型\"]"),
-            "p:模型"
-        );
+        assert_eq!(display_catalog_model_token("[\"p\",\"模型\"]"), "p:模型");
         assert_eq!(
             display_catalog_model_token("[\"p:q\",\"m\"]"),
             "[\"p:q\",\"m\"]"

@@ -664,7 +664,11 @@ pub(crate) mod wait_tests {
         for (tail, final_text, expected) in [
             ("开场白。最终答复", "最终答复", "开场白。"),
             ("最终答复", "最终答复", ""),
-            ("死前最后的文本", "Invalid params: unknown model", "死前最后的文本"),
+            (
+                "死前最后的文本",
+                "Invalid params: unknown model",
+                "死前最后的文本",
+            ),
             ("", "最终答复", ""),
             ("最终答复", "", "最终答复"),
         ] {

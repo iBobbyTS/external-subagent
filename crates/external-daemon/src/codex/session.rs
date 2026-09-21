@@ -88,8 +88,9 @@ impl CodexRuntimeOwner {
                 // posture.
                 let permission_mode = match prepared.permission_mode {
                     external_core::PermissionMode::Plan => CodexPermissionMode::Plan,
-                    external_core::PermissionMode::Build
-                    | external_core::PermissionMode::Edit => CodexPermissionMode::WorkspaceWrite,
+                    external_core::PermissionMode::Build | external_core::PermissionMode::Edit => {
+                        CodexPermissionMode::WorkspaceWrite
+                    }
                     external_core::PermissionMode::Yolo => CodexPermissionMode::Yolo,
                 };
                 Ok(AdmittedThread {

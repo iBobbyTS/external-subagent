@@ -148,7 +148,8 @@ impl DiagnosticLogger {
                 while let Ok(line) = receiver.recv() {
                     let count = pending_drops.swap(0, Ordering::Relaxed);
                     if count > 0 {
-                        let marker = format!("[external-subagentd] diagnostic_writes_dropped={count}\n");
+                        let marker =
+                            format!("[external-subagentd] diagnostic_writes_dropped={count}\n");
                         if writer.write_all(marker.as_bytes()).is_err() {
                             pending_drops.fetch_add(count, Ordering::Relaxed);
                         }

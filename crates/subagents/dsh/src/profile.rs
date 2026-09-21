@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 pub const BUILD_PROFILE_JSON: &str = include_str!("../../../../profiles/dsh/build.json");
 pub const STRICT_PLAN_PATCH_YAML: &str =
     include_str!("../../../../profiles/dsh/strict-plan.patch.yml");
-pub const STRICT_PLAN_PROFILE_JSON: &str = include_str!("../../../../profiles/dsh/strict-plan.json");
+pub const STRICT_PLAN_PROFILE_JSON: &str =
+    include_str!("../../../../profiles/dsh/strict-plan.json");
 
 /// Launch inputs for one DSH child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
