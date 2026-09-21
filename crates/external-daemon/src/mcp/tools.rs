@@ -1065,10 +1065,20 @@ mod contract_default_tests {
         let store = service.store_for_wait_test();
         let before = store.get_task(&id).unwrap();
         let facade = SubagentMcp::from_service(service);
-        for (agent, model, expected) in [
-            ("unknown", None, "subagent_unknown"),
-            ("dsh", None, "agent_disabled"),
-            ("zcode", Some("chosen"), "model_selection_unsupported"),
+        for (agent, model, expected, expected_message) in [
+            (
+                "unknown",
+                None,
+                "subagent_unknown",
+                "subagent is unknown, available subagents are [\"zcode\"]",
+            ),
+            ("dsh", None, "agent_disabled", "agent is disabled"),
+            (
+                "zcode",
+                Some("chosen"),
+                "model_selection_unsupported",
+                "model selection is unsupported for zcode",
+            ),
         ] {
             let input = AgentSpawnInput {
                 agent: Some(agent.into()),
@@ -1085,7 +1095,16 @@ mod contract_default_tests {
                 .err()
                 .expect("admission must reject");
             assert_eq!(error.body.code, expected);
+            assert_eq!(error.body.message, expected_message);
             assert_eq!(error.body.prompt_count, Some(0));
+            if agent == "unknown" {
+                // The composed roster message is the whole legacy text too:
+                // the generic ": {detail}" tail must not repeat the roster.
+                assert_eq!(
+                    error.legacy_text,
+                    "subagent_unknown: subagent is unknown, available subagents are [\"zcode\"]"
+                );
+            }
         }
         assert_eq!(before, store.get_task(&id).unwrap());
     }

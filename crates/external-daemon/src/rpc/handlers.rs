@@ -4,7 +4,7 @@
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::agents::{
     configured_agent_statuses, resolve_admission, unavailable_agent_statuses,
-    validate_agent_models_input, validate_agent_probe_input,
+    unknown_agent_name_error, validate_agent_models_input, validate_agent_probe_input,
 };
 use super::config::read_agent_config_snapshot;
 use super::errors::{map_scheduler, map_store, RpcError, RpcErrorCode};
@@ -244,6 +244,9 @@ impl RpcService {
             RpcMethod::AgentProbe(mut input) => {
                 validate_agent_probe_input(&input)?;
                 let config = read_agent_config_snapshot()?;
+                if !config.subagents.contains_key(input.agent.as_str()) {
+                    return Err(unknown_agent_name_error(&config));
+                }
                 if input.agent == "dsh" {
                     let dsh = config.subagents.get("dsh");
                     input.scope.profile = input
@@ -265,6 +268,9 @@ impl RpcService {
             RpcMethod::AgentModels(mut input) => {
                 validate_agent_models_input(&input)?;
                 let config = read_agent_config_snapshot()?;
+                if !config.subagents.contains_key(input.agent.as_str()) {
+                    return Err(unknown_agent_name_error(&config));
+                }
                 if input.agent == "dsh" {
                     let dsh = config.subagents.get("dsh");
                     input.scope.profile = input
@@ -295,10 +301,10 @@ impl RpcService {
             RpcMethod::TaskList(query) => {
                 if let Some(agent) = query.agent.as_deref() {
                     if !matches!(agent, "zcode" | "dsh" | "codex") {
-                        return Err(RpcError::new(
-                            RpcErrorCode::AgentUnknown,
-                            "agent is unknown",
-                        ));
+                        // The literal fast path keeps the happy read free of a
+                        // config load; only the error path pays for the roster.
+                        let config = read_agent_config_snapshot()?;
+                        return Err(unknown_agent_name_error(&config));
                     }
                 }
                 if query.limit == 0 || query.limit > MAX_LIST_TASKS {
@@ -794,6 +800,52 @@ mod agent_probe_tests {
         ] {
             assert!(service.dispatch(RpcMethod::AgentProbe(input)).is_err());
         }
+    }
+
+    #[test]
+    fn probe_models_and_list_answer_unknown_agents_with_the_configured_roster() {
+        let _config_guard = admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":false,"spawn_supported":false},"dsh":{"enabled":true,"spawn_supported":false}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
+        let (_directory, service) = service();
+        // zcode is configured but disabled: probing it stays legal, so the
+        // roster keeps it listable alongside enabled dsh and defaulted codex.
+        let expected = "subagent is unknown, available subagents are [\"codex\", \"dsh\", \"zcode\"]";
+        let probe = service
+            .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
+                agent: "future-provider".into(),
+                through: crate::agent_status::ProbeLayer::Local,
+                scope: ProbeScope::default(),
+            }))
+            .unwrap_err();
+        assert_eq!(probe.code, RpcErrorCode::AgentUnknown);
+        assert_eq!(probe.message, expected);
+        let models = service
+            .dispatch(RpcMethod::AgentModels(AgentModelsInput {
+                agent: "future-provider".into(),
+                scope: ProbeScope::default(),
+            }))
+            .unwrap_err();
+        assert_eq!(models.code, RpcErrorCode::AgentUnknown);
+        assert_eq!(models.message, expected);
+        let list = service
+            .dispatch(RpcMethod::TaskList(crate::rpc::TaskListQuery {
+                agent: Some("future-provider".into()),
+                repository: Some("/repository".into()),
+                phase: None,
+                outcome: None,
+                cursor: None,
+                limit: 5,
+            }))
+            .unwrap_err();
+        assert_eq!(list.code, RpcErrorCode::AgentUnknown);
+        assert_eq!(list.message, expected);
     }
 
     #[test]

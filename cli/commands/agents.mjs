@@ -144,7 +144,10 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
   const entries = status.subagents ?? status.agents;
   if (!Array.isArray(entries)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include subagent status');
   const subagents = entries.filter((entry) => input.subagent === undefined || (entry.subagent ?? entry.agent) === input.subagent).map(subagentView);
-  if (input.subagent !== undefined && subagents.length === 0) throw new CliError('subagent_unknown', `daemon did not report subagent: ${input.subagent}`, 2);
+  if (input.subagent !== undefined && subagents.length === 0) {
+    const roster = entries.map((entry) => entry.subagent ?? entry.agent).filter(Boolean).map((name) => `"${name}"`).join(', ');
+    throw new CliError('subagent_unknown', `daemon did not report subagent: ${input.subagent}, available subagents are [${roster}]`, 2);
+  }
   return { service_generation: status.service_generation ?? null, subagents };
 }
 

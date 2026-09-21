@@ -302,12 +302,9 @@ fn scope_status_view(value: &ScopeEvidence) -> AgentScopeStatusView {
 }
 
 pub(super) fn validate_agent_probe_input(input: &AgentProbeInput) -> Result<(), RpcError> {
-    if !matches!(input.agent.as_str(), "zcode" | "dsh" | "codex") {
-        return Err(RpcError::new(
-            RpcErrorCode::AgentUnknown,
-            "agent is unknown",
-        ));
-    }
+    // Agent membership is deliberately NOT checked here: the check needs the
+    // config snapshot (for the roster-bearing unknown message) and belongs to
+    // the handlers, before any evidence probing runs.
     for (name, value) in [
         ("workspace", input.scope.workspace.as_deref()),
         ("home", input.scope.home.as_deref()),
@@ -331,6 +328,40 @@ pub(super) fn validate_agent_models_input(input: &AgentModelsInput) -> Result<()
         through: crate::agent_status::ProbeLayer::Local,
         scope: input.scope.clone(),
     })
+}
+
+/// Admission composes the full public message itself: the MCP facade
+/// projects this detail verbatim (mcp::errors public_error), so the wording
+/// below is the public envelope message, not an internal diagnostic.
+fn unknown_agent_error<'a>(roster: impl Iterator<Item = &'a str>) -> RpcError {
+    let roster = roster
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    RpcError::new(
+        RpcErrorCode::AgentUnknown,
+        format!("subagent is unknown, available subagents are [{roster}]"),
+    )
+}
+
+/// The spawn roster lists only enabled subagents — configured-but-disabled
+/// names keep answering `agent_disabled` on their own and must not look
+/// retryable here.
+pub(super) fn unknown_subagent_error(config: &AgentConfigSnapshot) -> RpcError {
+    unknown_agent_error(
+        config
+            .subagents
+            .iter()
+            .filter(|(_, entry)| entry.enabled)
+            .map(|(name, _)| name.as_str()),
+    )
+}
+
+/// The probe/models/list roster lists every configured name — probing a
+/// disabled agent is legitimate, so their roster is the full key set,
+/// disabled names included.
+pub(super) fn unknown_agent_name_error(config: &AgentConfigSnapshot) -> RpcError {
+    unknown_agent_error(config.subagents.keys().map(String::as_str))
 }
 
 pub(super) fn resolve_admission(
@@ -358,7 +389,7 @@ pub(super) fn resolve_admission(
     let configured = config
         .subagents
         .get(agent)
-        .ok_or_else(|| RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"))?;
+        .ok_or_else(|| unknown_subagent_error(config))?;
     if !configured.enabled {
         return Err(RpcError::new(
             RpcErrorCode::AgentDisabled,
@@ -581,6 +612,44 @@ mod admission_tests {
     fn static_env_guard() -> &'static Mutex<()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
         GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn unknown_subagent_error_lists_enabled_roster() {
+        let mut config = AgentConfigSnapshot::default();
+        config.subagents.get_mut("zcode").unwrap().enabled = false;
+        config.subagents.get_mut("dsh").unwrap().enabled = true;
+        config.subagents.get_mut("codex").unwrap().enabled = true;
+        let mut probe = input(Path::new("/repository"));
+        probe.agent = Some("future-provider".into());
+        let error = resolve_admission(&probe, &config).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::AgentUnknown);
+        assert_eq!(
+            error.message,
+            "subagent is unknown, available subagents are [\"codex\", \"dsh\"]"
+        );
+        // A fully disabled config still answers with the empty roster rather
+        // than falling back to a roster-less message.
+        let error = resolve_admission(&probe, &AgentConfigSnapshot::default()).unwrap_err();
+        assert_eq!(
+            error.message,
+            "subagent is unknown, available subagents are []"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_name_error_lists_all_configured_names() {
+        let mut config = AgentConfigSnapshot::default();
+        config.subagents.get_mut("zcode").unwrap().enabled = false;
+        config.subagents.get_mut("dsh").unwrap().enabled = true;
+        // Probe/models/list accept disabled-but-configured names, so their
+        // roster keeps them listable.
+        let error = unknown_agent_name_error(&config);
+        assert_eq!(error.code, RpcErrorCode::AgentUnknown);
+        assert_eq!(
+            error.message,
+            "subagent is unknown, available subagents are [\"codex\", \"dsh\", \"zcode\"]"
+        );
     }
 
     #[test]

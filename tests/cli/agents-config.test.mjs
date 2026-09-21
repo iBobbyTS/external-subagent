@@ -352,7 +352,8 @@ test('agents status projects daemon evidence and rejects absent identities', asy
     assert.equal(socket, '/socket'); assert.equal(command, 'status'); assert.deepEqual(input, {}); return status;
   } };
   assert.deepEqual(await subagentsCommand(paths, { operation: 'status', subagent: 'zcode' }, options), { service_generation: 'generation-1', subagents: status.subagents });
-  await assert.rejects(() => subagentsCommand(paths, { operation: 'status', subagent: 'dsh' }, options), (error) => error.code === 'subagent_unknown');
+  await assert.rejects(() => subagentsCommand(paths, { operation: 'status', subagent: 'dsh' }, options), (error) => error.code === 'subagent_unknown'
+    && error.message === 'daemon did not report subagent: dsh, available subagents are ["zcode"]');
 });
 
 test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {

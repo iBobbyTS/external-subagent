@@ -113,7 +113,19 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             ("validation", "request validation failed")
         }
         RpcErrorCode::AgentRequired => ("subagent_required", "subagent is required"),
-        RpcErrorCode::AgentUnknown => ("subagent_unknown", "subagent is unknown"),
+        // The daemon composes the full public message (with the roster) at the
+        // admission/probe/models/list rejection sites and ships it as the RPC
+        // detail; project it verbatim. Any other emission site still sends an
+        // internal "agent is unknown"-style detail and keeps the static
+        // message.
+        RpcErrorCode::AgentUnknown => (
+            "subagent_unknown",
+            if detail.starts_with("subagent is unknown") {
+                detail.as_str()
+            } else {
+                "subagent is unknown"
+            },
+        ),
         RpcErrorCode::AgentDisabled => ("agent_disabled", "agent is disabled"),
         RpcErrorCode::AgentUnsupported if detail == "CODEX_WRITE_MANIFEST_UNSUPPORTED" => (
             "codex_write_manifest_unsupported",
@@ -226,6 +238,33 @@ mod tests {
         assert_eq!(error.body.code, "codex_write_manifest_unsupported");
         assert_eq!(error.body.prompt_count, Some(0));
         assert_eq!(error.body.agent_id, None);
+    }
+
+    #[test]
+    fn unknown_subagent_projection_carries_the_composed_roster_message() {
+        let composed = public_error(RpcError::new(
+            RpcErrorCode::AgentUnknown,
+            "subagent is unknown, available subagents are [\"codex\", \"dsh\"]",
+        ));
+        assert_eq!(composed.body.code, "subagent_unknown");
+        assert_eq!(
+            composed.body.message,
+            "subagent is unknown, available subagents are [\"codex\", \"dsh\"]"
+        );
+        // detail == message here, so the legacy text must not repeat the roster.
+        assert_eq!(
+            composed.legacy_text,
+            "subagent_unknown: subagent is unknown, available subagents are [\"codex\", \"dsh\"]"
+        );
+        assert_eq!(composed.body.prompt_count, Some(0));
+
+        let plain = public_error(RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"));
+        assert_eq!(plain.body.code, "subagent_unknown");
+        assert_eq!(plain.body.message, "subagent is unknown");
+        assert_eq!(
+            plain.legacy_text,
+            "subagent_unknown: subagent is unknown: agent is unknown"
+        );
     }
 
     #[test]
