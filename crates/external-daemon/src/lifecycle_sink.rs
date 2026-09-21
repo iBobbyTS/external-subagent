@@ -169,15 +169,21 @@ pub(crate) fn persist_general_result(
 ) -> Result<(), StoreError> {
     let result = task_result(completion);
     let _ = prepared;
-    store_result_with_cancel_precedence(store, agent_id, &result)
+    store_result_with_cancel_precedence(
+        store,
+        agent_id,
+        &result,
+        completion.reason_code.as_deref(),
+    )
 }
 
 pub(crate) fn store_result_with_cancel_precedence(
     store: &Store,
     agent_id: &str,
     result: &TaskResult,
+    reason: Option<&str>,
 ) -> Result<(), StoreError> {
-    match store.store_task_result(agent_id, result) {
+    match store.store_task_result_with_reason(agent_id, result, reason) {
         Ok(()) => Ok(()),
         Err(error @ StoreError::Conflict(_)) => {
             let task = store.get_task(agent_id)?.ok_or_else(|| {
@@ -187,7 +193,11 @@ pub(crate) fn store_result_with_cancel_precedence(
                 && result.outcome != TaskOutcome::Cancelled
                 && store.task_result(agent_id)?.is_none()
             {
-                store.store_task_result(agent_id, &bounded_cancelled_task_result())
+                store.store_task_result_with_reason(
+                    agent_id,
+                    &bounded_cancelled_task_result(),
+                    None,
+                )
             } else {
                 Err(error)
             }

@@ -799,6 +799,46 @@ mod contract_default_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn mcp_wait_output_carries_the_model_rejection_reason() {
+        use crate::mcp::views::PublicResult;
+        use crate::rpc::RpcSuccess;
+        use external_store::TaskOutcome;
+        let (_directory, service, id) = crate::rpc::wait_tests::fixture();
+        service
+            .store_for_wait_test()
+            .store_task_result_with_reason(
+                &id,
+                &external_store::TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "model selection was rejected: unknown model: foo".into(),
+                    partial: true,
+                },
+                Some("MODEL_REJECTED"),
+            )
+            .unwrap();
+        let facade = SubagentMcp::from_service(service);
+        let response = facade
+            .rpc_wait(crate::rpc::wait_tests::query(&id, 0), || false)
+            .await
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = response
+        else {
+            panic!("expected terminal wait response")
+        };
+        // The public projection is the MCP wait output; it must expose the
+        // machine reason verbatim.
+        let public = PublicResult::try_from(result).unwrap();
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert!(
+            encoded.contains("\"reason_code\":\"MODEL_REJECTED\""),
+            "{encoded}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn mcp_wait_wakes_for_respondable_pending_read_request() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 

@@ -393,6 +393,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | Result 的 `total_bytes` | integer | 知道全文长度、检查累计读取量 | 失去长度校验和进度信息；仍可用 next_offset 翻页 |
 | Result 的 `next_offset` | integer/null | 获取下一页的合法字节起点 | 无法可靠按服务端分页继续，尤其涉及 UTF-8 边界 |
 | Result 的 `complete` | boolean | 直接标识全文分页结束 | 可由 next_offset 为 null 推导；是便利字段，不表示任务成功 |
+| Result 的 `reason_code` | string/null | 任务终态的机器可读原因（如 dsh 模型选择被拒为 `MODEL_REJECTED`）；`null` 表示没有特定原因（成功的 completed 任务、旧的无终态行结果，或仅有历史占位原因的记录） | 调用方只能依赖人类可读的 final_text 判断失败类别 |
 
 `partial` 与 `complete` 含义不同：可能 `partial=true` 且 `complete=true`，表示已取完一个不完整任务产物的全部文本。PublicQuestion 只出现在 wait 的 pending_requests 里且无分页契约——wait 是问题正文的唯一获取面。当整个 wait 响应逼近 2MiB 帧上限时，服务端会把内嵌问题降级为更短的有界前缀并保持 `truncated=true`（request_id 始终可达）；`truncated` 因此表示“文本不完整”，不承诺 16KiB 全长。
 

@@ -10,6 +10,20 @@ use crate::tasks::query_task;
 
 impl Store {
     pub fn store_task_result(&self, agent_id: &str, result: &TaskResult) -> StoreResult<()> {
+        self.store_task_result_with_reason(agent_id, result, None)
+    }
+
+    /// Store an immutable terminal result and thread an explicit machine
+    /// reason through the terminal ledger row. `reason` wins over the task's
+    /// own `failure_code`; both yield to the compatibility placeholder only
+    /// when the outcome is not `Completed`, so a successful terminal row keeps
+    /// a NULL reason.
+    pub fn store_task_result_with_reason(
+        &self,
+        agent_id: &str,
+        result: &TaskResult,
+        reason: Option<&str>,
+    ) -> StoreResult<()> {
         validate_result(result)?;
         let canonical = task_result_bytes(result)?;
         let digest = task_result_digest(&canonical);
@@ -85,7 +99,7 @@ impl Store {
             task.stop_requested,
             &TerminalUpdate {
                 outcome: result.outcome,
-                failure_code: task.failure_code.or_else(|| {
+                failure_code: reason.map(str::to_owned).or(task.failure_code).or_else(|| {
                     (result.outcome != TaskOutcome::Completed).then(|| "task failed".to_string())
                 }),
                 failure_message: task.failure_message,
@@ -98,6 +112,26 @@ impl Store {
     pub fn task_result(&self, agent_id: &str) -> StoreResult<Option<StoredTaskResult>> {
         let connection = self.connection.lock().unwrap();
         query_task_result(&connection, agent_id)
+    }
+
+    /// The latest terminal ledger row's machine reason. Older-than-terminal
+    /// rows (CLAIMED/RUNTIME_STARTED/...) are excluded by `to_phase`, so a
+    /// failed-then-resumed-then-completed task yields the completed row's NULL
+    /// (`None`) instead of the stale failure. A NULL row and the legacy
+    /// `"task failed"` placeholder both read as `None`; a task without a
+    /// terminal row also yields `None`.
+    pub fn terminal_reason_code(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let connection = self.connection.lock().unwrap();
+        let reason = connection
+            .query_row(
+                "SELECT reason_code FROM lifecycle_ledger
+                 WHERE agent_id=?1 AND to_phase='TERMINAL'
+                 ORDER BY ledger_id DESC LIMIT 1",
+                [agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(reason.flatten().filter(|value| value != "task failed"))
     }
 }
 

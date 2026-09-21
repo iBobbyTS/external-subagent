@@ -89,7 +89,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [
-    'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'complete',
+    'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'complete', 'reason_code',
   ]);
   assert.deepEqual(Object.keys(schema.properties.contracts.properties).sort(), schema.properties.tools.const.slice().sort());
   for (const contract of Object.values(schema.properties.contracts.properties)) {

@@ -456,6 +456,7 @@ pub struct PublicResult {
     pub total_bytes: usize,
     pub next_offset: Option<usize>,
     pub complete: bool,
+    pub reason_code: Option<String>,
 }
 
 impl TryFrom<TaskResultView> for PublicResult {
@@ -470,6 +471,7 @@ impl TryFrom<TaskResultView> for PublicResult {
             total_bytes: value.total_bytes,
             next_offset: value.next_offset,
             complete: value.complete,
+            reason_code: value.reason_code,
         })
     }
 }
@@ -662,6 +664,36 @@ mod effort_projection_tests {
         assert_eq!(public.input_identity.effort.as_deref(), Some("high"));
         let encoded = serde_json::to_value(&public).unwrap();
         assert_eq!(encoded["input_identity"]["effort"], "high");
+    }
+}
+
+#[cfg(test)]
+mod public_result_reason_tests {
+    use super::*;
+    use crate::rpc::TaskResultView;
+
+    fn result_view(reason: Option<&str>) -> TaskResultView {
+        TaskResultView {
+            outcome: TaskOutcome::Failed,
+            final_text: "model selection was rejected: unknown model: foo".into(),
+            partial: true,
+            offset: 0,
+            total_bytes: 51,
+            next_offset: None,
+            complete: true,
+            reason_code: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn public_result_forwards_the_reason_code_and_serializes_null() {
+        let rejected = PublicResult::try_from(result_view(Some("MODEL_REJECTED"))).unwrap();
+        let encoded = serde_json::to_value(&rejected).unwrap();
+        assert_eq!(encoded["reason_code"], "MODEL_REJECTED");
+
+        let completed = PublicResult::try_from(result_view(None)).unwrap();
+        let encoded = serde_json::to_value(&completed).unwrap();
+        assert!(encoded["reason_code"].is_null());
     }
 }
 

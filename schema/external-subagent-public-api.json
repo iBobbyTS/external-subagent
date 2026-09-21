@@ -126,7 +126,7 @@
     },
     "result_projection": {
       "type": "object",
-      "required": ["outcome", "final_text", "partial", "offset", "total_bytes", "next_offset", "complete"],
+      "required": ["outcome", "final_text", "partial", "offset", "total_bytes", "next_offset", "complete", "reason_code"],
       "properties": {
         "outcome": { "enum": ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "RUNTIME_LOST", "RESULT_INVALID"] },
         "final_text": { "type": "string" },
@@ -134,7 +134,8 @@
         "offset": { "type": "integer", "minimum": 0 },
         "total_bytes": { "type": "integer", "minimum": 0 },
         "next_offset": { "type": ["integer", "null"], "minimum": 0 },
-        "complete": { "type": "boolean" }
+        "complete": { "type": "boolean" },
+        "reason_code": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },

@@ -1093,14 +1093,184 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
     let task = await_terminal_task(&scheduler, &agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Failed));
     let failure = scheduler.last_error(&agent_id).expect("failure record");
-    assert!(failure.contains("SESSION_START_FAILED"), "{failure}");
+    assert!(failure.contains("MODEL_REJECTED"), "{failure}");
+    assert!(!failure.contains("SESSION_START_FAILED"), "{failure}");
     assert!(failure.contains("unknown model option"), "{failure}");
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        stored.result.final_text,
+        "model selection was rejected: unknown model option: nope"
+    );
+    assert_eq!(
+        scheduler
+            .store()
+            .terminal_reason_code(&agent_id)
+            .unwrap()
+            .as_deref(),
+        Some("MODEL_REJECTED")
+    );
 
     let frames = wire_frames(workspace.path());
     assert_eq!(
         request_methods(&frames),
         vec!["initialize", "session/new", "session/set_config_option"],
         "no prompt may follow a refused model selection"
+    );
+}
+
+#[test]
+fn model_rejection_without_a_server_message_falls_back_to_the_whole_object() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603}}}}'
+"#
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:nope"));
+    scheduler.start_ready().unwrap_err();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        stored.result.final_text,
+        "model selection was rejected: {\"code\":-32603}"
+    );
+    assert_eq!(
+        scheduler
+            .store()
+            .terminal_reason_code(&agent_id)
+            .unwrap()
+            .as_deref(),
+        Some("MODEL_REJECTED")
+    );
+}
+
+#[test]
+fn model_rejection_uses_the_not_offered_session_display() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"reasoning_effort"}}]}}}}'
+"#
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:nope"));
+    scheduler.start_ready().unwrap_err();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        stored.result.final_text,
+        "model selection was rejected: dsh session advertised no model config option"
+    );
+    assert_eq!(
+        scheduler
+            .store()
+            .terminal_reason_code(&agent_id)
+            .unwrap()
+            .as_deref(),
+        Some("MODEL_REJECTED")
+    );
+    let frames = wire_frames(workspace.path());
+    assert_eq!(
+        request_methods(&frames),
+        vec!["initialize", "session/new"],
+        "a not-offered model must never emit a config frame"
+    );
+}
+
+#[test]
+fn non_model_bootstrap_failures_keep_session_start_failed_and_the_legacy_message() {
+    let _guard = scripted_test_guard();
+    // Initialize shape error: the session never reaches set_model.
+    let shape_workspace = dsh_workspace();
+    let shape_script = r#"
+read_frame
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"bogus"}}'
+"#;
+    let shape_child = scripted_child(shape_workspace.path(), shape_script);
+    let shape_scheduler = dsh_scheduler(
+        shape_workspace.path(),
+        DshRuntimeFactory::test_harness(Some(shape_child)),
+    );
+    let shape_agent = enqueue_dsh(
+        &shape_scheduler,
+        shape_workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    shape_scheduler.start_ready().unwrap_err();
+    let shape_stored = await_result(&shape_scheduler, &shape_agent);
+    assert_eq!(
+        shape_stored.result.final_text,
+        "invalid session response: dsh acp shape error: initialize result is missing protocolVersion"
+    );
+    assert_eq!(
+        shape_scheduler
+            .store()
+            .terminal_reason_code(&shape_agent)
+            .unwrap()
+            .as_deref(),
+        Some("SESSION_START_FAILED")
+    );
+
+    // Transport failure during set_model: the child exits before answering,
+    // which must stay an invalid-session failure and never MODEL_REJECTED.
+    let transport_workspace = dsh_workspace();
+    let transport_script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+exit 0
+"#
+    );
+    let transport_child = scripted_child(transport_workspace.path(), &transport_script);
+    let transport_scheduler = dsh_scheduler(
+        transport_workspace.path(),
+        DshRuntimeFactory::test_harness(Some(transport_child)),
+    );
+    let transport_agent = enqueue_dsh(
+        &transport_scheduler,
+        transport_workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    transport_scheduler.start_ready().unwrap_err();
+    let transport_stored = await_result(&transport_scheduler, &transport_agent);
+    assert!(
+        transport_stored
+            .result
+            .final_text
+            .starts_with("invalid session response: "),
+        "{}",
+        transport_stored.result.final_text
+    );
+    assert_eq!(
+        transport_scheduler
+            .store()
+            .terminal_reason_code(&transport_agent)
+            .unwrap()
+            .as_deref(),
+        Some("SESSION_START_FAILED")
     );
 }
 

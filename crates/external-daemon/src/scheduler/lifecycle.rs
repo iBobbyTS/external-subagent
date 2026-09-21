@@ -162,7 +162,14 @@ impl Scheduler {
                 let message = error.to_string();
                 let terminal = runtime.stop(self.inner.config.stop_grace);
                 let resources_reaped = terminal_proves_process_group_reaped(&terminal);
-                let (outcome, code) = (CompletionOutcome::Failed, "SESSION_START_FAILED");
+                let (outcome, code) = (
+                    CompletionOutcome::Failed,
+                    if matches!(error, RuntimeCommandError::ModelRejected(_)) {
+                        "MODEL_REJECTED"
+                    } else {
+                        "SESSION_START_FAILED"
+                    },
+                );
                 self.record_runtime_failure(
                     &claim.task.agent_id,
                     claim.task.session_id.as_deref(),
@@ -433,6 +440,7 @@ impl Scheduler {
                     &self.inner.store,
                     agent_id,
                     &bounded_result_invalid_task_result(),
+                    None,
                 )?;
             }
         }

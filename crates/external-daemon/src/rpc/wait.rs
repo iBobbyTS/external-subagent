@@ -92,7 +92,13 @@ impl RpcService {
                 let timed_out = !wake_respondable && !terminal && now >= deadline;
                 let result_page = stored_result
                     .filter(|_| terminal)
-                    .map(|stored| self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES))
+                    .map(|stored| {
+                        let reason = self
+                            .store
+                            .terminal_reason_code(&task.agent_id)
+                            .map_err(map_store)?;
+                        self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES, reason)
+                    })
                     .transpose()?;
                 let mut activity = task_activity_view(task.phase, activity);
                 if let Some(page) = result_page.as_ref() {
@@ -1489,5 +1495,78 @@ pub(crate) mod wait_tests {
         stream.read_to_string(&mut returned).unwrap();
         assert!(returned.contains("wait interrupted"));
         assert_eq!(before, service.store.get_task(&id).unwrap());
+    }
+
+    #[test]
+    fn task_result_and_wait_surface_the_terminal_reason_code() {
+        let (_directory, service, id) = fixture();
+        service
+            .store
+            .store_task_result_with_reason(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "model selection was rejected: unknown model: foo".into(),
+                    partial: true,
+                },
+                Some("MODEL_REJECTED"),
+            )
+            .unwrap();
+
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert_eq!(result.reason_code.as_deref(), Some("MODEL_REJECTED"));
+        assert_eq!(
+            result.final_text,
+            "model selection was rejected: unknown model: foo"
+        );
+
+        let RpcSuccess::TaskResult {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id,
+                offset: 0,
+                limit: MAX_RESULT_CHUNK_BYTES,
+            })
+            .unwrap()
+        else {
+            panic!("expected terminal result response")
+        };
+        assert_eq!(result.reason_code.as_deref(), Some("MODEL_REJECTED"));
+    }
+
+    #[test]
+    fn completed_task_result_reports_a_null_reason_code() {
+        let (_directory, service, id) = fixture();
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "all done".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert_eq!(result.reason_code, None);
     }
 }

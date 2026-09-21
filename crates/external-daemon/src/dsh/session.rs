@@ -96,8 +96,11 @@ impl DshRuntimeOwner {
             .to_owned();
         *self.shared.session_id.lock().unwrap() = Some(session_id.clone());
         let configured_model = if let Some(token) = model.as_deref() {
-            session.set_model(token, remaining()?).map_err(|error| {
-                RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+            session.set_model(token, remaining()?).map_err(|error| match error {
+                SessionError::Remote(_) | SessionError::Model(_) => {
+                    RuntimeCommandError::ModelRejected(model_rejection_message(&error))
+                }
+                error => RuntimeCommandError::InvalidSession(dsh_session_message(&error)),
             })?;
             Some(token.to_owned())
         } else {
@@ -132,6 +135,22 @@ impl DshRuntimeOwner {
 
 pub(super) fn dsh_session_message(error: &SessionError) -> String {
     let text = error.to_string();
+    text.chars().take(512).collect()
+}
+
+/// The public model-rejection reason: the server's own `error.message` when the
+/// JSON-RPC rejection carries one, and the whole object text otherwise. Other
+/// session errors fall back to their Display text. Bounded like every other
+/// session message.
+fn model_rejection_message(error: &SessionError) -> String {
+    let text = match error {
+        SessionError::Remote(value) => value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string()),
+        other => other.to_string(),
+    };
     text.chars().take(512).collect()
 }
 

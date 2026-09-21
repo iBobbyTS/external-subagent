@@ -605,3 +605,114 @@ fn failed_second_insert_preserves_prior_message_receipt() {
     assert_eq!(store.message("m1").unwrap().unwrap().content, "prior");
     assert!(store.message("m2").unwrap().is_none());
 }
+
+#[test]
+fn terminal_reason_code_reads_the_explicit_reason() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    running(&store, "agent");
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            Some("MODEL_REJECTED"),
+        )
+        .unwrap();
+    assert_eq!(
+        store.terminal_reason_code("agent").unwrap().as_deref(),
+        Some("MODEL_REJECTED")
+    );
+}
+
+#[test]
+fn terminal_reason_code_maps_placeholder_completed_and_absent_rows_to_none() {
+    let (_directory, _path, store) = store();
+    // The legacy `store_task_result` path still writes the compatibility
+    // placeholder, which the reader must not surface as a machine reason.
+    store
+        .enqueue_task_authoritative(&task("placeholder", "/repo", None))
+        .unwrap();
+    running(&store, "placeholder");
+    store
+        .store_task_result("placeholder", &result(TaskOutcome::Failed))
+        .unwrap();
+    assert_eq!(store.terminal_reason_code("placeholder").unwrap(), None);
+
+    store
+        .enqueue_task_authoritative(&task("completed", "/repo", None))
+        .unwrap();
+    running(&store, "completed");
+    store
+        .store_task_result("completed", &result(TaskOutcome::Completed))
+        .unwrap();
+    assert_eq!(store.terminal_reason_code("completed").unwrap(), None);
+
+    // No terminal row yet (queued) and an unknown task both read None.
+    store
+        .enqueue_task_authoritative(&task("queued", "/repo", None))
+        .unwrap();
+    assert_eq!(store.terminal_reason_code("queued").unwrap(), None);
+    assert_eq!(store.terminal_reason_code("missing").unwrap(), None);
+}
+
+#[test]
+fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    store
+        .mark_session_running(
+            "agent",
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some("session"),
+            None,
+        )
+        .unwrap();
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            Some("MODEL_REJECTED"),
+        )
+        .unwrap();
+    assert!(store
+        .requeue_task_for_resume_with_message("agent", "resume-msg", "continue")
+        .unwrap());
+    // The requeue row is not a TERMINAL row, so the stale failure still reads
+    // until the resumed task terminalizes.
+    assert_eq!(
+        store.terminal_reason_code("agent").unwrap().as_deref(),
+        Some("MODEL_REJECTED")
+    );
+
+    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    store
+        .mark_session_running(
+            "agent",
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some("session"),
+            None,
+        )
+        .unwrap();
+    // The resume message must be delivered before a completed result is
+    // admitted.
+    let message = store.claim_next_message("agent").unwrap().unwrap();
+    assert_eq!(message.content, "continue");
+    assert!(store
+        .complete_message(&message.message_id, None)
+        .unwrap());
+    store
+        .store_task_result("agent", &result(TaskOutcome::Completed))
+        .unwrap();
+    // The latest terminal row is the completed one (NULL reason); the older
+    // failure row must not resurface.
+    assert_eq!(store.terminal_reason_code("agent").unwrap(), None);
+}

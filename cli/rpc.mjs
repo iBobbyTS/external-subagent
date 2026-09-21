@@ -184,6 +184,7 @@ function publicResult(result) {
     total_bytes: result.total_bytes,
     next_offset: result.next_offset ?? null,
     complete: result.complete,
+    reason_code: result.reason_code ?? null,
   };
 }
 

@@ -247,6 +247,17 @@ test('CLI public projection removes private RPC fields and result digest', () =>
   assert.equal(projected.result.result_sha256, undefined);
 });
 
+test('CLI public projection carries the terminal reason code and defaults to null', () => {
+  const task = { agent_id: '10000001', status: 'failed', session_id: null, input_identity: null };
+  const base = { outcome: 'FAILED', final_text: 'model selection was rejected: unknown model: foo', partial: true, offset: 0, total_bytes: 51, next_offset: null, complete: true };
+  const rejected = projectDaemonResult('result', { kind: 'task_result', task, result: { ...base, reason_code: 'MODEL_REJECTED' } });
+  assert.equal(rejected.result.reason_code, 'MODEL_REJECTED');
+  // A legacy daemon frame without the field still projects an explicit null.
+  const legacy = projectDaemonResult('result', { kind: 'task_result', task, result: base });
+  assert.equal(legacy.result.reason_code, null);
+  assert.equal(Object.hasOwn(legacy.result, 'reason_code'), true);
+});
+
 test('CLI rejects the removed result question paging before connecting', () => {
   assert.throws(
     () => callDaemon(path.join(os.tmpdir(), 'x'), 'result', { agent_id: 10000001, request_id: 'question-1' }),

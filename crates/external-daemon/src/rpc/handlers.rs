@@ -455,7 +455,13 @@ impl RpcService {
                     .store
                     .task_result(&task.agent_id)
                     .map_err(map_store)?
-                    .map(|stored| self.task_result_view(stored, offset, limit))
+                    .map(|stored| {
+                        let reason = self
+                            .store
+                            .terminal_reason_code(&task.agent_id)
+                            .map_err(map_store)?;
+                        self.task_result_view(stored, offset, limit, reason)
+                    })
                     .transpose()?;
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(task),
@@ -550,6 +556,7 @@ impl RpcService {
         stored: StoredTaskResult,
         offset: usize,
         limit: usize,
+        reason_code: Option<String>,
     ) -> Result<TaskResultView, RpcError> {
         let text = stored.result.final_text;
         let total_bytes = text.len();
@@ -562,6 +569,7 @@ impl RpcService {
             total_bytes,
             next_offset,
             complete: next_offset.is_none(),
+            reason_code,
         })
     }
 }

@@ -192,6 +192,7 @@ pub enum RuntimeCommandError {
     Timeout,
     Transport(String),
     Remote(serde_json::Value),
+    ModelRejected(String),
     InvalidSession(String),
 }
 
@@ -202,6 +203,9 @@ impl fmt::Display for RuntimeCommandError {
             Self::Timeout => write!(f, "runtime command deadline elapsed"),
             Self::Transport(_) => write!(f, "runtime command transport failed"),
             Self::Remote(_) => write!(f, "runtime command was rejected"),
+            Self::ModelRejected(message) => {
+                write!(f, "model selection was rejected: {message}")
+            }
             Self::InvalidSession(message) => write!(f, "invalid session response: {message}"),
         }
     }

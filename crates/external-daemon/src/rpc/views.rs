@@ -272,6 +272,8 @@ pub struct TaskResultView {
     pub total_bytes: usize,
     pub next_offset: Option<usize>,
     pub complete: bool,
+    #[serde(default)]
+    pub reason_code: Option<String>,
 }
 
 /// Embedded view of an answerable user-input question. wait is the only
@@ -629,6 +631,7 @@ impl From<StoredTaskResult> for TaskResultView {
             total_bytes,
             next_offset: None,
             complete: true,
+            reason_code: None,
         }
     }
 }
@@ -722,6 +725,7 @@ mod result_paging_tests {
                     total_bytes: MAX_RESULT_CHUNK_BYTES + 1,
                     next_offset: Some(MAX_RESULT_CHUNK_BYTES),
                     complete: false,
+                    reason_code: None,
                 }),
             },
         );
@@ -738,6 +742,7 @@ mod result_paging_tests {
             total_bytes: 7,
             next_offset: None,
             complete: true,
+            reason_code: None,
         };
         assert_eq!(view.outcome, TaskOutcome::Failed);
         assert!(view.partial);
