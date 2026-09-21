@@ -88,6 +88,12 @@ pub struct AgentSpawnInput {
     #[serde(default)]
     pub permission_mode: PublicPermissionMode,
     pub prompt: String,
+    /// Caller write scope for the task. codex rejects a non-empty manifest
+    /// before task creation (codex_write_manifest_unsupported); dsh admits a
+    /// non-empty manifest in build through the guarded manifest-build
+    /// composition (at most 256 entries and 64 KiB serialized, `["."]` keeps
+    /// the legacy build composition) and keeps requiring an empty manifest in
+    /// plan; other subagents use the protected workspace scope.
     #[serde(default)]
     pub write_manifest: Vec<String>,
     #[serde(default, deserialize_with = "optional_non_null")]

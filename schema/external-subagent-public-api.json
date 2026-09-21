@@ -62,17 +62,19 @@
       "type": "object",
       "required": ["repository", "prompt"],
       "properties": {
-        "subagent": { "type": "string", "minLength": 1, "description": "Subagent route key; omission uses configured default_subagent or returns subagent_required. Null is invalid; dsh production spawn remains gated." },
+        "subagent": { "type": "string", "minLength": 1, "description": "Subagent route key; omission uses configured default_subagent or returns subagent_required. Null is invalid; dsh production spawn requires its enabled + spawn_supported + pinned-runtime configuration." },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode", "description": "codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never." },
         "prompt": { "type": "string", "minLength": 1 },
         "model": { "type": "string", "minLength": 1, "description": "Task model. dsh requires provider:model, split at the first colon (the model side may contain further colons; a missing colon or an empty side is rejected before any task). codex uses its own model id; zcode rejects model selection." },
         "effort": { "type": "string", "minLength": 1, "maxLength": 24, "pattern": "^[a-z0-9_]+$", "description": "Reasoning-effort token: 1..24 bytes of [a-z0-9_]. codex admits only low, medium, high or xhigh; zcode and dsh pass the bounded token through. Omission keeps the runtime default." },
-        "write_manifest": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "codex requires an empty or omitted write_manifest; non-empty input returns codex_write_manifest_unsupported before task creation. plan requires an empty manifest for every subagent." }
+        "write_manifest": { "type": "array", "items": { "type": "string", "minLength": 1 }, "description": "codex requires an empty or omitted write_manifest; non-empty input returns codex_write_manifest_unsupported before task creation. dsh admits a non-empty manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected as FS_WRITE_MANIFEST_DENIED), at most 256 entries; an explicit [\".\"] keeps the existing build composition. plan requires an empty manifest for every subagent." }
       },
       "allOf": [
         { "if": { "required": ["subagent"], "properties": { "subagent": { "const": "codex" } } },
           "then": { "properties": { "write_manifest": { "maxItems": 0 } } } },
+        { "if": { "required": ["subagent"], "properties": { "subagent": { "const": "dsh" } } },
+          "then": { "properties": { "write_manifest": { "maxItems": 256 } } } },
         { "if": { "required": ["permission_mode"], "properties": { "permission_mode": { "const": "plan" } } },
           "then": { "properties": { "write_manifest": { "maxItems": 0 } } } }
       ],

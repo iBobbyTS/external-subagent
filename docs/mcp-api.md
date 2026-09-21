@@ -177,7 +177,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
-| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 不支持非空清单（创建任务前返回 `codex_write_manifest_unsupported`）；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
+| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 不支持非空清单（创建任务前返回 `codex_write_manifest_unsupported`）；dsh build 接受非空清单，进入 workspace-write 的 manifest-build 组合（仅 `tool-fs` 可写，清单外路径由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝），上限 256 条／序列化 64 KiB，显式 `["."]` 走现行 build 组合（此前与任意非空清单同样被拒），plan 仍必须为空；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
 | `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`） | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝；codex 使用自有模型 ID |
 | `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh`（`minimal`/`max` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
 
@@ -185,7 +185,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** `:` 分割，第一个 `:` 之后的全部内容（可再含 `:`）归属 model；两侧不限字符集。缺少 `:`、provider 侧为空（`:m`）、model 侧为空（`p:`）、含 NUL、总长超过 512 字节，都会在派发前以 `validation` 拒绝并给出格式示例，不产生任务；`agents.dsh.default_model` 走同一校验路径。daemon 下发 ACP 前用 serde_json 把两侧重组为字节精确的 `["provider","model"]` 字符串（`session/set_config_option` 的 `value`），不会手工拼接；`input_identity.model` 保存 trim 后的冒号串，`model_source` 语义不变。`subagents models`（daemon RPC `agent_models`）输出层把这种 wire 元组反序列化为「恰好两个字符串的数组」后以 `p:m` 展示，解析失败、非二元组或 provider 侧含 `:` 的条目保留原样。模型是否真的存在于 provider 目录仍由 dsh 在 `session_start` 判定：未知元组以 `-32602` 失败，不发 prompt。
 
-`prompt` 必须非空白、无 NUL，最大 262144 字节。`write_manifest` 不允许重复路径、绝对路径、`..`，或包含 `.git`／`.gitmodules` 路径组件；plan 模式必须为空。整个内部 RPC 帧另有上限，因此正文上限不等于完整请求上限。`repository` 名称沿用契约，实际通用准备逻辑要求目录，不应仅因名称就额外假设必须有 `.git`。
+`prompt` 必须非空白、无 NUL，最大 262144 字节。`write_manifest` 不允许重复路径、绝对路径、`..`，或包含 `.git`／`.gitmodules` 路径组件；plan 模式必须为空。dsh 的非空清单另受 256 条／序列化 64 KiB 上限约束，超限以 `validation` 拒绝且 `prompt_count=0`；dsh 的 plan + 非空清单仍被拒，但错误码从 daemon 侧 `agent_unsupported` 变为 core 侧 `validation`，同样不产生任务。显式 `["."]` 与空清单派生值走同一现行 build 组合，不再被拒。整个内部 RPC 帧另有上限，因此正文上限不等于完整请求上限。`repository` 名称沿用契约，实际通用准备逻辑要求目录，不应仅因名称就额外假设必须有 `.git`。
 
 ### 5.2 输出
 
@@ -468,6 +468,8 @@ unavailable, daemon_unavailable
 ```
 
 `conflict` 的 message 可为 `WORKSPACE_BUSY`、`MESSAGE_ID_CONFLICT` 或通用 `durable state conflict`。结构化 message 可能是有意收敛后的说明，文本 content 可能包含有界校验细节；不要假设两者完全相同。错误不保证都能附带 operation、request_id、agent_id，例如在请求派发前失败时。
+
+dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单在上限内（≤256 条且序列化 ≤64 KiB）即放行进入 manifest-build 组合，显式 `["."]` 走现行 build 组合；只有超上限或 plan + 非空清单才拒绝，且都以 `validation` 返回（plan + 非空清单此前由 daemon 侧报 `agent_unsupported`，现由 core 以 `validation` 拒绝并同样不产生任务）；`agent_unsupported` 继续描述 dsh 的 edit/yolo 等未证明模式。
 
 ## 15. 调用示例与字段取舍
 

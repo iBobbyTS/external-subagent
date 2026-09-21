@@ -21,6 +21,38 @@ requested shell/write activity received no shell or write tool and the model
 declined to claim the write; the task was reaped and the workspace remained
 empty. This confirms the safety refusal path for the installed runtime.
 
+## Launch compositions (implemented)
+
+DSH spawn has three explicit compositions, selected by the daemon factory from
+the admitted permission mode and write manifest:
+
+- **strict plan** (`permission_mode: plan`): the strict-plan patch runs DSH with
+  `read-only` and every write/execute tool disabled. The write manifest must be
+  empty; a non-empty input is refused by admission with `validation` and no
+  task is created.
+- **build, caller-empty or explicit `["."]`**: the legacy build composition is
+  byte-for-byte unchanged — `workspace-write`, no patch, `preflight_build`.
+  An explicit `["."]` previously shared the "any non-empty manifest" refusal;
+  it is now admitted through this existing composition.
+- **build with a non-empty caller manifest**: per task the daemon materializes
+  the embedded `dsh-write-guard` package plus a nested
+  `node_modules/@deepseek-ai/dsh-fs` symlink into a fresh
+  `external-dsh-manifest-` TempDir, writes the S02 patch (`sandbox-policy`
+  `workspace-write`; every strict-plan tool except `tool-fs` disabled; one
+  `insert` row mounting the guard by absolute path with the caller manifest),
+  and requires `preflight_build_manifest` before ACP starts. The guard's
+  `fs/write-intent`/`fs/edit-intent` listeners are registered `prepend`, so an
+  out-of-manifest path becomes a real `FsError` with code
+  `FS_WRITE_MANIFEST_DENIED` (message marker `[write-guard]`) before `tool-fs`
+  writes anything. The manifest is bounded to 256 entries / 64 KiB serialized;
+  the TempDir is owned by the runtime owner and reaped with the task.
+
+Admission never trusts the child dump: `validate_manifest_build_dump` also
+checks the materialized patch's `--dump-config` output (guard name normalized
+to a `file://` URL, manifest equality, `tool-fs` enabled, the remaining
+strict-plan disable set, exactly one `workspace-write` sandbox policy and the
+build approval/permission presets; unknown enabled entries fail closed).
+
 ## Model selection via ACP set_config_option (implemented; live NOT_RUN)
 
 The spawn `model` token for dsh is `{provider}:{model}`, split at the

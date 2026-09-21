@@ -32,7 +32,12 @@ writes the configuration (no write on failure), and `dsh`/`codex` need a
 daemon restart to take effect. ZCode admits all four permission modes
 (build/edit/plan/yolo) and rejects an explicit spawn `model`; DSH admits
 `build` and strict `plan`, with model selection as explicit spawn model,
-configured default, then the native default; Codex admits all four modes
+configured default, then the native default, and its `build` mode admits a
+non-empty caller `write_manifest` through the guarded manifest-build
+composition (workspace-write sandbox, `tool-fs`-only writes, out-of-manifest
+paths rejected as `FS_WRITE_MANIFEST_DENIED`; an explicit `["."]` keeps the
+legacy build composition and `plan` still requires an empty manifest); Codex
+admits all four modes
 (build/edit → workspace-write, plan → read-only, yolo → danger-full-access,
 all pinning `approvalPolicy=never`) and rejects a non-empty `write_manifest`
 with `codex_write_manifest_unsupported`. `observe` works on all three: ZCode

@@ -431,6 +431,119 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
   }
 });
 
+test('installed daemon admits a dsh write manifest through the guarded manifest-build composition', { skip: !testable }, async () => {
+  await ensureInstalled();
+  // A short base keeps the unix socket path within SUN_LEN, matching the
+  // neutral daemon fixture above.
+  const home = fs.mkdtempSync('/tmp/external-dsh-wm-');
+  const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
+  const logs = path.join(home, 'Library', 'Logs', 'external-subagent');
+  fs.mkdirSync(data, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(logs, { recursive: true, mode: 0o700 });
+  const socket = path.join(data, 'external-subagent.sock');
+  const providerHome = path.join(home, 'provider');
+  const workspace = path.join(home, 'workspace');
+  fs.mkdirSync(providerHome);
+  fs.mkdirSync(workspace);
+
+  // The forged install layout the production derivation walks: a
+  // @deepseek-ai/dsh package whose NESTED @deepseek-ai/dsh-fs closure is the
+  // real install shape (not a sibling node_modules entry).
+  const packageRoot = path.join(home, 'pkg');
+  const dshPackage = path.join(packageRoot, 'node_modules', '@deepseek-ai', 'dsh');
+  const dshFs = path.join(dshPackage, 'node_modules', '@deepseek-ai', 'dsh-fs');
+  fs.mkdirSync(path.join(dshPackage, 'bin'), { recursive: true });
+  fs.mkdirSync(dshFs, { recursive: true });
+  fs.writeFileSync(path.join(dshPackage, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.1.5-rc.1' }));
+  fs.writeFileSync(path.join(dshFs, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-fs' }));
+  const runtime = path.join(dshPackage, 'bin', 'dsh-hi-probe.mjs');
+  fs.copyFileSync(path.join(repoRoot, 'tests/fixtures/dsh-hi-probe.mjs'), runtime);
+  fs.chmodSync(runtime, 0o755);
+
+  // The production dsh gate reads the persisted config once at startup; the
+  // policy already requires it at the database's sibling config.json.
+  const configPath = path.join(data, 'config.json');
+  fs.writeFileSync(configPath, `${JSON.stringify({
+    schema_version: 2,
+    revision: 1,
+    default_subagent: null,
+    subagents: {
+      zcode: { enabled: false, spawn_supported: false, default_model: null },
+      dsh: { enabled: true, spawn_supported: true, default_model: null, runtime_path: runtime, home: providerHome, profile: 'acp', version: '0.1.5-rc.1' },
+      codex: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
+    },
+  })}\n`);
+
+  const zcodeRuntime = fs.existsSync('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')
+    ? '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs'
+    : runtime;
+
+  const daemon = spawn(ctx.daemon, [
+    '--database', path.join(data, 'external-subagent.sqlite3'),
+    '--socket', socket,
+    '--runtime', zcodeRuntime,
+    '--diagnostic-log', path.join(logs, 'daemon-error.log'),
+  ], {
+    cwd: ctx.packageRoot,
+    env: fixtureEnv(home, { env: {
+      DSH_RUNTIME_PATH: runtime,
+      DSH_HOME: providerHome,
+      S05_DSH_SPAWN_FIXTURE: '1',
+      EXTERNAL_SUBAGENT_CONFIG: configPath,
+    } }),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let daemonStderr = '';
+  let daemonExited = false;
+  daemon.on('exit', () => { daemonExited = true; });
+  daemon.stderr.on('data', (chunk) => { daemonStderr += chunk; });
+
+  try {
+    const deadline = Date.now() + 20_000;
+    while (!fs.existsSync(socket) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.ok(fs.existsSync(socket), `daemon socket must appear: ${daemonStderr}`);
+
+    const env = fixtureEnv(home, { env: { EXTERNAL_SUBAGENT_SOCKET: socket } });
+    const spawned = jsonOutput(run(ctx.cli, [
+      'spawn', '--subagent', 'dsh', '--repository', workspace, '--permission-mode', 'build',
+      '--prompt', 'write the guarded manifest', '--write-manifest', 'src/a.rs', '--write-manifest', 'docs/',
+    ], { env }), 'manifest spawn');
+    const agentId = spawned.result.agent_id;
+    assert.equal(typeof agentId, 'number');
+
+    const probe = path.join(providerHome, 'probe.jsonl');
+    // The scheduler claims the submitted task asynchronously, so the real
+    // preflight dump appears shortly after the spawn reply.
+    await waitFor(() => fs.existsSync(probe) && fs.readFileSync(probe, 'utf8').includes('"kind":"dump"'), 'manifest dump probe');
+    const events = fs.readFileSync(probe, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const dump = events.find((event) => event.kind === 'dump' && event.patch);
+    assert.ok(dump, 'the manifest preflight must dump-config');
+    assert.equal(dump.mode, 'workspace-write');
+    assert.match(dump.patchText, /- insert:\n/u);
+    assert.match(dump.patchText, /- name: .*\/dsh-write-guard\/lib\/index\.js\n/u);
+    assert.match(dump.patchText, /^      - src\/a\.rs$/mu);
+    assert.match(dump.patchText, /^      - docs\/?$/mu);
+    assert.match(dump.patchText, /- id: tool-bash\n  disabled: true/u);
+    assert.equal(/- id: tool-fs\n  disabled: true/u.test(dump.patchText), false, 'tool-fs must stay enabled');
+    assert.equal(path.basename(path.dirname(dump.patch)).startsWith('external-dsh-manifest-'), true);
+    assert.equal(dump.patch.startsWith(path.join(repoRoot, 'profiles')), false, 'the patch must be the disposable materialized file, never a source resource');
+    assert.equal(dump.fsLink?.symbolic, true, 'the plugin tree must link the nested dsh-fs package');
+    assert.equal(dump.fsLink.target, fs.realpathSync(dshFs), 'the link must resolve inside the forged install layout');
+
+    const waited = jsonOutput(run(ctx.cli, ['wait', '--json', JSON.stringify({ agent_id: agentId, wait_time: 30 })], { env }), 'manifest wait');
+    assert.equal(waited.result.task.status, 'completed', JSON.stringify(waited));
+
+    jsonOutput(run(ctx.cli, ['close', '--json', JSON.stringify({ agent_id: agentId })], { env }), 'manifest close');
+    const reapDeadline = Date.now() + 10_000;
+    while (fs.existsSync(path.dirname(dump.patch)) && Date.now() < reapDeadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(fs.existsSync(path.dirname(dump.patch)), false, 'the per-task TempDir must be reaped');
+    assert.deepEqual(fs.readdirSync(workspace), []);
+  } finally {
+    daemon.kill('SIGTERM');
+    if (!daemonExited) await new Promise((resolve) => daemon.on('exit', resolve));
+  }
+});
+
 async function waitFor(predicate, label, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
