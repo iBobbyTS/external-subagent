@@ -1051,13 +1051,38 @@ mod contract_default_tests {
 
     #[tokio::test]
     async fn spawn_routes_admission_errors_through_daemon_before_manifest_preparation() {
-        // Keep ZCode enabled for model admission while DSH remains disabled.
+        // ZCode stays enabled for its model refusal, DSH is fully gated so its
+        // illegal-model refusal is reachable at admission, and a configured
+        // codex entry stays disabled for the disabled-agent projection.
         let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
         let config_root = tempfile::tempdir().unwrap();
+        let runtime = config_root.path().join("dsh-runtime");
+        std::fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&runtime, permissions).unwrap();
+        }
         let config_path = config_root.path().join("agents.json");
         std::fs::write(
             &config_path,
-            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 2,
+                "subagents": {
+                    "zcode": {"enabled": true, "spawn_supported": true},
+                    "dsh": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "runtime_path": runtime.to_string_lossy(),
+                        "profile": "acp",
+                        "version": external_agent_dsh::profile::PINNED_DSH_VERSION,
+                    },
+                    "codex": {"enabled": false, "spawn_supported": true},
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
         let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
@@ -1070,14 +1095,20 @@ mod contract_default_tests {
                 "unknown",
                 None,
                 "subagent_unknown",
-                "subagent is unknown, available subagents are [\"zcode\"]",
+                "subagent is unknown, available subagents are [\"dsh\", \"zcode\"]",
             ),
-            ("dsh", None, "agent_disabled", "agent is disabled"),
+            ("codex", None, "agent_disabled", "agent is disabled"),
             (
                 "zcode",
                 Some("chosen"),
                 "model_selection_unsupported",
                 "model selection is unsupported for zcode",
+            ),
+            (
+                "dsh",
+                Some("deepseek-flash"),
+                "validation",
+                "dsh model must be {provider}:{model}; the ':' separator is missing",
             ),
         ] {
             let input = AgentSpawnInput {
@@ -1102,8 +1133,13 @@ mod contract_default_tests {
                 // the generic ": {detail}" tail must not repeat the roster.
                 assert_eq!(
                     error.legacy_text,
-                    "subagent_unknown: subagent is unknown, available subagents are [\"zcode\"]"
+                    "subagent_unknown: subagent is unknown, available subagents are [\"dsh\", \"zcode\"]"
                 );
+            }
+            if agent == "dsh" {
+                // The composed format detail passes through verbatim and the
+                // legacy text drops the static middle sentence.
+                assert_eq!(error.legacy_text, format!("validation: {expected_message}"));
             }
         }
         assert_eq!(before, store.get_task(&id).unwrap());

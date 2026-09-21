@@ -185,7 +185,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** `:` 分割，第一个 `:` 之后的全部内容（可再含 `:`）归属 model；两侧不限字符集。缺少 `:`、provider 侧为空（`:m`）、model 侧为空（`p:`）、含 NUL、总长超过 512 字节，都会在派发前以 `validation` 拒绝并给出格式示例，不产生任务；`agents.dsh.default_model` 走同一校验路径。daemon 下发 ACP 前用 serde_json 把两侧重组为字节精确的 `["provider","model"]` 字符串（`session/set_config_option` 的 `value`），不会手工拼接；`input_identity.model` 保存 trim 后的冒号串，`model_source` 语义不变。`subagents models`（daemon RPC `agent_models`）输出层把这种 wire 元组反序列化为「恰好两个字符串的数组」后以 `p:m` 展示，解析失败、非二元组或 provider 侧含 `:` 的条目保留原样。模型是否真的存在于 provider 目录仍由 dsh 在 `session_start` 判定：未知元组以 `-32602` 失败，不发 prompt。
 
-`prompt` 必须非空白、无 NUL，最大 262144 字节。`write_manifest` 不允许重复路径、绝对路径、`..`，或包含 `.git`／`.gitmodules` 路径组件；plan 模式必须为空。dsh 的非空清单另受 256 条／序列化 64 KiB 上限约束，超限以 `validation` 拒绝且 `prompt_count=0`；dsh 的 plan + 非空清单仍被拒，但错误码从 daemon 侧 `agent_unsupported` 变为 core 侧 `validation`，同样不产生任务。显式 `["."]` 与空清单派生值走同一现行 build 组合，不再被拒。整个内部 RPC 帧另有上限，因此正文上限不等于完整请求上限。`repository` 名称沿用契约，实际通用准备逻辑要求目录，不应仅因名称就额外假设必须有 `.git`。
+`prompt` 必须非空白、无 NUL，最大 262144 字节。`write_manifest` 不允许重复路径、绝对路径、`..`，或包含 `.git`／`.gitmodules` 路径组件；plan 模式必须为空。dsh 的非空清单另受 256 条／序列化 64 KiB 上限约束，超限以 `validation` 拒绝并携带结构化 `prompt_count=0`（该计数只在结构化字段，不再写进消息文本）；dsh 的 plan + 非空清单仍被拒，但错误码从 daemon 侧 `agent_unsupported` 变为 core 侧 `validation`，同样不产生任务。显式 `["."]` 与空清单派生值走同一现行 build 组合，不再被拒。整个内部 RPC 帧另有上限，因此正文上限不等于完整请求上限。`repository` 名称沿用契约，实际通用准备逻辑要求目录，不应仅因名称就额外假设必须有 `.git`。
 
 ### 5.2 输出
 
@@ -455,7 +455,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `error.operation` | string/省略 | 诊断哪种操作失败 | 多操作日志难以关联 |
 | `error.request_id` | string/省略 | 关联 facade 发起的 RPC 请求 | 无法从错误定位具体 RPC；不是待回答问题的 ID |
 | `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务；workspace busy 时尤其有用 |
-| `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
+| `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝及 Validation/Malformed 准入拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
 
 当前公开映射的错误码：
 

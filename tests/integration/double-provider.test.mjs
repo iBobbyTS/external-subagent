@@ -38,7 +38,7 @@
 //   model catalog (non-empty); dsh build task spawn→wait→result→close with
 //   resources_reaped; dsh strict-plan task COMPLETED with an unmutated
 //   workspace; zcode task COMPLETED with native model and reaped; zcode
-//   model rejection `model_selection_unsupported` (prompt_count=0);
+//   model rejection `model_selection_unsupported`;
 //   mid-run dsh cancel → CANCELLED/reaped/closed.
 //
 //   LIVE, recorded in that session only and NOT re-asserted by this file
@@ -438,7 +438,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     assert.equal(rejected.status, 1);
     const rejection = JSON.parse(rejected.stderr);
     assert.equal(rejection.error.code, 'model_selection_unsupported');
-    assert.match(rejection.error.message, /prompt_count=0/);
+    assert.equal(rejection.error.message, 'model selection is unsupported for zcode');
 
     // Mid-run cancel with reaping on DSH. The poll loop must actually
     // observe RUNNING: cancelling a task that never left QUEUED would not
@@ -466,7 +466,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
       'discovery: dsh+zcode configured & spawn_supported; model_selection: dsh=supported zcode=unsupported(fail-closed)',
       `dsh: local=${dshLocal.local.state} authenticated-hi=${dshHi.hi.state} models=${dshModels.models.length}`,
       'dsh tasks: build=COMPLETED/reaped strict-plan=COMPLETED/workspace-unmutated mid-run-cancel=CANCELLED/reaped',
-      'zcode tasks: native-model=COMPLETED/reaped model-rejection=model_selection_unsupported(prompt_count=0)',
+      'zcode tasks: native-model=COMPLETED/reaped model-rejection=model_selection_unsupported',
       'NOT asserted here (that-session live evidence only): MCP facade, pending/respond, restart no-replay',
       'NOT asserted here (bounded limitation): zcode authenticated hi (policy_unverified/model_config_missing split)',
     ].join('\n'));

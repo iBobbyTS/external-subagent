@@ -399,13 +399,13 @@ pub(super) fn resolve_admission(
     if agent == "zcode" && (input.model.is_some() || configured.default_model.is_some()) {
         return Err(RpcError::new(
             RpcErrorCode::ModelSelectionUnsupported,
-            "model selection is unsupported for zcode; prompt_count=0",
+            "model selection is unsupported for zcode",
         ));
     }
     if !effective_spawn_supported(agent, configured) {
         return Err(RpcError::new(
             RpcErrorCode::AgentUnsupported,
-            format!("agent {agent} is unsupported; prompt_count=0"),
+            format!("agent {agent} is unsupported"),
         ));
     }
     let effort = resolve_effort_selection(agent, input)?;
@@ -426,7 +426,7 @@ pub(super) fn resolve_admission(
                 if external_agent_dsh::acp::model::parse_colon_token(token).is_err() {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
-                        "dsh model must be provider:model, split at the first colon, with non-empty sides, at most 512 bytes, no NUL; prompt_count=0",
+                        dsh_model_format_error(token),
                     ));
                 }
                 if input.model.is_some() {
@@ -448,7 +448,7 @@ pub(super) fn resolve_admission(
         let Some(token) = token else {
             return Err(RpcError::new(
                 RpcErrorCode::Validation,
-                "codex requires an explicit model or agents.codex.default_model; prompt_count=0",
+                "codex requires an explicit model or agents.codex.default_model",
             ));
         };
         if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
@@ -472,7 +472,7 @@ pub(super) fn resolve_admission(
         ) {
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
-                "dsh first-launch admission supports only the build and plan permission modes; prompt_count=0",
+                "dsh first-launch admission supports only the build and plan permission modes",
             ));
         }
         // A caller write manifest is admitted for build tasks: the factory
@@ -496,7 +496,7 @@ pub(super) fn resolve_admission(
         .map_err(|error| {
             RpcError::new(
                 RpcErrorCode::Validation,
-                format!("dsh write manifest could not be serialized: {error}; prompt_count=0"),
+                format!("dsh write manifest could not be serialized: {error}"),
             )
         })?;
         if input.manifest.write_manifest.len() > MAX_DSH_WRITE_MANIFEST_ENTRIES
@@ -504,7 +504,7 @@ pub(super) fn resolve_admission(
         {
             return Err(RpcError::new(
                 RpcErrorCode::Validation,
-                "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB); prompt_count=0",
+                "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
             ));
         }
     }
@@ -520,7 +520,7 @@ pub(super) fn resolve_admission(
         if configured.home.is_none() && env::var_os("CODEX_HOME").is_none() {
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
-                "codex home is unconfigured; prompt_count=0",
+                "codex home is unconfigured",
             ));
         }
     }
@@ -532,6 +532,34 @@ pub(super) fn resolve_admission(
         model_source: model_source.into(),
         effort,
     })
+}
+
+/// Compose the public validation message for a refused dsh model token.
+///
+/// `external_agent_dsh::acp::model::parse_colon_token` stays the authority:
+/// this runs only after it refused and only chooses the wording. Each branch
+/// names one failure cause so the caller sees what to fix instead of the
+/// whole format contract. `{provider}:{model}` is the frozen format notation
+/// (not a literal), and a token that fails without matching a listed cause
+/// falls back to the bare generic sentence.
+fn dsh_model_format_error(token: &str) -> String {
+    const FORMAT: &str = "dsh model must be {provider}:{model}";
+    let cause = if token.is_empty() {
+        "the token is empty"
+    } else if token.len() > external_agent_dsh::acp::model::MAX_MODEL_TOKEN_BYTES {
+        "the token exceeds 512 bytes"
+    } else if token.contains('\0') {
+        "the token contains a NUL byte"
+    } else if !token.contains(':') {
+        "the ':' separator is missing"
+    } else if token.starts_with(':') {
+        "the provider side is empty"
+    } else if token.ends_with(':') {
+        "the model side is empty"
+    } else {
+        return FORMAT.to_string();
+    };
+    format!("{FORMAT}; {cause}")
 }
 
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
@@ -562,13 +590,13 @@ fn resolve_effort_selection(
     {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
-            "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL; prompt_count=0",
+            "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL",
         ));
     }
     if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh") {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
-            "codex effort must be one of low, medium, high, xhigh; prompt_count=0",
+            "codex effort must be one of low, medium, high, xhigh",
         ));
     }
     Ok(Some(token.to_owned()))
@@ -960,7 +988,11 @@ mod admission_tests {
                 RpcErrorCode::Validation,
                 "codex effort {invalid:?}"
             );
-            assert!(error.message.contains("prompt_count=0"));
+            assert!(
+                error.message.contains("effort"),
+                "codex effort {invalid:?}: {}",
+                error.message
+            );
         }
     }
 
@@ -1322,9 +1354,22 @@ mod admission_policy_tests {
     fn dsh_invalid_resolved_model_token_is_refused_before_the_task_exists() {
         let root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let config = gated_dsh_snapshot(&root);
-        // Malformed colon tokens — no colon, empty provider, empty model — are
-        // refused at admission, not persisted and re-discovered at spawn.
-        for invalid in ["no-colon", "provider:", ":model"] {
+        // Spawn-token failures name the exact format cause, so the caller can
+        // fix the token without reading the whole contract sentence.
+        for (invalid, expected) in [
+            (
+                "no-colon",
+                "dsh model must be {provider}:{model}; the ':' separator is missing",
+            ),
+            (
+                "provider:",
+                "dsh model must be {provider}:{model}; the model side is empty",
+            ),
+            (
+                ":model",
+                "dsh model must be {provider}:{model}; the provider side is empty",
+            ),
+        ] {
             let input = policy_input(
                 Some("dsh"),
                 Some(invalid),
@@ -1333,36 +1378,50 @@ mod admission_policy_tests {
             );
             let error = resolve_admission(&input, &config).unwrap_err();
             assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
-            assert!(error.message.contains("provider:model"), "{invalid:?}");
-            assert!(error.message.contains("prompt_count=0"), "{invalid:?}");
+            assert_eq!(error.message, expected, "{invalid:?}");
         }
         // A spawn token beyond the colon-token bound the ACP session enforces
         // must fail admission, not the task after it is persisted.
+        let oversized_token = format!("p:{}", "t".repeat(513));
         let oversized = policy_input(
             Some("dsh"),
-            Some(&format!("p:{}", "t".repeat(513))),
+            Some(&oversized_token),
             external_core::PermissionMode::Build,
             &[],
         );
+        let error = resolve_admission(&oversized, &config).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
         assert_eq!(
-            resolve_admission(&oversized, &config).unwrap_err().code,
-            RpcErrorCode::Validation
+            error.message,
+            "dsh model must be {provider}:{model}; the token exceeds 512 bytes"
         );
         // The configured default is a selection too: an unusable default is
         // refused before prompt rather than silently downgraded to native.
-        let mut invalid_default = config.clone();
-        invalid_default
-            .subagents
-            .get_mut("dsh")
-            .unwrap()
-            .default_model = Some("provider:".into());
-        let defaulted = policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
-        assert_eq!(
-            resolve_admission(&defaulted, &invalid_default)
-                .unwrap_err()
-                .code,
-            RpcErrorCode::Validation
-        );
+        // Empty and NUL tokens are reachable only here: a spawn `model` is
+        // filtered first by `validate_text` and would answer "model is
+        // invalid", while the configured default bypasses that gate.
+        for (default_model, expected) in [
+            (
+                " ",
+                "dsh model must be {provider}:{model}; the token is empty",
+            ),
+            (
+                "provider:mo\0del",
+                "dsh model must be {provider}:{model}; the token contains a NUL byte",
+            ),
+        ] {
+            let mut invalid_default = config.clone();
+            invalid_default
+                .subagents
+                .get_mut("dsh")
+                .unwrap()
+                .default_model = Some(default_model.into());
+            let defaulted =
+                policy_input(Some("dsh"), None, external_core::PermissionMode::Build, &[]);
+            let error = resolve_admission(&defaulted, &invalid_default).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{default_model:?}");
+            assert_eq!(error.message, expected, "{default_model:?}");
+        }
         // The bound itself stays exact: the largest bounded colon token admits.
         let bounded_token = format!("p:{}", "t".repeat(510));
         let bounded = policy_input(
@@ -1456,7 +1515,11 @@ mod admission_policy_tests {
         .unwrap_err();
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert!(error.message.contains("dsh"), "{error:?}");
-        assert!(error.message.contains("prompt_count=0"), "{error:?}");
+        assert_eq!(
+            error.message,
+            "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
+            "{error:?}"
+        );
         // A single entry whose serialization exceeds 64 KiB rejects too,
         // mirroring the ZCode policy environment bounds.
         let oversized = "a".repeat(64 * 1024);
@@ -1472,7 +1535,11 @@ mod admission_policy_tests {
         .unwrap_err();
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert!(error.message.contains("dsh"), "{error:?}");
-        assert!(error.message.contains("prompt_count=0"), "{error:?}");
+        assert_eq!(
+            error.message,
+            "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
+            "{error:?}"
+        );
     }
 
     /// The exact `submit_general` wire frame the CLI emits over the daemon
@@ -1611,7 +1678,9 @@ mod admission_policy_tests {
             };
             assert_eq!(error.code, RpcErrorCode::AgentUnsupported, "{request_id}");
             assert!(
-                error.message.contains("prompt_count=0"),
+                error
+                    .message
+                    .contains("dsh first-launch admission supports only the build and plan permission modes"),
                 "{request_id}: {}",
                 error.message
             );
@@ -1867,6 +1936,6 @@ mod admission_policy_tests {
             panic!("zcode model selection must be refused")
         };
         assert_eq!(error.code, RpcErrorCode::ModelSelectionUnsupported);
-        assert!(error.message.contains("prompt_count=0"));
+        assert_eq!(error.message, "model selection is unsupported for zcode");
     }
 }

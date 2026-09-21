@@ -108,10 +108,23 @@ pub(crate) fn validation_error(detail: impl Into<String>) -> ToolError {
 
 pub(crate) fn public_error(error: RpcError) -> ToolError {
     let detail = error.message.clone();
+    // Admission sites compose the full public message and ship it as the RPC
+    // detail (same Design B as the AgentUnknown roster branch below); project
+    // a recognized prefix verbatim instead of the static sentence. The list is
+    // a prefix set so it can grow without message parsing.
+    const PASSTHROUGH_DETAIL_PREFIXES: [&str; 1] = ["dsh model must be"];
     let (code, message) = match error.code {
-        RpcErrorCode::Malformed | RpcErrorCode::Validation => {
-            ("validation", "request validation failed")
-        }
+        RpcErrorCode::Malformed | RpcErrorCode::Validation => (
+            "validation",
+            if PASSTHROUGH_DETAIL_PREFIXES
+                .iter()
+                .any(|prefix| detail.starts_with(prefix))
+            {
+                detail.as_str()
+            } else {
+                "request validation failed"
+            },
+        ),
         RpcErrorCode::AgentRequired => ("subagent_required", "subagent is required"),
         // The daemon composes the full public message (with the roster) at the
         // admission/probe/models/list rejection sites and ships it as the RPC
@@ -164,11 +177,16 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
     let agent_id = error.active_agent_id;
     let legacy_text = if let Some(agent_id) = agent_id.as_ref() {
         format!("{code}: {message} (active_agent_id={agent_id})")
+    } else if matches!(error.code, RpcErrorCode::Validation | RpcErrorCode::Malformed)
+        && detail != message
+        && detail.len() <= 512
+    {
+        // The detail is the whole public explanation for a rejected input, so
+        // the de-duplicated legacy form drops the static sentence entirely.
+        format!("{code}: {detail}")
     } else if matches!(
         error.code,
-        RpcErrorCode::Validation
-            | RpcErrorCode::Malformed
-            | RpcErrorCode::AgentRequired
+        RpcErrorCode::AgentRequired
             | RpcErrorCode::AgentUnknown
             | RpcErrorCode::AgentDisabled
             | RpcErrorCode::AgentUnsupported
@@ -183,7 +201,9 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
     let projected = ToolError::new(code, message, legacy_text, "daemon").with_agent_id(agent_id);
     if matches!(
         error.code,
-        RpcErrorCode::AgentRequired
+        RpcErrorCode::Validation
+            | RpcErrorCode::Malformed
+            | RpcErrorCode::AgentRequired
             | RpcErrorCode::AgentUnknown
             | RpcErrorCode::AgentDisabled
             | RpcErrorCode::AgentUnsupported
@@ -361,5 +381,76 @@ mod tests {
         ));
         assert_eq!(validation.body.code, "validation");
         assert!(validation.legacy_text.contains("agent_id is invalid"));
+    }
+
+    #[test]
+    fn dsh_model_format_detail_is_projected_verbatim_with_zero_prompts() {
+        let detail = "dsh model must be {provider}:{model}; the ':' separator is missing";
+        let projected = public_error(RpcError::new(RpcErrorCode::Validation, detail));
+        assert_eq!(projected.body.code, "validation");
+        assert_eq!(projected.body.message, detail);
+        // The passthrough makes detail == message, so the legacy branch emits
+        // one sentence without the static "request validation failed" middle.
+        assert_eq!(projected.legacy_text, format!("validation: {detail}"));
+        assert_eq!(projected.body.prompt_count, Some(0));
+    }
+
+    #[test]
+    fn non_prefix_validation_and_malformed_keep_the_static_message_deduplicated() {
+        let detail = "codex requires an explicit model or agents.codex.default_model";
+        let projected = public_error(RpcError::new(RpcErrorCode::Validation, detail));
+        assert_eq!(projected.body.code, "validation");
+        assert_eq!(projected.body.message, "request validation failed");
+        assert_eq!(projected.legacy_text, format!("validation: {detail}"));
+        assert_eq!(projected.body.prompt_count, Some(0));
+
+        // Malformed shares the public code, the de-duplication and the
+        // zero-prompt envelope.
+        let malformed = public_error(RpcError::new(RpcErrorCode::Malformed, "frame is malformed"));
+        assert_eq!(malformed.body.code, "validation");
+        assert_eq!(malformed.body.message, "request validation failed");
+        assert_eq!(malformed.legacy_text, "validation: frame is malformed");
+        assert_eq!(malformed.body.prompt_count, Some(0));
+    }
+
+    #[test]
+    fn model_selection_rejection_legacy_collapses_to_one_sentence() {
+        let projected = public_error(RpcError::new(
+            RpcErrorCode::ModelSelectionUnsupported,
+            "model selection is unsupported for zcode",
+        ));
+        assert_eq!(projected.body.code, "model_selection_unsupported");
+        assert_eq!(
+            projected.body.message,
+            "model selection is unsupported for zcode"
+        );
+        assert_eq!(
+            projected.legacy_text,
+            "model_selection_unsupported: model selection is unsupported for zcode"
+        );
+        assert_eq!(projected.body.prompt_count, Some(0));
+    }
+
+    #[test]
+    fn capability_composites_keep_their_legacy_shape_after_validation_dedup() {
+        // Roster stays exactly as before the Validation change.
+        let roster = public_error(RpcError::new(RpcErrorCode::AgentUnknown, "agent is unknown"));
+        assert_eq!(roster.body.code, "subagent_unknown");
+        assert_eq!(roster.body.message, "subagent is unknown");
+        assert_eq!(
+            roster.legacy_text,
+            "subagent_unknown: subagent is unknown: agent is unknown"
+        );
+        assert_eq!(roster.body.prompt_count, Some(0));
+        // The other composite members keep `{code}: {message}: {detail}`.
+        let unsupported = public_error(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            "private capability detail",
+        ));
+        assert_eq!(
+            unsupported.legacy_text,
+            "agent_unsupported: agent is unsupported: private capability detail"
+        );
+        assert_eq!(unsupported.body.prompt_count, Some(0));
     }
 }
