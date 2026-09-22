@@ -219,26 +219,34 @@ public MCP error code `codex_write_manifest_unsupported` (internal RPC
 sentinel `CODEX_WRITE_MANIFEST_UNSUPPORTED`). `zcode`/`dsh` manifest handling
 and the global "plan must be empty" rule are unchanged.
 
-## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED; live turn NOT_RUN)
+## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED + live max turn RUN)
 
 The spawn `effort` parameter (admission closed set
-`low | medium | high | xhigh`; `minimal` and `max` are rejected) is driven as
-the top-level `effort` of every `turn/start`; an omitted spawn effort keeps
-the pre-existing wire default. Evidence layers:
+`low | medium | high | xhigh | max`; `minimal` and `ultra` are rejected) is
+driven as the top-level `effort` of every `turn/start`; an omitted spawn
+effort keeps the pre-existing wire default. Evidence layers:
 
 - **SOURCE_INSPECTED** (codex-cli 0.154.0 binary strings): the
-  `low/medium/high/xhigh` ladder sits next to `reasoningEffort` /
-  `model_reasoning_effort` and the `ThreadStart`/`ResumeResponse` types. The
-  binary also serializes a `minimal` variant
-  (`core/src/session/reasoning_effort.rs`), but no observed model advertises
-  it (next bullet), so it stays out of the admitted set.
-- **OBSERVED** (`models/list` probe 2026-09-15, `.agent-work/tmp/codex-app-server-probe/result-20260915-persistent.json`): all 8 models advertise one of
-  three `supportedReasoningEfforts` shapes — `{low,medium,high,xhigh}`,
-  `{low,medium,high,xhigh,max}`, `{low,medium,high,xhigh,max,ultra}` — none
-  contains `minimal`, and the catalog tokens `max`/`ultra` have no verified
-  mapping onto the wire enum. The closed set therefore remains the four
-  values and `minimal`/`max` are pinned as rejected at admission.
-- **OBSERVED** (same probe): the `thread/start` result's `reasoningEffort`
+  `none/minimal/low/medium/high/xhigh/max/ultra` variant run sits next to
+  `effort`, `reasoningEffort` / `model_reasoning_effort` and the
+  `ThreadStart`/`ResumeResponse` types, so all eight tokens serialize on the
+  wire enum; admission still admits only the five values below.
+- **OBSERVED** (`models/list` probes 2026-09-15 and 2026-09-22): the models
+  advertise one of three `supportedReasoningEfforts` shapes —
+  `{low,medium,high,xhigh}`, `{low,medium,high,xhigh,max}`,
+  `{low,medium,high,xhigh,max,ultra}` — none contains `minimal`; `max` is
+  advertised by gpt-6-astra, gpt-reserve, the gpt-5.6 family and
+  codex-auto-review.
+- **OBSERVED + RUN** (2026-09-22 live probe,
+  `.agent-work/tmp/codex-effort-max-20260922/`): an effort=`zzz` turn fails
+  with the backend oracle `[ReasoningEffortParam] … Supported values are:
+  'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'` — the wire
+  mapping of `max` is verified and `ultra` is excluded by the same oracle.
+  A live `turn/start` effort=`max` on gpt-5.6-terra (ephemeral read-only
+  thread) ran to `completed` (2.7 s, exact expected output). `minimal`
+  remains out because no observed model advertises it; `ultra` remains out
+  because the API oracle rejects it.
+- **OBSERVED** (2026-09-15 probe): the `thread/start` result's `reasoningEffort`
   echo is the **model default, not an acknowledgement of any requested
   effort** — gpt-5.6-terra echoed `medium`, exactly its
   `defaultReasoningEffort`. The daemon treats the start echo as
@@ -246,7 +254,9 @@ the pre-existing wire default. Evidence layers:
 - **OBSERVED** (same probe): `thread/resume` (and `thread/read`) echo the
   **last turn's effective effort** (`low` after a `low` turn). The daemon
   fail-closes with `InvalidSession` when a resume echo exists, an explicit
-  effort was admitted, and the two differ.
+  effort was admitted, and the two differ. The `max` resume echo was not
+  separately re-probed; the comparison is byte-equality on the admitted
+  token, so a divergent echo stays a safe fail-closed `InvalidSession`.
 - **OBSERVED** (`start-posture-20260919.json`, same directory): a resume
   with no leading turn fails outright — the response is the JSON-RPC error
   branch (keys `code`/`message`, the no-rollout shape recorded above), not
@@ -254,9 +264,10 @@ the pre-existing wire default. Evidence layers:
   resume echo is diagnostic-only and passes through" branch is therefore a
   defensive implementation pinned by the fixture tests, not a live-observed
   success shape.
-- Live verification that a driven `turn/start` effort is actually applied by
-  the model is **NOT_RUN** (user prohibition on production spawns); the
-  evidence above is static-binary and unauthenticated-probe only.
+- The `max` tier has a live direct app-server run (ephemeral probe thread
+  above); an effort driven end-to-end through the daemon's production spawn
+  path is **NOT_RUN**, and the non-`max` tiers keep their static-binary and
+  unauthenticated-probe evidence only.
 
 ## NOT_RUN
 

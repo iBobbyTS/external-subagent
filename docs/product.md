@@ -65,7 +65,7 @@ external-subagent config set subagents.dsh.version 0.1.5-rc.1
 
 DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 指定 model 会被明确拒绝。
 
-spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 `low/medium/high/xhigh`（`minimal`/`max` 被拒绝），zcode 与 dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token；省略时保持各 subagent 现状默认，非法 token 在派发前被拒绝且不产生任务。
+spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），zcode 与 dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token；省略时保持各 subagent 现状默认，非法 token 在派发前被拒绝且不产生任务。
 
 ## 实际能力限制（来自已验收代码）
 

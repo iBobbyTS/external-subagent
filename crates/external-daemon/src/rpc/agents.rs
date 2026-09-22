@@ -564,16 +564,19 @@ fn dsh_model_format_error(token: &str) -> String {
 
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
 /// NUL. Codex additionally admits only its closed effort set {low, medium,
-/// high, xhigh}. Evidence notes for the values left OUT (S02 handoff): the
-/// wire enum on codex-cli 0.154.0 also serializes `minimal` (binary strings
-/// adjacency), but every model in the OBSERVED probe catalog
-/// (.agent-work/tmp/codex-app-server-probe/result-20260915-persistent.json,
-/// models/result/data[*]/supportedReasoningEfforts) lists only low..xhigh
-/// (some add the catalog tokens `max`/`ultra`, whose mapping onto the wire
-/// enum is unverified), so minimal/max/ultra stay out until a live run
-/// proves a model accepts them; zcode/dsh are bounded passthrough tokens
-/// because their supported sets are only known at runtime and admission
-/// must not fabricate a catalog.
+/// high, xhigh, max}. Evidence notes for the values left OUT and the max
+/// admission (2026-09-22 live probe,
+/// .agent-work/tmp/codex-effort-max-20260922/): the backend API rejects an
+/// unknown effort with an oracle listing exactly
+/// none/minimal/low/medium/high/xhigh/max, and a live `turn/start`
+/// effort=max on gpt-5.6-terra (codex-cli 0.154.0) ran to completion, so
+/// `max` is admitted — the observed model catalog (model/list 2026-09-15
+/// and 2026-09-22) advertises `max` for gpt-6-astra, gpt-reserve and the
+/// gpt-5.6 family. `minimal` is wire-valid per the same oracle but no
+/// observed model advertises it, and `ultra` is a catalog token the API
+/// oracle excludes, so both stay out; zcode/dsh are bounded passthrough
+/// tokens because their supported sets are only known at runtime and
+/// admission must not fabricate a catalog.
 fn resolve_effort_selection(
     agent: &str,
     input: &GeneralSubmitInput,
@@ -593,10 +596,10 @@ fn resolve_effort_selection(
             "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL",
         ));
     }
-    if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh") {
+    if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh" | "max") {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
-            "codex effort must be one of low, medium, high, xhigh",
+            "codex effort must be one of low, medium, high, xhigh, max",
         ));
     }
     Ok(Some(token.to_owned()))
@@ -945,7 +948,7 @@ mod admission_tests {
         let directory = tempfile::tempdir().unwrap();
         let config = codex_gate_config(directory.path());
         let mut input = codex_input(directory.path(), external_core::PermissionMode::Plan);
-        for admitted in ["low", "medium", "high", "xhigh"] {
+        for admitted in ["low", "medium", "high", "xhigh", "max"] {
             input.effort = Some(admitted.into());
             assert_eq!(
                 resolve_admission(&input, &config)
@@ -968,13 +971,13 @@ mod admission_tests {
                 .as_deref(),
             Some("high")
         );
-        // `minimal` serializes on the codex wire enum but no OBSERVED model
-        // catalog lists it, and `max` is a catalog token whose wire mapping
-        // is unverified — both stay outside the admitted closed set.
+        // `minimal` is wire-valid per the API oracle but no observed model
+        // advertises it, and `ultra` is a catalog token the API oracle
+        // excludes — both stay outside the admitted closed set.
         for invalid in [
             "minimal",
-            "max",
             "ultra",
+            "none",
             "HIGH",
             "hi gh",
             "",

@@ -179,7 +179,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
 | `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 不支持非空清单（创建任务前返回 `codex_write_manifest_unsupported`）；dsh build 接受非空清单，进入 workspace-write 的 manifest-build 组合（仅 `tool-fs` 可写，清单外路径由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝），上限 256 条／序列化 64 KiB，显式 `["."]` 走现行 build 组合（此前与任意非空清单同样被拒），plan 仍必须为空；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
 | `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`） | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝；codex 使用自有模型 ID |
-| `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh`（`minimal`/`max` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
+| `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
 
 `PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。Codex 支持四模式：build/edit 映射 workspace-write，plan 映射 read-only，yolo 映射 danger-full-access；全部固定 approvalPolicy=never。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
 

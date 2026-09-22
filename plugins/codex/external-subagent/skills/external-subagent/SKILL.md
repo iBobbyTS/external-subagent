@@ -25,7 +25,7 @@ Spawn accepts an optional `effort` token that steers the task's reasoning
 effort. Omit it to keep each agent's current default (codex keeps its existing
 wire default; zcode and dsh send no effort field or call at all). `codex`
 admits only the closed set
-`low | medium | high | xhigh` — `minimal` and `max` are rejected;
+`low | medium | high | xhigh | max` — `minimal` and `ultra` are rejected;
 `zcode` and `dsh` accept any bounded token (1..24 bytes of `[a-z0-9_]`) and
 pass it through to the runtime, because the supported set is only known at
 runtime. A malformed or unsupported token is rejected before dispatch, so no
