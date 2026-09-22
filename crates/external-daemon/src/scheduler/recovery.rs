@@ -41,26 +41,15 @@ impl Scheduler {
             && task.process_identity.is_none()
         {
             if task.phase == TaskPhase::Queued {
+                // QUEUED rows keep flowing through the ordinary cancellation
+                // owner; cancelling the phase directly would fight the store's
+                // result phase guard.
                 self.cancel_task(&task.agent_id)?;
-            } else {
-                // A prior recovery committed stop intent but crashed before
-                // result persistence. Epoch zero proves no claim ever ran.
-                let route = task_route(task).map_err(SchedulerError::InvalidConfig)?;
-                validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
-                self.finish_unstarted_route(
-                    &task.agent_id,
-                    task.owner_epoch,
-                    &route,
-                    Some(task),
-                    UnstartedTerminal {
-                        outcome: CompletionOutcome::Cancelled,
-                        reason_code: "CANCELLED",
-                        message: "task cancelled before runtime launch",
-                    },
-                    true,
-                )?;
+                return Ok(());
             }
-            return Ok(());
+            // A prior recovery committed stop intent but crashed before result
+            // persistence. Epoch zero proves no claim ever ran.
+            return self.finish_never_claimed_cancellation(task);
         }
         match (&task.runtime_agent_id, &task.process_identity) {
             (Some(_), Some(identity)) => {
@@ -88,10 +77,17 @@ impl Scheduler {
             }
         }
 
-        let route = task_route(task).map_err(SchedulerError::InvalidConfig)?;
-        validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
-        let TaskRoute::General(prepared) = route;
         if task.phase == TaskPhase::Terminal {
+            // A TERMINAL row already owns an immutable result. Decoding the
+            // prepared row is no longer required to reap it: old-format rows
+            // that cannot decode are reaped as-is, keeping the stored outcome
+            // and result untouched.
+            let Ok(route) = task_route(task) else {
+                self.inner.store.reap_task(&task.agent_id)?;
+                return Ok(());
+            };
+            validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+            let TaskRoute::General(prepared) = route;
             if self.inner.store.task_result(&task.agent_id)?.is_none() {
                 return Err(SchedulerError::RuntimeCommand {
                     agent_id: task.agent_id.clone(),
@@ -108,6 +104,15 @@ impl Scheduler {
             self.inner.store.reap_task(&task.agent_id)?;
             return Ok(());
         }
+
+        // Active row. Old-format preparation no longer decodes; converge it by
+        // row type instead of failing the whole startup reconciliation.
+        let route = match task_route(task) {
+            Ok(route) => route,
+            Err(message) => return self.store_invalid_prepared_terminal(task, &message),
+        };
+        validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+        let TaskRoute::General(prepared) = route;
         let (outcome, reason_code, message) = if task.stop_requested || task.close_requested {
             (
                 CompletionOutcome::Cancelled,
@@ -130,6 +135,61 @@ impl Scheduler {
         }
         persist_general_result(&self.inner.store, &task.agent_id, &prepared, &completion)?;
         self.inner.store.reap_task(&task.agent_id)?;
+        Ok(())
+    }
+
+    /// Settle a never-claimed cancellation (`CANCELLING`, epoch 0, no session,
+    /// stop requested). A decodable row keeps the established unstarted
+    /// cancellation path; an undecodable old-format row converges to the same
+    /// `CANCELLED` outcome without needing the prepared payload.
+    fn finish_never_claimed_cancellation(&self, task: &TaskRecord) -> Result<(), SchedulerError> {
+        match task_route(task) {
+            Ok(route) => {
+                validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+                self.finish_unstarted_route(
+                    &task.agent_id,
+                    task.owner_epoch,
+                    &route,
+                    Some(task),
+                    UnstartedTerminal {
+                        outcome: CompletionOutcome::Cancelled,
+                        reason_code: "CANCELLED",
+                        message: "task cancelled before runtime launch",
+                    },
+                    true,
+                )?;
+                Ok(())
+            }
+            Err(message) => self.store_invalid_prepared_terminal(task, &message),
+        }
+    }
+
+    /// Converge a row whose prepared payload no longer decodes. Stop/close
+    /// intent wins (Cancelled, matching the control path); otherwise the row
+    /// fails closed as ResultInvalid.
+    fn store_invalid_prepared_terminal(
+        &self,
+        task: &TaskRecord,
+        message: &str,
+    ) -> Result<(), SchedulerError> {
+        let (outcome, reason_code, summary) = if task.stop_requested || task.close_requested {
+            (
+                CompletionOutcome::Cancelled,
+                "CANCELLED_PREPARED_INVALID",
+                "task cancelled with invalid prepared metadata",
+            )
+        } else {
+            (
+                CompletionOutcome::ResultInvalid,
+                "PREPARED_LAUNCH_INVALID",
+                message,
+            )
+        };
+        self.inner.store.store_task_result(
+            &task.agent_id,
+            &minimal_task_result(outcome, summary, reason_code),
+        )?;
+        self.record_failure(&task.agent_id, message.to_owned());
         Ok(())
     }
 }

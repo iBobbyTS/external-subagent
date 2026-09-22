@@ -56,7 +56,6 @@ use external_core::{
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
 };
-use runtime_owner::general_initial_prompt;
 pub use runtime_owner::{CommandRuntimeFactory, ManagedRuntime, RuntimeFactory};
 pub use scheduler::configure_diagnostic_log;
 use scheduler::{bounded_error, bounded_prefix, RuntimeLifecycle, RuntimeLifecyclePhase};
@@ -1277,12 +1276,7 @@ fn task_route(task: &TaskRecord) -> Result<TaskRoute, String> {
         Some(external_core::GENERAL_TASK_SCHEMA) => {
             let prepared: PreparedGeneralTask = serde_json::from_value(value)
                 .map_err(|_| "stored general preparation is invalid")?;
-            prepared
-                .validate_digest()
-                .map_err(|_| "stored general preparation digest is invalid")?;
-            if task.prepared_launch_sha256 != prepared.prepared_sha256
-                || task.workspace_path != prepared.workspace.path.to_string_lossy()
-            {
+            if task.workspace_path != prepared.workspace.path.to_string_lossy() {
                 return Err("stored task does not match its general preparation".into());
             }
             Ok(TaskRoute::General(Box::new(prepared)))
@@ -1388,7 +1382,6 @@ mod zcode_effort_tests {
             workspace_path: prepared.workspace.path.to_string_lossy().into_owned(),
             runtime_hash: None,
             prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
-            prepared_launch_sha256: prepared.prepared_sha256.clone(),
             initial_prompt: "effort passthrough".into(),
             owner_id: None,
             owner_epoch: 0,
@@ -1745,7 +1738,6 @@ mod task_route_tests {
             workspace_path: prepared.workspace.path.to_string_lossy().into_owned(),
             runtime_hash: None,
             prepared_launch_json: serde_json::to_string(prepared).unwrap(),
-            prepared_launch_sha256: prepared.prepared_sha256.clone(),
             initial_prompt: String::new(),
             owner_id: None,
             owner_epoch: 0,
@@ -1804,7 +1796,54 @@ mod task_route_tests {
         else {
             panic!("expected the general route");
         };
-        routed.validate_digest().expect("legacy digest stays valid");
         assert_eq!(routed.admission.as_ref().unwrap().effort, None);
+    }
+
+    #[test]
+    fn legacy_prepared_launch_json_is_rejected() {
+        // A row written before the control protocol was dropped still carries
+        // prompt_path/prompt_sha256/manifest_sha256/prepared_sha256. It must
+        // fail closed at the task-route decode instead of silently routing.
+        let legacy_json = serde_json::json!({
+            "schema": external_core::GENERAL_TASK_SCHEMA,
+            "agent_id": "s01-legacy-row",
+            "repository": "/repo",
+            "workspace": {"path": "/repo", "scratch_root": "/tmp/legacy"},
+            "permission_mode": "plan",
+            "prompt_path": "/tmp/legacy/prompt.txt",
+            "prompt_sha256": "legacy-prompt",
+            "write_manifest": [],
+            "manifest_sha256": "legacy-manifest",
+            "prepared_sha256": "legacy-prepared",
+        })
+        .to_string();
+        let record = TaskRecord {
+            agent_id: "s01-legacy-row".into(),
+            repository: "/repo".into(),
+            phase: TaskPhase::Queued,
+            outcome: None,
+            workspace_path: "/repo".into(),
+            runtime_hash: None,
+            prepared_launch_json: legacy_json,
+            initial_prompt: String::new(),
+            owner_id: None,
+            owner_epoch: 0,
+            close_requested: false,
+            stop_requested: false,
+            last_event_seq: 0,
+            failure_code: None,
+            failure_message: None,
+            runtime_agent_id: None,
+            session_id: None,
+            turn_state: TurnState::Idle,
+            process_identity: None,
+            closed_at: None,
+            reaped_at: None,
+            created_at: 0,
+        };
+        match task_route(&record) {
+            Err(message) => assert_eq!(message, "stored general preparation is invalid"),
+            Ok(_) => panic!("legacy prepared launch must not route"),
+        }
     }
 }

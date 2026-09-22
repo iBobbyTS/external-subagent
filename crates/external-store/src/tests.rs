@@ -13,7 +13,6 @@ fn task(id: &str, repository: &str, _scope: Option<&str>) -> NewTask {
         workspace_path: format!("/workspace/{id}"),
         runtime_hash: Some("runtime".into()),
         prepared_launch_json: "{}".into(),
-        prepared_launch_sha256: "prepared".into(),
         initial_prompt: "do work".into(),
     }
 }

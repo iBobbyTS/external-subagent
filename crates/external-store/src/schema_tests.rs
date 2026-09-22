@@ -109,7 +109,7 @@ INSERT INTO task_id_allocator(id, next_id) VALUES (1, 10000000);
 );
 
 use super::*;
-use crate::schema::initialize_schema;
+use crate::schema::{initialize_schema, schema_is_current};
 use rusqlite::Connection;
 use std::{fs, path::Path, time::Duration};
 
@@ -128,6 +128,21 @@ fn v12_fixture(path: &Path) {
         "UPDATE task_id_allocator SET next_id=10000002; PRAGMA user_version=12;"
     ))
         .unwrap();
+}
+
+fn v13_fixture(path: &Path) {
+    // v13 is the v12 shape after the historical column rename and before the
+    // prepared_launch_sha256 removal; no separate DDL copy is needed.
+    v12_fixture(path);
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(concat!(
+            "ALTER TABLE tasks RENAME COLUMN ",
+            "zcode_",
+            "session_id TO session_id"
+        ))
+        .unwrap();
+    connection.pragma_update(None, "user_version", 13).unwrap();
 }
 
 fn version(connection: &Connection) -> i64 {
@@ -159,10 +174,13 @@ fn v12_migration_preserves_records_and_lifecycle_across_reopen() {
     let store = Store::open(&path).unwrap();
     {
         let connection = store.connection.lock().unwrap();
-        assert_eq!(version(&connection), 13);
+        assert_eq!(version(&connection), 14);
         let names = columns(&connection);
         assert!(names.iter().any(|column| column == "session_id"));
         assert!(!names.iter().any(|column| column == OLD_COLUMN));
+        assert!(!names
+            .iter()
+            .any(|column| column == "prepared_launch_sha256"));
         assert_eq!(
             connection
                 .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
@@ -187,7 +205,7 @@ fn v12_migration_preserves_records_and_lifecycle_across_reopen() {
     let store = Store::open(&path).unwrap();
     assert_eq!(store.get_task("10000001").unwrap().unwrap(), migrated);
     assert_eq!(store.message("message").unwrap().unwrap(), message);
-    assert_eq!(version(&store.connection.lock().unwrap()), 13);
+    assert_eq!(version(&store.connection.lock().unwrap()), 14);
     assert_eq!(store.reserve_task_id().unwrap(), "10000002");
     // Exercise the store lifecycle consumed by spawn/wait/result after migration.
     let claim = store.claim_next("daemon", 10, 1).unwrap().unwrap();
@@ -285,12 +303,62 @@ fn v12_commit_failure_rolls_back_rename_and_version() {
             .as_deref(),
         Some("t_123")
     );
-    assert_eq!(version(&reopened.connection.lock().unwrap()), 13);
+    assert_eq!(version(&reopened.connection.lock().unwrap()), 14);
+}
+
+#[test]
+fn v13_migration_drops_legacy_digest_column() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v13.sqlite3");
+    v13_fixture(&path);
+    let before = Connection::open(&path).unwrap();
+    assert_eq!(version(&before), 13);
+    assert!(columns(&before)
+        .iter()
+        .any(|column| column == "prepared_launch_sha256"));
+    drop(before);
+
+    let store = Store::open(&path).unwrap();
+    {
+        let connection = store.connection.lock().unwrap();
+        assert_eq!(version(&connection), 14);
+        assert!(!columns(&connection)
+            .iter()
+            .any(|column| column == "prepared_launch_sha256"));
+        assert!(schema_is_current(&connection).unwrap());
+    }
+    let migrated = store.get_task("10000001").unwrap().unwrap();
+    assert_eq!(migrated.session_id.as_deref(), Some("t_123"));
+    assert_eq!(migrated.initial_prompt, "do work");
+    assert_eq!(migrated.created_at, 123);
+    assert_eq!(store.message("message").unwrap().unwrap().content, "follow up");
+}
+
+#[test]
+fn v12_chain_migration_supports_a_fresh_enqueue() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v12-enqueue.sqlite3");
+    v12_fixture(&path);
+
+    let store = Store::open(&path).unwrap();
+    let enqueued = store
+        .enqueue_task_authoritative(&NewTask {
+            agent_id: "10000003".into(),
+            repository: "/repo".into(),
+            workspace_path: "/workspace/new".into(),
+            runtime_hash: None,
+            prepared_launch_json: "{}".into(),
+            initial_prompt: "new work".into(),
+        })
+        .unwrap();
+    assert_eq!(enqueued.phase, TaskPhase::Queued);
+    assert_eq!(enqueued.initial_prompt, "new work");
+    assert_eq!(version(&store.connection.lock().unwrap()), 14);
 }
 
 #[test]
 fn unsupported_versions_preserve_even_a_v12_shaped_database() {
-    for unsupported in [0, 8, 11, 14] {
+    for unsupported in [0, 8, 11, 15] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("unsupported.sqlite3");
         v12_fixture(&path);
@@ -312,8 +380,11 @@ fn fresh_database_uses_only_new_session_column() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(directory.path().join("fresh.sqlite3")).unwrap();
     let connection = store.connection.lock().unwrap();
-    assert_eq!(version(&connection), 13);
+    assert_eq!(version(&connection), 14);
     let names = columns(&connection);
     assert!(names.iter().any(|column| column == "session_id"));
     assert!(!names.iter().any(|column| column == OLD_COLUMN));
+    assert!(!names
+        .iter()
+        .any(|column| column == "prepared_launch_sha256"));
 }

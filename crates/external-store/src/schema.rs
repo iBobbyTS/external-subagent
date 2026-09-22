@@ -2,7 +2,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::{StoreError, StoreResult};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -15,7 +15,6 @@ CREATE TABLE tasks (
     workspace_path TEXT NOT NULL,
     runtime_hash TEXT,
     prepared_launch_json TEXT NOT NULL,
-    prepared_launch_sha256 TEXT NOT NULL,
     initial_prompt TEXT NOT NULL,
     session_id TEXT,
     turn_state TEXT NOT NULL DEFAULT 'IDLE',
@@ -119,15 +118,21 @@ pub(crate) fn initialize_schema(connection: &mut Connection) -> StoreResult<()> 
         |row| row.get(0),
     )?;
     if user_tables != 0 {
-        if !matches!(version, 12 | SCHEMA_VERSION) || !schema_is_current(&transaction)? {
+        if !matches!(version, 12 | 13 | SCHEMA_VERSION) || !schema_is_current(&transaction)? {
             return Err(StoreError::LegacySchemaUnsupported);
         }
         if version == 12 {
+            // v12 carried the historical column name; fold that rename and the
+            // v14 column removal into one transaction so the database either
+            // reaches the current shape or keeps its original bytes.
             transaction.execute_batch(concat!(
                 "ALTER TABLE tasks RENAME COLUMN ",
                 "zcode_",
                 "session_id TO session_id"
             ))?;
+        }
+        if version != SCHEMA_VERSION {
+            transaction.execute_batch("ALTER TABLE tasks DROP COLUMN prepared_launch_sha256")?;
             transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
     } else {

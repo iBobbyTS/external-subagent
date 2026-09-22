@@ -1284,7 +1284,6 @@ fn codex_task_record(directory: &Path) -> TaskRecord {
         workspace_path: canonical.to_string_lossy().into_owned(),
         runtime_hash: None,
         prepared_launch_json: serde_json::to_string(&prepared).unwrap(),
-        prepared_launch_sha256: prepared.prepared_sha256.clone(),
         initial_prompt: "prompt".into(),
         owner_id: None,
         owner_epoch: 0,
@@ -1322,7 +1321,6 @@ fn routing_keeps_zcode_and_dsh_on_their_factories() {
         .unwrap();
     let mut task = codex_task_record(workspace.path());
     task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
-    task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
     let error = factory
         .spawn(&task, Arc::clone(&sink))
         .err()
@@ -1345,7 +1343,6 @@ fn routing_keeps_zcode_and_dsh_on_their_factories() {
         .unwrap();
     let mut task = codex_task_record(workspace.path());
     task.prepared_launch_json = serde_json::to_string(&prepared).unwrap();
-    task.prepared_launch_sha256 = prepared.prepared_sha256.clone();
     let error = factory
         .spawn(&task, Arc::clone(&sink))
         .err()

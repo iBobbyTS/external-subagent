@@ -36,14 +36,15 @@ impl Scheduler {
         };
         let prepared_json = serde_json::to_string(&prepared)
             .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-        let initial_prompt = general_initial_prompt(&prepared)?;
+        // The caller prompt is the first turn verbatim: no daemon-authored
+        // control block, separator, or digest is prepended.
+        let initial_prompt = manifest.prompt.clone();
         let task = NewTask {
             agent_id: prepared.agent_id.clone(),
             repository: prepared.repository.to_string_lossy().into_owned(),
             workspace_path: prepared.workspace.path.to_string_lossy().into_owned(),
             runtime_hash: None,
             prepared_launch_json: prepared_json,
-            prepared_launch_sha256: prepared.prepared_sha256.clone(),
             initial_prompt,
         };
         let enqueued = self.inner.store.enqueue_task_authoritative(&task)?;

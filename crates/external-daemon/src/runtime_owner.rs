@@ -1,13 +1,13 @@
 use crate::{
     task_route, LifecycleSink, RuntimeActivitySnapshot, RuntimeCommandError, RuntimeOwner,
-    RuntimeTerminal, SchedulerError, SessionReady, TaskRoute, TurnBoundary, TurnSnapshot,
+    RuntimeTerminal, SessionReady, TaskRoute, TurnBoundary, TurnSnapshot,
 };
 use external_contract::StdioMcpServer;
-use external_core::{general_launch_prompt, PreparedGeneralTask, ValidatedPermissionDenial};
+use external_core::ValidatedPermissionDenial;
 use external_runtime::ProcessIdentity;
 use external_store::TaskRecord;
 use std::{
-    fs, io,
+    io,
     path::Path,
     process::Command,
     sync::Arc,
@@ -322,16 +322,4 @@ where
         apply_agent_policy_environment(&mut command, task)?;
         Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
     }
-}
-
-pub(crate) fn general_initial_prompt(
-    prepared: &PreparedGeneralTask,
-) -> Result<String, SchedulerError> {
-    prepared
-        .validate_prepared_content()
-        .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-    let caller_prompt = fs::read_to_string(&prepared.prompt_path)
-        .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))?;
-    general_launch_prompt(prepared, &caller_prompt)
-        .map_err(|error| SchedulerError::InvalidConfig(error.to_string()))
 }

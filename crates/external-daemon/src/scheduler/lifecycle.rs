@@ -628,7 +628,6 @@ impl Scheduler {
         sink.runtime_lifecycle.terminalize();
         match route {
             TaskRoute::General(prepared) => {
-                let resumed = !prepared.prompt_path.is_file();
                 let (outcome, reason) = forced_outcome.unwrap_or_else(|| {
                     let outcome = match &terminal {
                         RuntimeTerminal::Completed(_) if natural_completion => {
@@ -681,25 +680,11 @@ impl Scheduler {
                 let mut completion = if natural_completed {
                     let terminal_text = sink.activity.take_terminal_text();
                     let mut completion = match &terminal_text {
-                        TerminalText::Visible(_) if resumed => GeneralFinalizer::finalize_resumed(
-                            prepared,
-                            CompletionOutcome::Completed,
-                        ),
                         TerminalText::Visible(_) => {
-                            GeneralFinalizer::finalize_completed_tree(prepared)
+                            GeneralFinalizer::finalize(prepared, CompletionOutcome::Completed)
                         }
                         TerminalText::Missing => {
-                            if resumed {
-                                GeneralFinalizer::finalize_resumed(
-                                    prepared,
-                                    CompletionOutcome::ResultInvalid,
-                                )
-                            } else {
-                                GeneralFinalizer::finalize(
-                                    prepared,
-                                    CompletionOutcome::ResultInvalid,
-                                )
-                            }
+                            GeneralFinalizer::finalize(prepared, CompletionOutcome::ResultInvalid)
                         }
                     };
                     match terminal_text {
@@ -716,11 +701,7 @@ impl Scheduler {
                     }
                     GeneralFinalizer::finish_cleanup(prepared, completion)
                 } else if process_group_reaped {
-                    if resumed {
-                        GeneralFinalizer::finalize_resumed(prepared, outcome)
-                    } else {
-                        GeneralFinalizer::finalize(prepared, outcome)
-                    }
+                    GeneralFinalizer::finalize(prepared, outcome)
                 } else {
                     unreaped_general(outcome, &reason, &reason)
                 };

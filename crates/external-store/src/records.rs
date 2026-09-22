@@ -87,7 +87,6 @@ pub struct NewTask {
     pub workspace_path: String,
     pub runtime_hash: Option<String>,
     pub prepared_launch_json: String,
-    pub prepared_launch_sha256: String,
     pub initial_prompt: String,
 }
 
@@ -100,7 +99,6 @@ pub struct TaskRecord {
     pub workspace_path: String,
     pub runtime_hash: Option<String>,
     pub prepared_launch_json: String,
-    pub prepared_launch_sha256: String,
     pub initial_prompt: String,
     pub owner_id: Option<String>,
     pub owner_epoch: u64,

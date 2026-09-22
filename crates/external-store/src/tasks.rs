@@ -64,15 +64,14 @@ impl Store {
         transaction.execute(
             "INSERT INTO tasks (
                 agent_id,repository,phase,workspace_path,runtime_hash,prepared_launch_json,
-                prepared_launch_sha256,initial_prompt,created_at
-             ) VALUES (?1,?2,'QUEUED',?3,?4,?5,?6,?7,?8)",
+                initial_prompt,created_at
+             ) VALUES (?1,?2,'QUEUED',?3,?4,?5,?6,?7)",
             params![
                 task.agent_id,
                 task.repository,
                 task.workspace_path,
                 task.runtime_hash,
                 task.prepared_launch_json,
-                task.prepared_launch_sha256,
                 task.initial_prompt,
                 created_at,
             ],
@@ -348,10 +347,6 @@ fn validate_task(task: &NewTask) -> StoreResult<()> {
         ("repository", task.repository.as_str()),
         ("workspace_path", task.workspace_path.as_str()),
         ("prepared_launch_json", task.prepared_launch_json.as_str()),
-        (
-            "prepared_launch_sha256",
-            task.prepared_launch_sha256.as_str(),
-        ),
         ("initial_prompt", task.initial_prompt.as_str()),
     ] {
         if value.trim().is_empty() || value.contains('\0') {
@@ -380,7 +375,6 @@ type TaskRow = (
     Option<String>,
     String,
     String,
-    String,
     Option<String>,
     i64,
     i64,
@@ -407,7 +401,7 @@ pub(crate) fn query_task(
     let row = connection
         .query_row(
             "SELECT agent_id,repository,phase,outcome,
-                    workspace_path,runtime_hash,prepared_launch_json,prepared_launch_sha256,
+                    workspace_path,runtime_hash,prepared_launch_json,
                     initial_prompt,owner_id,owner_epoch,
                     close_requested,stop_requested,failure_code,failure_message,runtime_agent_id,
                     session_id,turn_state,pid,process_group_id,process_uid,process_start_token,
@@ -441,7 +435,6 @@ pub(crate) fn query_task(
                     row.get(22)?,
                     row.get(23)?,
                     row.get(24)?,
-                    row.get(25)?,
                 ))
             },
         )
@@ -450,7 +443,7 @@ pub(crate) fn query_task(
 }
 
 fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
-    let process_identity = match (row.18, row.19, row.20, row.21) {
+    let process_identity = match (row.17, row.18, row.19, row.20) {
         (Some(pid), Some(process_group_id), Some(uid), Some(start_token)) => {
             Some(StoredProcessIdentity {
                 pid: u32::try_from(pid)
@@ -478,22 +471,21 @@ fn convert_task_row(row: TaskRow) -> StoreResult<TaskRecord> {
         workspace_path: row.4,
         runtime_hash: row.5,
         prepared_launch_json: row.6,
-        prepared_launch_sha256: row.7,
-        initial_prompt: row.8,
-        owner_id: row.9,
-        owner_epoch: i64_to_u64(row.10)?,
-        close_requested: row.11 != 0,
-        stop_requested: row.12 != 0,
-        failure_code: row.13,
-        failure_message: row.14,
-        runtime_agent_id: row.15,
-        session_id: row.16,
-        turn_state: TurnState::parse(&row.17)?,
+        initial_prompt: row.7,
+        owner_id: row.8,
+        owner_epoch: i64_to_u64(row.9)?,
+        close_requested: row.10 != 0,
+        stop_requested: row.11 != 0,
+        failure_code: row.12,
+        failure_message: row.13,
+        runtime_agent_id: row.14,
+        session_id: row.15,
+        turn_state: TurnState::parse(&row.16)?,
         process_identity,
-        closed_at: row.22,
-        reaped_at: row.23,
-        created_at: row.24,
-        last_event_seq: i64_to_u64(row.25)?,
+        closed_at: row.21,
+        reaped_at: row.22,
+        created_at: row.23,
+        last_event_seq: i64_to_u64(row.24)?,
     })
 }
 

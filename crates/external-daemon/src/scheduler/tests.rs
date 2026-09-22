@@ -1361,3 +1361,248 @@ sleep 2
         assert_eq!(failures.get("agent").map(String::as_str), Some("latest"));
     }
 }
+
+#[cfg(test)]
+mod bare_prompt_admission_tests {
+    use super::*;
+
+    fn workspace(prefix: &str) -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(base)
+            .unwrap()
+    }
+
+    fn open_scheduler(directory: &tempfile::TempDir) -> Scheduler {
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> io::Result<Command> {
+                panic!("admission must never spawn a provider")
+            },
+        ));
+        Scheduler::new(
+            "prompt-owner",
+            Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap()),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn admitted_prompt_is_the_first_turn_byte_for_byte() {
+        for prompt in [
+            "第一行\n\n徐→π\n trailing ",
+            "  leading and trailing whitespace  ",
+            "single line",
+        ] {
+            let directory = workspace("bare-prompt-");
+            let scheduler = open_scheduler(&directory);
+            let task = scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: "zcode-general-task/v1".into(),
+                    agent_id: String::new(),
+                    repository: directory.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Build,
+                    prompt: prompt.into(),
+                    write_manifest: vec![],
+                })
+                .unwrap();
+            assert_eq!(task.initial_prompt.as_bytes(), prompt.as_bytes());
+
+            let reopened = Store::open(directory.path().join("state.sqlite")).unwrap();
+            let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
+            assert_eq!(stored.initial_prompt.as_bytes(), prompt.as_bytes());
+            let prepared: external_core::PreparedGeneralTask =
+                serde_json::from_str(&stored.prepared_launch_json).unwrap();
+            assert!(
+                !prepared.workspace.scratch_root.join("prompt.txt").exists(),
+                "admission must not persist prompt.txt"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_row_recovery_tests {
+    use super::*;
+    use external_store::TaskResult;
+
+    fn workspace(prefix: &str) -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(base)
+            .unwrap()
+    }
+
+    fn open_scheduler(directory: &tempfile::TempDir) -> Scheduler {
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> io::Result<Command> {
+                panic!("startup recovery must never spawn a provider")
+            },
+        ));
+        Scheduler::new(
+            "recovery-owner",
+            Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap()),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+    }
+
+    /// A pre-v14 prepared payload: it still names the removed prompt path and
+    /// digest fields, so `deny_unknown_fields` refuses to decode it.
+    fn legacy_prepared_json(repository: &Path, scratch_root: &Path) -> String {
+        serde_json::json!({
+            "schema": external_core::GENERAL_TASK_SCHEMA,
+            "agent_id": "10000001",
+            "repository": repository,
+            "workspace": {"path": repository, "scratch_root": scratch_root},
+            "permission_mode": "plan",
+            "prompt_path": scratch_root.join("prompt.txt"),
+            "prompt_sha256": "legacy-prompt",
+            "write_manifest": [],
+            "manifest_sha256": "legacy-manifest",
+            "prepared_sha256": "legacy-prepared",
+        })
+        .to_string()
+    }
+
+    fn enqueue_legacy(
+        scheduler: &Scheduler,
+        directory: &tempfile::TempDir,
+    ) -> (String, PathBuf) {
+        let repository = directory.path().canonicalize().unwrap();
+        let scratch_root = repository.join("scratch");
+        fs::create_dir_all(&scratch_root).unwrap();
+        scheduler
+            .store()
+            .enqueue_task_authoritative(&NewTask {
+                agent_id: "10000001".into(),
+                repository: repository.to_string_lossy().into_owned(),
+                workspace_path: repository.to_string_lossy().into_owned(),
+                runtime_hash: None,
+                prepared_launch_json: legacy_prepared_json(&repository, &scratch_root),
+                initial_prompt: "legacy prompt".into(),
+            })
+            .unwrap();
+        (repository.to_string_lossy().into_owned(), scratch_root)
+    }
+
+    fn fresh_manifest(directory: &tempfile::TempDir) -> GeneralTaskManifest {
+        GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Build,
+            prompt: "fresh work after upgrade".into(),
+            write_manifest: vec![],
+        }
+    }
+
+    #[test]
+    fn legacy_active_row_without_intent_converges_to_result_invalid_and_stays_usable() {
+        let directory = workspace("legacy-active-");
+        let scheduler = open_scheduler(&directory);
+        let (repository, _scratch) = enqueue_legacy(&scheduler, &directory);
+        scheduler
+            .store()
+            .claim_next("prior-owner", 10, 1)
+            .unwrap()
+            .unwrap();
+        drop(scheduler);
+
+        let reopened = open_scheduler(&directory);
+        let recovered = reopened.reconcile_startup().unwrap();
+        assert_eq!(
+            recovered,
+            vec![("10000001".to_string(), TaskOutcome::ResultInvalid)]
+        );
+        let settled = reopened.store().get_task("10000001").unwrap().unwrap();
+        assert_eq!(settled.phase, TaskPhase::Terminal);
+        assert_eq!(settled.outcome, Some(TaskOutcome::ResultInvalid));
+
+        // New admissions still work once the legacy row has a terminal state.
+        let fresh = reopened.enqueue_general(&fresh_manifest(&directory)).unwrap();
+        assert_eq!(fresh.phase, TaskPhase::Queued);
+        assert_eq!(
+            fresh.repository,
+            Path::new(&repository).to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_unreaped_row_is_reaped_without_rewriting_result() {
+        let directory = workspace("legacy-terminal-");
+        let scheduler = open_scheduler(&directory);
+        enqueue_legacy(&scheduler, &directory);
+        scheduler
+            .store()
+            .claim_next("prior-owner", 10, 1)
+            .unwrap()
+            .unwrap();
+        let original = TaskResult {
+            outcome: TaskOutcome::RuntimeLost,
+            final_text: "old immutable result".into(),
+            partial: true,
+        };
+        scheduler
+            .store()
+            .store_task_result("10000001", &original)
+            .unwrap();
+        let before = scheduler.store().get_task("10000001").unwrap().unwrap();
+        assert_eq!(before.phase, TaskPhase::Terminal);
+        assert!(before.reaped_at.is_none());
+        drop(scheduler);
+
+        let reopened = open_scheduler(&directory);
+        let recovered = reopened.reconcile_startup().unwrap();
+        assert_eq!(
+            recovered,
+            vec![("10000001".to_string(), TaskOutcome::RuntimeLost)]
+        );
+        let after = reopened.store().get_task("10000001").unwrap().unwrap();
+        assert_eq!(after.outcome, before.outcome);
+        assert!(after.reaped_at.is_some());
+        assert_eq!(
+            reopened
+                .store()
+                .task_result("10000001")
+                .unwrap()
+                .unwrap()
+                .result,
+            original
+        );
+    }
+
+    #[test]
+    fn legacy_never_claimed_cancellation_converges_to_cancelled() {
+        let directory = workspace("legacy-never-claimed-");
+        let scheduler = open_scheduler(&directory);
+        enqueue_legacy(&scheduler, &directory);
+        scheduler.store().request_stop("10000001").unwrap();
+        let before = scheduler.store().get_task("10000001").unwrap().unwrap();
+        assert_eq!(before.phase, TaskPhase::Cancelling);
+        assert_eq!(before.owner_epoch, 0);
+        assert!(before.session_id.is_none());
+        assert!(before.stop_requested);
+        assert!(before.runtime_agent_id.is_none());
+        assert!(before.process_identity.is_none());
+        drop(scheduler);
+
+        let reopened = open_scheduler(&directory);
+        let recovered = reopened.reconcile_startup().unwrap();
+        assert_eq!(
+            recovered,
+            vec![("10000001".to_string(), TaskOutcome::Cancelled)]
+        );
+        let after = reopened.store().get_task("10000001").unwrap().unwrap();
+        assert_eq!(after.phase, TaskPhase::Terminal);
+        assert_eq!(after.outcome, Some(TaskOutcome::Cancelled));
+    }
+}

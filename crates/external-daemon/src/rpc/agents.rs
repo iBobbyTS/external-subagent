@@ -1116,7 +1116,6 @@ mod admission_tests {
         let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
         let prepared: external_core::PreparedGeneralTask =
             serde_json::from_str(&stored.prepared_launch_json).unwrap();
-        prepared.validate_digest().unwrap();
         assert_eq!(prepared.admission.as_ref(), Some(&identity));
         assert!(
             stored.prepared_launch_json.contains("\"effort\":\"high\""),
@@ -1160,7 +1159,6 @@ mod admission_tests {
         let stored = reopened.get_task(&task.agent_id).unwrap().unwrap();
         let prepared: external_core::PreparedGeneralTask =
             serde_json::from_str(&stored.prepared_launch_json).unwrap();
-        prepared.validate_digest().unwrap();
         assert_eq!(prepared.admission.as_ref(), Some(&identity));
         assert_eq!(
             flat_identity(&task_view(stored).input_identity),
@@ -1790,7 +1788,6 @@ mod admission_policy_tests {
             let stored = reopened.get_task(agent_id).unwrap().unwrap();
             let prepared: external_core::PreparedGeneralTask =
                 serde_json::from_str(&stored.prepared_launch_json).unwrap();
-            prepared.validate_digest().unwrap();
             assert_eq!(prepared.admission.as_ref(), Some(identity));
             assert_eq!(prepared.write_manifest, vec![PathBuf::from(".")]);
         }
@@ -1823,7 +1820,6 @@ mod admission_policy_tests {
         let stored = reopened.get_task(&manifest_task.agent_id).unwrap().unwrap();
         let prepared: external_core::PreparedGeneralTask =
             serde_json::from_str(&stored.prepared_launch_json).unwrap();
-        prepared.validate_digest().unwrap();
         assert_eq!(
             prepared.write_manifest,
             vec![PathBuf::from("src/a.rs"), PathBuf::from("docs")]
