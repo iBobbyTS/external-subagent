@@ -1268,6 +1268,48 @@ fn home_precedence_and_runtime_path_bounds() {
     assert!(error.to_string().contains("absolute executable file"));
 }
 
+#[test]
+fn child_command_strips_inherited_auth_environment() {
+    let _env = env_test_guard();
+    let directory = tempfile::tempdir().unwrap();
+    let script = executable_script(
+        directory.path(),
+        "env-probe.sh",
+        "printf '%s\\n' \"${OPENAI_API_KEY:-unset}:${OPENAI_BASE_URL:-unset}\" > env.txt\nsleep 5\n",
+    );
+    let previous_key = std::env::var_os("OPENAI_API_KEY");
+    let previous_base = std::env::var_os("OPENAI_BASE_URL");
+    std::env::set_var("OPENAI_API_KEY", "sk-inherited");
+    std::env::set_var("OPENAI_BASE_URL", "https://inherited.example");
+
+    let launch = CodexLaunch::new(script, directory.path().join("home"));
+    let sink: Arc<dyn LifecycleSink> = Arc::new(NoopSink);
+    let owner = CodexRuntimeOwner::spawn(launch.command(directory.path()), sink).unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    let env_report = loop {
+        if let Ok(report) = std::fs::read_to_string(directory.path().join("env.txt")) {
+            break report;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child never recorded its auth environment"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(env_report.trim(), "unset:unset");
+    let terminal = owner.stop(Duration::from_secs(2));
+    assert!(terminal_proves_process_group_reaped(&terminal));
+
+    match previous_key {
+        Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+        None => std::env::remove_var("OPENAI_API_KEY"),
+    }
+    match previous_base {
+        Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+        None => std::env::remove_var("OPENAI_BASE_URL"),
+    }
+}
+
 fn codex_task_record(directory: &Path) -> TaskRecord {
     let canonical = directory.canonicalize().unwrap();
     let prepared = external_core::GeneralTaskPreparer::new(Vec::new())

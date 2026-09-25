@@ -113,11 +113,15 @@ impl CodexLaunch {
     /// The pinned child command: `<runtime> app-server --listen stdio://`
     /// with the resolved home exported as `CODEX_HOME` and the task
     /// workspace as the working directory (mirroring the observed probe
-    /// launch, where the process cwd matched the thread cwd).
+    /// launch, where the process cwd matched the thread cwd). Inherited
+    /// provider credentials are removed so authentication follows only
+    /// the resolved home's `auth.json`.
     pub fn command(&self, cwd: &Path) -> Command {
         let mut command = Command::new(&self.runtime_path);
         command.args(["app-server", "--listen", "stdio://"]);
         command.env("CODEX_HOME", &self.home);
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("OPENAI_BASE_URL");
         command.current_dir(cwd);
         command
     }
