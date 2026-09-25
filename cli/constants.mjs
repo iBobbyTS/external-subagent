@@ -8,7 +8,7 @@ const IS_DEBUG_VARIANT = process.env.EXTERNAL_SUBAGENT_VARIANT === 'debug';
 
 export const PRODUCT_NAME = IS_DEBUG_VARIANT ? 'external-subagent-debug' : 'external-subagent';
 export const PRODUCT_ID = IS_DEBUG_VARIANT ? 'external_subagent_debug' : 'external_subagent';
-export const VERSION = '0.1.3';
+export const VERSION = '0.1.4';
 export const LAUNCH_AGENT_LABEL = IS_DEBUG_VARIANT ? 'com.external-subagent-debug.daemon' : 'com.external-subagent.daemon';
 export const DAEMON_BIN_NAME = IS_DEBUG_VARIANT ? 'external-subagent-debugd' : 'external-subagentd';
 export const MCP_BIN_NAME = IS_DEBUG_VARIANT ? 'external-subagent-debug-mcp' : 'external-subagent-mcp';
