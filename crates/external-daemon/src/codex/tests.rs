@@ -2676,3 +2676,179 @@ sleep 1
         assert_eq!(turn_starts, 0, "no turn may start on an unverified resume");
     }
 }
+
+/// S01: the runtime line cap is 16 MiB, so a terminal frame that replays the
+/// whole turn must reach the codex projection intact instead of being dropped
+/// as oversized and hanging the task.
+#[test]
+fn two_megabyte_turn_completed_frame_completes_the_task() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let pad = "Z".repeat(2_300_000);
+    let frame = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {
+                "id": "codex-turn-1",
+                "status": "completed",
+                "error": null,
+                "items": [{"type": "agentMessage", "id": "msg_1", "text": pad}],
+            },
+        },
+    })
+    .to_string();
+    std::fs::write(
+        workspace.path().join("large-turn-completed.json"),
+        format!("{frame}\n"),
+    )
+    .unwrap();
+    let echo = start_echo(workspace.path(), PermissionMode::Plan);
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+cat large-turn-completed.json
+sleep 2
+"#
+    );
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(&script, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "replay the large terminal frame"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        result.result.final_text, pad,
+        "the full terminal payload must be visible"
+    );
+    assert!(!result.result.partial);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.session_id.as_deref(), Some(THREAD_ID));
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+    assert!(task.reaped_at.is_some());
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while scheduler.active_count() != 0 {
+        assert!(Instant::now() < deadline, "runtime was not released");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn codex_event_count(workspace: &Path, agent_id: &str, event_type: &str) -> i64 {
+    let connection = rusqlite::Connection::open(workspace.join("state.sqlite")).unwrap();
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type=?2",
+            rusqlite::params![agent_id, event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn codex_oversize_script(directory: &Path, prefix: &str, tail: &str) -> String {
+    format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+{prefix}
+head -c {bytes} /dev/zero
+{tail}
+"#,
+        echo = start_echo(directory, PermissionMode::Plan),
+        bytes = external_runtime::MAX_NDJSON_LINE_BYTES + 1,
+    )
+}
+
+const CODEX_TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+
+/// S01 AC3: a codex provider that emits an oversized frame and keeps running
+/// fails explicitly instead of hanging RUNNING.
+#[test]
+fn codex_oversized_frame_fails_explicitly_and_reaps_the_provider() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let script = codex_oversize_script(
+        workspace.path(),
+        "",
+        "while [ ! -f test-release ]; do sleep 0.05; done",
+    );
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(&script, workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "oversized codex frame"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    let pgid = loop {
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        if task.phase == TaskPhase::Running {
+            if let Some(identity) = task.process_identity.clone() {
+                break identity.process_group_id;
+            }
+        }
+        assert!(Instant::now() < deadline, "task never reached RUNNING");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    assert_eq!(
+        scheduler
+            .store()
+            .terminal_reason_code(&agent_id)
+            .unwrap()
+            .as_deref(),
+        Some(CODEX_TRANSPORT_REASON)
+    );
+    assert_eq!(codex_event_count(workspace.path(), &agent_id, "driver.oversized_line"), 1);
+    // The provider was blocked after its oversized write and never exited on
+    // its own, so no child-exit boundary can explain the terminal.
+    assert_eq!(codex_event_count(workspace.path(), &agent_id, "driver.child_exited"), 0);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    assert!(task.reaped_at.is_some());
+    assert!(external_runtime::observe_process_group(pgid).unwrap().is_empty());
+    let record: serde_json::Value =
+        serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
+    assert_eq!(record["stage"], "transport");
+    assert_eq!(record["error_code"], CODEX_TRANSPORT_REASON);
+    assert!(
+        record["cleanup_result"].as_str().unwrap().contains("Stopped"),
+        "{record}"
+    );
+    assert_eq!(
+        scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+        result
+    );
+}

@@ -1606,3 +1606,628 @@ mod legacy_row_recovery_tests {
         assert_eq!(after.outcome, Some(TaskOutcome::Cancelled));
     }
 }
+
+
+#[cfg(test)]
+mod transport_failure_tests {
+    use super::*;
+
+    const FRAME_LIMIT: usize = external_runtime::MAX_NDJSON_LINE_BYTES;
+    const TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+
+    /// The transport fixtures each push a >16 MiB frame through a real child
+    /// pipe; serialize them so the parallel suite is not starved by their
+    /// byte-wise reads (mirrors the codex/DSH scripted-child guards).
+    static TRANSPORT_CHILD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn transport_child_guard() -> std::sync::MutexGuard<'static, ()> {
+        TRANSPORT_CHILD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn transport_workspace(prefix: &str) -> tempfile::TempDir {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    /// A scheduler whose child command is selected from the task's prompt, so
+    /// one fixture can exercise both the failing transport task and a queued
+    /// follow-up task with a normal completion.
+    fn transport_scheduler<F>(directory: &Path, script_for: F) -> Scheduler
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
+        let directory = directory.to_owned();
+        let factory = CommandRuntimeFactory::new(move |task: &TaskRecord| {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", &script_for(&task.initial_prompt)])
+                .current_dir(&directory);
+            Ok(command)
+        });
+        Scheduler::new(
+            "transport-test",
+            store,
+            Arc::new(factory),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                stop_grace: Duration::from_millis(250),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn enqueue(scheduler: &Scheduler, directory: &Path, prompt: &str) -> String {
+        scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: String::new(),
+                repository: directory.canonicalize().unwrap(),
+                permission_mode: external_core::PermissionMode::Plan,
+                prompt: prompt.into(),
+                write_manifest: Vec::new(),
+            })
+            .unwrap()
+            .agent_id
+    }
+
+    fn await_result(scheduler: &Scheduler, agent_id: &str) -> external_store::StoredTaskResult {
+        await_result_within(scheduler, agent_id, Duration::from_secs(30))
+    }
+
+    fn await_result_within(
+        scheduler: &Scheduler,
+        agent_id: &str,
+        within: Duration,
+    ) -> external_store::StoredTaskResult {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no terminal result in time");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn await_running_identity(
+        scheduler: &Scheduler,
+        agent_id: &str,
+    ) -> (TaskRecord, external_store::StoredProcessIdentity) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+            if let Some(identity) = task.process_identity.clone() {
+                if task.phase == TaskPhase::Running {
+                    return (task, identity);
+                }
+            }
+            assert!(Instant::now() < deadline, "task never reached RUNNING");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn oversized_events(directory: &Path, agent_id: &str) -> i64 {
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='driver.oversized_line'",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The zcode bootstrap prefix used by the S01 transport fixtures: three
+    /// request/response pairs plus a turn.started boundary, leaving the task
+    /// RUNNING with its monitor attached.
+    const ZCODE_RUNNING_PREFIX: &str = r#"
+read request
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"transport-session"}}}'
+read request
+printf '%s\n' '{"id":2,"result":{}}'
+read request
+printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+"#;
+
+    fn oversized_output() -> String {
+        format!("head -c {} /dev/zero\n", FRAME_LIMIT + 1)
+    }
+
+    fn assert_transport_diagnostic(record: &serde_json::Value, expect_cleanup: &str) {
+        assert_eq!(record["stage"], "transport");
+        assert_eq!(record["error_code"], TRANSPORT_REASON);
+        assert_eq!(record["bytes"], (FRAME_LIMIT + 1) as u64);
+        assert_eq!(record["cap"], FRAME_LIMIT as u64);
+        assert!(record["last_event_seq"].as_u64().unwrap() >= 1);
+        assert!(
+            record["cleanup_result"]
+                .as_str()
+                .unwrap()
+                .contains(expect_cleanup),
+            "{record}"
+        );
+    }
+
+    /// Pauses the monitor inside the transport-failure closure so a test can
+    /// pin the exact interleaving before the real cleanup runs.
+    struct TransportBarrier {
+        ready: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl TransportBarrier {
+        fn install(scheduler: &Scheduler) -> Self {
+            let ready = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let ready_hook = Arc::clone(&ready);
+            let release_hook = Arc::clone(&release);
+            scheduler.set_before_transport_cleanup_hook(Arc::new(move || {
+                ready_hook.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !release_hook.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "transport cleanup barrier never released"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            Self { ready, release }
+        }
+
+        fn wait_ready(&self, within: Duration) {
+            let deadline = Instant::now() + within;
+            while !self.ready.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "monitor never latched the transport failure"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn release(&self) {
+            self.release.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn zcode_oversized_frame_fails_explicitly_reaps_and_releases_the_queue() {
+        let _guard = transport_child_guard();
+        let directory = transport_workspace("s01-transport-zcode-");
+        let failing = format!("{ZCODE_RUNNING_PREFIX}{}\nsleep 30\n", oversized_output());
+        let normal = format!(
+            "{ZCODE_RUNNING_PREFIX}\
+printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.streaming\",\"payload\":{{\"kind\":\"text_delta\",\"delta\":\"queued task answer\",\"assistantMessageId\":\"m1\"}}}}}}' \
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"message.finished\",\"payload\":{{\"assistantMessageId\":\"m1\"}}}}}}' \
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\"}}}}'\nsleep 1\n"
+        );
+        let scheduler = transport_scheduler(directory.path(), move |prompt| {
+            if prompt == "oversized transport" {
+                failing.clone()
+            } else {
+                normal.clone()
+            }
+        });
+        let barrier = TransportBarrier::install(&scheduler);
+        let failing_id = enqueue(&scheduler, directory.path(), "oversized transport");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![failing_id.clone()]);
+        let (_, identity) = await_running_identity(&scheduler, &failing_id);
+        let pgid = identity.process_group_id;
+        barrier.wait_ready(Duration::from_secs(30));
+        // Accident condition: the provider is still alive after emitting the
+        // oversized frame, so no child-exit terminal could have closed it.
+        assert!(
+            external_runtime::observe_process(identity.pid as u32).is_ok(),
+            "provider must survive the oversized output"
+        );
+        barrier.release();
+
+        // Bounded wait, far below any stall watchdog threshold.
+        let result = await_result_within(&scheduler, &failing_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert!(result.result.partial);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&failing_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON)
+        );
+        // The oversized event was persisted exactly once.
+        assert_eq!(oversized_events(directory.path(), &failing_id), 1);
+
+        let task = scheduler.store().get_task(&failing_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Terminal);
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert!(task.reaped_at.is_some(), "cleanup must prove the reap");
+        assert!(observe_process_group(pgid).unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+
+        // The diagnostic closure carries the transport stage, bounded
+        // evidence, and the real cleanup result.
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(&failing_id).unwrap()).unwrap();
+        assert_transport_diagnostic(&record, "Stopped");
+
+        // The result is immutable and no second terminal was produced.
+        assert_eq!(
+            scheduler.store().task_result(&failing_id).unwrap().unwrap(),
+            result
+        );
+
+        // Capacity released: the workspace slot is free again and the
+        // scheduler admits a follow-up task through the same closure path.
+        let queued_id = enqueue(&scheduler, directory.path(), "queued normal task");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![queued_id.clone()]);
+        let queued = await_result(&scheduler, &queued_id);
+        assert_eq!(queued.result.outcome, TaskOutcome::Completed);
+        assert_eq!(queued.result.final_text, "queued task answer");
+    }
+
+    #[test]
+    fn zcode_oversized_frame_with_a_pending_input_still_fails_the_task() {
+        let _guard = transport_child_guard();
+        let directory = transport_workspace("s01-transport-zcode-pending-");
+        let script = format!(
+            "{ZCODE_RUNNING_PREFIX}\
+while [ ! -f release-request ]; do sleep 0.01; done\n\
+printf '%s\n' '{{\"id\":\"srv-input-1\",\"method\":\"interaction/requestUserInput\",\"params\":{{\"question\":\"which scope?\"}}}}'\n\
+while [ ! -f release-oversize ]; do sleep 0.01; done\n\
+{}\nsleep 30\n",
+            oversized_output()
+        );
+        let scheduler = transport_scheduler(directory.path(), move |_| script.clone());
+        let agent_id = enqueue(&scheduler, directory.path(), "oversized with pending");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        // The interaction request requires a RUNNING row, so gate it on the
+        // observed phase instead of racing process bootstrap.
+        let (_, _) = await_running_identity(&scheduler, &agent_id);
+        fs::write(directory.path().join("release-request"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if !scheduler
+                .store()
+                .pending_requests(&agent_id)
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "pending input never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(directory.path().join("release-oversize"), b"").unwrap();
+        let result = await_result_within(&scheduler, &agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON)
+        );
+        // The closure terminalizes once: the pending interaction is settled
+        // away instead of leaving the task waiting for input.
+        assert!(scheduler
+            .store()
+            .pending_requests(&agent_id)
+            .unwrap()
+            .is_empty());
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    }
+
+    #[test]
+    fn zcode_committed_cancellation_outranks_the_transport_failure() {
+        let _guard = transport_child_guard();
+        let directory = transport_workspace("s01-transport-zcode-cancel-");
+        let script = format!(
+            "{ZCODE_RUNNING_PREFIX}\
+while [ ! -f release-oversize ]; do sleep 0.01; done\n\
+{}\nsleep 30\n",
+            oversized_output()
+        );
+        let scheduler = transport_scheduler(directory.path(), move |_| script.clone());
+        let agent_id = enqueue(&scheduler, directory.path(), "oversized after cancel");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let (_, identity) = await_running_identity(&scheduler, &agent_id);
+        let pgid = identity.process_group_id;
+        scheduler.store().request_stop(&agent_id).unwrap();
+        fs::write(directory.path().join("release-oversize"), b"").unwrap();
+        let result = await_result_within(&scheduler, &agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+        assert!(observe_process_group(pgid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn latched_transport_failure_cleans_up_after_a_late_orphaned_terminal() {
+        let _guard = transport_child_guard();
+        let directory = transport_workspace("s01-transport-b2-01-");
+        // The leader publishes an oversized frame, forks a descendant that
+        // keeps the process group alive, then exits so the pump publishes an
+        // Orphaned terminal before the monitor reaches its cleanup.
+        let script = format!(
+            "{ZCODE_RUNNING_PREFIX}{}\n\
+sleep 30 &\n\
+sleep 0.3\n\
+exit 0\n",
+            oversized_output()
+        );
+        let scheduler = transport_scheduler(directory.path(), move |_| script.clone());
+        let barrier = TransportBarrier::install(&scheduler);
+        let agent_id = enqueue(&scheduler, directory.path(), "oversized then orphan");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        barrier.wait_ready(Duration::from_secs(30));
+
+        let (_, runtime, _, _, _) = scheduler
+            .active_session(&agent_id)
+            .expect("active instance retained for the barrier");
+        let pgid = runtime.identity().expect("owned process group").pgid;
+        // Barrier: the monitor is paused before cleanup, the late child-exit
+        // boundary has already published its terminal, and a cleanable
+        // descendant still holds the group.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(terminal) = runtime.wait_terminal(Duration::ZERO) {
+                assert!(
+                    matches!(terminal, RuntimeTerminal::Orphaned(_)),
+                    "expected an orphaned late terminal, got {terminal:?}"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "late terminal never published");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !observe_process_group(pgid).unwrap().is_empty(),
+            "the barrier requires a live cleanable descendant"
+        );
+
+        barrier.release();
+        let result = await_result_within(&scheduler, &agent_id, Duration::from_secs(15));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON)
+        );
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert!(task.reaped_at.is_some());
+        assert!(observe_process_group(pgid).unwrap().is_empty());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(oversized_events(directory.path(), &agent_id), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
+        assert_transport_diagnostic(&record, "Stopped");
+        assert_eq!(
+            scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+            result
+        );
+    }
+
+    struct InjectingFactory {
+        injected: RuntimeTerminal,
+        fault_terminal: Option<RuntimeTerminal>,
+        calls: Arc<AtomicU64>,
+        store: Arc<Store>,
+        session_id: String,
+    }
+
+    impl RuntimeFactory for InjectingFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Ok(Arc::new(InjectingRuntime {
+                agent_id: task.agent_id.clone(),
+                publisher: Arc::new(Publisher::new(sink)),
+                tracker: Arc::new(TurnTracker::new()),
+                injected: self.injected.clone(),
+                fault_terminal: self.fault_terminal.clone(),
+                calls: Arc::clone(&self.calls),
+                store: Arc::clone(&self.store),
+                session_id: self.session_id.clone(),
+            }) as Arc<dyn ManagedRuntime>)
+        }
+    }
+
+    struct InjectingRuntime {
+        agent_id: String,
+        publisher: Arc<Publisher>,
+        tracker: Arc<TurnTracker>,
+        injected: RuntimeTerminal,
+        fault_terminal: Option<RuntimeTerminal>,
+        calls: Arc<AtomicU64>,
+        store: Arc<Store>,
+        session_id: String,
+    }
+
+    impl ManagedRuntime for InjectingRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            self.injected.clone()
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            self.publisher.wait_terminal(timeout)
+        }
+        fn cleanup_for_transport_failure(&self, _: Duration) -> RuntimeTerminal {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.injected.clone()
+        }
+        fn diagnostic_session_id(&self) -> Option<String> {
+            Some(self.session_id.clone())
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            _task: &TaskRecord,
+            _mcp_servers: &[external_contract::StdioMcpServer],
+            _timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            let publisher = Arc::clone(&self.publisher);
+            let store = Arc::clone(&self.store);
+            let agent_id = self.agent_id.clone();
+            let fault_terminal = self.fault_terminal.clone();
+            thread::spawn(move || {
+                // Wait until the durable row is RUNNING so the latch lands on
+                // a monitor-managed instance.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let running = store
+                        .get_task(&agent_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|task| task.phase == TaskPhase::Running);
+                    if running {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                publisher.emit_driver(
+                    Inbound::OversizedLine {
+                        bytes: FRAME_LIMIT + 1,
+                    },
+                    None,
+                );
+                // Simulate a pump that publishes a normal terminal boundary
+                // right after the oversized frame was latched.
+                if let Some(terminal) = fault_terminal {
+                    publisher.publish_terminal(terminal);
+                }
+            });
+            Ok(SessionReady {
+                session_id: self.session_id.clone(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            self.tracker.snapshot()
+        }
+    }
+
+    #[test]
+    fn injected_cleanup_failure_keeps_unreaped_evidence() {
+        let directory = transport_workspace("s01-transport-cleanup-failure-");
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let scheduler = Scheduler::new(
+            "transport-injection",
+            Arc::clone(&store),
+            Arc::new(InjectingFactory {
+                injected: RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed(
+                    "injected cleanup failure".into(),
+                )),
+                fault_terminal: None,
+                calls: Arc::clone(&calls),
+                store: Arc::clone(&store),
+                session_id: "injected-cleanup-session".into(),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let agent_id = enqueue(&scheduler, directory.path(), "injected cleanup failure");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result_within(&scheduler, &agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert!(task.reaped_at.is_none(), "a failed cleanup is not a reap");
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
+        assert_transport_diagnostic(&record, "injected cleanup failure");
+        assert_eq!(record["session_id"], "injected-cleanup-session");
+        assert_eq!(
+            scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+            result
+        );
+        assert_eq!(scheduler.active_count(), 0);
+    }
+
+    /// S01 AC4: a normal terminal published by the pump after the oversized
+    /// frame (here a Completed boundary) must not turn the task COMPLETED.
+    #[test]
+    fn published_completed_terminal_does_not_override_the_latched_failure() {
+        let directory = transport_workspace("s01-transport-late-completed-");
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let scheduler = Scheduler::new(
+            "transport-late-completed",
+            Arc::clone(&store),
+            Arc::new(InjectingFactory {
+                injected: RuntimeTerminal::Stopped(StopOutcome::Terminated(
+                    ChildExit::Signaled(15),
+                )),
+                fault_terminal: Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                ))),
+                calls: Arc::clone(&calls),
+                store: Arc::clone(&store),
+                session_id: "late-completed-session".into(),
+            }),
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let agent_id = enqueue(&scheduler, directory.path(), "completed after fault");
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result_within(&scheduler, &agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert!(task.reaped_at.is_some(), "the real cleanup proves the reap");
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
+        assert_transport_diagnostic(&record, "Stopped");
+        assert_eq!(
+            scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+            result
+        );
+        assert_eq!(scheduler.active_count(), 0);
+    }
+}

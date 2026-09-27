@@ -2300,3 +2300,95 @@ fn manifest_build_spawn_materializes_a_patch_and_observes_the_caller_manifest() 
     );
     assert!(!patch.contains("external-subagent/plugins"), "{patch}");
 }
+
+const DSH_TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+
+fn dsh_event_count(workspace: &std::path::Path, agent_id: &str, event_type: &str) -> i64 {
+    let connection = rusqlite::Connection::open(workspace.join("state.sqlite")).unwrap();
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type=?2",
+            rusqlite::params![agent_id, event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// S01 AC3: a DSH provider that emits an oversized ACP frame and keeps
+/// running fails explicitly instead of hanging RUNNING.
+#[test]
+fn dsh_oversized_frame_fails_explicitly_and_reaps_the_provider() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"model"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[]}}}}'
+read_frame
+head -c {bytes} /dev/zero
+while [ ! -f test-release ]; do sleep 0.05; done
+"#,
+        bytes = external_runtime::MAX_NDJSON_LINE_BYTES + 1,
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::test_harness(Some(child)));
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    let pgid = loop {
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        if task.phase == TaskPhase::Running {
+            if let Some(identity) = task.process_identity.clone() {
+                break identity.process_group_id;
+            }
+        }
+        assert!(Instant::now() < deadline, "task never reached RUNNING");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    assert_eq!(
+        scheduler
+            .store()
+            .terminal_reason_code(&agent_id)
+            .unwrap()
+            .as_deref(),
+        Some(DSH_TRANSPORT_REASON)
+    );
+    assert_eq!(
+        dsh_event_count(workspace.path(), &agent_id, "driver.oversized_line"),
+        1
+    );
+    // The provider blocked after its oversized write; no self-exit boundary
+    // can explain the terminal.
+    assert_eq!(
+        dsh_event_count(workspace.path(), &agent_id, "driver.child_exited"),
+        0
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    assert!(task.reaped_at.is_some());
+    assert!(external_runtime::observe_process_group(pgid)
+        .unwrap()
+        .is_empty());
+    let record: serde_json::Value =
+        serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
+    assert_eq!(record["stage"], "transport");
+    assert_eq!(record["error_code"], DSH_TRANSPORT_REASON);
+    assert!(
+        record["cleanup_result"].as_str().unwrap().contains("Stopped"),
+        "{record}"
+    );
+    assert_eq!(
+        scheduler.store().task_result(&agent_id).unwrap().unwrap(),
+        result
+    );
+}
