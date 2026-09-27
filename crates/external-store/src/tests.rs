@@ -869,3 +869,120 @@ fn terminal_result_and_failure_message_roll_back_together() {
     assert_eq!(row.phase, TaskPhase::Running);
     assert_eq!(row.failure_message, None);
 }
+
+#[test]
+fn task_with_result_returns_both_reads_of_one_committed_state() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    running(&store, "agent");
+    // No result yet: the task still comes back, the result slot is empty.
+    let (pending_task, pending_result) = store.task_with_result("agent").unwrap().unwrap();
+    assert_eq!(pending_task.agent_id, "agent");
+    assert!(pending_result.is_none());
+
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            Some("RUNTIME_TERMINAL"),
+            Some(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#),
+        )
+        .unwrap();
+    let (failed_task, failed_result) = store.task_with_result("agent").unwrap().unwrap();
+    assert_eq!(failed_task.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(
+        failed_task.failure_message.as_deref(),
+        Some(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#)
+    );
+    let failed_result = failed_result.expect("terminal result");
+    assert_eq!(failed_result.result.outcome, TaskOutcome::Failed);
+
+    // An unknown task reads as absent, never as an empty pair.
+    assert!(store.task_with_result("missing").unwrap().is_none());
+}
+
+#[test]
+fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(directory.path().join("store.sqlite3")).unwrap());
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    store
+        .mark_session_running(
+            "agent",
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some("session"),
+            None,
+        )
+        .unwrap();
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            Some("RUNTIME_TERMINAL"),
+            Some("round-one detail"),
+        )
+        .unwrap();
+
+    // The hook fires between the task read and the result read while the
+    // snapshot holds the connection lock. The hook releases the concurrent
+    // resume, which must then stay blocked until the snapshot returns: the pair
+    // the snapshot reads is still round one.
+    let (start_tx, start_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let writer_store = Arc::clone(&store);
+    let writer = std::thread::spawn(move || {
+        start_rx.recv().unwrap();
+        writer_store
+            .requeue_task_for_resume_with_message("agent", "resume-msg", "continue")
+            .unwrap();
+        done_tx.send(()).unwrap();
+    });
+
+    let done_rx = Arc::new(Mutex::new(done_rx));
+    let hook_done = Arc::clone(&done_rx);
+    let start_tx = Mutex::new(start_tx);
+    store.set_snapshot_hook(Arc::new(move || {
+        // Start the resume only now, while the snapshot holds the lock.
+        start_tx.lock().unwrap().send(()).unwrap();
+        assert!(
+            hook_done
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "a resume committed inside the task_with_result window"
+        );
+    }));
+    let snapshot = store.task_with_result("agent").unwrap().unwrap();
+    // The lock is released, so the blocked resume proceeds.
+    done_rx
+        .lock()
+        .unwrap()
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    writer.join().unwrap();
+    store.clear_snapshot_hook();
+
+    let (snapshot_task, snapshot_result) = snapshot;
+    assert_eq!(snapshot_task.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(
+        snapshot_task.failure_message.as_deref(),
+        Some("round-one detail")
+    );
+    assert_eq!(snapshot_result.unwrap().result.outcome, TaskOutcome::Failed);
+    // The resume did clear the durable row once it was allowed to run.
+    let (resumed_task, resumed_result) = store.task_with_result("agent").unwrap().unwrap();
+    assert_eq!(resumed_task.outcome, None);
+    assert_eq!(resumed_task.failure_message, None);
+    assert!(resumed_result.is_none());
+}

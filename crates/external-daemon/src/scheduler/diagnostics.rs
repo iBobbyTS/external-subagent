@@ -172,6 +172,234 @@ const PERSISTABLE_CODE_BYTES: usize = 128;
 const PERSISTABLE_MESSAGE_BYTES: usize = 512;
 const PERSISTABLE_EVIDENCE_BYTES: usize = 192;
 
+/// Per-field string budgets for one serialized persistable record. The default
+/// set is the S01 production contract; [`shrink_persistable_record`] scales it
+/// down to fit a smaller consumer envelope.
+#[derive(Clone, Copy)]
+struct PersistableBudgets {
+    id: usize,
+    code: usize,
+    message: usize,
+    evidence: usize,
+}
+
+const PERSISTABLE_BUDGETS: PersistableBudgets = PersistableBudgets {
+    id: PERSISTABLE_ID_BYTES,
+    code: PERSISTABLE_CODE_BYTES,
+    message: PERSISTABLE_MESSAGE_BYTES,
+    evidence: PERSISTABLE_EVIDENCE_BYTES,
+};
+
+/// The smallest per-field budget that still leaves room for
+/// [`bounded_prefix`]'s truncation marker.
+const PERSISTABLE_MIN_BUDGET: usize = 8;
+
+impl PersistableBudgets {
+    fn shrunk(self) -> Self {
+        Self {
+            id: (self.id / 2).max(PERSISTABLE_MIN_BUDGET),
+            code: (self.code / 2).max(PERSISTABLE_MIN_BUDGET),
+            message: (self.message / 2).max(PERSISTABLE_MIN_BUDGET),
+            evidence: (self.evidence / 2).max(PERSISTABLE_MIN_BUDGET),
+        }
+    }
+
+    fn at_floor(self) -> bool {
+        self.id <= PERSISTABLE_MIN_BUDGET
+            && self.code <= PERSISTABLE_MIN_BUDGET
+            && self.message <= PERSISTABLE_MIN_BUDGET
+            && self.evidence <= PERSISTABLE_MIN_BUDGET
+    }
+}
+
+/// The already-extracted materials of a persistable failure record. `detail`
+/// mirrors the evidence shape: either the original detail JSON (production) or
+/// a parsed record with the same top-level keys (shrink path).
+struct PersistableFields<'a> {
+    agent_id: &'a str,
+    session_id: Option<&'a str>,
+    stage: &'a str,
+    error_code: &'a str,
+    message: &'a str,
+    detail: Option<&'a serde_json::Value>,
+    stderr_tail: &'a str,
+    tail_truncated: bool,
+}
+
+fn render_persistable(fields: &PersistableFields<'_>, budgets: &PersistableBudgets) -> String {
+    let mut record = serde_json::json!({
+        "agent_id": bounded_prefix(fields.agent_id, budgets.id),
+        "session_id": fields.session_id.map(|value| bounded_prefix(value, budgets.id)),
+        "stage": bounded_prefix(fields.stage, budgets.code),
+        "error_code": bounded_prefix(fields.error_code, budgets.code),
+        "message": bounded_prefix(
+            fields
+                .detail
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fields.message),
+            budgets.message,
+        ),
+        "stderr_tail": fields.stderr_tail,
+        "tail_truncated": fields.tail_truncated,
+    });
+    if let Some(detail) = fields.detail {
+        for field in ["operation", "remote_message", "cleanup_result"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_str) {
+                record[field] = bounded_prefix(value, budgets.evidence).into();
+            }
+        }
+        for field in ["bytes", "cap", "last_event_seq"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
+        for field in [
+            "stall_elapsed_ms",
+            "stall_timeout_ms",
+            "last_progress_age_ms",
+        ] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
+        if let Some(code) = detail
+            .get("remote_code")
+            .and_then(serde_json::Value::as_i64)
+        {
+            record["remote_code"] = code.into();
+        }
+    }
+    record.to_string()
+}
+
+pub(crate) fn persistable_record_with_tail(
+    agent_id: &str,
+    session_id: Option<&str>,
+    stage: &str,
+    error_code: &str,
+    message: &str,
+    stderr_tail: &str,
+    tail_truncated: bool,
+) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(message).ok();
+    render_persistable(
+        &PersistableFields {
+            agent_id,
+            session_id,
+            stage,
+            error_code,
+            message,
+            detail: detail.as_ref(),
+            stderr_tail,
+            tail_truncated,
+        },
+        &PERSISTABLE_BUDGETS,
+    )
+}
+
+/// Structured re-shrink of an already-serialized persistable record for a
+/// consumer whose envelope must stay smaller than the 16 KiB persistence
+/// budget. It keeps the same field set, the same single-line parseable JSON,
+/// and the latest `stderr_tail` suffix; the per-field budgets and the tail are
+/// reduced only as far as `max_bytes` demands. Returns the floor record when
+/// even the smallest budgets cannot fit `max_bytes`, and `None` only when
+/// `record` is not a JSON object (for example the legacy plain-text
+/// `fail_claim` message), which callers keep as an opaque string.
+pub(crate) fn shrink_persistable_record(record: &str, max_bytes: usize) -> Option<String> {
+    fn materials<'a>(
+        value: &'a serde_json::Value,
+        stderr_tail: &'a str,
+        tail_truncated: bool,
+    ) -> PersistableFields<'a> {
+        PersistableFields {
+            agent_id: value
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            session_id: value.get("session_id").and_then(serde_json::Value::as_str),
+            stage: value
+                .get("stage")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            error_code: value
+                .get("error_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            message: value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+            // The parsed record mirrors the evidence keys at its top level, so
+            // it is its own detail source for the rebuild.
+            detail: Some(value),
+            stderr_tail,
+            tail_truncated,
+        }
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(record).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let original_tail = value
+        .get("stderr_tail")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let original_truncated = value
+        .get("tail_truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // Reduce the non-tail budgets until the empty-tail record fits the budget
+    // (or the floor is reached and the caller must degrade further).
+    let mut budgets = PERSISTABLE_BUDGETS;
+    loop {
+        let probe = render_persistable(&materials(&value, "", false), &budgets);
+        if probe.len() <= max_bytes || budgets.at_floor() {
+            break;
+        }
+        budgets = budgets.shrunk();
+    }
+
+    // The encoded length is monotone in the suffix size, so the smallest
+    // feasible cut is the maximal feasible suffix. A cut also marks the tail
+    // truncated, like the S01 path.
+    let mut boundaries: Vec<usize> = original_tail.char_indices().map(|(index, _)| index).collect();
+    boundaries.push(original_tail.len());
+    let feasible = |index: usize| {
+        let cut = boundaries[index];
+        render_persistable(
+            &materials(&value, &original_tail[cut..], original_truncated || cut > 0),
+            &budgets,
+        )
+        .len()
+            <= max_bytes
+    };
+    let chosen = if feasible(0) {
+        0
+    } else if !feasible(boundaries.len() - 1) {
+        boundaries.len() - 1
+    } else {
+        let mut lo = 0;
+        let mut hi = boundaries.len() - 1;
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if feasible(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    };
+    let cut = boundaries[chosen];
+    Some(render_persistable(
+        &materials(&value, &original_tail[cut..], original_truncated || cut > 0),
+        &budgets,
+    ))
+}
+
 /// Build the bounded, persistable form of `runtime_failure_record`. The
 /// returned string is always a single-line, parseable JSON object no larger
 /// than [`PERSISTABLE_RECORD_BYTES`] whose `stderr_tail` keeps the latest
@@ -239,63 +467,6 @@ pub(crate) fn persistable_failure_record(
         window_start > 0 || cut > 0,
     )
 }
-
-pub(crate) fn persistable_record_with_tail(
-    agent_id: &str,
-    session_id: Option<&str>,
-    stage: &str,
-    error_code: &str,
-    message: &str,
-    stderr_tail: &str,
-    tail_truncated: bool,
-) -> String {
-    let detail = serde_json::from_str::<serde_json::Value>(message).ok();
-    let mut record = serde_json::json!({
-        "agent_id": bounded_prefix(agent_id, PERSISTABLE_ID_BYTES),
-        "session_id": session_id.map(|value| bounded_prefix(value, PERSISTABLE_ID_BYTES)),
-        "stage": bounded_prefix(stage, PERSISTABLE_CODE_BYTES),
-        "error_code": bounded_prefix(error_code, PERSISTABLE_CODE_BYTES),
-        "message": bounded_prefix(
-            detail
-                .as_ref()
-                .and_then(|value| value.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(message),
-            PERSISTABLE_MESSAGE_BYTES,
-        ),
-        "stderr_tail": stderr_tail,
-        "tail_truncated": tail_truncated,
-    });
-    if let Some(detail) = detail {
-        for field in ["operation", "remote_message", "cleanup_result"] {
-            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_str) {
-                record[field] = bounded_prefix(value, PERSISTABLE_EVIDENCE_BYTES).into();
-            }
-        }
-        for field in ["bytes", "cap", "last_event_seq"] {
-            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
-                record[field] = value.into();
-            }
-        }
-        for field in [
-            "stall_elapsed_ms",
-            "stall_timeout_ms",
-            "last_progress_age_ms",
-        ] {
-            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
-                record[field] = value.into();
-            }
-        }
-        if let Some(code) = detail
-            .get("remote_code")
-            .and_then(serde_json::Value::as_i64)
-        {
-            record["remote_code"] = code.into();
-        }
-    }
-    record.to_string()
-}
-
 
 pub(crate) fn bounded_prefix(message: &str, max_bytes: usize) -> String {
     if message.len() <= max_bytes {

@@ -4,7 +4,9 @@ use sha2::Digest;
 use crate::error::{StoreError, StoreResult};
 use crate::lifecycle::apply_terminal;
 use crate::pending::completion_blockers_tx;
-use crate::records::{StoredTaskResult, TaskOutcome, TaskPhase, TaskResult, TerminalUpdate};
+use crate::records::{
+    StoredTaskResult, TaskOutcome, TaskPhase, TaskRecord, TaskResult, TerminalUpdate,
+};
 use crate::store::{now_millis, Store};
 use crate::tasks::query_task;
 
@@ -120,6 +122,28 @@ impl Store {
     pub fn task_result(&self, agent_id: &str) -> StoreResult<Option<StoredTaskResult>> {
         let connection = self.connection.lock().unwrap();
         query_task_result(&connection, agent_id)
+    }
+
+    /// Single consistent snapshot of a task row and its optional immutable
+    /// result. Both reads share one connection lock, so a concurrent terminal
+    /// write (including a resume that clears `failure_message` and deletes the
+    /// old result) can never be interleaved between them: the returned pair
+    /// always belongs to the same committed database state. Returns `None`
+    /// only when the task row itself is absent.
+    pub fn task_with_result(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Option<(TaskRecord, Option<StoredTaskResult>)>> {
+        let connection = self.connection.lock().unwrap();
+        let Some(task) = query_task(&connection, agent_id)? else {
+            return Ok(None);
+        };
+        // Test-only controlled interleave point, called while the connection
+        // lock is still held so the atomicity contract is directly observable.
+        #[cfg(test)]
+        self.run_snapshot_hook();
+        let result = query_task_result(&connection, agent_id)?;
+        Ok(Some((task, result)))
     }
 
     /// The latest terminal ledger row's machine reason. Older-than-terminal

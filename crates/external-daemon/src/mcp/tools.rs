@@ -340,7 +340,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_wait",
     output_schema = tool_output_schema::<AgentWaitOutput>(),
-    description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the latest text tail (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status; use observe only when these suggest a meaningless loop.",
+    description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. A failed terminal result also carries failure_message: the daemon's bounded single-line JSON failure detail (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the latest text tail (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status; use observe only when these suggest a meaningless loop.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -613,7 +613,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_result",
     output_schema = tool_output_schema::<AgentResultOutput>(),
-    description = "Read a terminal task result with stable outcome, partial status, and bounded final-text segments. Returns null result while the task is non-terminal. Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
+    description = "Read a terminal task result with stable outcome, partial status, and bounded final-text segments. Returns null result while the task is non-terminal. A failed terminal result also carries failure_message, the daemon's bounded single-line JSON failure detail (null when the task has no persisted detail or the outcome is not a failure). Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -1440,6 +1440,102 @@ mod contract_default_tests {
                 "{} rejected error: {:?}",
                 tool.name,
                 validator.iter_errors(&error).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn failure_message_is_documented_and_optional_in_both_read_tools() {
+        fn walk(node: &serde_json::Value, tool: &str, found: &mut bool) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    if let Some(properties) = map.get("properties").and_then(|value| value.as_object())
+                    {
+                        if let Some(property) = properties.get("failure_message") {
+                            *found = true;
+                            let required = map
+                                .get("required")
+                                .and_then(|value| value.as_array())
+                                .is_some_and(|required| {
+                                    required
+                                        .iter()
+                                        .any(|value| value.as_str() == Some("failure_message"))
+                                });
+                            assert!(!required, "{tool} must not require failure_message");
+                            let encoded = property.to_string();
+                            assert!(
+                                encoded.contains("null"),
+                                "{tool} failure_message must allow null: {encoded}"
+                            );
+                        }
+                    }
+                    for value in map.values() {
+                        walk(value, tool, found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, tool, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let facade = SubagentMcp::new(
+            PathBuf::from("/tmp/failure-schema.sock"),
+            Duration::from_secs(1),
+        );
+        let tools = facade.tool_router.list_all();
+        for name in ["external_subagent_wait", "external_subagent_result"] {
+            let tool = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} tool missing"));
+            let description = tool.description.as_deref().unwrap();
+            assert!(
+                description.contains("failure_message"),
+                "{name} description must document failure_message: {description}"
+            );
+            let schema = serde_json::to_value(tool.output_schema.as_ref().unwrap()).unwrap();
+            let mut found = false;
+            walk(&schema, name, &mut found);
+            assert!(found, "{name} output schema must expose failure_message");
+        }
+
+        // The schema accepts both the extended and the legacy result shapes.
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == "external_subagent_result")
+            .unwrap();
+        let schema = serde_json::to_value(tool.output_schema.as_ref().unwrap()).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let task = serde_json::json!({
+            "agent_id":10000001, "status":"failed", "session_id":null,
+            "input_identity":{
+                "subagent":null,"config_revision":null,"adapter_version":null,
+                "model":null,"model_source":null,"effort":null,"workspace_path":"/tmp/repo",
+                "permission_mode":"build"
+            }
+        });
+        let base_result = serde_json::json!({
+            "outcome":"FAILED","final_text":"RUNTIME_TERMINAL","partial":true,
+            "offset":0,"total_bytes":16,"next_offset":null,"complete":true,
+            "reason_code":"RUNTIME_TERMINAL"
+        });
+        for failure in [
+            serde_json::Value::Null,
+            serde_json::json!(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#),
+        ] {
+            let mut result = base_result.clone();
+            if !failure.is_null() {
+                result["failure_message"] = failure;
+            }
+            let success = serde_json::json!({"task": task.clone(), "result": result});
+            assert!(
+                validator.is_valid(&success),
+                "result schema rejected {success}: {:?}",
+                validator.iter_errors(&success).collect::<Vec<_>>()
             );
         }
     }

@@ -1,6 +1,8 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{StoreError, StoreResult};
@@ -11,6 +13,11 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Store {
     pub(crate) connection: Mutex<Connection>,
     database_path: PathBuf,
+    /// Test-only seam invoked by [`Store::task_with_result`] between its two
+    /// reads while the connection lock is held. It exists so a test can prove
+    /// no concurrent writer can commit inside the snapshot window.
+    #[cfg(test)]
+    pub(crate) snapshot_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Store {
@@ -26,6 +33,8 @@ impl Store {
         Ok(Self {
             connection: Mutex::new(connection),
             database_path,
+            #[cfg(test)]
+            snapshot_hook: Mutex::new(None),
         })
     }
 
@@ -35,6 +44,23 @@ impl Store {
     pub fn journal_mode(&self) -> StoreResult<String> {
         let connection = self.connection.lock().unwrap();
         Ok(connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_snapshot_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.snapshot_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_snapshot_hook(&self) {
+        *self.snapshot_hook.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_snapshot_hook(&self) {
+        if let Some(hook) = self.snapshot_hook.lock().unwrap().clone() {
+            hook();
+        }
     }
 }
 

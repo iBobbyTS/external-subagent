@@ -457,6 +457,9 @@ pub struct PublicResult {
     pub next_offset: Option<usize>,
     pub complete: bool,
     pub reason_code: Option<String>,
+    /// Bounded structured failure detail. `None` serializes as `null`, the
+    /// same serialized behavior as the `reason_code` precedent.
+    pub failure_message: Option<String>,
 }
 
 impl TryFrom<TaskResultView> for PublicResult {
@@ -472,6 +475,7 @@ impl TryFrom<TaskResultView> for PublicResult {
             next_offset: value.next_offset,
             complete: value.complete,
             reason_code: value.reason_code,
+            failure_message: value.failure_message,
         })
     }
 }
@@ -682,6 +686,7 @@ mod public_result_reason_tests {
             next_offset: None,
             complete: true,
             reason_code: reason.map(str::to_owned),
+            failure_message: None,
         }
     }
 
@@ -694,6 +699,28 @@ mod public_result_reason_tests {
         let completed = PublicResult::try_from(result_view(None)).unwrap();
         let encoded = serde_json::to_value(&completed).unwrap();
         assert!(encoded["reason_code"].is_null());
+    }
+
+    #[test]
+    fn public_result_forwards_the_failure_message_and_serializes_null() {
+        let detail = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","stderr_tail":"401"}"#;
+        let mut view = result_view(Some("RUNTIME_TERMINAL"));
+        view.failure_message = Some(detail.into());
+        let public = PublicResult::try_from(view).unwrap();
+        let encoded = serde_json::to_value(&public).unwrap();
+        assert_eq!(encoded["failure_message"], detail);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(encoded["failure_message"].as_str().unwrap())
+                .unwrap()["stderr_tail"],
+            "401"
+        );
+
+        // No detail (completed/cancelled or a historical row) serializes null
+        // exactly like reason_code, with the field still present.
+        let completed = PublicResult::try_from(result_view(None)).unwrap();
+        let encoded = serde_json::to_value(&completed).unwrap();
+        assert!(encoded.get("failure_message").is_some());
+        assert!(encoded["failure_message"].is_null());
     }
 }
 

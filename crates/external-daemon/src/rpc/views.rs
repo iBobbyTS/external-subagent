@@ -274,6 +274,12 @@ pub struct TaskResultView {
     pub complete: bool,
     #[serde(default)]
     pub reason_code: Option<String>,
+    /// Bounded structured failure detail, exposed only when the stored result
+    /// outcome is a failure and the task row's effective outcome matches it.
+    /// `#[serde(default)]` with no skip mirrors `reason_code`: an absent field
+    /// decodes as `None` and `None` serializes as `null`.
+    #[serde(default)]
+    pub failure_message: Option<String>,
 }
 
 /// Embedded view of an answerable user-input question. wait is the only
@@ -632,6 +638,7 @@ impl From<StoredTaskResult> for TaskResultView {
             next_offset: None,
             complete: true,
             reason_code: None,
+            failure_message: None,
         }
     }
 }
@@ -674,8 +681,13 @@ pub(super) fn pending_request_view(request: StoredPendingRequest) -> PendingRequ
 
 #[cfg(test)]
 mod result_paging_tests {
-    use super::{result_page_bounds, InputIdentityView, TaskResultView, TaskView};
-    use crate::rpc::{RpcResponse, RpcSuccess, MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES};
+    use super::{
+        result_page_bounds, InputIdentityView, TaskActivityView, TaskResultView, TaskView,
+        TelemetryStatusView,
+    };
+    use crate::rpc::{
+        RpcOutcome, RpcResponse, RpcSuccess, MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
+    };
     use external_store::TaskOutcome;
 
     fn task() -> TaskView {
@@ -696,6 +708,36 @@ mod result_paging_tests {
         }
     }
 
+    fn activity() -> TaskActivityView {
+        TaskActivityView {
+            latest_text_tail: "\u{0}".repeat(8 * 1024),
+            latest_text_truncated: true,
+            latest_reasoning: String::new(),
+            tool_calls_last_60s: 0,
+            telemetry_status: TelemetryStatusView::Healthy,
+        }
+    }
+
+    /// The worst-case escaped failure detail: a 16 KiB record of control
+    /// characters expands six-fold inside the response JSON string.
+    fn worst_case_failure_detail() -> String {
+        "\u{0}".repeat(16 * 1024)
+    }
+
+    fn failed_result() -> TaskResultView {
+        TaskResultView {
+            outcome: TaskOutcome::Failed,
+            final_text: "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES),
+            partial: true,
+            offset: 0,
+            total_bytes: MAX_RESULT_CHUNK_BYTES,
+            next_offset: None,
+            complete: true,
+            reason_code: Some("RUNTIME_TERMINAL".into()),
+            failure_message: Some(worst_case_failure_detail()),
+        }
+    }
+
     #[test]
     fn non_terminal_pages_always_advance() {
         assert_eq!(result_page_bounds("abcdef", 0, 3).unwrap(), (3, Some(3)));
@@ -711,25 +753,89 @@ mod result_paging_tests {
     }
 
     #[test]
-    fn worst_case_encoded_result_response_and_newline_fit_the_frame() {
-        let text = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
+    fn worst_case_failed_result_response_with_detail_and_newline_fits_the_frame() {
         let response = RpcResponse::success(
             "q".repeat(128),
             RpcSuccess::TaskResult {
                 task: task(),
-                result: Some(TaskResultView {
-                    outcome: TaskOutcome::Completed,
-                    final_text: text,
-                    partial: false,
-                    offset: 0,
-                    total_bytes: MAX_RESULT_CHUNK_BYTES + 1,
-                    next_offset: Some(MAX_RESULT_CHUNK_BYTES),
-                    complete: false,
-                    reason_code: None,
-                }),
+                result: Some(failed_result()),
             },
         );
-        assert!(serde_json::to_vec(&response).unwrap().len() + 1 <= MAX_RESPONSE_FRAME_BYTES);
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(
+            bytes.len() + 1 <= MAX_RESPONSE_FRAME_BYTES,
+            "TaskResult envelope {} exceeds the cap",
+            bytes.len() + 1
+        );
+    }
+
+    #[test]
+    fn worst_case_terminal_wait_response_with_detail_and_newline_fits_the_frame() {
+        // A terminal wait can embed the same result page, the detail, and the
+        // activity tail; the pending projection is empty so the raw envelope
+        // must still fit without invoking the degradation path.
+        let response = RpcResponse::success(
+            "q".repeat(128),
+            RpcSuccess::TaskWait {
+                task: task(),
+                pending_requests: Vec::new(),
+                result_available: true,
+                activity: activity(),
+                result: Some(failed_result()),
+                instruction: Some(
+                    "This is the final result. There is no need to call external_subagent_result again."
+                        .into(),
+                ),
+                timed_out: false,
+                message_receipt: None,
+            },
+        );
+        let bytes = serde_json::to_vec(&response).unwrap();
+        assert!(
+            bytes.len() + 1 <= MAX_RESPONSE_FRAME_BYTES,
+            "TaskWait envelope {} exceeds the cap",
+            bytes.len() + 1
+        );
+        // Keep the bound meaningful: the cap is 2 MiB and this synthesized
+        // worst case consumes most of it through the two escape-dense fields.
+        assert!(bytes.len() > MAX_RESPONSE_FRAME_BYTES / 2);
+    }
+
+    #[test]
+    fn terminal_wait_projection_serializes_a_null_failure_message_when_absent() {
+        let response = RpcResponse::success(
+            "q".repeat(128),
+            RpcSuccess::TaskWait {
+                task: task(),
+                pending_requests: Vec::new(),
+                result_available: true,
+                activity: activity(),
+                result: Some(TaskResultView {
+                    failure_message: None,
+                    ..failed_result()
+                }),
+                instruction: None,
+                timed_out: false,
+                message_receipt: None,
+            },
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        let result = &value["result"]["result"];
+        assert!(result["failure_message"].is_null());
+        // A legacy frame without the field still decodes.
+        let mut legacy = value;
+        legacy["result"]["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("failure_message");
+        let decoded: RpcResponse = serde_json::from_value(legacy).unwrap();
+        let RpcOutcome::Success { result } = decoded.outcome else {
+            panic!("expected success")
+        };
+        let RpcSuccess::TaskWait { result: Some(view), .. } = *result else {
+            panic!("expected wait result")
+        };
+        assert_eq!(view.failure_message, None);
     }
 
     #[test]
@@ -743,6 +849,7 @@ mod result_paging_tests {
             next_offset: None,
             complete: true,
             reason_code: None,
+            failure_message: None,
         };
         assert_eq!(view.outcome, TaskOutcome::Failed);
         assert!(view.partial);

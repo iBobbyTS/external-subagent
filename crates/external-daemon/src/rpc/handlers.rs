@@ -19,7 +19,9 @@ use super::views::{
 };
 use crate::{agent_status::AgentEvidenceStore, observation::OBSERVATION_SCHEMA, Scheduler};
 use external_core::{canonical_general_repository, PreparedGeneralTask};
-use external_store::{Store, StoredTaskResult, TaskPageFilter, TaskQueryScope, TaskRecord};
+use external_store::{
+    Store, StoredTaskResult, TaskOutcome, TaskPageFilter, TaskQueryScope, TaskRecord,
+};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -442,7 +444,7 @@ impl RpcService {
                 offset,
                 limit,
             } => {
-                let task = self.require_task(&agent_id)?;
+                let (task, stored) = self.require_task_with_result(&agent_id)?;
                 if limit == 0 || limit > MAX_RESULT_CHUNK_BYTES {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
@@ -451,16 +453,14 @@ impl RpcService {
                         ),
                     ));
                 }
-                let result = self
-                    .store
-                    .task_result(&task.agent_id)
-                    .map_err(map_store)?
+                let result = stored
                     .map(|stored| {
                         let reason = self
                             .store
                             .terminal_reason_code(&task.agent_id)
                             .map_err(map_store)?;
-                        self.task_result_view(stored, offset, limit, reason)
+                        let failure_message = failure_message_projection(&task, &stored);
+                        self.task_result_view(stored, offset, limit, reason, failure_message)
                     })
                     .transpose()?;
                 Ok(RpcSuccess::TaskResult {
@@ -543,12 +543,24 @@ impl RpcService {
             .get_task(agent_id)
             .map_err(map_store)?
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        let prepared = serde_json::from_str::<PreparedGeneralTask>(&task.prepared_launch_json)
-            .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        if prepared.repository.to_string_lossy() != task.repository {
-            return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
-        }
-        Ok(task)
+        validate_task_record(task)
+    }
+
+    /// Snapshot the task row and its optional immutable result under one store
+    /// lock so the two RPC exits can never pair a task state with a result
+    /// from a different round. The task still passes the existing access
+    /// validation.
+    pub(super) fn require_task_with_result(
+        &self,
+        agent_id: &str,
+    ) -> Result<(TaskRecord, Option<StoredTaskResult>), RpcError> {
+        validate_id(agent_id, "agent_id")?;
+        let (task, result) = self
+            .store
+            .task_with_result(agent_id)
+            .map_err(map_store)?
+            .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
+        Ok((validate_task_record(task)?, result))
     }
 
     pub(super) fn task_result_view(
@@ -557,6 +569,7 @@ impl RpcService {
         offset: usize,
         limit: usize,
         reason_code: Option<String>,
+        failure_message: Option<String>,
     ) -> Result<TaskResultView, RpcError> {
         let text = stored.result.final_text;
         let total_bytes = text.len();
@@ -570,8 +583,40 @@ impl RpcService {
             next_offset,
             complete: next_offset.is_none(),
             reason_code,
+            failure_message,
         })
     }
+}
+
+fn validate_task_record(task: TaskRecord) -> Result<TaskRecord, RpcError> {
+    let prepared = serde_json::from_str::<PreparedGeneralTask>(&task.prepared_launch_json)
+        .map_err(|_| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
+    if prepared.repository.to_string_lossy() != task.repository {
+        return Err(RpcError::new(RpcErrorCode::NotFound, "task was not found"));
+    }
+    Ok(task)
+}
+
+/// Expose the persisted failure detail only when the immutable stored result
+/// is one of the three failure outcomes AND the task row's effective outcome
+/// matches it. The matching check guards against mixing a task row with a
+/// result from another round; same-round atomicity comes from
+/// [`RpcService::require_task_with_result`]'s single-lock snapshot.
+pub(super) fn failure_message_projection(
+    task: &TaskRecord,
+    result: &StoredTaskResult,
+) -> Option<String> {
+    let outcome = result.result.outcome;
+    if !matches!(
+        outcome,
+        TaskOutcome::Failed | TaskOutcome::RuntimeLost | TaskOutcome::ResultInvalid
+    ) {
+        return None;
+    }
+    if task.outcome != Some(outcome) {
+        return None;
+    }
+    task.failure_message.clone()
 }
 
 fn opaque_generation() -> Result<String, RpcServiceConfigError> {

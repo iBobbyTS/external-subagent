@@ -3,15 +3,16 @@
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::errors::{map_store, RpcError, RpcErrorCode};
-use super::handlers::RpcService;
+use super::handlers::{failure_message_projection, RpcService};
 use super::types::{
     RpcResponse, RpcSuccess, TaskWaitQuery, MAX_PENDING_REQUESTS, MAX_REQUEST_ID_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
 };
 use super::views::{
-    pending_request_view, result_page_bounds, task_activity_view, task_view,
-    truncate_at_char_boundary, MessageReceiptView, TaskResultView, MAX_QUESTION_SUMMARY_BYTES,
+    pending_request_view, task_activity_view, task_view, truncate_at_char_boundary,
+    MessageReceiptView, TaskResultView, MAX_QUESTION_SUMMARY_BYTES,
 };
+use crate::scheduler::shrink_persistable_record;
 use external_store::{PendingRequestState, TaskPhase};
 use std::{
     thread,
@@ -46,7 +47,10 @@ impl RpcService {
             if interrupted() {
                 return Err(RpcError::new(RpcErrorCode::Unavailable, "wait interrupted"));
             }
-            let task = self.require_task(&query.agent_id)?;
+            // One snapshot per round: the task row and its optional immutable
+            // result are read under a single store lock, so a concurrent
+            // terminal write can never be interleaved between them.
+            let (task, stored_result) = self.require_task_with_result(&query.agent_id)?;
             let message_receipt = if let Some(id) = &query.message_id {
                 self.store.message(id).map_err(map_store)?.and_then(|m| {
                     (m.agent_id == query.agent_id).then(|| MessageReceiptView {
@@ -83,7 +87,6 @@ impl RpcService {
                 .map(pending_request_view)
                 .collect::<Vec<_>>();
             let wake_respondable = wake_request.is_some();
-            let stored_result = self.store.task_result(&task.agent_id).map_err(map_store)?;
             let result_available = stored_result.is_some();
             let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
             let terminal = task.phase == TaskPhase::Terminal;
@@ -97,7 +100,14 @@ impl RpcService {
                             .store
                             .terminal_reason_code(&task.agent_id)
                             .map_err(map_store)?;
-                        self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES, reason)
+                        let failure_message = failure_message_projection(&task, &stored);
+                        self.task_result_view(
+                            stored,
+                            0,
+                            MAX_RESULT_CHUNK_BYTES,
+                            reason,
+                            failure_message,
+                        )
                     })
                     .transpose()?;
                 let mut activity = task_activity_view(task.phase, activity);
@@ -133,14 +143,7 @@ fn wait_instruction(
 ) -> Option<String> {
     if terminal {
         return match result_page {
-            Some(result) if result.complete => Some(
-                "This is the final result. There is no need to call external_subagent_result again."
-                    .to_owned(),
-            ),
-            Some(result) => Some(format!(
-                "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
-                result.next_offset.unwrap_or(result.offset)
-            )),
+            Some(result) => Some(terminal_result_instruction(result)),
             None => Some(
                 "The task is finished; use external_subagent_result to read the stored result."
                     .to_owned(),
@@ -160,6 +163,20 @@ fn wait_instruction(
             "Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop"
                 .to_owned(),
         ),
+    }
+}
+
+/// The terminal instruction for the current page state. Regenerated after a
+/// last-resort page shortening so it always names the page's real cursor.
+fn terminal_result_instruction(result: &TaskResultView) -> String {
+    if result.complete {
+        "This is the final result. There is no need to call external_subagent_result again."
+            .to_owned()
+    } else {
+        format!(
+            "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
+            result.next_offset.unwrap_or(result.offset)
+        )
     }
 }
 
@@ -188,57 +205,201 @@ fn wake_pending_request(request: &external_store::StoredPendingRequest) -> bool 
         && matches!(request.request_type.as_str(), "permission" | "user_input")
 }
 
-// Measure the complete envelope with the largest valid request ID. Large result
-// text falls back to the existing first-page contract; embedded questions
-// degrade to a bounded prefix so actionable request_ids stay reachable. Only
-// metadata that still exceeds the cap uses the transport's Oversized response.
+// Measure the complete envelope with the largest valid request ID. Degradation
+// is staged: first the structured failure detail is re-shrunk (field-level, so
+// it stays parseable with a latest-suffix tail), then embedded questions fall
+// back to a bounded prefix so actionable request_ids stay reachable, and only
+// as a last resort is the result page itself shortened. The last step derives
+// the cursor from the original total/offset and regenerates the instruction,
+// so it never falsely reports a shortened page as complete or points at a
+// stale offset. Metadata that still exceeds the cap uses the transport's
+// Oversized response.
 fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
-    let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
-    let fits = serde_json::to_vec(&envelope)
-        .map_err(|_| RpcError::new(RpcErrorCode::Oversized, "response encoding failed"))?
-        .len()
-        .saturating_add(1)
-        <= MAX_RESPONSE_FRAME_BYTES;
-    if !fits {
+    if wait_envelope_fits(response)? {
+        return Ok(());
+    }
+    let mut candidate = response.clone();
+    // 1. Failure detail only: the result page, its cursor, the questions, and
+    //    the instruction stay byte-identical.
+    let original_detail = match &candidate {
+        RpcSuccess::TaskWait {
+            result: Some(view), ..
+        } => view.failure_message.clone(),
+        _ => None,
+    };
+    if let Some(original) = original_detail {
+        let fitted = fit_failure_message(&candidate, &original);
         if let RpcSuccess::TaskWait {
-            result,
-            pending_requests,
-            ..
-        } = response
+            result: Some(view), ..
+        } = &mut candidate
         {
-            // Degrade each bounded page independently: a non-terminal wait has
-            // no result to shrink, but its embedded questions still must.
-            if let Some(result) = result.as_mut() {
-                let (end, next_offset) =
-                    result_page_bounds(&result.final_text, 0, MAX_RESULT_CHUNK_BYTES)?;
-                result.final_text.truncate(end);
-                result.next_offset = next_offset;
-                result.complete = next_offset.is_none();
-            }
-            for request in pending_requests {
-                if let Some(question) = request.question.as_mut() {
-                    let full = std::mem::take(&mut question.text);
-                    question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
-                    question.truncated |= question.text.len() < full.len();
-                }
-            }
-        }
-        let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
-        if serde_json::to_vec(&envelope)
-            .map_or(true, |bytes| bytes.len() + 1 > MAX_RESPONSE_FRAME_BYTES)
-        {
-            return Err(RpcError::new(
-                RpcErrorCode::Oversized,
-                "response frame exceeds cap",
-            ));
+            view.failure_message = Some(fitted);
         }
     }
+    if wait_envelope_fits(&candidate)? {
+        *response = candidate;
+        return Ok(());
+    }
+    // 2. Embedded questions (existing bounded-prefix contract).
+    if let RpcSuccess::TaskWait {
+        pending_requests, ..
+    } = &mut candidate
+    {
+        for request in pending_requests {
+            if let Some(question) = request.question.as_mut() {
+                let full = std::mem::take(&mut question.text);
+                question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
+                question.truncated |= question.text.len() < full.len();
+            }
+        }
+    }
+    if wait_envelope_fits(&candidate)? {
+        *response = candidate;
+        return Ok(());
+    }
+    // 3. Last resort: shorten the result page. The cursor comes from the
+    //    original total/offset and the instruction is regenerated for the new
+    //    page state.
+    if let Some((end, next_offset, complete)) = shrunk_result_page(&candidate) {
+        if let RpcSuccess::TaskWait {
+            result: Some(view),
+            instruction,
+            ..
+        } = &mut candidate
+        {
+            view.final_text.truncate(end);
+            view.next_offset = next_offset;
+            view.complete = complete;
+            *instruction = Some(terminal_result_instruction(view));
+        }
+    }
+    if !wait_envelope_fits(&candidate)? {
+        return Err(RpcError::new(
+            RpcErrorCode::Oversized,
+            "response frame exceeds cap",
+        ));
+    }
+    *response = candidate;
     Ok(())
+}
+
+/// Measure the whole wait envelope with the largest valid request ID plus the
+/// newline the transport appends.
+fn wait_envelope_fits(response: &RpcSuccess) -> Result<bool, RpcError> {
+    let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
+    let bytes = serde_json::to_vec(&envelope)
+        .map_err(|_| RpcError::new(RpcErrorCode::Oversized, "response encoding failed"))?;
+    Ok(bytes.len().saturating_add(1) <= MAX_RESPONSE_FRAME_BYTES)
+}
+
+/// Binary-search the largest structured shrink of `original` whose envelope
+/// still fits. Envelope size is monotone in the shrunk record length, so the
+/// feasible budgets form a prefix. When even the floor record cannot fit, the
+/// caller falls through to the other degradation stages with the floor record.
+fn fit_failure_message(base: &RpcSuccess, original: &str) -> String {
+    let mut lo = 0usize;
+    let mut hi = original.len();
+    let mut best: Option<String> = None;
+    while lo <= hi {
+        let mid = lo + (hi - lo) / 2;
+        match shrink_persistable_record(original, mid) {
+            Some(candidate) if message_envelope_fits(base, &candidate) => {
+                best = Some(candidate);
+                if mid == hi {
+                    break;
+                }
+                lo = mid + 1;
+            }
+            _ => {
+                if mid == 0 {
+                    break;
+                }
+                hi = mid - 1;
+            }
+        }
+    }
+    best.or_else(|| shrink_persistable_record(original, 0))
+        .unwrap_or_else(|| original.to_owned())
+}
+
+fn message_envelope_fits(base: &RpcSuccess, message: &str) -> bool {
+    let mut probe = base.clone();
+    if let RpcSuccess::TaskWait {
+        result: Some(view), ..
+    } = &mut probe
+    {
+        view.failure_message = Some(message.to_owned());
+    }
+    wait_envelope_fits(&probe).unwrap_or(false)
+}
+
+/// The largest prefix of the embedded result page that keeps the envelope in
+/// bounds, with `next_offset`/`complete` derived from the ORIGINAL
+/// `total_bytes`/`offset` rather than by re-paging the already-paged text.
+/// Returns `None` when there is no page to shorten or even one character does
+/// not fit.
+fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>, bool)> {
+    let RpcSuccess::TaskWait {
+        result: Some(view), ..
+    } = base
+    else {
+        return None;
+    };
+    let page = &view.final_text;
+    if page.is_empty() {
+        return None;
+    }
+    let offset = view.offset;
+    let total = view.total_bytes;
+    // Candidate byte ends inside the page, always at least one character
+    // (`char_indices` yields 0 first, which is skipped).
+    let ends: Vec<usize> = page
+        .char_indices()
+        .map(|(index, _)| index)
+        .skip(1)
+        .collect();
+    if ends.is_empty() {
+        return None;
+    }
+    let fits_end = |end: usize| {
+        let mut probe = base.clone();
+        if let RpcSuccess::TaskWait {
+            result: Some(view), ..
+        } = &mut probe
+        {
+            let next = offset + end;
+            view.final_text.truncate(end);
+            view.next_offset = (next < total).then_some(next);
+            view.complete = view.next_offset.is_none();
+        }
+        wait_envelope_fits(&probe).unwrap_or(false)
+    };
+    if !fits_end(ends[0]) {
+        return None;
+    }
+    let mut lo = 0usize;
+    let mut hi = ends.len() - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if fits_end(ends[mid]) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let end = ends[lo];
+    let next = offset + end;
+    let next_offset = (next < total).then_some(next);
+    Some((end, next_offset, next_offset.is_none()))
 }
 
 #[cfg(test)]
 pub(crate) mod wait_tests {
     use super::*;
+    use crate::rpc::{
+        InputIdentityView, PendingRequestView, QuestionView, TaskActivityView, TaskView,
+        TelemetryStatusView,
+    };
     use crate::{CommandRuntimeFactory, SchedulerConfig};
     use external_store::TaskResult;
     use std::process::Command;
@@ -498,7 +659,7 @@ pub(crate) mod wait_tests {
         let id = submitted.agent_id;
         let claim = store.claim_next("wait-test", 10, 10).unwrap().unwrap();
         store
-            .mark_session_running(&id, claim.owner_epoch, "runtime", None, None, None)
+            .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
             .unwrap();
         (
             directory,
@@ -1569,5 +1730,482 @@ pub(crate) mod wait_tests {
             panic!("expected terminal wait response")
         };
         assert_eq!(result.reason_code, None);
+    }
+
+    fn perspective_task() -> TaskView {
+        TaskView {
+            agent_id: "10000001".into(),
+            status: "failed".into(),
+            session_id: None,
+            input_identity: InputIdentityView {
+                subagent: None,
+                config_revision: None,
+                adapter_version: None,
+                model: None,
+                model_source: None,
+                effort: None,
+                workspace_path: None,
+                permission_mode: None,
+            },
+        }
+    }
+
+    fn empty_activity() -> TaskActivityView {
+        TaskActivityView {
+            latest_text_tail: String::new(),
+            latest_text_truncated: false,
+            latest_reasoning: String::new(),
+            tool_calls_last_60s: 0,
+            telemetry_status: TelemetryStatusView::Healthy,
+        }
+    }
+
+    fn user_question(request_id: &str, text: String) -> PendingRequestView {
+        PendingRequestView {
+            request_id: request_id.into(),
+            kind: "user_input".into(),
+            tool_name: None,
+            operation: "user_input".into(),
+            summary: "question".into(),
+            question: Some(QuestionView {
+                truncated: false,
+                text,
+            }),
+        }
+    }
+
+    fn synthesized_wait(
+        final_text: String,
+        total_bytes: usize,
+        next_offset: Option<usize>,
+        failure_message: Option<String>,
+        pending_requests: Vec<PendingRequestView>,
+        instruction: &str,
+    ) -> RpcSuccess {
+        RpcSuccess::TaskWait {
+            task: perspective_task(),
+            pending_requests,
+            result_available: true,
+            activity: empty_activity(),
+            result: Some(TaskResultView {
+                outcome: TaskOutcome::Failed,
+                final_text,
+                partial: true,
+                offset: 0,
+                total_bytes,
+                complete: next_offset.is_none(),
+                next_offset,
+                reason_code: Some("RUNTIME_TERMINAL".into()),
+                failure_message,
+            }),
+            instruction: Some(instruction.to_owned()),
+            timed_out: false,
+            message_receipt: None,
+        }
+    }
+
+    fn envelope_bytes(response: &RpcSuccess) -> usize {
+        let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
+        serde_json::to_vec(&envelope).unwrap().len() + 1
+    }
+
+    fn terminal_instruction_for(result: &TaskResultView) -> String {
+        super::terminal_result_instruction(result)
+    }
+
+    fn realistic_failure_detail() -> String {
+        crate::scheduler::persistable_failure_record(
+            "10000007",
+            Some("session-401"),
+            "runtime_terminal",
+            "RUNTIME_TERMINAL",
+            r#"{"message":"request failed with status 401"}"#,
+            &format!("{}401", "x".repeat(9 * 1024)),
+        )
+    }
+
+    fn failed_result_for(service: &Arc<RpcService>, id: &str, detail: &str) {
+        service
+            .store
+            .store_task_result_with_reason(
+                id,
+                &TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "RUNTIME_TERMINAL".into(),
+                    partial: true,
+                },
+                Some("RUNTIME_TERMINAL"),
+                Some(detail),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_terminal_result_surfaces_the_persisted_failure_message_on_both_exits() {
+        let (_directory, service, id) = fixture();
+        let detail = realistic_failure_detail();
+        failed_result_for(&service, &id, &detail);
+        // The RPC projection reads the stored library value verbatim.
+        assert_eq!(
+            service
+                .store
+                .get_task(&id)
+                .unwrap()
+                .unwrap()
+                .failure_message
+                .as_deref(),
+            Some(detail.as_str())
+        );
+
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert_eq!(result.failure_message.as_deref(), Some(detail.as_str()));
+        assert_eq!(result.reason_code.as_deref(), Some("RUNTIME_TERMINAL"));
+        assert_eq!(result.outcome, TaskOutcome::Failed);
+        assert_eq!(result.final_text, "RUNTIME_TERMINAL");
+        // The detail is parseable single-line JSON carrying the 401.
+        let encoded: serde_json::Value =
+            serde_json::from_str(result.failure_message.as_deref().unwrap()).unwrap();
+        assert!(encoded["stderr_tail"].as_str().unwrap().contains("401"));
+
+        let RpcSuccess::TaskResult {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id,
+                offset: 0,
+                limit: MAX_RESULT_CHUNK_BYTES,
+            })
+            .unwrap()
+        else {
+            panic!("expected terminal result response")
+        };
+        // Both exits carry the same un-degraded detail.
+        assert_eq!(result.failure_message.as_deref(), Some(detail.as_str()));
+    }
+
+    #[test]
+    fn non_failure_outcomes_never_expose_a_failure_message() {
+        let detail = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#;
+        for outcome in [
+            TaskOutcome::Completed,
+            TaskOutcome::Cancelled,
+            TaskOutcome::TimedOut,
+        ] {
+            let (_directory, service, id) = fixture();
+            service
+                .store
+                .store_task_result_with_reason(
+                    &id,
+                    &TaskResult {
+                        outcome,
+                        final_text: "terminal".into(),
+                        partial: outcome != TaskOutcome::Completed,
+                    },
+                    None,
+                    Some(detail),
+                )
+                .unwrap();
+            // The store gate cleared the explicit detail.
+            assert_eq!(
+                service
+                    .store
+                    .get_task(&id)
+                    .unwrap()
+                    .unwrap()
+                    .failure_message,
+                None,
+                "{outcome:?}"
+            );
+            let RpcSuccess::TaskWait {
+                result: Some(result),
+                ..
+            } = service
+                .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+                .unwrap()
+            else {
+                panic!("expected terminal wait response")
+            };
+            assert_eq!(result.outcome, outcome, "{outcome:?}");
+            assert_eq!(result.failure_message, None, "{outcome:?}");
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert!(encoded.get("failure_message").is_some(), "{outcome:?}");
+            assert!(encoded["failure_message"].is_null(), "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn historical_failed_result_without_detail_serializes_a_null_failure_message() {
+        let (_directory, service, id) = fixture();
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "RUNTIME_TERMINAL".into(),
+                    partial: true,
+                },
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert_eq!(result.failure_message, None);
+        assert!(serde_json::to_value(&result).unwrap()["failure_message"].is_null());
+    }
+
+    #[test]
+    fn cross_round_same_outcome_failures_pair_the_current_detail() {
+        let (_directory, service, id) = fixture();
+        let first = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round one"}"#;
+        let second = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round two"}"#;
+        // Round one: same final_text/digest as round two, different detail.
+        failed_result_for(&service, &id, first);
+        let RpcSuccess::TaskWait {
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected round-one terminal wait")
+        };
+        assert_eq!(result.failure_message.as_deref(), Some(first));
+
+        // Resume clears the detail and deletes the immutable result.
+        assert!(service
+            .store
+            .requeue_task_for_resume_with_message(&id, "resume-detail", "continue")
+            .unwrap());
+        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        service
+            .store
+            .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
+            .unwrap();
+        // Round two writes the same final_text (same digest) with a new detail.
+        failed_result_for(&service, &id, second);
+
+        for read in [
+            service.dispatch(RpcMethod::TaskWait(query(&id, 0))).unwrap(),
+            service
+                .dispatch(RpcMethod::TaskResult {
+                    agent_id: id.clone(),
+                    offset: 0,
+                    limit: MAX_RESULT_CHUNK_BYTES,
+                })
+                .unwrap(),
+        ] {
+            let result = match read {
+                RpcSuccess::TaskWait {
+                    result: Some(result),
+                    ..
+                }
+                | RpcSuccess::TaskResult {
+                    result: Some(result),
+                    ..
+                } => result,
+                other => panic!("expected terminal result: {other:?}"),
+            };
+            assert_eq!(result.final_text, "RUNTIME_TERMINAL");
+            assert_eq!(
+                result.failure_message.as_deref(),
+                Some(second),
+                "the old round's detail must not be mixed with the current result"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_projection_shrinks_only_the_failure_detail_when_that_is_enough() {
+        let detail = realistic_failure_detail();
+        let instruction = "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.";
+        let build = |message: Option<String>, question: String| {
+            synthesized_wait(
+                "RUNTIME_TERMINAL".into(),
+                "RUNTIME_TERMINAL".len() + 100,
+                Some("RUNTIME_TERMINAL".len()),
+                message,
+                vec![user_question("q", question)],
+                instruction,
+            )
+        };
+        let with_detail = build(Some(detail.clone()), String::new());
+        let without_detail = build(None, String::new());
+        let contribution = envelope_bytes(&with_detail) - envelope_bytes(&without_detail);
+        let deficit = MAX_RESPONSE_FRAME_BYTES - envelope_bytes(&with_detail);
+        assert!(contribution > 12 && deficit > 0);
+        // An escape-dense question grows the envelope by exactly six bytes per
+        // NUL. Size it to push the envelope over the cap while leaving it under
+        // the cap when the detail is absent, so only the detail stage runs.
+        let question_len = (deficit + contribution / 2).div_ceil(6) + 1;
+        let question = "\u{0}".repeat(question_len);
+        let mut base = build(Some(detail.clone()), question.clone());
+        assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
+        assert!(envelope_bytes(&build(None, question.clone())) <= MAX_RESPONSE_FRAME_BYTES);
+        let original_final = match &base {
+            RpcSuccess::TaskWait {
+                result: Some(view),
+                ..
+            } => view.final_text.clone(),
+            _ => unreachable!(),
+        };
+        bound_wait_result(&mut base).unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(view),
+            pending_requests,
+            instruction,
+            ..
+        } = &base
+        else {
+            panic!("expected wait response")
+        };
+        assert!(envelope_bytes(&base) <= MAX_RESPONSE_FRAME_BYTES);
+        // Detail shrunk, but still structured JSON with an honest marker.
+        let shrunk = view.failure_message.as_deref().expect("shrunk detail");
+        assert_ne!(shrunk, detail);
+        assert!(shrunk.len() <= detail.len());
+        serde_json::from_str::<serde_json::Value>(shrunk).unwrap();
+        // The result page, its cursor, the question, and the instruction are
+        // byte-identical: this branch never touches them.
+        assert_eq!(view.final_text, original_final);
+        assert_eq!(view.next_offset, Some("RUNTIME_TERMINAL".len()));
+        assert!(!view.complete);
+        assert_eq!(pending_requests.len(), 1);
+        assert_eq!(
+            pending_requests[0].question.as_ref().unwrap().text,
+            question
+        );
+        assert!(!pending_requests[0].question.as_ref().unwrap().truncated);
+        assert_eq!(
+            instruction.as_deref(),
+            Some("The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.")
+        );
+    }
+
+    #[test]
+    fn wait_projection_shrinks_questions_before_touching_a_paged_result() {
+        let detail = realistic_failure_detail();
+        let instruction = "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.";
+        let build = |message: Option<String>, question: String| {
+            synthesized_wait(
+                "RUNTIME_TERMINAL".into(),
+                "RUNTIME_TERMINAL".len() + 100,
+                Some("RUNTIME_TERMINAL".len()),
+                message,
+                vec![user_question("q", question)],
+                instruction,
+            )
+        };
+        // Size the question so that even the smallest structured detail cannot
+        // fit, forcing the question stage; the question stage itself then has
+        // ample room (2048 bytes per embed vs a multi-hundred-KiB oversized
+        // embed).
+        let floor =
+            envelope_bytes(&build(Some("{}".into()), String::new()));
+        let deficit = MAX_RESPONSE_FRAME_BYTES - floor;
+        assert!(deficit > 0);
+        let question_len = (deficit + 1024).div_ceil(6) + 1;
+        let mut base = build(Some(detail.clone()), "\u{0}".repeat(question_len));
+        let mut floor_probe = base.clone();
+        if let RpcSuccess::TaskWait {
+            result: Some(view), ..
+        } = &mut floor_probe
+        {
+            view.failure_message = Some("{}".into());
+        }
+        assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
+        assert!(envelope_bytes(&floor_probe) > MAX_RESPONSE_FRAME_BYTES);
+        bound_wait_result(&mut base).unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(view),
+            pending_requests,
+            instruction,
+            ..
+        } = &base
+        else {
+            panic!("expected wait response")
+        };
+        assert!(envelope_bytes(&base) <= MAX_RESPONSE_FRAME_BYTES);
+        let question = pending_requests[0].question.as_ref().unwrap();
+        assert!(
+            question.text.len() <= MAX_QUESTION_SUMMARY_BYTES,
+            "questions stage must bound the embed"
+        );
+        assert!(question.truncated);
+        // The paged result keeps its original cursor and instruction.
+        assert_eq!(view.final_text, "RUNTIME_TERMINAL");
+        assert_eq!(view.next_offset, Some("RUNTIME_TERMINAL".len()));
+        assert!(!view.complete);
+        assert_eq!(view.total_bytes, "RUNTIME_TERMINAL".len() + 100);
+        assert_eq!(instruction.as_deref(), Some("The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0."));
+    }
+
+    #[test]
+    fn wait_projection_shortens_a_result_page_with_a_consistent_cursor_and_instruction() {
+        let page = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
+        let total = MAX_RESULT_CHUNK_BYTES + 4096;
+        let original_instruction = format!(
+            "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {MAX_RESULT_CHUNK_BYTES}."
+        );
+        let mut base = synthesized_wait(
+            page.clone(),
+            total,
+            Some(page.len()),
+            None,
+            (0..MAX_PENDING_REQUESTS)
+                .map(|index| user_question(&format!("q{index}"), "\u{0}".repeat(16 * 1024)))
+                .collect(),
+            &original_instruction,
+        );
+        assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
+        bound_wait_result(&mut base).unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(view),
+            pending_requests,
+            instruction,
+            ..
+        } = &base
+        else {
+            panic!("expected wait response")
+        };
+        assert!(envelope_bytes(&base) <= MAX_RESPONSE_FRAME_BYTES);
+        // The last-resort page is shorter than the original 256 KiB page.
+        assert!(view.final_text.len() < page.len());
+        assert!(!view.final_text.is_empty());
+        // The cursor advances from the ORIGINAL total, not by re-paging the
+        // shortened page (which would falsely report complete).
+        let end = view.final_text.len();
+        assert_eq!(view.total_bytes, total);
+        assert_eq!(view.next_offset, Some(end));
+        assert!(!view.complete);
+        // The instruction names the updated page state.
+        let regenerated = terminal_instruction_for(view);
+        assert_eq!(
+            instruction.as_deref(),
+            Some(regenerated.as_str())
+        );
+        assert!(instruction.as_deref().unwrap().contains(&format!("offset {end}")));
+        assert_ne!(instruction.as_deref(), Some(original_instruction.as_str()));
+        // Pagination still advances and the questions were bounded too.
+        assert!(view.next_offset.unwrap() > view.offset);
+        assert!(pending_requests
+            .iter()
+            .all(|request| request.question.as_ref().unwrap().text.len()
+                <= MAX_QUESTION_SUMMARY_BYTES));
     }
 }
