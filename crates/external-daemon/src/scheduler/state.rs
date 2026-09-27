@@ -24,8 +24,13 @@ pub(crate) struct SchedulerInner {
     pub(super) before_transport_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     pub(super) before_stall_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// Test-only decision read fault: returning true makes the single
-    /// protected store read fail once, so R3 recovery can be pinned.
+    /// Test-only hook fired just before the monitor waits for a terminal, so
+    /// a test can publish a terminal and latch a fault in the window where
+    /// the loop-top latch check has already run.
+    #[cfg(test)]
+    pub(super) before_terminal_wait_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only decision read fault: returning true makes the protected
+    /// store read fail, so read-error recovery can be pinned.
     #[cfg(test)]
     pub(super) stall_read_fault: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     /// Monotonic clock seam shared by every stall decision. Production uses
@@ -220,7 +225,7 @@ impl RuntimeLifecycle {
 
     /// Report a transient decision read failure at most once per claim.
     /// Returns true when this call is the first to report it.
-    pub(super) fn stall_note_read_error(&self) -> bool {
+    pub(super) fn note_decision_read_error(&self) -> bool {
         let mut state = self.stall.lock().unwrap();
         if state.read_error_reported {
             false
@@ -436,6 +441,8 @@ impl Scheduler {
                 #[cfg(test)]
                 before_stall_cleanup_hook: Mutex::new(None),
                 #[cfg(test)]
+                before_terminal_wait_hook: Mutex::new(None),
+                #[cfg(test)]
                 stall_read_fault: Mutex::new(None),
                 clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
@@ -625,6 +632,18 @@ impl Scheduler {
     #[cfg(test)]
     pub(super) fn set_before_stall_cleanup_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.before_stall_cleanup_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_before_terminal_wait_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.before_terminal_wait_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_before_terminal_wait_hook(&self) {
+        if let Some(hook) = self.inner.before_terminal_wait_hook.lock().unwrap().clone() {
+            hook();
+        }
     }
 
     #[cfg(test)]

@@ -3036,4 +3036,91 @@ mod stall_tests {
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
         assert_stall_failure(scheduler, agent_id, &result);
     }
+
+    /// R7: a transport fault confirmed at the terminal re-check must keep its
+    /// priority through transient decision read failures instead of falling
+    /// into the normal terminal closure.
+    #[test]
+    fn latched_transport_fault_survives_transient_read_failures_at_the_terminal_recheck() {
+        const TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+        let bytes = external_runtime::MAX_NDJSON_LINE_BYTES + 1;
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+
+        // Fail the first two decision reads, then recover.
+        let reads = Arc::new(AtomicU64::new(0));
+        {
+            let reads = Arc::clone(&reads);
+            scheduler
+                .set_stall_read_fault(Arc::new(move || reads.fetch_add(1, Ordering::AcqRel) < 2));
+        }
+        // Block the monitor once just before its terminal wait, so the loop
+        // top latch check has already missed the fault latched afterwards.
+        let ready = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        {
+            let armed = Arc::new(AtomicBool::new(true));
+            let ready = Arc::clone(&ready);
+            let release = Arc::clone(&release);
+            scheduler.set_before_terminal_wait_hook(Arc::new(move || {
+                if armed.swap(false, Ordering::AcqRel) {
+                    ready.store(true, Ordering::Release);
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !release.load(Ordering::Acquire) {
+                        assert!(
+                            Instant::now() < deadline,
+                            "terminal-wait barrier never released"
+                        );
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }));
+        }
+
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "monitor never reached the terminal wait"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
+        // Latch the fault and publish a normal terminal in the window the
+        // loop-top check already passed.
+        runtime.emit(Inbound::OversizedLine { bytes });
+        runtime
+            .publisher
+            .publish_terminal(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        release.store(true, Ordering::Release);
+
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON),
+            "the confirmed transport latch must survive the read failures"
+        );
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 1);
+        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        assert!(task.reaped_at.is_some());
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(agent_id).unwrap()).unwrap();
+        assert_eq!(record["stage"], "transport");
+        assert_eq!(record["error_code"], TRANSPORT_REASON);
+        assert!(record["last_event_seq"].as_u64().unwrap() >= 1);
+        assert_eq!(
+            scheduler.store().task_result(agent_id).unwrap().unwrap(),
+            result
+        );
+    }
 }

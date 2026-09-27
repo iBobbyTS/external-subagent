@@ -97,7 +97,7 @@ impl Scheduler {
             Err(error) => {
                 // A transient read failure must not orphan the watchdog:
                 // report once and retry on the next tick.
-                if sink.runtime_lifecycle.stall_note_read_error() {
+                if sink.runtime_lifecycle.note_decision_read_error() {
                     self.record_failure(agent_id, error.to_string());
                 }
                 return FaultDisposition::Suppressed;
@@ -161,7 +161,7 @@ impl Scheduler {
         let current = match self.decision_task(agent_id) {
             Ok(current) => current,
             Err(error) => {
-                if sink.runtime_lifecycle.stall_note_read_error() {
+                if sink.runtime_lifecycle.note_decision_read_error() {
                     self.record_failure(agent_id, error.to_string());
                 }
                 return FaultDisposition::Suppressed;
@@ -349,6 +349,8 @@ impl Scheduler {
                         FaultDisposition::Handled | FaultDisposition::Abandoned => return,
                     }
                 }
+                #[cfg(test)]
+                scheduler.run_before_terminal_wait_hook();
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
                     // A latched transport fault outranks any terminal a late
                     // child-exit boundary published while this wait slept, so
@@ -364,7 +366,15 @@ impl Scheduler {
                             &operation,
                             &check,
                         ) {
-                            FaultDisposition::Suppressed => {}
+                            // The confirmed latch keeps this monitor's fault
+                            // priority: a transient decision read failure must
+                            // retry from the loop top, never fall through into
+                            // the normal terminal closure (that would drop the
+                            // S01 reason, stage and forced cleanup).
+                            FaultDisposition::Suppressed => {
+                                thread::sleep(Duration::from_millis(10));
+                                continue;
+                            }
                             FaultDisposition::Handled | FaultDisposition::Abandoned => return,
                         }
                     }
