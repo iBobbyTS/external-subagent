@@ -1,4 +1,4 @@
-use super::types::{STALL_DIAGNOSTIC_STAGE, STALLED_NO_ACTIVITY_REASON};
+use super::types::{STALLED_NO_ACTIVITY_REASON, STALL_DIAGNOSTIC_STAGE};
 use super::*;
 use crate::{TRANSPORT_DIAGNOSTIC_STAGE, TRANSPORT_FRAME_LIMIT_REASON};
 use external_store::StoreError;

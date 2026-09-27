@@ -423,17 +423,41 @@ pub trait LifecycleSink: Send + Sync + 'static {
 }
 
 #[derive(Debug)]
-enum OwnerState {
+pub(crate) enum OwnerState {
     Running,
     Stopping,
     Terminal(RuntimeTerminal),
 }
 
 #[derive(Debug)]
-struct PublisherState {
+pub(crate) struct PublisherState {
     next_sequence: u64,
     owner: OwnerState,
     exit_boundary_delivered: bool,
+}
+
+impl PublisherState {
+    /// The terminal this owner already published, if any. Read under the
+    /// publisher latch; publishing also happens under that latch, so a
+    /// decision holding the latch can never miss a concurrent terminal.
+    pub(crate) fn published_terminal(&self) -> Option<&RuntimeTerminal> {
+        match &self.owner {
+            OwnerState::Terminal(terminal) => Some(terminal),
+            _ => None,
+        }
+    }
+}
+
+/// Opaque publisher-state latch held across a scheduler fault decision.
+///
+/// Public only because [`ManagedRuntime`] is public; it exposes no publisher
+/// internals beyond the terminal a decision must not miss.
+pub struct TerminalLatch<'a>(MutexGuard<'a, PublisherState>);
+
+impl TerminalLatch<'_> {
+    pub(crate) fn published_terminal(&self) -> Option<RuntimeTerminal> {
+        self.0.published_terminal().cloned()
+    }
 }
 
 pub(crate) struct Publisher {
@@ -453,6 +477,17 @@ impl Publisher {
             }),
             changed: Condvar::new(),
         }
+    }
+
+    /// The outermost latch for a scheduler fault decision.
+    ///
+    /// Every pump publishes (and therefore calls the lifecycle sink, and
+    /// therefore admits events) while holding this same lock, so holding it
+    /// makes the terminal, the admitted activity and any pending insertion
+    /// quiescent until it is released. Callers must not call back into the
+    /// publisher while holding it.
+    pub(crate) fn decision_latch(&self) -> TerminalLatch<'_> {
+        TerminalLatch(self.state.lock().unwrap())
     }
 
     pub(crate) fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
@@ -1068,12 +1103,13 @@ impl RuntimeOwner {
         self.publisher.wait_terminal(timeout)
     }
 
-    /// Real cleanup for the transport-failure closure. `finish_process` is
-    /// short-circuited by `begin_stopping` once any terminal was published
-    /// (for example a late `ChildExited` classified as `Orphaned`), so this
-    /// entry always performs the actual stop/reap and reports its own
-    /// outcome instead of trusting a frozen terminal.
-    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+    /// Real cleanup for both scheduler fault closures (latched transport
+    /// failure and stalled task). `finish_process` is short-circuited by
+    /// `begin_stopping` once any terminal was published (for example a late
+    /// `ChildExited` classified as `Orphaned`), so this entry always performs
+    /// the actual stop/reap and reports its own outcome instead of trusting a
+    /// frozen terminal.
+    fn cleanup_for_forced_failure(&self, grace: Duration) -> RuntimeTerminal {
         self.permission_responses.lock().unwrap().clear();
         let terminal = cleanup_owned_group(&self.driver, grace);
         self.publisher.publish_cleanup_terminal(terminal.clone());

@@ -64,11 +64,10 @@ impl Scheduler {
         )
     }
 
-    /// Handle the sink's latched transport fault. Caller must not hold the
-    /// per-task operation lock: this takes it and re-validates that the active
-    /// instance and the durable task row still belong to this monitor before
-    /// performing the real cleanup and the explicit
-    /// `RUNTIME_TRANSPORT_FRAME_LIMIT` closure.
+    /// Handle the sink's latched transport fault on the loop paths that do
+    /// not run the stall decision. Re-validates ownership before the real
+    /// cleanup and the explicit `RUNTIME_TRANSPORT_FRAME_LIMIT` closure.
+    #[allow(clippy::too_many_arguments)]
     fn handle_transport_failure(
         &self,
         agent_id: &str,
@@ -78,66 +77,64 @@ impl Scheduler {
         route: &TaskRoute,
         operation: &Mutex<()>,
         check: &ActiveCheck,
-    ) {
+    ) -> FaultDisposition {
         let Some(failure) = sink.transport_failure() else {
-            return;
+            return FaultDisposition::Suppressed;
         };
-        check.cancel();
-        let _guard = operation.lock().unwrap();
-        let current = match self.inner.store.get_task(agent_id) {
-            Ok(current) => current,
-            Err(error) => {
-                self.record_failure(agent_id, error.to_string());
-                return;
-            }
-        };
-        let owned = current
-            .as_ref()
-            .is_some_and(|task| !task.phase.is_terminal() && task.owner_epoch == owner_epoch);
-        if !owned || !self.active_instance_matches(agent_id, owner_epoch) {
-            // Another control path already released or finished this instance.
-            return;
-        }
+        let guard = operation.lock().unwrap();
         #[cfg(test)]
         self.run_before_transport_cleanup_hook();
+        match self.decision_task(agent_id) {
+            Ok(Some(task))
+                if !task.phase.is_terminal()
+                    && task.owner_epoch == owner_epoch
+                    && self.active_instance_matches(agent_id, owner_epoch) => {}
+            Ok(_) => {
+                // The row is gone, terminal, or owned by a newer epoch.
+                self.abandon_active_monitor(agent_id, owner_epoch);
+                return FaultDisposition::Abandoned;
+            }
+            Err(error) => {
+                // A transient read failure must not orphan the watchdog:
+                // report once and retry on the next tick.
+                if sink.runtime_lifecycle.stall_note_read_error() {
+                    self.record_failure(agent_id, error.to_string());
+                }
+                return FaultDisposition::Suppressed;
+            }
+        }
         // Close ingress before the real cleanup: `finish_routed_terminal`
         // flips the lifecycle phase to Terminal, so records the pump forwards
         // after that point are dropped instead of reopening the owner.
         sink.runtime_lifecycle
             .request_stop(&runtime.turn_snapshot());
         sink.runtime_lifecycle.force_terminating();
-        let terminal = runtime.cleanup_for_transport_failure(self.inner.config.stop_grace);
-        let message = transport_failure_message(&failure, &terminal);
-        if let Err(error) = self.finish_locked_monitor_terminal(
+        self.commit_fault(
             agent_id,
             owner_epoch,
             runtime,
             sink,
             route,
-            current.as_ref(),
-            terminal,
-            false,
-            Some((
-                CompletionOutcome::Failed,
-                TRANSPORT_FRAME_LIMIT_REASON.into(),
-            )),
-            Some(message),
-        ) {
-            self.record_failure(agent_id, error.to_string());
-        }
-        self.release_active(agent_id, owner_epoch);
-        if let Err(error) = self.start_ready() {
-            self.record_failure(agent_id, error.to_string());
-        }
+            TRANSPORT_FRAME_LIMIT_REASON,
+            |terminal| transport_failure_message(&failure, terminal),
+            check,
+            operation,
+            guard,
+        );
+        FaultDisposition::Handled
     }
 
-    /// Decide and execute the S02 stall closure.
+    /// Decide and execute a scheduler fault closure at the protected stall
+    /// decision point.
     ///
-    /// The caller observed an expired window outside the operation lock; this
-    /// re-validates the whole decision at the protected point (fresh progress,
-    /// ownership, phase, cancel/close, pending), switches the runtime
-    /// lifecycle to terminating, then releases the lock and only afterwards
-    /// performs the real stop/reap (B-B03).
+    /// The decision is linearized on the publisher latch (no terminal can be
+    /// published) and the admission latch (no event or pending input can be
+    /// admitted). Inside both latches it re-reads the transport latch, the
+    /// admitted-progress revision, the durable phase, pending input, and the
+    /// published terminal, then atomically switches the lifecycle to
+    /// terminating before releasing everything for the real stop/reap
+    /// (B-B03, review R1/R2).
+    #[allow(clippy::too_many_arguments)]
     fn handle_stall(
         &self,
         agent_id: &str,
@@ -147,69 +144,155 @@ impl Scheduler {
         route: &TaskRoute,
         operation: &Mutex<()>,
         check: &ActiveCheck,
-    ) -> StallDisposition {
-        let failure_message;
-        {
-            let _guard = operation.lock().unwrap();
-            #[cfg(test)]
-            self.run_before_stall_cleanup_hook();
-            let now = self.now();
-            // A normal terminal published concurrently outranks the stall
-            // closure: leave it to the monitor's terminal branch.
-            if runtime.wait_terminal(Duration::ZERO).is_some() {
-                return StallDisposition::Suppressed;
-            }
-            // Re-observe admitted progress at the protected decision point: an
-            // event that landed while the monitor slept always wins.
-            sink.runtime_lifecycle
-                .stall_observe_progress(sink.activity.progress_revision(), now);
-            let current = match self.inner.store.get_task(agent_id) {
-                Ok(current) => current,
-                Err(error) => {
+    ) -> FaultDisposition {
+        let guard = operation.lock().unwrap();
+        #[cfg(test)]
+        self.run_before_stall_cleanup_hook();
+        // Outermost latch: while held, no pump can publish a terminal, and
+        // because pumps call the sink under it, no event or pending input can
+        // be admitted. The admission latch nests inside it, matching the
+        // sink's publisher -> admission order.
+        let publisher_latch = runtime.terminal_latch();
+        let published_terminal = publisher_latch
+            .as_ref()
+            .and_then(|state| state.published_terminal());
+        let mut admission = sink.runtime_lifecycle.decision_latch();
+
+        let current = match self.decision_task(agent_id) {
+            Ok(current) => current,
+            Err(error) => {
+                if sink.runtime_lifecycle.stall_note_read_error() {
                     self.record_failure(agent_id, error.to_string());
-                    return StallDisposition::Abandoned;
                 }
-            };
-            let Some(task) = current.as_ref() else {
-                return StallDisposition::Abandoned;
-            };
-            if task.owner_epoch != owner_epoch || task.phase.is_terminal() {
-                return StallDisposition::Abandoned;
+                return FaultDisposition::Suppressed;
             }
-            if !self.active_instance_matches(agent_id, owner_epoch) {
-                return StallDisposition::Abandoned;
-            }
-            // Waiting for input, an in-flight stop/close, or a phase that is
-            // not RUNNING is never a stall.
-            if task.phase != TaskPhase::Running || task.stop_requested || task.close_requested {
-                return StallDisposition::Suppressed;
-            }
-            if self
-                .inner
-                .store
-                .completion_blockers(agent_id)
-                .map(|(pending, _)| pending)
-                .unwrap_or(true)
-            {
-                return StallDisposition::Suppressed;
-            }
-            let Some(status) = sink
-                .runtime_lifecycle
-                .stall_poll(now, self.inner.config.stall_timeout)
-            else {
-                return StallDisposition::Suppressed;
-            };
-            check.cancel();
-            sink.runtime_lifecycle.request_stop(&runtime.turn_snapshot());
-            sink.runtime_lifecycle.force_terminating();
-            sink.runtime_lifecycle.stall_mark_triggered();
-            failure_message = Some(stall_failure_message(&status));
+        };
+        let Some(task) = current.as_ref() else {
+            drop(admission);
+            drop(publisher_latch);
+            self.abandon_active_monitor(agent_id, owner_epoch);
+            return FaultDisposition::Abandoned;
+        };
+        if task.owner_epoch != owner_epoch
+            || task.phase.is_terminal()
+            || !self.active_instance_matches(agent_id, owner_epoch)
+        {
+            drop(admission);
+            drop(publisher_latch);
+            self.abandon_active_monitor(agent_id, owner_epoch);
+            return FaultDisposition::Abandoned;
         }
-        // Ingress is closed, so the real cleanup runs without holding the
-        // operation lock. Reuse the S01 cleanup entry for the same
-        // already-published-terminal handoff (a late child exit may have
-        // frozen the owner with an Orphaned terminal).
-        let terminal = runtime.cleanup_for_transport_failure(self.inner.config.stop_grace);
+
+        let now = self.now();
+        // Re-read the transport latch inside the decision latch (review R2):
+        // a fault latched after the loop-top check always takes the S01
+        // closure with its transport reason and stage.
+        let transport = sink.transport_failure();
+        // Fold every admitted progress event; a revision that advanced after
+        // the expiry check restarts the window and suppresses the stall.
+        sink.runtime_lifecycle
+            .stall_observe_progress(sink.activity.progress_revision(), now);
+        let pending = self
+            .inner
+            .store
+            .completion_blockers(agent_id)
+            .map(|(pending, _)| pending)
+            .unwrap_or(true);
+
+        let stall_status = if transport.is_none()
+            && task.phase == TaskPhase::Running
+            && !task.stop_requested
+            && !task.close_requested
+            && published_terminal.is_none()
+            && !pending
+        {
+            sink.runtime_lifecycle
+                .stall_poll(now, self.inner.config.stall_timeout)
+        } else {
+            None
+        };
+
+        if transport.is_none() && stall_status.is_none() {
+            // Freeze the window while the task waits for user input before
+            // handing it back to the normal loop.
+            sink.runtime_lifecycle
+                .stall_set_waiting(task.phase == TaskPhase::WaitingInput, now);
+            drop(admission);
+            drop(publisher_latch);
+            return FaultDisposition::Suppressed;
+        }
+
+        // Atomic commit under both latches: close ingress and record the
+        // stall trigger before anything can be admitted or published.
+        RuntimeLifecycle::request_stop_locked(&mut admission, &runtime.turn_snapshot());
+        RuntimeLifecycle::force_terminating_locked(&mut admission);
+        if transport.is_none() {
+            sink.runtime_lifecycle.stall_mark_triggered();
+        }
+        drop(admission);
+        drop(publisher_latch);
+
+        match transport {
+            Some(failure) => {
+                self.commit_fault(
+                    agent_id,
+                    owner_epoch,
+                    runtime,
+                    sink,
+                    route,
+                    TRANSPORT_FRAME_LIMIT_REASON,
+                    |terminal| transport_failure_message(&failure, terminal),
+                    check,
+                    operation,
+                    guard,
+                );
+            }
+            None => {
+                let status = stall_status
+                    .expect("a stall status exists when no transport fault was latched");
+                self.commit_fault(
+                    agent_id,
+                    owner_epoch,
+                    runtime,
+                    sink,
+                    route,
+                    STALLED_NO_ACTIVITY_REASON,
+                    |_| stall_failure_message(&status),
+                    check,
+                    operation,
+                    guard,
+                );
+            }
+        }
+        FaultDisposition::Handled
+    }
+
+    /// Commit a scheduler fault closure. The caller holds the operation lock
+    /// and has already closed ingress atomically; this releases the lock,
+    /// performs the real stop/reap, re-acquires it, persists the forced
+    /// outcome, releases the active slot, and advances the queue (B-B03).
+    #[allow(clippy::too_many_arguments)]
+    fn commit_fault<F>(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &StoreLifecycleSink,
+        route: &TaskRoute,
+        forced_reason: &'static str,
+        detail: F,
+        check: &ActiveCheck,
+        operation: &Mutex<()>,
+        guard: MutexGuard<'_, ()>,
+    ) where
+        F: FnOnce(&RuntimeTerminal) -> String,
+    {
+        check.cancel();
+        drop(guard);
+        // The cleanup entry never trusts a terminal a late exit boundary may
+        // have published (S01 handoff) and reports the real stop/reap.
+        let terminal = runtime.cleanup_for_forced_failure(self.inner.config.stop_grace);
+        let message = detail(&terminal);
         let _guard = operation.lock().unwrap();
         if let Err(error) = self.finish_locked_monitor_terminal(
             agent_id,
@@ -220,11 +303,8 @@ impl Scheduler {
             None,
             terminal,
             false,
-            Some((
-                CompletionOutcome::Failed,
-                STALLED_NO_ACTIVITY_REASON.into(),
-            )),
-            failure_message,
+            Some((CompletionOutcome::Failed, forced_reason.into())),
+            Some(message),
         ) {
             self.record_failure(agent_id, error.to_string());
         }
@@ -232,7 +312,6 @@ impl Scheduler {
         if let Err(error) = self.start_ready() {
             self.record_failure(agent_id, error.to_string());
         }
-        StallDisposition::Terminated
     }
 
     pub(super) fn spawn_monitor(&self, context: MonitorContext) {
@@ -253,7 +332,7 @@ impl Scheduler {
             let mut handled_generation = 0;
             loop {
                 if sink.transport_failure().is_some() {
-                    scheduler.handle_transport_failure(
+                    match scheduler.handle_transport_failure(
                         &agent_id,
                         owner_epoch,
                         &runtime,
@@ -261,8 +340,14 @@ impl Scheduler {
                         &route,
                         &operation,
                         &check,
-                    );
-                    return;
+                    ) {
+                        // Only a transient decision read failure lands here;
+                        // back off a tick before retrying instead of spinning.
+                        FaultDisposition::Suppressed => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        FaultDisposition::Handled | FaultDisposition::Abandoned => return,
+                    }
                 }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
                     // A latched transport fault outranks any terminal a late
@@ -270,7 +355,7 @@ impl Scheduler {
                     // re-check before normal turn adjudication.
                     if sink.transport_failure().is_some() {
                         let _ = terminal;
-                        scheduler.handle_transport_failure(
+                        match scheduler.handle_transport_failure(
                             &agent_id,
                             owner_epoch,
                             &runtime,
@@ -278,8 +363,10 @@ impl Scheduler {
                             &route,
                             &operation,
                             &check,
-                        );
-                        return;
+                        ) {
+                            FaultDisposition::Suppressed => {}
+                            FaultDisposition::Handled | FaultDisposition::Abandoned => return,
+                        }
                     }
                     let _guard = operation.lock().unwrap();
                     let natural = matches!(terminal, RuntimeTerminal::Completed(_));
@@ -397,17 +484,12 @@ impl Scheduler {
                 }
                 // S02: the stall watchdog shares this unified decision point.
                 // It runs after the confirmed terminal/sink failures but
-                // before turn adjudication, and its window only advances on
-                // admitted runtime progress.
+                // before turn adjudication. The window only advances on
+                // admitted runtime progress; the full decision (owner epoch,
+                // durable phase, pending, cancel/close, transport latch, and
+                // published terminal) is re-validated under the linearization
+                // latches inside `handle_stall`.
                 let stall_now = scheduler.now();
-                let waiting_for_input = scheduler
-                    .inner
-                    .store
-                    .get_task(&agent_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|task| task.phase == TaskPhase::WaitingInput);
-                runtime_lifecycle.stall_set_waiting(waiting_for_input, stall_now);
                 runtime_lifecycle
                     .stall_observe_progress(sink.activity.progress_revision(), stall_now);
                 if runtime_lifecycle
@@ -423,8 +505,8 @@ impl Scheduler {
                         &operation,
                         &check,
                     ) {
-                        StallDisposition::Suppressed => {}
-                        StallDisposition::Terminated | StallDisposition::Abandoned => return,
+                        FaultDisposition::Suppressed => {}
+                        FaultDisposition::Handled | FaultDisposition::Abandoned => return,
                     }
                 }
                 let turn = runtime.turn_snapshot();

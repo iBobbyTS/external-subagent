@@ -24,6 +24,10 @@ pub(crate) struct SchedulerInner {
     pub(super) before_transport_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     pub(super) before_stall_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test-only decision read fault: returning true makes the single
+    /// protected store read fail once, so R3 recovery can be pinned.
+    #[cfg(test)]
+    pub(super) stall_read_fault: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     /// Monotonic clock seam shared by every stall decision. Production uses
     /// `Instant::now`; tests inject a manual clock so window arithmetic is
     /// exercised on the same semantics as production.
@@ -95,6 +99,9 @@ struct StallWatchState {
     waiting: bool,
     /// Set when the watchdog closure has taken ownership once.
     triggered: bool,
+    /// One-shot flag so a transient store read failure is reported once
+    /// instead of on every retry tick.
+    read_error_reported: bool,
 }
 
 /// Bounded stall evidence handed to the closure diagnostics.
@@ -104,12 +111,13 @@ pub(super) struct StallStatus {
     pub(super) timeout: Duration,
 }
 
-/// Whether the monitor keeps looping after a stall decision.
+/// Whether the monitor keeps looping after a fault decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StallDisposition {
-    /// The task was failed by the stall closure; the monitor returns.
-    Terminated,
-    /// A concurrent activity, pending input, or stop suppressed the watchdog.
+pub(super) enum FaultDisposition {
+    /// A fault closure took the task; the monitor returns.
+    Handled,
+    /// A concurrent activity, pending input, stop, or a transient read
+    /// failure suppressed the watchdog; the monitor keeps looping.
     Suppressed,
     /// This monitor no longer owns the task; the monitor returns.
     Abandoned,
@@ -210,6 +218,45 @@ impl RuntimeLifecycle {
         self.stall.lock().unwrap().triggered = true;
     }
 
+    /// Report a transient decision read failure at most once per claim.
+    /// Returns true when this call is the first to report it.
+    pub(super) fn stall_note_read_error(&self) -> bool {
+        let mut state = self.stall.lock().unwrap();
+        if state.read_error_reported {
+            false
+        } else {
+            state.read_error_reported = true;
+            true
+        }
+    }
+
+    /// The admission latch shared with the lifecycle sink. While held, no
+    /// event can be admitted (`admit_event` blocks), so a decision made under
+    /// it sees exactly the events admitted before the linearization point.
+    pub(super) fn decision_latch(&self) -> MutexGuard<'_, RuntimeLifecycleSnapshot> {
+        self.state.lock().unwrap()
+    }
+
+    /// [`Self::request_stop`] against an already-held admission latch.
+    pub(super) fn request_stop_locked(state: &mut RuntimeLifecycleSnapshot, turn: &TurnSnapshot) {
+        if state.phase == RuntimeLifecyclePhase::Running {
+            state.phase = RuntimeLifecyclePhase::StopRequested;
+            state.turn_generation = turn.generation;
+            state.stop_requested_at = Some(Instant::now());
+        }
+    }
+
+    /// [`Self::force_terminating`] against an already-held admission latch.
+    pub(super) fn force_terminating_locked(state: &mut RuntimeLifecycleSnapshot) {
+        if !matches!(
+            state.phase,
+            RuntimeLifecyclePhase::ForceTerminating | RuntimeLifecyclePhase::Terminal
+        ) {
+            state.phase = RuntimeLifecyclePhase::ForceTerminating;
+            state.force_termination_count = state.force_termination_count.saturating_add(1);
+        }
+    }
+
     #[cfg(test)]
     fn snapshot(&self) -> RuntimeLifecycleSnapshot {
         self.state.lock().unwrap().clone()
@@ -217,11 +264,7 @@ impl RuntimeLifecycle {
 
     pub(super) fn request_stop(&self, turn: &TurnSnapshot) {
         let mut state = self.state.lock().unwrap();
-        if state.phase == RuntimeLifecyclePhase::Running {
-            state.phase = RuntimeLifecyclePhase::StopRequested;
-            state.turn_generation = turn.generation;
-            state.stop_requested_at = Some(Instant::now());
-        }
+        Self::request_stop_locked(&mut state, turn);
     }
 
     pub(super) fn acknowledge_boundary(&self, turn: &TurnSnapshot) -> bool {
@@ -243,13 +286,7 @@ impl RuntimeLifecycle {
 
     pub(super) fn force_terminating(&self) {
         let mut state = self.state.lock().unwrap();
-        if !matches!(
-            state.phase,
-            RuntimeLifecyclePhase::ForceTerminating | RuntimeLifecyclePhase::Terminal
-        ) {
-            state.phase = RuntimeLifecyclePhase::ForceTerminating;
-            state.force_termination_count = state.force_termination_count.saturating_add(1);
-        }
+        Self::force_terminating_locked(&mut state);
     }
 
     pub(super) fn terminalize(&self) {
@@ -398,6 +435,8 @@ impl Scheduler {
                 before_transport_cleanup_hook: Mutex::new(None),
                 #[cfg(test)]
                 before_stall_cleanup_hook: Mutex::new(None),
+                #[cfg(test)]
+                stall_read_fault: Mutex::new(None),
                 clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
@@ -544,6 +583,38 @@ impl Scheduler {
         (self.inner.clock)()
     }
 
+    /// The durable task read used by fault decisions, with a test-only
+    /// single-shot failure seam.
+    pub(super) fn decision_task(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<TaskRecord>, external_store::StoreError> {
+        #[cfg(test)]
+        if let Some(fault) = self.inner.stall_read_fault.lock().unwrap().clone() {
+            if fault() {
+                return Err(external_store::StoreError::InvalidState(
+                    "injected decision read failure".into(),
+                ));
+            }
+        }
+        self.inner.store.get_task(agent_id)
+    }
+
+    /// Release the in-memory slot and advance the queue for a task this
+    /// monitor can no longer own. Epoch-guarded, so a newer claim is never
+    /// disturbed (`release_active` is a no-op when the epoch changed).
+    pub(super) fn abandon_active_monitor(&self, agent_id: &str, owner_epoch: u64) {
+        self.release_active(agent_id, owner_epoch);
+        if let Err(error) = self.start_ready() {
+            self.record_failure(agent_id, error.to_string());
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_stall_read_fault(&self, fault: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.inner.stall_read_fault.lock().unwrap() = Some(fault);
+    }
+
     #[cfg(test)]
     pub(super) fn set_clock(&mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) {
         Arc::get_mut(&mut self.inner)
@@ -558,24 +629,14 @@ impl Scheduler {
 
     #[cfg(test)]
     pub(super) fn run_before_stall_cleanup_hook(&self) {
-        if let Some(hook) = self
-            .inner
-            .before_stall_cleanup_hook
-            .lock()
-            .unwrap()
-            .clone()
-        {
+        if let Some(hook) = self.inner.before_stall_cleanup_hook.lock().unwrap().clone() {
             hook();
         }
     }
 
     #[cfg(test)]
     pub(super) fn set_before_transport_cleanup_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self
-            .inner
-            .before_transport_cleanup_hook
-            .lock()
-            .unwrap() = Some(hook);
+        *self.inner.before_transport_cleanup_hook.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]

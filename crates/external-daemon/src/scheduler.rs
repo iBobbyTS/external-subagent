@@ -17,7 +17,7 @@ pub(crate) use self::diagnostics::{bounded_error, bounded_prefix};
 #[cfg(test)]
 use self::state::ResponseClaimHookStage;
 use self::state::{
-    ActiveCheck, ActiveRuntime, MonitorContext, StallDisposition, StallStatus, TerminalDecision,
+    ActiveCheck, ActiveRuntime, FaultDisposition, MonitorContext, StallStatus, TerminalDecision,
     TerminalTarget,
 };
 pub use self::state::{MessageDisposition, ResponseDisposition, ResponseOutcome, Scheduler};

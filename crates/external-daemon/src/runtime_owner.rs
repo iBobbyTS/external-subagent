@@ -1,6 +1,6 @@
 use crate::{
     task_route, LifecycleSink, RuntimeActivitySnapshot, RuntimeCommandError, RuntimeOwner,
-    RuntimeTerminal, SessionReady, TaskRoute, TurnBoundary, TurnSnapshot,
+    RuntimeTerminal, SessionReady, TaskRoute, TerminalLatch, TurnBoundary, TurnSnapshot,
 };
 use external_contract::StdioMcpServer;
 use external_core::ValidatedPermissionDenial;
@@ -18,16 +18,24 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     fn identity(&self) -> Option<ProcessIdentity>;
     fn stop(&self, grace: Duration) -> RuntimeTerminal;
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal>;
-    /// Real cleanup for the latched transport failure.
+    /// Real cleanup shared by both scheduler fault closures (S01 latched
+    /// transport failure and S02 stalled task).
     ///
     /// `stop` is short-circuited by the owner's publisher once any terminal
     /// was published, including a late child-exit classification that never
-    /// stopped anything. Process owners override this so the transport
-    /// closure still performs the actual stop/reap and reports its outcome;
-    /// the default preserves the historical `stop` contract for runtimes
-    /// without a process group to prove.
-    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+    /// stopped anything. Process owners override this so a fault closure
+    /// still performs the actual stop/reap and reports its outcome; the
+    /// default preserves the historical `stop` contract for runtimes without
+    /// a process group to prove.
+    fn cleanup_for_forced_failure(&self, grace: Duration) -> RuntimeTerminal {
         self.stop(grace)
+    }
+    /// Outermost latch for a fault decision: while held, no pump can publish
+    /// a terminal for this runtime (and, because pumps call the lifecycle
+    /// sink under the same lock, no event or pending input can be admitted).
+    /// Runtimes without a publisher (test doubles) return `None`.
+    fn terminal_latch(&self) -> Option<TerminalLatch<'_>> {
+        None
     }
     fn diagnostic_tail(&self) -> String {
         String::new()
@@ -124,8 +132,12 @@ impl ManagedRuntime for RuntimeOwner {
         self.stop(grace)
     }
 
-    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
-        self.cleanup_for_transport_failure(grace)
+    fn cleanup_for_forced_failure(&self, grace: Duration) -> RuntimeTerminal {
+        self.cleanup_for_forced_failure(grace)
+    }
+
+    fn terminal_latch(&self) -> Option<TerminalLatch<'_>> {
+        Some(self.publisher.decision_latch())
     }
 
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {

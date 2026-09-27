@@ -192,12 +192,7 @@ pub(crate) fn persist_general_result(
 ) -> Result<(), StoreError> {
     let result = task_result(completion);
     let _ = prepared;
-    store_result_with_cancel_precedence(
-        store,
-        agent_id,
-        &result,
-        completion.reason_code.as_deref(),
-    )
+    store_result_with_cancel_precedence(store, agent_id, &result, completion.reason_code.as_deref())
 }
 
 pub(crate) fn store_result_with_cancel_precedence(
