@@ -444,7 +444,7 @@ impl RpcService {
                 offset,
                 limit,
             } => {
-                let (task, stored) = self.require_task_with_result(&agent_id)?;
+                let (task, stored, reason) = self.require_task_with_result(&agent_id)?;
                 if limit == 0 || limit > MAX_RESULT_CHUNK_BYTES {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
@@ -455,10 +455,6 @@ impl RpcService {
                 }
                 let result = stored
                     .map(|stored| {
-                        let reason = self
-                            .store
-                            .terminal_reason_code(&task.agent_id)
-                            .map_err(map_store)?;
                         let failure_message = failure_message_projection(&task, &stored);
                         self.task_result_view(stored, offset, limit, reason, failure_message)
                     })
@@ -546,21 +542,22 @@ impl RpcService {
         validate_task_record(task)
     }
 
-    /// Snapshot the task row and its optional immutable result under one store
-    /// lock so the two RPC exits can never pair a task state with a result
-    /// from a different round. The task still passes the existing access
-    /// validation.
+    /// Snapshot the task row, its optional immutable result, and the latest
+    /// terminal reason under one store lock so the two RPC exits can never pair
+    /// a task state, a result, or a reason from a different round. The task
+    /// still passes the existing access validation.
+    #[allow(clippy::type_complexity)]
     pub(super) fn require_task_with_result(
         &self,
         agent_id: &str,
-    ) -> Result<(TaskRecord, Option<StoredTaskResult>), RpcError> {
+    ) -> Result<(TaskRecord, Option<StoredTaskResult>, Option<String>), RpcError> {
         validate_id(agent_id, "agent_id")?;
-        let (task, result) = self
+        let (task, result, reason) = self
             .store
             .task_with_result(agent_id)
             .map_err(map_store)?
             .ok_or_else(|| RpcError::new(RpcErrorCode::NotFound, "task was not found"))?;
-        Ok((validate_task_record(task)?, result))
+        Ok((validate_task_record(task)?, result, reason))
     }
 
     pub(super) fn task_result_view(

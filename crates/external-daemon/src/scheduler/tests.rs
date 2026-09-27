@@ -1720,7 +1720,8 @@ sleep 2
     }
 
     #[test]
-    fn bounded_error_respects_utf8_byte_limit() {        let value = bounded_error(&"界".repeat(5000));
+    fn bounded_error_respects_utf8_byte_limit() {
+        let value = bounded_error(&"界".repeat(5000));
         assert!(value.len() <= 4096);
         assert!(value.ends_with('…'));
         assert!(std::str::from_utf8(value.as_bytes()).is_ok());
@@ -1865,6 +1866,113 @@ sleep 2
         update_latest_failure(&mut failures, "agent", "first".into());
         update_latest_failure(&mut failures, "agent", "latest".into());
         assert_eq!(failures.get("agent").map(String::as_str), Some("latest"));
+    }
+
+    #[test]
+    fn registered_cleanup_captures_runtime_session_and_tail() {
+        // Review C-02(1) asked for an assertion on the unstarted sibling at
+        // `cleanup_registered_runtime_with_grace` (the `else` branch). That
+        // branch is only taken when the post-stop row phase is outside
+        // {RUNNING, CANCELLING, TERMINAL}, but `request_runtime_stop` runs
+        // immediately before it and unconditionally moves any non-terminal row
+        // to CANCELLING (crates/external-store/src/lifecycle.rs:169-187), so
+        // the sibling is defensive-only and no production path reaches it.
+        // This test pins the reachable registered-cleanup handoff instead: the
+        // failure record must carry the still-owned runtime's session and tail.
+        struct CleanupRuntime;
+        impl ManagedRuntime for CleanupRuntime {
+            fn identity(&self) -> Option<ProcessIdentity> {
+                None
+            }
+            fn stop(&self, _: Duration) -> RuntimeTerminal {
+                RuntimeTerminal::Completed(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+            }
+            fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+                Some(self.stop(Duration::ZERO))
+            }
+            fn bootstrap_session(
+                &self,
+                _: &TaskRecord,
+                _: Duration,
+            ) -> Result<SessionReady, RuntimeCommandError> {
+                Ok(SessionReady {
+                    session_id: "cleanup-session".into(),
+                    initial_turn_id: None,
+                    configured_model: None,
+                })
+            }
+            fn diagnostic_session_id(&self) -> Option<String> {
+                Some("cleanup-session".into())
+            }
+            fn diagnostic_tail(&self) -> String {
+                "cleanup-tail".into()
+            }
+        }
+        struct CleanupFactory;
+        impl RuntimeFactory for CleanupFactory {
+            fn spawn(
+                &self,
+                _: &TaskRecord,
+                _: Arc<dyn LifecycleSink>,
+            ) -> io::Result<Arc<dyn ManagedRuntime>> {
+                Ok(Arc::new(CleanupRuntime))
+            }
+        }
+
+        let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(CleanupFactory);
+        // Abort the RUNNING transition so registration succeeds but the store
+        // mark fails: cleanup then hands off while still owning the runtime.
+        {
+            let connection =
+                rusqlite::Connection::open(workspace.path().join("state.sqlite")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_running BEFORE UPDATE ON tasks
+                     WHEN NEW.phase='RUNNING' AND OLD.phase='PREPARING'
+                     BEGIN SELECT RAISE(ABORT, 'injected running failure'); END;",
+                )
+                .unwrap();
+        }
+        assert!(scheduler.start_ready().is_err());
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["error_code"], "STORE_START_FAILED");
+        // The still-owned runtime supplies the honest session/tail evidence.
+        assert_eq!(persisted["session_id"], "cleanup-session");
+        assert_eq!(persisted["stderr_tail"], "cleanup-tail");
+        assert_eq!(persisted["stage"], "runtime_terminal");
+    }
+
+    #[test]
+    fn legacy_top_level_model_fails_route_decoding_before_the_model_gate() {
+        let (_workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        // A legacy row that carried the requested model at the prepared JSON
+        // top level is rejected by the strict PreparedGeneralTask decode
+        // before the session-level model gate can run, so it lands as a
+        // preparation failure rather than MODEL_MISMATCH.
+        {
+            let store = scheduler.store();
+            let task = store.get_task(&agent_id).unwrap().unwrap();
+            let mut prepared: serde_json::Value =
+                serde_json::from_str(&task.prepared_launch_json).unwrap();
+            prepared["model"] = serde_json::json!("zai/requested-model");
+            let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE tasks SET prepared_launch_json=?1 WHERE agent_id=?2",
+                    rusqlite::params![prepared.to_string(), agent_id],
+                )
+                .unwrap();
+        }
+        let error = scheduler.start_ready().unwrap_err();
+        assert!(matches!(error, SchedulerError::InvalidConfig(_)));
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::ResultInvalid));
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["error_code"], "PREPARED_LAUNCH_INVALID");
     }
 }
 

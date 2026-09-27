@@ -47,10 +47,11 @@ impl RpcService {
             if interrupted() {
                 return Err(RpcError::new(RpcErrorCode::Unavailable, "wait interrupted"));
             }
-            // One snapshot per round: the task row and its optional immutable
-            // result are read under a single store lock, so a concurrent
-            // terminal write can never be interleaved between them.
-            let (task, stored_result) = self.require_task_with_result(&query.agent_id)?;
+            // One snapshot per round: the task row, its optional immutable
+            // result, and the terminal reason are read under a single store
+            // lock, so a concurrent terminal write can never be interleaved
+            // between them.
+            let (task, stored_result, reason) = self.require_task_with_result(&query.agent_id)?;
             let message_receipt = if let Some(id) = &query.message_id {
                 self.store.message(id).map_err(map_store)?.and_then(|m| {
                     (m.agent_id == query.agent_id).then(|| MessageReceiptView {
@@ -96,10 +97,6 @@ impl RpcService {
                 let result_page = stored_result
                     .filter(|_| terminal)
                     .map(|stored| {
-                        let reason = self
-                            .store
-                            .terminal_reason_code(&task.agent_id)
-                            .map_err(map_store)?;
                         let failure_message = failure_message_projection(&task, &stored);
                         self.task_result_view(
                             stored,
@@ -364,13 +361,20 @@ fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>, bool)>
     let fits_end = |end: usize| {
         let mut probe = base.clone();
         if let RpcSuccess::TaskWait {
-            result: Some(view), ..
+            result: Some(view),
+            instruction,
+            ..
         } = &mut probe
         {
             let next = offset + end;
             view.final_text.truncate(end);
             view.next_offset = (next < total).then_some(next);
             view.complete = view.next_offset.is_none();
+            // The instruction is part of the frame and depends on the page
+            // state, so every probe must carry the instruction the real path
+            // would emit for that candidate page (a complete->partial shrink
+            // lengthens it, and the remaining slack can be a few bytes).
+            *instruction = Some(terminal_result_instruction(view));
         }
         wait_envelope_fits(&probe).unwrap_or(false)
     };
@@ -1824,7 +1828,7 @@ pub(crate) mod wait_tests {
         )
     }
 
-    fn failed_result_for(service: &Arc<RpcService>, id: &str, detail: &str) {
+    fn failed_result_for(service: &Arc<RpcService>, id: &str, reason: &str, detail: &str) {
         service
             .store
             .store_task_result_with_reason(
@@ -1834,7 +1838,7 @@ pub(crate) mod wait_tests {
                     final_text: "RUNTIME_TERMINAL".into(),
                     partial: true,
                 },
-                Some("RUNTIME_TERMINAL"),
+                Some(reason),
                 Some(detail),
             )
             .unwrap();
@@ -1844,7 +1848,7 @@ pub(crate) mod wait_tests {
     fn failed_terminal_result_surfaces_the_persisted_failure_message_on_both_exits() {
         let (_directory, service, id) = fixture();
         let detail = realistic_failure_detail();
-        failed_result_for(&service, &id, &detail);
+        failed_result_for(&service, &id, "RUNTIME_TERMINAL", &detail);
         // The RPC projection reads the stored library value verbatim.
         assert_eq!(
             service
@@ -1970,12 +1974,12 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn cross_round_same_outcome_failures_pair_the_current_detail() {
+    fn cross_round_same_outcome_failures_pair_the_current_detail_and_reason() {
         let (_directory, service, id) = fixture();
         let first = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round one"}"#;
         let second = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round two"}"#;
         // Round one: same final_text/digest as round two, different detail.
-        failed_result_for(&service, &id, first);
+        failed_result_for(&service, &id, "RUNTIME_TERMINAL", first);
         let RpcSuccess::TaskWait {
             result: Some(result),
             ..
@@ -1986,6 +1990,7 @@ pub(crate) mod wait_tests {
             panic!("expected round-one terminal wait")
         };
         assert_eq!(result.failure_message.as_deref(), Some(first));
+        assert_eq!(result.reason_code.as_deref(), Some("RUNTIME_TERMINAL"));
 
         // Resume clears the detail and deletes the immutable result.
         assert!(service
@@ -1997,8 +2002,9 @@ pub(crate) mod wait_tests {
             .store
             .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
             .unwrap();
-        // Round two writes the same final_text (same digest) with a new detail.
-        failed_result_for(&service, &id, second);
+        // Round two writes the same final_text (same digest) with a new detail
+        // and a different reason.
+        failed_result_for(&service, &id, "MODEL_REJECTED", second);
 
         for read in [
             service.dispatch(RpcMethod::TaskWait(query(&id, 0))).unwrap(),
@@ -2027,7 +2033,108 @@ pub(crate) mod wait_tests {
                 Some(second),
                 "the old round's detail must not be mixed with the current result"
             );
+            assert_eq!(
+                result.reason_code.as_deref(),
+                Some("MODEL_REJECTED"),
+                "the old round's reason must not be mixed with the current result"
+            );
         }
+    }
+
+    #[test]
+    fn cross_round_reads_never_mix_detail_or_reason_during_a_concurrent_second_failure() {
+        let (_directory, service, id) = fixture();
+        let first = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round one"}"#;
+        let second = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round two"}"#;
+        failed_result_for(&service, &id, "RUNTIME_TERMINAL", first);
+
+        // A real interleave: the writer resumes and commits a second
+        // same-outcome, same-digest failure while the reader keeps calling both
+        // exits. Detail and reason must always move together with the result
+        // they belong to (the single-lock snapshot includes the reason).
+        let writer_service = Arc::clone(&service);
+        let writer_id = id.clone();
+        let writer = std::thread::spawn(move || {
+            assert!(writer_service
+                .store
+                .requeue_task_for_resume_with_message(&writer_id, "resume-concurrent", "continue")
+                .unwrap());
+            let claim = writer_service
+                .store
+                .claim_next("wait-test", 10, 10)
+                .unwrap()
+                .unwrap();
+            writer_service
+                .store
+                .mark_session_running(
+                    &writer_id,
+                    claim.owner_epoch,
+                    "runtime",
+                    None,
+                    Some("session"),
+                    None,
+                )
+                .unwrap();
+            writer_service
+                .store
+                .store_task_result_with_reason(
+                    &writer_id,
+                    &TaskResult {
+                        outcome: TaskOutcome::Failed,
+                        final_text: "RUNTIME_TERMINAL".into(),
+                        partial: true,
+                    },
+                    Some("MODEL_REJECTED"),
+                    Some(second),
+                )
+                .unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_round_two = false;
+        while Instant::now() < deadline && !saw_round_two {
+            for read in [
+                service.dispatch(RpcMethod::TaskWait(query(&id, 0))).unwrap(),
+                service
+                    .dispatch(RpcMethod::TaskResult {
+                        agent_id: id.clone(),
+                        offset: 0,
+                        limit: MAX_RESULT_CHUNK_BYTES,
+                    })
+                    .unwrap(),
+            ] {
+                let Some(result) = (match read {
+                    RpcSuccess::TaskWait { result, .. }
+                    | RpcSuccess::TaskResult { result, .. } => result,
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                assert_eq!(result.final_text, "RUNTIME_TERMINAL");
+                match result.failure_message.as_deref() {
+                    Some(detail) if detail == first => assert_eq!(
+                        result.reason_code.as_deref(),
+                        Some("RUNTIME_TERMINAL"),
+                        "round-one detail mixed with another round's reason"
+                    ),
+                    Some(detail) if detail == second => {
+                        assert_eq!(
+                            result.reason_code.as_deref(),
+                            Some("MODEL_REJECTED"),
+                            "round-two detail mixed with another round's reason"
+                        );
+                        saw_round_two = true;
+                    }
+                    other => panic!("unexpected failure detail {other:?}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        assert!(
+            saw_round_two,
+            "the concurrent second round was never observed"
+        );
     }
 
     #[test]
@@ -2207,5 +2314,74 @@ pub(crate) mod wait_tests {
             .iter()
             .all(|request| request.question.as_ref().unwrap().text.len()
                 <= MAX_QUESTION_SUMMARY_BYTES));
+    }
+
+    #[test]
+    fn wait_projection_counts_the_regenerated_instruction_when_a_complete_page_shrinks() {
+        // A complete page that must shrink becomes partial, which replaces the
+        // short "no need to call again" instruction with the longer "continue
+        // reading from offset N" one. The frame probing must account for that
+        // growth at every candidate prefix, or the chosen largest prefix looks
+        // fine during the search and then overflows on the real envelope
+        // (B-01 regression).
+        let page = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
+        let complete_instruction =
+            "This is the final result. There is no need to call external_subagent_result again.";
+        let mut base = synthesized_wait(
+            page.clone(),
+            page.len(),
+            None,
+            None,
+            (0..MAX_PENDING_REQUESTS)
+                .map(|index| user_question(&format!("q{index}"), "\u{0}".repeat(16 * 1024)))
+                .collect(),
+            complete_instruction,
+        );
+        assert!(matches!(
+            &base,
+            RpcSuccess::TaskWait {
+                result: Some(view),
+                ..
+            } if view.complete && view.next_offset.is_none()
+        ));
+        assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
+        bound_wait_result(&mut base).unwrap();
+        let RpcSuccess::TaskWait {
+            result: Some(view),
+            instruction,
+            ..
+        } = &base
+        else {
+            panic!("expected wait response")
+        };
+        assert!(envelope_bytes(&base) <= MAX_RESPONSE_FRAME_BYTES);
+        assert!(view.final_text.len() < page.len());
+        let end = view.final_text.len();
+        assert_eq!(view.total_bytes, page.len());
+        assert_eq!(view.next_offset, Some(end));
+        assert!(!view.complete);
+        // The instruction matches the shortened page, not the stale complete
+        // one, and the real envelope stays inside the cap.
+        let regenerated = terminal_instruction_for(view);
+        assert_eq!(instruction.as_deref(), Some(regenerated.as_str()));
+        assert!(instruction
+            .as_deref()
+            .unwrap()
+            .contains(&format!("offset {end}")));
+        assert_ne!(instruction.as_deref(), Some(complete_instruction));
+        // The chosen prefix is maximal for the real (instruction-inclusive)
+        // envelope: one more byte cannot fit.
+        if end + 1 <= page.len() {
+            let mut probe = base.clone();
+            if let RpcSuccess::TaskWait {
+                result: Some(view), ..
+            } = &mut probe
+            {
+                view.final_text = page[..end + 1].to_owned();
+                view.next_offset = Some(end + 1);
+                view.complete = false;
+            }
+            assert!(envelope_bytes(&probe) > MAX_RESPONSE_FRAME_BYTES);
+        }
     }
 }

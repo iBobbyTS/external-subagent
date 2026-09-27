@@ -124,16 +124,18 @@ impl Store {
         query_task_result(&connection, agent_id)
     }
 
-    /// Single consistent snapshot of a task row and its optional immutable
-    /// result. Both reads share one connection lock, so a concurrent terminal
-    /// write (including a resume that clears `failure_message` and deletes the
-    /// old result) can never be interleaved between them: the returned pair
-    /// always belongs to the same committed database state. Returns `None`
-    /// only when the task row itself is absent.
+    /// Single consistent snapshot of a task row, its optional immutable
+    /// result, and the latest terminal ledger reason. All reads share one
+    /// connection lock, so a concurrent terminal write (including a resume that
+    /// clears `failure_message` and deletes the old result) can never be
+    /// interleaved between them: the returned triple always belongs to the same
+    /// committed database state. Returns `None` only when the task row itself
+    /// is absent.
+    #[allow(clippy::type_complexity)]
     pub fn task_with_result(
         &self,
         agent_id: &str,
-    ) -> StoreResult<Option<(TaskRecord, Option<StoredTaskResult>)>> {
+    ) -> StoreResult<Option<(TaskRecord, Option<StoredTaskResult>, Option<String>)>> {
         let connection = self.connection.lock().unwrap();
         let Some(task) = query_task(&connection, agent_id)? else {
             return Ok(None);
@@ -143,7 +145,8 @@ impl Store {
         #[cfg(test)]
         self.run_snapshot_hook();
         let result = query_task_result(&connection, agent_id)?;
-        Ok(Some((task, result)))
+        let reason = query_terminal_reason(&connection, agent_id)?;
+        Ok(Some((task, result, reason)))
     }
 
     /// The latest terminal ledger row's machine reason. Older-than-terminal
@@ -154,17 +157,24 @@ impl Store {
     /// terminal row also yields `None`.
     pub fn terminal_reason_code(&self, agent_id: &str) -> StoreResult<Option<String>> {
         let connection = self.connection.lock().unwrap();
-        let reason = connection
-            .query_row(
-                "SELECT reason_code FROM lifecycle_ledger
-                 WHERE agent_id=?1 AND to_phase='TERMINAL'
-                 ORDER BY ledger_id DESC LIMIT 1",
-                [agent_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?;
-        Ok(reason.flatten().filter(|value| value != "task failed"))
+        query_terminal_reason(&connection, agent_id)
     }
+}
+
+fn query_terminal_reason(
+    connection: &Connection,
+    agent_id: &str,
+) -> StoreResult<Option<String>> {
+    let reason = connection
+        .query_row(
+            "SELECT reason_code FROM lifecycle_ledger
+             WHERE agent_id=?1 AND to_phase='TERMINAL'
+             ORDER BY ledger_id DESC LIMIT 1",
+            [agent_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(reason.flatten().filter(|value| value != "task failed"))
 }
 
 pub(crate) fn task_result_bytes(result: &TaskResult) -> StoreResult<Vec<u8>> {

@@ -877,10 +877,13 @@ fn task_with_result_returns_both_reads_of_one_committed_state() {
         .enqueue_task_authoritative(&task("agent", "/repo", None))
         .unwrap();
     running(&store, "agent");
-    // No result yet: the task still comes back, the result slot is empty.
-    let (pending_task, pending_result) = store.task_with_result("agent").unwrap().unwrap();
+    // No result yet: the task still comes back, the result slot and reason are
+    // empty.
+    let (pending_task, pending_result, pending_reason) =
+        store.task_with_result("agent").unwrap().unwrap();
     assert_eq!(pending_task.agent_id, "agent");
     assert!(pending_result.is_none());
+    assert!(pending_reason.is_none());
 
     store
         .store_task_result_with_reason(
@@ -890,7 +893,8 @@ fn task_with_result_returns_both_reads_of_one_committed_state() {
             Some(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#),
         )
         .unwrap();
-    let (failed_task, failed_result) = store.task_with_result("agent").unwrap().unwrap();
+    let (failed_task, failed_result, failed_reason) =
+        store.task_with_result("agent").unwrap().unwrap();
     assert_eq!(failed_task.outcome, Some(TaskOutcome::Failed));
     assert_eq!(
         failed_task.failure_message.as_deref(),
@@ -898,13 +902,16 @@ fn task_with_result_returns_both_reads_of_one_committed_state() {
     );
     let failed_result = failed_result.expect("terminal result");
     assert_eq!(failed_result.result.outcome, TaskOutcome::Failed);
+    // The reason shares the snapshot lock, so it belongs to the same round as
+    // the task row and the result.
+    assert_eq!(failed_reason.as_deref(), Some("RUNTIME_TERMINAL"));
 
-    // An unknown task reads as absent, never as an empty pair.
+    // An unknown task reads as absent, never as an empty triple.
     assert!(store.task_with_result("missing").unwrap().is_none());
 }
 
 #[test]
-fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
+fn task_with_result_holds_one_lock_across_a_resume_and_second_failure() {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
@@ -933,10 +940,12 @@ fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
         )
         .unwrap();
 
-    // The hook fires between the task read and the result read while the
-    // snapshot holds the connection lock. The hook releases the concurrent
-    // resume, which must then stay blocked until the snapshot returns: the pair
-    // the snapshot reads is still round one.
+    // The hook fires between the task read and the result/reason reads while
+    // the snapshot holds the connection lock. The hook releases a concurrent
+    // resume plus a second same-outcome (same digest) failure commit, which must
+    // stay blocked until the snapshot returns: the tuple the snapshot reads is
+    // entirely round one, never a round-one result/detail mixed with round-two
+    // state.
     let (start_tx, start_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let writer_store = Arc::clone(&store);
@@ -945,6 +954,25 @@ fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
         writer_store
             .requeue_task_for_resume_with_message("agent", "resume-msg", "continue")
             .unwrap();
+        let claim = writer_store.claim_next("daemon", 10, 10).unwrap().unwrap();
+        writer_store
+            .mark_session_running(
+                "agent",
+                claim.owner_epoch,
+                "runtime",
+                None,
+                Some("session"),
+                None,
+            )
+            .unwrap();
+        writer_store
+            .store_task_result_with_reason(
+                "agent",
+                &result(TaskOutcome::Failed),
+                Some("MODEL_REJECTED"),
+                Some("round-two detail"),
+            )
+            .unwrap();
         done_tx.send(()).unwrap();
     });
 
@@ -952,7 +980,8 @@ fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
     let hook_done = Arc::clone(&done_rx);
     let start_tx = Mutex::new(start_tx);
     store.set_snapshot_hook(Arc::new(move || {
-        // Start the resume only now, while the snapshot holds the lock.
+        // Start the round-two commit only now, while the snapshot holds the
+        // lock.
         start_tx.lock().unwrap().send(()).unwrap();
         assert!(
             hook_done
@@ -960,11 +989,11 @@ fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
                 .unwrap()
                 .recv_timeout(Duration::from_millis(200))
                 .is_err(),
-            "a resume committed inside the task_with_result window"
+            "a second-round commit reached the snapshot window"
         );
     }));
     let snapshot = store.task_with_result("agent").unwrap().unwrap();
-    // The lock is released, so the blocked resume proceeds.
+    // The lock is released, so the blocked round-two commit proceeds.
     done_rx
         .lock()
         .unwrap()
@@ -973,16 +1002,23 @@ fn task_with_result_holds_one_lock_so_a_resume_cannot_tear_the_snapshot() {
     writer.join().unwrap();
     store.clear_snapshot_hook();
 
-    let (snapshot_task, snapshot_result) = snapshot;
+    let (snapshot_task, snapshot_result, snapshot_reason) = snapshot;
     assert_eq!(snapshot_task.outcome, Some(TaskOutcome::Failed));
     assert_eq!(
         snapshot_task.failure_message.as_deref(),
         Some("round-one detail")
     );
     assert_eq!(snapshot_result.unwrap().result.outcome, TaskOutcome::Failed);
-    // The resume did clear the durable row once it was allowed to run.
-    let (resumed_task, resumed_result) = store.task_with_result("agent").unwrap().unwrap();
-    assert_eq!(resumed_task.outcome, None);
-    assert_eq!(resumed_task.failure_message, None);
-    assert!(resumed_result.is_none());
+    assert_eq!(snapshot_reason.as_deref(), Some("RUNTIME_TERMINAL"));
+    // After the writer ran, the durable state is the second round: same
+    // outcome/digest, but the detail and reason moved together.
+    let (second_task, second_result, second_reason) =
+        store.task_with_result("agent").unwrap().unwrap();
+    assert_eq!(second_task.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(
+        second_task.failure_message.as_deref(),
+        Some("round-two detail")
+    );
+    assert_eq!(second_result.unwrap().result.outcome, TaskOutcome::Failed);
+    assert_eq!(second_reason.as_deref(), Some("MODEL_REJECTED"));
 }
