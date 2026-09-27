@@ -22,7 +22,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
+/// Hard cap for one NDJSON wire line, counted including the line delimiter.
+///
+/// A line above this bound is reported once as [`Inbound::OversizedLine`] with
+/// the detection lower bound (`cap + 1`, never the true frame length) and the
+/// reader then stops, so a single unparseable frame can never grow the read
+/// buffer without bound. The bound is sized for real app-server terminal
+/// frames that replay every item of a turn (observed at ~2.1 MB) while still
+/// keeping the per-line buffer bounded.
+pub const MAX_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Wire framing the driver applies on stdio.
 ///
@@ -1805,10 +1813,16 @@ mod tests {
     #[test]
     fn oversized_line_is_classified_and_discarded() {
         let mut c = Command::new("sh");
-        c.args(["-c", "printf '%1048577s\\n' x"]);
+        c.args([
+            "-c",
+            &format!(
+                "head -c {} /dev/zero; printf '\\n'",
+                MAX_NDJSON_LINE_BYTES
+            ),
+        ]);
         let d = Driver::spawn(c).unwrap();
         assert!(matches!(
-            d.recv_timeout(Duration::from_secs(2)),
+            d.recv_timeout(Duration::from_secs(10)),
             Ok(Inbound::OversizedLine { bytes }) if bytes > MAX_NDJSON_LINE_BYTES
         ));
         d.stop().unwrap();
@@ -1817,12 +1831,167 @@ mod tests {
     #[test]
     fn unterminated_oversized_line_is_bounded_and_closes_reader() {
         let mut c = Command::new("sh");
-        c.args(["-c", "head -c 1048577 /dev/zero"]);
+        c.args([
+            "-c",
+            &format!("head -c {} /dev/zero", MAX_NDJSON_LINE_BYTES + 1),
+        ]);
         let d = Driver::spawn(c).unwrap();
         assert!(matches!(
-            d.recv_timeout(Duration::from_secs(2)),
+            d.recv_timeout(Duration::from_secs(10)),
             Ok(Inbound::OversizedLine { bytes }) if bytes == MAX_NDJSON_LINE_BYTES + 1
         ));
+    }
+
+    const LARGE_FRAME_PAYLOAD_BYTES: usize = 2_300_000;
+
+    fn streaming_frame(delta: &str) -> String {
+        serde_json::json!({
+            "method": "session/event",
+            "params": {"type": "model.streaming", "payload": {"kind": "text_delta", "delta": delta}},
+        })
+        .to_string()
+    }
+
+    fn write_frame_file(label: &str, codec: FrameCodec) -> (std::path::PathBuf, Vec<String>) {
+        let path = capture_path(label);
+        let pad = "z".repeat(LARGE_FRAME_PAYLOAD_BYTES);
+        let deltas = ["alpha".to_owned(), pad, "omega".to_owned()];
+        let mut frames = Vec::with_capacity(deltas.len());
+        for delta in &deltas {
+            let frame = streaming_frame(delta);
+            frames.push(match codec {
+                FrameCodec::ZcodeStrict => frame,
+                FrameCodec::JsonRpc2 => {
+                    let mut object: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    object
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("jsonrpc".into(), "2.0".into());
+                    object.to_string()
+                }
+            });
+        }
+        std::fs::write(&path, format!("{}\n", frames.join("\n"))).unwrap();
+        (path, deltas.to_vec())
+    }
+
+    fn assert_large_frames_are_delivered_in_order(codec: FrameCodec, label: &str) {
+        let (path, deltas) = write_frame_file(label, codec);
+        let mut c = Command::new("sh");
+        c.args(["-c", &format!("cat '{}'; sleep 5", path.display())]);
+        let d = Driver::spawn_with_codec(c, codec).unwrap();
+        for delta in &deltas {
+            let expected = serde_json::json!({
+                "method": "session/event",
+                "params": {"type": "model.streaming", "payload": {"kind": "text_delta", "delta": delta}},
+            });
+            match d.recv_timeout(Duration::from_secs(10)) {
+                Ok(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => {
+                    assert_eq!(method, "session/event");
+                    assert_eq!(raw, expected);
+                    assert_eq!(
+                        raw["params"]["payload"]["delta"].as_str().unwrap().len(),
+                        delta.len()
+                    );
+                }
+                other => panic!("unexpected frame in order for {label}: {other:?}"),
+            }
+        }
+        d.stop().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zcode_strict_two_megabyte_frame_is_delivered_intact_and_in_order() {
+        assert_large_frames_are_delivered_in_order(FrameCodec::ZcodeStrict, "strict-large-frame");
+    }
+
+    #[test]
+    fn jsonrpc_two_megabyte_frame_is_delivered_intact_and_in_order() {
+        assert_large_frames_are_delivered_in_order(FrameCodec::JsonRpc2, "jsonrpc-large-frame");
+    }
+
+    #[test]
+    fn line_limit_boundary_pins_acceptance_and_oversize_detection() {
+        // payload cap-1 + LF == cap wire bytes: accepted, delimiter excluded.
+        let mut accepted = vec![b'a'; MAX_NDJSON_LINE_BYTES - 1];
+        accepted.push(b'\n');
+        let mut accepted_reader: &[u8] = &accepted;
+        let (line, bytes) = read_bounded_line(&mut accepted_reader).unwrap().unwrap();
+        assert_eq!(bytes, MAX_NDJSON_LINE_BYTES);
+        assert_eq!(line.len(), MAX_NDJSON_LINE_BYTES - 1);
+
+        // payload cap + LF == cap+1 wire bytes: over the limit. The delimiter
+        // path returns the truncated payload with the cap+1 detection lower
+        // bound; `read_loop` rejects it on the byte count before parsing.
+        let mut oversized = vec![b'a'; MAX_NDJSON_LINE_BYTES];
+        oversized.push(b'\n');
+        let mut oversized_reader: &[u8] = &oversized;
+        let (line, bytes) = read_bounded_line(&mut oversized_reader).unwrap().unwrap();
+        assert_eq!(line.len(), MAX_NDJSON_LINE_BYTES);
+        assert_eq!(bytes, MAX_NDJSON_LINE_BYTES + 1);
+
+        // payload cap-2 + CRLF == cap wire bytes: accepted, CRLF excluded.
+        let mut crlf = vec![b'a'; MAX_NDJSON_LINE_BYTES - 2];
+        crlf.extend_from_slice(b"\r\n");
+        let mut crlf_reader: &[u8] = &crlf;
+        let (line, bytes) = read_bounded_line(&mut crlf_reader).unwrap().unwrap();
+        assert_eq!(bytes, MAX_NDJSON_LINE_BYTES);
+        assert_eq!(line.len(), MAX_NDJSON_LINE_BYTES - 2);
+
+        // EOF without a delimiter at exactly cap+1: one bounded oversize.
+        let eof = vec![b'a'; MAX_NDJSON_LINE_BYTES + 1];
+        let mut eof_reader: &[u8] = &eof;
+        let (line, bytes) = read_bounded_line(&mut eof_reader).unwrap().unwrap();
+        assert!(line.is_empty());
+        assert_eq!(bytes, MAX_NDJSON_LINE_BYTES + 1);
+    }
+
+    #[test]
+    fn oversized_frame_is_broadcast_to_every_subscriber_and_is_not_a_child_exit() {
+        let release = capture_path("oversized-broadcast-release");
+        let mut c = Command::new("sh");
+        c.args([
+            "-c",
+            &format!(
+                "IFS= read -r line; while [ ! -f '{}' ]; do sleep 0.005; done; \
+                 head -c {} /dev/zero; sleep 10",
+                release.display(),
+                MAX_NDJSON_LINE_BYTES + 1
+            ),
+        ]);
+        let d = Driver::spawn(c).unwrap();
+        let first = d.subscribe();
+        let second = d.subscribe();
+        let pending = d
+            .begin_request("probe", serde_json::json!({}))
+            .unwrap();
+        std::fs::write(&release, b"").unwrap();
+        for receiver in [&first, &second] {
+            assert!(
+                matches!(
+                    receiver.recv_timeout(Duration::from_secs(10)),
+                    Ok(Inbound::OversizedLine { bytes }) if bytes == MAX_NDJSON_LINE_BYTES + 1
+                ),
+                "subscriber did not observe the bounded oversize exactly once"
+            );
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_millis(100)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+        }
+        // The reader thread stops on the oversized line; that is not a child
+        // exit and must not be reported as one while the provider is alive.
+        assert!(matches!(
+            first.recv_timeout(Duration::from_millis(100)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        d.stop().unwrap();
+        assert!(matches!(
+            pending.wait(Duration::from_secs(2)),
+            Err(RequestError::ChildExited(_) | RequestError::StreamClosed)
+        ));
+        std::fs::remove_file(release).unwrap();
     }
 
     #[test]
