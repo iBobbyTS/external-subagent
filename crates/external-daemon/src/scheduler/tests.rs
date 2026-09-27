@@ -1473,10 +1473,7 @@ mod legacy_row_recovery_tests {
         .to_string()
     }
 
-    fn enqueue_legacy(
-        scheduler: &Scheduler,
-        directory: &tempfile::TempDir,
-    ) -> (String, PathBuf) {
+    fn enqueue_legacy(scheduler: &Scheduler, directory: &tempfile::TempDir) -> (String, PathBuf) {
         let repository = directory.path().canonicalize().unwrap();
         let scratch_root = repository.join("scratch");
         fs::create_dir_all(&scratch_root).unwrap();
@@ -1528,12 +1525,11 @@ mod legacy_row_recovery_tests {
         assert_eq!(settled.outcome, Some(TaskOutcome::ResultInvalid));
 
         // New admissions still work once the legacy row has a terminal state.
-        let fresh = reopened.enqueue_general(&fresh_manifest(&directory)).unwrap();
+        let fresh = reopened
+            .enqueue_general(&fresh_manifest(&directory))
+            .unwrap();
         assert_eq!(fresh.phase, TaskPhase::Queued);
-        assert_eq!(
-            fresh.repository,
-            Path::new(&repository).to_string_lossy()
-        );
+        assert_eq!(fresh.repository, Path::new(&repository).to_string_lossy());
     }
 
     #[test]
@@ -1606,7 +1602,6 @@ mod legacy_row_recovery_tests {
         assert_eq!(after.outcome, Some(TaskOutcome::Cancelled));
     }
 }
-
 
 #[cfg(test)]
 mod transport_failure_tests {
@@ -1742,6 +1737,40 @@ printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type"
         format!("head -c {} /dev/zero\n", FRAME_LIMIT + 1)
     }
 
+    /// A zcode fixture that completes one turn without any fault.
+    fn normal_completion_script() -> String {
+        format!(
+            "{ZCODE_RUNNING_PREFIX}\
+printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.streaming\",\"payload\":{{\"kind\":\"text_delta\",\"delta\":\"queued task answer\",\"assistantMessageId\":\"m1\"}}}}}}' \
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"message.finished\",\"payload\":{{\"assistantMessageId\":\"m1\"}}}}}}' \
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\"}}}}'\nsleep 1\n"
+        )
+    }
+
+    /// Directly queue a second task in the same workspace (the submission API
+    /// refuses to enqueue while any non-terminal task owns the workspace), so
+    /// the fault closure's queue advancement can be observed without a manual
+    /// `start_ready`.
+    fn insert_queued_task(directory: &Path, source: &str, new_agent: &str, prompt: &str) {
+        let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
+        let created: i64 = connection
+            .query_row(
+                "SELECT created_at FROM tasks WHERE agent_id=?1",
+                [source],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tasks(agent_id,repository,phase,workspace_path,runtime_hash,
+                     prepared_launch_json,initial_prompt,created_at)
+                 SELECT ?1,repository,'QUEUED',workspace_path,runtime_hash,
+                     prepared_launch_json,?2,?3 FROM tasks WHERE agent_id=?4",
+                rusqlite::params![new_agent, prompt, created + 1, source],
+            )
+            .unwrap();
+    }
+
     fn assert_transport_diagnostic(record: &serde_json::Value, expect_cleanup: &str) {
         assert_eq!(record["stage"], "transport");
         assert_eq!(record["error_code"], TRANSPORT_REASON);
@@ -1805,12 +1834,7 @@ printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type"
         let _guard = transport_child_guard();
         let directory = transport_workspace("s01-transport-zcode-");
         let failing = format!("{ZCODE_RUNNING_PREFIX}{}\nsleep 30\n", oversized_output());
-        let normal = format!(
-            "{ZCODE_RUNNING_PREFIX}\
-printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.streaming\",\"payload\":{{\"kind\":\"text_delta\",\"delta\":\"queued task answer\",\"assistantMessageId\":\"m1\"}}}}}}' \
-'{{\"method\":\"session/event\",\"params\":{{\"type\":\"message.finished\",\"payload\":{{\"assistantMessageId\":\"m1\"}}}}}}' \
-'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\"}}}}'\nsleep 1\n"
-        );
+        let normal = normal_completion_script();
         let scheduler = transport_scheduler(directory.path(), move |prompt| {
             if prompt == "oversized transport" {
                 failing.clone()
@@ -1967,9 +1991,24 @@ sleep 0.3\n\
 exit 0\n",
             oversized_output()
         );
-        let scheduler = transport_scheduler(directory.path(), move |_| script.clone());
+        let scheduler = transport_scheduler(directory.path(), move |prompt| {
+            if prompt == "oversized then orphan" {
+                script.clone()
+            } else {
+                normal_completion_script()
+            }
+        });
         let barrier = TransportBarrier::install(&scheduler);
         let agent_id = enqueue(&scheduler, directory.path(), "oversized then orphan");
+        let queued_id = "10009999".to_string();
+        // R4: an already-queued same-workspace task must be admitted by the
+        // fault closure's own queue advancement.
+        insert_queued_task(
+            directory.path(),
+            &agent_id,
+            &queued_id,
+            "queued normal task",
+        );
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         barrier.wait_ready(Duration::from_secs(30));
 
@@ -2011,7 +2050,6 @@ exit 0\n",
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         assert!(task.reaped_at.is_some());
         assert!(observe_process_group(pgid).unwrap().is_empty());
-        assert_eq!(scheduler.active_count(), 0);
         assert_eq!(oversized_events(directory.path(), &agent_id), 1);
         let record: serde_json::Value =
             serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
@@ -2020,6 +2058,13 @@ exit 0\n",
             scheduler.store().task_result(&agent_id).unwrap().unwrap(),
             result
         );
+
+        // The closure released the slot and advanced the queue by itself: the
+        // pre-queued task starts and completes without a manual start_ready.
+        let queued = await_result(&scheduler, &queued_id);
+        assert_eq!(queued.result.outcome, TaskOutcome::Completed);
+        assert_eq!(queued.result.final_text, "queued task answer");
+        assert_eq!(scheduler.active_count(), 0);
     }
 
     struct InjectingFactory {
@@ -2070,7 +2115,7 @@ exit 0\n",
         fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
             self.publisher.wait_terminal(timeout)
         }
-        fn cleanup_for_transport_failure(&self, _: Duration) -> RuntimeTerminal {
+        fn cleanup_for_forced_failure(&self, _: Duration) -> RuntimeTerminal {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.injected.clone()
         }
@@ -2189,9 +2234,9 @@ exit 0\n",
             "transport-late-completed",
             Arc::clone(&store),
             Arc::new(InjectingFactory {
-                injected: RuntimeTerminal::Stopped(StopOutcome::Terminated(
-                    ChildExit::Signaled(15),
-                )),
+                injected: RuntimeTerminal::Stopped(StopOutcome::Terminated(ChildExit::Signaled(
+                    15,
+                ))),
                 fault_terminal: Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                     ChildExit::Exited(Some(0)),
                 ))),
@@ -2307,12 +2352,15 @@ mod stall_tests {
         fn stop(&self, _: Duration) -> RuntimeTerminal {
             RuntimeTerminal::Stopped(StopOutcome::Terminated(ChildExit::Signaled(15)))
         }
-        fn cleanup_for_transport_failure(&self, _: Duration) -> RuntimeTerminal {
+        fn cleanup_for_forced_failure(&self, _: Duration) -> RuntimeTerminal {
             self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
             RuntimeTerminal::Stopped(StopOutcome::Terminated(ChildExit::Signaled(15)))
         }
         fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
             self.publisher.wait_terminal(timeout)
+        }
+        fn terminal_latch(&self) -> Option<TerminalLatch<'_>> {
+            Some(self.publisher.decision_latch())
         }
         fn diagnostic_session_id(&self) -> Option<String> {
             Some("stall-session".into())
@@ -2513,7 +2561,10 @@ mod stall_tests {
         );
         let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
-        assert!(task.reaped_at.is_some(), "stall cleanup must prove the reap");
+        assert!(
+            task.reaped_at.is_some(),
+            "stall cleanup must prove the reap"
+        );
         let record: serde_json::Value =
             serde_json::from_str(&scheduler.last_error(agent_id).unwrap()).unwrap();
         assert_eq!(record["stage"], "stall");
@@ -2538,7 +2589,9 @@ mod stall_tests {
         await_phase(scheduler, agent_id, TaskPhase::Running);
 
         // Just below the threshold the task must stay RUNNING.
-        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT - Duration::from_secs(1));
         thread::sleep(Duration::from_millis(200));
         assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
         assert_eq!(
@@ -2566,12 +2619,16 @@ mod stall_tests {
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         await_phase(scheduler, agent_id, TaskPhase::Running);
 
-        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(60));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT - Duration::from_secs(60));
         harness.runtimes.lock().unwrap()[0].emit_activity();
         thread::sleep(Duration::from_millis(250));
 
         // The window restarted at the event, so the original deadline is gone.
-        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT - Duration::from_secs(1));
         thread::sleep(Duration::from_millis(200));
         assert!(
             scheduler.store().task_result(agent_id).unwrap().is_none(),
@@ -2596,7 +2653,9 @@ mod stall_tests {
         await_phase(scheduler, agent_id, TaskPhase::WaitingInput);
 
         // Waiting far past the window never triggers while input is pending.
-        harness.clock.advance(STALL_TIMEOUT + Duration::from_secs(60));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT + Duration::from_secs(60));
         thread::sleep(Duration::from_millis(250));
         assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
 
@@ -2614,7 +2673,9 @@ mod stall_tests {
             scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
             TaskPhase::WaitingInput
         );
-        harness.clock.advance(STALL_TIMEOUT + Duration::from_secs(60));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT + Duration::from_secs(60));
         thread::sleep(Duration::from_millis(250));
         assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
 
@@ -2627,7 +2688,9 @@ mod stall_tests {
             ResponseDisposition::Responded
         );
         await_phase(scheduler, agent_id, TaskPhase::Running);
-        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        harness
+            .clock
+            .advance(STALL_TIMEOUT - Duration::from_secs(1));
         thread::sleep(Duration::from_millis(200));
         assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
         harness.clock.advance(Duration::from_secs(1));
@@ -2642,8 +2705,10 @@ mod stall_tests {
         let agent_id = &harness.agent_id;
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         await_phase(scheduler, agent_id, TaskPhase::Running);
-        harness.runtimes.lock().unwrap()[0]
-            .emit_request("srv-fail", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        harness.runtimes.lock().unwrap()[0].emit_request(
+            "srv-fail",
+            external_contract::INTERACTION_REQUEST_USER_INPUT,
+        );
         await_phase(scheduler, agent_id, TaskPhase::WaitingInput);
         let requests = scheduler.store().pending_requests(agent_id).unwrap();
         assert!(
@@ -2695,7 +2760,10 @@ mod stall_tests {
         fn wait_ready(&self) {
             let deadline = Instant::now() + Duration::from_secs(30);
             while !self.ready.load(Ordering::Acquire) {
-                assert!(Instant::now() < deadline, "monitor never reached the stall decision");
+                assert!(
+                    Instant::now() < deadline,
+                    "monitor never reached the stall decision"
+                );
                 thread::sleep(Duration::from_millis(1));
             }
         }
@@ -2746,8 +2814,10 @@ mod stall_tests {
 
         harness.clock.advance(STALL_TIMEOUT);
         barrier.wait_ready();
-        harness.runtimes.lock().unwrap()[0]
-            .emit_request("srv-late", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        harness.runtimes.lock().unwrap()[0].emit_request(
+            "srv-late",
+            external_contract::INTERACTION_REQUEST_USER_INPUT,
+        );
         barrier.release();
         thread::sleep(Duration::from_millis(300));
         assert!(
@@ -2800,7 +2870,8 @@ mod stall_tests {
     }
 
     #[test]
-    fn committed_cancellation_wins_over_the_stall_decision() {        let harness = stall_harness(false, "");
+    fn committed_cancellation_wins_over_the_stall_decision() {
+        let harness = stall_harness(false, "");
         let scheduler = &harness.scheduler;
         let agent_id = &harness.agent_id;
         let barrier = StallBarrier::install(scheduler);
@@ -2816,8 +2887,7 @@ mod stall_tests {
         };
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if scheduler.store().get_task(agent_id).unwrap().unwrap().phase
-                == TaskPhase::Cancelling
+            if scheduler.store().get_task(agent_id).unwrap().unwrap().phase == TaskPhase::Cancelling
             {
                 break;
             }
@@ -2828,7 +2898,12 @@ mod stall_tests {
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
         assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
         assert_eq!(
-            scheduler.store().get_task(agent_id).unwrap().unwrap().outcome,
+            scheduler
+                .store()
+                .get_task(agent_id)
+                .unwrap()
+                .unwrap()
+                .outcome,
             Some(TaskOutcome::Cancelled)
         );
         canceller.join().unwrap().unwrap();
@@ -2858,7 +2933,9 @@ mod stall_tests {
         assert!(second.owner_epoch > first.owner_epoch);
 
         let claim_offset = harness.clock.offset();
-        harness.clock.set_offset(claim_offset + STALL_TIMEOUT - Duration::from_secs(60));
+        harness
+            .clock
+            .set_offset(claim_offset + STALL_TIMEOUT - Duration::from_secs(60));
         thread::sleep(Duration::from_millis(200));
         assert!(
             scheduler.store().task_result(agent_id).unwrap().is_none(),
@@ -2868,5 +2945,95 @@ mod stall_tests {
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
         assert_stall_failure(scheduler, agent_id, &result);
         assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 2);
+    }
+
+    /// R2: a transport fault latched after the loop-top check but before the
+    /// stall decision must take the S01 closure, never STALLED_NO_ACTIVITY.
+    #[test]
+    fn transport_fault_latched_at_the_stall_decision_takes_the_transport_closure() {
+        const TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+        let bytes = external_runtime::MAX_NDJSON_LINE_BYTES + 1;
+        let cap = external_runtime::MAX_NDJSON_LINE_BYTES;
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let barrier = StallBarrier::install(scheduler);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        barrier.wait_ready();
+        // The loop-top latch check already ran; latch the fault here.
+        harness.runtimes.lock().unwrap()[0].emit(Inbound::OversizedLine { bytes });
+        barrier.release();
+
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(TRANSPORT_REASON),
+            "the latched transport fault must outrank the stall"
+        );
+        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        assert!(task.reaped_at.is_some());
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 1);
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(agent_id).unwrap()).unwrap();
+        assert_eq!(record["stage"], "transport");
+        assert_eq!(record["error_code"], TRANSPORT_REASON);
+        assert_eq!(record["bytes"], bytes as u64);
+        assert_eq!(record["cap"], cap as u64);
+        assert!(record["last_event_seq"].as_u64().unwrap() >= 1);
+        assert!(
+            record["cleanup_result"]
+                .as_str()
+                .unwrap()
+                .contains("Stopped"),
+            "{record}"
+        );
+        assert_eq!(
+            scheduler.store().task_result(agent_id).unwrap().unwrap(),
+            result
+        );
+    }
+
+    /// R3: a transient decision store read failure reports once and keeps the
+    /// watchdog alive; the next successful read still fails the task.
+    #[test]
+    fn transient_decision_read_failure_keeps_the_watchdog_running() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let fault = Arc::new(AtomicBool::new(true));
+        {
+            let fault = Arc::clone(&fault);
+            scheduler.set_stall_read_fault(Arc::new(move || fault.load(Ordering::Acquire)));
+        }
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            scheduler.store().task_result(agent_id).unwrap().is_none(),
+            "a transient read failure must not terminalize the task"
+        );
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+            TaskPhase::Running,
+            "the watchdog must stay attached through the read failure"
+        );
+        assert!(
+            scheduler.last_error(agent_id).is_some(),
+            "the read failure must be reported"
+        );
+
+        fault.store(false, Ordering::Release);
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_stall_failure(scheduler, agent_id, &result);
     }
 }

@@ -1815,10 +1815,7 @@ mod tests {
         let mut c = Command::new("sh");
         c.args([
             "-c",
-            &format!(
-                "head -c {} /dev/zero; printf '\\n'",
-                MAX_NDJSON_LINE_BYTES
-            ),
+            &format!("head -c {} /dev/zero; printf '\\n'", MAX_NDJSON_LINE_BYTES),
         ]);
         let d = Driver::spawn(c).unwrap();
         assert!(matches!(
@@ -1963,9 +1960,7 @@ mod tests {
         let d = Driver::spawn(c).unwrap();
         let first = d.subscribe();
         let second = d.subscribe();
-        let pending = d
-            .begin_request("probe", serde_json::json!({}))
-            .unwrap();
+        let pending = d.begin_request("probe", serde_json::json!({})).unwrap();
         std::fs::write(&release, b"").unwrap();
         for receiver in [&first, &second] {
             assert!(

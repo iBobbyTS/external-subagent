@@ -2335,7 +2335,10 @@ while [ ! -f test-release ]; do sleep 0.05; done
         bytes = external_runtime::MAX_NDJSON_LINE_BYTES + 1,
     );
     let child = scripted_child(workspace.path(), &script);
-    let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::test_harness(Some(child)));
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
     let agent_id = enqueue_dsh(
         &scheduler,
         workspace.path(),
@@ -2384,7 +2387,10 @@ while [ ! -f test-release ]; do sleep 0.05; done
     assert_eq!(record["stage"], "transport");
     assert_eq!(record["error_code"], DSH_TRANSPORT_REASON);
     assert!(
-        record["cleanup_result"].as_str().unwrap().contains("Stopped"),
+        record["cleanup_result"]
+            .as_str()
+            .unwrap()
+            .contains("Stopped"),
         "{record}"
     );
     assert_eq!(

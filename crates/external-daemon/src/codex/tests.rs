@@ -2721,10 +2721,7 @@ cat large-turn-completed.json
 sleep 2
 "#
     );
-    let scheduler = codex_scheduler(
-        workspace.path(),
-        harness_factory(&script, workspace.path()),
-    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "replay the large terminal frame"),
@@ -2798,10 +2795,7 @@ fn codex_oversized_frame_fails_explicitly_and_reaps_the_provider() {
         "",
         "while [ ! -f test-release ]; do sleep 0.05; done",
     );
-    let scheduler = codex_scheduler(
-        workspace.path(),
-        harness_factory(&script, workspace.path()),
-    );
+    let scheduler = codex_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for(workspace.path(), "oversized codex frame"),
@@ -2831,20 +2825,31 @@ fn codex_oversized_frame_fails_explicitly_and_reaps_the_provider() {
             .as_deref(),
         Some(CODEX_TRANSPORT_REASON)
     );
-    assert_eq!(codex_event_count(workspace.path(), &agent_id, "driver.oversized_line"), 1);
+    assert_eq!(
+        codex_event_count(workspace.path(), &agent_id, "driver.oversized_line"),
+        1
+    );
     // The provider was blocked after its oversized write and never exited on
     // its own, so no child-exit boundary can explain the terminal.
-    assert_eq!(codex_event_count(workspace.path(), &agent_id, "driver.child_exited"), 0);
+    assert_eq!(
+        codex_event_count(workspace.path(), &agent_id, "driver.child_exited"),
+        0
+    );
     let task = await_terminal_task(&scheduler, &agent_id);
     assert_eq!(task.outcome, Some(TaskOutcome::Failed));
     assert!(task.reaped_at.is_some());
-    assert!(external_runtime::observe_process_group(pgid).unwrap().is_empty());
+    assert!(external_runtime::observe_process_group(pgid)
+        .unwrap()
+        .is_empty());
     let record: serde_json::Value =
         serde_json::from_str(&scheduler.last_error(&agent_id).unwrap()).unwrap();
     assert_eq!(record["stage"], "transport");
     assert_eq!(record["error_code"], CODEX_TRANSPORT_REASON);
     assert!(
-        record["cleanup_result"].as_str().unwrap().contains("Stopped"),
+        record["cleanup_result"]
+            .as_str()
+            .unwrap()
+            .contains("Stopped"),
         "{record}"
     );
     assert_eq!(
