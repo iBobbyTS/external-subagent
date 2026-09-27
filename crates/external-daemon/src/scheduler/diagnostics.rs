@@ -88,6 +88,13 @@ pub(crate) fn runtime_failure_record(
                 record[field] = value.into();
             }
         }
+        // The stall closure's bounded evidence: elapsed window, timeout, and
+        // the age of the last admitted progress.
+        for field in ["stall_elapsed_ms", "stall_timeout_ms", "last_progress_age_ms"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
         if let Some(code) = detail
             .get("remote_code")
             .and_then(serde_json::Value::as_i64)

@@ -3,6 +3,9 @@ use super::*;
 #[derive(Default)]
 struct PassiveActivityState {
     revision: u64,
+    /// Admitted-progress revision for the stall watchdog: every admitted
+    /// runtime event except `Malformed`/`OversizedLine` advances it.
+    progress_revision: u64,
     last_runtime_event_at: Option<(Instant, u64)>,
     active_model_requests: HashMap<String, Instant>,
     last_model_delta_at: Option<Instant>,
@@ -70,6 +73,14 @@ impl PassiveActivityTracker {
         }
         state.revision = state.revision.saturating_add(1);
         state.last_runtime_event_at = Some((now, wall_now_ms));
+        // A dropped or oversized frame is a loss, not progress: it must never
+        // restart the S02 no-activity window.
+        if !matches!(
+            event,
+            RuntimeEvent::Driver(Inbound::Malformed(_) | Inbound::OversizedLine { .. })
+        ) {
+            state.progress_revision = state.progress_revision.saturating_add(1);
+        }
         let parsed = parse_passive_activity(event);
         if parsed.source == ActivitySource::Telemetry && !parsed.telemetry_known {
             state.telemetry_degraded = true;
@@ -181,6 +192,12 @@ impl PassiveActivityTracker {
 
     pub(crate) fn snapshot(&self) -> PassiveActivitySnapshot {
         self.snapshot_at(Instant::now())
+    }
+
+    /// Monotonic count of admitted progress events (losses excluded). The
+    /// stall watchdog restarts its window whenever this advances.
+    pub(crate) fn progress_revision(&self) -> u64 {
+        self.state.lock().unwrap().progress_revision
     }
 
     fn snapshot_at(&self, now: Instant) -> PassiveActivitySnapshot {
@@ -355,6 +372,27 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stall_progress_ignores_malformed_and_oversized_frames() {
+        let tracker = PassiveActivityTracker::new(false);
+        let message = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
+            method: "session/event".into(),
+            raw: serde_json::json!({"method": "session/event", "params": {"type": "model.streaming"}}),
+        }));
+        tracker.observe(&message);
+        assert_eq!(tracker.progress_revision(), 1);
+        // A loss is not progress: it must never restart the stall window.
+        tracker.observe(&RuntimeEvent::Driver(Inbound::Malformed("bad".into())));
+        tracker.observe(&RuntimeEvent::Driver(Inbound::OversizedLine { bytes: 42 }));
+        assert_eq!(tracker.progress_revision(), 1);
+        tracker.observe(&RuntimeEvent::Driver(Inbound::Lifecycle {
+            sequence: 2,
+            method: "turn.started".into(),
+            order: external_contract::LifecycleOrder::InOrder,
+        }));
+        assert_eq!(tracker.progress_revision(), 2);
+    }
 
     #[test]
     fn dsh_acp_invalid_thoughts_report_loss_but_empty_text_does_not() {

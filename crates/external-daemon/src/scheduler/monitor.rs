@@ -1,8 +1,8 @@
+use super::types::STALLED_NO_ACTIVITY_REASON;
 use super::*;
 use crate::lifecycle_sink::TransportFrameLimit;
 use crate::TRANSPORT_FRAME_LIMIT_REASON;
 use external_store::StoreError;
-
 impl Scheduler {
     #[allow(clippy::too_many_arguments)]
     fn finish_locked_monitor_terminal(
@@ -129,6 +129,110 @@ impl Scheduler {
         if let Err(error) = self.start_ready() {
             self.record_failure(agent_id, error.to_string());
         }
+    }
+
+    /// Decide and execute the S02 stall closure.
+    ///
+    /// The caller observed an expired window outside the operation lock; this
+    /// re-validates the whole decision at the protected point (fresh progress,
+    /// ownership, phase, cancel/close, pending), switches the runtime
+    /// lifecycle to terminating, then releases the lock and only afterwards
+    /// performs the real stop/reap (B-B03).
+    fn handle_stall(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &StoreLifecycleSink,
+        route: &TaskRoute,
+        operation: &Mutex<()>,
+        check: &ActiveCheck,
+    ) -> StallDisposition {
+        let failure_message;
+        {
+            let _guard = operation.lock().unwrap();
+            #[cfg(test)]
+            self.run_before_stall_cleanup_hook();
+            let now = self.now();
+            // A normal terminal published concurrently outranks the stall
+            // closure: leave it to the monitor's terminal branch.
+            if runtime.wait_terminal(Duration::ZERO).is_some() {
+                return StallDisposition::Suppressed;
+            }
+            // Re-observe admitted progress at the protected decision point: an
+            // event that landed while the monitor slept always wins.
+            sink.runtime_lifecycle
+                .stall_observe_progress(sink.activity.progress_revision(), now);
+            let current = match self.inner.store.get_task(agent_id) {
+                Ok(current) => current,
+                Err(error) => {
+                    self.record_failure(agent_id, error.to_string());
+                    return StallDisposition::Abandoned;
+                }
+            };
+            let Some(task) = current.as_ref() else {
+                return StallDisposition::Abandoned;
+            };
+            if task.owner_epoch != owner_epoch || task.phase.is_terminal() {
+                return StallDisposition::Abandoned;
+            }
+            if !self.active_instance_matches(agent_id, owner_epoch) {
+                return StallDisposition::Abandoned;
+            }
+            // Waiting for input, an in-flight stop/close, or a phase that is
+            // not RUNNING is never a stall.
+            if task.phase != TaskPhase::Running || task.stop_requested || task.close_requested {
+                return StallDisposition::Suppressed;
+            }
+            if self
+                .inner
+                .store
+                .completion_blockers(agent_id)
+                .map(|(pending, _)| pending)
+                .unwrap_or(true)
+            {
+                return StallDisposition::Suppressed;
+            }
+            let Some(status) = sink
+                .runtime_lifecycle
+                .stall_poll(now, self.inner.config.stall_timeout)
+            else {
+                return StallDisposition::Suppressed;
+            };
+            check.cancel();
+            sink.runtime_lifecycle.request_stop(&runtime.turn_snapshot());
+            sink.runtime_lifecycle.force_terminating();
+            sink.runtime_lifecycle.stall_mark_triggered();
+            failure_message = Some(stall_failure_message(&status));
+        }
+        // Ingress is closed, so the real cleanup runs without holding the
+        // operation lock. Reuse the S01 cleanup entry for the same
+        // already-published-terminal handoff (a late child exit may have
+        // frozen the owner with an Orphaned terminal).
+        let terminal = runtime.cleanup_for_transport_failure(self.inner.config.stop_grace);
+        let _guard = operation.lock().unwrap();
+        if let Err(error) = self.finish_locked_monitor_terminal(
+            agent_id,
+            owner_epoch,
+            runtime,
+            sink,
+            route,
+            None,
+            terminal,
+            false,
+            Some((
+                CompletionOutcome::Failed,
+                STALLED_NO_ACTIVITY_REASON.into(),
+            )),
+            failure_message,
+        ) {
+            self.record_failure(agent_id, error.to_string());
+        }
+        self.release_active(agent_id, owner_epoch);
+        if let Err(error) = self.start_ready() {
+            self.record_failure(agent_id, error.to_string());
+        }
+        StallDisposition::Terminated
     }
 
     pub(super) fn spawn_monitor(&self, context: MonitorContext) {
@@ -291,6 +395,38 @@ impl Scheduler {
                     scheduler.release_active(&agent_id, owner_epoch);
                     return;
                 }
+                // S02: the stall watchdog shares this unified decision point.
+                // It runs after the confirmed terminal/sink failures but
+                // before turn adjudication, and its window only advances on
+                // admitted runtime progress.
+                let stall_now = scheduler.now();
+                let waiting_for_input = scheduler
+                    .inner
+                    .store
+                    .get_task(&agent_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|task| task.phase == TaskPhase::WaitingInput);
+                runtime_lifecycle.stall_set_waiting(waiting_for_input, stall_now);
+                runtime_lifecycle
+                    .stall_observe_progress(sink.activity.progress_revision(), stall_now);
+                if runtime_lifecycle
+                    .stall_poll(stall_now, scheduler.inner.config.stall_timeout)
+                    .is_some()
+                {
+                    match scheduler.handle_stall(
+                        &agent_id,
+                        owner_epoch,
+                        &runtime,
+                        &sink,
+                        &route,
+                        &operation,
+                        &check,
+                    ) {
+                        StallDisposition::Suppressed => {}
+                        StallDisposition::Terminated | StallDisposition::Abandoned => return,
+                    }
+                }
                 let turn = runtime.turn_snapshot();
                 if !turn.active && turn.generation > handled_generation {
                     let Some(boundary) = turn.boundary else {
@@ -435,6 +571,23 @@ fn transport_failure_message(failure: &TransportFrameLimit, terminal: &RuntimeTe
         "cap": failure.cap,
         "last_event_seq": failure.last_event_seq,
         "cleanup_result": format!("{terminal:?}"),
+    })
+    .to_string()
+}
+
+/// Bounded diagnostic detail for the stall closure: elapsed window, the
+/// configured timeout, and the age of the last admitted progress.
+fn stall_failure_message(status: &StallStatus) -> String {
+    let millis = |value: Duration| u64::try_from(value.as_millis()).unwrap_or(u64::MAX);
+    serde_json::json!({
+        "message": format!(
+            "no admitted runtime activity for {}ms (stall_timeout={}ms)",
+            millis(status.elapsed),
+            millis(status.timeout)
+        ),
+        "stall_elapsed_ms": millis(status.elapsed),
+        "stall_timeout_ms": millis(status.timeout),
+        "last_progress_age_ms": status.last_progress_age.map(millis),
     })
     .to_string()
 }

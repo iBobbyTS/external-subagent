@@ -391,6 +391,20 @@ impl Scheduler {
                 "request {request_id} lost its response claim"
             ))));
         }
+        // S02 B-B02 resume point: resolving the last awaitable request puts
+        // the durable task back to RUNNING, and the stall watchdog starts a
+        // full new window from this successful response. A read failure here
+        // must not turn a persisted response into a caller-visible error.
+        if self
+            .inner
+            .store
+            .get_task(agent_id)
+            .ok()
+            .flatten()
+            .is_some_and(|job| job.phase == TaskPhase::Running)
+        {
+            runtime_lifecycle.stall_resume(self.now());
+        }
         Ok(ResponseOutcome {
             disposition: ResponseDisposition::Responded,
             requested_decision: decision.to_owned(),

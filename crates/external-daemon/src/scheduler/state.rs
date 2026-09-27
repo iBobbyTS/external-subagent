@@ -22,6 +22,12 @@ pub(crate) struct SchedulerInner {
     pub(super) admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     pub(super) before_transport_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) before_stall_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Monotonic clock seam shared by every stall decision. Production uses
+    /// `Instant::now`; tests inject a manual clock so window arithmetic is
+    /// exercised on the same semantics as production.
+    pub(super) clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     pub(super) draining: AtomicBool,
     pub(super) drain_cancel_running: AtomicBool,
     pub(super) updater_fired: AtomicBool,
@@ -70,6 +76,43 @@ pub(crate) struct RuntimeLifecycleSnapshot {
 
 pub(crate) struct RuntimeLifecycle {
     pub(crate) state: Mutex<RuntimeLifecycleSnapshot>,
+    stall: Mutex<StallWatchState>,
+}
+
+/// S02 stall watchdog state, owned by one launched `(agent_id, owner_epoch)`.
+///
+/// A re-claim builds a fresh `RuntimeLifecycle`, so the window, the observed
+/// progress revision, and the triggered flag can never leak across epochs.
+#[derive(Default)]
+struct StallWatchState {
+    /// Monotonic instant the current no-activity window started.
+    baseline: Option<Instant>,
+    /// Last admitted-progress revision observed by the watchdog.
+    observed_progress: u64,
+    /// Monotonic instant of the last admitted progress (diagnostics only).
+    last_progress_at: Option<Instant>,
+    /// True while the task waits for user input: the window is frozen.
+    waiting: bool,
+    /// Set when the watchdog closure has taken ownership once.
+    triggered: bool,
+}
+
+/// Bounded stall evidence handed to the closure diagnostics.
+pub(super) struct StallStatus {
+    pub(super) elapsed: Duration,
+    pub(super) last_progress_age: Option<Duration>,
+    pub(super) timeout: Duration,
+}
+
+/// Whether the monitor keeps looping after a stall decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StallDisposition {
+    /// The task was failed by the stall closure; the monitor returns.
+    Terminated,
+    /// A concurrent activity, pending input, or stop suppressed the watchdog.
+    Suppressed,
+    /// This monitor no longer owns the task; the monitor returns.
+    Abandoned,
 }
 
 const MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS: u64 = 64;
@@ -86,7 +129,85 @@ impl RuntimeLifecycle {
                 force_termination_count: 0,
                 late_event_count: 0,
             }),
+            stall: Mutex::new(StallWatchState::default()),
         }
+    }
+
+    /// Establish the initial window baseline at the first RUNNING transition
+    /// (called synchronously by the claim path, before the monitor thread
+    /// starts, so the baseline never depends on polling delay).
+    pub(super) fn stall_start(&self, now: Instant) {
+        let mut state = self.stall.lock().unwrap();
+        if !state.triggered {
+            state.baseline.get_or_insert(now);
+        }
+    }
+
+    /// Freeze or unfreeze the no-activity window for user input. Entering a
+    /// wait discards the consumed window; leaving it (without an explicit
+    /// response resume) starts a fresh full window.
+    pub(super) fn stall_set_waiting(&self, waiting: bool, now: Instant) {
+        let mut state = self.stall.lock().unwrap();
+        if waiting == state.waiting {
+            return;
+        }
+        state.waiting = waiting;
+        if waiting {
+            state.baseline = None;
+        } else {
+            state.baseline = Some(now);
+            state.last_progress_at = Some(now);
+        }
+    }
+
+    /// Restart the window from the successful response that resolved the last
+    /// awaitable pending request (S02 B-B02 resume point).
+    pub(super) fn stall_resume(&self, now: Instant) {
+        let mut state = self.stall.lock().unwrap();
+        state.waiting = false;
+        state.baseline = Some(now);
+        state.last_progress_at = Some(now);
+    }
+
+    /// Fold in admitted-progress revisions. A new revision restarts the
+    /// window from `now`; `OversizedLine`/`Malformed` never advance the
+    /// revision, so they cannot mask a stalled task.
+    pub(super) fn stall_observe_progress(&self, revision: u64, now: Instant) {
+        let mut state = self.stall.lock().unwrap();
+        if revision == state.observed_progress {
+            return;
+        }
+        state.observed_progress = revision;
+        state.last_progress_at = Some(now);
+        if !state.waiting {
+            state.baseline = Some(now);
+        }
+    }
+
+    /// Report the current no-activity window once it reaches `timeout`
+    /// (`elapsed >= timeout`). `None` while waiting for input, already
+    /// triggered, disabled, or still inside the window.
+    pub(super) fn stall_poll(&self, now: Instant, timeout: Duration) -> Option<StallStatus> {
+        if timeout.is_zero() {
+            return None;
+        }
+        let mut state = self.stall.lock().unwrap();
+        state.baseline.get_or_insert(now);
+        if state.waiting || state.triggered {
+            return None;
+        }
+        let elapsed = now.saturating_duration_since(state.baseline?);
+        (elapsed >= timeout).then(|| StallStatus {
+            elapsed,
+            last_progress_age: state
+                .last_progress_at
+                .map(|at| now.saturating_duration_since(at)),
+            timeout,
+        })
+    }
+
+    pub(super) fn stall_mark_triggered(&self) {
+        self.stall.lock().unwrap().triggered = true;
     }
 
     #[cfg(test)]
@@ -275,6 +396,9 @@ impl Scheduler {
                 admission_hook: Mutex::new(None),
                 #[cfg(test)]
                 before_transport_cleanup_hook: Mutex::new(None),
+                #[cfg(test)]
+                before_stall_cleanup_hook: Mutex::new(None),
+                clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
@@ -412,6 +536,37 @@ impl Scheduler {
             .active
             .get(agent_id)
             .is_some_and(|active| active.owner_epoch == owner_epoch)
+    }
+
+    /// The scheduler's monotonic now. Production and tests share this one
+    /// seam, so window arithmetic never depends on which clock filled it.
+    pub(super) fn now(&self) -> Instant {
+        (self.inner.clock)()
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_clock(&mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) {
+        Arc::get_mut(&mut self.inner)
+            .expect("clock must attach before the scheduler is cloned")
+            .clock = clock;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_before_stall_cleanup_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.before_stall_cleanup_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_before_stall_cleanup_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .before_stall_cleanup_hook
+            .lock()
+            .unwrap()
+            .clone()
+        {
+            hook();
+        }
     }
 
     #[cfg(test)]

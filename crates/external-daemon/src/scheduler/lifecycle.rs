@@ -1,7 +1,7 @@
+use super::types::{STALL_DIAGNOSTIC_STAGE, STALLED_NO_ACTIVITY_REASON};
 use super::*;
 use crate::{TRANSPORT_DIAGNOSTIC_STAGE, TRANSPORT_FRAME_LIMIT_REASON};
 use external_store::StoreError;
-
 impl Scheduler {
     pub fn start_ready(&self) -> Result<Vec<String>, SchedulerError> {
         let mut started = Vec::new();
@@ -379,6 +379,9 @@ impl Scheduler {
                 return Err(error);
             }
         }
+        // S02: the first RUNNING transition fixes the stall window baseline,
+        // before the monitor thread can observe any progress.
+        runtime_lifecycle.stall_start(self.now());
         self.spawn_monitor(MonitorContext {
             agent_id: claim.task.agent_id,
             owner_epoch: claim.owner_epoch,
@@ -386,7 +389,7 @@ impl Scheduler {
             sink,
             session_id: session.session_id,
             operation,
-            runtime_lifecycle,
+            runtime_lifecycle: Arc::clone(&runtime_lifecycle),
             route,
             task,
             check,
@@ -666,11 +669,14 @@ impl Scheduler {
                     } else {
                         format!("{terminal:?}")
                     };
-                    // The generic closure logs `runtime_terminal`; the
-                    // transport closure carries its own stage so the final
-                    // record (and latest failure) keeps that context.
+                    // The generic closure logs `runtime_terminal`; the S01
+                    // transport and S02 stall closures carry their own stage
+                    // so the final record (and latest failure) keeps that
+                    // context.
                     let stage = if reason == TRANSPORT_FRAME_LIMIT_REASON {
                         TRANSPORT_DIAGNOSTIC_STAGE
+                    } else if reason == STALLED_NO_ACTIVITY_REASON {
+                        STALL_DIAGNOSTIC_STAGE
                     } else {
                         "runtime_terminal"
                     };

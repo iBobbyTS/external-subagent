@@ -5,12 +5,22 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Failure code for the S02 stall closure: a RUNNING task admitted no runtime
+/// activity for the configured window, so the daemon fails it explicitly
+/// instead of leaving it RUNNING forever.
+pub(crate) const STALLED_NO_ACTIVITY_REASON: &str = "STALLED_NO_ACTIVITY";
+/// Diagnostic stage carried by the stall closure's final failure record.
+pub(crate) const STALL_DIAGNOSTIC_STAGE: &str = "stall";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
     pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
     pub bootstrap_timeout: Duration,
     pub control_timeout: Duration,
+    /// No-activity window for a RUNNING task. A zero value disables the
+    /// watchdog; production keeps the 30 minute default and exposes no knob.
+    pub stall_timeout: Duration,
     pub runtime_source: Option<PathBuf>,
 }
 impl Default for SchedulerConfig {
@@ -20,6 +30,7 @@ impl Default for SchedulerConfig {
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(2),
             control_timeout: Duration::from_secs(2),
+            stall_timeout: Duration::from_secs(30 * 60),
             runtime_source: None,
         }
     }
