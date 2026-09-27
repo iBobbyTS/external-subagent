@@ -95,6 +95,37 @@ pub(crate) fn terminal_proves_process_group_reaped(terminal: &RuntimeTerminal) -
     )
 }
 
+/// Failure code for the S01 transport closure: the runtime rejected an
+/// oversized NDJSON frame, so the provider can no longer deliver a truthful
+/// terminal and the task is failed explicitly instead of hanging RUNNING.
+pub(crate) const TRANSPORT_FRAME_LIMIT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
+/// Diagnostic stage carried by the transport closure's final failure record.
+pub(crate) const TRANSPORT_DIAGNOSTIC_STAGE: &str = "transport";
+
+/// Real cleanup for the transport-failure closure, shared by every process
+/// owner.
+///
+/// `Driver::stop_and_reap` refuses an unproven cleanup once the leader exited
+/// while descendants still hold the group (the state a late `Orphaned`
+/// terminal leaves behind). That refusal is exactly the case B2-01 has to
+/// clean up, so it falls back to the persisted-identity group reaper the
+/// startup recovery path already uses, and only reports a runtime loss when
+/// that real attempt fails too.
+pub(crate) fn cleanup_owned_group(driver: &Driver, grace: Duration) -> RuntimeTerminal {
+    let identity = driver.identity();
+    match driver.stop_and_reap(grace) {
+        Ok(outcome) => RuntimeTerminal::Stopped(outcome),
+        Err(error) => match stop_and_reap_persisted_process_group(&identity, grace) {
+            Ok(()) => RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Unknown)),
+            Err(reap_error) => {
+                RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::StopFailed(format!(
+                    "owned cleanup failed ({error}); persisted group reap failed ({reap_error})"
+                )))
+            }
+        },
+    }
+}
+
 pub(crate) fn task_agent(task: &TaskRecord) -> String {
     match task_route(task) {
         Ok(TaskRoute::General(prepared)) => prepared
@@ -459,6 +490,19 @@ impl Publisher {
         if let OwnerState::Terminal(existing) = &state.owner {
             return existing.clone();
         }
+        self.publish_terminal_locked(&mut state, terminal.clone());
+        terminal
+    }
+
+    /// Freeze the owner with the terminal proven by a real cleanup.
+    ///
+    /// Unlike [`Publisher::publish_terminal`], this replaces a terminal that a
+    /// late child-exit boundary published without any stop/reap, so the real
+    /// cleanup outcome is never masked by an earlier orphan classification.
+    /// The shared sink has already been terminalized by the caller, so the
+    /// extra `Terminal` record is admitted only when the caller raced it.
+    pub(crate) fn publish_cleanup_terminal(&self, terminal: RuntimeTerminal) -> RuntimeTerminal {
+        let mut state = self.state.lock().unwrap();
         self.publish_terminal_locked(&mut state, terminal.clone());
         terminal
     }
@@ -1022,6 +1066,18 @@ impl RuntimeOwner {
 
     pub fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
         self.publisher.wait_terminal(timeout)
+    }
+
+    /// Real cleanup for the transport-failure closure. `finish_process` is
+    /// short-circuited by `begin_stopping` once any terminal was published
+    /// (for example a late `ChildExited` classified as `Orphaned`), so this
+    /// entry always performs the actual stop/reap and reports its own
+    /// outcome instead of trusting a frozen terminal.
+    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+        self.permission_responses.lock().unwrap().clear();
+        let terminal = cleanup_owned_group(&self.driver, grace);
+        self.publisher.publish_cleanup_terminal(terminal.clone());
+        terminal
     }
 }
 

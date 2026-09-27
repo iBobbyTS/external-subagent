@@ -1,4 +1,6 @@
 use super::*;
+use crate::lifecycle_sink::TransportFrameLimit;
+use crate::TRANSPORT_FRAME_LIMIT_REASON;
 use external_store::StoreError;
 
 impl Scheduler {
@@ -14,6 +16,7 @@ impl Scheduler {
         terminal: RuntimeTerminal,
         natural_completion: bool,
         forced_outcome: Option<(CompletionOutcome, String)>,
+        failure_message: Option<String>,
     ) -> Result<TaskPhase, SchedulerError> {
         let current = self.inner.store.get_task(agent_id)?.ok_or_else(|| {
             SchedulerError::Store(StoreError::InvalidState(
@@ -56,9 +59,76 @@ impl Scheduler {
                 terminal,
                 natural_completion,
                 forced_outcome,
-                failure_message: None,
+                failure_message,
             },
         )
+    }
+
+    /// Handle the sink's latched transport fault. Caller must not hold the
+    /// per-task operation lock: this takes it and re-validates that the active
+    /// instance and the durable task row still belong to this monitor before
+    /// performing the real cleanup and the explicit
+    /// `RUNTIME_TRANSPORT_FRAME_LIMIT` closure.
+    fn handle_transport_failure(
+        &self,
+        agent_id: &str,
+        owner_epoch: u64,
+        runtime: &Arc<dyn ManagedRuntime>,
+        sink: &StoreLifecycleSink,
+        route: &TaskRoute,
+        operation: &Mutex<()>,
+        check: &ActiveCheck,
+    ) {
+        let Some(failure) = sink.transport_failure() else {
+            return;
+        };
+        check.cancel();
+        let _guard = operation.lock().unwrap();
+        let current = match self.inner.store.get_task(agent_id) {
+            Ok(current) => current,
+            Err(error) => {
+                self.record_failure(agent_id, error.to_string());
+                return;
+            }
+        };
+        let owned = current
+            .as_ref()
+            .is_some_and(|task| !task.phase.is_terminal() && task.owner_epoch == owner_epoch);
+        if !owned || !self.active_instance_matches(agent_id, owner_epoch) {
+            // Another control path already released or finished this instance.
+            return;
+        }
+        #[cfg(test)]
+        self.run_before_transport_cleanup_hook();
+        // Close ingress before the real cleanup: `finish_routed_terminal`
+        // flips the lifecycle phase to Terminal, so records the pump forwards
+        // after that point are dropped instead of reopening the owner.
+        sink.runtime_lifecycle
+            .request_stop(&runtime.turn_snapshot());
+        sink.runtime_lifecycle.force_terminating();
+        let terminal = runtime.cleanup_for_transport_failure(self.inner.config.stop_grace);
+        let message = transport_failure_message(&failure, &terminal);
+        if let Err(error) = self.finish_locked_monitor_terminal(
+            agent_id,
+            owner_epoch,
+            runtime,
+            sink,
+            route,
+            current.as_ref(),
+            terminal,
+            false,
+            Some((
+                CompletionOutcome::Failed,
+                TRANSPORT_FRAME_LIMIT_REASON.into(),
+            )),
+            Some(message),
+        ) {
+            self.record_failure(agent_id, error.to_string());
+        }
+        self.release_active(agent_id, owner_epoch);
+        if let Err(error) = self.start_ready() {
+            self.record_failure(agent_id, error.to_string());
+        }
     }
 
     pub(super) fn spawn_monitor(&self, context: MonitorContext) {
@@ -78,7 +148,35 @@ impl Scheduler {
         thread::spawn(move || {
             let mut handled_generation = 0;
             loop {
+                if sink.transport_failure().is_some() {
+                    scheduler.handle_transport_failure(
+                        &agent_id,
+                        owner_epoch,
+                        &runtime,
+                        &sink,
+                        &route,
+                        &operation,
+                        &check,
+                    );
+                    return;
+                }
                 if let Some(terminal) = runtime.wait_terminal(Duration::from_millis(50)) {
+                    // A latched transport fault outranks any terminal a late
+                    // child-exit boundary published while this wait slept, so
+                    // re-check before normal turn adjudication.
+                    if sink.transport_failure().is_some() {
+                        let _ = terminal;
+                        scheduler.handle_transport_failure(
+                            &agent_id,
+                            owner_epoch,
+                            &runtime,
+                            &sink,
+                            &route,
+                            &operation,
+                            &check,
+                        );
+                        return;
+                    }
                     let _guard = operation.lock().unwrap();
                     let natural = matches!(terminal, RuntimeTerminal::Completed(_));
                     if !natural && runtime_lifecycle.ingress_reason() == Some("LATE_AFTER_STOP") {
@@ -152,6 +250,7 @@ impl Scheduler {
                         terminal,
                         natural,
                         None,
+                        None,
                     ) {
                         scheduler.record_failure(&agent_id, error.to_string());
                     }
@@ -184,6 +283,7 @@ impl Scheduler {
                             CompletionOutcome::RuntimeLost,
                             "LIFECYCLE_SINK_FAILED".into(),
                         )),
+                        None,
                     ) {
                         scheduler.record_failure(&agent_id, store_error.to_string());
                     }
@@ -259,6 +359,7 @@ impl Scheduler {
                                 terminal,
                                 boundary == TurnBoundary::Completed,
                                 None,
+                                None,
                             ) {
                                 scheduler.record_failure(&agent_id, error.to_string());
                             }
@@ -296,6 +397,7 @@ impl Scheduler {
                                 terminal,
                                 false,
                                 Some((CompletionOutcome::Failed, "MESSAGE_DELIVERY_FAILED".into())),
+                                None,
                             ) {
                                 scheduler.record_failure(&agent_id, finish_error.to_string());
                             }
@@ -318,4 +420,21 @@ impl Scheduler {
             }
         });
     }
+}
+
+/// Bounded diagnostic detail for the transport closure. `bytes` is the
+/// runtime's detection lower bound (`cap + 1`), never the true frame length;
+/// `cleanup_result` always carries the real cleanup outcome (or its failure).
+fn transport_failure_message(failure: &TransportFrameLimit, terminal: &RuntimeTerminal) -> String {
+    serde_json::json!({
+        "message": format!(
+            "{}: oversized NDJSON frame rejected (bytes={} cap={} last_event_seq={})",
+            failure.reason, failure.bytes, failure.cap, failure.last_event_seq
+        ),
+        "bytes": failure.bytes,
+        "cap": failure.cap,
+        "last_event_seq": failure.last_event_seq,
+        "cleanup_result": format!("{terminal:?}"),
+    })
+    .to_string()
 }

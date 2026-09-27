@@ -81,6 +81,13 @@ pub(crate) fn runtime_failure_record(
                 record[field] = bounded_prefix(value, 1024).into();
             }
         }
+        // The transport closure's bounded evidence: detection lower bound,
+        // frame cap, and the last admitted event sequence at latch time.
+        for field in ["bytes", "cap", "last_event_seq"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
         if let Some(code) = detail
             .get("remote_code")
             .and_then(serde_json::Value::as_i64)

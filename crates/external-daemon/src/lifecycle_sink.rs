@@ -43,6 +43,22 @@ struct SinkWriteState {
     last_source_sequence: u64,
     pending_terminal_sequence: Option<u64>,
     terminal_written: bool,
+    transport_failure: Option<TransportFrameLimit>,
+}
+
+/// The first transport fault observed by the shared sink.
+///
+/// Latched (never overwritten) so the scheduler monitor can hand the task to
+/// its explicit `RUNTIME_TRANSPORT_FRAME_LIMIT` closure even after a late
+/// child-exit boundary published an unrelated runtime terminal. `bytes` is
+/// the runtime's detection lower bound (`cap + 1`), never the true frame
+/// length; `last_event_seq` is the sink's source sequence at latch time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransportFrameLimit {
+    pub(crate) reason: &'static str,
+    pub(crate) bytes: usize,
+    pub(crate) cap: usize,
+    pub(crate) last_event_seq: u64,
 }
 
 impl StoreLifecycleSink {
@@ -158,6 +174,13 @@ impl StoreLifecycleSink {
 
     pub(crate) fn error(&self) -> Option<String> {
         self.write_state.lock().unwrap().first_error.clone()
+    }
+
+    /// The first latched transport fault, if any. Latched by
+    /// [`LifecycleSink::emit`] while it persists the oversized-frame record;
+    /// never overwritten, and never used to publish a runtime terminal.
+    pub(crate) fn transport_failure(&self) -> Option<TransportFrameLimit> {
+        self.write_state.lock().unwrap().transport_failure.clone()
     }
 }
 
@@ -325,6 +348,20 @@ impl LifecycleSink for StoreLifecycleSink {
             return;
         }
         state.last_source_sequence = state.last_source_sequence.max(record.sequence);
+        // Latch the first transport fault while its oversized-frame record is
+        // persisted. Latching is a pure write under the sink's own state lock:
+        // it never publishes a terminal and never re-enters stop, so the
+        // shared `Publisher` callback lock is never re-entered.
+        if let RuntimeEvent::Driver(Inbound::OversizedLine { bytes }) = &record.event {
+            if state.transport_failure.is_none() {
+                state.transport_failure = Some(TransportFrameLimit {
+                    reason: crate::TRANSPORT_FRAME_LIMIT_REASON,
+                    bytes: *bytes,
+                    cap: external_runtime::MAX_NDJSON_LINE_BYTES,
+                    last_event_seq: state.last_source_sequence,
+                });
+            }
+        }
         if matches!(record.event, RuntimeEvent::Terminal(_)) {
             state.pending_terminal_sequence = Some(record.sequence);
             return;

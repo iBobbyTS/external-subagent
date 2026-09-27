@@ -1,4 +1,5 @@
 use super::*;
+use crate::{TRANSPORT_DIAGNOSTIC_STAGE, TRANSPORT_FRAME_LIMIT_REASON};
 use external_store::StoreError;
 
 impl Scheduler {
@@ -665,10 +666,18 @@ impl Scheduler {
                     } else {
                         format!("{terminal:?}")
                     };
+                    // The generic closure logs `runtime_terminal`; the
+                    // transport closure carries its own stage so the final
+                    // record (and latest failure) keeps that context.
+                    let stage = if reason == TRANSPORT_FRAME_LIMIT_REASON {
+                        TRANSPORT_DIAGNOSTIC_STAGE
+                    } else {
+                        "runtime_terminal"
+                    };
                     self.record_runtime_failure(
                         agent_id,
                         session_id.as_deref(),
-                        "runtime_terminal",
+                        stage,
                         &reason,
                         &message,
                         Some(runtime.as_ref()),

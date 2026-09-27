@@ -20,6 +20,8 @@ pub(crate) struct SchedulerInner {
     pub(super) admission: Mutex<()>,
     #[cfg(test)]
     pub(super) admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) before_transport_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) draining: AtomicBool,
     pub(super) drain_cancel_running: AtomicBool,
     pub(super) updater_fired: AtomicBool,
@@ -271,6 +273,8 @@ impl Scheduler {
                 admission: Mutex::new(()),
                 #[cfg(test)]
                 admission_hook: Mutex::new(None),
+                #[cfg(test)]
+                before_transport_cleanup_hook: Mutex::new(None),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
                 updater_fired: AtomicBool::new(false),
@@ -395,6 +399,41 @@ impl Scheduler {
             .failures
             .get(agent_id)
             .cloned()
+    }
+
+    /// Whether the in-memory active instance still belongs to this owner
+    /// epoch. The transport-failure closure validates this before it acts on
+    /// a task that another control path may already have released.
+    pub(super) fn active_instance_matches(&self, agent_id: &str, owner_epoch: u64) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .active
+            .get(agent_id)
+            .is_some_and(|active| active.owner_epoch == owner_epoch)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_before_transport_cleanup_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .before_transport_cleanup_hook
+            .lock()
+            .unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(super) fn run_before_transport_cleanup_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .before_transport_cleanup_hook
+            .lock()
+            .unwrap()
+            .clone()
+        {
+            hook();
+        }
     }
 
     pub(super) fn release_active(&self, agent_id: &str, owner_epoch: u64) {

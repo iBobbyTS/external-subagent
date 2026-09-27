@@ -18,6 +18,17 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     fn identity(&self) -> Option<ProcessIdentity>;
     fn stop(&self, grace: Duration) -> RuntimeTerminal;
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal>;
+    /// Real cleanup for the latched transport failure.
+    ///
+    /// `stop` is short-circuited by the owner's publisher once any terminal
+    /// was published, including a late child-exit classification that never
+    /// stopped anything. Process owners override this so the transport
+    /// closure still performs the actual stop/reap and reports its outcome;
+    /// the default preserves the historical `stop` contract for runtimes
+    /// without a process group to prove.
+    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+        self.stop(grace)
+    }
     fn diagnostic_tail(&self) -> String {
         String::new()
     }
@@ -111,6 +122,10 @@ impl ManagedRuntime for RuntimeOwner {
 
     fn stop(&self, grace: Duration) -> RuntimeTerminal {
         self.stop(grace)
+    }
+
+    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+        self.cleanup_for_transport_failure(grace)
     }
 
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {

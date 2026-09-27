@@ -94,6 +94,16 @@ impl CodexRuntimeOwner {
             ))
         }
     }
+
+    /// See [`crate::RuntimeOwner`]: never short-circuited by a terminal a late
+    /// child-exit boundary published, so the real stop/reap is always tried.
+    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+        let terminal = crate::cleanup_owned_group(&self.driver, grace);
+        self.shared
+            .publisher
+            .publish_cleanup_terminal(terminal.clone());
+        terminal
+    }
 }
 
 impl Drop for CodexRuntimeOwner {
@@ -110,6 +120,10 @@ impl ManagedRuntime for CodexRuntimeOwner {
 
     fn stop(&self, grace: Duration) -> RuntimeTerminal {
         self.finish_process(grace, None)
+    }
+
+    fn cleanup_for_transport_failure(&self, grace: Duration) -> RuntimeTerminal {
+        self.cleanup_for_transport_failure(grace)
     }
 
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
