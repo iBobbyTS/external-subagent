@@ -4,7 +4,7 @@ import { atomicWrite } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
 import { callDaemon } from '../rpc.mjs';
 import { LAUNCH_AGENT_LABEL } from '../constants.mjs';
-import { launchctl } from './service-macos.mjs';
+import { launchAgentPlist, launchctl } from './service-macos.mjs';
 
 const xml = (s) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const unxml = (s) => s.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
@@ -15,8 +15,11 @@ export function hasInstalledService(paths) {
   return Boolean(paths.launchAgent && fs.existsSync(paths.launchAgent));
 }
 
-// The service definition is the executable entry: change only its first argv,
-// retaining the installed configuration/environment and rollback bytes exactly.
+// The service definition is derived from the CURRENT config: activation
+// regenerates the whole plist (environment, revision, runtime forwarding) so a
+// reconfigured installation can never keep serving stale launchd environment.
+// Only rollback restores the previous definition bytes — the exact known state
+// the service ran before — with its executable repointed.
 export async function activateService(paths, candidate, options = {}) {
   const control = options.launchctl || launchctl;
   const rpc = options.callDaemon || callDaemon;
@@ -93,17 +96,21 @@ export async function activateService(paths, candidate, options = {}) {
     } while (Date.now() < deadline);
     throw new CliError('SERVICE_UNLOAD_TIMEOUT', 'launchd service remained registered after bootout');
   };
-  const writeProgram = (entryPath) => atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(entryPath)}${c}`)), 0o600);
+  const writeDefinition = (entryPath) => atomicWrite(paths.launchAgent, launchAgentPlist(paths, {
+    daemonPath: entryPath,
+    ...(options.zcodeRuntime !== undefined ? { zcodeRuntime: options.zcodeRuntime } : {}),
+  }), 0o600);
+  const restoreDefinition = (entryPath) => atomicWrite(paths.launchAgent, Buffer.from(oldPlist.toString().replace(program, (_, a, b, c) => `${a}${xml(entryPath)}${c}`)), 0o600);
   const rollbackService = async () => {
     await unload();
     const previous = rollbackExecutable();
-    writeProgram(previous.path);
+    restoreDefinition(previous.path);
     await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
     return healthy({ path: previous.path, sha256: previous.sha256, version: oldStatus?.identity?.daemon?.version }, oldPid, oldStatus?.service_generation);
   };
   try {
     await unload();
-    writeProgram(candidate.path);
+    writeDefinition(candidate.path);
     await control(['bootstrap', `gui/${process.getuid()}`, paths.launchAgent]);
     const health = await healthy(candidate, oldPid, oldStatus?.service_generation);
       return {

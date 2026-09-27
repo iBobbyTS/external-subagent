@@ -164,6 +164,18 @@ function stubPlist(program) {
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>${xml(program)}</string><string>--database</string><string>/tmp/unused.db</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`);
 }
 
+// The activation-owned plist regeneration needs the same path members the real
+// product paths carry: config (environment source of truth), database, logs.
+const activationPaths = (dir, plist) => ({
+  data: dir,
+  state: path.join(dir, 'state.json'),
+  socket: path.join(dir, 'absent.sock'),
+  launchAgent: plist,
+  config: path.join(dir, 'config.json'),
+  database: path.join(dir, 'external-subagent.sqlite3'),
+  logs: path.join(dir, 'logs'),
+});
+
 test('a failed cross-version activation restores the old service from retained bytes after npm overwrote the old path', { skip: !darwinArm64 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rollback-retained-'));
   try {
@@ -180,7 +192,7 @@ test('a failed cross-version activation restores the old service from retained b
     const shaB = digest(pkgB);
     const plist = path.join(dir, 'agent.plist');
     fs.writeFileSync(plist, stubPlist(pkgA), { mode: 0o600 });
-    const p = { data: dir, state: path.join(dir, 'state.json'), socket: path.join(dir, 'absent.sock'), launchAgent: plist };
+    const p = activationPaths(dir, plist);
     const service = await faithfulService(dir, plist, marker);
 
     // The vA service is running when npm replaces the package directory:
@@ -200,6 +212,7 @@ test('a failed cross-version activation restores the old service from retained b
       await activateService(p, { path: pkgB, sha256: shaB, version: '2.0.1' }, {
         launchctl: service.launchctl,
         callDaemon: service.callDaemon,
+        zcodeRuntime: '/definitely/absent/zcode.cjs',
         healthTimeoutMs: 1_500,
         rollbackPayload: { path: retainedA, sha256: shaA },
       });
@@ -232,6 +245,68 @@ test('a failed cross-version activation restores the old service from retained b
       process.kill(restored.pid, 'SIGTERM');
     })();
     assert.ok(service.spawnCount.value >= 3, 'activation attempted the new payload and rolled back to the retained one');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Issue #1 oracle: the installed service definition is derived from the
+// CURRENT config, never carried forward from the previous plist.  A stale
+// launchd environment (old CODEX_HOME, old config revision, hand-added keys)
+// must be gone after any successful activation, and the regenerated entry must
+// run the verified candidate payload.
+test('a successful activation regenerates the service environment from the current config', { skip: !darwinArm64 }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'env-regen-'));
+  try {
+    const marker = path.join(dir, 'spawned-argv0.log');
+    const oldProgram = path.join(dir, 'pkg-old', 'external-subagentd');
+    const candidate = path.join(dir, 'pkg-c', 'external-subagentd');
+    for (const target of [oldProgram, candidate]) fs.mkdirSync(path.dirname(target), { recursive: true });
+    const stub = (name) => Buffer.from(`#!/bin/sh\necho "$0" >> ${JSON.stringify(marker)}\nexec sleep 300\n`);
+    fs.writeFileSync(oldProgram, stub(), { mode: 0o755 });
+    fs.writeFileSync(candidate, stub(), { mode: 0o755 });
+
+    const config = {
+      schema_version: 2,
+      revision: 22,
+      subagents: {
+        dsh: { home: '/fresh/dsh-home' },
+        codex: { home: '/fresh/codex-home', runtime_path: '/opt/codex-runtime' },
+      },
+    };
+    const staleEnv = [
+      '<key>PATH</key><string>/usr/bin:/bin</string>',
+      '<key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>21</string>',
+      '<key>CODEX_HOME</key><string>/Users/gone/.codex-multi-2</string>',
+      '<key>USER_ADDED_KEY</key><string>hand-edit-that-regeneration-must-drop</string>',
+    ].join('');
+    const plist = path.join(dir, 'agent.plist');
+    fs.writeFileSync(plist, Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>${oldProgram}</string></array>\n<key>EnvironmentVariables</key><dict>${staleEnv}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`), { mode: 0o600 });
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(config));
+
+    const p = activationPaths(dir, plist);
+    const service = await faithfulService(dir, plist, marker);
+    const activated = await activateService(p, { path: candidate, sha256: digest(candidate), version: '2.0.0' }, {
+      launchctl: service.launchctl,
+      callDaemon: service.callDaemon,
+      zcodeRuntime: '/definitely/absent/zcode.cjs',
+    });
+    try {
+      assert.ok(activated.service_generation, 'the candidate health-verified');
+      const text = fs.readFileSync(plist, 'utf8');
+      assert.match(text, new RegExp(`<string>${candidate.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}</string>`));
+      assert.match(text, /<key>CODEX_HOME<\/key><string>\/fresh\/codex-home<\/string>/);
+      assert.match(text, /<key>CODEX_RUNTIME_PATH<\/key><string>\/opt\/codex-runtime<\/string>/);
+      assert.match(text, /<key>DSH_HOME<\/key><string>\/fresh\/dsh-home<\/string>/);
+      assert.match(text, /<key>EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>22<\/string>/);
+      assert.doesNotMatch(text, /codex-multi-2/);
+      assert.doesNotMatch(text, /USER_ADDED_KEY/);
+      assert.doesNotMatch(text, /<string>21<\/string>/);
+      assert.doesNotMatch(text, new RegExp(`<string>${oldProgram.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}</string>`));
+    } finally {
+      const running = service.read();
+      if (running.pid && service.alive(running.pid)) process.kill(running.pid, 'SIGTERM');
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

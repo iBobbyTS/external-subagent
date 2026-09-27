@@ -28,7 +28,10 @@ export function runtimeObservations(paths, options = {}) {
 }
 
 export function launchAgentPlist(paths, options = {}) {
-  const daemon = nativeBinary(DAEMON_BIN_NAME);
+  // An activation carries its own verified daemon artifact (the retained
+  // payload copy), so the entry may be pinned explicitly; every other caller
+  // derives it from the installed package.
+  const daemon = options.daemonPath || nativeBinary(DAEMON_BIN_NAME);
   const config = readConfig(paths.config);
   const { runtime_path: dshRuntime, home: dshHome, profile: dshProfile, version: dshVersion } = config.subagents.dsh;
   const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;

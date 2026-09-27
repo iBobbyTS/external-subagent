@@ -69,6 +69,34 @@ test('legacy read preserves bytes and next locked write persists only canonical 
   assert.equal(fs.existsSync(path.join(paths.data, 'codex-homes.json')), false);
 });
 
+test('config writes regenerate an installed service definition and never create one', () => {
+  const stale = fixture();
+  fs.mkdirSync(path.dirname(stale.paths.config), { recursive: true });
+  fs.writeFileSync(stale.paths.config, JSON.stringify({ schema_version: 2, revision: 21, subagents: { codex: { home: '/stale/codex-home' } } }));
+  fs.mkdirSync(path.dirname(stale.paths.launchAgent), { recursive: true });
+  fs.writeFileSync(stale.paths.launchAgent, Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>/gone/external-subagentd</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HOME</key><string>/stale/codex-home</string><key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>21</string><key>USER_ADDED_KEY</key><string>dropped-by-regeneration</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`), { mode: 0o600 });
+
+  const result = configCommand(stale.paths, parseConfigArgs(['set', 'subagents.codex.home', '/fresh/codex-home']));
+  assert.equal(result.service_definition_refreshed, true, 'an installed definition is regenerated on config writes');
+  assert.equal(result.config.revision, 22);
+  const text = fs.readFileSync(stale.paths.launchAgent, 'utf8');
+  assert.match(text, /<key>CODEX_HOME<\/key><string>\/fresh\/codex-home<\/string>/);
+  assert.match(text, /<key>EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>22<\/string>/);
+  assert.doesNotMatch(text, /USER_ADDED_KEY/);
+  assert.doesNotMatch(text, /\/stale\/codex-home/);
+  // The regenerated definition re-derives the daemon entry from the installed
+  // package, not from the previous plist's program.
+  assert.doesNotMatch(text, /\/gone\/external-subagentd/);
+
+  const absent = fixture();
+  fs.mkdirSync(path.dirname(absent.paths.config), { recursive: true });
+  const untouched = configCommand(absent.paths, parseConfigArgs(['set', 'subagents.codex.home', '/fresh/codex-home']));
+  assert.equal(untouched.service_definition_refreshed, false, 'no installed service means nothing to regenerate');
+  assert.equal(fs.existsSync(absent.paths.launchAgent), false, 'a config write must not install a service definition');
+  const readBack = configCommand(absent.paths, parseConfigArgs(['get', 'subagents.codex.home']));
+  assert.equal(readBack.value, '/fresh/codex-home');
+});
+
 test('config has no default and lists layered agent support', async () => {
   const { paths } = fixture();
   const listed = await subagentsCommand(paths);

@@ -2,6 +2,9 @@ import { readConfig } from '../config/read.mjs';
 import { updateConfig, writeConfig } from '../config/write.mjs';
 import { SUBAGENT_IDS } from '../config/schema.mjs';
 import { CliError } from '../errors.mjs';
+import { atomicWrite } from '../fs-atomic.mjs';
+import { hasInstalledService } from '../install/service-activation.mjs';
+import { launchAgentPlist } from '../install/service-macos.mjs';
 
 const CONFIG_INPUT_FIELDS = new Set(['operation', 'patch', 'key']);
 const GET_KEYS = new Set([
@@ -85,6 +88,17 @@ export function parseConfigArgs(args) {
   throw new CliError('INVALID_ARGUMENT', `unsupported config operation: ${operation}`, 2);
 }
 
+// A config change moves the very values the installed LaunchAgent forwards to
+// launchd (subagent homes, config revision), so every successful write also
+// regenerates the service definition from the new config.  Only the file is
+// rewritten — launchd picks the environment up at its next load, so a running
+// daemon is never restarted or disturbed here.
+function refreshServiceDefinition(paths) {
+  if (!hasInstalledService(paths)) return false;
+  atomicWrite(paths.launchAgent, launchAgentPlist(paths), 0o600);
+  return true;
+}
+
 export function configCommand(paths, input = {}) {
   rejectUnknownInput(input);
   const operation = input.operation ?? 'get';
@@ -98,7 +112,8 @@ export function configCommand(paths, input = {}) {
     for (const [agent, value] of Object.entries(input.patch.subagents || {})) {
       if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new CliError('CONFIG_INVALID', `subagents.${agent} must be an object`, 2);
     }
-    return { config: updateConfig(paths.config, (latest) => mergePatch(latest, input.patch)) };
+    const config = updateConfig(paths.config, (latest) => mergePatch(latest, input.patch));
+    return { config, service_definition_refreshed: refreshServiceDefinition(paths) };
   }
   if (operation === 'show') {
     if (input.patch !== undefined || input.key !== undefined) throw new CliError('INVALID_ARGUMENT', 'config show does not accept key or patch', 2);
@@ -106,7 +121,8 @@ export function configCommand(paths, input = {}) {
   }
   if (operation === 'unset') {
     if (input.patch !== undefined || typeof input.key !== 'string') throw new CliError('INVALID_ARGUMENT', 'config unset requires exactly one supported key', 2);
-    return { config: updateConfig(paths.config, (latest) => mergePatch(latest, unsetPatch(input.key))) };
+    const config = updateConfig(paths.config, (latest) => mergePatch(latest, unsetPatch(input.key)));
+    return { config, service_definition_refreshed: refreshServiceDefinition(paths) };
   }
   if (operation === 'get') {
     if (input.patch !== undefined) throw new CliError('INVALID_ARGUMENT', 'config get does not accept patch', 2);
