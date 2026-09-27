@@ -617,6 +617,7 @@ fn terminal_reason_code_reads_the_explicit_reason() {
             "agent",
             &result(TaskOutcome::Failed),
             Some("MODEL_REJECTED"),
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -678,6 +679,7 @@ fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
             "agent",
             &result(TaskOutcome::Failed),
             Some("MODEL_REJECTED"),
+            None,
         )
         .unwrap();
     assert!(store
@@ -714,4 +716,156 @@ fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
     // The latest terminal row is the completed one (NULL reason); the older
     // failure row must not resurface.
     assert_eq!(store.terminal_reason_code("agent").unwrap(), None);
+}
+
+#[test]
+fn terminal_failure_message_is_gated_by_the_effective_outcome() {
+    let (_directory, _path, store) = store();
+    // A failure outcome persists the explicit bounded record.
+    store
+        .enqueue_task_authoritative(&task("failed", "/repo", None))
+        .unwrap();
+    running(&store, "failed");
+    store
+        .store_task_result_with_reason(
+            "failed",
+            &result(TaskOutcome::Failed),
+            Some("MODEL_REJECTED"),
+            Some(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#),
+        )
+        .unwrap();
+    let failed = store.get_task("failed").unwrap().unwrap();
+    assert_eq!(failed.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(
+        failed.failure_message.as_deref(),
+        Some(r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL"}"#)
+    );
+
+    // Completed and Cancelled clear a pre-planted value even when the caller
+    // passes an explicit message.
+    for (id, outcome) in [
+        ("completed", TaskOutcome::Completed),
+        ("cancelled", TaskOutcome::Cancelled),
+    ] {
+        store
+            .enqueue_task_authoritative(&task(id, "/repo", None))
+            .unwrap();
+        running(&store, id);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET failure_message='stale' WHERE agent_id=?1",
+                [id],
+            )
+            .unwrap();
+        store
+            .store_task_result_with_reason(id, &result(outcome), None, Some("ignored"))
+            .unwrap();
+        let row = store.get_task(id).unwrap().unwrap();
+        assert_eq!(row.outcome, Some(outcome), "{id}");
+        assert_eq!(row.failure_message, None, "{id}");
+    }
+}
+
+#[test]
+fn terminal_failure_message_survives_duplicate_digest_but_not_cancel_precedence() {
+    let (_directory, _path, store) = store();
+    // The first terminal commit owns the detail; an identical immutable
+    // result (same digest) must not overwrite it.
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    running(&store, "agent");
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            None,
+            Some("first detail"),
+        )
+        .unwrap();
+    store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            None,
+            Some("second detail"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_task("agent")
+            .unwrap()
+            .unwrap()
+            .failure_message
+            .as_deref(),
+        Some("first detail")
+    );
+
+    // A late failure result after a stop request is rejected without writing.
+    store
+        .enqueue_task_authoritative(&task("stopped", "/repo", None))
+        .unwrap();
+    running(&store, "stopped");
+    store.request_stop("stopped").unwrap();
+    assert!(store
+        .store_task_result_with_reason(
+            "stopped",
+            &result(TaskOutcome::Failed),
+            None,
+            Some("late detail")
+        )
+        .is_err());
+    assert_eq!(
+        store.get_task("stopped").unwrap().unwrap().failure_message,
+        None
+    );
+
+    // fail_claim's cancellation flip clears the message it was handed.
+    store
+        .enqueue_task_authoritative(&task("claim", "/repo", None))
+        .unwrap();
+    let epoch = running(&store, "claim");
+    store.request_stop("claim").unwrap();
+    let outcome = store
+        .fail_claim("claim", epoch, "RUNTIME_SPAWN_FAILED", "spawn detail")
+        .unwrap();
+    assert_eq!(outcome, TaskOutcome::Cancelled);
+    let claim = store.get_task("claim").unwrap().unwrap();
+    assert_eq!(claim.outcome, Some(TaskOutcome::Cancelled));
+    assert_eq!(claim.failure_message, None);
+}
+
+#[test]
+fn terminal_result_and_failure_message_roll_back_together() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    running(&store, "agent");
+    {
+        let connection = store.connection.lock().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_terminal BEFORE UPDATE ON tasks
+                 WHEN NEW.phase='TERMINAL'
+                 BEGIN SELECT RAISE(ABORT, 'injected terminal failure'); END;",
+            )
+            .unwrap();
+    }
+    assert!(store
+        .store_task_result_with_reason(
+            "agent",
+            &result(TaskOutcome::Failed),
+            None,
+            Some(r#"{"stage":"runtime_terminal"}"#)
+        )
+        .is_err());
+    // Neither the immutable result nor the detail may survive the rollback.
+    assert!(store.task_result("agent").unwrap().is_none());
+    let row = store.get_task("agent").unwrap().unwrap();
+    assert_eq!(row.phase, TaskPhase::Running);
+    assert_eq!(row.failure_message, None);
 }

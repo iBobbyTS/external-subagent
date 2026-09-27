@@ -29,13 +29,23 @@ impl Scheduler {
             Ok(route) => route,
             Err(message) => {
                 if task.is_some() {
-                    self.inner.store.store_task_result(
+                    let failure_message = self.persistable_failure_record_for(
+                        &claim.task.agent_id,
+                        claim.task.session_id.as_deref(),
+                        "preparation",
+                        "PREPARED_LAUNCH_INVALID",
+                        &message,
+                        None,
+                    );
+                    self.inner.store.store_task_result_with_reason(
                         &claim.task.agent_id,
                         &minimal_task_result(
                             CompletionOutcome::ResultInvalid,
                             &message,
                             "PREPARED_LAUNCH_INVALID",
                         ),
+                        None,
+                        Some(&failure_message),
                     )?;
                 } else {
                     self.inner.store.fail_claim(
@@ -50,13 +60,23 @@ impl Scheduler {
         };
         if let Err(message) = validate_task_route(task.as_ref(), &route) {
             if task.is_some() {
-                self.inner.store.store_task_result(
+                let failure_message = self.persistable_failure_record_for(
+                    &claim.task.agent_id,
+                    claim.task.session_id.as_deref(),
+                    "preparation",
+                    "TASK_ROUTE_INVALID",
+                    &message,
+                    None,
+                );
+                self.inner.store.store_task_result_with_reason(
                     &claim.task.agent_id,
                     &minimal_task_result(
                         CompletionOutcome::ResultInvalid,
                         &message,
                         "TASK_ROUTE_INVALID",
                     ),
+                    None,
+                    Some(&failure_message),
                 )?;
             } else {
                 self.inner.store.fail_claim(
@@ -79,6 +99,16 @@ impl Scheduler {
             Ok(policy) => policy.map(Arc::new),
             Err(error) => {
                 let message = error.to_string();
+                // No runtime was built: an empty tail and the persisted
+                // session (if any) are the only honest evidence available.
+                let failure_message = self.persistable_failure_record_for(
+                    &claim.task.agent_id,
+                    claim.task.session_id.as_deref(),
+                    "preparation",
+                    "PREPARED_CONTENT_INVALID",
+                    &message,
+                    None,
+                );
                 self.finish_unstarted_route(
                     &claim.task.agent_id,
                     claim.owner_epoch,
@@ -88,6 +118,7 @@ impl Scheduler {
                         outcome: CompletionOutcome::ResultInvalid,
                         reason_code: "PREPARED_CONTENT_INVALID",
                         message: &message,
+                        failure_message: Some(failure_message),
                     },
                     true,
                 )?;
@@ -119,7 +150,7 @@ impl Scheduler {
             Ok(runtime) => runtime,
             Err(error) => {
                 let message = error.to_string();
-                self.record_runtime_failure(
+                let failure_message = self.record_runtime_failure(
                     &claim.task.agent_id,
                     claim.task.session_id.as_deref(),
                     "spawn",
@@ -136,6 +167,7 @@ impl Scheduler {
                         outcome: CompletionOutcome::Failed,
                         reason_code: "RUNTIME_SPAWN_FAILED",
                         message: &message,
+                        failure_message: Some(failure_message),
                     },
                     true,
                 ) {
@@ -171,7 +203,7 @@ impl Scheduler {
                         "SESSION_START_FAILED"
                     },
                 );
-                self.record_runtime_failure(
+                let failure_message = self.record_runtime_failure(
                     &claim.task.agent_id,
                     claim.task.session_id.as_deref(),
                     "session_start",
@@ -188,6 +220,7 @@ impl Scheduler {
                         outcome,
                         reason_code: code,
                         message: &message,
+                        failure_message: Some(failure_message),
                     },
                     resources_reaped,
                 ) {
@@ -207,7 +240,7 @@ impl Scheduler {
         ) {
             let message = "runtime model did not match the prepared request";
             let terminal = runtime.stop(self.inner.config.stop_grace);
-            self.record_runtime_failure(
+            let failure_message = self.record_runtime_failure(
                 &claim.task.agent_id,
                 Some(&session.session_id),
                 "session_start",
@@ -225,6 +258,7 @@ impl Scheduler {
                     outcome: CompletionOutcome::Failed,
                     reason_code: code,
                     message,
+                    failure_message: Some(failure_message),
                 },
                 resources_reaped,
             ) {
@@ -414,9 +448,15 @@ impl Scheduler {
                         terminal.outcome,
                         terminal.reason_code,
                         terminal.message,
+                        terminal.failure_message,
                     )
                 } else {
-                    unreaped_general(terminal.outcome, terminal.reason_code, terminal.message)
+                    unreaped_general(
+                        terminal.outcome,
+                        terminal.reason_code,
+                        terminal.message,
+                        terminal.failure_message,
+                    )
                 };
                 self.persist_general_completion(
                     agent_id,
@@ -438,13 +478,25 @@ impl Scheduler {
         if let Err(error) =
             persist_general_result(&self.inner.store, agent_id, prepared, completion)
         {
-            self.record_failure(agent_id, error.to_string());
+            let error_message = error.to_string();
+            self.record_failure(agent_id, error_message.clone());
             if self.inner.store.task_result(agent_id)?.is_none() {
+                // The bounded placeholder keeps its original final_text/hash;
+                // only tasks.failure_message carries the persistence error.
+                let failure_message = persistable_failure_record(
+                    agent_id,
+                    None,
+                    "result_persist",
+                    "RESULT_PERSIST_FAILED",
+                    &error_message,
+                    "",
+                );
                 store_result_with_cancel_precedence(
                     &self.inner.store,
                     agent_id,
                     &bounded_result_invalid_task_result(),
                     None,
+                    Some(&failure_message),
                 )?;
             }
         }
@@ -545,6 +597,19 @@ impl Scheduler {
                     },
                 )
             } else {
+                // The runtime was stopped above but is still owned here, so
+                // this is the last point that can capture its session/tail for
+                // an unstarted handoff that has no other diagnostic sink.
+                let failure_message = failure.as_ref().map(|(code, message)| {
+                    self.persistable_failure_record_for(
+                        agent_id,
+                        None,
+                        "runtime_start",
+                        code,
+                        message,
+                        Some(runtime.as_ref()),
+                    )
+                });
                 let (code, message) = failure.unwrap_or((
                     "GENERAL_START_CANCELLED",
                     "general task stopped before entering its runtime phase".into(),
@@ -567,6 +632,7 @@ impl Scheduler {
                             code
                         },
                         message: &message,
+                        failure_message,
                     },
                     resources_reaped,
                 )
@@ -652,7 +718,7 @@ impl Scheduler {
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
-                if !matches!(
+                let routed_failure_message = if !matches!(
                     outcome,
                     CompletionOutcome::Completed | CompletionOutcome::Cancelled
                 ) {
@@ -680,15 +746,17 @@ impl Scheduler {
                     } else {
                         "runtime_terminal"
                     };
-                    self.record_runtime_failure(
+                    Some(self.record_runtime_failure(
                         agent_id,
                         session_id.as_deref(),
                         stage,
                         &reason,
                         &message,
                         Some(runtime.as_ref()),
-                    );
-                }
+                    ))
+                } else {
+                    None
+                };
                 let natural_completed =
                     natural_completion && matches!(terminal, RuntimeTerminal::Completed(_));
                 let process_group_reaped = terminal_proves_process_group_reaped(&terminal);
@@ -718,7 +786,7 @@ impl Scheduler {
                 } else if process_group_reaped {
                     GeneralFinalizer::finalize(prepared, outcome)
                 } else {
-                    unreaped_general(outcome, &reason, &reason)
+                    unreaped_general(outcome, &reason, &reason, None)
                 };
                 if completion.summary.trim().is_empty() {
                     completion.summary = reason.clone();
@@ -727,6 +795,24 @@ impl Scheduler {
                     && completion.outcome != CompletionOutcome::Completed
                 {
                     completion.reason_code = Some(reason);
+                }
+                // The natural ResultInvalid is decided only after the final
+                // completion exists, so its record is built here from that
+                // completion plus the runtime's still-owned diagnostic tail.
+                if completion.outcome == CompletionOutcome::ResultInvalid {
+                    completion.failure_message = Some(self.persistable_failure_record_for(
+                        agent_id,
+                        None,
+                        "runtime_terminal",
+                        completion
+                            .reason_code
+                            .as_deref()
+                            .unwrap_or("FINAL_TEXT_MISSING"),
+                        &completion.summary,
+                        Some(runtime.as_ref()),
+                    ));
+                } else if routed_failure_message.is_some() {
+                    completion.failure_message = routed_failure_message;
                 }
                 let reap_after_persist = completion.cleaned && process_group_reaped;
                 #[cfg(test)]

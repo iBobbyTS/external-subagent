@@ -1,6 +1,7 @@
 use super::diagnostics::{
-    runtime_failure_record, update_latest_failure, DiagnosticLogger, RotatingDiagnosticWriter,
-    DIAGNOSTIC_FILE_BYTES, DIAGNOSTIC_QUEUE_CAPACITY, DIAGNOSTIC_RECORD_BYTES,
+    persistable_failure_record, persistable_record_with_tail, runtime_failure_record,
+    update_latest_failure, DiagnosticLogger, RotatingDiagnosticWriter, DIAGNOSTIC_FILE_BYTES,
+    DIAGNOSTIC_QUEUE_CAPACITY, DIAGNOSTIC_RECORD_BYTES, PERSISTABLE_RECORD_BYTES,
 };
 use super::*;
 
@@ -578,15 +579,17 @@ mod failure_log_tests {
                 !result_json.contains(tail),
                 "stderr leaked into task result"
             );
-            assert_eq!(
-                scheduler
-                    .store()
-                    .get_task(&agent_id)
-                    .unwrap()
-                    .unwrap()
-                    .outcome,
-                Some(TaskOutcome::Failed)
-            );
+            let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+            assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+            // Bootstrap failures persist the real runtime session and stderr
+            // suffix in the task row, not just in the diagnostic log.
+            let raw = task.failure_message.expect("persisted failure detail");
+            let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(persisted["stage"], "session_start");
+            assert_eq!(persisted["error_code"], "SESSION_START_FAILED");
+            assert_eq!(persisted["session_id"].as_str(), session);
+            assert!(persisted["stderr_tail"].as_str().unwrap().contains(tail));
+            assert!(!raw.contains('\n'));
         }
     }
 
@@ -599,6 +602,351 @@ read request
 printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
 sleep 0.1
 "#;
+
+    /// One started turn settled by a model-reported failure boundary.
+    const FAILED_TURN_PROTOCOL: &str = r#"
+read request
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"failed-session"}}}'
+read request
+printf '%s\n' '{"id":2,"result":{}}'
+read request
+printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+printf failed-turn-tail >&2
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.failed"}}'
+sleep 2
+"#;
+
+    /// A completed turn that never verifies a visible final text.
+    const MISSING_TEXT_PROTOCOL: &str = r#"
+read request
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"missing-session"}}}'
+read request
+printf '%s\n' '{"id":2,"result":{}}'
+read request
+printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+printf missing-text-tail >&2
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.completed"}}'
+sleep 2
+"#;
+
+    #[test]
+    fn failed_turn_persists_a_bounded_failure_record_in_the_task_row() {
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(FAILED_TURN_PROTOCOL);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        let raw = task.failure_message.expect("persisted failure detail");
+        assert!(raw.len() <= PERSISTABLE_RECORD_BYTES);
+        assert!(!raw.contains('\n'));
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "runtime_terminal");
+        assert_eq!(persisted["error_code"], "RUNTIME_TERMINAL");
+        assert_eq!(persisted["session_id"], "failed-session");
+        assert!(persisted["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("failed-turn-tail"));
+        // The immutable result keeps the bare reason code (final_text
+        // semantics unchanged).
+        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+    }
+
+    #[test]
+    fn natural_result_invalid_persists_final_text_missing_detail() {
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(MISSING_TEXT_PROTOCOL);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::ResultInvalid);
+        assert_eq!(
+            result.result.final_text,
+            "runtime completed without visible final text"
+        );
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(&agent_id)
+                .unwrap()
+                .as_deref(),
+            Some("FINAL_TEXT_MISSING")
+        );
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::ResultInvalid));
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "runtime_terminal");
+        assert_eq!(persisted["error_code"], "FINAL_TEXT_MISSING");
+        assert!(persisted["message"]
+            .as_str()
+            .unwrap()
+            .contains("without visible final text"));
+        assert!(persisted["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("missing-text-tail"));
+    }
+
+    #[test]
+    fn spawn_failure_persists_preparation_detail_with_empty_tail() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("spawn-failure-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(workspace.path().join("state.sqlite")).unwrap());
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> io::Result<Command> {
+                Err(io::Error::other("synthetic spawn refusal"))
+            },
+        ));
+        let scheduler = Scheduler::new(
+            "spawn-failure",
+            store,
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let submitted = scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: "10000007".into(),
+                repository: workspace.path().canonicalize().unwrap(),
+                permission_mode: external_core::PermissionMode::Plan,
+                prompt: "spawn failure fixture".into(),
+                write_manifest: Vec::new(),
+            })
+            .unwrap();
+        assert!(scheduler.start_ready().is_err());
+        let task = scheduler
+            .store()
+            .get_task(&submitted.agent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "spawn");
+        assert_eq!(persisted["error_code"], "RUNTIME_SPAWN_FAILED");
+        // No runtime ever existed: never fabricate a session or tail.
+        assert_eq!(persisted["session_id"], serde_json::Value::Null);
+        assert_eq!(persisted["stderr_tail"], "");
+        assert_eq!(persisted["tail_truncated"], false);
+    }
+
+    #[test]
+    fn failed_turn_message_delivery_persists_remote_detail_and_fails_the_task() {
+        struct DeliveryFailRuntime;
+        impl ManagedRuntime for DeliveryFailRuntime {
+            fn identity(&self) -> Option<ProcessIdentity> {
+                None
+            }
+            fn stop(&self, _: Duration) -> RuntimeTerminal {
+                RuntimeTerminal::FailedTurn(StopOutcome::AlreadyExited(ChildExit::Exited(Some(1))))
+            }
+            fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+                None
+            }
+            fn turn_snapshot(&self) -> TurnSnapshot {
+                TurnSnapshot {
+                    generation: 1,
+                    active: false,
+                    boundary: Some(TurnBoundary::Failed),
+                }
+            }
+            fn bootstrap_session(
+                &self,
+                _: &TaskRecord,
+                _: Duration,
+            ) -> Result<SessionReady, RuntimeCommandError> {
+                Ok(SessionReady {
+                    session_id: "delivery-session".into(),
+                    initial_turn_id: None,
+                    configured_model: None,
+                })
+            }
+            fn send_turn(
+                &self,
+                _: &str,
+                _: &str,
+                _: Duration,
+            ) -> Result<Option<String>, RuntimeCommandError> {
+                Err(RuntimeCommandError::Remote(serde_json::json!({
+                    "code": -32031,
+                    "message": "delivery rejected with remote detail"
+                })))
+            }
+            fn diagnostic_tail(&self) -> String {
+                "delivery-tail".into()
+            }
+            fn diagnostic_session_id(&self) -> Option<String> {
+                Some("delivery-session".into())
+            }
+        }
+        struct DeliveryFailFactory;
+        impl RuntimeFactory for DeliveryFailFactory {
+            fn spawn(
+                &self,
+                _: &TaskRecord,
+                _: Arc<dyn LifecycleSink>,
+            ) -> io::Result<Arc<dyn ManagedRuntime>> {
+                Ok(Arc::new(DeliveryFailRuntime))
+            }
+        }
+        let (_workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(DeliveryFailFactory);
+        scheduler
+            .store()
+            .insert_message("queued-delivery", &agent_id, "queue", "follow-up")
+            .unwrap();
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let result = await_result(&scheduler, &agent_id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        // The terminal message-delivery failure hands its already-built detail
+        // to the routed closure instead of inspecting only after persistence.
+        let raw = task.failure_message.expect("persisted delivery detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["error_code"], "MESSAGE_DELIVERY_FAILED");
+        assert_eq!(persisted["session_id"], "delivery-session");
+        assert!(persisted["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("delivery-tail"));
+        assert!(persisted["remote_message"]
+            .as_str()
+            .unwrap()
+            .contains("delivery rejected"));
+        assert_eq!(persisted["remote_code"], -32031);
+    }
+
+    #[test]
+    fn claim_prepared_decode_failure_persists_preparation_detail() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        let workspace = tempfile::Builder::new()
+            .prefix("prepared-failure-")
+            .tempdir_in(root)
+            .unwrap();
+        let repository = workspace.path().canonicalize().unwrap();
+        let store = Arc::new(Store::open(workspace.path().join("state.sqlite")).unwrap());
+        let factory = Arc::new(CommandRuntimeFactory::new(
+            |_: &TaskRecord| -> io::Result<Command> {
+                panic!("an undecodable preparation must never spawn")
+            },
+        ));
+        let scheduler = Scheduler::new(
+            "prepared-failure",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        store
+            .enqueue_task_authoritative(&NewTask {
+                agent_id: "10000009".into(),
+                repository: repository.to_string_lossy().into_owned(),
+                workspace_path: repository.to_string_lossy().into_owned(),
+                runtime_hash: None,
+                prepared_launch_json: "{not valid json".into(),
+                initial_prompt: "undecodable".into(),
+            })
+            .unwrap();
+        assert!(scheduler.start_ready().is_err());
+        let task = store.get_task("10000009").unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::ResultInvalid));
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "preparation");
+        assert_eq!(persisted["error_code"], "PREPARED_LAUNCH_INVALID");
+    }
+
+    #[test]
+    fn resumed_policy_launcher_failure_persists_preparation_detail() {
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler("unused");
+        let store = scheduler.store();
+        let claim = store.claim_next("old-daemon", 10, 1).unwrap().unwrap();
+        assert!(store
+            .mark_session_running(
+                &agent_id,
+                claim.owner_epoch,
+                "old-runtime",
+                None,
+                Some("policy-session"),
+                None,
+            )
+            .unwrap());
+        store
+            .store_task_result(
+                &agent_id,
+                &external_store::TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "prior turn failed".into(),
+                    partial: true,
+                },
+            )
+            .unwrap();
+        assert!(store
+            .requeue_task_for_resume_with_message(&agent_id, "resume-policy", "continue")
+            .unwrap());
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        let prepared: external_core::PreparedGeneralTask =
+            serde_json::from_str(&task.prepared_launch_json).unwrap();
+        let scratch = prepared.workspace.scratch_root.clone();
+        // A resume with an existing scratch path that is now a plain file
+        // still decodes but fails `resume_launcher`'s create_dir_all.
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::write(&scratch, b"not a directory").unwrap();
+        let error = scheduler.start_ready().unwrap_err();
+        assert!(matches!(error, SchedulerError::InvalidConfig(_)));
+        let task = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::ResultInvalid));
+        let raw = task.failure_message.expect("persisted failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "preparation");
+        assert_eq!(persisted["error_code"], "PREPARED_CONTENT_INVALID");
+        // No runtime was built; the persisted session is the honest evidence.
+        assert_eq!(persisted["session_id"], "policy-session");
+        assert_eq!(persisted["stderr_tail"], "");
+    }
+
+    #[test]
+    fn persist_failure_fallback_carries_the_store_error_evidence() {
+        let (workspace, scheduler, agent_id) =
+            diagnostic_scheduler("read request; printf bootstrap-detail >&2; exit 7");
+        {
+            let connection =
+                rusqlite::Connection::open(workspace.path().join("state.sqlite")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER reject_failed_result BEFORE INSERT ON task_results
+                     WHEN NEW.outcome='FAILED'
+                     BEGIN SELECT RAISE(ABORT, 'injected persist failure'); END;",
+                )
+                .unwrap();
+        }
+        assert!(scheduler.start_ready().is_err());
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::ResultInvalid));
+        let result = scheduler
+            .store()
+            .task_result(&agent_id)
+            .unwrap()
+            .unwrap()
+            .result;
+        // The bounded placeholder keeps its original final_text/hash.
+        assert_eq!(result.final_text, "result unavailable");
+        assert!(result.partial);
+        let raw = task.failure_message.expect("persisted persistence error");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "result_persist");
+        assert_eq!(persisted["error_code"], "RESULT_PERSIST_FAILED");
+        assert!(persisted["message"]
+            .as_str()
+            .unwrap()
+            .contains("injected persist failure"));
+    }
 
     #[test]
     fn scheduler_queue_drains_once_through_driver_and_persists_receipt() {
@@ -839,6 +1187,19 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                     .outcome,
                 expected
             );
+            // Startup recovery persists a record for the RuntimeLost rows and
+            // never invents one for the cancelled row.
+            if cancelled {
+                assert_eq!(task.failure_message, None);
+            } else {
+                let raw = task.failure_message.expect("recovery failure detail");
+                let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(persisted["stage"], "recovery");
+                assert_eq!(persisted["error_code"], "DAEMON_RESTART_RUNTIME_LOST");
+                assert_eq!(persisted["session_id"], "old-session");
+                // No runtime survives a restart: never claim a stderr tail.
+                assert_eq!(persisted["stderr_tail"], "");
+            }
         }
     }
 
@@ -859,15 +1220,25 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert!(!serde_json::to_string(&result.result)
             .unwrap()
             .contains("abnormal-exit-tail"));
-        assert_eq!(
-            scheduler
-                .store()
-                .get_task(&agent_id)
-                .unwrap()
-                .unwrap()
-                .outcome,
-            Some(TaskOutcome::RuntimeLost)
-        );
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::RuntimeLost));
+        // The persistable variant lands in the task row with the same
+        // correlation and the latest stderr suffix.
+        let raw = task.failure_message.expect("persisted failure detail");
+        assert!(raw.len() <= PERSISTABLE_RECORD_BYTES);
+        assert!(!raw.contains('\n'));
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "runtime_terminal");
+        assert_eq!(persisted["error_code"], "RUNTIME_TERMINAL");
+        assert_eq!(persisted["session_id"], "running-session");
+        assert!(persisted["stderr_tail"]
+            .as_str()
+            .unwrap()
+            .contains("abnormal-exit-tail"));
+        // The immutable result carries neither the detail nor the stderr.
+        assert!(!serde_json::to_string(&result.result)
+            .unwrap()
+            .contains("abnormal-exit-tail"));
     }
 
     #[test]
@@ -978,6 +1349,17 @@ sleep 2
         assert!(!record.to_string().contains("must-not-record"));
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
         assert_eq!(result.result.final_text, "completed answer");
+        // A message-only failure on a task that still completes must never
+        // reach tasks.failure_message.
+        assert_eq!(
+            scheduler
+                .store()
+                .get_task(&agent_id)
+                .unwrap()
+                .unwrap()
+                .failure_message,
+            None
+        );
         let message = scheduler
             .store()
             .message("queued-after-completion")
@@ -1212,9 +1594,133 @@ sleep 2
         assert!(!record.to_string().contains('\n'));
     }
 
+    fn escaped_worst_case_message() -> String {
+        serde_json::json!({
+            "message": "\u{1}".repeat(512),
+            "operation": "\u{1}".repeat(192),
+            "remote_message": "\u{1}".repeat(192),
+            "cleanup_result": "\u{1}".repeat(192),
+            "bytes": u64::MAX,
+            "cap": u64::MAX,
+            "last_event_seq": u64::MAX,
+            "stall_elapsed_ms": u64::MAX,
+            "stall_timeout_ms": u64::MAX,
+            "last_progress_age_ms": u64::MAX,
+            "remote_code": i64::MIN,
+        })
+        .to_string()
+    }
+
     #[test]
-    fn bounded_error_respects_utf8_byte_limit() {
-        let value = bounded_error(&"界".repeat(5000));
+    fn persistable_empty_tail_worst_case_stays_under_twelve_kib() {
+        let id = "\u{1}".repeat(256);
+        let code = "\u{1}".repeat(128);
+        let message = escaped_worst_case_message();
+        let without_marker =
+            persistable_record_with_tail(&id, Some(&id), &code, &code, &message, "", false);
+        let with_marker =
+            persistable_record_with_tail(&id, Some(&id), &code, &code, &message, "", true);
+        assert!(
+            without_marker.len() <= 12 * 1024,
+            "worst empty tail: {}",
+            without_marker.len()
+        );
+        assert!(
+            with_marker.len() <= 12 * 1024,
+            "worst empty tail with marker: {}",
+            with_marker.len()
+        );
+        assert!(with_marker.len() <= PERSISTABLE_RECORD_BYTES);
+        let value: serde_json::Value = serde_json::from_str(&with_marker).unwrap();
+        assert_eq!(value["tail_truncated"], true);
+        assert_eq!(value["bytes"].as_u64(), Some(u64::MAX));
+        assert_eq!(value["remote_code"].as_i64(), Some(i64::MIN));
+        assert_eq!(value["operation"].as_str().unwrap().len(), 192);
+        assert_eq!(value["message"].as_str().unwrap().chars().count(), 512);
+    }
+
+    #[test]
+    fn persistable_record_keeps_latest_stderr_and_is_parseable_single_line_json() {
+        let large = "\0".repeat(30000);
+        let record = persistable_failure_record(
+            &large,
+            Some(&large),
+            &large,
+            &large,
+            &large,
+            &(large.clone() + "END"),
+        );
+        assert!(record.len() <= PERSISTABLE_RECORD_BYTES);
+        assert!(!record.contains('\n'));
+        let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert!(value["stderr_tail"].as_str().unwrap().ends_with("END"));
+        assert_eq!(value["tail_truncated"], true);
+        assert_eq!(value["agent_id"].as_str().unwrap().len(), 256);
+    }
+
+    #[test]
+    fn persistable_record_marks_initial_twelve_kib_truncation() {
+        let tail = "x".repeat(16 * 1024);
+        let record = persistable_failure_record(
+            "agent",
+            None,
+            "runtime_terminal",
+            "RUNTIME_TERMINAL",
+            "short message",
+            &tail,
+        );
+        let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+        // The independent 12 KiB cap already drops the older prefix, so the
+        // marker must be set even though no second shrink was needed.
+        assert_eq!(value["stderr_tail"].as_str().unwrap().len(), 12 * 1024);
+        assert_eq!(value["tail_truncated"], true);
+        assert!(record.len() <= PERSISTABLE_RECORD_BYTES);
+    }
+
+    #[test]
+    fn persistable_record_finds_the_maximal_feasible_tail_suffix() {
+        // U+0001 escapes to six bytes, so this construction has a fixed part
+        // of exactly 3,752 bytes and can retain (16,384 - 3,752) / 6 = 2,105
+        // tail bytes. A halving search would have stopped at 1,536.
+        let agent = "1000020700";
+        let session = "\u{1}".repeat(88);
+        let message = "\u{1}".repeat(512);
+        let fixed = persistable_record_with_tail(
+            agent,
+            Some(&session),
+            "runtime_terminal",
+            "RUNTIME_TERMINAL",
+            &message,
+            "",
+            true,
+        );
+        assert_eq!(fixed.len(), 3752, "{fixed}");
+        let record = persistable_failure_record(
+            agent,
+            Some(&session),
+            "runtime_terminal",
+            "RUNTIME_TERMINAL",
+            &message,
+            &"\u{1}".repeat(3000),
+        );
+        let value: serde_json::Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(value["stderr_tail"].as_str().unwrap().len(), 2105);
+        assert_eq!(record.len(), 16382);
+        assert_eq!(value["tail_truncated"], true);
+        let one_more = persistable_record_with_tail(
+            agent,
+            Some(&session),
+            "runtime_terminal",
+            "RUNTIME_TERMINAL",
+            &message,
+            &"\u{1}".repeat(2106),
+            true,
+        );
+        assert!(one_more.len() > PERSISTABLE_RECORD_BYTES);
+    }
+
+    #[test]
+    fn bounded_error_respects_utf8_byte_limit() {        let value = bounded_error(&"界".repeat(5000));
         assert!(value.len() <= 4096);
         assert!(value.ends_with('…'));
         assert!(std::str::from_utf8(value.as_bytes()).is_ok());
@@ -1523,6 +2029,13 @@ mod legacy_row_recovery_tests {
         let settled = reopened.store().get_task("10000001").unwrap().unwrap();
         assert_eq!(settled.phase, TaskPhase::Terminal);
         assert_eq!(settled.outcome, Some(TaskOutcome::ResultInvalid));
+        let raw = settled
+            .failure_message
+            .expect("legacy recovery failure detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "recovery");
+        assert_eq!(persisted["error_code"], "PREPARED_LAUNCH_INVALID");
+        assert!(!raw.contains('\n'));
 
         // New admissions still work once the legacy row has a terminal state.
         let fresh = reopened
@@ -1951,6 +2464,15 @@ while [ ! -f release-oversize ]; do sleep 0.01; done\n\
             .is_empty());
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        // The transport closure's bounded evidence reaches tasks.failure_message.
+        let raw = task.failure_message.expect("persisted transport detail");
+        let persisted: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(persisted["stage"], "transport");
+        assert_eq!(persisted["error_code"], TRANSPORT_REASON);
+        assert!(persisted["bytes"].as_u64().is_some());
+        assert!(persisted["cap"].as_u64().is_some());
+        assert!(persisted["last_event_seq"].as_u64().is_some());
+        assert!(!raw.contains('\n'));
     }
 
     #[test]
@@ -1974,6 +2496,8 @@ while [ ! -f release-oversize ]; do sleep 0.01; done\n\
         assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         assert_eq!(task.outcome, Some(TaskOutcome::Cancelled));
+        // The cancellation precedence must clear the transport failure detail.
+        assert_eq!(task.failure_message, None);
         assert!(observe_process_group(pgid).unwrap().is_empty());
     }
 
@@ -2577,6 +3101,20 @@ mod stall_tests {
                 .unwrap()
                 .contains("Stopped"),
             "{record}"
+        );
+        // The stall closure's evidence also reaches the task row.
+        let persisted: serde_json::Value =
+            serde_json::from_str(task.failure_message.as_deref().expect("persisted stall detail"))
+                .unwrap();
+        assert_eq!(persisted["stage"], "stall");
+        assert_eq!(persisted["error_code"], STALL_REASON);
+        assert_eq!(
+            persisted["stall_timeout_ms"],
+            STALL_TIMEOUT.as_millis() as u64
+        );
+        assert!(
+            persisted["stall_elapsed_ms"].as_u64().unwrap()
+                >= STALL_TIMEOUT.as_millis() as u64
         );
     }
 

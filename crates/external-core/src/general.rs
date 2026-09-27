@@ -263,6 +263,12 @@ pub struct GeneralCompletion {
     pub summary: String,
     pub residual_gaps: Vec<String>,
     pub cleaned: bool,
+    /// Bounded, persistable failure detail owned by the producer side. It is
+    /// never part of the immutable [`TaskResult`]; the store writes it to
+    /// `tasks.failure_message` only when the finally effective outcome is a
+    /// failure. Legacy completions decode with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
 }
 
 pub struct GeneralFinalizer;
@@ -287,6 +293,7 @@ impl GeneralFinalizer {
             summary: String::new(),
             residual_gaps: Vec::new(),
             cleaned: true,
+            failure_message: None,
         }
     }
 

@@ -13,7 +13,7 @@ mod types;
 use super::*;
 
 pub use self::diagnostics::configure_diagnostic_log;
-pub(crate) use self::diagnostics::{bounded_error, bounded_prefix};
+pub(crate) use self::diagnostics::{bounded_error, bounded_prefix, persistable_failure_record};
 #[cfg(test)]
 use self::state::ResponseClaimHookStage;
 use self::state::{

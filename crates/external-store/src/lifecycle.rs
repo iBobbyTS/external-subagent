@@ -466,6 +466,15 @@ pub(crate) fn apply_terminal(
         } else {
             terminal.outcome
         };
+    // The message gate follows the finally effective outcome, not the outcome
+    // the caller proposed: a cancellation flip clears it, and Completed/
+    // TimedOut never expose failure detail.
+    let failure_message = match outcome {
+        TaskOutcome::Failed | TaskOutcome::RuntimeLost | TaskOutcome::ResultInvalid => {
+            terminal.failure_message.as_deref()
+        }
+        TaskOutcome::Completed | TaskOutcome::Cancelled | TaskOutcome::TimedOut => None,
+    };
     let now = now_millis();
     let changed = transaction.execute(
         "UPDATE tasks SET phase='TERMINAL',outcome=?1,completed_at=COALESCE(completed_at,?2),
@@ -478,7 +487,7 @@ pub(crate) fn apply_terminal(
             outcome.as_str(),
             now,
             terminal.failure_code,
-            terminal.failure_message,
+            failure_message,
             agent_id,
             u64_to_i64(owner_epoch)?,
         ],

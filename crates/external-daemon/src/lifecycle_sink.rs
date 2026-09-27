@@ -192,7 +192,13 @@ pub(crate) fn persist_general_result(
 ) -> Result<(), StoreError> {
     let result = task_result(completion);
     let _ = prepared;
-    store_result_with_cancel_precedence(store, agent_id, &result, completion.reason_code.as_deref())
+    store_result_with_cancel_precedence(
+        store,
+        agent_id,
+        &result,
+        completion.reason_code.as_deref(),
+        completion.failure_message.as_deref(),
+    )
 }
 
 pub(crate) fn store_result_with_cancel_precedence(
@@ -200,8 +206,9 @@ pub(crate) fn store_result_with_cancel_precedence(
     agent_id: &str,
     result: &TaskResult,
     reason: Option<&str>,
+    failure_message: Option<&str>,
 ) -> Result<(), StoreError> {
-    match store.store_task_result_with_reason(agent_id, result, reason) {
+    match store.store_task_result_with_reason(agent_id, result, reason, failure_message) {
         Ok(()) => Ok(()),
         Err(error @ StoreError::Conflict(_)) => {
             let task = store.get_task(agent_id)?.ok_or_else(|| {
@@ -211,9 +218,12 @@ pub(crate) fn store_result_with_cancel_precedence(
                 && result.outcome != TaskOutcome::Cancelled
                 && store.task_result(agent_id)?.is_none()
             {
+                // The cancellation fallback owns a Cancelled result; it must
+                // never inherit the suppressed failure detail.
                 store.store_task_result_with_reason(
                     agent_id,
                     &bounded_cancelled_task_result(),
+                    None,
                     None,
                 )
             } else {
@@ -283,11 +293,12 @@ pub(crate) fn bounded_result_invalid_task_result() -> TaskResult {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct UnstartedTerminal<'a> {
     pub(crate) outcome: CompletionOutcome,
     pub(crate) reason_code: &'a str,
     pub(crate) message: &'a str,
+    pub(crate) failure_message: Option<String>,
 }
 
 pub(crate) fn finalized_general(
@@ -295,6 +306,7 @@ pub(crate) fn finalized_general(
     outcome: CompletionOutcome,
     reason_code: &str,
     message: &str,
+    failure_message: Option<String>,
 ) -> GeneralCompletion {
     let mut completion = GeneralFinalizer::finalize(prepared, outcome);
     if completion.summary.trim().is_empty() {
@@ -307,6 +319,7 @@ pub(crate) fn finalized_general(
     if completion.reason_code.is_none() && outcome != CompletionOutcome::Completed {
         completion.reason_code = Some(reason_code.into());
     }
+    completion.failure_message = failure_message;
     completion
 }
 
@@ -314,6 +327,7 @@ pub(crate) fn unreaped_general(
     outcome: CompletionOutcome,
     reason_code: &str,
     message: &str,
+    failure_message: Option<String>,
 ) -> GeneralCompletion {
     GeneralCompletion {
         outcome,
@@ -325,6 +339,7 @@ pub(crate) fn unreaped_general(
         },
         residual_gaps: Vec::new(),
         cleaned: false,
+        failure_message,
     }
 }
 

@@ -615,6 +615,7 @@ impl Scheduler {
                                     || serde_json::json!({"message": bounded_error(&cause)}),
                                 );
                             detail["cleanup_result"] = format!("{terminal:?}").into();
+                            let detail = detail.to_string();
                             if let Err(finish_error) = scheduler.finish_locked_monitor_terminal(
                                 &agent_id,
                                 owner_epoch,
@@ -625,7 +626,7 @@ impl Scheduler {
                                 terminal,
                                 false,
                                 Some((CompletionOutcome::Failed, "MESSAGE_DELIVERY_FAILED".into())),
-                                None,
+                                Some(detail.clone()),
                             ) {
                                 scheduler.record_failure(&agent_id, finish_error.to_string());
                             }
@@ -634,7 +635,7 @@ impl Scheduler {
                                 Some(&session_id),
                                 "message_delivery",
                                 "SESSION_SEND_FAILED",
-                                &detail.to_string(),
+                                &detail,
                                 Some(runtime.as_ref()),
                             );
                             scheduler.release_active(&agent_id, owner_epoch);

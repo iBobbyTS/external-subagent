@@ -814,6 +814,7 @@ mod contract_default_tests {
                     partial: true,
                 },
                 Some("MODEL_REJECTED"),
+                None,
             )
             .unwrap();
         let facade = SubagentMcp::from_service(service);

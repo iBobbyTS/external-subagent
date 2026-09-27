@@ -155,6 +155,7 @@ impl Scheduler {
                                 outcome: CompletionOutcome::Cancelled,
                                 reason_code: "CANCELLED",
                                 message: "task cancelled before runtime launch",
+                                failure_message: None,
                             },
                             true,
                         );

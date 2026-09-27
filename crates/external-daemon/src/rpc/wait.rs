@@ -1510,6 +1510,7 @@ pub(crate) mod wait_tests {
                     partial: true,
                 },
                 Some("MODEL_REJECTED"),
+                None,
             )
             .unwrap();
 

@@ -10,7 +10,7 @@ use crate::tasks::query_task;
 
 impl Store {
     pub fn store_task_result(&self, agent_id: &str, result: &TaskResult) -> StoreResult<()> {
-        self.store_task_result_with_reason(agent_id, result, None)
+        self.store_task_result_with_reason(agent_id, result, None, None)
     }
 
     /// Store an immutable terminal result and thread an explicit machine
@@ -18,11 +18,19 @@ impl Store {
     /// own `failure_code`; both yield to the compatibility placeholder only
     /// when the outcome is not `Completed`, so a successful terminal row keeps
     /// a NULL reason.
+    ///
+    /// `failure_message` is the producer's bounded failure detail. It is
+    /// written to `tasks.failure_message` only when the finally effective
+    /// outcome (including the cancellation precedence flip) is one of
+    /// `FAILED`/`RUNTIME_LOST`/`RESULT_INVALID`; every other outcome stores
+    /// NULL, so a pre-planted or explicit value can never survive a
+    /// Completed/Cancelled terminal row.
     pub fn store_task_result_with_reason(
         &self,
         agent_id: &str,
         result: &TaskResult,
         reason: Option<&str>,
+        failure_message: Option<&str>,
     ) -> StoreResult<()> {
         validate_result(result)?;
         let canonical = task_result_bytes(result)?;
@@ -102,7 +110,7 @@ impl Store {
                 failure_code: reason.map(str::to_owned).or(task.failure_code).or_else(|| {
                     (result.outcome != TaskOutcome::Completed).then(|| "task failed".to_string())
                 }),
-                failure_message: task.failure_message,
+                failure_message: failure_message.map(str::to_owned),
             },
         )?;
         transaction.commit()?;

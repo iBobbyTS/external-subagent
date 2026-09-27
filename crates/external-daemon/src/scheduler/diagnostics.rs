@@ -1,6 +1,10 @@
 use super::*;
 
 impl Scheduler {
+    /// Record a bounded failure diagnostic for logs and the in-memory latest
+    /// map, and return the independent persistable representation so a
+    /// terminal fill point can hand it to the store in the same transaction
+    /// as the immutable result.
     pub(super) fn record_runtime_failure(
         &self,
         agent_id: &str,
@@ -9,13 +13,10 @@ impl Scheduler {
         error_code: &str,
         message: &str,
         runtime: Option<&dyn ManagedRuntime>,
-    ) {
+    ) -> String {
         // Callers already stopped/reaped the runtime or observed its terminal
         // boundary. Do not introduce a diagnostic wait into scheduler control.
-        let known_session = runtime.and_then(ManagedRuntime::diagnostic_session_id);
-        let tail = runtime
-            .map(ManagedRuntime::diagnostic_tail)
-            .unwrap_or_default();
+        let (known_session, tail) = runtime_diagnostic(runtime);
         let record = runtime_failure_record(
             agent_id,
             known_session.as_deref().or(session_id),
@@ -25,6 +26,37 @@ impl Scheduler {
             &tail,
         );
         self.record_failure_line(agent_id, record.clone(), &record);
+        persistable_failure_record(
+            agent_id,
+            known_session.as_deref().or(session_id),
+            stage,
+            error_code,
+            message,
+            &tail,
+        )
+    }
+
+    /// Build the persistable record without touching the log or the in-memory
+    /// latest map. Fill points that have no existing `record_runtime_failure`
+    /// call use this so persistence never invents a log side effect.
+    pub(super) fn persistable_failure_record_for(
+        &self,
+        agent_id: &str,
+        session_id: Option<&str>,
+        stage: &str,
+        error_code: &str,
+        message: &str,
+        runtime: Option<&dyn ManagedRuntime>,
+    ) -> String {
+        let (known_session, tail) = runtime_diagnostic(runtime);
+        persistable_failure_record(
+            agent_id,
+            known_session.as_deref().or(session_id),
+            stage,
+            error_code,
+            message,
+            &tail,
+        )
     }
 
     fn record_failure_line(&self, agent_id: &str, message: String, record: &str) {
@@ -48,6 +80,18 @@ impl Scheduler {
         let bounded = bounded_error(&message);
         self.record_failure_line(agent_id, message, &bounded);
     }
+}
+
+/// The runtime-owned diagnostic identity at the moment a fill point observes
+/// the failure. Callers must hold the runtime (or pass `None` when it was
+/// never built); this never fabricates a session or tail.
+fn runtime_diagnostic(runtime: Option<&dyn ManagedRuntime>) -> (Option<String>, String) {
+    (
+        runtime.and_then(ManagedRuntime::diagnostic_session_id),
+        runtime
+            .map(ManagedRuntime::diagnostic_tail)
+            .unwrap_or_default(),
+    )
 }
 
 // Every variable field is bounded before JSON escaping, whose worst-case
@@ -112,6 +156,146 @@ pub(crate) fn runtime_failure_record(
 pub(crate) fn bounded_error(message: &str) -> String {
     bounded_prefix(message, 4096)
 }
+
+/// Independent byte budgets for the persistable record. The log/memory record
+/// keeps its 192 KiB envelope with 16 KiB of `stderr_tail`; the persisted
+/// variant must fit a single 16 KiB `tasks.failure_message` value while still
+/// carrying a latest-suffix stderr tail. Escaping expands one input byte to at
+/// most six (`\u0001`), so the non-tail budget below has a hard ceiling of
+/// `2*256 + 2*128 + 512 + 3*192 = 1,856` raw bytes (11,136 escaped) and the
+/// empty-tail record is asserted below 12 KiB, leaving room for a bounded tail
+/// inside the 16 KiB total.
+pub(crate) const PERSISTABLE_RECORD_BYTES: usize = 16 * 1024;
+pub(crate) const PERSISTABLE_TAIL_BYTES: usize = 12 * 1024;
+const PERSISTABLE_ID_BYTES: usize = 256;
+const PERSISTABLE_CODE_BYTES: usize = 128;
+const PERSISTABLE_MESSAGE_BYTES: usize = 512;
+const PERSISTABLE_EVIDENCE_BYTES: usize = 192;
+
+/// Build the bounded, persistable form of `runtime_failure_record`. The
+/// returned string is always a single-line, parseable JSON object no larger
+/// than [`PERSISTABLE_RECORD_BYTES`] whose `stderr_tail` keeps the latest
+/// usable suffix. The whole serialized string is never prefix-cut.
+pub(crate) fn persistable_failure_record(
+    agent_id: &str,
+    session_id: Option<&str>,
+    stage: &str,
+    error_code: &str,
+    message: &str,
+    stderr_tail: &str,
+) -> String {
+    // The independent 12 KiB cap is a hard limit, not a global optimum: the
+    // search below only ever shrinks this already-capped window.
+    let mut window_start = stderr_tail.len().saturating_sub(PERSISTABLE_TAIL_BYTES);
+    while !stderr_tail.is_char_boundary(window_start) {
+        window_start += 1;
+    }
+    let window = &stderr_tail[window_start..];
+    let mut boundaries: Vec<usize> = window.char_indices().map(|(index, _)| index).collect();
+    boundaries.push(window.len());
+    let feasible = |index: usize| {
+        let cut = boundaries[index];
+        let truncated = window_start > 0 || cut > 0;
+        persistable_record_with_tail(
+            agent_id,
+            session_id,
+            stage,
+            error_code,
+            message,
+            &window[cut..],
+            truncated,
+        )
+        .len()
+            <= PERSISTABLE_RECORD_BYTES
+    };
+    // `boundaries[0]` is the largest suffix (the whole capped window); the
+    // last boundary is the empty suffix, which the 12 KiB empty-tail contract
+    // guarantees feasible. Encoded length is monotone in suffix size, so the
+    // smallest feasible cut is the maximal feasible suffix.
+    let chosen = if feasible(0) {
+        0
+    } else {
+        let mut lo = 0;
+        let mut hi = boundaries.len() - 1;
+        debug_assert!(feasible(hi));
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if feasible(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    };
+    let cut = boundaries[chosen];
+    persistable_record_with_tail(
+        agent_id,
+        session_id,
+        stage,
+        error_code,
+        message,
+        &window[cut..],
+        window_start > 0 || cut > 0,
+    )
+}
+
+pub(crate) fn persistable_record_with_tail(
+    agent_id: &str,
+    session_id: Option<&str>,
+    stage: &str,
+    error_code: &str,
+    message: &str,
+    stderr_tail: &str,
+    tail_truncated: bool,
+) -> String {
+    let detail = serde_json::from_str::<serde_json::Value>(message).ok();
+    let mut record = serde_json::json!({
+        "agent_id": bounded_prefix(agent_id, PERSISTABLE_ID_BYTES),
+        "session_id": session_id.map(|value| bounded_prefix(value, PERSISTABLE_ID_BYTES)),
+        "stage": bounded_prefix(stage, PERSISTABLE_CODE_BYTES),
+        "error_code": bounded_prefix(error_code, PERSISTABLE_CODE_BYTES),
+        "message": bounded_prefix(
+            detail
+                .as_ref()
+                .and_then(|value| value.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(message),
+            PERSISTABLE_MESSAGE_BYTES,
+        ),
+        "stderr_tail": stderr_tail,
+        "tail_truncated": tail_truncated,
+    });
+    if let Some(detail) = detail {
+        for field in ["operation", "remote_message", "cleanup_result"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_str) {
+                record[field] = bounded_prefix(value, PERSISTABLE_EVIDENCE_BYTES).into();
+            }
+        }
+        for field in ["bytes", "cap", "last_event_seq"] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
+        for field in [
+            "stall_elapsed_ms",
+            "stall_timeout_ms",
+            "last_progress_age_ms",
+        ] {
+            if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
+                record[field] = value.into();
+            }
+        }
+        if let Some(code) = detail
+            .get("remote_code")
+            .and_then(serde_json::Value::as_i64)
+        {
+            record["remote_code"] = code.into();
+        }
+    }
+    record.to_string()
+}
+
 
 pub(crate) fn bounded_prefix(message: &str, max_bytes: usize) -> String {
     if message.len() <= max_bytes {

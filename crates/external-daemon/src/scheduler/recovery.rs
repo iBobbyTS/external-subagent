@@ -126,7 +126,20 @@ impl Scheduler {
                 "daemon restarted while task runtime was active",
             )
         };
-        let completion = finalized_general(&prepared, outcome, reason_code, message);
+        // Recovery owns no runtime, so the record cannot claim a stderr tail;
+        // the persisted session and the recovery reason are the honest facts.
+        let failure_message = (outcome == CompletionOutcome::RuntimeLost).then(|| {
+            persistable_failure_record(
+                &task.agent_id,
+                task.session_id.as_deref(),
+                "recovery",
+                reason_code,
+                message,
+                "",
+            )
+        });
+        let completion =
+            finalized_general(&prepared, outcome, reason_code, message, failure_message);
         if !completion.cleaned {
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: task.agent_id.clone(),
@@ -155,6 +168,7 @@ impl Scheduler {
                         outcome: CompletionOutcome::Cancelled,
                         reason_code: "CANCELLED",
                         message: "task cancelled before runtime launch",
+                        failure_message: None,
                     },
                     true,
                 )?;
@@ -185,9 +199,21 @@ impl Scheduler {
                 message,
             )
         };
-        self.inner.store.store_task_result(
+        let failure_message = (outcome == CompletionOutcome::ResultInvalid).then(|| {
+            persistable_failure_record(
+                &task.agent_id,
+                task.session_id.as_deref(),
+                "recovery",
+                reason_code,
+                summary,
+                "",
+            )
+        });
+        self.inner.store.store_task_result_with_reason(
             &task.agent_id,
             &minimal_task_result(outcome, summary, reason_code),
+            None,
+            failure_message.as_deref(),
         )?;
         self.record_failure(&task.agent_id, message.to_owned());
         Ok(())
