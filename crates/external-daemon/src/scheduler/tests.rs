@@ -2231,3 +2231,642 @@ exit 0\n",
         assert_eq!(scheduler.active_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    const STALL_REASON: &str = "STALLED_NO_ACTIVITY";
+    const STALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+    /// Manual monotonic clock injected through `Scheduler::now`, so window
+    /// arithmetic in tests uses exactly the production code path.
+    struct ManualClock {
+        base: Instant,
+        offset: Mutex<Duration>,
+    }
+
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset: Mutex::new(Duration::ZERO),
+            }
+        }
+        fn now(&self) -> Instant {
+            self.base + *self.offset.lock().unwrap()
+        }
+        fn advance(&self, delta: Duration) {
+            *self.offset.lock().unwrap() += delta;
+        }
+        fn set_offset(&self, value: Duration) {
+            *self.offset.lock().unwrap() = value;
+        }
+        fn offset(&self) -> Duration {
+            *self.offset.lock().unwrap()
+        }
+    }
+
+    struct StallRuntime {
+        publisher: Arc<Publisher>,
+        tracker: Arc<TurnTracker>,
+        respond_fails: bool,
+        cleanup_calls: Arc<AtomicU64>,
+    }
+
+    impl StallRuntime {
+        fn emit(&self, event: Inbound) {
+            self.publisher.emit_driver(event, None);
+        }
+
+        fn emit_activity(&self) {
+            self.emit(Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({
+                    "method": "session/event",
+                    "params": {"type": "model.streaming"},
+                }),
+            }));
+        }
+
+        fn emit_request(&self, id: &str, method: &str) {
+            self.emit(Inbound::Message(WireMessage::Request(
+                external_contract::RequestEnvelope::new(
+                    WireId::String(id.into()),
+                    method,
+                    serde_json::json!({"question": "still working?"}),
+                ),
+            )));
+        }
+    }
+
+    impl ManagedRuntime for StallRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Stopped(StopOutcome::Terminated(ChildExit::Signaled(15)))
+        }
+        fn cleanup_for_transport_failure(&self, _: Duration) -> RuntimeTerminal {
+            self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+            RuntimeTerminal::Stopped(StopOutcome::Terminated(ChildExit::Signaled(15)))
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            self.publisher.wait_terminal(timeout)
+        }
+        fn diagnostic_session_id(&self) -> Option<String> {
+            Some("stall-session".into())
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            _task: &TaskRecord,
+            _mcp_servers: &[external_contract::StdioMcpServer],
+            _timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: "stall-session".into(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+        fn resume_session_with_mcp(
+            &self,
+            _task: &TaskRecord,
+            _mcp_servers: &[external_contract::StdioMcpServer],
+            _timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: "stall-session".into(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+        fn send_turn(
+            &self,
+            _session_id: &str,
+            _content: &str,
+            _timeout: Duration,
+        ) -> Result<Option<String>, RuntimeCommandError> {
+            Ok(None)
+        }
+        fn respond_request(
+            &self,
+            _correlation_id: &str,
+            _decision: &str,
+            _content: Option<&str>,
+            _validated_denial: Option<&external_core::ValidatedPermissionDenial>,
+            _deadline: Instant,
+        ) -> Result<(), RuntimeCommandError> {
+            if self.respond_fails {
+                Err(RuntimeCommandError::InvalidSession(
+                    "injected response failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            self.tracker.snapshot()
+        }
+    }
+
+    struct StallFactory {
+        runtimes: Arc<Mutex<Vec<Arc<StallRuntime>>>>,
+        respond_fails: bool,
+        cleanup_calls: Arc<AtomicU64>,
+    }
+
+    impl RuntimeFactory for StallFactory {
+        fn spawn(
+            &self,
+            _task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let runtime = Arc::new(StallRuntime {
+                publisher: Arc::new(Publisher::new(sink)),
+                tracker: Arc::new(TurnTracker::new()),
+                respond_fails: self.respond_fails,
+                cleanup_calls: Arc::clone(&self.cleanup_calls),
+            });
+            self.runtimes.lock().unwrap().push(Arc::clone(&runtime));
+            Ok(runtime as Arc<dyn ManagedRuntime>)
+        }
+    }
+
+    struct StallHarness {
+        _directory: tempfile::TempDir,
+        scheduler: Scheduler,
+        clock: Arc<ManualClock>,
+        runtimes: Arc<Mutex<Vec<Arc<StallRuntime>>>>,
+        cleanup_calls: Arc<AtomicU64>,
+        agent_id: String,
+    }
+
+    fn stall_harness(respond_fails: bool, admission_agent: &str) -> StallHarness {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("s02-stall-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let runtimes = Arc::new(Mutex::new(Vec::new()));
+        let cleanup_calls = Arc::new(AtomicU64::new(0));
+        let factory = Arc::new(StallFactory {
+            runtimes: Arc::clone(&runtimes),
+            respond_fails,
+            cleanup_calls: Arc::clone(&cleanup_calls),
+        });
+        let mut scheduler = Scheduler::new(
+            "stall-test",
+            store,
+            factory,
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                stop_grace: Duration::from_millis(250),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let clock = Arc::new(ManualClock::new());
+        {
+            let clock = Arc::clone(&clock);
+            scheduler.set_clock(Arc::new(move || clock.now()));
+        }
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "stall fixture".into(),
+            write_manifest: Vec::new(),
+        };
+        let submitted = if admission_agent.is_empty() {
+            scheduler.enqueue_general(&manifest).unwrap()
+        } else {
+            scheduler
+                .enqueue_general_with_admission(
+                    &manifest,
+                    Some(external_core::AdmissionIdentity {
+                        agent: admission_agent.into(),
+                        config_revision: 1,
+                        adapter_version: "test".into(),
+                        model: Some("fixture-model".into()),
+                        model_source: "catalog".into(),
+                        effort: None,
+                    }),
+                )
+                .unwrap()
+        };
+        StallHarness {
+            _directory: directory,
+            scheduler,
+            clock,
+            runtimes,
+            cleanup_calls,
+            agent_id: submitted.agent_id,
+        }
+    }
+
+    fn await_phase(scheduler: &Scheduler, agent_id: &str, phase: TaskPhase) -> TaskRecord {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+            if task.phase == phase {
+                return task;
+            }
+            assert!(Instant::now() < deadline, "task never reached {phase:?}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn await_result_within(
+        scheduler: &Scheduler,
+        agent_id: &str,
+        within: Duration,
+    ) -> external_store::StoredTaskResult {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(result) = scheduler.store().task_result(agent_id).unwrap() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "no terminal result in time");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn assert_stall_failure(
+        scheduler: &Scheduler,
+        agent_id: &str,
+        result: &external_store::StoredTaskResult,
+    ) {
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert!(result.result.partial);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(STALL_REASON)
+        );
+        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert!(task.reaped_at.is_some(), "stall cleanup must prove the reap");
+        let record: serde_json::Value =
+            serde_json::from_str(&scheduler.last_error(agent_id).unwrap()).unwrap();
+        assert_eq!(record["stage"], "stall");
+        assert_eq!(record["error_code"], STALL_REASON);
+        assert_eq!(record["stall_timeout_ms"], STALL_TIMEOUT.as_millis() as u64);
+        assert!(record["stall_elapsed_ms"].as_u64().unwrap() >= STALL_TIMEOUT.as_millis() as u64);
+        assert!(
+            record["cleanup_result"]
+                .as_str()
+                .unwrap()
+                .contains("Stopped"),
+            "{record}"
+        );
+    }
+
+    #[test]
+    fn stall_fires_at_the_threshold_and_releases_capacity() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        // Just below the threshold the task must stay RUNNING.
+        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(200));
+        assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+            TaskPhase::Running
+        );
+
+        // Exactly at the threshold the `>=` comparison fires.
+        harness.clock.advance(Duration::from_secs(1));
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 1);
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(
+            scheduler.store().task_result(agent_id).unwrap().unwrap(),
+            result
+        );
+    }
+
+    #[test]
+    fn admitted_activity_resets_the_stall_window() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(60));
+        harness.runtimes.lock().unwrap()[0].emit_activity();
+        thread::sleep(Duration::from_millis(250));
+
+        // The window restarted at the event, so the original deadline is gone.
+        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            scheduler.store().task_result(agent_id).unwrap().is_none(),
+            "activity must reset the window"
+        );
+
+        harness.clock.advance(Duration::from_secs(1));
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+    }
+
+    #[test]
+    fn waiting_for_input_pauses_and_the_last_response_restarts_the_window() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+        let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
+        runtime.emit_request("srv-1", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        runtime.emit_request("srv-2", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        await_phase(scheduler, agent_id, TaskPhase::WaitingInput);
+
+        // Waiting far past the window never triggers while input is pending.
+        harness.clock.advance(STALL_TIMEOUT + Duration::from_secs(60));
+        thread::sleep(Duration::from_millis(250));
+        assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
+
+        let requests = scheduler.store().pending_requests(agent_id).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            scheduler
+                .respond_request(agent_id, &requests[0].request_id, "answer", Some("scope"))
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        // One more pending request keeps the task waiting.
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+            TaskPhase::WaitingInput
+        );
+        harness.clock.advance(STALL_TIMEOUT + Duration::from_secs(60));
+        thread::sleep(Duration::from_millis(250));
+        assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
+
+        // The last response resumes RUNNING with a full new window.
+        assert_eq!(
+            scheduler
+                .respond_request(agent_id, &requests[1].request_id, "answer", Some("scope"))
+                .unwrap()
+                .disposition,
+            ResponseDisposition::Responded
+        );
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+        harness.clock.advance(STALL_TIMEOUT - Duration::from_secs(1));
+        thread::sleep(Duration::from_millis(200));
+        assert!(scheduler.store().task_result(agent_id).unwrap().is_none());
+        harness.clock.advance(Duration::from_secs(1));
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+    }
+
+    #[test]
+    fn runtime_response_failure_fails_closed_and_never_reports_a_stall() {
+        let harness = stall_harness(true, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+        harness.runtimes.lock().unwrap()[0]
+            .emit_request("srv-fail", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        await_phase(scheduler, agent_id, TaskPhase::WaitingInput);
+        let requests = scheduler.store().pending_requests(agent_id).unwrap();
+        assert!(
+            scheduler
+                .respond_request(agent_id, &requests[0].request_id, "answer", Some("scope"))
+                .is_err(),
+            "the injected runtime response failure must surface"
+        );
+        // A failed response never grants a new stall window: the existing
+        // fail-closed control path owns the terminal, with its own code.
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(
+            scheduler
+                .store()
+                .terminal_reason_code(agent_id)
+                .unwrap()
+                .as_deref(),
+            Some("CONTROL_RUNTIME_FAILED"),
+            "a response failure must not be reported as a stall"
+        );
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 0);
+    }
+
+    /// Pauses the monitor inside the stall closure so a test can inject a
+    /// competing event at the protected decision point.
+    struct StallBarrier {
+        ready: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl StallBarrier {
+        fn install(scheduler: &Scheduler) -> Self {
+            let ready = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let ready_hook = Arc::clone(&ready);
+            let release_hook = Arc::clone(&release);
+            scheduler.set_before_stall_cleanup_hook(Arc::new(move || {
+                ready_hook.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !release_hook.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline, "stall barrier never released");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }));
+            Self { ready, release }
+        }
+
+        fn wait_ready(&self) {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !self.ready.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "monitor never reached the stall decision");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn release(&self) {
+            self.release.store(true, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn activity_arriving_at_the_decision_point_suppresses_the_watchdog() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let barrier = StallBarrier::install(scheduler);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        barrier.wait_ready();
+        harness.runtimes.lock().unwrap()[0].emit_activity();
+        barrier.release();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            scheduler.store().task_result(agent_id).unwrap().is_none(),
+            "activity at the decision point must suppress the stall"
+        );
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+            TaskPhase::Running
+        );
+
+        // The suppressed decision restarted the window; the task still fails
+        // once the new window elapses.
+        harness.clock.advance(STALL_TIMEOUT);
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+    }
+
+    #[test]
+    fn pending_input_arriving_at_the_decision_point_suppresses_the_watchdog() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let barrier = StallBarrier::install(scheduler);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        barrier.wait_ready();
+        harness.runtimes.lock().unwrap()[0]
+            .emit_request("srv-late", external_contract::INTERACTION_REQUEST_USER_INPUT);
+        barrier.release();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            scheduler.store().task_result(agent_id).unwrap().is_none(),
+            "pending input at the decision point must suppress the stall"
+        );
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+            TaskPhase::WaitingInput
+        );
+        // Resolving the request restores RUNNING and a full window.
+        let requests = scheduler.store().pending_requests(agent_id).unwrap();
+        scheduler
+            .respond_request(agent_id, &requests[0].request_id, "answer", Some("scope"))
+            .unwrap();
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+        harness.clock.advance(STALL_TIMEOUT);
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+    }
+
+    #[test]
+    fn published_normal_terminal_outranks_the_stall_decision() {
+        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let barrier = StallBarrier::install(scheduler);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        barrier.wait_ready();
+        harness.runtimes.lock().unwrap()[0]
+            .publisher
+            .publish_terminal(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
+                ChildExit::Exited(Some(0)),
+            )));
+        barrier.release();
+        let _result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_ne!(
+            scheduler
+                .store()
+                .terminal_reason_code(agent_id)
+                .unwrap()
+                .as_deref(),
+            Some(STALL_REASON),
+            "a normal terminal must win over the stall closure"
+        );
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn committed_cancellation_wins_over_the_stall_decision() {        let harness = stall_harness(false, "");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        let barrier = StallBarrier::install(scheduler);
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        await_phase(scheduler, agent_id, TaskPhase::Running);
+
+        harness.clock.advance(STALL_TIMEOUT);
+        barrier.wait_ready();
+        let canceller = {
+            let scheduler = scheduler.clone();
+            let agent_id = agent_id.clone();
+            thread::spawn(move || scheduler.cancel_task(&agent_id))
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if scheduler.store().get_task(agent_id).unwrap().unwrap().phase
+                == TaskPhase::Cancelling
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "cancellation never committed");
+            thread::sleep(Duration::from_millis(5));
+        }
+        barrier.release();
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
+        assert_eq!(result.result.outcome, TaskOutcome::Cancelled);
+        assert_eq!(
+            scheduler.store().get_task(agent_id).unwrap().unwrap().outcome,
+            Some(TaskOutcome::Cancelled)
+        );
+        canceller.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn reclaim_starts_a_fresh_stall_window_for_the_new_epoch() {
+        let harness = stall_harness(false, "codex");
+        let scheduler = &harness.scheduler;
+        let agent_id = &harness.agent_id;
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let first = await_phase(scheduler, agent_id, TaskPhase::Running);
+        harness.clock.advance(STALL_TIMEOUT);
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+
+        // A queued follow-up requeues the terminal Codex task and a new claim
+        // builds a fresh lifecycle with a fresh baseline.
+        assert_eq!(
+            scheduler
+                .queue_message(agent_id, "resume-msg", "continue the task")
+                .unwrap(),
+            MessageDisposition::Queued
+        );
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let second = await_phase(scheduler, agent_id, TaskPhase::Running);
+        assert!(second.owner_epoch > first.owner_epoch);
+
+        let claim_offset = harness.clock.offset();
+        harness.clock.set_offset(claim_offset + STALL_TIMEOUT - Duration::from_secs(60));
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            scheduler.store().task_result(agent_id).unwrap().is_none(),
+            "the re-claimed epoch gets its own full window"
+        );
+        harness.clock.set_offset(claim_offset + STALL_TIMEOUT);
+        let result = await_result_within(scheduler, agent_id, Duration::from_secs(5));
+        assert_stall_failure(scheduler, agent_id, &result);
+        assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 2);
+    }
+}
