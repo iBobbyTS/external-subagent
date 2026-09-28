@@ -51,6 +51,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         configure_codex_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
+    // The daemon is the authority for the derived zcode data root. The
+    // production LaunchAgent passes `--database` as a program argument and never
+    // sets EXTERNAL_SUBAGENT_STORE, so export the resolved absolute path here
+    // (not a possibly-conflicting inherited value) for both provider
+    // injection sites (`data_root_from_environment`).
+    env::set_var("EXTERNAL_SUBAGENT_STORE", &config.database);
     wait_for_startup_test_gate(&shutdown_requested)?;
     if shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
