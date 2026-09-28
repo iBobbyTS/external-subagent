@@ -363,7 +363,11 @@ impl AgentProbeBackend for ProcessProbeBackend {
 
     fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
         if input.agent == "zcode" {
-            return probe_zcode_models(self.runtime_source.as_deref(), input);
+            return probe_zcode_models(
+                self.runtime_source.as_deref(),
+                self.verifier_deadline,
+                input,
+            );
         }
         if input.agent == "codex" {
             // The Codex catalog was observed only through the controlled live
@@ -506,14 +510,19 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
 /// Read the ZCode model directory from the session/create
 /// `settings.model.available` catalog without sending a prompt.
 ///
-/// The probe reuses the read-only hi probe's command shape — the daemon policy
-/// environment, the app-server transport, and the S01 provider environment —
-/// but stops after create: `available` is a create-time fact that shrinks to
-/// the selected model after `session/setModel`, so it must never be re-read as
-/// the full directory. Only entries carrying both providerId and modelId
-/// project; the credentials stay in the shared 0600 provider file and never
-/// reach the output, evidence, or logs.
-fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
+/// The probe reuses the read-only hi probe's command shape — the scope policy
+/// verifier, the daemon policy environment, the app-server transport, and the
+/// S01 provider environment — but stops after create: `available` is a
+/// create-time fact that shrinks to the selected model after
+/// `session/setModel`, so it must never be re-read as the full directory. Only
+/// entries carrying both providerId and modelId project; the credentials stay
+/// in the shared 0600 provider file and never reach the output, evidence, or
+/// logs.
+fn probe_zcode_models(
+    executable: Option<&Path>,
+    verifier_deadline: Option<Duration>,
+    input: &AgentModelsInput,
+) -> AgentModelsOutput {
     let checked_at_ms = wall_now_millis();
     let mut scope = input.scope.clone();
     if scope.home.is_none() {
@@ -556,6 +565,16 @@ fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> Ag
     };
     if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
         return zcode_models_degraded(input, evidence, "workspace_missing");
+    }
+    // The models probe holds the same read-only policy pre-flight as the hi
+    // probe: a scope the hi probe would refuse must not get a session created
+    // on the models path either. The verifier runs before any app-server spawn.
+    if !verified_read_only_policy(
+        &scope,
+        workspace,
+        verifier_deadline.unwrap_or(LOCAL_PROBE_TIMEOUT),
+    ) {
+        return zcode_models_degraded(input, evidence, "policy_unverified");
     }
     let executable = executable.expect("ready local evidence has a runtime path");
     let mut command = runtime_command(executable, false);
@@ -2963,6 +2982,20 @@ process.stdin.on('data', (chunk) => {
         fs::write(executable, source).unwrap();
     }
 
+    /// Install the scope policy verifier the read-only probes require under the
+    /// scope home, so the models probe can reach `session/create`.
+    fn install_policy_verifier(directory: &Path) {
+        let verifier = directory.join(
+            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
+        );
+        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
+        fs::write(&verifier, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
     #[test]
     fn zcode_catalog_projects_create_settings_available_without_a_prompt() {
         let directory = tempfile::tempdir().unwrap();
@@ -2979,6 +3012,7 @@ process.stdin.on('data', (chunk) => {
             {"ref": {"providerId": "zai"}}
         ]);
         fake_models_runtime(&runtime, &log, &catalog, false);
+        install_policy_verifier(directory.path());
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
@@ -2987,7 +3021,7 @@ process.stdin.on('data', (chunk) => {
         };
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: None,
+            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -3031,9 +3065,10 @@ process.stdin.on('data', (chunk) => {
         let runtime = directory.path().join("zcode-models.mjs");
         let log = directory.path().join("models.jsonl");
         fake_models_runtime(&runtime, &log, &serde_json::json!([]), true);
+        install_policy_verifier(directory.path());
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: None,
+            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -3048,6 +3083,37 @@ process.stdin.on('data', (chunk) => {
         assert!(output.models.is_empty());
         assert_eq!(output.reason.as_deref(), Some("create_failed"));
         assert_eq!(output.evidence.source, "zcode_session_create_settings");
+    }
+
+    #[test]
+    fn zcode_catalog_refuses_session_creation_without_scope_policy_verifier() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("zcode-models.mjs");
+        let log = directory.path().join("models.jsonl");
+        fake_models_runtime(&runtime, &log, &serde_json::json!([]), false);
+        // No verifier under the scope home: the models probe must hold the hi
+        // probe's read-only policy gate and degrade before spawning anything.
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+            verifier_deadline: Some(Duration::from_secs(30)),
+        };
+        let output = backend.models(&AgentModelsInput {
+            agent: "zcode".into(),
+            scope: ProbeScope {
+                workspace: Some(directory.path().to_string_lossy().into_owned()),
+                home: Some(directory.path().to_string_lossy().into_owned()),
+                profile: None,
+                version: None,
+            },
+        });
+        assert!(!output.supported);
+        assert!(output.models.is_empty());
+        assert_eq!(output.reason.as_deref(), Some("policy_unverified"));
+        assert_eq!(output.evidence.source, "zcode_session_create_settings");
+        assert!(
+            !log.exists(),
+            "the app-server must not be spawned when the policy is unverified"
+        );
     }
 
     #[test]
