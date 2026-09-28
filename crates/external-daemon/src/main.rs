@@ -3,6 +3,7 @@ use external_daemon::{
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
     rpc::{parse_subagent_config, ServerOptions},
+    zcode::{apply_provider_environment, data_root_from_environment},
     CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 use external_store::Store;
@@ -56,8 +57,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
+    let data_root = data_root_from_environment();
     let zcode = CommandRuntimeFactory::new_prepared(move |_task: &external_store::TaskRecord| {
-        runtime_command(runtime.as_deref())
+        let mut command = runtime_command(runtime.as_deref())?;
+        if let (Some(runtime), Some(data_root)) = (runtime.as_deref(), data_root.as_deref()) {
+            apply_provider_environment(&mut command, runtime, data_root);
+        }
+        Ok(command)
     });
     let dsh_factory = if dsh_production_enabled(config.agent_config.as_deref()) {
         DshRuntimeFactory::enabled()

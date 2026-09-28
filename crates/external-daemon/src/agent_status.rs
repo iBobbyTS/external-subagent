@@ -1221,6 +1221,9 @@ fn probe_zcode_hi(
         .env("ZCODE_AGENT_WORKSPACE_ROOT", workspace)
         .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
         .env("ZCODE_AGENT_WRITE_MANIFEST", "[]");
+    if let Some(data_root) = crate::zcode::data_root_from_environment() {
+        crate::zcode::apply_provider_environment(&mut command, executable, &data_root);
+    }
     let driver = match Driver::spawn(command) {
         Ok(driver) => Arc::new(driver),
         Err(_) => {
