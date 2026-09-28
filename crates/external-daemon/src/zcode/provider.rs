@@ -90,14 +90,87 @@ pub(crate) fn derive_builtin_provider_config(runtime_path: &Path) -> Option<Path
         .find(|candidate| candidate.is_file())
 }
 
+/// Structurally validated v2 inputs. Absent keys keep their faithful defaults;
+/// a present key with the wrong type is refused (see [`parse_v2_layer`]).
+struct V2Layer {
+    provider_rules: Vec<Value>,
+    model_config_rules: Option<Value>,
+    provider_order: Option<Vec<String>>,
+}
+
+/// Validate the exact v2 keys this generator reads and return their owned
+/// values. A genuinely absent file or key is a faithful default; a present key
+/// with the wrong structure refuses generation, so a structurally malformed
+/// user config can never be silently misrepresented as the authoritative layer
+/// (which would let the generated file mask the child's own v2 resolution).
+/// Subtrees copied verbatim (rule entries, `modelConfigRules`) are not
+/// inspected internally: their entries remain the child's business.
+fn parse_v2_layer(path: &Path, v2: Option<&Value>) -> io::Result<V2Layer> {
+    let unusable = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("zcode v2 provider config {path:?} is unusable: {reason}"),
+        )
+    };
+    let mut layer = V2Layer {
+        provider_rules: Vec::new(),
+        model_config_rules: None,
+        provider_order: None,
+    };
+    let Some(value) = v2 else {
+        return Ok(layer);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| unusable("top level is not an object"))?;
+    let Some(config) = object.get("config") else {
+        return Ok(layer);
+    };
+    let config = config
+        .as_object()
+        .ok_or_else(|| unusable("\"config\" is not an object"))?;
+
+    if let Some(provider_config_rules) = config.get("providerConfigRules") {
+        let rules_object = provider_config_rules
+            .as_object()
+            .ok_or_else(|| unusable("\"config.providerConfigRules\" is not an object"))?;
+        if let Some(provider_rules) = rules_object.get("providerRules") {
+            layer.provider_rules = provider_rules.as_array().cloned().ok_or_else(|| {
+                unusable("\"config.providerConfigRules.providerRules\" is not an array")
+            })?;
+        }
+    }
+    if let Some(model_config_rules) = config.get("modelConfigRules") {
+        if !model_config_rules.is_object() {
+            return Err(unusable("\"config.modelConfigRules\" is not an object"));
+        }
+        layer.model_config_rules = Some(model_config_rules.clone());
+    }
+    if let Some(provider_order) = config.get("providerOrder") {
+        let entries = provider_order
+            .as_array()
+            .ok_or_else(|| unusable("\"config.providerOrder\" is not an array"))?;
+        let mut order = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let id = entry
+                .as_str()
+                .ok_or_else(|| unusable("\"config.providerOrder\" contains a non-string entry"))?;
+            order.push(id.to_owned());
+        }
+        layer.provider_order = Some(order);
+    }
+    Ok(layer)
+}
+
 /// Compose the daemon-owned personal provider file and write it 0600 (atomically)
 /// into `output_dir`, returning the written path. Idempotent: regenerating from
 /// the same inputs yields the same bytes.
 ///
-/// Degradation is intentional and non-fatal for missing user inputs: an
-/// unreadable CLI config or an absent zai key simply omits the zai rule, and an
-/// unreadable v2 config omits the v2 layer. Only a malformed/unreadable builtin
-/// template or a bound violation refuses generation; no partial file is ever
+/// Degradation is intentional and non-fatal for genuinely missing user inputs:
+/// an absent/unusable CLI config or an absent zai key omits the zai rule, and
+/// an absent v2 file omits the v2 layer. A v2 file that is present but
+/// unreadable, unparsable or structurally malformed refuses generation, as does
+/// an unreadable builtin template or a bound violation; no partial file is ever
 /// written.
 pub fn generate_personal_provider_config(
     cli_config: &Path,
@@ -147,13 +220,8 @@ pub fn generate_personal_provider_config(
         }
     };
 
-    let mut rules = v2
-        .as_ref()
-        .and_then(|value| value.get("config"))
-        .and_then(|config| config.pointer("/providerConfigRules/providerRules"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let layer = parse_v2_layer(v2_config, v2.as_ref())?;
+    let mut rules = layer.provider_rules;
     if rules.len() > MAX_PROVIDER_RULES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -162,12 +230,11 @@ pub fn generate_personal_provider_config(
     }
 
     // A user-defined zai rule is authoritative: never synthesize a second one
-    // (and never overwrite the user's credential) and never re-append "zai" to
-    // the provider order.
+    // and never overwrite the user's credential.
     let user_defined_zai = rules
         .iter()
         .any(|rule| rule.get("providerId").and_then(Value::as_str) == Some(ZAI_PROVIDER_ID));
-    let mut zai_added = false;
+    let mut zai_synthesized = false;
     if user_defined_zai {
         eprintln!(
             "external-subagent: personal provider config already defines a zai rule; \
@@ -181,32 +248,22 @@ pub fn generate_personal_provider_config(
                 .unwrap_or(&[]),
         );
         rules.push(zai_rule(&api_key, model_order));
-        zai_added = true;
+        zai_synthesized = true;
     }
+    let zai_present = user_defined_zai || zai_synthesized;
 
     // providerOrder authority is the user's v2 list verbatim; without one the
-    // rule appearance order is used. "zai" is appended only when it is absent
-    // (it is already part of the fallback order once the rule was added).
-    let mut provider_order = v2
-        .as_ref()
-        .and_then(|value| value.get("config"))
-        .and_then(|config| config.get("providerOrder"))
-        .and_then(Value::as_array)
-        .map(|order| {
-            order
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| {
-            rules
-                .iter()
-                .filter_map(|rule| rule.get("providerId").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect()
-        });
-    if zai_added && !provider_order.iter().any(|id| id == ZAI_PROVIDER_ID) {
+    // rule appearance order is used. "zai" is appended whenever a zai rule is
+    // present in the final rules (user-defined or synthesized) and the order
+    // omits it, so the rule can materialize either way.
+    let mut provider_order = layer.provider_order.unwrap_or_else(|| {
+        rules
+            .iter()
+            .filter_map(|rule| rule.get("providerId").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    });
+    if zai_present && !provider_order.iter().any(|id| id == ZAI_PROVIDER_ID) {
         provider_order.push(ZAI_PROVIDER_ID.to_owned());
     }
 
@@ -215,12 +272,7 @@ pub fn generate_personal_provider_config(
         "providerConfigRules".into(),
         json!({ "providerRules": rules }),
     );
-    if let Some(model_config_rules) = v2
-        .as_ref()
-        .and_then(|value| value.get("config"))
-        .and_then(|config| config.get("modelConfigRules"))
-        .cloned()
-    {
+    if let Some(model_config_rules) = layer.model_config_rules {
         config.insert("modelConfigRules".into(), model_config_rules);
     }
     config.insert("providerOrder".into(), json!(provider_order));

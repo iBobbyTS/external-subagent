@@ -511,3 +511,107 @@ fn an_absent_v2_config_still_injects_the_environment_group() {
     .unwrap();
     assert_eq!(generated["config"]["providerOrder"], json!(["zai"]));
 }
+
+/// A structurally malformed v2 file must refuse generation so the whole group
+/// degrades instead of masking the real registry with a defaulted layer.
+fn assert_malformed_v2_degrades(v2: &Value) {
+    let directory = tempfile::tempdir().unwrap();
+    let cli = directory.path().join("cli.json");
+    let v2_path = directory.path().join("v2.json");
+    let builtin = directory.path().join("builtin.json");
+    let output = directory.path().join("out");
+    write_json(&cli, &cli_config(Some(ZAI_KEY)));
+    write_json(&builtin, &builtin_config());
+    write_json(&v2_path, v2);
+
+    let error = generate_personal_provider_config(&cli, &v2_path, &builtin, &output).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("v2.json"),
+        "diagnostic must name the malformed path: {message}"
+    );
+    assert!(!message.contains(ZAI_KEY));
+
+    let data_root = directory.path().join("data");
+    let mut command = Command::new("zcode-fixture");
+    let error =
+        apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2_path)
+            .unwrap_err();
+    assert!(!error.to_string().contains(ZAI_KEY));
+    assert_eq!(command.get_envs().count(), 0);
+    assert!(!data_root.join("zcode-runtime").exists());
+}
+
+// A1: providerRules present but not an array is refused.
+#[test]
+fn a_non_array_provider_rules_degrades_the_environment_group() {
+    assert_malformed_v2_degrades(&json!({
+        "config": {"providerConfigRules": {"providerRules": "invalid"}}
+    }));
+}
+
+// A2: modelConfigRules present but not an object is refused (its disable rules
+// must never be silently dropped).
+#[test]
+fn a_non_object_model_config_rules_degrades_the_environment_group() {
+    assert_malformed_v2_degrades(&json!({"config": {"modelConfigRules": "invalid"}}));
+}
+
+// A3: a providerOrder containing a non-string entry is refused.
+#[test]
+fn a_non_string_provider_order_entry_degrades_the_environment_group() {
+    assert_malformed_v2_degrades(&json!({
+        "config": {"providerOrder": ["deepseek", 7]}
+    }));
+}
+
+// B1: a user-defined zai rule whose providerOrder omits "zai" still gets "zai"
+// appended, and the group is injected.
+#[test]
+fn a_user_defined_zai_rule_missing_from_provider_order_is_appended() {
+    let directory = tempfile::tempdir().unwrap();
+    let cli = directory.path().join("cli.json");
+    let v2 = directory.path().join("v2.json");
+    let builtin = directory.path().join("builtin.json");
+    write_json(&cli, &cli_config(Some(ZAI_KEY)));
+    let user_zai = json!({
+        "providerId": "zai",
+        "templateId": "zai-api",
+        "providerName": "User Zai",
+        "config": {"access": {"type": "zhipu-coding-plan-api-key", "apiKey": "user-owned-key"}}
+    });
+    write_json(
+        &v2,
+        &v2_config(
+            json!([user_zai, deepseek_rule()]),
+            json!(["deepseek"]),
+            json!({}),
+        ),
+    );
+    write_json(&builtin, &builtin_config());
+    let data_root = directory.path().join("data");
+
+    let mut command = Command::new("zcode-fixture");
+    apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2).unwrap();
+    assert!(env_of(&command, PERSONAL_PROVIDER_CONFIG_ENV).is_some());
+    assert!(env_of(&command, DATA_BASE_DIR_ENV).is_some());
+
+    let generated: Value = serde_json::from_slice(
+        &fs::read(data_root.join("zcode-runtime/personal-provider-config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        generated["config"]["providerOrder"],
+        json!(["deepseek", "zai"])
+    );
+    let rules = generated["config"]["providerConfigRules"]["providerRules"]
+        .as_array()
+        .unwrap();
+    assert_eq!(rules.len(), 2);
+    let zai = rules
+        .iter()
+        .find(|rule| rule["providerId"] == json!("zai"))
+        .unwrap();
+    assert_eq!(zai["providerName"], json!("User Zai"));
+    assert_eq!(zai["config"]["access"]["apiKey"], json!("user-owned-key"));
+}
