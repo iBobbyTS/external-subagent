@@ -295,6 +295,15 @@ impl Scheduler {
         };
         {
             let mut state = self.inner.state.lock().unwrap();
+            // The wait text stream is per-task, not per-claim: a follow-up or
+            // resume replaces the tracker, so the incoming one must inherit the
+            // old window and byte cursors. Both the read of the old tracker and
+            // the map replacement happen under this one state lock, so a wait
+            // cannot advance the old cursor between them and be re-delivered by
+            // the new tracker.
+            if let Some(previous) = state.activities.get(&claim.task.agent_id).cloned() {
+                activity.inherit_wait_text(&previous);
+            }
             state
                 .activities
                 .insert(claim.task.agent_id.clone(), Arc::clone(&activity));

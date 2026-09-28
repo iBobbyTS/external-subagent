@@ -525,6 +525,17 @@ impl Scheduler {
             .map(|activity| activity.snapshot())
     }
 
+    /// Take-on-delivery wait text for a task. The state guard is held across
+    /// the tracker call (lock order state -> tracker) so the delivery cursor
+    /// advance is serialized with tracker replacement in `start_claim`.
+    pub(crate) fn take_wait_tail(&self, agent_id: &str) -> Option<WaitTail> {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .activities
+            .get(agent_id)
+            .map(|activity| activity.take_wait_tail())
+    }
+
     pub(crate) fn observation_snapshot(
         &self,
         agent_id: &str,

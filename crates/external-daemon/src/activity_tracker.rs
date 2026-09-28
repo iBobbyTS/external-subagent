@@ -12,6 +12,12 @@ struct PassiveActivityState {
     latest_text_tail: String,
     latest_text_updated_at: Option<u64>,
     latest_text_truncated: bool,
+    /// Monotonic total UTF-8 bytes ever appended to the wait text window. Only
+    /// `append_latest_text` advances it; draining the window never reduces it.
+    appended_bytes: u64,
+    /// Bytes of the wait text stream already delivered by take-on-delivery.
+    /// Advanced only by `take_wait_tail`; always `<= appended_bytes`.
+    delivered_bytes: u64,
     terminal_text: String,
     /// The current turn's terminal text was set by a boundary carrying the
     /// turn's verified final text; later streaming echoes must not pollute it.
@@ -289,6 +295,87 @@ impl PassiveActivityTracker {
         }
     }
 
+    /// Take-on-delivery projection of the wait text window: return only the
+    /// bytes appended since the previous take (from any caller) and advance the
+    /// delivery cursor to the current append point in the same lock. A caller
+    /// that fell behind the rolling window (its undelivered bytes were
+    /// drained) degrades to the whole current window with `truncated = true`;
+    /// the normal path returns the unseen suffix and `truncated = false`, and
+    /// an empty suffix when nothing new arrived.
+    pub(crate) fn take_wait_tail(&self) -> WaitTail {
+        let mut state = self.state.lock().unwrap();
+        let appended = state.appended_bytes;
+        let window_len = state.latest_text_tail.len() as u64;
+        debug_assert!(appended >= window_len);
+        let window_start = appended.saturating_sub(window_len);
+        let delivered = state.delivered_bytes;
+        let (text, truncated) = if delivered < window_start {
+            // Undelivered bytes rolled out of the window: the only honest
+            // answer is the whole window, flagged as a gap.
+            (state.latest_text_tail.clone(), true)
+        } else {
+            let start = (delivered - window_start) as usize;
+            debug_assert!(state.latest_text_tail.is_char_boundary(start));
+            (state.latest_text_tail[start..].to_owned(), false)
+        };
+        state.delivered_bytes = appended;
+        WaitTail { text, truncated }
+    }
+
+    /// Carry the wait text stream across a tracker replacement (a follow-up or
+    /// resume claim). The incoming tracker may already have collected text
+    /// (the runtime sink is wired before the claim reaches the map swap), so
+    /// this is a MERGE, not an overwrite: the old window is the stream's tail
+    /// before the new tracker's bytes, and the merged window is their
+    /// concatenation trimmed from the head to the 8 KiB cap on a char boundary.
+    /// When both pre-merge windows are within the cap this is exactly the bytes
+    /// the full appended stream's last window would hold; once the incoming
+    /// tracker has already rolled its own window the concatenation is no
+    /// longer a literal contiguous suffix (a window of a window), and the next
+    /// take safely degrades to the whole merged window with `truncated = true`.
+    /// Cursors merge as `appended = old + new`, `delivered = old` (the new
+    /// tracker cannot have delivered: takes need the state lock this
+    /// replacement holds). The per-turn terminal text and the sticky window
+    /// truncation flag are deliberately NOT inherited. Locks are taken in the
+    /// fixed order old-read then new-write, never held together.
+    pub(crate) fn inherit_wait_text(&self, old: &PassiveActivityTracker) {
+        let (old_tail, old_appended, old_delivered, old_updated) = {
+            let old_state = old.state.lock().unwrap();
+            (
+                old_state.latest_text_tail.clone(),
+                old_state.appended_bytes,
+                old_state.delivered_bytes,
+                old_state.latest_text_updated_at,
+            )
+        };
+        let mut state = self.state.lock().unwrap();
+        debug_assert_eq!(
+            state.delivered_bytes, 0,
+            "the incoming tracker cannot have delivered before the map swap"
+        );
+        let new_appended = state.appended_bytes;
+        let new_updated = state.latest_text_updated_at;
+        let mut merged = old_tail;
+        merged.push_str(&state.latest_text_tail);
+        if merged.len() > MAX_LATEST_TEXT_BYTES {
+            let mut split = merged.len() - MAX_LATEST_TEXT_BYTES;
+            while !merged.is_char_boundary(split) {
+                split += 1;
+            }
+            merged.drain(..split);
+        }
+        state.latest_text_tail = merged;
+        state.appended_bytes = old_appended.saturating_add(new_appended);
+        state.delivered_bytes = old_delivered;
+        state.latest_text_updated_at = match (old_updated, new_updated) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        debug_assert!(state.appended_bytes >= state.latest_text_tail.len() as u64);
+    }
+
     pub(crate) fn observation_snapshot(&self) -> observation::ObservationSnapshot {
         self.state.lock().unwrap().observation.snapshot()
     }
@@ -311,6 +398,8 @@ impl PassiveActivityTracker {
         let mut state = self.state.lock().unwrap();
         state.revision = 900;
         state.latest_text_tail = "ordinary text".into();
+        state.appended_bytes = state.latest_text_tail.len() as u64;
+        state.delivered_bytes = 0;
         state.last_model_delta_at = Some(now);
         state
             .active_tools
@@ -330,7 +419,12 @@ impl PassiveActivityTracker {
 
     #[cfg(test)]
     pub(crate) fn set_wait_tail_fixture(&self, tail: &str) {
-        self.state.lock().unwrap().latest_text_tail = tail.into();
+        let mut state = self.state.lock().unwrap();
+        state.latest_text_tail = tail.into();
+        // The fixture injects a window directly, bypassing append: keep the
+        // counters consistent so the first take returns the whole window.
+        state.appended_bytes = state.latest_text_tail.len() as u64;
+        state.delivered_bytes = 0;
     }
 }
 
@@ -338,6 +432,14 @@ impl PassiveActivityTracker {
 pub(crate) enum TerminalText {
     Visible(String),
     Missing,
+}
+
+/// One take-on-delivery wait projection: the newly delivered `text` plus
+/// whether the caller had fallen behind the rolling window (`truncated`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WaitTail {
+    pub text: String,
+    pub truncated: bool,
 }
 
 fn duration_millis(value: Duration) -> u64 {
@@ -357,6 +459,7 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
     if !state.terminal_text_settled {
         state.terminal_text.push_str(delta);
     }
+    state.appended_bytes = state.appended_bytes.saturating_add(delta.len() as u64);
     state.latest_text_tail.push_str(delta);
     if state.latest_text_tail.len() > MAX_LATEST_TEXT_BYTES {
         let mut split = state.latest_text_tail.len() - MAX_LATEST_TEXT_BYTES;
@@ -519,5 +622,277 @@ mod tests {
         let unverified = PassiveActivityTracker::new(false);
         unverified.confirm_runtime_source(true);
         assert!(!unverified.runtime_source_verified());
+    }
+
+    fn append_delta(tracker: &PassiveActivityTracker, delta: &str) {
+        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            external_contract::EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type": "model.streaming",
+                    "eventId": format!("delta-{delta}"),
+                    "payload": {
+                        "kind": "text_delta",
+                        "delta": delta,
+                        "assistantMessageId": "m1"
+                    }
+                }),
+            },
+        ))));
+    }
+
+    #[test]
+    fn inherit_wait_text_merges_text_appended_before_the_swap() {
+        // Old window "AB" with "A" delivered; the incoming tracker already
+        // collected "N" from the runtime sink before the map swap.
+        let old = PassiveActivityTracker::new(false);
+        append_delta(&old, "A");
+        assert_eq!(old.take_wait_tail().text, "A");
+        append_delta(&old, "B");
+        let new = PassiveActivityTracker::new(false);
+        append_delta(&new, "N");
+
+        new.inherit_wait_text(&old);
+        assert_eq!(
+            new.take_wait_tail(),
+            WaitTail {
+                text: "BN".into(),
+                truncated: false
+            },
+            "old undelivered text plus the pre-swap append, in stream order"
+        );
+    }
+
+    #[test]
+    fn inherit_wait_text_trims_the_merged_window_to_the_cap() {
+        let old = PassiveActivityTracker::new(false);
+        // 3000 * 3 = 9000 bytes; append drains to the largest char-aligned
+        // suffix <= 8192, i.e. 810 bytes are dropped, leaving 2730 "界" (8190).
+        append_delta(&old, &"界".repeat(3000));
+        let new = PassiveActivityTracker::new(false);
+        append_delta(&new, "尾");
+
+        new.inherit_wait_text(&old);
+        // merged = 2730 "界" + "尾" = 8193 bytes; the head is trimmed to the
+        // next char boundary (3 bytes = one "界"), leaving 2729 "界" + "尾"
+        // (8190 bytes). appended = 9000 + 3 = 9003, delivered = 0, so
+        // window_start = 813 > delivered: the take degrades to the whole
+        // window with a truncation flag.
+        assert_eq!(
+            new.take_wait_tail(),
+            WaitTail {
+                text: format!("{}尾", "界".repeat(2729)),
+                truncated: true
+            },
+            "exactly the last 8190 bytes of the merged stream, no over-trimming"
+        );
+    }
+
+    #[test]
+    fn take_wait_tail_delivers_only_the_new_suffix() {
+        let tracker = PassiveActivityTracker::new(false);
+        append_delta(&tracker, "hello");
+        assert_eq!(
+            tracker.take_wait_tail(),
+            WaitTail {
+                text: "hello".into(),
+                truncated: false
+            }
+        );
+        // The second take returns only the appended suffix, with no overlap.
+        append_delta(&tracker, " world");
+        let second = tracker.take_wait_tail();
+        assert_eq!(second.text, " world");
+        assert!(!second.text.starts_with("hello"));
+        assert!(!second.truncated);
+        // Nothing appended: empty suffix, not truncated.
+        assert_eq!(
+            tracker.take_wait_tail(),
+            WaitTail {
+                text: String::new(),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn take_wait_tail_rolls_the_window_with_per_call_truncation() {
+        // (a) A caller that falls behind the rolling window gets the whole
+        // window plus a truncation flag, and the cursor catches up.
+        let tracker = PassiveActivityTracker::new(false);
+        append_delta(&tracker, "中");
+        let first = tracker.take_wait_tail();
+        assert_eq!(first.text, "中");
+        assert!(!first.truncated);
+        append_delta(&tracker, &"🙂中".repeat(3000));
+        let degraded = tracker.take_wait_tail();
+        assert!(degraded.truncated);
+        assert!(
+            degraded.text.len() <= MAX_LATEST_TEXT_BYTES
+                && degraded.text.len() > MAX_LATEST_TEXT_BYTES - 4,
+            "degraded window stays at the 8 KiB cap on a char boundary: {}",
+            degraded.text.len()
+        );
+        // (c) A degraded take followed by no new bytes is empty and false.
+        assert_eq!(
+            tracker.take_wait_tail(),
+            WaitTail {
+                text: String::new(),
+                truncated: false
+            }
+        );
+
+        // (b) Delivered up to the full window, then roll it and append a small
+        // multibyte delta: only the delta, no truncation.
+        let tracker = PassiveActivityTracker::new(false);
+        append_delta(&tracker, &"x".repeat(MAX_LATEST_TEXT_BYTES));
+        let full = tracker.take_wait_tail();
+        assert_eq!(full.text.len(), MAX_LATEST_TEXT_BYTES);
+        assert!(!full.truncated);
+        append_delta(&tracker, "中🙂");
+        assert_eq!(
+            tracker.take_wait_tail(),
+            WaitTail {
+                text: "中🙂".into(),
+                truncated: false
+            }
+        );
+
+        // (c) delivered == window_start exactly is NOT degradation: the whole
+        // window is returned without a truncation flag.
+        let tracker = PassiveActivityTracker::new(false);
+        append_delta(&tracker, &"a".repeat(1808));
+        assert_eq!(tracker.take_wait_tail().text.len(), 1808);
+        append_delta(&tracker, &"b".repeat(MAX_LATEST_TEXT_BYTES));
+        let equal = tracker.take_wait_tail();
+        assert_eq!(
+            equal,
+            WaitTail {
+                text: "b".repeat(MAX_LATEST_TEXT_BYTES),
+                truncated: false
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_takes_partition_the_appended_stream_exactly_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        const DELTAS: usize = 200;
+        const TOKEN_BYTES: usize = 8;
+        const CONSUMERS: usize = 4;
+        let tracker = Arc::new(PassiveActivityTracker::new(false));
+        let token = |index: usize| format!("d{index:07}");
+        let produced: String = (0..DELTAS).map(token).collect();
+        assert!(produced.len() < MAX_LATEST_TEXT_BYTES, "no window roll");
+
+        let done = Arc::new(AtomicBool::new(false));
+        // Pin a take inside the append phase with a handshake, not a barrier:
+        // the appender releases consumer 0 after appending the first token and
+        // blocks on the reply before finishing the stream. No other consumer
+        // exists yet, so that take cannot be raced away; and a failure is
+        // reported by the appender (no peer blocked on a barrier).
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (taken_tx, taken_rx) = mpsc::channel::<(String, bool)>();
+        let mut handles = Vec::new();
+        {
+            let tracker = Arc::clone(&tracker);
+            let done = Arc::clone(&done);
+            handles.push(std::thread::spawn(move || {
+                let mut chunks = Vec::new();
+                go_rx.recv().expect("appender must release the pinned consumer");
+                let first = tracker.take_wait_tail();
+                taken_tx
+                    .send((first.text.clone(), first.truncated))
+                    .expect("appender must await the pinned take");
+                chunks.push(first.text);
+                drain_until_done(&tracker, &done, &mut chunks);
+                chunks
+            }));
+        }
+        // Append the first token, let the pinned consumer take it, then bring up
+        // the remaining consumers and finish the stream.
+        append_delta(&tracker, &token(0));
+        go_tx.send(()).unwrap();
+        let (first_text, first_truncated) = taken_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the pinned consumer must take during the append phase");
+        assert!(!first_truncated);
+        assert!(
+            !first_text.is_empty(),
+            "a take must run while appends are still in progress"
+        );
+        for _ in 1..CONSUMERS {
+            let tracker = Arc::clone(&tracker);
+            let done = Arc::clone(&done);
+            handles.push(std::thread::spawn(move || {
+                let mut chunks = Vec::new();
+                drain_until_done(&tracker, &done, &mut chunks);
+                chunks
+            }));
+        }
+        for index in 1..DELTAS {
+            append_delta(&tracker, &token(index));
+        }
+        done.store(true, Ordering::Release);
+
+        let mut chunks: Vec<String> = Vec::new();
+        for handle in handles {
+            chunks.extend(handle.join().unwrap());
+        }
+        // Every chunk is a contiguous token-aligned slice of the stream, so
+        // each appears exactly once at a unique offset in `produced`. Sorting
+        // by that offset must tile the stream with no gap and no overlap.
+        let mut placed: Vec<(usize, String)> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let start = produced
+                    .find(&chunk)
+                    .unwrap_or_else(|| panic!("chunk {chunk:?} is not in the stream"));
+                (start, chunk)
+            })
+            .collect();
+        placed.sort_by_key(|(start, _)| *start);
+        let mut reassembled = String::new();
+        for (start, chunk) in &placed {
+            assert_eq!(
+                *start,
+                reassembled.len(),
+                "chunks must be disjoint and contiguous"
+            );
+            reassembled.push_str(chunk);
+        }
+        assert_eq!(reassembled, produced);
+        assert_eq!(
+            placed.iter().map(|(_, c)| c.len()).sum::<usize>(),
+            DELTAS * TOKEN_BYTES
+        );
+    }
+
+    fn drain_until_done(
+        tracker: &PassiveActivityTracker,
+        done: &std::sync::atomic::AtomicBool,
+        chunks: &mut Vec<String>,
+    ) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let tail = tracker.take_wait_tail();
+            assert!(!tail.truncated, "the stream never rolls the window");
+            if !tail.text.is_empty() {
+                chunks.push(tail.text);
+            }
+            if done.load(Ordering::Acquire) {
+                // One final take captures anything appended after the last
+                // empty read.
+                let tail = tracker.take_wait_tail();
+                assert!(!tail.truncated);
+                if !tail.text.is_empty() {
+                    chunks.push(tail.text);
+                }
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
 }

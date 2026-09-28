@@ -44,7 +44,7 @@ mod lifecycle_sink;
 pub mod mcp;
 pub mod observation;
 mod projection;
-use activity_tracker::{PassiveActivityTracker, TerminalText};
+use activity_tracker::{PassiveActivityTracker, TerminalText, WaitTail};
 use lifecycle_sink::{
     bounded_result_invalid_task_result, finalized_general, minimal_task_result,
     persist_general_result, store_result_with_cancel_precedence, unreaped_general,

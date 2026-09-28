@@ -416,8 +416,8 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `latest_text_tail` | string | 展示近期公开文本尾部；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
-| `latest_text_truncated` | boolean | 判断尾部是否省略了前文 | 易把片段当完整输出 |
+| `latest_text_tail` | string | 增量投递：仅返回自上次任意 wait 之后新增的公开文本；空串表示无新增。每个字节最多经 wait 投递一次（后到的 wait 只见新内容）；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
+| `latest_text_truncated` | boolean | 为 true 表示本次返回相对上次投递存在缺口：尚未投递的字节已滚出 8 KiB 窗口，本次返回退化为整个窗口 | 易把片段当完整输出 |
 | `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex 不采集时为空串 |
 | `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数 | 看不出近期是否有工具活动 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |

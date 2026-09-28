@@ -108,6 +108,14 @@ impl RpcService {
                     })
                     .transpose()?;
                 let mut activity = task_activity_view(task.phase, activity);
+                // Take-on-delivery: only bytes appended since the previous
+                // wait are shipped, and the cursor advances in the same lock.
+                // The take happens here, at the single response construction
+                // point, never mid-loop.
+                if let Some(wait_tail) = self.scheduler.take_wait_tail(&task.agent_id) {
+                    activity.latest_text_tail = wait_tail.text;
+                    activity.latest_text_truncated = wait_tail.truncated;
+                }
                 if let Some(page) = result_page.as_ref() {
                     dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
                 }
@@ -2383,5 +2391,160 @@ pub(crate) mod wait_tests {
             }
             assert!(envelope_bytes(&probe) > MAX_RESPONSE_FRAME_BYTES);
         }
+    }
+
+    fn inject_wait_delta(tracker: &crate::PassiveActivityTracker, delta: &str) {
+        tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+            external_contract::WireMessage::Event(external_contract::EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type": "model.streaming",
+                    "eventId": format!("delta-{delta}"),
+                    "payload": {
+                        "kind": "text_delta",
+                        "delta": delta,
+                        "assistantMessageId": "m1"
+                    }
+                }),
+            }),
+        )));
+    }
+
+    #[test]
+    fn wait_delivers_activity_tail_incrementally_across_every_exit() {
+        // Timeout and actionable-wake exits over one tracker; the terminal exit
+        // uses a second fixture because a pending request blocks completion.
+        let (_, service, id) = fixture();
+        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id.clone(), Arc::clone(&tracker));
+
+        // First wait: the whole current window (AC1), delivered over the
+        // timeout exit.
+        inject_wait_delta(&tracker, "alpha");
+        let RpcSuccess::TaskWait {
+            activity,
+            timed_out: true,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected the timeout exit")
+        };
+        assert_eq!(activity.latest_text_tail, "alpha");
+        assert!(!activity.latest_text_truncated);
+
+        // Actionable wake exit: only the bytes appended since the last wait.
+        inject_wait_delta(&tracker, "beta");
+        service
+            .store
+            .insert_pending_request(
+                "request",
+                &id,
+                "correlation",
+                "permission",
+                r#"{"toolName":"Read"}"#,
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            activity,
+            timed_out: false,
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected the wake exit")
+        };
+        assert_eq!(activity.latest_text_tail, "beta");
+
+        // The wake exit advanced the cursor: a second wait on the same task
+        // ships an empty tail for the already-sent bytes.
+        let RpcSuccess::TaskWait { activity, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected a wait response")
+        };
+        assert_eq!(activity.latest_text_tail, "");
+
+        // Terminal exit: a fresh fixture (a pending request blocks completion)
+        // proves the terminal response also advances the cursor.
+        let (_, service, id) = fixture();
+        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id.clone(), Arc::clone(&tracker));
+        inject_wait_delta(&tracker, "gamma");
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Completed,
+                    final_text: "the final answer".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            activity,
+            result: Some(_),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected the terminal exit")
+        };
+        assert_eq!(activity.latest_text_tail, "gamma");
+        // A repeated terminal wait does not re-send the consumed bytes.
+        let RpcSuccess::TaskWait { activity, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected a wait response")
+        };
+        assert_eq!(activity.latest_text_tail, "");
+
+        // Nothing appended is an empty tail, verified on the non-terminal path
+        // (a second wait over the same tracker).
+        let (_, service, id) = fixture();
+        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id.clone(), Arc::clone(&tracker));
+        inject_wait_delta(&tracker, "delta");
+        let RpcSuccess::TaskWait { activity, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected a wait response")
+        };
+        assert_eq!(activity.latest_text_tail, "delta");
+        let RpcSuccess::TaskWait { activity, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected a wait response")
+        };
+        assert_eq!(activity.latest_text_tail, "");
     }
 }

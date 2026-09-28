@@ -3853,3 +3853,278 @@ mod stall_tests {
         );
     }
 }
+
+mod wait_tail_inheritance_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A runtime that bootstraps, then reports a clean terminal so the monitor
+    /// thread exits promptly; the wait-tail tests only need a registered
+    /// activity tracker.
+    struct InheritRuntime {
+        session_id: String,
+    }
+
+    impl ManagedRuntime for InheritRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Completed(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+        }
+        fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+            Some(self.stop(Duration::ZERO))
+        }
+        fn bootstrap_session(
+            &self,
+            _: &TaskRecord,
+            _: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: self.session_id.clone(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+    }
+
+    /// Optionally pauses inside `spawn`, i.e. after `start_claim` built the new
+    /// tracker (lifecycle.rs:133) but before the activities map replacement
+    /// critical section, so a test can advance the outgoing tracker's cursor in
+    /// that exact window. `inject_before_replacement` emits a text delta through
+    /// the runtime sink while the new tracker is still outside the map.
+    struct InheritFactory {
+        ready: Option<Arc<AtomicBool>>,
+        release: Option<Arc<AtomicBool>>,
+        inject_before_replacement: Option<String>,
+    }
+
+    impl RuntimeFactory for InheritFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            if let Some(delta) = &self.inject_before_replacement {
+                sink.emit(LifecycleRecord {
+                    sequence: 1,
+                    event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                        external_contract::EventEnvelope {
+                            method: "session/event".into(),
+                            params: serde_json::json!({
+                                "type": "model.streaming",
+                                "eventId": format!("pre-swap-{delta}"),
+                                "payload": {
+                                    "kind": "text_delta",
+                                    "delta": delta,
+                                    "assistantMessageId": "m1"
+                                }
+                            }),
+                        },
+                    ))),
+                });
+            }
+            if let (Some(ready), Some(release)) = (&self.ready, &self.release) {
+                ready.store(true, Ordering::Release);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !release.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "tracker inheritance barrier never released"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            Ok(Arc::new(InheritRuntime {
+                session_id: format!("inherit-{}", task.agent_id),
+            }))
+        }
+    }
+
+    struct InheritHarness {
+        _directory: tempfile::TempDir,
+        scheduler: Scheduler,
+        agent_id: String,
+    }
+
+    fn inherit_harness(
+        paused: bool,
+        inject_before_replacement: Option<&str>,
+    ) -> (InheritHarness, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("s01-wait-inherit-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let ready = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let factory = Arc::new(InheritFactory {
+            ready: paused.then(|| Arc::clone(&ready)),
+            release: paused.then(|| Arc::clone(&release)),
+            inject_before_replacement: inject_before_replacement.map(str::to_owned),
+        });
+        let scheduler = Scheduler::new("inherit-test", store, factory, SchedulerConfig::default())
+            .unwrap();
+        let submitted = scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: String::new(),
+                repository: directory.path().canonicalize().unwrap(),
+                permission_mode: external_core::PermissionMode::Plan,
+                prompt: "wait tail inheritance".into(),
+                write_manifest: Vec::new(),
+            })
+            .unwrap();
+        (
+            InheritHarness {
+                _directory: directory,
+                scheduler,
+                agent_id: submitted.agent_id,
+            },
+            ready,
+            release,
+        )
+    }
+
+    fn inject_text(tracker: &PassiveActivityTracker, delta: &str) {
+        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            external_contract::EventEnvelope {
+                method: "session/event".into(),
+                params: serde_json::json!({
+                    "type": "model.streaming",
+                    "eventId": format!("delta-{delta}"),
+                    "payload": {
+                        "kind": "text_delta",
+                        "delta": delta,
+                        "assistantMessageId": "m1"
+                    }
+                }),
+            },
+        ))));
+    }
+
+    fn tracker_for(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .get(agent_id)
+            .cloned()
+            .expect("activity tracker in the map")
+    }
+
+    /// Install an outgoing tracker whose window is "AB" with "A" delivered.
+    fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
+        let old = Arc::new(PassiveActivityTracker::new(true));
+        old.set_wait_tail_fixture("A");
+        assert_eq!(old.take_wait_tail().text, "A");
+        inject_text(&old, "B");
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(agent_id.to_owned(), Arc::clone(&old));
+        old
+    }
+
+    #[test]
+    fn wait_tail_survives_tracker_replacement_with_undelivered_text() {
+        // AC9(a): a follow-up/resume build replaces the tracker; bytes that were
+        // never delivered must still be deliverable, and the cursor must not
+        // reset to zero.
+        let (harness, _, _) = inherit_harness(false, None);
+        let scheduler = &harness.scheduler;
+        let id = &harness.agent_id;
+        let old = outgoing_tracker(scheduler, id);
+
+        assert_eq!(scheduler.start_ready().unwrap(), vec![id.clone()]);
+        let new = tracker_for(scheduler, id);
+        assert!(!Arc::ptr_eq(&old, &new), "the claim replaced the tracker");
+
+        inject_text(&new, "C");
+        assert_eq!(
+            scheduler.take_wait_tail(id).expect("new tracker").text,
+            "BC",
+            "undelivered old text (B) plus the new delta (C)"
+        );
+    }
+
+    #[test]
+    fn wait_tail_inheritance_reads_the_latest_cursor_inside_the_replacement_lock() {
+        // AC9(b): deterministic interleaving. The new tracker exists but the map
+        // replacement is paused; a wait consumes "B" from the outgoing tracker
+        // in that window. The inheritance read must happen under the same state
+        // lock as the map swap, so it sees the advanced cursor and only "C" is
+        // delivered. A lock-outside pre-copy (lifecycle.rs:133) would capture
+        // delivered=A and re-deliver "BC".
+        let (harness, ready, release) = inherit_harness(true, None);
+        let scheduler = harness.scheduler.clone();
+        let id = harness.agent_id.clone();
+        let old = outgoing_tracker(&harness.scheduler, &id);
+
+        let spawner = thread::spawn(move || scheduler.start_ready());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "spawn never paused");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The map still holds the outgoing tracker; consume its pending "B".
+        assert_eq!(
+            harness
+                .scheduler
+                .take_wait_tail(&id)
+                .expect("old tracker")
+                .text,
+            "B"
+        );
+        release.store(true, Ordering::Release);
+        assert_eq!(spawner.join().unwrap().unwrap(), vec![id.clone()]);
+
+        let new = tracker_for(&harness.scheduler, &id);
+        assert!(!Arc::ptr_eq(&old, &new));
+        inject_text(&new, "C");
+        assert_eq!(
+            harness
+                .scheduler
+                .take_wait_tail(&id)
+                .expect("new tracker")
+                .text,
+            "C",
+            "already consumed bytes must not be re-delivered"
+        );
+    }
+
+    #[test]
+    fn wait_tail_inheritance_merges_text_appended_before_the_map_swap() {
+        // MAJOR repair: the runtime sink is wired to the new tracker before the
+        // map replacement (lifecycle.rs:133-147), so the incoming tracker can
+        // already hold text (e.g. a resume's initial output). The inheritance
+        // must MERGE that text after the old window instead of overwriting it.
+        // Old window "AB" with "A" delivered; the new tracker collects "N"
+        // during spawn, before the swap. A correct merge yields "BN" (old
+        // undelivered "B" plus "N"); an overwriting implementation loses "N".
+        let (harness, _, _) = inherit_harness(false, Some("N"));
+        let scheduler = &harness.scheduler;
+        let id = &harness.agent_id;
+        let old = outgoing_tracker(scheduler, id);
+
+        assert_eq!(scheduler.start_ready().unwrap(), vec![id.clone()]);
+        let new = tracker_for(scheduler, id);
+        assert!(!Arc::ptr_eq(&old, &new));
+
+        let merged = scheduler.take_wait_tail(id).expect("new tracker");
+        assert_eq!(
+            merged.text, "BN",
+            "old undelivered text plus the pre-swap append"
+        );
+        assert!(!merged.truncated);
+        // The merged stream is not re-delivered after the take.
+        assert_eq!(scheduler.take_wait_tail(id).expect("new tracker").text, "");
+    }
+}
