@@ -95,7 +95,7 @@
     },
     "wait": {
       "type": "object",
-      "description": "Wait returns early only for an actionable pending request (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or a terminal result; ordinary progress, message receipts, already-responded and unsupported requests never wake it. The pending_requests output projection is capped at 100 actionable records, while the wake decision scans the full pending set. activity carries the latest text tail, a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status.",
+      "description": "Wait returns early only for an actionable pending request (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or a terminal result; ordinary progress, message receipts, already-responded and unsupported requests never wake it. The pending_requests output projection is capped at 100 actionable records, while the wake decision scans the full pending set. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags undelivered bytes that rolled out of the bounded window (that response degrades to the whole window); a terminal response also strips bytes repeating the embedded result page verbatim. activity also carries a 200-char verified reasoning tail, tool calls started in the last 60 seconds, and telemetry status.",
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "type": "integer", "minimum": 10000000, "maximum": 99999999 },
