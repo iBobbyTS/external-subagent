@@ -42,7 +42,7 @@ test('CLI sends daemon RPC and preserves success result', async () => {
         outcome: 'success',
         result: {
           kind: 'task_wait',
-          task: { agent_id: '10000001', status: 'running', session_id: null, input_identity: null },
+          task: { agent_id: '10000001', status: 'running', session_id: null },
           pending_requests: [{ request_id: 'read-1', kind: 'permission', tool_name: 'Read', operation: 'read', summary: 'target input.txt' }],
           result_available: false,
           activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
@@ -57,7 +57,7 @@ test('CLI sends daemon RPC and preserves success result', async () => {
   try {
     const result = await callDaemon(socketPath, 'wait', { agent_id: 10000001, wait_time: 0 });
     assert.equal(clientEnded, false, 'sending a request must not half-close the RPC socket');
-    assert.deepEqual(result.task, { agent_id: 10000001, status: 'running', session_id: null, input_identity: null });
+    assert.deepEqual(result.task, { agent_id: 10000001, status: 'running', session_id: null });
     assert.equal(result.result, null);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
     assert.equal(result.activity.latest_reasoning, '');
@@ -108,7 +108,7 @@ test('CLI forwards wait message_id when declared', async () => {
       outcome: 'success',
       result: {
         kind: 'task_wait',
-        task: { agent_id: '10000001', status: 'running', session_id: null, input_identity: null },
+        task: { agent_id: '10000001', status: 'running', session_id: null },
         pending_requests: [], result_available: false,
         activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
         result: null, instruction: null, timed_out: true,

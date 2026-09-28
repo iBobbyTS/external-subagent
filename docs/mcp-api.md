@@ -214,7 +214,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `task` | PublicTask | 检查单一生命周期状态 | 无法从等待响应直接判断任务生命周期 |
+| `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
 | `result_available` | boolean | 快速判断有无终态结果 | 客户端须从结果等字段推导；属于显式便利信号 |
 | `activity` | PublicActivity | 查看文本尾部、推理尾部、近期工具频度与遥测可信度 | 难以判断运行中是在工作还是停滞 |
@@ -354,7 +354,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 ### 13.1 PublicTask
 
-用于 wait、list.tasks[]、cancel、result、close。
+用于 list.tasks[]、cancel、result、close；wait 使用下面的 PublicTaskHeader。
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
@@ -364,6 +364,8 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `input_identity` | InputIdentity | 诊断：追溯任务接纳时配置与执行范围 | 只能看当前系统配置，无法解释历史任务 |
 
 `status` 是折叠后的单一状态：`queued / preparing / running / waiting_input / cancelling`（非终态）与 `completed / failed / cancelled / timed_out / runtime_lost / result_invalid`（终态）及 `closed`（close 之后，含回收）。失败原因细码不再出现在公共视图；深入诊断使用 diagnose（日志中的 failure 记录保留完整信息）。status 在输出类型中是 string，而非强制枚举。
+
+**PublicTaskHeader**（wait 专用）：`{ agent_id, status, session_id }`，即 PublicTask 去掉 `input_identity` 的收窄形式。准入 provenance（subagent、model、effort、config_revision、adapter_version、workspace、permission_mode）在 spawn 后不可变，每次 wait 重复返回同一块没有新信息；需要 provenance 时读 list/result/cancel/close 的完整 PublicTask。
 
 ### 13.2 InputIdentity
 

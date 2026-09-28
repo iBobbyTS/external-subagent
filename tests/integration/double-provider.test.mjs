@@ -424,7 +424,10 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
       '--prompt', 'Reply with exactly the single word LIVE_ZCODE_OK and nothing else. Do not use any tools.'])).result;
     const zcodeWaited = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id, wait_time: 240 })])).result;
     assert.equal(zcodeWaited.task.status, 'completed');
-    assert.equal(zcodeWaited.task.input_identity.model_source, 'native');
+    // Admission provenance lives in the result/list task views; wait carries
+    // only the lifecycle header.
+    const zcodeResult = jsonOut(cli(['result', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
+    assert.equal(zcodeResult.task.input_identity.model_source, 'native');
     assert.equal(zcodeWaited.result.final_text.includes('LIVE_ZCODE_OK'), true);
     const zcodeClosed = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
     assert.equal(zcodeClosed.task.status, 'closed');

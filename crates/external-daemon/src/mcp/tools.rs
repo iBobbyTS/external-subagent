@@ -1368,6 +1368,11 @@ mod contract_default_tests {
                 "permission_mode":"build"
             }
         });
+        // The wait output carries the lifecycle header only; its schema must
+        // reject the full task shape that list/cancel/result still accept.
+        let wait_task = serde_json::json!({
+            "agent_id":10000001, "status":"running", "session_id":null
+        });
         let activity = serde_json::json!({
             "latest_text_tail":"", "latest_text_truncated":false,
             "latest_reasoning":"", "tool_calls_last_60s":0,
@@ -1385,7 +1390,7 @@ mod contract_default_tests {
             "subagents":[]
         });
         let wait = serde_json::json!({
-            "task":task.clone(),"pending_requests":[],
+            "task":wait_task,"pending_requests":[],
             "result_available":false,"activity":activity,
             "result":null,"instruction":null,"timed_out":false,
             "message_receipt":{"message_id":"message-1","state":"queued","failure_code":null}
@@ -1442,6 +1447,26 @@ mod contract_default_tests {
                 validator.iter_errors(&error).collect::<Vec<_>>()
             );
         }
+
+        // The wait output narrows its task to the lifecycle header; its schema
+        // must reject the full PublicTask shape list/cancel/result accept.
+        let wait_tool = facade
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "external_subagent_wait")
+            .unwrap();
+        let wait_schema = serde_json::to_value(wait_tool.output_schema.as_ref().unwrap()).unwrap();
+        let wait_validator = jsonschema::validator_for(&wait_schema).unwrap();
+        let mut full_task_wait = successes.get("external_subagent_wait").unwrap().clone();
+        full_task_wait["task"] = serde_json::json!({
+            "agent_id":10000001, "status":"running", "session_id":null,
+            "input_identity":{}
+        });
+        assert!(
+            !wait_validator.is_valid(&full_task_wait),
+            "wait schema must reject the full task shape"
+        );
     }
 
     #[test]

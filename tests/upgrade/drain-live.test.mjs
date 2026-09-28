@@ -614,7 +614,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     const postZcodeDone = await waitForTerminal(postZcode.agent_id);
     assert.ok(postZcodeDone, 'the post-upgrade ZCode task never completed');
     assert.equal(postZcodeDone.task.status, 'completed');
-    assert.equal(postZcodeDone.task.input_identity.model_source, 'native');
+    assert.equal(cli(['result', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.input_identity.model_source, 'native');
     assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.status === 'closed');
 
     const postDsh = cli(['spawn', '--subagent', 'dsh', '--repository', path.join(workDir, 'ws-post-d'), '--permission-mode', 'build',

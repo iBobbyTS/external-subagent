@@ -9,7 +9,7 @@ use super::types::{
     MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
 };
 use super::views::{
-    pending_request_view, task_activity_view, task_view, truncate_at_char_boundary,
+    pending_request_view, task_activity_view, task_header_view, truncate_at_char_boundary,
     MessageReceiptView, TaskResultView, MAX_QUESTION_SUMMARY_BYTES,
 };
 use crate::scheduler::shrink_persistable_record;
@@ -123,7 +123,7 @@ impl RpcService {
                     wait_instruction(terminal, result_page.as_ref(), wake_request.as_ref());
                 let mut response = RpcSuccess::TaskWait {
                     activity,
-                    task: task_view(task.clone()),
+                    task: task_header_view(&task),
                     pending_requests,
                     result_available,
                     result: result_page,
@@ -409,8 +409,7 @@ fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>, bool)>
 pub(crate) mod wait_tests {
     use super::*;
     use crate::rpc::{
-        InputIdentityView, PendingRequestView, QuestionView, TaskActivityView, TaskView,
-        TelemetryStatusView,
+        PendingRequestView, QuestionView, TaskActivityView, TaskHeaderView, TelemetryStatusView,
     };
     use crate::{CommandRuntimeFactory, SchedulerConfig};
     use external_store::TaskResult;
@@ -686,6 +685,26 @@ pub(crate) mod wait_tests {
             wait_time,
             message_id: None,
         }
+    }
+
+    #[test]
+    fn wait_task_serializes_only_the_lifecycle_header() {
+        let (_directory, service, id) = fixture();
+        let RpcSuccess::TaskWait { task, .. } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("wait")
+        };
+        let encoded = serde_json::to_value(&task).unwrap();
+        let mut keys = encoded
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, ["agent_id", "session_id", "status"]);
+        assert_eq!(encoded["agent_id"], id);
     }
 
     #[test]
@@ -1744,21 +1763,11 @@ pub(crate) mod wait_tests {
         assert_eq!(result.reason_code, None);
     }
 
-    fn perspective_task() -> TaskView {
-        TaskView {
+    fn perspective_task() -> TaskHeaderView {
+        TaskHeaderView {
             agent_id: "10000001".into(),
             status: "failed".into(),
             session_id: None,
-            input_identity: InputIdentityView {
-                subagent: None,
-                config_revision: None,
-                adapter_version: None,
-                model: None,
-                model_source: None,
-                effort: None,
-                workspace_path: None,
-                permission_mode: None,
-            },
         }
     }
 

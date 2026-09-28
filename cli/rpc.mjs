@@ -174,6 +174,16 @@ function publicTask(task) {
   };
 }
 
+// The wait response carries only the task lifecycle header: admission
+// provenance never changes after spawn, so wait does not repeat it.
+function publicTaskHeader(task) {
+  return {
+    agent_id: publicTaskId(task.agent_id),
+    status: task.status,
+    session_id: task.session_id ?? null,
+  };
+}
+
 function publicResult(result) {
   if (result == null) return null;
   return {
@@ -198,7 +208,7 @@ export function projectDaemonResult(command, result) {
       return { agent_id: publicTaskId(result.task.agent_id), status: result.task.status };
     case 'wait': {
       const { result: taskResult, task, activity, kind: _kind, ...rest } = result;
-      return { ...rest, task: publicTask(task), activity, result: publicResult(taskResult) };
+      return { ...rest, task: publicTaskHeader(task), activity, result: publicResult(taskResult) };
     }
     case 'list': return { tasks: result.tasks.map(publicTask), next_cursor: result.next_cursor ?? null };
     case 'send': return { message_id: result.message_id, disposition: result.disposition };

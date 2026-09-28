@@ -4,8 +4,8 @@
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::views::{
     AgentStatusView, MessageDispositionView, MessageReceiptView, PendingRequestView,
-    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView,
-    TaskView,
+    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskHeaderView, TaskObservationView,
+    TaskResultView, TaskView,
 };
 use crate::agent_status::{
     AgentModelsInput, AgentModelsOutput, AgentProbeEvidence, AgentProbeInput,
@@ -297,7 +297,7 @@ pub enum RpcSuccess {
         next_cursor: Option<String>,
     },
     TaskWait {
-        task: TaskView,
+        task: TaskHeaderView,
         pending_requests: Vec<PendingRequestView>,
         result_available: bool,
         activity: TaskActivityView,

@@ -39,8 +39,8 @@ pub use views::{
     ComponentStateView, DaemonIdentityView, InputIdentityView, MessageDispositionView,
     MessageReceiptView, ModelIdentityFactView, ModelIdentityView, ObservationCapabilityView,
     ObservationDefaultsView, PendingRequestView, QuestionView, ResponseDispositionView,
-    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView,
-    TaskView, TelemetryStatusView,
+    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskHeaderView, TaskObservationView,
+    TaskResultView, TaskView, TelemetryStatusView,
 };
 
 #[cfg(test)]

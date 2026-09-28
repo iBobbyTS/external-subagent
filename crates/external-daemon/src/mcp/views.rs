@@ -10,8 +10,8 @@ use crate::observation::OBSERVATION_SCHEMA;
 use crate::rpc::{
     AgentCapabilitiesView, AgentEffortSelectionModeView, AgentModelSelectionModeView,
     AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, CapabilityMaturityView,
-    ComponentStateView, SystemStatusView, TaskActivityView, TaskObservationView, TaskResultView,
-    TaskView, TelemetryStatusView,
+    ComponentStateView, SystemStatusView, TaskActivityView, TaskHeaderView, TaskObservationView,
+    TaskResultView, TaskView, TelemetryStatusView,
 };
 use external_store::TaskOutcome;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -388,6 +388,18 @@ pub struct PublicTask {
     pub input_identity: PublicInputIdentity,
 }
 
+/// The wait output's task projection: lifecycle only. Admission provenance is
+/// immutable after spawn, so wait never repeats it; list/result/close return
+/// the full [`PublicTask`].
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicTaskHeader {
+    #[schemars(range(min = 10000000, max = 99999999))]
+    pub agent_id: u64,
+    pub status: String,
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct PublicInputIdentity {
     pub subagent: Option<String>,
@@ -398,6 +410,18 @@ pub struct PublicInputIdentity {
     pub effort: Option<String>,
     pub workspace_path: Option<String>,
     pub permission_mode: Option<String>,
+}
+
+impl TryFrom<TaskHeaderView> for PublicTaskHeader {
+    type Error = ToolError;
+
+    fn try_from(value: TaskHeaderView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            agent_id: public_task_id(&value.agent_id)?,
+            status: value.status,
+            session_id: value.session_id,
+        })
+    }
 }
 
 impl TryFrom<TaskView> for PublicTask {
@@ -527,7 +551,7 @@ impl From<TaskActivityView> for PublicActivity {
 #[derive(Debug, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentWaitOutput {
-    pub task: PublicTask,
+    pub task: PublicTaskHeader,
     pub pending_requests: Vec<PublicPendingRequest>,
     pub result_available: bool,
     pub activity: PublicActivity,

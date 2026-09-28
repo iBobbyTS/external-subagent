@@ -213,6 +213,17 @@ pub struct TaskView {
     pub input_identity: InputIdentityView,
 }
 
+/// The wait response's task projection. Admission provenance is immutable
+/// after spawn, so every wait would repeat the same `input_identity` block;
+/// wait carries only this header and list/result/close keep the full
+/// [`TaskView`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskHeaderView {
+    pub agent_id: String,
+    pub status: String,
+    pub session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputIdentityView {
     #[serde(default)]
@@ -472,19 +483,8 @@ pub(super) fn agent_capabilities() -> AgentCapabilitiesView {
     }
 }
 
-pub(super) fn task_view(task: TaskRecord) -> TaskView {
-    let prepared = serde_json::from_str::<serde_json::Value>(&task.prepared_launch_json).ok();
-    let permission_mode = prepared.as_ref().and_then(|v| {
-        v.get("permission_mode")
-            .and_then(|x| x.as_str())
-            .map(str::to_owned)
-    });
-    let workspace_path = Some(task.workspace_path.clone());
-    let admission: Option<external_core::AdmissionIdentity> = prepared
-        .as_ref()
-        .and_then(|v| v.get("admission"))
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let status = if task.closed_at.is_some() {
+pub(super) fn task_status(task: &TaskRecord) -> String {
+    if task.closed_at.is_some() {
         "closed".to_owned()
     } else {
         match task.phase {
@@ -503,7 +503,30 @@ pub(super) fn task_view(task: TaskRecord) -> TaskView {
                 None => "terminal".to_owned(),
             },
         }
-    };
+    }
+}
+
+pub(super) fn task_header_view(task: &TaskRecord) -> TaskHeaderView {
+    TaskHeaderView {
+        agent_id: task.agent_id.clone(),
+        status: task_status(task),
+        session_id: task.session_id.clone(),
+    }
+}
+
+pub(super) fn task_view(task: TaskRecord) -> TaskView {
+    let prepared = serde_json::from_str::<serde_json::Value>(&task.prepared_launch_json).ok();
+    let permission_mode = prepared.as_ref().and_then(|v| {
+        v.get("permission_mode")
+            .and_then(|x| x.as_str())
+            .map(str::to_owned)
+    });
+    let workspace_path = Some(task.workspace_path.clone());
+    let admission: Option<external_core::AdmissionIdentity> = prepared
+        .as_ref()
+        .and_then(|v| v.get("admission"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let status = task_status(&task);
     TaskView {
         agent_id: task.agent_id,
         status,
@@ -682,8 +705,8 @@ pub(super) fn pending_request_view(request: StoredPendingRequest) -> PendingRequ
 #[cfg(test)]
 mod result_paging_tests {
     use super::{
-        result_page_bounds, InputIdentityView, TaskActivityView, TaskResultView, TaskView,
-        TelemetryStatusView,
+        result_page_bounds, InputIdentityView, TaskActivityView, TaskHeaderView, TaskResultView,
+        TaskView, TelemetryStatusView,
     };
     use crate::rpc::{
         RpcOutcome, RpcResponse, RpcSuccess, MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
@@ -705,6 +728,14 @@ mod result_paging_tests {
                 workspace_path: None,
                 permission_mode: None,
             },
+        }
+    }
+
+    fn task_header() -> TaskHeaderView {
+        TaskHeaderView {
+            agent_id: "a".repeat(256),
+            status: "completed".into(),
+            session_id: None,
         }
     }
 
@@ -777,7 +808,7 @@ mod result_paging_tests {
         let response = RpcResponse::success(
             "q".repeat(128),
             RpcSuccess::TaskWait {
-                task: task(),
+                task: task_header(),
                 pending_requests: Vec::new(),
                 result_available: true,
                 activity: activity(),
@@ -806,7 +837,7 @@ mod result_paging_tests {
         let response = RpcResponse::success(
             "q".repeat(128),
             RpcSuccess::TaskWait {
-                task: task(),
+                task: task_header(),
                 pending_requests: Vec::new(),
                 result_available: true,
                 activity: activity(),
