@@ -102,8 +102,8 @@ impl CodexRuntimeOwner {
                     // The admitted effort lives at admission.effort
                     // (prepared_launch_json.admission.effort). Reading it
                     // from the prepared-launch top level instead would copy
-                    // the known requested_model_from_prepared_launch defect
-                    // (lib.rs) where the field is not actually persisted.
+                    // the retired legacy model read (lib.rs) where the field
+                    // is not actually persisted.
                     effort: admission.effort.clone(),
                     permission_mode,
                 })

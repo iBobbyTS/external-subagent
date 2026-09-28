@@ -38,6 +38,61 @@ fn event(sequence: &mut u64, session_id: &str, kind: &str, payload: Value) -> Va
     })
 }
 
+/// Default create-time model catalog: a reasoning-capable `zai/GLM-5.3`
+/// (levels low/high/max, default max) plus a non-`zai` provider so the
+/// provider-qualified round trip can be exercised end to end.
+fn default_catalog() -> Value {
+    json!([
+        {
+            "ref": {"providerId": "zai", "modelId": "GLM-5.3"},
+            "label": "GLM-5.3",
+            "contextWindow": 1000000,
+            "reasoning": {
+                "levels": [
+                    {"value": "low", "label": "low"},
+                    {"value": "high", "label": "high"},
+                    {"value": "max", "label": "max"}
+                ],
+                "defaultLevel": "max"
+            }
+        },
+        {
+            "ref": {"providerId": "deepseek", "modelId": "deepseek-flash"},
+            "label": "deepseek-flash",
+            "contextWindow": 200000,
+            "reasoning": {
+                "levels": [
+                    {"value": "low", "label": "low"},
+                    {"value": "high", "label": "high"}
+                ],
+                "defaultLevel": "low"
+            }
+        }
+    ])
+}
+
+fn env_json(name: &str) -> Option<Value> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .and_then(|value| serde_json::from_str(&value).ok())
+}
+
+fn env_token(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Append one inbound frame to the wire log when `ZCODE_FAKE_LOG` is set.
+fn append_log(path: &str, line: &str) {
+    if let Ok(mut file) = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 fn exact_keys(object: &Map<String, Value>, required: &[&str], optional: &[&str]) -> bool {
     required.iter().all(|key| object.contains_key(*key))
         && object
@@ -118,6 +173,36 @@ fn valid_params(method: &str, params: &Value, session_id: &str) -> bool {
             });
             workspace_valid && mode_valid && thought_level_valid && mcp_valid
         }
+        "session/setModel" => {
+            // Pinned switch shape: sessionId + model{providerId,modelId[,options
+            // .reasoningLevel]} + persistAsWorkspaceLastUsed. Anything else is
+            // protocol drift.
+            if !exact_keys(
+                params,
+                &["sessionId", "model", "persistAsWorkspaceLastUsed"],
+                &[],
+            ) || params.get("sessionId").and_then(Value::as_str) != Some(session_id)
+                || !params
+                    .get("persistAsWorkspaceLastUsed")
+                    .is_some_and(Value::is_boolean)
+            {
+                return false;
+            }
+            let Some(model) = params.get("model").and_then(Value::as_object) else {
+                return false;
+            };
+            let non_empty_string =
+                |value: &Value| value.as_str().is_some_and(|token| !token.trim().is_empty());
+            exact_keys(model, &["providerId", "modelId"], &["options"])
+                && model.get("providerId").is_some_and(non_empty_string)
+                && model.get("modelId").is_some_and(non_empty_string)
+                && model.get("options").is_none_or(|options| {
+                    options.as_object().is_some_and(|options| {
+                        exact_keys(options, &["reasoningLevel"], &[])
+                            && options.get("reasoningLevel").is_some_and(non_empty_string)
+                    })
+                })
+        }
         "session/subscribe" => {
             exact_keys(
                 params,
@@ -163,11 +248,21 @@ fn main() {
     let mut sequence = 0u64;
     let session_id =
         std::env::var("ZCODE_FAKE_SESSION_ID").unwrap_or_else(|_| "fake-session-7f3a".into());
+    let catalog = env_json("ZCODE_FAKE_MODEL_CATALOG").unwrap_or_else(default_catalog);
+    let create_current = env_json("ZCODE_FAKE_MODEL_CURRENT")
+        .unwrap_or_else(|| json!({"providerId": "zai", "modelId": "fixture-model"}));
+    let set_model_current = env_json("ZCODE_FAKE_SETMODEL_CURRENT");
+    let set_model_effort = std::env::var("ZCODE_FAKE_SETMODEL_EFFORT").ok();
+    let set_model_error_code = env_token("ZCODE_FAKE_SETMODEL_ERROR_CODE");
+    let log_path = env_token("ZCODE_FAKE_LOG");
     let mut pending_permission: Option<Value> = None;
 
     let mut lines = stdin.lock().lines();
     while let Some(line) = lines.next() {
         let Ok(line) = line else { break };
+        if let Some(path) = &log_path {
+            append_log(path, &line);
+        }
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -249,10 +344,12 @@ fn main() {
                         "params": {"scope":"session","sessionId":&session_id}
                     }),
                 );
-                let preference_response = lines
-                    .next()
-                    .and_then(Result::ok)
-                    .and_then(|line| serde_json::from_str::<Value>(&line).ok());
+                let preference_line = lines.next().and_then(Result::ok);
+                if let (Some(path), Some(line)) = (&log_path, preference_line.as_deref()) {
+                    append_log(path, line);
+                }
+                let preference_response =
+                    preference_line.and_then(|line| serde_json::from_str::<Value>(&line).ok());
                 if preference_response.as_ref().is_none_or(|response| {
                     response.get("id") != Some(&preference_id)
                         || response.get("result")
@@ -269,7 +366,12 @@ fn main() {
                 // supported, so an unset ZCODE_FAKE_EFFORT_ECHO keeps the
                 // whole section absent (the UNKNOWN state), while a set value
                 // pins the echoed level (equal or diverging).
-                let mut settings = json!({"model":{"current":{"modelId":"fixture-model"}}});
+                let mut settings = json!({
+                    "model": {
+                        "current": create_current.clone(),
+                        "available": catalog.clone()
+                    }
+                });
                 if let Some(echo) = std::env::var("ZCODE_FAKE_EFFORT_ECHO")
                     .ok()
                     .filter(|value| !value.is_empty())
@@ -289,6 +391,85 @@ fn main() {
                         id,
                         json!({
                             "session": {"sessionId": &session_id},
+                            "settings": settings
+                        }),
+                    ),
+                );
+            }
+            "session/setModel" => {
+                let requested_model = params.get("model").cloned().unwrap_or_else(|| json!({}));
+                // Configurable remote rejection: the documented discriminators
+                // live on error.data.code, the top-level code always -32603.
+                if let Some(code) = &set_model_error_code {
+                    let _ = write_value(
+                        &mut out,
+                        json!({
+                            "id": id,
+                            "error": {
+                                "code": -32603,
+                                "message": format!("fixture setModel rejected: {code}"),
+                                "data": {"name": "ModelProtocolError", "code": code}
+                            }
+                        }),
+                    );
+                    continue;
+                }
+                // Success echo: default is the requested reference (so a
+                // correct round trip passes), overridable to force a
+                // provider-qualified read-back mismatch.
+                let current = set_model_current
+                    .clone()
+                    .unwrap_or_else(|| requested_model.clone());
+                let requested_level = requested_model
+                    .get("options")
+                    .and_then(|options| options.get("reasoningLevel"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let thought_level = match &set_model_effort {
+                    Some(value) => (!value.is_empty()).then(|| value.clone()),
+                    None => requested_level,
+                };
+                // The real runtime emits the model_changed notification before
+                // resolving the setModel response; the event pump must tolerate
+                // an UnknownEvent interleaved into the pending request.
+                let _ = write_value(
+                    &mut out,
+                    json!({
+                        "method": "state.updated",
+                        "params": {
+                            "patch": {"model": {"current": current.clone()}},
+                            "reason": "model_changed",
+                            "revision": sequence.saturating_add(1),
+                            "scope": "session",
+                            "sessionId": &session_id,
+                            "type": "state.updated"
+                        }
+                    }),
+                );
+                let mut settings = json!({"model": {"current": current.clone()}});
+                if let Some(level) = thought_level {
+                    settings["thoughtLevel"] = json!({
+                        "enabled": true,
+                        "current": level,
+                        "available": [
+                            {"value": "low", "label": "low"},
+                            {"value": "high", "label": "high"},
+                            {"value": "max", "label": "max"}
+                        ]
+                    });
+                }
+                let _ = write_value(
+                    &mut out,
+                    response(
+                        id,
+                        json!({
+                            "session": {
+                                "sessionId": &session_id,
+                                "model": {
+                                    "providerId": current.get("providerId").cloned().unwrap_or(Value::Null),
+                                    "modelId": current.get("modelId").cloned().unwrap_or(Value::Null)
+                                }
+                            },
                             "settings": settings
                         }),
                     ),
@@ -548,6 +729,57 @@ mod tests {
         assert!(valid_response_envelope(
             &json!({"id":"server-1","result":{"decision":"allow"}})
         ));
+    }
+
+    #[test]
+    fn session_set_model_accepts_only_the_pinned_switch_shape() {
+        let base = json!({
+            "sessionId": "fake-session-7f3a",
+            "model": {"providerId": "zai", "modelId": "GLM-5.3"},
+            "persistAsWorkspaceLastUsed": false
+        });
+        assert!(valid_params("session/setModel", &base, "fake-session-7f3a"));
+        let mut with_options = base.clone();
+        with_options["model"]["options"] = json!({"reasoningLevel": "high"});
+        assert!(valid_params(
+            "session/setModel",
+            &with_options,
+            "fake-session-7f3a"
+        ));
+        // Wrong session, missing flag, non-boolean flag and invented keys all
+        // fail closed.
+        for invalid in [
+            json!({
+                "sessionId": "other",
+                "model": {"providerId": "zai", "modelId": "GLM-5.3"},
+                "persistAsWorkspaceLastUsed": false
+            }),
+            json!({
+                "sessionId": "fake-session-7f3a",
+                "model": {"providerId": "zai", "modelId": "GLM-5.3"}
+            }),
+            json!({
+                "sessionId": "fake-session-7f3a",
+                "model": {"providerId": "zai", "modelId": "GLM-5.3"},
+                "persistAsWorkspaceLastUsed": "false"
+            }),
+            json!({
+                "sessionId": "fake-session-7f3a",
+                "model": {"providerId": "zai", "modelId": "GLM-5.3"},
+                "persistAsWorkspaceLastUsed": false,
+                "reasoningEffort": "high"
+            }),
+            json!({
+                "sessionId": "fake-session-7f3a",
+                "model": {"providerId": "zai", "modelId": "GLM-5.3", "options": {}},
+                "persistAsWorkspaceLastUsed": false
+            }),
+        ] {
+            assert!(
+                !valid_params("session/setModel", &invalid, "fake-session-7f3a"),
+                "setModel drift must be rejected: {invalid}"
+            );
+        }
     }
 
     #[test]

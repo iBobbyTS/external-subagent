@@ -1,11 +1,12 @@
 use external_contract::{
-    configured_thought_level_from_result, event_type, normalized_zai_model,
-    offered_permission_response, turn_id_from_result, CreateSessionParams, ResumeSessionParams,
-    RuntimePreferences, SendParams, SessionCreateProjection, SessionParams, StdioMcpServer,
-    SubscribeParams, WireId, WireMessage, WorkspaceRef, INTERACTION_REQUEST_PERMISSION,
-    INTERACTION_REQUEST_UNSUPPORTED_INPUT, INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE,
-    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_RESUME, SESSION_SEND, SESSION_STOP,
-    SESSION_SUBSCRIBE,
+    configured_thought_level_from_result, event_type, normalized_scoped_model,
+    normalized_zai_model, offered_permission_response, provider_model_matches,
+    set_model_projection_from_result, turn_id_from_result, CatalogModelEntry, CreateSessionParams,
+    ResumeSessionParams, RuntimePreferences, SendParams, SessionCreateProjection, SessionParams,
+    SetModelParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
+    INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+    INTERACTION_REQUEST_USER_INPUT, SESSION_CREATE, SESSION_REQUEST_RUNTIME_PREFERENCES,
+    SESSION_RESUME, SESSION_SEND, SESSION_SET_MODEL, SESSION_STOP, SESSION_SUBSCRIBE,
 };
 use external_runtime::{
     observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
@@ -837,8 +838,7 @@ impl RuntimeOwner {
         mcp_servers: &[StdioMcpServer],
         timeout: Duration,
     ) -> Result<SessionReady, RuntimeCommandError> {
-        let requested_model =
-            requested_model_from_prepared_launch(Some(task.prepared_launch_json.as_str()));
+        let requested_model = admitted_model_from_task(task);
         self.bootstrap_session_with_mcp_for_requested_model(
             &task.workspace_path,
             &task.initial_prompt,
@@ -887,19 +887,38 @@ impl RuntimeOwner {
                 "session/create projection is invalid: {error}"
             ))
         })?;
-        let session_id = projection.session_id;
+        let session_id = projection.session_id.clone();
         // Correlation only: the command-plane session is still registered only
         // after subscribe succeeds. A rejected subscribe must remain diagnosable.
         *self.diagnostic_session_id.lock().unwrap() = Some(session_id.clone());
-        let configured_model = projection.requested_model;
-        validate_requested_model(requested_model, configured_model.as_deref())
-            .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
-        validate_requested_effort(
-            SESSION_CREATE,
-            requested_effort,
-            projection.configured_thought_level.as_deref(),
-        )
-        .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
+        let configured_model = match requested_model {
+            None => {
+                // No admitted model: the native create result is the only
+                // source and the historical validation stays byte-equivalent.
+                validate_requested_model(None, projection.requested_model.as_deref())
+                    .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
+                validate_requested_effort(
+                    SESSION_CREATE,
+                    requested_effort,
+                    projection.configured_thought_level.as_deref(),
+                )
+                .map_err(|code| RuntimeCommandError::InvalidSession(code.into()))?;
+                projection.requested_model
+            }
+            Some(requested) => {
+                // Two-step model switch: the create result's full catalog is
+                // the whitelist, session/setModel applies the selection, and
+                // the result's provider-qualified read-back is authoritative.
+                self.switch_session_model(
+                    &session_id,
+                    requested,
+                    requested_effort,
+                    &projection,
+                    deadline,
+                )?;
+                Some(requested.to_owned())
+            }
+        };
         let subscribe_params = serde_json::to_value(SubscribeParams {
             session_id: &session_id,
             delivery_kind: "desktop-continuous",
@@ -918,6 +937,123 @@ impl RuntimeOwner {
             initial_turn_id,
             configured_model,
         })
+    }
+
+    /// Apply an admitted model to a freshly created session before the first
+    /// prompt.
+    ///
+    /// The create result's catalog is the only whitelist: `available` shrinks
+    /// to the selected model after `session/setModel`, so it must never be
+    /// re-read as the full directory. The reasoning level resolves against
+    /// the matched catalog entry, then setModel's own result is read back
+    /// provider-qualified fail-closed.
+    fn switch_session_model(
+        &self,
+        session_id: &str,
+        requested: &str,
+        requested_effort: Option<&str>,
+        projection: &SessionCreateProjection,
+        deadline: Instant,
+    ) -> Result<(), RuntimeCommandError> {
+        if normalized_scoped_model(requested).is_none() {
+            return Err(RuntimeCommandError::InvalidSession(format!(
+                "MODEL_REQUEST_INVALID: {}",
+                bounded_prefix(requested, 128)
+            )));
+        }
+        let entry = projection
+            .available_models
+            .iter()
+            .find(|entry| {
+                matches!(
+                    (entry.provider_id.as_deref(), entry.model_id.as_deref()),
+                    (Some(provider), Some(model))
+                        if provider_model_matches(requested, provider, model)
+                )
+            })
+            .ok_or_else(|| {
+                RuntimeCommandError::InvalidSession(model_not_offered_message(
+                    requested,
+                    &projection.available_models,
+                ))
+            })?;
+        let (Some(provider), Some(model)) =
+            (entry.provider_id.as_deref(), entry.model_id.as_deref())
+        else {
+            unreachable!("matched catalog entries carry both ref segments")
+        };
+        let reasoning_level = match requested_effort {
+            Some(effort) => Some(
+                entry
+                    .reasoning_levels
+                    .iter()
+                    .any(|level| level == effort)
+                    .then_some(effort)
+                    .ok_or_else(|| {
+                        RuntimeCommandError::InvalidSession(format!(
+                            "MODEL_NOT_OFFERED: effort {} not in levels [{}]",
+                            bounded_prefix(effort, 128),
+                            bounded_prefix(&entry.reasoning_levels.join(", "), 512)
+                        ))
+                    })?,
+            ),
+            None => entry.default_level.as_deref(),
+        };
+        let params = serde_json::to_value(SetModelParams::new(
+            session_id,
+            provider,
+            model,
+            reasoning_level,
+        ))
+        .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
+        let switched =
+            match self
+                .driver
+                .request(SESSION_SET_MODEL, params, remaining_runtime_time(deadline)?)
+            {
+                Ok(response) => response,
+                // Only error.data.code discriminates the documented rejections;
+                // the top-level code is always -32603. Any other remote rejection
+                // is still a model-selection refusal and must not be retried.
+                Err(RequestError::Remote(error)) => {
+                    return Err(RuntimeCommandError::ModelRejected(model_rejection_message(
+                        &error,
+                    )));
+                }
+                Err(other) => return Err(RuntimeCommandError::from(other)),
+            };
+        let result = switched.result.as_ref().ok_or_else(|| {
+            RuntimeCommandError::InvalidSession("session/setModel result is missing".into())
+        })?;
+        let echo = set_model_projection_from_result(result).map_err(|error| {
+            RuntimeCommandError::InvalidSession(format!(
+                "session/setModel projection is invalid: {error}"
+            ))
+        })?;
+        let (Some(observed_provider), Some(observed_model)) =
+            (echo.provider_id.as_deref(), echo.model_id.as_deref())
+        else {
+            return Err(RuntimeCommandError::InvalidSession("MODEL_MISMATCH".into()));
+        };
+        if !provider_model_matches(requested, observed_provider, observed_model) {
+            return Err(RuntimeCommandError::InvalidSession("MODEL_MISMATCH".into()));
+        }
+        if let Some(effort) = requested_effort {
+            match echo.configured_thought_level.as_deref() {
+                Some(observed) if observed == effort => {}
+                Some(_) => {
+                    return Err(RuntimeCommandError::InvalidSession(
+                        "EFFORT_MISMATCH".into(),
+                    ));
+                }
+                None => eprintln!(
+                    "external-subagent: session/setModel did not project a thought level for the \
+                     admitted effort {effort:?}; the effective reasoning level is UNKNOWN and the \
+                     task proceeds"
+                ),
+            }
+        }
+        Ok(())
     }
 
     pub fn send_turn(
@@ -1172,9 +1308,7 @@ fn validate_requested_effort(
 }
 
 /// Admitted effort for a task, read from the strongly typed preparation
-/// (`prepared_launch_json.admission.effort`). Deliberately unlike
-/// `requested_model_from_prepared_launch`, which reads the legacy top-level
-/// `model` key that the preparation no longer writes.
+/// (`prepared_launch_json.admission.effort`).
 fn admitted_effort_from_task(task: &TaskRecord) -> Option<String> {
     match task_route(task) {
         Ok(TaskRoute::General(prepared)) => prepared
@@ -1185,15 +1319,48 @@ fn admitted_effort_from_task(task: &TaskRecord) -> Option<String> {
     }
 }
 
-fn requested_model_from_prepared_launch(prepared_launch_json: Option<&str>) -> Option<String> {
-    prepared_launch_json
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .and_then(|prepared| {
-            prepared
-                .get("model")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+/// Admitted model for a task, read from the strongly typed preparation
+/// (`prepared_launch_json.admission.model`). This retires the legacy
+/// top-level `model` read the preparation never wrote; `deny_unknown_fields`
+/// on the general preparation rejects such a row before bootstrap.
+fn admitted_model_from_task(task: &TaskRecord) -> Option<String> {
+    match task_route(task) {
+        Ok(TaskRoute::General(prepared)) => prepared
+            .admission
+            .as_ref()
+            .and_then(|identity| identity.model.clone()),
+        Err(_) => None,
+    }
+}
+
+fn model_not_offered_message(requested: &str, available: &[CatalogModelEntry]) -> String {
+    let mut tokens = available
+        .iter()
+        .filter_map(
+            |entry| match (entry.provider_id.as_deref(), entry.model_id.as_deref()) {
+                (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    tokens.sort();
+    tokens.dedup();
+    format!(
+        "MODEL_NOT_OFFERED: {}; available: [{}]",
+        bounded_prefix(requested, 128),
+        bounded_prefix(&tokens.join(", "), 512)
+    )
+}
+
+fn model_rejection_message(error: &serde_json::Value) -> String {
+    match error
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(code) => format!("MODEL_REJECTED: {}", bounded_prefix(code, 128)),
+        None => "MODEL_REJECTED".into(),
+    }
 }
 
 fn permission_mode_from_task(task: &TaskRecord) -> Option<&'static str> {
@@ -1890,6 +2057,49 @@ mod task_route_tests {
             panic!("expected the general route");
         };
         assert_eq!(routed.admission.as_ref().unwrap().effort, None);
+    }
+
+    #[test]
+    fn admitted_model_reads_only_the_strongly_typed_admission() {
+        let repository = tempfile::tempdir().unwrap();
+        let manifest = external_core::GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: "s02-admission-model".into(),
+            repository: repository.path().to_path_buf(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "model".into(),
+            write_manifest: Vec::new(),
+        };
+        let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
+            .unwrap()
+            .prepare_direct_submission(&manifest)
+            .unwrap()
+            .with_admission(external_core::AdmissionIdentity {
+                agent: "zcode".into(),
+                config_revision: 1,
+                adapter_version: "test".into(),
+                model: Some("zai/GLM-5.3".into()),
+                model_source: "catalog".into(),
+                effort: None,
+            })
+            .unwrap();
+        let record = record(&prepared);
+        assert_eq!(
+            admitted_model_from_task(&record).as_deref(),
+            Some("zai/GLM-5.3")
+        );
+
+        // The retired legacy read was `prepared_launch_json.model` at the top
+        // level. The general preparation denies unknown fields, so such a row
+        // never routes and can never reach bootstrap.
+        let mut legacy = serde_json::to_value(&prepared).unwrap();
+        legacy["model"] = serde_json::json!("zai/GLM-4.5");
+        let legacy_record = TaskRecord {
+            prepared_launch_json: legacy.to_string(),
+            ..record.clone()
+        };
+        assert_eq!(admitted_model_from_task(&legacy_record), None);
+        assert!(task_route(&legacy_record).is_err());
     }
 
     #[test]

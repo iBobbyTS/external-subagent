@@ -322,7 +322,12 @@ dependencies = [
 name = "external-fixture-zcode"
 version = "0.1.4"
 dependencies = [
+ "external-contract",
+ "external-core",
+ "external-daemon",
+ "external-store",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

@@ -6,3 +6,10 @@ license.workspace = true
 
 [dependencies]
 serde_json = "1"
+
+[dev-dependencies]
+external-contract = { path = "../../external-contract" }
+external-core = { path = "../../external-core" }
+external-daemon = { path = "../../external-daemon" }
+external-store = { path = "../../external-store" }
+tempfile = "3"

@@ -3003,10 +3003,13 @@ mod stall_tests {
             _mcp_servers: &[external_contract::StdioMcpServer],
             _timeout: Duration,
         ) -> Result<SessionReady, RuntimeCommandError> {
+            // Echo the stall harness's admitted model, exactly like a real
+            // adapter: the bootstrap now cross-checks admission.model against
+            // the runtime's configured model.
             Ok(SessionReady {
                 session_id: "stall-session".into(),
                 initial_turn_id: None,
-                configured_model: None,
+                configured_model: Some("fixture-model".into()),
             })
         }
         fn resume_session_with_mcp(
@@ -3018,7 +3021,7 @@ mod stall_tests {
             Ok(SessionReady {
                 session_id: "stall-session".into(),
                 initial_turn_id: None,
-                configured_model: None,
+                configured_model: Some("fixture-model".into()),
             })
         }
         fn send_turn(

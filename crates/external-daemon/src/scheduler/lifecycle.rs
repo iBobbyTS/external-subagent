@@ -232,8 +232,7 @@ impl Scheduler {
                 });
             }
         };
-        let requested_model =
-            requested_model_from_prepared_launch(Some(claim.task.prepared_launch_json.as_str()));
+        let requested_model = admitted_model_from_task(&claim.task);
         if let Err(code) = validate_requested_model(
             requested_model.as_deref(),
             session.configured_model.as_deref(),
