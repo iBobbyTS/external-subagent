@@ -581,19 +581,26 @@ fn dsh_model_format_error(token: &str) -> String {
 /// Validate a zcode model selection token and return the token to persist.
 ///
 /// The admission format is the contract normalization
-/// (`external_contract::normalized_model_reference`): at most 128 bytes, no
-/// NUL, at most one `/` with both sides non-empty, and a provider segment of
-/// `[A-Za-z0-9._-]+`. A bare token keeps the legacy `zai/<value>` reading so an
-/// existing bare selection stays admissible; an explicit `provider/model` token
-/// is preserved as written (the shared helper lowercases the model id for
-/// comparison, which is the wrong form to persist).
+/// (`external_contract::normalized_model_reference`) applied to the persisted
+/// form: at most 128 bytes, no NUL, at most one `/` with both sides non-empty,
+/// and a provider segment of `[A-Za-z0-9._-]+`. A bare token keeps the legacy
+/// `zai/<value>` reading so an existing bare selection stays admissible; an
+/// explicit `provider/model` token is preserved as written (the shared helper
+/// lowercases the model id for comparison, which is the wrong form to
+/// persist).
 fn normalized_zcode_model(token: &str) -> Option<String> {
-    external_contract::normalized_model_reference(token)?;
-    Some(if token.contains('/') {
+    let (provider, _) = external_contract::normalized_model_reference(token)?;
+    let normalized = if token.contains('/') {
         token.to_owned()
     } else {
-        format!("zai/{token}")
-    })
+        format!("{provider}/{token}")
+    };
+    // Re-validate the persisted form: the bare legacy reading adds the `zai/`
+    // prefix, so a raw token of 125..128 bytes would otherwise be admitted here
+    // and only fail the S02 bootstrap `normalized_scoped_model` check after the
+    // runtime already spawned.
+    external_contract::normalized_model_reference(&normalized)?;
+    Some(normalized)
 }
 
 /// Compose the public validation message for a refused zcode model token.
@@ -605,9 +612,17 @@ fn normalized_zcode_model(token: &str) -> Option<String> {
 /// generic sentence.
 fn zcode_model_format_error(token: &str) -> String {
     const FORMAT: &str = "zcode model must be {provider}/{model}";
+    // The persisted form drifts from the raw token for the legacy bare reading
+    // (it gains a `zai/` prefix), so the byte bound targets the form admission
+    // would store, not the raw input.
+    let persisted_len = if token.contains('/') {
+        token.len()
+    } else {
+        token.len() + "zai/".len()
+    };
     let cause = if token.is_empty() {
         "the token is empty"
-    } else if token.len() > 128 {
+    } else if persisted_len > 128 {
         "the token exceeds 128 bytes"
     } else if token.contains('\0') {
         "the token contains a NUL byte"
@@ -1256,6 +1271,26 @@ mod admission_tests {
         let oversized_default = format!("p/{}", "t".repeat(127));
         let invalid = zcode_gated_config(Some(&oversized_default));
         let error = resolve_admission(&input(Path::new("/repository")), &invalid).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert_eq!(
+            error.message,
+            "zcode model must be {provider}/{model}; the token exceeds 128 bytes"
+        );
+        // The bound applies to the PERSISTED form: a bare token gains the
+        // `zai/` prefix, so 124 raw bytes persist as exactly 128 and admit,
+        // while 125 raw bytes would persist as 129 and must be refused here
+        // rather than at the S02 bootstrap after the runtime already spawned.
+        let bounded_bare = "t".repeat(124);
+        let mut bare = input(Path::new("/repository"));
+        bare.model = Some(bounded_bare.clone());
+        let identity = resolve_admission(&bare, &config).unwrap();
+        let persisted = identity.model.expect("bounded bare token persists");
+        assert_eq!(persisted.len(), 128);
+        assert_eq!(persisted, format!("zai/{bounded_bare}"));
+        let oversized_bare = "t".repeat(125);
+        let mut bare = input(Path::new("/repository"));
+        bare.model = Some(oversized_bare);
+        let error = resolve_admission(&bare, &config).unwrap_err();
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert_eq!(
             error.message,

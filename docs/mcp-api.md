@@ -151,7 +151,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `permission_modes` | PermissionMode[] | 选择该 subagent 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 subagent 都支持 |
 | `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
-| `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式；三个 subagent 现均为 `catalog_token`（zcode 为 `provider/model`，dsh 为 `provider:model`，codex 为自身 model id），`native_only` 保留为不支持时的取值 | 不清楚应省略还是使用模型 token |
+| `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式；三个 subagent 现均为 `catalog_token`（zcode 为 `provider/model`，dsh 为 `provider:model`，codex 为自身 model id）。`native_only` 仅为保留枚举字面量，当前无 subagent 产出：不支持模型选择时仍发 `catalog_token` 且 `supported:false` | 不清楚应省略还是使用模型 token |
 | `effort_selection` | object | 描述推理力度（reasoning effort）选择能力 | 无法按 subagent 选择 effort 参数策略 |
 | `effort_selection.supported` | boolean | 是否应传 spawn.effort（随 `spawn_supported` 门） | 更容易触发不支持 effort 的错误 |
 | `effort_selection.mode` | enum | `closed_set / passthrough_token`，说明选择方式 | 不清楚应使用闭集值还是有界透传 token |
