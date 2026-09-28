@@ -1141,9 +1141,9 @@ mod contract_default_tests {
             ("codex", None, "agent_disabled", "agent is disabled"),
             (
                 "zcode",
-                Some("chosen"),
-                "model_selection_unsupported",
-                "model selection is unsupported for zcode",
+                Some("two/slashes/here"),
+                "validation",
+                "zcode model must be {provider}/{model}; the token contains more than one '/' separator",
             ),
             (
                 "dsh",

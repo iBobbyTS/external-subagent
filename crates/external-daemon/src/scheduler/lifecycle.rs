@@ -232,41 +232,50 @@ impl Scheduler {
                 });
             }
         };
-        let requested_model = admitted_model_from_task(&claim.task);
-        if let Err(code) = validate_requested_model(
-            requested_model.as_deref(),
-            session.configured_model.as_deref(),
-        ) {
-            let message = "runtime model did not match the prepared request";
-            let terminal = runtime.stop(self.inner.config.stop_grace);
-            let failure_message = self.record_runtime_failure(
-                &claim.task.agent_id,
-                Some(&session.session_id),
-                "session_start",
-                code,
-                message,
-                Some(runtime.as_ref()),
-            );
-            let resources_reaped = terminal_proves_process_group_reaped(&terminal);
-            if let Err(error) = self.finish_unstarted_route(
-                &claim.task.agent_id,
-                claim.owner_epoch,
-                &route,
-                task.as_ref(),
-                UnstartedTerminal {
-                    outcome: CompletionOutcome::Failed,
-                    reason_code: code,
-                    message,
-                    failure_message: Some(failure_message),
-                },
-                resources_reaped,
+        // The requested-model cross-check applies to a fresh bootstrap only.
+        // A resumed session keeps the persisted model (session stickiness):
+        // adapters that cannot re-read a model on resume return
+        // `configured_model: None`, and re-validating it would fail a task the
+        // runtime legitimately accepted. Adapters that do echo the configured
+        // model on resume (codex) are unaffected because the check is skipped
+        // for both.
+        if claim.task.session_id.is_none() {
+            let requested_model = admitted_model_from_task(&claim.task);
+            if let Err(code) = validate_requested_model(
+                requested_model.as_deref(),
+                session.configured_model.as_deref(),
             ) {
-                self.record_failure(&claim.task.agent_id, error.to_string());
+                let message = "runtime model did not match the prepared request";
+                let terminal = runtime.stop(self.inner.config.stop_grace);
+                let failure_message = self.record_runtime_failure(
+                    &claim.task.agent_id,
+                    Some(&session.session_id),
+                    "session_start",
+                    code,
+                    message,
+                    Some(runtime.as_ref()),
+                );
+                let resources_reaped = terminal_proves_process_group_reaped(&terminal);
+                if let Err(error) = self.finish_unstarted_route(
+                    &claim.task.agent_id,
+                    claim.owner_epoch,
+                    &route,
+                    task.as_ref(),
+                    UnstartedTerminal {
+                        outcome: CompletionOutcome::Failed,
+                        reason_code: code,
+                        message,
+                        failure_message: Some(failure_message),
+                    },
+                    resources_reaped,
+                ) {
+                    self.record_failure(&claim.task.agent_id, error.to_string());
+                }
+                return Err(SchedulerError::RuntimeCommand {
+                    agent_id: claim.task.agent_id,
+                    message: message.into(),
+                });
             }
-            return Err(SchedulerError::RuntimeCommand {
-                agent_id: claim.task.agent_id,
-                message: message.into(),
-            });
         }
         let identity = runtime.identity().map(|identity| StoredProcessIdentity {
             pid: identity.pid,

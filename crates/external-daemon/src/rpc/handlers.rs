@@ -41,7 +41,8 @@ use super::config::AgentConfigSnapshot;
 use super::views::{AgentModelSelectionModeView, AgentTransportView};
 #[cfg(test)]
 use crate::agent_status::{
-    AgentModelsInput, AgentProbeEvidence, AgentProbeInput, EvidenceState, ProbeScope, ScopeEvidence,
+    AgentModelsInput, AgentModelsOutput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
+    ModelCatalogEvidence, ProbeScope, ScopeEvidence,
 };
 #[cfg(test)]
 use external_core::GeneralTaskManifest;
@@ -702,6 +703,29 @@ mod agent_probe_tests {
                 hi,
             }
         }
+
+        fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
+            // S03 catalog fixture: the RPC result must carry the projected
+            // token list and the create-settings provenance unchanged.
+            let supported = input.agent == "zcode";
+            AgentModelsOutput {
+                agent: input.agent.clone(),
+                config_revision: 0,
+                supported,
+                models: if supported {
+                    vec!["zai/GLM-5.3".into(), "deepseek/deepseek-flash".into()]
+                } else {
+                    Vec::new()
+                },
+                evidence: ModelCatalogEvidence {
+                    source: "zcode_session_create_settings".into(),
+                    version: Some("3.8.1".into()),
+                    scope: input.scope.clone(),
+                    checked_at_ms: 123,
+                },
+                reason: (!supported).then(|| "native_only".into()),
+            }
+        }
     }
 
     fn service() -> (tempfile::TempDir, RpcService) {
@@ -899,7 +923,7 @@ mod agent_probe_tests {
     }
 
     #[test]
-    fn agent_models_rpc_preserves_native_only_result_and_config_identity() {
+    fn agent_models_rpc_preserves_catalog_result_and_config_identity() {
         let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
         let RpcSuccess::AgentModels { catalog } = service
@@ -911,10 +935,16 @@ mod agent_probe_tests {
         else {
             panic!("expected models result")
         };
-        assert!(!catalog.supported);
-        assert!(catalog.models.is_empty());
-        assert_eq!(catalog.reason.as_deref(), Some("native_only"));
-        assert_eq!(catalog.evidence.source, "zcode_native_model");
+        assert!(catalog.supported);
+        assert_eq!(
+            catalog.models,
+            vec![
+                "zai/GLM-5.3".to_owned(),
+                "deepseek/deepseek-flash".to_owned()
+            ]
+        );
+        assert_eq!(catalog.reason, None);
+        assert_eq!(catalog.evidence.source, "zcode_session_create_settings");
         assert_eq!(
             catalog.config_revision,
             AgentConfigSnapshot::default().revision

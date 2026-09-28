@@ -111,6 +111,27 @@ bundled and marketplace plugins: **inline directories** — every path in
 - `plugins.enabled: false` in the config disables all plugin loading;
   `install-plugin zcode` still installs and reports a `warning` instead
   of silently binding into a disabled subsystem.
+- ZCode model selection materializes a provider environment from four
+  undocumented variables (`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`,
+  `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE`,
+  `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR`). The
+  variable names and the `provider_config` schema they point at are
+  internal interfaces, not a public API, and a ZCode update can change
+  them. The group is injected atomically and falls back to today's native
+  behavior when the builtin template is unreadable. After any ZCode
+  upgrade, re-run the model chain: `subagents models zcode` must list the
+  expected catalog tokens, and one small task spawned with an explicit
+  model must complete with that model. The generated personal file holds
+  the API key, so it is written 0600 under the daemon data root and never
+  appears in catalog output, evidence, or logs.
+- `session/setModel` is the pinned switch protocol: the request always
+  sets `persistAsWorkspaceLastUsed: false`, the create result's
+  `settings.model.available` is the only whitelist (it shrinks to the
+  selected model afterwards), and a remote rejection is classified from
+  `error.data.code` (`invalid_model_request` / `model_not_found`) because
+  the top-level `code` is always -32603 and the message is only a bounded
+  fallback. A resumed session is model-sticky: it is neither re-applied
+  nor re-read.
 
 ## Session thought level (SOURCE_INSPECTED; live NOT_RUN)
 

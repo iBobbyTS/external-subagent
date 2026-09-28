@@ -251,9 +251,9 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
             ));
         }
         if let Some(model) = entry.get("default_model") {
-            if model.as_str().is_some_and(str::is_empty)
-                || (name == "zcode" && !model.is_null())
-                || (!model.is_null() && !model.is_string())
+            // S03: zcode now consumes `default_model` as the middle level of
+            // its admission precedence, so it is a normal optional selection.
+            if model.as_str().is_some_and(str::is_empty) || (!model.is_null() && !model.is_string())
             {
                 return Err(RpcError::new(
                     RpcErrorCode::Validation,
@@ -280,6 +280,26 @@ mod config_migration_tests {
                 .subagents
                 .values()
                 .all(|entry| !entry.enabled && !entry.spawn_supported));
+        }
+    }
+
+    #[test]
+    fn zcode_default_model_is_an_optional_selection() {
+        // S03: zcode admits a configured default model (bare or
+        // provider/model); only empty and non-string shapes stay invalid.
+        let config = parse_agent_config_snapshot(
+            br#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true,"default_model":"glm-5.3"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.subagents["zcode"].default_model.as_deref(),
+            Some("glm-5.3")
+        );
+        for invalid in [
+            br#"{"schema_version":2,"subagents":{"zcode":{"default_model":""}}}"#.as_slice(),
+            br#"{"schema_version":2,"subagents":{"zcode":{"default_model":42}}}"#.as_slice(),
+        ] {
+            assert!(parse_agent_config_snapshot(invalid).is_err(), "{invalid:?}");
         }
     }
 

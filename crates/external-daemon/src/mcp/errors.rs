@@ -112,7 +112,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
     // detail (same Design B as the AgentUnknown roster branch below); project
     // a recognized prefix verbatim instead of the static sentence. The list is
     // a prefix set so it can grow without message parsing.
-    const PASSTHROUGH_DETAIL_PREFIXES: [&str; 1] = ["dsh model must be"];
+    const PASSTHROUGH_DETAIL_PREFIXES: [&str; 2] = ["dsh model must be", "zcode model must be"];
     let (code, message) = match error.code {
         RpcErrorCode::Malformed | RpcErrorCode::Validation => (
             "validation",

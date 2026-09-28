@@ -211,16 +211,10 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
 }
 
 fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelectionCapabilityView {
-    if agent == "zcode" {
-        AgentModelSelectionCapabilityView {
-            supported: false,
-            mode: AgentModelSelectionModeView::NativeOnly,
-        }
-    } else {
-        AgentModelSelectionCapabilityView {
-            supported: matches!(agent, "dsh" | "codex") && effective_spawn_supported(agent, entry),
-            mode: AgentModelSelectionModeView::CatalogToken,
-        }
+    AgentModelSelectionCapabilityView {
+        supported: matches!(agent, "zcode" | "dsh" | "codex")
+            && effective_spawn_supported(agent, entry),
+        mode: AgentModelSelectionModeView::CatalogToken,
     }
 }
 
@@ -396,12 +390,6 @@ pub(super) fn resolve_admission(
             "agent is disabled",
         ));
     }
-    if agent == "zcode" && (input.model.is_some() || configured.default_model.is_some()) {
-        return Err(RpcError::new(
-            RpcErrorCode::ModelSelectionUnsupported,
-            "model selection is unsupported for zcode",
-        ));
-    }
     if !effective_spawn_supported(agent, configured) {
         return Err(RpcError::new(
             RpcErrorCode::AgentUnsupported,
@@ -461,6 +449,34 @@ pub(super) fn resolve_admission(
             (Some(token.to_owned()), "spawn_catalog")
         } else {
             (Some(token.to_owned()), "configured_default")
+        }
+    } else if agent == "zcode" {
+        // Explicit spawn token, then the configured default, then the
+        // provider-native model — the same three-level precedence as dsh. The
+        // configured default is a selection too: an unusable token is refused
+        // here rather than silently downgraded to native. A `provider/model`
+        // token is applied as written; a bare token keeps the legacy
+        // `zai/<value>` reading, matching the S02 bootstrap normalization.
+        let token = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .or_else(|| configured.default_model.as_deref().map(str::trim));
+        match token {
+            Some(token) => {
+                let Some(normalized) = normalized_zcode_model(token) else {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        zcode_model_format_error(token),
+                    ));
+                };
+                if input.model.is_some() {
+                    (Some(normalized), "spawn_catalog")
+                } else {
+                    (Some(normalized), "configured_default")
+                }
+            }
+            None => (None, "native"),
         }
     } else {
         (None, "native")
@@ -560,6 +576,62 @@ fn dsh_model_format_error(token: &str) -> String {
         return FORMAT.to_string();
     };
     format!("{FORMAT}; {cause}")
+}
+
+/// Validate a zcode model selection token and return the token to persist.
+///
+/// The admission format is the contract normalization
+/// (`external_contract::normalized_model_reference`): at most 128 bytes, no
+/// NUL, at most one `/` with both sides non-empty, and a provider segment of
+/// `[A-Za-z0-9._-]+`. A bare token keeps the legacy `zai/<value>` reading so an
+/// existing bare selection stays admissible; an explicit `provider/model` token
+/// is preserved as written (the shared helper lowercases the model id for
+/// comparison, which is the wrong form to persist).
+fn normalized_zcode_model(token: &str) -> Option<String> {
+    external_contract::normalized_model_reference(token)?;
+    Some(if token.contains('/') {
+        token.to_owned()
+    } else {
+        format!("zai/{token}")
+    })
+}
+
+/// Compose the public validation message for a refused zcode model token.
+///
+/// Each branch names one failure cause so the caller sees what to fix instead
+/// of the whole format contract; `{provider}/{model}` is the frozen format
+/// notation (not a literal). The cause order mirrors `normalized_zcode_model`
+/// and a bare token is valid, so an unmatched failure falls back to the bare
+/// generic sentence.
+fn zcode_model_format_error(token: &str) -> String {
+    const FORMAT: &str = "zcode model must be {provider}/{model}";
+    let cause = if token.is_empty() {
+        "the token is empty"
+    } else if token.len() > 128 {
+        "the token exceeds 128 bytes"
+    } else if token.contains('\0') {
+        "the token contains a NUL byte"
+    } else {
+        match token.split_once('/') {
+            Some((provider, _)) if provider.is_empty() => "the provider side is empty",
+            Some((_, model)) if model.is_empty() => "the model side is empty",
+            Some((_, model)) if model.contains('/') => {
+                "the token contains more than one '/' separator"
+            }
+            Some((provider, _)) if !is_zcode_provider_segment(provider) => {
+                "the provider side must be [A-Za-z0-9._-]+"
+            }
+            _ => return FORMAT.to_string(),
+        }
+    };
+    format!("{FORMAT}; {cause}")
+}
+
+fn is_zcode_provider_segment(provider: &str) -> bool {
+    !provider.is_empty()
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
@@ -742,15 +814,22 @@ mod admission_tests {
         config.subagents.get_mut("zcode").unwrap().enabled = true;
         input.model = Some("model".into());
         config.subagents.get_mut("zcode").unwrap().spawn_supported = false;
+        // The spawn gate still precedes model resolution, so an ungated zcode
+        // entry is unsupported rather than refused for its model.
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
-            RpcErrorCode::ModelSelectionUnsupported
+            RpcErrorCode::AgentUnsupported
         );
         input.model = Some(" ".into());
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::Validation
         );
+        config.subagents.get_mut("zcode").unwrap().spawn_supported = true;
+        input.model = Some("model".into());
+        let identity = resolve_admission(&input, &config).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("zai/model"));
+        assert_eq!(identity.model_source, "spawn_catalog");
     }
 
     #[test]
@@ -1050,6 +1129,178 @@ mod admission_tests {
             Some("high"),
             "dsh effort must pass through the gated config"
         );
+    }
+
+    fn zcode_gated_config(default_model: Option<&str>) -> AgentConfigSnapshot {
+        let mut config = AgentConfigSnapshot::default();
+        let zcode = config.subagents.get_mut("zcode").unwrap();
+        zcode.enabled = true;
+        zcode.spawn_supported = true;
+        zcode.default_model = default_model.map(str::to_owned);
+        config
+    }
+
+    #[test]
+    fn zcode_model_precedence_is_spawn_then_configured_default_then_native() {
+        let config = zcode_gated_config(Some("configured-provider/configured-default-token"));
+
+        let mut explicit = input(Path::new("/repository"));
+        explicit.model = Some("  spawn-provider/spawn-token  ".into());
+        let identity = resolve_admission(&explicit, &config).unwrap();
+        assert_eq!(identity.agent, "zcode");
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("spawn-provider/spawn-token")
+        );
+        assert_eq!(identity.model_source, "spawn_catalog");
+
+        let fallback = input(Path::new("/repository"));
+        let identity = resolve_admission(&fallback, &config).unwrap();
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("configured-provider/configured-default-token")
+        );
+        assert_eq!(identity.model_source, "configured_default");
+
+        let native =
+            resolve_admission(&input(Path::new("/repository")), &zcode_gated_config(None)).unwrap();
+        assert_eq!(native.model, None);
+        assert_eq!(native.model_source, "native");
+
+        // The model and effort selections compose on one admission.
+        let mut combined = input(Path::new("/repository"));
+        combined.model = Some("spawn-provider/spawn-token".into());
+        combined.effort = Some("high".into());
+        let identity = resolve_admission(&combined, &config).unwrap();
+        assert_eq!(
+            identity.model.as_deref(),
+            Some("spawn-provider/spawn-token")
+        );
+        assert_eq!(identity.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn zcode_bare_model_token_keeps_the_legacy_zai_reading() {
+        let config = zcode_gated_config(None);
+        let mut bare = input(Path::new("/repository"));
+        bare.model = Some("glm-5.3".into());
+        let identity = resolve_admission(&bare, &config).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("zai/glm-5.3"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+        // A bare configured default takes the same legacy interpretation.
+        let configured = zcode_gated_config(Some("configured-token"));
+        let identity = resolve_admission(&input(Path::new("/repository")), &configured).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("zai/configured-token"));
+        assert_eq!(identity.model_source, "configured_default");
+    }
+
+    #[test]
+    fn zcode_invalid_resolved_model_token_is_refused_before_the_task_exists() {
+        let config = zcode_gated_config(Some("configured-provider/configured-default-token"));
+        // Spawn-token failures name the exact format cause.
+        for (invalid, expected) in [
+            (
+                "two/slashes/here",
+                "zcode model must be {provider}/{model}; the token contains more than one '/' separator",
+            ),
+            (
+                "/model",
+                "zcode model must be {provider}/{model}; the provider side is empty",
+            ),
+            (
+                "provider/",
+                "zcode model must be {provider}/{model}; the model side is empty",
+            ),
+            (
+                "pr ov/model",
+                "zcode model must be {provider}/{model}; the provider side must be [A-Za-z0-9._-]+",
+            ),
+        ] {
+            let mut spawn = input(Path::new("/repository"));
+            spawn.model = Some(invalid.into());
+            let error = resolve_admission(&spawn, &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
+            assert_eq!(error.message, expected, "{invalid:?}");
+        }
+        // Empty and NUL tokens are reachable only through the configured
+        // default: a spawn `model` is filtered first by `validate_text` and
+        // would answer "model is invalid".
+        for (default_model, expected) in [
+            (
+                " ",
+                "zcode model must be {provider}/{model}; the token is empty",
+            ),
+            (
+                "provider/mo\0del",
+                "zcode model must be {provider}/{model}; the token contains a NUL byte",
+            ),
+        ] {
+            let invalid = zcode_gated_config(Some(default_model));
+            let error = resolve_admission(&input(Path::new("/repository")), &invalid).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{default_model:?}");
+            assert_eq!(error.message, expected, "{default_model:?}");
+        }
+        // The bound stays exact: the largest bounded token admits and one byte
+        // more is refused as oversized.
+        let bounded_token = format!("p/{}", "t".repeat(126));
+        assert_eq!(bounded_token.len(), 128);
+        let mut bounded = input(Path::new("/repository"));
+        bounded.model = Some(bounded_token.clone());
+        assert_eq!(
+            resolve_admission(&bounded, &config)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some(bounded_token.as_str())
+        );
+        let oversized_default = format!("p/{}", "t".repeat(127));
+        let invalid = zcode_gated_config(Some(&oversized_default));
+        let error = resolve_admission(&input(Path::new("/repository")), &invalid).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert_eq!(
+            error.message,
+            "zcode model must be {provider}/{model}; the token exceeds 128 bytes"
+        );
+    }
+
+    #[test]
+    fn zcode_model_selection_capability_follows_the_spawn_gate() {
+        let evidence = AgentEvidenceStore::new(None);
+        let statuses = configured_agent_statuses(&zcode_gated_config(None), &evidence);
+        let zcode = statuses.iter().find(|s| s.agent == "zcode").unwrap();
+        assert_eq!(
+            zcode.model_selection,
+            AgentModelSelectionCapabilityView {
+                supported: true,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            }
+        );
+        let dsh = statuses.iter().find(|s| s.agent == "dsh").unwrap();
+        assert_eq!(
+            dsh.model_selection,
+            AgentModelSelectionCapabilityView {
+                supported: false,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            }
+        );
+        // The ungated default projection keeps catalog_token with support off.
+        let statuses = configured_agent_statuses(&AgentConfigSnapshot::default(), &evidence);
+        let zcode = statuses.iter().find(|s| s.agent == "zcode").unwrap();
+        assert_eq!(
+            zcode.model_selection,
+            AgentModelSelectionCapabilityView {
+                supported: false,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            }
+        );
+        // The unavailable projection carries no model choice at all.
+        for status in unavailable_agent_statuses() {
+            assert!(!status.model_selection.supported, "{}", status.agent);
+            assert_eq!(
+                status.model_selection.mode,
+                AgentModelSelectionModeView::CatalogToken
+            );
+        }
     }
 
     #[test]
@@ -1870,7 +2121,7 @@ mod admission_policy_tests {
     }
 
     #[test]
-    fn zcode_admission_capabilities_are_unchanged() {
+    fn zcode_admission_preserves_modes_manifests_and_admits_model_tokens() {
         // Explicit enable preserves all four modes and caller manifests.
         let _env_guard = config_env_guard();
         let config_root = gated_dsh_config(None);
@@ -1921,20 +2172,50 @@ mod admission_policy_tests {
             serde_json::from_str(&stored.prepared_launch_json).unwrap();
         assert_eq!(prepared.write_manifest, vec![PathBuf::from(".")]);
 
-        // ZCode model selection stays explicitly refused before prompt.
+        // A spawn model is admitted with the legacy bare-token reading and
+        // persisted into the task identity. A fresh workspace keeps the
+        // one-active-task-per-workspace rule out of the way.
+        let model_workspace = zcode_root.path().join("zcode-model");
+        fs::create_dir(&model_workspace).unwrap();
         let response = submit(
             &service,
             "zcode-model",
             "zcode",
             Some("glm-5.3"),
+            &model_workspace,
+            "build",
+            &[],
+        );
+        let task = match response.outcome {
+            RpcOutcome::Success { result } => match *result {
+                RpcSuccess::GeneralSubmitted { task, .. } => task,
+                _ => panic!("expected a submitted task"),
+            },
+            RpcOutcome::Error { error } => {
+                panic!("zcode model selection must admit: {error:?}")
+            }
+        };
+        let identity = flat_identity(&task.input_identity).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("zai/glm-5.3"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+
+        // A malformed token is refused before any task exists.
+        let response = submit(
+            &service,
+            "zcode-model-invalid",
+            "zcode",
+            Some("two/slashes/here"),
             &build_workspace,
             "build",
             &[],
         );
         let RpcOutcome::Error { error } = response.outcome else {
-            panic!("zcode model selection must be refused")
+            panic!("zcode malformed model must be refused")
         };
-        assert_eq!(error.code, RpcErrorCode::ModelSelectionUnsupported);
-        assert_eq!(error.message, "model selection is unsupported for zcode");
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert_eq!(
+            error.message,
+            "zcode model must be {provider}/{model}; the token contains more than one '/' separator"
+        );
     }
 }

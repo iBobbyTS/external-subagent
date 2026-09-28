@@ -363,7 +363,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
 
     fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
         if input.agent == "zcode" {
-            return unsupported_models(input, "native_only");
+            return probe_zcode_models(self.runtime_source.as_deref(), input);
         }
         if input.agent == "codex" {
             // The Codex catalog was observed only through the controlled live
@@ -501,6 +501,176 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
         },
         reason: Some(reason.into()),
     }
+}
+
+/// Read the ZCode model directory from the session/create
+/// `settings.model.available` catalog without sending a prompt.
+///
+/// The probe reuses the read-only hi probe's command shape — the daemon policy
+/// environment, the app-server transport, and the S01 provider environment —
+/// but stops after create: `available` is a create-time fact that shrinks to
+/// the selected model after `session/setModel`, so it must never be re-read as
+/// the full directory. Only entries carrying both providerId and modelId
+/// project; the credentials stay in the shared 0600 provider file and never
+/// reach the output, evidence, or logs.
+fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
+    let checked_at_ms = wall_now_millis();
+    let mut scope = input.scope.clone();
+    if scope.home.is_none() {
+        scope.home = env::var_os("ZCODE_HOME")
+            .or_else(|| env::var_os("HOME"))
+            .map(|value| value.to_string_lossy().into_owned());
+    }
+    let disposable_workspace = if scope.workspace.is_none() {
+        tempfile::Builder::new()
+            .prefix("external-subagent-zcode-catalog-")
+            .tempdir()
+            .ok()
+    } else {
+        None
+    };
+    if let Some(workspace) = disposable_workspace.as_ref() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700));
+        }
+        scope.workspace = Some(workspace.path().to_string_lossy().into_owned());
+    }
+    let local = probe_local(executable, scope.clone(), checked_at_ms);
+    let evidence = ModelCatalogEvidence {
+        source: "zcode_session_create_settings".into(),
+        version: local.version.clone(),
+        scope: scope.clone(),
+        checked_at_ms,
+    };
+    if local.state != EvidenceState::Ready {
+        return zcode_models_degraded(
+            input,
+            evidence,
+            local.reason.as_deref().unwrap_or("missing"),
+        );
+    }
+    let Some(workspace) = scope.workspace.as_deref() else {
+        return zcode_models_degraded(input, evidence, "workspace_required");
+    };
+    if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
+        return zcode_models_degraded(input, evidence, "workspace_missing");
+    }
+    let executable = executable.expect("ready local evidence has a runtime path");
+    let mut command = runtime_command(executable, false);
+    if let Some(home) = scope.home.as_deref() {
+        command.env("ZCODE_HOME", home);
+    }
+    command
+        .env("ZCODE_AGENT_POLICY", "1")
+        .env("ZCODE_AGENT_PERMISSION_MODE", "plan")
+        .env("ZCODE_AGENT_WORKSPACE_ROOT", workspace)
+        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
+        .env("ZCODE_AGENT_WRITE_MANIFEST", "[]");
+    if let Some(data_root) = crate::zcode::data_root_from_environment() {
+        crate::zcode::apply_provider_environment(&mut command, executable, &data_root);
+    }
+    let driver = match Driver::spawn(command) {
+        Ok(driver) => Arc::new(driver),
+        Err(_) => return zcode_models_degraded(input, evidence, "transport"),
+    };
+    let result = run_zcode_create_catalog(Arc::clone(&driver), workspace);
+    let mapped = match result {
+        Ok((models, session_id)) => {
+            let _ = driver.request(
+                SESSION_CLOSE,
+                serde_json::to_value(SessionParams {
+                    session_id: &session_id,
+                })
+                .unwrap_or(Value::Null),
+                RUNTIME_STOP_GRACE,
+            );
+            if models.is_empty() {
+                Err("model_catalog_empty".to_owned())
+            } else {
+                Ok(models)
+            }
+        }
+        Err(reason) => Err(reason),
+    };
+    let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
+    match mapped {
+        Ok(models) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: true,
+            models,
+            evidence,
+            reason: None,
+        },
+        Err(reason) => zcode_models_degraded(input, evidence, &reason),
+    }
+}
+
+fn zcode_models_degraded(
+    input: &AgentModelsInput,
+    evidence: ModelCatalogEvidence,
+    reason: &str,
+) -> AgentModelsOutput {
+    AgentModelsOutput {
+        agent: input.agent.clone(),
+        config_revision: 0,
+        supported: false,
+        models: Vec::new(),
+        evidence,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Create one plan session and project its `settings.model.available` catalog.
+///
+/// No prompt is sent and the session is closed by the caller. `available`
+/// entries missing either ref segment cannot be selected and are dropped.
+fn run_zcode_create_catalog(
+    driver: Arc<Driver>,
+    workspace: &str,
+) -> Result<(Vec<String>, String), String> {
+    let deadline = Instant::now() + RUNTIME_PROBE_TIMEOUT;
+    let mut events = ProbeEventCache::default();
+    let workspace_ref = WorkspaceRef {
+        workspace_key: workspace,
+        workspace_path: workspace,
+    };
+    let created = request_with_runtime_preferences(
+        Arc::clone(&driver),
+        SESSION_CREATE,
+        serde_json::to_value(CreateSessionParams {
+            workspace: workspace_ref,
+            mode: Some("plan"),
+            thought_level: None,
+            mcp_servers: &[],
+        })
+        .map_err(|_| "transport".to_owned())?,
+        deadline,
+        &mut events,
+    )
+    .map_err(|_| "create_failed".to_owned())?;
+    let projection = created
+        .result
+        .as_ref()
+        .ok_or_else(|| "transport".to_owned())
+        .and_then(|result| {
+            SessionCreateProjection::from_result(result).map_err(|_| "transport".to_owned())
+        })?;
+    let mut models = projection
+        .available_models
+        .iter()
+        .filter_map(
+            |entry| match (entry.provider_id.as_deref(), entry.model_id.as_deref()) {
+                (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    models.sort();
+    models.dedup();
+    Ok((models, projection.session_id))
 }
 
 fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
@@ -2746,20 +2916,160 @@ process.stdin.on('data', (chunk) => {
         );
     }
 
+    /// Minimal zcode app-server fixture for the models probe: answers
+    /// `--version`, completes the create-time runtime-preferences handshake,
+    /// returns a controllable `settings.model.available` catalog (or a create
+    /// error), and answers `session/close`. Every inbound frame is logged so
+    /// the test can assert the probe never sent a prompt.
+    fn fake_models_runtime(executable: &Path, log: &Path, catalog: &Value, create_error: bool) {
+        let source = r#"
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('3.8.1\n'); process.exit(0); }
+const log = __LOG__;
+const catalog = __CATALOG__;
+const createError = __CREATE_ERROR__;
+let pendingCreate = null;
+let buffer = '';
+function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n'); if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const value = JSON.parse(line);
+    fs.appendFileSync(log, JSON.stringify({
+      value,
+      permissionMode: process.env.ZCODE_AGENT_PERMISSION_MODE,
+      writeManifest: process.env.ZCODE_AGENT_WRITE_MANIFEST
+    }) + '\n');
+    if (value.method === 'session/create') {
+      if (value.params.mode !== 'plan') { write({ id: value.id, error: { code: -32602, message: 'not plan' } }); continue; }
+      if (createError) { write({ id: value.id, error: { code: -32603, message: 'fixture create failed' } }); continue; }
+      pendingCreate = value.id;
+      write({ id: 'preferences', method: 'session/requestRuntimePreferences', params: { scope: 'session', sessionId: 'catalog-session' } });
+    } else if (value.id === 'preferences' && value.result) {
+      write({ id: pendingCreate, result: { session: { sessionId: 'catalog-session' }, settings: { model: { current: { providerId: 'zai', modelId: 'GLM-5.3' }, available: catalog } } } });
+    } else if (value.method === 'session/close') {
+      write({ id: value.id, result: { closed: true } });
+    }
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(log).unwrap())
+        .replace("__CATALOG__", &catalog.to_string())
+        .replace("__CREATE_ERROR__", if create_error { "true" } else { "false" });
+        fs::write(executable, source).unwrap();
+    }
+
     #[test]
-    fn zcode_catalog_is_explicitly_native_only_without_runtime_start() {
+    fn zcode_catalog_projects_create_settings_available_without_a_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("zcode-models.mjs");
+        let log = directory.path().join("models.jsonl");
+        let catalog = serde_json::json!([
+            {
+                "ref": {"providerId": "zai", "modelId": "GLM-5.3"},
+                "reasoning": {"levels": [{"value": "high", "label": "high"}], "defaultLevel": "high"}
+            },
+            {"ref": {"providerId": "deepseek", "modelId": "deepseek-flash"}},
+            // Entries missing either ref segment cannot be selected and drop.
+            {"label": "no-ref"},
+            {"ref": {"providerId": "zai"}}
+        ]);
+        fake_models_runtime(&runtime, &log, &catalog, false);
+        let scope = ProbeScope {
+            workspace: Some(directory.path().to_string_lossy().into_owned()),
+            home: Some(directory.path().to_string_lossy().into_owned()),
+            profile: None,
+            version: None,
+        };
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+            verifier_deadline: None,
+        };
+        let output = backend.models(&AgentModelsInput {
+            agent: "zcode".into(),
+            scope,
+        });
+        assert!(output.supported, "{output:?}");
+        assert_eq!(
+            output.models,
+            vec![
+                "deepseek/deepseek-flash".to_owned(),
+                "zai/GLM-5.3".to_owned()
+            ]
+        );
+        assert_eq!(output.evidence.source, "zcode_session_create_settings");
+        assert_eq!(output.evidence.version.as_deref(), Some("3.8.1"));
+        assert_eq!(output.reason, None);
+
+        let frames = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let methods = frames
+            .iter()
+            .filter_map(|frame| frame["value"]["method"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["session/create", "session/close"], "{frames:?}");
+        let create = frames
+            .iter()
+            .find(|frame| frame["value"]["method"] == "session/create")
+            .unwrap();
+        assert_eq!(create["value"]["params"]["mode"], "plan");
+        assert_eq!(create["permissionMode"], "plan");
+        assert_eq!(create["writeManifest"], "[]");
+        assert!(create["value"]["params"].get("mcpServers").is_none());
+    }
+
+    #[test]
+    fn zcode_catalog_degrades_when_session_create_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("zcode-models.mjs");
+        let log = directory.path().join("models.jsonl");
+        fake_models_runtime(&runtime, &log, &serde_json::json!([]), true);
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+            verifier_deadline: None,
+        };
+        let output = backend.models(&AgentModelsInput {
+            agent: "zcode".into(),
+            scope: ProbeScope {
+                workspace: Some(directory.path().to_string_lossy().into_owned()),
+                home: Some(directory.path().to_string_lossy().into_owned()),
+                profile: None,
+                version: None,
+            },
+        });
+        assert!(!output.supported);
+        assert!(output.models.is_empty());
+        assert_eq!(output.reason.as_deref(), Some("create_failed"));
+        assert_eq!(output.evidence.source, "zcode_session_create_settings");
+    }
+
+    #[test]
+    fn zcode_catalog_reports_a_missing_runtime_without_spawning() {
+        let workspace = tempfile::tempdir().unwrap();
         let backend = ProcessProbeBackend {
             runtime_source: Some(PathBuf::from("/must-not-run")),
             verifier_deadline: None,
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
-            scope: ProbeScope::default(),
+            scope: ProbeScope {
+                workspace: Some(workspace.path().to_string_lossy().into_owned()),
+                home: Some("/home-a".into()),
+                profile: None,
+                version: None,
+            },
         });
         assert!(!output.supported);
         assert!(output.models.is_empty());
-        assert_eq!(output.reason.as_deref(), Some("native_only"));
-        assert_eq!(output.evidence.source, "zcode_native_model");
+        assert_eq!(output.reason.as_deref(), Some("missing"));
+        assert_eq!(output.evidence.source, "zcode_session_create_settings");
     }
 
     fn wait_process_gone(pid: i32, deadline: Instant) -> bool {

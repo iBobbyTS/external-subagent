@@ -615,8 +615,8 @@ mod effort_projection_tests {
             },
             permission_modes: Vec::new(),
             model_selection: crate::rpc::AgentModelSelectionCapabilityView {
-                supported: false,
-                mode: crate::rpc::AgentModelSelectionModeView::NativeOnly,
+                supported,
+                mode: crate::rpc::AgentModelSelectionModeView::CatalogToken,
             },
             effort_selection: AgentEffortSelectionCapabilityView {
                 supported,

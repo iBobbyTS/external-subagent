@@ -3018,10 +3018,13 @@ mod stall_tests {
             _mcp_servers: &[external_contract::StdioMcpServer],
             _timeout: Duration,
         ) -> Result<SessionReady, RuntimeCommandError> {
+            // A resumed session is model-sticky: like the zcode owner, this
+            // fixture cannot re-read the configured model and returns None.
+            // The scheduler must not re-validate the admitted model on resume.
             Ok(SessionReady {
                 session_id: "stall-session".into(),
                 initial_turn_id: None,
-                configured_model: Some("fixture-model".into()),
+                configured_model: None,
             })
         }
         fn send_turn(
@@ -3227,6 +3230,83 @@ mod stall_tests {
             persisted["stall_elapsed_ms"].as_u64().unwrap()
                 >= STALL_TIMEOUT.as_millis() as u64
         );
+    }
+
+    #[test]
+    fn fresh_bootstrap_still_enforces_the_requested_model_gate() {
+        let harness = stall_harness(false, "zcode");
+        let store = harness.scheduler.store();
+        // Rewrite the persisted admission model so the fixture's echoed
+        // bootstrap model no longer matches it. A fresh bootstrap must still
+        // fail closed on the divergence (only the resume path skips the gate).
+        {
+            let task = store.get_task(&harness.agent_id).unwrap().unwrap();
+            let mut prepared: serde_json::Value =
+                serde_json::from_str(&task.prepared_launch_json).unwrap();
+            prepared["admission"]["model"] = serde_json::json!("other-model");
+            let connection = rusqlite::Connection::open(store.database_path()).unwrap();
+            connection
+                .execute(
+                    "UPDATE tasks SET prepared_launch_json=?1 WHERE agent_id=?2",
+                    rusqlite::params![prepared.to_string(), harness.agent_id],
+                )
+                .unwrap();
+        }
+        let error = harness.scheduler.start_ready().unwrap_err();
+        assert!(matches!(error, SchedulerError::RuntimeCommand { .. }));
+        let task = store.get_task(&harness.agent_id).unwrap().unwrap();
+        assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(
+            store
+                .terminal_reason_code(&harness.agent_id)
+                .unwrap()
+                .as_deref(),
+            Some("MODEL_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn resume_skips_the_requested_model_gate_for_a_sticky_session() {
+        let harness = stall_harness(false, "zcode");
+        let store = harness.scheduler.store();
+        // The task carries an admitted model, but its resume adapter cannot
+        // re-read the persisted model (configured_model None). Resume must not
+        // re-validate the sticky session, so the task still reaches RUNNING.
+        let claim = store.claim_next("stall-test", 10, 1).unwrap().unwrap();
+        assert!(store
+            .mark_session_running(
+                &harness.agent_id,
+                claim.owner_epoch,
+                "old-runtime",
+                None,
+                Some("sticky-session"),
+                None,
+            )
+            .unwrap());
+        store
+            .store_task_result(
+                &harness.agent_id,
+                &external_store::TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "prior turn failed".into(),
+                    partial: true,
+                },
+            )
+            .unwrap();
+        assert!(store
+            .requeue_task_for_resume_with_message(
+                &harness.agent_id,
+                "resume-model-gate",
+                "continue"
+            )
+            .unwrap());
+        let resumed = store.get_task(&harness.agent_id).unwrap().unwrap();
+        assert_eq!(resumed.session_id.as_deref(), Some("sticky-session"));
+        assert_eq!(
+            harness.scheduler.start_ready().unwrap(),
+            vec![harness.agent_id.clone()]
+        );
+        await_phase(&harness.scheduler, &harness.agent_id, TaskPhase::Running);
     }
 
     #[test]
