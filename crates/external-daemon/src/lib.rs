@@ -1012,14 +1012,11 @@ impl RuntimeOwner {
                 .request(SESSION_SET_MODEL, params, remaining_runtime_time(deadline)?)
             {
                 Ok(response) => response,
-                // Only error.data.code discriminates the documented rejections;
-                // the top-level code is always -32603. Any other remote rejection
-                // is still a model-selection refusal and must not be retried.
-                Err(RequestError::Remote(error)) => {
-                    return Err(RuntimeCommandError::ModelRejected(model_rejection_message(
-                        &error,
-                    )));
-                }
+                // Only error.data.code discriminates the documented model
+                // rejections; the top-level code is always -32603. Any other
+                // remote failure is NOT proof the model token was refused, so
+                // it must not claim MODEL_REJECTED.
+                Err(RequestError::Remote(error)) => return Err(remote_set_model_error(&error)),
                 Err(other) => return Err(RuntimeCommandError::from(other)),
             };
         let result = switched.result.as_ref().ok_or_else(|| {
@@ -1350,6 +1347,32 @@ fn model_not_offered_message(requested: &str, available: &[CatalogModelEntry]) -
         bounded_prefix(requested, 128),
         bounded_prefix(&tokens.join(", "), 512)
     )
+}
+
+/// Classify a remote `session/setModel` error.
+///
+/// Only the two documented `error.data.code` values prove the model token
+/// itself was refused; those become `ModelRejected` (scheduler `MODEL_REJECTED`).
+/// Every other remote failure (missing/unknown `data.code`, malformed payload)
+/// is an unrecognized bootstrap failure and stays `InvalidSession` (scheduler
+/// `SESSION_START_FAILED`) instead of mislabeling the model as rejected.
+fn remote_set_model_error(error: &serde_json::Value) -> RuntimeCommandError {
+    let code = error
+        .get("data")
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str);
+    match code {
+        Some("invalid_model_request" | "model_not_found") => {
+            RuntimeCommandError::ModelRejected(model_rejection_message(error))
+        }
+        Some(code) => RuntimeCommandError::InvalidSession(format!(
+            "session/setModel was rejected: {}",
+            bounded_prefix(code, 128)
+        )),
+        None => {
+            RuntimeCommandError::InvalidSession("session/setModel was rejected: unknown".into())
+        }
+    }
 }
 
 fn model_rejection_message(error: &serde_json::Value) -> String {

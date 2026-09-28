@@ -254,6 +254,7 @@ fn main() {
     let set_model_current = env_json("ZCODE_FAKE_SETMODEL_CURRENT");
     let set_model_effort = std::env::var("ZCODE_FAKE_SETMODEL_EFFORT").ok();
     let set_model_error_code = env_token("ZCODE_FAKE_SETMODEL_ERROR_CODE");
+    let set_model_error_without_code = env_token("ZCODE_FAKE_SETMODEL_ERROR_WITHOUT_CODE");
     let log_path = env_token("ZCODE_FAKE_LOG");
     let mut pending_permission: Option<Value> = None;
 
@@ -400,9 +401,18 @@ fn main() {
                 let requested_model = params.get("model").cloned().unwrap_or_else(|| json!({}));
                 // Configurable remote rejection: the documented discriminators
                 // live on error.data.code, the top-level code always -32603.
+                // ZCODE_FAKE_SETMODEL_ERROR_WITHOUT_CODE drops the whole
+                // `data` object to model an unrecognized remote failure.
                 if let Some(code) = &set_model_error_code {
-                    let _ = write_value(
-                        &mut out,
+                    let error = if set_model_error_without_code.is_some() {
+                        json!({
+                            "id": id,
+                            "error": {
+                                "code": -32603,
+                                "message": "fixture setModel rejected without a data code"
+                            }
+                        })
+                    } else {
                         json!({
                             "id": id,
                             "error": {
@@ -410,8 +420,9 @@ fn main() {
                                 "message": format!("fixture setModel rejected: {code}"),
                                 "data": {"name": "ModelProtocolError", "code": code}
                             }
-                        }),
-                    );
+                        })
+                    };
+                    let _ = write_value(&mut out, error);
                     continue;
                 }
                 // Success echo: default is the requested reference (so a

@@ -273,6 +273,57 @@ fn ac3_remote_model_rejection_maps_to_model_rejected() {
     }
 }
 
+/// Repair (S02 closing review): an unrecognized remote failure during the
+/// switch — an unknown `error.data.code` or a missing one — must NOT claim
+/// MODEL_REJECTED. It stays the InvalidSession variant and classifies as
+/// SESSION_START_FAILED, the honest bucket for an unrecognized bootstrap
+/// failure.
+#[test]
+fn unrecognized_remote_set_model_failure_stays_invalid_session() {
+    let unknown_code = run_case(
+        "s02-ac3-unknown-code-",
+        &[("ZCODE_FAKE_SETMODEL_ERROR_CODE", "session_busy")],
+        Some("zai/GLM-5.3"),
+        Some("high"),
+    );
+    assert!(unknown_code.start.is_err());
+    assert_eq!(unknown_code.outcome(), TaskOutcome::Failed);
+    assert_eq!(
+        unknown_code.reason_code().as_deref(),
+        Some("SESSION_START_FAILED"),
+        "an unknown data.code must not be labeled MODEL_REJECTED"
+    );
+    let failure = unknown_code.last_error().unwrap();
+    assert!(
+        failure.contains("invalid session response")
+            && failure.contains("session/setModel was rejected: session_busy"),
+        "unknown code must stay InvalidSession with a bounded token: {failure}"
+    );
+
+    let missing_code = run_case(
+        "s02-ac3-no-code-",
+        &[
+            ("ZCODE_FAKE_SETMODEL_ERROR_CODE", "ignored"),
+            ("ZCODE_FAKE_SETMODEL_ERROR_WITHOUT_CODE", "1"),
+        ],
+        Some("zai/GLM-5.3"),
+        Some("high"),
+    );
+    assert!(missing_code.start.is_err());
+    assert_eq!(missing_code.outcome(), TaskOutcome::Failed);
+    assert_eq!(
+        missing_code.reason_code().as_deref(),
+        Some("SESSION_START_FAILED"),
+        "a missing data.code must not be labeled MODEL_REJECTED"
+    );
+    let failure = missing_code.last_error().unwrap();
+    assert!(
+        failure.contains("invalid session response")
+            && failure.contains("session/setModel was rejected: unknown"),
+        "missing code must stay InvalidSession with an unknown marker: {failure}"
+    );
+}
+
 /// AC④: a success result whose read-back diverges fails closed as
 /// MODEL_MISMATCH even though the request was offered.
 #[test]
