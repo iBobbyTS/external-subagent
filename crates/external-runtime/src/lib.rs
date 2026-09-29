@@ -37,11 +37,16 @@ pub const MAX_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// `ZcodeStrict` keeps the pinned app-server envelope (no `jsonrpc` field).
 /// `JsonRpc2` accepts and emits standard JSON-RPC 2.0 frames for adapters
 /// whose provider speaks that dialect (for example the DSH ACP transport).
-/// The envelope types stay shared; only the framing differs.
+/// `Ndjson` accepts any single JSON value per line and delivers it verbatim as
+/// a [`WireMessage::UnknownEvent`] (the frame's `event` string, when present,
+/// becomes the `method` label), for providers whose stream has no request/id
+/// or `session/event` envelope semantics (for example the `agy` stream-json
+/// transport). The envelope types stay shared; only the framing differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameCodec {
     ZcodeStrict,
     JsonRpc2,
+    Ndjson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,8 +218,9 @@ impl Driver {
 
     /// Spawn with an explicit wire codec. JSON-RPC 2.0 mode parses inbound
     /// frames that carry `"jsonrpc":"2.0"` and stamps the field on outbound
-    /// requests/responses; all other process, deadline, and correlation
-    /// behavior is identical.
+    /// requests/responses; NDJSON mode parses each inbound line as one JSON
+    /// value and delivers it as a raw unknown-event frame. All other process,
+    /// deadline, and correlation behavior is identical.
     pub fn spawn_with_codec(mut command: Command, codec: FrameCodec) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
@@ -429,7 +435,7 @@ impl Driver {
     /// Serialize one outbound frame under the driver's wire codec.
     fn encode_frame<T: serde::Serialize>(&self, value: &T) -> serde_json::Result<String> {
         match self.codec {
-            FrameCodec::ZcodeStrict => encode(value),
+            FrameCodec::ZcodeStrict | FrameCodec::Ndjson => encode(value),
             FrameCodec::JsonRpc2 => {
                 let mut object = serde_json::to_value(value)?;
                 if let Some(map) = object.as_object_mut() {
@@ -1301,6 +1307,7 @@ fn read_loop(
                 let parsed = match codec {
                     FrameCodec::ZcodeStrict => parse_line(&line),
                     FrameCodec::JsonRpc2 => parse_jsonrpc_line(&line),
+                    FrameCodec::Ndjson => parse_ndjson_line(&line),
                 };
                 match parsed {
                     Ok(msg) => {
@@ -1379,6 +1386,22 @@ pub fn parse_jsonrpc_line(line: &str) -> Result<WireMessage, external_contract::
     let canonical = serde_json::to_string(&canonical)
         .map_err(|error| external_contract::ParseError::InvalidJson(error.to_string()))?;
     parse_line(&canonical)
+}
+
+/// Parse one inbound NDJSON frame into the shared envelope types without
+/// imposing any method/id semantics: the whole parsed JSON value is delivered
+/// as a [`WireMessage::UnknownEvent`] whose `method` is the frame's `event`
+/// string when present. A frame that is not a syntactically valid JSON value
+/// stays a malformed frame, exactly like the other codecs.
+pub fn parse_ndjson_line(line: &str) -> Result<WireMessage, external_contract::ParseError> {
+    let value: serde_json::Value = serde_json::from_str(line)
+        .map_err(|error| external_contract::ParseError::InvalidJson(error.to_string()))?;
+    let method = value
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(WireMessage::UnknownEvent { method, raw: value })
 }
 
 fn read_bounded_line(reader: &mut impl Read) -> std::io::Result<Option<(Vec<u8>, usize)>> {
@@ -1536,6 +1559,98 @@ mod tests {
         ] {
             assert!(parse_jsonrpc_line(line).is_err(), "frame accepted: {line}");
         }
+    }
+
+    #[test]
+    fn ndjson_codec_delivers_the_raw_parsed_value_without_envelope_semantics() {
+        assert_eq!(
+            parse_ndjson_line(r#"{"event":"init","conversation_id":"c1","init":{"tools":[]}}"#)
+                .unwrap(),
+            WireMessage::UnknownEvent {
+                method: "init".into(),
+                raw: serde_json::json!({
+                    "event": "init",
+                    "conversation_id": "c1",
+                    "init": {"tools": []},
+                }),
+            }
+        );
+        // A frame with no `event` key is still delivered verbatim (empty label);
+        // any JSON value is accepted, not only objects.
+        assert_eq!(
+            parse_ndjson_line(r#"{"result":{"status":"SUCCESS"}}"#).unwrap(),
+            WireMessage::UnknownEvent {
+                method: String::new(),
+                raw: serde_json::json!({"result": {"status": "SUCCESS"}}),
+            }
+        );
+        assert_eq!(
+            parse_ndjson_line("[1,2,3]").unwrap(),
+            WireMessage::UnknownEvent {
+                method: String::new(),
+                raw: serde_json::json!([1, 2, 3]),
+            }
+        );
+        // Bad JSON stays a transport-level malformed frame.
+        assert!(parse_ndjson_line("not json").is_err());
+    }
+
+    #[test]
+    fn ndjson_codec_skips_malformed_lines_and_keeps_reading() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"c1\"}' 'oops not json' \
+             '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"OK\"}}'; sleep 5",
+        ]);
+        let driver = Driver::spawn_with_codec(command, FrameCodec::Ndjson).unwrap();
+        assert_eq!(driver.codec(), FrameCodec::Ndjson);
+        match driver.recv_timeout(Duration::from_secs(2)).unwrap() {
+            Inbound::Message(WireMessage::UnknownEvent { method, raw }) => {
+                assert_eq!(method, "init");
+                assert_eq!(raw["conversation_id"], "c1");
+            }
+            other => panic!("expected init frame, got {other:?}"),
+        }
+        assert!(matches!(
+            driver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Inbound::Malformed(_)
+        ));
+        // The malformed line is skipped, not fatal: the next frame arrives.
+        match driver.recv_timeout(Duration::from_secs(2)).unwrap() {
+            Inbound::Message(WireMessage::UnknownEvent { method, raw }) => {
+                assert_eq!(method, "result");
+                assert_eq!(raw["result"]["response"], "OK");
+            }
+            other => panic!("expected result frame after noise, got {other:?}"),
+        }
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn ndjson_codec_sends_plain_frames_without_a_jsonrpc_version() {
+        let path = capture_path("ndjson-outbound");
+        let mut command = Command::new("sh");
+        command
+            .env("RESPONSE_PATH", &path)
+            .args([
+                "-c",
+                "IFS= read -r line; printf '%s\\n' \"$line\" > \"$RESPONSE_PATH\"; sleep 5",
+            ]);
+        let driver = Driver::spawn_with_codec(command, FrameCodec::Ndjson).unwrap();
+        driver
+            .send(&serde_json::json!({
+                "event": "user",
+                "message": {"content": "hello"},
+            }))
+            .unwrap();
+        let text = String::from_utf8(wait_for_file(&path)).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(frame["event"], "user");
+        assert_eq!(frame["message"]["content"], "hello");
+        assert!(frame.get("jsonrpc").is_none());
+        driver.stop_and_reap(Duration::from_millis(100)).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1857,7 +1972,7 @@ mod tests {
         for delta in &deltas {
             let frame = streaming_frame(delta);
             frames.push(match codec {
-                FrameCodec::ZcodeStrict => frame,
+                FrameCodec::ZcodeStrict | FrameCodec::Ndjson => frame,
                 FrameCodec::JsonRpc2 => {
                     let mut object: serde_json::Value = serde_json::from_str(&frame).unwrap();
                     object
@@ -1877,6 +1992,13 @@ mod tests {
         let mut c = Command::new("sh");
         c.args(["-c", &format!("cat '{}'; sleep 5", path.display())]);
         let d = Driver::spawn_with_codec(c, codec).unwrap();
+        // The NDJSON codec labels a frame from its `event` key, which the
+        // shared streaming fixture does not carry; every other codec keeps the
+        // `method` label.
+        let expected_method = match codec {
+            FrameCodec::Ndjson => "",
+            _ => "session/event",
+        };
         for delta in &deltas {
             let expected = serde_json::json!({
                 "method": "session/event",
@@ -1884,7 +2006,7 @@ mod tests {
             });
             match d.recv_timeout(Duration::from_secs(10)) {
                 Ok(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => {
-                    assert_eq!(method, "session/event");
+                    assert_eq!(method, expected_method);
                     assert_eq!(raw, expected);
                     assert_eq!(
                         raw["params"]["payload"]["delta"].as_str().unwrap().len(),
@@ -1906,6 +2028,11 @@ mod tests {
     #[test]
     fn jsonrpc_two_megabyte_frame_is_delivered_intact_and_in_order() {
         assert_large_frames_are_delivered_in_order(FrameCodec::JsonRpc2, "jsonrpc-large-frame");
+    }
+
+    #[test]
+    fn ndjson_two_megabyte_frame_is_delivered_intact_and_in_order() {
+        assert_large_frames_are_delivered_in_order(FrameCodec::Ndjson, "ndjson-large-frame");
     }
 
     #[test]

@@ -9,13 +9,14 @@ use super::factory::DshRuntimeFactory;
 use crate::{task_agent, CommandRuntimeFactory, LifecycleSink, ManagedRuntime, RuntimeFactory};
 
 /// Route each prepared task to its agent factory. Legacy tasks without an
-/// admission identity keep the ZCode route; DSH and Codex tasks route to
-/// their configured factories, which are closed unless the production gates
-/// are satisfied.
+/// admission identity keep the ZCode route; DSH, Codex, and agy tasks route
+/// to their configured factories, which are closed unless the production
+/// gates are satisfied.
 pub struct RoutingRuntimeFactory<F> {
     zcode: CommandRuntimeFactory<F>,
     dsh: DshRuntimeFactory,
     codex: crate::codex::CodexRuntimeFactory,
+    agy: crate::agy::AgyRuntimeFactory,
 }
 
 impl<F> RoutingRuntimeFactory<F> {
@@ -24,6 +25,7 @@ impl<F> RoutingRuntimeFactory<F> {
             zcode,
             dsh,
             codex: crate::codex::CodexRuntimeFactory::closed(),
+            agy: crate::agy::AgyRuntimeFactory::closed(),
         }
     }
 
@@ -32,7 +34,26 @@ impl<F> RoutingRuntimeFactory<F> {
         dsh: DshRuntimeFactory,
         codex: crate::codex::CodexRuntimeFactory,
     ) -> Self {
-        Self { zcode, dsh, codex }
+        Self {
+            zcode,
+            dsh,
+            codex,
+            agy: crate::agy::AgyRuntimeFactory::closed(),
+        }
+    }
+
+    pub fn with_agy(
+        zcode: CommandRuntimeFactory<F>,
+        dsh: DshRuntimeFactory,
+        codex: crate::codex::CodexRuntimeFactory,
+        agy: crate::agy::AgyRuntimeFactory,
+    ) -> Self {
+        Self {
+            zcode,
+            dsh,
+            codex,
+            agy,
+        }
     }
 }
 
@@ -49,6 +70,7 @@ where
             "zcode" => self.zcode.spawn(task, sink),
             "dsh" => self.dsh.spawn(task, sink),
             "codex" => self.codex.spawn(task, sink),
+            "agy" => self.agy.spawn(task, sink),
             agent => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("task routes to unknown agent {agent:?}"),

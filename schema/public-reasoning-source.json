@@ -31,6 +31,12 @@
       "status": "HIDDEN",
       "reasoning": null,
       "collected": false
+    },
+    "agy": {
+      "public": false,
+      "status": "HIDDEN",
+      "reasoning": null,
+      "collected": false
     }
   }
 }

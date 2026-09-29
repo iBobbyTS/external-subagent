@@ -1,6 +1,6 @@
 # Google Antigravity (`agy`) stream-json compatibility probe
 
-本文记录 2026-09-28 对 Google Antigravity CLI（`agy` 1.2.12，长驻 `--input-format stream-json` 模式）的真实机器探测结果，评估其作为本产品 subagent 的接入面。**It is not a claim that Antigravity is supported by the product.** 全部原始证据（stdout/stderr/事件流）保存在 `.agent-work/tmp/antigravity-probe/logs/`（未跟踪目录）。
+本文记录 2026-09-28 对 Google Antigravity CLI（`agy` 1.2.12，长驻 `--input-format stream-json` 模式）的真实机器探测结果，评估其作为本产品 subagent 的接入面。**Antigravity (`agy`) 现已作为第四个 subagent 注册，但全部 spawn 入口默认关闭、由 `enabled + spawn_supported + AGY_RUNTIME_PATH` 门控；live smoke 证据仍待「集成与完成」阶段回填（见 §10「接入状态」）。** 全部原始证据（stdout/stderr/事件流）保存在 `.agent-work/tmp/antigravity-probe/logs/`（未跟踪目录）。
 
 探测环境：macOS darwin 25.6.0 arm64；`agy 1.2.12`（`~/.local/bin/agy`，home `~/.gemini/antigravity-cli/`）；已认证（缓存凭据有效，未登录时 headless 直接报错不挂起）；settings.json 仅含 `trustedWorkspaces: ["/Users/ibobby"]`（探测期间曾临时注入 permissions 规则，已恢复原样并核对）。官方 headless 文档：`antigravity.google/docs/cli/headless/`。
 
@@ -104,3 +104,30 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 5. result 可附带 `denied_actions`、`structured_output` 字段（文档未记载）。
 6. "每 turn 恰好一个 result" 在空闲期信号打断时不成立（双 result）。
 7. 事件 payload 嵌套在 `step_update`/`result` 内层对象（文档的字段描述位置有歧义）。
+
+## 10. 接入状态
+
+> 本节由外围合同节（S03）追加；live smoke 证据待「集成与完成」阶段回填，当前仅登记实现面与已知缺口。
+
+**注册与门控**：`agy` 已作为第 4 个 subagent 注册（`zcode`/`dsh`/`codex`/`agy`），传输为 `agy_stream_json`。生产 spawn 与顶层 `spawn_supported` 默认关闭，需要 `enabled + spawn_supported` 加绝对可执行的 `AGY_RUNTIME_PATH`；未满足时 status 如实报告 closed。
+
+**admission 面**：permission 仅 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），`plan`/`edit` 在 admission 拒绝；任何非空 `write_manifest` 拒绝（`agy_write_manifest_unsupported`，只接受空 manifest）；effort 为闭集 `low | medium | high | max`；model 为裸 slug（无 `:`/`/`/空白，≤512B），优先级为显式值 > `agents.agy.default_model` > native，native 时不传 `--model`、由 `agy` CLI 采用自带默认模型。
+
+**probe 面**：`local` 执行 `agy --version`；`auth` 固定 `auth_not_probed`（无独立认证检查）；`hi` 为只读 streaming（不跳过权限、bounded prompt、任何 tool step 即 `policy_violation`）；`models` 来自 `agy models` 的一次性目录发现（source `agy_models_list`，去重 ≤256）。
+
+**已登记缺口（documented gaps）**：
+
+- permission request/respond 交互缺失：流中无请求事件，工具被 soft-deny 自动决；被拒动作仅经失败/取消路径拼入 bounded 诊断尾部。
+- 成功路径的 `denied_actions` 无公共投影面：`TaskResult` 无该字段、Completed 不携带 diagnostics，成功 turn 的 soft-deny 明细不上报。
+- 无 write-manifest 守卫：无 `FS_WRITE_MANIFEST_DENIED` 等价物，故 admission 只接受空 manifest。
+- 无 daemon 重启 resume：探测虽确认 streaming + `--conversation` 原生可用，适配器当前不实现重启恢复。
+- 运行时 set-model/set-effort/cancel 控制面缺失（`control_request` 明示 not supported yet）。
+- model×effort 非正交：admission 不做 per-model 校验，交给 `agy` CLI 在 session 启动时 loud-fail。
+
+**live smoke 证据**（2026-09-28，集成阶段回填）：隔离 daemon（`target/release/external-subagentd` 以 `--database/--socket/--agent-config` 独立启动，未触碰生产 LaunchAgent）+ 本机真实 `agy`（探测时 1.2.12，smoke 时已自动升级 1.2.13，版本探测如实反映）完成五用例，原始响应存 `.agent-work/tmp/agy-subagent-live/0*.json`：
+
+1. `agent_probe agy local` → `READY`，version 1.2.13，runtime_path 解析正确（01）。
+2. `agent_models agy` → `supported:true`，14 个多供应商 slug，source `agy_models_list`（02）。
+3. build spawn（`gemini-3.8-flash-low`，映射 `--mode accept-edits`）→ 真实 agy 长驻进程完成文件写：outcome `COMPLETED`、final_text `DONE`、workspace 内 `smoke-build.txt` 内容 `AGY_BUILD_OK`（03/04）。
+4. yolo spawn（`--dangerously-skip-permissions`，prompt 要求以 `run_command` 执行 echo）→ outcome `COMPLETED`、final_text `done`、**`tool_calls_last_60s: 1`**（Detailed 词汇对真实 tool step 的计数验证，05/06）。
+5. plan 模式 spawn → admission fail-closed 拒绝：`agent_unsupported / AGY_PERMISSION_MODE_UNSUPPORTED`（07）。

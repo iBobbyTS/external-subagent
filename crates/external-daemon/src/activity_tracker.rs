@@ -62,7 +62,7 @@ impl PassiveActivityTracker {
             observation::ObservationState::for_adapter(adapter);
         tracker.mode = match adapter {
             "codex" => ToolActivityMode::CountOnly,
-            "zcode" | "dsh" => ToolActivityMode::Detailed,
+            "zcode" | "dsh" | "agy" => ToolActivityMode::Detailed,
             _ => ToolActivityMode::Mixed,
         };
         tracker

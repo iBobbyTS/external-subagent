@@ -79,6 +79,7 @@ pub enum AgentTransportView {
     ZcodeAppServer,
     DshAcp,
     CodexAppServer,
+    AgyStreamJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

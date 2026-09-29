@@ -22,7 +22,7 @@
 | `host.codex` | 支持多个 instance | `hosts.codex.installations[].home` | 每个 `home` 代表一个独立 Codex 安装绑定；同步、状态和解绑按 home 分别报告 |
 | `host.zcode` | 单 instance（单用户配置，无 home 概念） | `~/.zcode/cli/config.json` 的 `plugins.dirs` | 由 `install-plugin zcode` 注册一个受管 inline plugin 目录；绑定状态从 config 无状态推导，不设注册表 |
 | `host.custom` | 支持任意未注册本机 MCP client；不要求持久化 instance | 无需配置 | 连接按 MCP session 识别；不提供安装或自动升级绑定，也不要求预先登记 |
-| `subagents.zcode`、`subagents.dsh`、`subagents.codex` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
+| `subagents.zcode`、`subagents.dsh`、`subagents.codex`、`subagents.agy` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
 
 因此，Codex home 不属于产品顶层配置。它是 `host.codex` 的安装实例属性；产品可以同时管理多个 Codex home，但不能据此推导出 subagent 多实例能力。
 
@@ -52,7 +52,7 @@ bin/external-subagent-debug.mjs install-plugin zcode            # 第二个 plug
 
 ## Provider 配置
 
-所有 subagent（zcode、dsh、codex）默认禁用。运行 `external-subagent agents enable zcode|dsh|codex` 先做 local probe，再经配置 writer 原子落盘；失败不写配置，重复启用幂等。ZCode 使用固定 runtime，启用后新任务即时生效。DSH/Codex 在 daemon 未设置 runtime 环境变量时从 daemon 的 PATH 发现可执行文件与版本，配置保存后必须重启 daemon 才生效（回执明确提示）；probe 本身不会启用任何 subagent。Codex 需要显式配置 home 或在 daemon 启动前设置 CODEX_HOME。也可使用下列配置命令手动写入 DSH 六键（schema-2 的 `subagents.*` 前缀）：
+所有 subagent（zcode、dsh、codex、agy）默认禁用。运行 `external-subagent agents enable zcode|dsh|codex|agy` 先做 local probe，再经配置 writer 原子落盘；失败不写配置，重复启用幂等。ZCode 使用固定 runtime，启用后新任务即时生效。DSH/Codex/agy 在 daemon 未设置 runtime 环境变量时从 daemon 的 PATH 发现可执行文件与版本，配置保存后必须重启 daemon 才生效（回执明确提示）；probe 本身不会启用任何 subagent。Codex 需要显式配置 home 或在 daemon 启动前设置 CODEX_HOME；agy 无 home 覆盖（仅 `AGY_RUNTIME_PATH`，回退 `HOME`）。也可使用下列配置命令手动写入 DSH 六键（schema-2 的 `subagents.*` 前缀）：
 
 ```sh
 external-subagent config set subagents.dsh.enabled true
@@ -63,16 +63,17 @@ external-subagent config set subagents.dsh.profile acp
 external-subagent config set subagents.dsh.version 0.1.5-rc.1
 ```
 
-DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 指定 model 会被明确拒绝。
+DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 指定 model 会被明确拒绝。agy 仅接受 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），model 选择顺序同为 spawn 显式裸 slug、配置 `default_model`、native default（启动时按 `agy models` 目录校验，未知 slug 响亮失败）。
 
-spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），zcode 与 dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token；省略时保持各 subagent 现状默认，非法 token 在派发前被拒绝且不产生任务。
+spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），agy 只接受实测闭集 `low/medium/high/max`，zcode 与 dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token；省略时保持各 subagent 现状默认，非法 token 在派发前被拒绝且不产生任务。
 
 ## 实际能力限制（来自已验收代码）
 
 - `zcode`：默认禁用；显式启用后支持 spawn，四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
 - `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。build 接受 caller 非空 `write_manifest`（≤256 条、序列化 ≤64 KiB）：daemon 为每任务物化 write-guard 插件与 manifest-build patch，以 workspace-write 沙箱拉起 dsh，唯一启用写工具为 `tool-fs`，清单外写入由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝；显式 `["."]` 与空清单一样走现行 build 组合，plan + 非空清单仍被拒。
 - `codex`（作为 subagent）：默认禁用；支持四模式：`build`/`edit` → sandbox=workspace-write，`plan` → sandbox=read-only，`yolo` → sandbox=danger-full-access；全部钉死 approvalPolicy=never。不支持非空 `write_manifest`，在创建任务前以 `codex_write_manifest_unsupported` 拒绝。
-- `observe`：三种 subagent 均可调用；zcode（保留运行时来源校验）与 dsh 返回公开推理尾部最多 200 字符，codex 不采集推理，整个 `reasoning` 字段为 `null`。工具历史和 coverage 按 adapter 能力与实际采集缺口返回。
+- `agy`（Google Antigravity，作为 subagent）：默认禁用；显式启用并配置绝对可执行的 `AGY_RUNTIME_PATH`（或 daemon 启动前设置该环境变量）后才可 spawn；仅接受 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），plan/edit 在准入阶段以 `agy_permission_mode_unsupported` 拒绝；model 为裸 slug（`agy models` 目录校验）；effort 为闭集 `low/medium/high/max`；无 write-manifest 守卫，任何非空 `write_manifest`（含显式 `["."]`）在创建任务前以 `agy_write_manifest_unsupported` 拒绝；无 permission request/respond 交互，工具在默认 soft-deny 姿态下被自动拒绝，成功路径的 denied_actions 无公共投影面（documented gap），失败/取消诊断尾部可见。
+- `observe`：四种 subagent 均可调用；zcode（保留运行时来源校验）与 dsh 返回公开推理尾部最多 200 字符，codex 与 agy 不采集推理，整个 `reasoning` 字段为 `null`。工具历史和 coverage 按 adapter 能力与实际采集缺口返回。
 - MCP `status` 只携带路由／能力／就绪结论；部署身份、配置版本、适配器传输细节和逐 scope 探测证据属于操作员诊断，经 CLI `diagnose` 读取。
 
 ## CLI 生命周期

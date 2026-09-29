@@ -39,7 +39,7 @@ pub(super) fn configured_agent_statuses(
     config: &AgentConfigSnapshot,
     evidence: &AgentEvidenceStore,
 ) -> Vec<AgentStatusView> {
-    ["zcode", "dsh", "codex"]
+    ["zcode", "dsh", "codex", "agy"]
         .into_iter()
         .map(|agent| {
             let entry = &config.subagents[agent];
@@ -64,7 +64,7 @@ pub(super) fn configured_agent_statuses(
 }
 
 pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
-    ["zcode", "dsh", "codex"]
+    ["zcode", "dsh", "codex", "agy"]
         .into_iter()
         .map(|agent| AgentStatusView {
             agent: agent.into(),
@@ -175,6 +175,33 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
                         })
                 });
     }
+    if agent == "agy" {
+        // agy pins the same codex-style gate: enabled + spawn_supported + an
+        // absolute executable runtime_path. agy has no home override — the
+        // launch reads AGY_RUNTIME_PATH only — so no home term participates.
+        return entry.enabled
+            && entry.spawn_supported
+            && entry
+                .runtime_path
+                .as_deref()
+                .map(Path::new)
+                .is_some_and(|path| {
+                    path.is_absolute()
+                        && fs::metadata(path).is_ok_and(|m| {
+                            m.is_file() && {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    m.permissions().mode() & 0o111 != 0
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    true
+                                }
+                            }
+                        })
+                });
+    }
     entry.enabled && entry.spawn_supported
 }
 
@@ -183,6 +210,7 @@ fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSup
         transport: match agent {
             "zcode" => AgentTransportView::ZcodeAppServer,
             "codex" => AgentTransportView::CodexAppServer,
+            "agy" => AgentTransportView::AgyStreamJson,
             _ => AgentTransportView::DshAcp,
         },
         probe: true,
@@ -202,6 +230,15 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
             AgentPermissionModeView::Plan,
         ];
     }
+    if agent == "agy" {
+        // agy has no write-manifest guard and no permission-respond surface,
+        // so only the two postures with a measured mapping are admitted:
+        // build -> --mode accept-edits and yolo -> --dangerously-skip-permissions.
+        return vec![
+            AgentPermissionModeView::Build,
+            AgentPermissionModeView::Yolo,
+        ];
+    }
     vec![
         AgentPermissionModeView::Build,
         AgentPermissionModeView::Edit,
@@ -212,7 +249,7 @@ fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissio
 
 fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelectionCapabilityView {
     AgentModelSelectionCapabilityView {
-        supported: matches!(agent, "zcode" | "dsh" | "codex")
+        supported: matches!(agent, "zcode" | "dsh" | "codex" | "agy")
             && effective_spawn_supported(agent, entry),
         mode: AgentModelSelectionModeView::CatalogToken,
     }
@@ -221,7 +258,7 @@ fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelection
 fn effort_selection(agent: &str, entry: &AgentConfigEntry) -> AgentEffortSelectionCapabilityView {
     AgentEffortSelectionCapabilityView {
         supported: effective_spawn_supported(agent, entry),
-        mode: if agent == "codex" {
+        mode: if agent == "codex" || agent == "agy" {
             AgentEffortSelectionModeView::ClosedSet
         } else {
             AgentEffortSelectionModeView::PassthroughToken
@@ -450,6 +487,33 @@ pub(super) fn resolve_admission(
         } else {
             (Some(token.to_owned()), "configured_default")
         }
+    } else if agent == "agy" {
+        // Explicit spawn token, then the configured default, then the native
+        // model — the same three-level precedence as dsh/zcode. agy models are
+        // bare slugs: the ':' and '/' separators and embedded whitespace are
+        // refused here so an invalid selection never reaches the runtime after
+        // the task exists.
+        let token = input
+            .model
+            .as_deref()
+            .map(str::trim)
+            .or_else(|| configured.default_model.as_deref().map(str::trim));
+        match token {
+            Some(token) => {
+                if !agy_model_is_valid(token) {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        agy_model_format_error(token),
+                    ));
+                }
+                if input.model.is_some() {
+                    (Some(token.to_owned()), "spawn_catalog")
+                } else {
+                    (Some(token.to_owned()), "configured_default")
+                }
+            }
+            None => (None, "native"),
+        }
     } else if agent == "zcode" {
         // Explicit spawn token, then the configured default, then the
         // provider-native model — the same three-level precedence as dsh. The
@@ -537,6 +601,28 @@ pub(super) fn resolve_admission(
             return Err(RpcError::new(
                 RpcErrorCode::AgentUnsupported,
                 "codex home is unconfigured",
+            ));
+        }
+    }
+    if agent == "agy" {
+        // Only the two measured permission mappings are admitted; plan/edit are
+        // refused before the prompt. The public code is projected from the
+        // sentinel detail by mcp::errors (agy_permission_mode_unsupported).
+        if !matches!(
+            input.manifest.permission_mode,
+            external_core::PermissionMode::Build | external_core::PermissionMode::Yolo
+        ) {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "AGY_PERMISSION_MODE_UNSUPPORTED",
+            ));
+        }
+        // agy has no write-manifest guard, so only an empty manifest is
+        // admitted — even an explicit ["."] is refused before any task exists.
+        if !input.manifest.write_manifest.is_empty() {
+            return Err(RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                "AGY_WRITE_MANIFEST_UNSUPPORTED",
             ));
         }
     }
@@ -649,6 +735,44 @@ fn is_zcode_provider_segment(provider: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// Whether an agy model selection is a valid bare slug: non-empty, at most
+/// 512 bytes, no NUL, no `:`/`/` separator, and no whitespace. agy models are
+/// multi-vendor bare slugs (`claude-sonnet-4-6`, `gemini-3.8-flash-low`); the
+/// separators and whitespace would be interpreted by the runtime as a
+/// different selection or fail it after the task exists.
+fn agy_model_is_valid(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 512
+        && !token.contains('\0')
+        && !token.contains(':')
+        && !token.contains('/')
+        && !token.chars().any(char::is_whitespace)
+}
+
+/// Compose the public validation message for a refused agy model token.
+///
+/// Each branch names one failure cause so the caller sees what to fix instead
+/// of the whole format contract; a valid bare slug never reaches this. The
+/// `agy model must be` prefix is also a public passthrough marker in
+/// `mcp::errors`, so this wording is the public envelope message.
+fn agy_model_format_error(token: &str) -> String {
+    const FORMAT: &str = "agy model must be a bare slug without a ':' or '/' separator or whitespace";
+    let cause = if token.is_empty() {
+        "the token is empty"
+    } else if token.len() > 512 {
+        "the token exceeds 512 bytes"
+    } else if token.contains('\0') {
+        "the token contains a NUL byte"
+    } else if token.contains(':') || token.contains('/') {
+        "the token contains a ':' or '/' separator"
+    } else if token.chars().any(char::is_whitespace) {
+        "the token contains whitespace"
+    } else {
+        return FORMAT.to_string();
+    };
+    format!("{FORMAT}; {cause}")
+}
+
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
 /// NUL. Codex additionally admits only its closed effort set {low, medium,
 /// high, xhigh, max}. Evidence notes for the values left OUT and the max
@@ -687,6 +811,14 @@ fn resolve_effort_selection(
         return Err(RpcError::new(
             RpcErrorCode::Validation,
             "codex effort must be one of low, medium, high, xhigh, max",
+        ));
+    }
+    // agy's measured closed set includes `max` (unlike the official docs) and
+    // excludes every other well-formed token.
+    if agent == "agy" && !matches!(token, "low" | "medium" | "high" | "max") {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "agy effort must be one of low, medium, high, max",
         ));
     }
     Ok(Some(token.to_owned()))
@@ -766,7 +898,7 @@ mod admission_tests {
         assert_eq!(error.code, RpcErrorCode::AgentUnknown);
         assert_eq!(
             error.message,
-            "subagent is unknown, available subagents are [\"codex\", \"dsh\", \"zcode\"]"
+            "subagent is unknown, available subagents are [\"agy\", \"codex\", \"dsh\", \"zcode\"]"
         );
     }
 
@@ -1091,6 +1223,284 @@ mod admission_tests {
                 error.message
             );
         }
+    }
+
+    fn agy_gate_config(directory: &std::path::Path) -> AgentConfigSnapshot {
+        let runtime = directory.join("agy-runtime");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let mut config = AgentConfigSnapshot::default();
+        let agy = config.subagents.get_mut("agy").unwrap();
+        agy.enabled = true;
+        agy.spawn_supported = true;
+        agy.runtime_path = Some(runtime.to_string_lossy().into_owned());
+        config
+    }
+
+    fn agy_input(
+        directory: &std::path::Path,
+        mode: external_core::PermissionMode,
+    ) -> GeneralSubmitInput {
+        GeneralSubmitInput {
+            agent: Some("agy".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            effort: None,
+            manifest: GeneralTaskManifest {
+                schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                agent_id: "agy-gate-test".into(),
+                repository: directory.into(),
+                permission_mode: mode,
+                prompt: "test".into(),
+                write_manifest: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn agy_admission_pins_a_bare_slug_with_three_level_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = agy_gate_config(directory.path());
+
+        let explicit = agy_input(directory.path(), external_core::PermissionMode::Build);
+        let identity = resolve_admission(&explicit, &config).unwrap();
+        assert_eq!(identity.agent, "agy");
+        assert_eq!(identity.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+
+        // The configured default is the second level; absence is native.
+        let mut defaulted = config.clone();
+        defaulted.subagents.get_mut("agy").unwrap().default_model =
+            Some("gemini-3.8-flash-low".into());
+        let mut fallback = agy_input(directory.path(), external_core::PermissionMode::Build);
+        fallback.model = None;
+        let identity = resolve_admission(&fallback, &defaulted).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("gemini-3.8-flash-low"));
+        assert_eq!(identity.model_source, "configured_default");
+        let native = resolve_admission(&fallback, &config).unwrap();
+        assert_eq!(native.model, None);
+        assert_eq!(native.model_source, "native");
+
+        // A trimmed explicit token wins over the configured default.
+        let mut explicit = agy_input(directory.path(), external_core::PermissionMode::Build);
+        explicit.model = Some("  gemini-3.8-flash-low  ".into());
+        let identity = resolve_admission(&explicit, &defaulted).unwrap();
+        assert_eq!(identity.model.as_deref(), Some("gemini-3.8-flash-low"));
+        assert_eq!(identity.model_source, "spawn_catalog");
+    }
+
+    #[test]
+    fn agy_rejects_separators_whitespace_nul_and_oversized_tokens_before_the_task() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = agy_gate_config(directory.path());
+        for (invalid, expected) in [
+            (
+                "provider:model",
+                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a ':' or '/' separator",
+            ),
+            (
+                "provider/model",
+                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a ':' or '/' separator",
+            ),
+            (
+                "two words",
+                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains whitespace",
+            ),
+        ] {
+            let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+            input.model = Some(invalid.into());
+            let error = resolve_admission(&input, &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
+            assert_eq!(error.message, expected, "{invalid:?}");
+        }
+        // Empty and NUL tokens are reachable only through the configured
+        // default: a spawn `model` is filtered first by `validate_text`.
+        for (default_model, expected) in [
+            (
+                " ",
+                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token is empty",
+            ),
+            (
+                "model\0nul",
+                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a NUL byte",
+            ),
+        ] {
+            let mut invalid = config.clone();
+            invalid.subagents.get_mut("agy").unwrap().default_model = Some(default_model.into());
+            let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+            input.model = None;
+            let error = resolve_admission(&input, &invalid).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{default_model:?}");
+            assert_eq!(error.message, expected, "{default_model:?}");
+        }
+        // The 512-byte bound is exact: 512 admits and 513 is refused.
+        let bounded = "t".repeat(512);
+        let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+        input.model = Some(bounded.clone());
+        assert_eq!(
+            resolve_admission(&input, &config)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some(bounded.as_str())
+        );
+        let oversized = "t".repeat(513);
+        let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+        input.model = Some(oversized);
+        let error = resolve_admission(&input, &config).unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Validation);
+        assert_eq!(
+            error.message,
+            "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token exceeds 512 bytes"
+        );
+    }
+
+    #[test]
+    fn agy_admission_admits_only_build_and_yolo_and_only_empty_manifests() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = agy_gate_config(directory.path());
+        for mode in [
+            external_core::PermissionMode::Plan,
+            external_core::PermissionMode::Edit,
+        ] {
+            let error =
+                resolve_admission(&agy_input(directory.path(), mode), &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::AgentUnsupported, "{mode:?}");
+            assert_eq!(error.message, "AGY_PERMISSION_MODE_UNSUPPORTED", "{mode:?}");
+        }
+        for mode in [
+            external_core::PermissionMode::Build,
+            external_core::PermissionMode::Yolo,
+        ] {
+            assert_eq!(
+                resolve_admission(&agy_input(directory.path(), mode), &config)
+                    .unwrap()
+                    .agent,
+                "agy",
+                "{mode:?}"
+            );
+        }
+        // agy has no write-manifest guard: even the legacy ["."] scope is
+        // refused, not rewritten.
+        for manifest in [vec![PathBuf::from(".")], vec![PathBuf::from("src/main.rs")]] {
+            let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+            input.manifest.write_manifest = manifest;
+            let error = resolve_admission(&input, &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::AgentUnsupported);
+            assert_eq!(error.message, "AGY_WRITE_MANIFEST_UNSUPPORTED");
+        }
+    }
+
+    #[test]
+    fn agy_effort_is_the_measured_closed_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = agy_gate_config(directory.path());
+        let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
+        for admitted in ["low", "medium", "high", "max"] {
+            input.effort = Some(admitted.into());
+            assert_eq!(
+                resolve_admission(&input, &config)
+                    .unwrap()
+                    .effort
+                    .as_deref(),
+                Some(admitted),
+                "agy effort {admitted} must admit"
+            );
+        }
+        input.effort = Some(" high ".into());
+        assert_eq!(
+            resolve_admission(&input, &config)
+                .unwrap()
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+        input.effort = None;
+        assert_eq!(resolve_admission(&input, &config).unwrap().effort, None);
+        for invalid in ["xhigh", "minimal", "ultra", "none", "HIGH", "float"] {
+            input.effort = Some(invalid.into());
+            let error = resolve_admission(&input, &config).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "agy effort {invalid:?}");
+            // Uppercase and other shape failures hit the shared token bound;
+            // the agy closed set owns the well-formed but unadmitted tokens.
+            assert!(
+                error.message.contains("effort"),
+                "agy effort {invalid:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn agy_status_projection_pins_transport_modes_and_closed_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = agy_gate_config(directory.path());
+        let evidence = AgentEvidenceStore::new(None);
+        let status = configured_agent_statuses(&config, &evidence)
+            .into_iter()
+            .find(|status| status.agent == "agy")
+            .unwrap();
+        assert_eq!(
+            status.transport_support.transport,
+            AgentTransportView::AgyStreamJson
+        );
+        assert!(status.transport_support.spawn);
+        assert_eq!(
+            status.permission_modes,
+            vec![
+                AgentPermissionModeView::Build,
+                AgentPermissionModeView::Yolo
+            ]
+        );
+        assert_eq!(
+            status.model_selection,
+            AgentModelSelectionCapabilityView {
+                supported: true,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            }
+        );
+        assert_eq!(
+            status.effort_selection,
+            AgentEffortSelectionCapabilityView {
+                supported: true,
+                mode: AgentEffortSelectionModeView::ClosedSet,
+            }
+        );
+
+        // Without the spawn gate the projection stays closed but keeps the
+        // transport and capability modes.
+        let ungated = configured_agent_statuses(&AgentConfigSnapshot::default(), &evidence)
+            .into_iter()
+            .find(|status| status.agent == "agy")
+            .unwrap();
+        assert!(!ungated.transport_support.spawn);
+        assert!(ungated.permission_modes.is_empty());
+        assert!(!ungated.model_selection.supported);
+        assert_eq!(
+            ungated.effort_selection,
+            AgentEffortSelectionCapabilityView {
+                supported: false,
+                mode: AgentEffortSelectionModeView::ClosedSet,
+            }
+        );
+        let unavailable = unavailable_agent_statuses()
+            .into_iter()
+            .find(|status| status.agent == "agy")
+            .unwrap();
+        assert_eq!(
+            unavailable.transport_support.transport,
+            AgentTransportView::AgyStreamJson
+        );
+        assert!(!unavailable.model_selection.supported);
+        assert_eq!(
+            unavailable.effort_selection.mode,
+            AgentEffortSelectionModeView::ClosedSet
+        );
     }
 
     #[test]

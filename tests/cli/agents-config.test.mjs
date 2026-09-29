@@ -101,7 +101,7 @@ test('config has no default and lists layered agent support', async () => {
   const { paths } = fixture();
   const listed = await subagentsCommand(paths);
   assert.equal(listed.default_subagent, null);
-  assert.deepEqual(listed.subagents.map((agent) => [agent.subagent, agent.spawn_supported]), [['zcode', false], ['dsh', false], ['codex', false]]);
+  assert.deepEqual(listed.subagents.map((agent) => [agent.subagent, agent.spawn_supported]), [['zcode', false], ['dsh', false], ['codex', false], ['agy', false]]);
 });
 
 test('zcode model is rejected before prompt and dsh remains discovery-only', () => {
@@ -450,6 +450,29 @@ test('dsh enable rejects incompatible or absent daemon version requirements with
   }
 });
 
+test('agy enable writes runtime_path and version without a home override', async () => {
+  const { paths } = fixture();
+  assert.deepEqual(parseSubagentsArgs(['enable', 'agy']), { operation: 'enable', subagent: 'agy' });
+  const result = await subagentsCommand(paths, parseSubagentsArgs(['enable', 'agy']), {
+    socket: '/socket',
+    callDaemon: async (socket, command, input) => {
+      assert.equal(socket, '/socket');
+      assert.equal(command, 'agent-probe');
+      // agy has no home override, so the probe scope stays empty even though
+      // other agents require a home for enable.
+      assert.deepEqual(input, { subagent: 'agy', through: 'local', scope: {} });
+      return { evidence: { local: { state: 'READY', runtime_path: '/opt/agy/bin/agy', version: '1.2.12', scope: {} } }, status: {} };
+    },
+  });
+  assert.equal(result.subagent, 'agy');
+  assert.equal(result.restart_required, true);
+  assert.match(result.message, /重启 daemon 后生效/);
+  assert.deepEqual(readConfig(paths.config).subagents.agy, {
+    enabled: true, spawn_supported: true, default_model: null,
+    runtime_path: '/opt/agy/bin/agy', home: null, profile: null, version: '1.2.12',
+  });
+});
+
 test('daemon startup timeout reaps the child, escalating ignored SIGTERM to SIGKILL', async () => {
   const { daemonHarness } = await import('../fixtures/restart-daemon.mjs');
   for (const ignoreTerm of [false, true]) {
@@ -488,7 +511,7 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   fs.writeFileSync(path.join(bin, 'codex'), '#!/bin/sh\nif [ "$1" = "--version" ]; then echo codex-cli 1.2.3; exit 0; fi\nexit 42\n', { mode: 0o755 });
   fs.symlinkSync(process.execPath, path.join(bin, 'node'));
   const init = runInit({ paths, skipPayloadProbe: true, skipServiceStart: true });
-  assert.deepEqual(Object.keys(init.runtimes), ['zcode', 'dsh', 'codex']);
+  assert.deepEqual(Object.keys(init.runtimes), ['zcode', 'dsh', 'codex', 'agy']);
   assert.ok(Object.values(readConfig(paths.config).subagents).every((entry) => !entry.enabled && !entry.spawn_supported));
   const daemon = await daemonHarness({ root, home, runtime: path.resolve('tests/fixtures/zcode-general.mjs'), env: {
     PATH: bin, DSH_HOME: providerHome, CODEX_HOME: providerHome, S05_DSH_SPAWN_FIXTURE: '1',

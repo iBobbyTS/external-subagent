@@ -16,7 +16,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 - `host.codex` 支持多个 instance。每个 instance 由一个独立的 Codex `home` 标识，安装绑定使用 `hosts.codex.installations[].home`；状态、升级同步和解绑必须按 home 分开处理。
 - `host.custom` 表示未注册的本机 MCP client。它不要求持久化 instance，也没有 Codex home、安装或自动升级绑定；每个连接按 MCP session 处理。
-- 每个 `subagent` 名称目前只支持单一 instance。`subagents.zcode`、`subagents.dsh` 和 `subagents.codex` 分别描述一个受管 runtime/home；`spawn` 的 `subagent` 选择的是名称，不是 instance ID。当前协议不承诺同名 subagent 的多实例路由、实例选择或实例级故障隔离。
+- 每个 `subagent` 名称目前只支持单一 instance。`subagents.zcode`、`subagents.dsh`、`subagents.codex` 和 `subagents.agy` 分别描述一个受管 runtime/home；`spawn` 的 `subagent` 选择的是名称，不是 instance ID。当前协议不承诺同名 subagent 的多实例路由、实例选择或实例级故障隔离。
 
 这意味着 `codex_home` 是 host 安装绑定信息，不是产品顶层运行时配置；不能把多个 Codex home 的能力误解为 subagent 多实例能力。
 
@@ -144,14 +144,14 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 字段 | 类型 | 何时使用／存在理由 | 移除影响 |
 |---|---|---|---|
-| `subagent` | string | 把状态关联到 subagent 路由，如 zcode、dsh、codex | 无法知道能力属于谁 |
+| `subagent` | string | 把状态关联到 subagent 路由，如 zcode、dsh、codex、agy | 无法知道能力属于谁 |
 | `configured` | boolean | 判断配置是否存在 | 无法区分未配置与已禁用 |
 | `enabled` | boolean | 判断配置是否允许使用 | 客户端只能通过失败获知禁用 |
 | `spawn_supported` | boolean | 判断此 subagent 配置是否支持启动 | 容易把可 probe 误当作可 spawn |
 | `permission_modes` | PermissionMode[] | 选择该 subagent 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 subagent 都支持 |
 | `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
-| `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式；三个 subagent 现均为 `catalog_token`（zcode 为 `provider/model`，dsh 为 `provider:model`，codex 为自身 model id）。`native_only` 仅为保留枚举字面量，当前无 subagent 产出：不支持模型选择时仍发 `catalog_token` 且 `supported:false` | 不清楚应省略还是使用模型 token |
+| `model_selection.mode` | enum | `native_only / catalog_token`，说明选择方式；四个 subagent 现均为 `catalog_token`（zcode 为 `provider/model`，dsh 为 `provider:model`，codex 为自身 model id，agy 为 `agy models` 目录中的裸 slug）。`native_only` 仅为保留枚举字面量，当前无 subagent 产出：不支持模型选择时仍发 `catalog_token` 且 `supported:false` | 不清楚应省略还是使用模型 token |
 | `effort_selection` | object | 描述推理力度（reasoning effort）选择能力 | 无法按 subagent 选择 effort 参数策略 |
 | `effort_selection.supported` | boolean | 是否应传 spawn.effort（随 `spawn_supported` 门） | 更容易触发不支持 effort 的错误 |
 | `effort_selection.mode` | enum | `closed_set / passthrough_token`，说明选择方式 | 不清楚应使用闭集值还是有界透传 token |
@@ -177,11 +177,11 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |
 | `prompt` | string；必填 | 给出具体任务 | 缺少报错；移除后没有任务指令 |
-| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 不支持非空清单（创建任务前返回 `codex_write_manifest_unsupported`）；dsh build 接受非空清单，进入 workspace-write 的 manifest-build 组合（仅 `tool-fs` 可写，清单外路径由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝），上限 256 条／序列化 64 KiB，显式 `["."]` 走现行 build 组合（此前与任意非空清单同样被拒），plan 仍必须为空；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
-| `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`） | 省略采用 subagent 配置／原生默认；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝；codex 使用自有模型 ID |
-| `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
+| `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 和 agy 不支持非空清单（创建任务前分别返回 `codex_write_manifest_unsupported` / `agy_write_manifest_unsupported`，agy 无 write-manifest 守卫，显式 `["."]` 同样被拒）；dsh build 接受非空清单，进入 workspace-write 的 manifest-build 组合（仅 `tool-fs` 可写，清单外路径由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝），上限 256 条／序列化 64 KiB，显式 `["."]` 走现行 build 组合（此前与任意非空清单同样被拒），plan 仍必须为空；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
+| `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`）；agy 要求不含 `:`／`/`／空白的裸 slug（启动时按 `agy models` 目录校验，未知 slug 会响亮失败） | 省略采用 subagent 配置／原生默认（dsh、zcode、agy）；移除后失去逐任务模型选择；ZCode 当前显式传入会被拒绝；codex 使用自有模型 ID |
+| `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex/agy 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），agy 仅接受实测闭集 `low/medium/high/max`，zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
 
-`PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。Codex 支持四模式：build/edit 映射 workspace-write，plan 映射 read-only，yolo 映射 danger-full-access；全部固定 approvalPolicy=never。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。
+`PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。Codex 支持四模式：build/edit 映射 workspace-write，plan 映射 read-only，yolo 映射 danger-full-access；全部固定 approvalPolicy=never。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。agy 仅支持 build（`--mode accept-edits`）与 yolo（`--dangerously-skip-permissions`），plan/edit 在准入阶段以 `agy_permission_mode_unsupported` 拒绝。
 
 dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** `:` 分割，第一个 `:` 之后的全部内容（可再含 `:`）归属 model；两侧不限字符集。缺少 `:`、provider 侧为空（`:m`）、model 侧为空（`p:`）、含 NUL、总长超过 512 字节，都会在派发前以 `validation` 拒绝并给出格式示例，不产生任务；`agents.dsh.default_model` 走同一校验路径。daemon 下发 ACP 前用 serde_json 把两侧重组为字节精确的 `["provider","model"]` 字符串（`session/set_config_option` 的 `value`），不会手工拼接；`input_identity.model` 保存 trim 后的冒号串，`model_source` 语义不变。`subagents models`（daemon RPC `agent_models`）输出层把这种 wire 元组反序列化为「恰好两个字符串的数组」后以 `p:m` 展示，解析失败、非二元组或 provider 侧含 `:` 的条目保留原样。模型是否真的存在于 provider 目录仍由 dsh 在 `session_start` 判定：未知元组以 `-32602` 失败，不发 prompt。
 
@@ -248,7 +248,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | `recent_calls[].arguments` | object | 判断是否重复相同输入、是否在探索新路径 | 只有名称无法判断动作是否等价 |
 | `recent_calls[].arguments_truncated` | boolean | 判断参数是否完整 | 易把被截断参数误当作完整输入 |
 | `recent_calls[].redacted_fields` | integer | 说明字段脱敏数量 | 易把缺失数据误当作没有提供 |
-| `reasoning` | object 或 null | zcode/dsh 公开推理尾部的容器；codex 整个字段为 null | 缺少动作上下文 |
+| `reasoning` | object 或 null | zcode/dsh 公开推理尾部的容器；codex 与 agy 整个字段为 null | 缺少动作上下文 |
 | `reasoning.text` | string，最多 200 Unicode 字符 | 理解最近公开思路 | 判断上下文减少；不含加密内容或私有推理 |
 | `reasoning.truncated` | boolean | 提醒只看到了尾部片段 | 易把片段当作完整解释 |
 | `coverage` | object | 描述采集完整性 | 无法评估观测证据的局限 |
@@ -256,7 +256,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | `coverage.reasoning_complete` | boolean | 判断推理采集覆盖 | 易对缺失片段过度推断 |
 | `coverage.dropped_events` | integer | 量化丢弃事件 | 无法衡量证据缺口 |
 
-zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；工具调用计数可见，但当前 adapter 不投影工具输入，返回空参数对象并标记 `arguments_truncated: true`，`coverage.tool_history_complete: false`。codex 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`；其工具输入历史当前未由 adapter 完整投影，`coverage.tool_history_complete: false`（codex 的 wait `tool_calls_last_60s` 计数有效，经适配器白名单 count-only 投影，但工具明细仍不经 observe 投影）。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
+zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；工具调用计数可见，但当前 adapter 不投影工具输入，返回空参数对象并标记 `arguments_truncated: true`，`coverage.tool_history_complete: false`。codex 与 agy 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`；其工具输入历史当前未由 adapter 完整投影，`coverage.tool_history_complete: false`（codex 的 wait `tool_calls_last_60s` 计数有效，经适配器白名单 count-only 投影，但工具明细仍不经 observe 投影）。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex/agy 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
 
 不返回工具结果，因而不能据此证明执行成功、文件没有变化或任务失败。公开描述中的 `PROGRESSING / EXPECTED_WAIT / NEEDS_CLARIFICATION / NO_PROGRESS_LOOP / INSUFFICIENT_OBSERVABILITY` 是调用方判断用语，**不是返回字段或服务端分类结果**。
 
@@ -420,8 +420,8 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 |---|---|---|---|
 | `latest_text_tail` | string | 增量投递：仅返回自上次任意 wait 之后新增的公开文本；空串表示无新增。每个字节最多经 wait 投递一次（后到的 wait 只见新内容）；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
 | `latest_text_truncated` | boolean | 为 true 表示本次返回相对上次投递存在缺口：尚未投递的字节已滚出 8 KiB 窗口，本次返回退化为整个窗口 | 易把片段当完整输出 |
-| `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex 不采集时为空串 |
-| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数（来源：zcode 原生 `tool.updated`、dsh ACP 归一化、codex 适配器白名单 count-only 投影；codex 错过 item/started 的回填按完成通知的接收时间计入窗口，发起可能早于窗口） | 看不出近期是否有工具活动 |
+| `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex/agy 不采集时为空串 |
+| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数（来源：zcode 原生 `tool.updated`、dsh ACP 归一化、agy stream-json 工具 step 归一化、codex 适配器白名单 count-only 投影；codex 错过 item/started 的回填按完成通知的接收时间计入窗口，发起可能早于窗口） | 看不出近期是否有工具活动 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
 
 计数不能证明产生了有效任务进展。深度诊断（逐工具调用参数、覆盖率缺口）使用 observe。
@@ -465,6 +465,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 ```text
 validation, subagent_required, subagent_unknown, agent_disabled,
 agent_unsupported, model_selection_unsupported, codex_write_manifest_unsupported,
+agy_write_manifest_unsupported, agy_permission_mode_unsupported,
 oversized, protocol_error, not_found, conflict, runtime_command_failed,
 timeout, runtime_lost, result_invalid, persistence, internal,
 unavailable, daemon_unavailable

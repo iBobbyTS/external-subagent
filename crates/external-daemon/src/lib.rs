@@ -39,6 +39,7 @@ use activity_parser::{
     ToolActivityMode,
 };
 pub mod agent_status;
+pub mod agy;
 pub mod codex;
 pub mod dsh;
 mod lifecycle_sink;

@@ -106,9 +106,12 @@ test('dual-provider config surface keeps DSH and ZCode addressable', async () =>
   const paths = writeDualConfig(path.join(root, 'config.json'));
   const listed = await subagentsCommand(paths, { operation: 'list' });
   const ids = listed.subagents.map((agent) => agent.subagent).sort();
-  assert.deepEqual(ids, ['codex', 'dsh', 'zcode']);
+  assert.deepEqual(ids, ['agy', 'codex', 'dsh', 'zcode']);
   assert.equal(listed.subagents.find((entry) => entry.subagent === 'codex').enabled, false);
-  for (const agent of listed.subagents.filter((entry) => entry.subagent !== 'codex')) {
+  // agy is registered but defaults disabled; only the explicitly enabled
+  // providers in the fixture are addressable for spawn.
+  assert.equal(listed.subagents.find((entry) => entry.subagent === 'agy').enabled, false);
+  for (const agent of listed.subagents.filter((entry) => ['zcode', 'dsh'].includes(entry.subagent))) {
     assert.equal(agent.enabled, true);
     assert.equal(agent.spawn_supported, true);
   }

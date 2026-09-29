@@ -80,6 +80,20 @@ impl Default for AgentConfigSnapshot {
                         version: None,
                     },
                 ),
+                (
+                    // agy is closed like codex's default: no runtime_path, no
+                    // home override (its launch reads AGY_RUNTIME_PATH only).
+                    "agy".into(),
+                    AgentConfigEntry {
+                        enabled: false,
+                        spawn_supported: false,
+                        default_model: None,
+                        runtime_path: None,
+                        home: None,
+                        profile: None,
+                        version: None,
+                    },
+                ),
             ]),
         }
     }
@@ -127,7 +141,7 @@ fn parse_agent_config_snapshot(bytes: &[u8]) -> Result<AgentConfigSnapshot, RpcE
     if snapshot
         .subagents
         .keys()
-        .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh" | "codex"))
+        .any(|agent| !matches!(agent.as_str(), "zcode" | "dsh" | "codex" | "agy"))
     {
         return Err(RpcError::new(
             RpcErrorCode::Validation,
@@ -301,6 +315,28 @@ mod config_migration_tests {
         ] {
             assert!(parse_agent_config_snapshot(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn agy_default_entry_is_closed_but_configurable() {
+        let config = parse_agent_config_snapshot(br#"{"schema_version":2,"subagents":{"agy":{}}}"#)
+            .unwrap();
+        let agy = &config.subagents["agy"];
+        assert!(!agy.enabled && !agy.spawn_supported);
+        // The closed default carries no runtime_path and no home override.
+        assert!(agy.runtime_path.is_none() && agy.home.is_none());
+        let configured = parse_agent_config_snapshot(
+            br#"{"schema_version":2,"subagents":{"agy":{"enabled":true,"spawn_supported":true,"default_model":"claude-sonnet-4-6","runtime_path":"/opt/agy"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.subagents["agy"].default_model.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            configured.subagents["agy"].runtime_path.as_deref(),
+            Some("/opt/agy")
+        );
     }
 
     #[test]

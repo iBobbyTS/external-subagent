@@ -1,4 +1,5 @@
 use external_daemon::{
+    agy::AgyRuntimeFactory,
     codex::{resolve_codex_home, CodexRuntimeFactory},
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
@@ -49,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
         configure_dsh_environment(Some(path));
         configure_codex_environment(Some(path));
+        configure_agy_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
     // The daemon is the authority for the derived zcode data root. The
@@ -81,10 +83,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         CodexRuntimeFactory::closed()
     };
-    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::with_codex(
+    let agy_factory = if agy_production_enabled(config.agent_config.as_deref()) {
+        AgyRuntimeFactory::enabled()
+    } else {
+        AgyRuntimeFactory::closed()
+    };
+    let runtime_factory: Arc<dyn RuntimeFactory> = Arc::new(RoutingRuntimeFactory::with_agy(
         zcode,
         dsh_factory,
         codex_factory,
+        agy_factory,
     ));
     let scheduler = Scheduler::new(
         format!("external-subagentd-{}", std::process::id()),
@@ -228,6 +236,62 @@ fn codex_production_enabled(path: Option<&Path>) -> bool {
         return false;
     };
     let configured = configured_subagent(&value, "codex");
+    configured
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && configured
+            .and_then(|entry| entry.get("spawn_supported"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && configured
+            .and_then(|entry| entry.get("runtime_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(Path::new)
+            .is_some_and(|runtime| {
+                runtime.is_absolute() && runtime.is_file() && {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                }
+            })
+}
+
+/// Export the persisted agy runtime path into the daemon environment. `agy`
+/// has no home override; only the absolute executable path is exported, and an
+/// absent entry leaves the spawn gate closed.
+fn configure_agy_environment(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    let Ok(bytes) = fs::read(path) else { return };
+    let Ok(value) = parse_subagent_config(&bytes) else {
+        return;
+    };
+    let Some(entry) = configured_subagent(&value, "agy") else {
+        return;
+    };
+    if let Some(runtime) = entry
+        .get("runtime_path")
+        .and_then(serde_json::Value::as_str)
+    {
+        env::set_var("AGY_RUNTIME_PATH", runtime);
+    }
+}
+
+fn agy_production_enabled(path: Option<&Path>) -> bool {
+    let Some(path) = path else { return false };
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Ok(value) = parse_subagent_config(&bytes) else {
+        return false;
+    };
+    let configured = configured_subagent(&value, "agy");
     configured
         .and_then(|entry| entry.get("enabled"))
         .and_then(serde_json::Value::as_bool)

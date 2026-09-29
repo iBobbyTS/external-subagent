@@ -20,7 +20,7 @@ it is never an MCP connection or task-submission prerequisite.
 `host.codex` supports multiple installations. Each registered Codex `home` is
 an independent host instance and is reconciled, upgraded, inspected, and
 unbound separately. A subagent name currently supports only one instance:
-`subagents.zcode`, `subagents.dsh`, and `subagents.codex` each describe one runtime/home. The
+`subagents.zcode`, `subagents.dsh`, `subagents.codex`, and `subagents.agy` each describe one runtime/home. The
 product does not currently provide same-name subagent instance selection or
 multi-instance routing.
 

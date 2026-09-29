@@ -8,10 +8,10 @@ independent axes:
 - **Hosts** — Codex (`install-plugin codex` or `install-mcp`), ZCode
   (`install-plugin zcode`), and any custom local MCP client that connects
   directly to the facade without registration.
-- **Subagents** — ZCode, DeepSeek Harness (DSH), and Codex, each routed
-  through an internal adapter and subject to the per-subagent limitations
-  listed in [docs/product.md](docs/product.md) and
-  [docs/mcp-api.md](docs/mcp-api.md).
+- **Subagents** — ZCode, DeepSeek Harness (DSH), Codex, and Google
+  Antigravity (`agy`), each routed through an internal adapter and subject to
+  the per-subagent limitations listed in [docs/product.md](docs/product.md)
+  and [docs/mcp-api.md](docs/mcp-api.md).
 
 ## Status
 
@@ -26,9 +26,9 @@ artifact and explicitly initializing to a launchd-resident service
 active-task upgrade and standalone initialization are implemented and
 reviewed.
 
-All three subagents are **disabled by default** and are enabled per name with
-`external-subagent agents enable <zcode|dsh|codex>`: a successful local probe
-writes the configuration (no write on failure), and `dsh`/`codex` need a
+All four subagents are **disabled by default** and are enabled per name with
+`external-subagent agents enable <zcode|dsh|codex|agy>`: a successful local probe
+writes the configuration (no write on failure), and `dsh`/`codex`/`agy` need a
 daemon restart to take effect. ZCode admits all four permission modes
 (build/edit/plan/yolo) and rejects an explicit spawn `model`; DSH admits
 `build` and strict `plan`, with model selection as explicit spawn model,
@@ -40,9 +40,16 @@ legacy build composition and `plan` still requires an empty manifest); Codex
 admits all four modes
 (build/edit → workspace-write, plan → read-only, yolo → danger-full-access,
 all pinning `approvalPolicy=never`) and rejects a non-empty `write_manifest`
-with `codex_write_manifest_unsupported`. `observe` works on all three: ZCode
+with `codex_write_manifest_unsupported`; Antigravity (`agy`) spawns only when
+its `enabled + spawn_supported` gate and an absolute `AGY_RUNTIME_PATH`
+executable admit it, runs with `build` (`--mode accept-edits`) or `yolo`
+(`--dangerously-skip-permissions`), selects a catalog-validated bare model
+slug, admits effort from `low|medium|high|max`, and rejects a non-empty
+`write_manifest` with `agy_write_manifest_unsupported` (it has no
+permission-respond interaction — tools are soft-denied and denied actions
+surface on failure diagnostics). `observe` works on all four: ZCode
 and DSH expose the public reasoning tail (at most 200 characters) and Codex
-reports `reasoning: null`.
+and agy report `reasoning: null`.
 
 The daemon socket environment variable is now the neutral
 `EXTERNAL_SUBAGENT_SOCKET`, with no fallback to the retired name. An existing

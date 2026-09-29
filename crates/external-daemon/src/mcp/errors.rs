@@ -112,7 +112,8 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
     // detail (same Design B as the AgentUnknown roster branch below); project
     // a recognized prefix verbatim instead of the static sentence. The list is
     // a prefix set so it can grow without message parsing.
-    const PASSTHROUGH_DETAIL_PREFIXES: [&str; 2] = ["dsh model must be", "zcode model must be"];
+    const PASSTHROUGH_DETAIL_PREFIXES: [&str; 3] =
+        ["dsh model must be", "zcode model must be", "agy model must be"];
     let (code, message) = match error.code {
         RpcErrorCode::Malformed | RpcErrorCode::Validation => (
             "validation",
@@ -143,6 +144,17 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
         RpcErrorCode::AgentUnsupported if detail == "CODEX_WRITE_MANIFEST_UNSUPPORTED" => (
             "codex_write_manifest_unsupported",
             "codex does not support non-empty write_manifest",
+        ),
+        // agy's admission refusals ship a sentinel detail (like codex's
+        // manifest) so the RPC rejection stays diagnosable while the public
+        // `error.code` stays machine-distinct without message parsing.
+        RpcErrorCode::AgentUnsupported if detail == "AGY_WRITE_MANIFEST_UNSUPPORTED" => (
+            "agy_write_manifest_unsupported",
+            "agy does not support non-empty write_manifest",
+        ),
+        RpcErrorCode::AgentUnsupported if detail == "AGY_PERMISSION_MODE_UNSUPPORTED" => (
+            "agy_permission_mode_unsupported",
+            "agy supports only the build and yolo permission modes",
         ),
         RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
         RpcErrorCode::ModelSelectionUnsupported => (
@@ -384,6 +396,28 @@ mod tests {
     }
 
     #[test]
+    fn agy_manifest_and_permission_rejections_have_distinct_public_codes() {
+        let manifest = public_error(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            "AGY_WRITE_MANIFEST_UNSUPPORTED",
+        ));
+        assert_eq!(manifest.body.code, "agy_write_manifest_unsupported");
+        assert_eq!(manifest.body.message, "agy does not support non-empty write_manifest");
+        assert_eq!(manifest.body.prompt_count, Some(0));
+
+        let permission = public_error(RpcError::new(
+            RpcErrorCode::AgentUnsupported,
+            "AGY_PERMISSION_MODE_UNSUPPORTED",
+        ));
+        assert_eq!(permission.body.code, "agy_permission_mode_unsupported");
+        assert_eq!(
+            permission.body.message,
+            "agy supports only the build and yolo permission modes"
+        );
+        assert_eq!(permission.body.prompt_count, Some(0));
+    }
+
+    #[test]
     fn dsh_model_format_detail_is_projected_verbatim_with_zero_prompts() {
         let detail = "dsh model must be {provider}:{model}; the ':' separator is missing";
         let projected = public_error(RpcError::new(RpcErrorCode::Validation, detail));
@@ -391,6 +425,17 @@ mod tests {
         assert_eq!(projected.body.message, detail);
         // The passthrough makes detail == message, so the legacy branch emits
         // one sentence without the static "request validation failed" middle.
+        assert_eq!(projected.legacy_text, format!("validation: {detail}"));
+        assert_eq!(projected.body.prompt_count, Some(0));
+    }
+
+    #[test]
+    fn agy_model_format_detail_is_projected_verbatim_with_zero_prompts() {
+        let detail =
+            "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains whitespace";
+        let projected = public_error(RpcError::new(RpcErrorCode::Validation, detail));
+        assert_eq!(projected.body.code, "validation");
+        assert_eq!(projected.body.message, detail);
         assert_eq!(projected.legacy_text, format!("validation: {detail}"));
         assert_eq!(projected.body.prompt_count, Some(0));
     }

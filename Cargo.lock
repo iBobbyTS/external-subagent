@@ -252,6 +252,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "external-agent-agy"
+version = "0.1.0"
+dependencies = [
+ "external-contract",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "external-agent-codex"
 version = "0.1.5"
 dependencies = [
@@ -295,6 +304,7 @@ dependencies = [
 name = "external-daemon"
 version = "0.2.0"
 dependencies = [
+ "external-agent-agy",
  "external-agent-codex",
  "external-agent-dsh",
  "external-contract",

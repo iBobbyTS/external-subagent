@@ -303,7 +303,7 @@ impl RpcService {
             }
             RpcMethod::TaskList(query) => {
                 if let Some(agent) = query.agent.as_deref() {
-                    if !matches!(agent, "zcode" | "dsh" | "codex") {
+                    if !matches!(agent, "zcode" | "dsh" | "codex" | "agy") {
                         // The literal fast path keeps the happy read free of a
                         // config load; only the error path pays for the roster.
                         let config = read_agent_config_snapshot()?;
@@ -480,7 +480,8 @@ impl RpcService {
                 let (snapshot, runtime_source_verified) =
                     self.scheduler.observation_snapshot(&task.agent_id);
                 let adapter = crate::task_agent(&task);
-                if !runtime_source_verified && adapter != "dsh" && adapter != "codex" {
+                if !runtime_source_verified && adapter != "dsh" && adapter != "codex" && adapter != "agy"
+                {
                     return Err(RpcError::new(
                         RpcErrorCode::Unavailable,
                         "observation runtime source is not verified",
@@ -492,7 +493,8 @@ impl RpcService {
                         agent_id: task.agent_id,
                         count_scope: "agent_lifetime".into(),
                         tools: snapshot.tools,
-                        reasoning: (adapter != "codex").then_some(snapshot.reasoning),
+                        reasoning: (!matches!(adapter.as_str(), "codex" | "agy"))
+                            .then_some(snapshot.reasoning),
                         coverage: snapshot.coverage,
                     },
                 })
@@ -890,7 +892,8 @@ mod agent_probe_tests {
         let (_directory, service) = service();
         // zcode is configured but disabled: probing it stays legal, so the
         // roster keeps it listable alongside enabled dsh and defaulted codex.
-        let expected = "subagent is unknown, available subagents are [\"codex\", \"dsh\", \"zcode\"]";
+        let expected =
+            "subagent is unknown, available subagents are [\"agy\", \"codex\", \"dsh\", \"zcode\"]";
         let probe = service
             .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
                 agent: "future-provider".into(),

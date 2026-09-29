@@ -65,7 +65,7 @@ export function parseSubagentsArgs(args) {
   const [operation, ...rest] = args;
   if (!['list', 'status', 'probe', 'models', 'enable'].includes(operation)) throw new CliError('INVALID_ARGUMENT', `unsupported subagents operation: ${operation}`, 2);
   if (operation === 'enable') {
-    if (rest.length !== 1 || !SUBAGENT_IDS.includes(rest[0])) throw new CliError('INVALID_ARGUMENT', 'usage: agents enable <zcode|dsh|codex>', 2);
+    if (rest.length !== 1 || !SUBAGENT_IDS.includes(rest[0])) throw new CliError('INVALID_ARGUMENT', 'usage: agents enable <zcode|dsh|codex|agy>', 2);
     return { operation, subagent: rest[0] };
   }
   if (operation === 'probe') return parseProbeArgs(rest);
@@ -82,7 +82,7 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
   if (operation === 'enable') {
     const agent = input.subagent;
     if (!SUBAGENT_IDS.includes(agent) || ['through', 'workspace', 'home'].some((key) => input[key] !== undefined)) {
-      throw new CliError('INVALID_ARGUMENT', 'usage: agents enable <zcode|dsh|codex>', 2);
+      throw new CliError('INVALID_ARGUMENT', 'usage: agents enable <zcode|dsh|codex|agy>', 2);
     }
     if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'agents enable requires a daemon connection');
     const entry = config.subagents[agent];
@@ -102,9 +102,15 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
       if (typeof local.runtime_path !== 'string' || !path.isAbsolute(local.runtime_path) || typeof local.version !== 'string' || !local.version.trim()) {
         throw new CliError('agent_probe_failed', 'Probe did not return an absolute runtime_path and observed version', 2);
       }
-      const home = local.scope?.home;
-      if (typeof home !== 'string' || !path.isAbsolute(home)) throw new CliError('agent_probe_failed', `Cannot enable ${agent}: configure subagents.${agent}.home or export ${agent.toUpperCase()}_HOME before starting the daemon`, 2);
-      Object.assign(patch, { runtime_path: local.runtime_path, home, profile: agent === 'dsh' ? 'acp' : (entry.profile ?? null), version: local.version });
+      if (agent === 'agy') {
+        // agy has no home override: the daemon resolves the executable from
+        // AGY_RUNTIME_PATH, so the patch carries runtime_path + version only.
+        Object.assign(patch, { runtime_path: local.runtime_path, version: local.version });
+      } else {
+        const home = local.scope?.home;
+        if (typeof home !== 'string' || !path.isAbsolute(home)) throw new CliError('agent_probe_failed', `Cannot enable ${agent}: configure subagents.${agent}.home or export ${agent.toUpperCase()}_HOME before starting the daemon`, 2);
+        Object.assign(patch, { runtime_path: local.runtime_path, home, profile: agent === 'dsh' ? 'acp' : (entry.profile ?? null), version: local.version });
+      }
     }
     const updated = updateConfig(paths.config, (latest) => {
       if (Object.entries(patch).every(([key, value]) => latest.subagents[agent][key] === value)) return latest;

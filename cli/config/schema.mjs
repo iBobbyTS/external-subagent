@@ -1,7 +1,7 @@
 import { CliError } from '../errors.mjs';
 
 export const CONFIG_SCHEMA_VERSION = 2;
-export const SUBAGENT_IDS = Object.freeze(['zcode', 'dsh', 'codex']);
+export const SUBAGENT_IDS = Object.freeze(['zcode', 'dsh', 'codex', 'agy']);
 const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_subagent', 'subagents']);
 const AGENT_FIELDS = new Set(['enabled', 'spawn_supported', 'default_model', 'runtime_path', 'home', 'profile', 'version']);
 
@@ -24,6 +24,7 @@ export function defaultConfig() {
       zcode: { enabled: false, spawn_supported: false, default_model: null },
       dsh: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
       codex: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
+      agy: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
     },
   };
 }

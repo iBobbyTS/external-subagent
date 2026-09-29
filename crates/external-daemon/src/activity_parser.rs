@@ -41,16 +41,16 @@
 //!
 //! - `"codex"` → [`ToolActivityMode::CountOnly`] (the Codex item whitelist
 //!   folds first-seen tool items into count events);
-//! - `"zcode"` | `"dsh"` → [`ToolActivityMode::Detailed`] (native detailed
-//!   `tool.updated` events);
+//! - `"zcode"` | `"dsh"` | `"agy"` → [`ToolActivityMode::Detailed`] (native
+//!   detailed `tool.updated` events);
 //! - any other name → [`ToolActivityMode::Mixed`] (accept both).
 //!
 //! The bare `PassiveActivityTracker::new()` is fixed to `Mixed` so the
 //! pre-mode behavior is preserved for callers that never register an adapter.
 //! In production the only construction site is the scheduler lifecycle, which
-//! derives the name from `task_agent` → `"zcode"`/`"dsh"`/`"codex"` (or the
-//! `"zcode"` fallback), so `Mixed` is unreachable on the production path and
-//! exists only as the safe default for unregistered names.
+//! derives the name from `task_agent` → `"zcode"`/`"dsh"`/`"codex"`/`"agy"`
+//! (or the `"zcode"` fallback), so `Mixed` is unreachable on the production
+//! path and exists only as the safe default for unregistered names.
 //!
 //! # Gating and its expected semantic change surface
 //!

@@ -21,7 +21,7 @@ function escapeXml(value) {
 // Presence is diagnostic only; enabling is an explicit probe + config operation.
 export function runtimeObservations(paths, options = {}) {
   const config = readConfig(paths.config);
-  return Object.fromEntries(['zcode', 'dsh', 'codex'].map((agent) => {
+  return Object.fromEntries(['zcode', 'dsh', 'codex', 'agy'].map((agent) => {
     const runtime = agent === 'zcode' ? (options.zcodeRuntime ?? ZCODE_RUNTIME) : config.subagents[agent].runtime_path;
     return [agent, { path: runtime, present: Boolean(runtime && fs.existsSync(runtime)), enabled: config.subagents[agent].enabled }];
   }));
@@ -35,6 +35,7 @@ export function launchAgentPlist(paths, options = {}) {
   const config = readConfig(paths.config);
   const { runtime_path: dshRuntime, home: dshHome, profile: dshProfile, version: dshVersion } = config.subagents.dsh;
   const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;
+  const { runtime_path: agyRuntime } = config.subagents.agy;
   const configRevision = config.revision;
   // AUD-005/D1: the standalone service never depends on an unrelated runtime.
   // The pinned ZCode runtime is forwarded only when that installation exists;
@@ -70,6 +71,10 @@ export function launchAgentPlist(paths, options = {}) {
     // fails Codex admission closed instead of falling back to ~/.codex.
     ...(codexRuntime ? [`<key>CODEX_RUNTIME_PATH</key><string>${escapeXml(codexRuntime)}</string>`] : []),
     ...(codexHome ? [`<key>CODEX_HOME</key><string>${escapeXml(codexHome)}</string>`] : []),
+    // agy has no home override: only its persisted executable is forwarded, so
+    // the service-side daemon resolves the same AGY_RUNTIME_PATH the
+    // interactive one does.
+    ...(agyRuntime ? [`<key>AGY_RUNTIME_PATH</key><string>${escapeXml(agyRuntime)}</string>`] : []),
   ].join('');
   return Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>${LAUNCH_AGENT_LABEL}</string>\n<key>ProgramArguments</key><array>${programArguments.join('')}</array>\n<key>EnvironmentVariables</key><dict>${dshEnvironment}</dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>${escapeXml(path.join(paths.logs, 'daemon.log'))}</string>\n<key>StandardErrorPath</key><string>${escapeXml(path.join(paths.logs, 'daemon-error.log'))}</string>\n</dict></plist>\n`);
 }

@@ -15,6 +15,7 @@ external-store = { path = "../external-store" }
 external-core = { path = "../external-core" }
 external-agent-codex = { path = "../subagents/codex" }
 external-agent-dsh = { path = "../subagents/dsh" }
+external-agent-agy = { path = "../subagents/agy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 external-contract = { path = "../external-contract" }

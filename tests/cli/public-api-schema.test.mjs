@@ -117,7 +117,7 @@ test('observation contract preserves public tails and object-level hidden reason
   assert.equal(schema.properties.reasoning.properties.text.maxLength, 200);
   assert.deepEqual(schema.properties.reasoning.required, ['text', 'truncated']);
   const { subagents } = JSON.parse(fs.readFileSync(path.join(root, 'schema/public-reasoning-source.json'), 'utf8'));
-  assert.deepEqual(Object.keys(subagents), ['zcode', 'dsh', 'codex']);
+  assert.deepEqual(Object.keys(subagents), ['zcode', 'dsh', 'codex', 'agy']);
   assert.equal(subagents.zcode.status, 'VERIFIED_RUNTIME_PUBLIC');
   assert.equal(subagents.zcode.runtime_version, '3.11.2');
   assert.equal(subagents.zcode.runtime_sha256, 'e9f1868c0fdb863537ed910ee3828b9be96b8c2fd805473f63b439e1113266b8');
@@ -127,4 +127,22 @@ test('observation contract preserves public tails and object-level hidden reason
   assert.equal(subagents.codex.public, false);
   assert.equal(subagents.codex.collected, false);
   assert.equal(subagents.codex.reasoning, null);
+  assert.equal(subagents.agy.public, false);
+  assert.equal(subagents.agy.collected, false);
+  assert.equal(subagents.agy.reasoning, null);
+});
+
+test('agy spawn contract pins a bare slug, the closed effort set, build/yolo and empty manifests', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
+  const spawn = schema.properties.spawn;
+  assert.match(spawn.properties.write_manifest.description, /agy_write_manifest_unsupported/u);
+  assert.match(spawn.properties.model.description, /agy uses a bare model slug/u);
+  const rule = spawn.allOf.find((rule) => rule.if.properties.subagent?.const === 'agy');
+  assert.deepEqual(rule.if.required, ['subagent']);
+  assert.deepEqual(rule.then.properties.permission_mode.enum, ['build', 'yolo']);
+  assert.deepEqual(rule.then.properties.effort.enum, ['low', 'medium', 'high', 'max']);
+  assert.equal(rule.then.properties.model.maxLength, 512);
+  assert.equal(rule.then.properties.model.pattern, '^[^:/\\s]+$');
+  assert.equal(rule.then.properties.write_manifest.maxItems, 0);
+  assert.deepEqual(schema.properties.subagent_status.properties.subagent.enum, ['zcode', 'dsh', 'codex', 'agy']);
 });

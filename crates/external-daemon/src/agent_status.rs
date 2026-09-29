@@ -31,6 +31,8 @@ const DSH_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 const DSH_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DSH_MAX_MODELS: usize = 256;
 const DSH_MAX_MODEL_TOKEN_BYTES: usize = 512;
+const AGY_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
+const AGY_MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const VERSION_STREAM_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +277,9 @@ impl AgentProbeBackend for ProcessProbeBackend {
                 // Codex never falls back to ~/.codex: only an explicit home
                 // (persisted configuration or exported CODEX_HOME) counts.
                 "codex" => "CODEX_HOME",
+                // agy has no home override: the default HOME is the only source
+                // (there is no AGY_HOME), so a scoped home just records HOME.
+                "agy" => "HOME",
                 _ => "ZCODE_HOME",
             };
             scope.home = if variable == "CODEX_HOME" {
@@ -307,6 +312,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
             "zcode" => self.runtime_source.clone(),
             "dsh" => discover_runtime("DSH_RUNTIME_PATH", "dsh"),
             "codex" => discover_runtime("CODEX_RUNTIME_PATH", "codex"),
+            "agy" => discover_runtime("AGY_RUNTIME_PATH", "agy"),
             _ => None,
         };
         let local = probe_local(executable.as_deref(), scope.clone(), checked_at_ms);
@@ -326,6 +332,20 @@ impl AgentProbeBackend for ProcessProbeBackend {
             // DSH has no independent credential endpoint in the ACP dialect
             // we support. Auth-only must remain side-effect free: do not
             // create a session or send a prompt merely to infer auth.
+            auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
+        } else if input.agent == "agy" && input.through == ProbeLayer::Hi {
+            let (a, h) = probe_agy_hi(
+                executable.as_deref(),
+                &scope,
+                local.version.clone(),
+                checked_at_ms,
+            );
+            auth = a;
+            hi = h;
+        } else if input.agent == "agy" && input.through == ProbeLayer::Auth {
+            // agy exposes no independent credential endpoint either: auth-only
+            // stays side-effect free (never spawn a streaming session just to
+            // infer auth), matching the dsh precedent.
             auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
         } else if input.agent == "zcode" && input.through != ProbeLayer::Local {
             if local.state != EvidenceState::Ready {
@@ -373,6 +393,12 @@ impl AgentProbeBackend for ProcessProbeBackend {
             // The Codex catalog was observed only through the controlled live
             // probe; no in-band catalog claim is made here.
             return unsupported_models(input, "codex_models_probed_live_only");
+        }
+        if input.agent == "agy" {
+            return probe_agy_models(
+                discover_runtime("AGY_RUNTIME_PATH", "agy").as_deref(),
+                input,
+            );
         }
         probe_dsh_models(
             env::var_os("DSH_RUNTIME_PATH")
@@ -487,6 +513,186 @@ fn probe_dsh_hi(
     }
 }
 
+/// Probe the agy read-only posture with a real streaming session.
+///
+/// The child launches with the bare stream-json framing only — no permission
+/// flags — so it holds agy's default soft-deny posture
+/// (`docs/compatibility/antigravity.md` §2). A bounded no-tool prompt is sent;
+/// any tool `step_update` (even a soft-denied one, which agy still reports)
+/// fails the probe as a policy violation, and only a `SUCCESS` result
+/// concludes READY. agy exposes no independent credential endpoint, so auth
+/// stays `auth_not_probed` UNKNOWN, matching the dsh precedent.
+fn probe_agy_hi(
+    path: Option<&Path>,
+    scope: &ProbeScope,
+    version: Option<String>,
+    checked: u64,
+) -> (ScopeEvidence, ScopeEvidence) {
+    let unknown = ScopeEvidence::unknown(scope.clone(), checked, "auth_not_probed");
+    let Some(path) = path.filter(|path| path.is_file()) else {
+        return (unknown, unavailable(scope, version, checked, "missing"));
+    };
+    let Some(workspace) = scope.workspace.as_deref() else {
+        return (
+            unknown,
+            unavailable(scope, version, checked, "workspace_missing"),
+        );
+    };
+    if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
+        return (
+            unknown,
+            unavailable(scope, version, checked, "workspace_missing"),
+        );
+    }
+    let mut command = Command::new(path);
+    command
+        .args(external_agent_agy::launch::launch_args(
+            &external_agent_agy::launch::AgyLaunchOptions::default(),
+        ))
+        .current_dir(workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // stderr is discarded instead of piped: an undrained pipe would
+        // deadlock the child on a full buffer, and the result event carries
+        // the failure reason the probe classifies.
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return (unknown, unavailable(scope, version, checked, "transport")),
+    };
+    let process_group = child.id() as i32;
+    let (Some(mut input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+        cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
+        return (unknown, unavailable(scope, version, checked, "transport"));
+    };
+    let (frames_tx, frames_rx) = mpsc::channel();
+    thread::spawn(move || read_agy_lines(output, frames_tx));
+    let result = run_agy_hi_stream(&mut input, &frames_rx);
+    drop(input);
+    cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+    match result {
+        Ok(()) => (
+            unknown,
+            ScopeEvidence {
+                runtime_path: None,
+                state: EvidenceState::Ready,
+                scope: scope.clone(),
+                version,
+                checked_at_ms: checked,
+                reason: None,
+            },
+        ),
+        Err(reason) => (unknown, unavailable(scope, version, checked, &reason)),
+    }
+}
+
+/// The bounded prompt the agy hi probe sends: an explicit no-tool request, so
+/// a tool step in the default soft-deny posture is a policy violation rather
+/// than an ambiguous model choice.
+const AGY_HI_PROMPT: &str = "Reply with exactly hi. Do not call any tools.";
+
+/// Stream one agy turn for the hi probe and return Ok only on `SUCCESS`.
+///
+/// Any tool step fails as `policy_violation`; any other result status is
+/// classified from its `error` (falling back to the status token) so auth,
+/// rate-limit and network failures stay distinct. A malformed line is a
+/// transport concern and a silent deadline is `network`.
+fn run_agy_hi_stream(
+    input: &mut impl Write,
+    frames: &mpsc::Receiver<Result<String, String>>,
+) -> Result<(), String> {
+    let mut event = serde_json::to_vec(&serde_json::json!({
+        "event": "user",
+        "message": {"content": AGY_HI_PROMPT}
+    }))
+    .map_err(|_| "transport".to_owned())?;
+    event.push(b'\n');
+    input
+        .write_all(&event)
+        .map_err(|_| "transport".to_owned())?;
+    input.flush().map_err(|_| "transport".to_owned())?;
+    let deadline = Instant::now() + LOCAL_PROBE_TIMEOUT;
+    loop {
+        let line = match frames.recv_timeout(remaining(deadline)?) {
+            Ok(Ok(line)) => line,
+            Ok(Err(reason)) => return Err(reason),
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err("network".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
+        };
+        match external_agent_agy::event::parse_line(&line) {
+            Ok(external_agent_agy::event::AgyEvent::StepUpdate(step)) => {
+                if matches!(step.step_type, external_agent_agy::event::StepType::Tool) {
+                    return Err("policy_violation".into());
+                }
+            }
+            Ok(external_agent_agy::event::AgyEvent::Result(result)) => {
+                return match result.status {
+                    external_agent_agy::event::ResultStatus::Success => Ok(()),
+                    _ => {
+                        let text = result
+                            .error
+                            .clone()
+                            .filter(|error| !error.is_empty())
+                            .unwrap_or_else(|| result.status.as_str().to_owned());
+                        Err(classify_provider_failure(&Value::Null, &text).into())
+                    }
+                };
+            }
+            Ok(_) => {}
+            Err(_) => return Err("transport".into()),
+        }
+    }
+}
+
+/// One bounded NDJSON line reader for the agy probe: the same 1 MiB frame cap
+/// and terminator discipline as the dsh frame reader, delivering UTF-8 lines to
+/// the event parser.
+fn read_agy_lines(output: impl Read, sender: mpsc::Sender<Result<String, String>>) {
+    let mut output = output;
+    let mut frame = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match output.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(read) => {
+                for byte in &chunk[..read] {
+                    if *byte == b'\n' {
+                        if matches!(frame.last(), Some(b'\r')) {
+                            frame.pop();
+                        }
+                        if !frame.is_empty() {
+                            let parsed = String::from_utf8(std::mem::take(&mut frame))
+                                .map_err(|_| "protocol".to_owned());
+                            if sender.send(parsed).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        if frame.len() == DSH_MAX_FRAME_BYTES {
+                            let _ = sender.send(Err("oversized".into()));
+                            return;
+                        }
+                        frame.push(*byte);
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = sender.send(Err("transport".into()));
+                return;
+            }
+        }
+    }
+}
+
 fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutput {
     AgentModelsOutput {
         agent: input.agent.clone(),
@@ -497,6 +703,7 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
             source: match input.agent.as_str() {
                 "zcode" => "zcode_native_model".into(),
                 "codex" => "codex_app_server_model_list".into(),
+                "agy" => "agy_models_list".into(),
                 _ => "dsh_acp_models_list".into(),
             },
             version: None,
@@ -786,6 +993,197 @@ fn probe_dsh_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModel
             evidence,
             reason: Some(reason),
         },
+    }
+}
+
+/// Discover the agy model catalog with a one-shot `agy models` subprocess.
+///
+/// The child runs under the same lifecycle discipline as the dsh catalog
+/// probe: its own process group, bounded stdout (1 MiB) and stderr (64 KiB),
+/// and a TERM/KILL group cleanup on every exit path. `agy models` prints one
+/// `slug<TAB>display name` line per model; the pure crate parser deduplicates
+/// and caps at 256 entries, and the source label is `agy_models_list`.
+fn probe_agy_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
+    let checked_at_ms = wall_now_millis();
+    let mut scope = input.scope.clone();
+    if scope.home.is_none() {
+        // agy has no home override: the default HOME is the only source.
+        scope.home = env::var_os("HOME").map(|value| value.to_string_lossy().into_owned());
+    }
+    let disposable_workspace = if scope.workspace.is_none() {
+        tempfile::Builder::new()
+            .prefix("external-subagent-agy-catalog-")
+            .tempdir()
+            .ok()
+    } else {
+        None
+    };
+    if let Some(workspace) = disposable_workspace.as_ref() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(workspace.path(), fs::Permissions::from_mode(0o700));
+        }
+        scope.workspace = Some(workspace.path().to_string_lossy().into_owned());
+    }
+    let local = probe_local(path, scope.clone(), checked_at_ms);
+    let evidence = ModelCatalogEvidence {
+        source: "agy_models_list".into(),
+        version: local.version.clone(),
+        scope: scope.clone(),
+        checked_at_ms,
+    };
+    if local.state != EvidenceState::Ready {
+        return AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: local.reason,
+        };
+    }
+    let result = run_agy_catalog(
+        path.expect("ready local evidence has a runtime path"),
+        &scope,
+        AGY_CATALOG_TIMEOUT,
+    );
+    match result {
+        Ok(models) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: true,
+            models,
+            evidence,
+            reason: None,
+        },
+        Err(reason) => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: false,
+            models: Vec::new(),
+            evidence,
+            reason: Some(reason),
+        },
+    }
+}
+
+/// Run one bounded `agy models` discovery under its own process group.
+fn run_agy_catalog(
+    executable: &Path,
+    scope: &ProbeScope,
+    timeout: Duration,
+) -> Result<Vec<String>, String> {
+    let workspace = scope
+        .workspace
+        .as_deref()
+        .ok_or_else(|| "workspace_required".to_owned())?;
+    let mut command = Command::new(executable);
+    command
+        .args(external_agent_agy::launch::models_args())
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(home) = scope.home.as_deref() {
+        command.env("HOME", home);
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let process_group = child.id() as i32;
+    let (Some(output), Some(diagnostic)) = (child.stdout.take(), child.stderr.take()) else {
+        cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+        return Err("transport".into());
+    };
+    let (frames_tx, frames_rx) = mpsc::channel();
+    thread::spawn(move || read_version_stream(output, frames_tx));
+    let (diagnostic_tx, diagnostic_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = diagnostic.take(64 * 1024).read_to_end(&mut bytes);
+        let _ = diagnostic_tx.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
+    let deadline = Instant::now() + timeout;
+    let mut stdout_bytes = Vec::new();
+    let status = loop {
+        if let Err(reason) = drain_agy_stdout(&frames_rx, &mut stdout_bytes) {
+            // The oversized/reader-error path must still tear down the group;
+            // every post-spawn return path runs the catalog cleanup discipline.
+            cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+            return Err(reason);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            Ok(None) | Err(_) => {
+                cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+                return Err("network".into());
+            }
+        }
+    };
+    cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
+    // The reader thread may still hold the last chunks after the leader exits;
+    // drain until it disconnects, bounded so a stuck reader cannot hang the
+    // daemon.
+    let drain_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match frames_rx.try_recv() {
+            Ok(Ok(chunk)) => {
+                if stdout_bytes.len().saturating_add(chunk.len()) > AGY_MAX_CATALOG_BYTES {
+                    return Err("oversized".into());
+                }
+                stdout_bytes.extend_from_slice(&chunk);
+            }
+            Ok(Err(reason)) => return Err(reason),
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= drain_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    let diagnostic_tail = diagnostic_rx
+        .recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default();
+    if !status.success() {
+        return Err(classify_provider_failure(&Value::Null, &diagnostic_tail).into());
+    }
+    let text = String::from_utf8_lossy(&stdout_bytes);
+    let models = external_agent_agy::launch::parse_models(&text);
+    if models.is_empty() {
+        Err("model_catalog_empty".into())
+    } else {
+        Ok(models)
+    }
+}
+
+/// Drain the agy catalog stdout channel into `output`, enforcing the 1 MiB
+/// total cap. Returns `Ok(())` whether or not more bytes are pending.
+fn drain_agy_stdout(
+    frames: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    output: &mut Vec<u8>,
+) -> Result<(), String> {
+    loop {
+        match frames.try_recv() {
+            Ok(Ok(chunk)) => {
+                if output.len().saturating_add(chunk.len()) > AGY_MAX_CATALOG_BYTES {
+                    return Err("oversized".into());
+                }
+                output.extend_from_slice(&chunk);
+            }
+            Ok(Err(reason)) => return Err(reason),
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
+        }
     }
 }
 
@@ -3136,6 +3534,261 @@ process.stdin.on('data', (chunk) => {
         assert!(output.models.is_empty());
         assert_eq!(output.reason.as_deref(), Some("missing"));
         assert_eq!(output.evidence.source, "zcode_session_create_settings");
+    }
+
+    /// Minimal agy streaming fixture: answers `--version`, and for each stdin
+    /// user event emits init, optionally one tool step, then a SUCCESS result.
+    fn fake_agy_hi_runtime(directory: &Path, emit_tool: bool) -> PathBuf {
+        let executable = directory.join(if emit_tool {
+            "agy-hi-tool"
+        } else {
+            "agy-hi-clean"
+        });
+        let source = r#"#!/usr/bin/env node
+if (process.argv.includes('--version')) { process.stdout.write('1.2.12\n'); process.exit(0); }
+const emitTool = __EMIT_TOOL__;
+let buffer = '';
+const write = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n');
+    if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const event = JSON.parse(line);
+    if (event.event !== 'user') continue;
+    write({ event: 'init', conversation_id: 'conv-1', init: { cwd: process.cwd(), tools: [], permission_mode: 'request-review' } });
+    if (emitTool) write({ event: 'step_update', step_update: { conversation_id: 'conv-1', step_index: 1, state: 'DONE', step_type: 'tool', tool_info: { name: 'run_command', output: 'x' } } });
+    write({ event: 'result', result: { conversation_id: 'conv-1', status: 'SUCCESS', response: 'hi', num_turns: 1 } });
+  }
+});
+"#
+        .replace("__EMIT_TOOL__", if emit_tool { "true" } else { "false" });
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    #[test]
+    fn agy_hi_probe_marks_ready_and_never_probes_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let home = directory.path().join("home");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&home).unwrap();
+        let runtime = fake_agy_hi_runtime(directory.path(), false);
+        let scope = ProbeScope {
+            workspace: Some(workspace.to_string_lossy().into_owned()),
+            home: Some(home.to_string_lossy().into_owned()),
+            profile: None,
+            version: None,
+        };
+        let (auth, hi) = probe_agy_hi(Some(&runtime), &scope, Some("1.2.12".into()), 7);
+        assert_eq!(auth.state, EvidenceState::Unknown);
+        assert_eq!(auth.reason.as_deref(), Some("auth_not_probed"));
+        assert_eq!(hi.state, EvidenceState::Ready);
+        assert_eq!(hi.reason, None);
+        assert_eq!(hi.version.as_deref(), Some("1.2.12"));
+        // The streaming session left no files behind in the workspace.
+        assert_eq!(fs::read_dir(&workspace).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn agy_hi_probe_fails_closed_on_any_tool_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let home = directory.path().join("home");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&home).unwrap();
+        let runtime = fake_agy_hi_runtime(directory.path(), true);
+        let scope = ProbeScope {
+            workspace: Some(workspace.to_string_lossy().into_owned()),
+            home: Some(home.to_string_lossy().into_owned()),
+            profile: None,
+            version: None,
+        };
+        let (auth, hi) = probe_agy_hi(Some(&runtime), &scope, None, 7);
+        assert_eq!(auth.state, EvidenceState::Unknown);
+        assert_eq!(auth.reason.as_deref(), Some("auth_not_probed"));
+        assert_eq!(hi.state, EvidenceState::Unavailable);
+        assert_eq!(hi.reason.as_deref(), Some("policy_violation"));
+    }
+
+    #[test]
+    fn agy_hi_probe_requires_a_workspace_and_a_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = fake_agy_hi_runtime(directory.path(), false);
+        let (_, hi) = probe_agy_hi(Some(&runtime), &ProbeScope::default(), None, 0);
+        assert_eq!(hi.reason.as_deref(), Some("workspace_missing"));
+        let workspace = ProbeScope {
+            workspace: Some(directory.path().to_string_lossy().into_owned()),
+            ..ProbeScope::default()
+        };
+        let (_, hi) = probe_agy_hi(None, &workspace, None, 0);
+        assert_eq!(hi.reason.as_deref(), Some("missing"));
+    }
+
+    /// Minimal agy models fixture: answers `--version` and prints a catalog for
+    /// the `models` subcommand, with a duplicate slug the parser must dedup.
+    fn fake_agy_models_runtime(directory: &Path) -> PathBuf {
+        let executable = directory.join("agy-models");
+        let source = r#"#!/usr/bin/env node
+if (process.argv.includes('--version')) { process.stdout.write('1.2.12\n'); process.exit(0); }
+if (process.argv.includes('models')) {
+  process.stdout.write('Fetching available models...\n');
+  process.stdout.write('claude-sonnet-4-6\tClaude Sonnet 4.6\n');
+  process.stdout.write('gemini-3.8-flash-low\tGemini 3.8 Flash Low\n');
+  process.stdout.write('claude-sonnet-4-6\tduplicate\n');
+  process.exit(0);
+}
+process.exit(1);
+"#;
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    #[test]
+    fn agy_catalog_dedups_slugs_under_the_agy_models_list_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = fake_agy_models_runtime(directory.path());
+        let output = probe_agy_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "agy".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(output.supported, "{output:?}");
+        assert_eq!(
+            output.models,
+            vec!["claude-sonnet-4-6", "gemini-3.8-flash-low"]
+        );
+        assert_eq!(output.evidence.source, "agy_models_list");
+        assert_eq!(output.evidence.version.as_deref(), Some("1.2.12"));
+        let workspace = output.evidence.scope.workspace.as_deref().unwrap();
+        assert!(workspace.contains("external-subagent-agy-catalog-"));
+        assert!(!Path::new(workspace).exists());
+    }
+
+    #[test]
+    fn agy_catalog_fails_closed_when_the_runtime_is_missing_or_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = probe_agy_models(
+            None,
+            &AgentModelsInput {
+                agent: "agy".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("missing"));
+        assert_eq!(output.evidence.source, "agy_models_list");
+
+        let empty = directory.path().join("agy-empty-models");
+        fs::write(
+            &empty,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.2.12\\n'; exit 0; fi\nprintf 'Fetching available models...\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&empty, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = probe_agy_models(
+            Some(&empty),
+            &AgentModelsInput {
+                agent: "agy".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(!output.supported);
+        assert!(output.models.is_empty());
+        assert_eq!(output.reason.as_deref(), Some("model_catalog_empty"));
+    }
+
+    /// Minimal agy models fixture that violates the 1 MiB catalog cap: it
+    /// records the models process pid, floods stdout, then parks on a timer so
+    /// it only disappears if the probe tears down its process group.
+    fn fake_agy_oversized_models_runtime(directory: &Path) -> (PathBuf, PathBuf) {
+        let executable = directory.join("agy-oversized-models");
+        let runtime_pid = directory.join("agy-oversized.pid");
+        let source = r#"#!/usr/bin/env node
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('1.2.12\n'); process.exit(0); }
+fs.writeFileSync(__PID__, String(process.pid));
+process.stdout.write('x'.repeat(1024 * 1024 + 1));
+setInterval(() => {}, 1000);
+"#
+        .replace("__PID__", &serde_json::to_string(&runtime_pid).unwrap());
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (executable, runtime_pid)
+    }
+
+    #[test]
+    fn agy_catalog_rejects_oversized_stream_and_reaps_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, runtime_pid) = fake_agy_oversized_models_runtime(directory.path());
+        let started = Instant::now();
+        let output = probe_agy_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "agy".into(),
+                scope: ProbeScope::default(),
+            },
+        );
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("oversized"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = fs::read_to_string(&runtime_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(wait_process_gone(
+            pid,
+            Instant::now() + Duration::from_secs(1)
+        ));
+    }
+
+    /// Resolve the executable from `AGY_RUNTIME_PATH` in an isolated
+    /// subprocess (never mutate process-global env under a parallel suite).
+    #[test]
+    fn agy_probe_resolves_agy_runtime_path_and_never_promotes() {
+        if env::var_os("S03_AGY_PROBE").is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join("agy-runtime");
+            fs::write(&executable, "#!/bin/sh\nprintf '1.2.12\\n'\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            let status = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "agent_status::tests::agy_probe_resolves_agy_runtime_path_and_never_promotes",
+                ])
+                .env("S03_AGY_PROBE", "1")
+                .env("PATH", "")
+                .env("AGY_RUNTIME_PATH", &executable)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let backend = ProcessProbeBackend {
+            runtime_source: None,
+            verifier_deadline: None,
+        };
+        let evidence = backend.probe(&AgentProbeInput {
+            agent: "agy".into(),
+            through: ProbeLayer::Local,
+            scope: ProbeScope::default(),
+        });
+        assert_eq!(evidence.local.state, EvidenceState::Ready);
+        assert_eq!(
+            evidence.local.runtime_path.as_deref(),
+            env::var("AGY_RUNTIME_PATH").ok().as_deref()
+        );
+        assert_eq!(evidence.local.version.as_deref(), Some("1.2.12"));
+        assert_eq!(evidence.auth.reason.as_deref(), Some("auth_not_probed"));
+        assert_eq!(evidence.hi.reason.as_deref(), Some("hi_not_probed"));
     }
 
     fn wait_process_gone(pid: i32, deadline: Instant) -> bool {
