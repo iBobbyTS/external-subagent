@@ -32,6 +32,10 @@ struct PassiveActivityState {
 pub(crate) struct PassiveActivityTracker {
     state: Mutex<PassiveActivityState>,
     changed: Condvar,
+    /// Which tool-activity vocabularies this task's adapter may emit. Fixed at
+    /// construction: `Mixed` for [`Self::new`], inferred from the adapter name
+    /// by [`Self::for_adapter`]. See [`ToolActivityMode`].
+    mode: ToolActivityMode,
     /// Launch-scoped public-source evidence: true only when the adapter that
     /// actually launched this task has a verified public observation source.
     /// Constructed from the claimed task's route identity, never from a
@@ -45,14 +49,22 @@ impl PassiveActivityTracker {
         Self {
             state: Mutex::new(state),
             changed: Condvar::new(),
+            // The pre-mode default: accept both vocabularies so an
+            // unregistered caller keeps its behavior.
+            mode: ToolActivityMode::Mixed,
             runtime_source_verified: AtomicBool::new(runtime_source_verified),
         }
     }
 
     pub(crate) fn for_adapter(adapter: &str, runtime_source_verified: bool) -> Self {
-        let tracker = Self::new(runtime_source_verified);
+        let mut tracker = Self::new(runtime_source_verified);
         tracker.state.lock().unwrap().observation =
             observation::ObservationState::for_adapter(adapter);
+        tracker.mode = match adapter {
+            "codex" => ToolActivityMode::CountOnly,
+            "zcode" | "dsh" => ToolActivityMode::Detailed,
+            _ => ToolActivityMode::Mixed,
+        };
         tracker
     }
 
@@ -87,7 +99,7 @@ impl PassiveActivityTracker {
         ) {
             state.progress_revision = state.progress_revision.saturating_add(1);
         }
-        let parsed = parse_passive_activity(event);
+        let parsed = parse_passive_activity(event, self.mode);
         if parsed.source == ActivitySource::Telemetry && !parsed.telemetry_known {
             state.telemetry_degraded = true;
         }
@@ -394,6 +406,11 @@ impl PassiveActivityTracker {
     }
 
     #[cfg(test)]
+    pub(crate) fn activity_mode(&self) -> ToolActivityMode {
+        self.mode
+    }
+
+    #[cfg(test)]
     pub(crate) fn set_wait_fixture(&self, now: Instant) {
         let mut state = self.state.lock().unwrap();
         state.revision = 900;
@@ -523,6 +540,178 @@ mod tests {
                 .window_60s
                 .tool_calls_started,
             0
+        );
+    }
+
+    #[test]
+    fn for_adapter_infers_the_activity_mode() {
+        assert_eq!(
+            PassiveActivityTracker::new(false).activity_mode(),
+            ToolActivityMode::Mixed,
+            "the bare constructor stays on the safe Mixed default"
+        );
+        assert_eq!(
+            PassiveActivityTracker::for_adapter("codex", false).activity_mode(),
+            ToolActivityMode::CountOnly
+        );
+        assert_eq!(
+            PassiveActivityTracker::for_adapter("zcode", false).activity_mode(),
+            ToolActivityMode::Detailed
+        );
+        assert_eq!(
+            PassiveActivityTracker::for_adapter("dsh", false).activity_mode(),
+            ToolActivityMode::Detailed
+        );
+        assert_eq!(
+            PassiveActivityTracker::for_adapter("future-agent", false).activity_mode(),
+            ToolActivityMode::Mixed
+        );
+    }
+
+    #[test]
+    fn strict_modes_match_mixed_for_each_adapters_production_shapes() {
+        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
+
+        fn typed_session(params: serde_json::Value) -> RuntimeEvent {
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                external_contract::EventEnvelope {
+                    method: "session/event".into(),
+                    params,
+                },
+            )))
+        }
+        fn unknown_session(params: serde_json::Value) -> RuntimeEvent {
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"method": "session/event", "params": params}),
+            }))
+        }
+        fn assert_strict_matches_mixed(
+            strict: &PassiveActivityTracker,
+            mixed: &PassiveActivityTracker,
+            now: Instant,
+        ) {
+            let strict_snapshot = strict.snapshot_at(now);
+            let mixed_snapshot = mixed.snapshot_at(now);
+            assert_eq!(strict_snapshot.window_60s, mixed_snapshot.window_60s);
+            assert_eq!(strict_snapshot.active_tools, mixed_snapshot.active_tools);
+            assert_eq!(strict_snapshot.revision, mixed_snapshot.revision);
+        }
+
+        let now = Instant::now();
+
+        // ZCode native detailed events: named started (with toolName) + result.
+        let zcode_events = || {
+            vec![
+                typed_session(external_contract::activity::tool_started_event(
+                    "z1",
+                    "t1",
+                    "call-1",
+                    Some("Read"),
+                )),
+                typed_session(external_contract::activity::tool_started_event(
+                    "z2",
+                    "t1",
+                    "call-2",
+                    Some("Bash"),
+                )),
+                typed_session(external_contract::activity::tool_result_event(
+                    "z3", "t1", "call-1",
+                )),
+            ]
+        };
+        let zcode = PassiveActivityTracker::for_adapter("zcode", false);
+        let zcode_mixed = PassiveActivityTracker::new(false);
+        for event in zcode_events() {
+            zcode.observe_at(&event, now, 1_000);
+            zcode_mixed.observe_at(&event, now, 1_000);
+        }
+        assert_strict_matches_mixed(&zcode, &zcode_mixed, now);
+        let zcode_window = zcode.snapshot_at(now).window_60s;
+        assert_eq!(zcode_window.tool_calls_started, 2);
+        assert_eq!(zcode_window.read_calls, 1);
+        assert_eq!(zcode_window.bash_calls, 1);
+        assert_eq!(zcode_window.tool_calls_completed, 1);
+
+        // DSH canonical projections: named started, unnamed started, result.
+        let dsh_events = || {
+            let mut events = Vec::new();
+            let named = parse_update(&serde_json::json!({
+                "sessionId": "s",
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "call-3", "kind": "edit"}
+            }))
+            .unwrap();
+            for params in canonical_event_payloads(&named, "d1", "t1") {
+                events.push(unknown_session(params));
+            }
+            let unnamed = parse_update(&serde_json::json!({
+                "sessionId": "s",
+                "update": {"sessionUpdate": "tool_call_update", "toolCallId": "call-4"}
+            }))
+            .unwrap();
+            for params in canonical_event_payloads(&unnamed, "d2", "t1") {
+                events.push(unknown_session(params));
+            }
+            let result = parse_update(&serde_json::json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "call-3",
+                    "content": [{"type": "text", "text": "done"}]
+                }
+            }))
+            .unwrap();
+            for params in canonical_event_payloads(&result, "d3", "t1") {
+                events.push(unknown_session(params));
+            }
+            events
+        };
+        let dsh = PassiveActivityTracker::for_adapter("dsh", false);
+        let dsh_mixed = PassiveActivityTracker::new(false);
+        for event in dsh_events() {
+            dsh.observe_at(&event, now, 1_000);
+            dsh_mixed.observe_at(&event, now, 1_000);
+        }
+        assert_strict_matches_mixed(&dsh, &dsh_mixed, now);
+        let dsh_window = dsh.snapshot_at(now).window_60s;
+        assert_eq!(dsh_window.tool_calls_started, 2);
+        assert_eq!(dsh_window.tool_calls_completed, 1);
+
+        // Codex count-only events.
+        let codex_events = || {
+            vec![
+                typed_session(external_contract::activity::tool_count_event("c1", "t1", 1)),
+                typed_session(external_contract::activity::tool_count_event("c2", "t1", 3)),
+            ]
+        };
+        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let codex_mixed = PassiveActivityTracker::new(false);
+        for event in codex_events() {
+            codex.observe_at(&event, now, 1_000);
+            codex_mixed.observe_at(&event, now, 1_000);
+        }
+        assert_strict_matches_mixed(&codex, &codex_mixed, now);
+        assert_eq!(codex.snapshot_at(now).window_60s.tool_calls_started, 4);
+
+        // Both strict modes reject the foreign vocabulary.
+        let count_for_detailed =
+            typed_session(external_contract::activity::tool_count_event("x1", "t1", 7));
+        zcode.observe_at(&count_for_detailed, now, 2_000);
+        assert_eq!(
+            zcode.snapshot_at(now).window_60s.tool_calls_started,
+            2,
+            "Detailed must ignore the count vocabulary"
+        );
+        for event in zcode_events() {
+            codex.observe_at(&event, now, 2_000);
+        }
+        assert_eq!(
+            codex.snapshot_at(now).window_60s.tool_calls_started,
+            4,
+            "CountOnly must ignore the detailed vocabulary"
+        );
+        assert!(
+            codex.snapshot_at(now).active_tools.is_empty(),
+            "ignored detailed events must not enter active_tools"
         );
     }
 

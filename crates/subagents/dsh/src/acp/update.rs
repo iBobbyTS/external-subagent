@@ -8,6 +8,7 @@
 //! dialects are accepted: the S01-pinned fixture shape (`update.type`) and
 //! the upstream standard shape (`update.sessionUpdate`).
 
+use external_contract::activity::{tool_result_event, tool_started_event};
 use serde_json::{json, Value};
 
 /// Parsed `session/update`.
@@ -202,31 +203,20 @@ pub fn canonical_event_payloads(
                     "toolCallId": tool_call_id,
                     "toolName": name,
                 })),
-                json!({
-                    "type": "tool.updated",
-                    "eventId": event_id,
-                    "turnId": turn_id,
-                    "payload": {
-                        "kind": "started",
-                        "toolCallId": tool_call_id,
-                        "toolName": name,
-                    },
-                }),
+                // The activity vocabulary is shared with the daemon parser; the
+                // "dsh_tool" fallback and 64-char truncation stay caller-side.
+                tool_started_event(event_id, turn_id, tool_call_id, Some(&name)),
             ]
         }
         UpdateKind::ToolCallUpdate {
             tool_call_id,
             has_result,
         } => {
-            vec![json!({
-                "type": "tool.updated",
-                "eventId": event_id,
-                "turnId": turn_id,
-                "payload": {
-                    "kind": if *has_result { "result" } else { "started" },
-                    "toolCallId": tool_call_id,
-                },
-            })]
+            if *has_result {
+                vec![tool_result_event(event_id, turn_id, tool_call_id)]
+            } else {
+                vec![tool_started_event(event_id, turn_id, tool_call_id, None)]
+            }
         }
         _ => Vec::new(),
     }
@@ -348,6 +338,63 @@ mod tests {
         let payloads = canonical_event_payloads(&chunk, "evt-4", "turn-1");
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0]["payload"]["kind"], "text_delta");
+    }
+
+    #[test]
+    fn canonical_tool_activity_payloads_are_exact_literal_shapes() {
+        // Named started: the observation companion (`model.streaming`/
+        // `tool_call`) plus the shared detailed activity event, asserted as
+        // hand-written JSON (never generated from the constructors).
+        let named = parse_update(&json!({
+            "sessionId": "s",
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "call-1", "kind": "read"}
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical_event_payloads(&named, "evt-1", "turn-1"),
+            vec![
+                json!({
+                    "type": "model.streaming", "eventId": "evt-1", "turnId": "turn-1",
+                    "payload": {"kind": "tool_call", "toolCallId": "call-1", "toolName": "read"},
+                }),
+                json!({
+                    "type": "tool.updated", "eventId": "evt-1", "turnId": "turn-1",
+                    "payload": {"kind": "started", "toolCallId": "call-1", "toolName": "read"},
+                }),
+            ]
+        );
+
+        // Unnamed started: a tool_call_update without a result array carries no
+        // toolName field at all (omitted, not null).
+        let unnamed = parse_update(&json!({
+            "sessionId": "s",
+            "update": {"sessionUpdate": "tool_call_update", "toolCallId": "call-2"}
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical_event_payloads(&unnamed, "evt-2", "turn-1"),
+            vec![json!({
+                "type": "tool.updated", "eventId": "evt-2", "turnId": "turn-1",
+                "payload": {"kind": "started", "toolCallId": "call-2"},
+            })]
+        );
+
+        // Result: a tool_call_update carrying a content array.
+        let result = parse_update(&json!({
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "call-3",
+                "content": [{"type": "text", "text": "ok"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical_event_payloads(&result, "evt-3", "turn-1"),
+            vec![json!({
+                "type": "tool.updated", "eventId": "evt-3", "turnId": "turn-1",
+                "payload": {"kind": "result", "toolCallId": "call-3"},
+            })]
+        );
     }
 
     #[test]

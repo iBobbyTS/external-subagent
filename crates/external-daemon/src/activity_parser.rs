@@ -1,9 +1,112 @@
+//! The daemon-side tool-activity contract: two event vocabularies, one
+//! emission mode per adapter, and the single point where a malformed frame
+//! is refused instead of inventing activity.
+//!
+//! # Two vocabularies
+//!
+//! Producers feed the wait window over the generic `session/event` stream (or
+//! the `v4/telemetry/event` stream) with one of two shapes, both shared with
+//! [`external_contract::activity`]:
+//!
+//! - **Detailed**: `tool.updated` / `streamRecovery.updated` with
+//!   `payload.kind` one of `scheduled`/`started`/`result`/`error`/`batch`,
+//!   plus `payload.toolCallId` and an optional `payload.toolName` (the DSH and
+//!   ZCode native dialects). A single `started` contributes weight `1`; the
+//!   sample identity is `tool:{toolCallId}:{phase}` and it also drives
+//!   `active_tools` bookkeeping (started/scheduled insert, result/error
+//!   remove). Telemetry `tool.lifecycle` frames carry the same fields with
+//!   `phase` in place of `kind`.
+//! - **Count-only**: `payload.kind == "count"` with a bounded positive
+//!   integer `payload.count` and a params-level `eventId`. It carries no tool
+//!   identity; the sample identity is `tool:{eventId}:count`, the weight is
+//!   `count`, and it never touches `active_tools`. [`MAX_TOOL_COUNT`] is the
+//!   single upper bound: `1..=MAX_TOOL_COUNT` is accepted, `0`, a value above
+//!   the bound, a non-integer, or a missing/unbounded `eventId` invents
+//!   nothing.
+//!
+//! Both identities are stable and **re-delivery idempotent** at the tracker:
+//! an already-admitted identity neither adds weight nor refreshes the
+//! sample's receipt time.
+//!
+//! # Emission modes
+//!
+//! An adapter declares which vocabularies it may emit as a
+//! [`ToolActivityMode`], inferred by `PassiveActivityTracker::for_adapter`:
+//!
+//! - `"codex"` → [`ToolActivityMode::CountOnly`] (the Codex item whitelist
+//!   folds first-seen tool items into count events);
+//! - `"zcode"` | `"dsh"` → [`ToolActivityMode::Detailed`] (native detailed
+//!   `tool.updated` events);
+//! - any other name → [`ToolActivityMode::Mixed`] (accept both).
+//!
+//! The bare `PassiveActivityTracker::new()` is fixed to `Mixed` so the
+//! pre-mode behavior is preserved for callers that never register an adapter.
+//! In production the only construction site is the scheduler lifecycle, which
+//! derives the name from `task_agent` → `"zcode"`/`"dsh"`/`"codex"` (or the
+//! `"zcode"` fallback), so `Mixed` is unreachable on the production path and
+//! exists only as the safe default for unregistered names.
+//!
+//! # Gating and its expected semantic change surface
+//!
+//! The mode is applied at three entry points: the session `tool.updated` /
+//! `streamRecovery.updated` arm (count branch and every detailed phase), and
+//! the `v4/telemetry/event` `tool.lifecycle` arm. `Detailed` ignores the
+//! count branch; `CountOnly` ignores every detailed tool phase at both
+//! entries (no sample, no transition, nothing enters `active_tools`);
+//! `Mixed` accepts both.
+//!
+//! This is behavior-preserving for the current producers — ZCode/DSH emit
+//! only detailed started/result, Codex emits only count, and no producer
+//! emits `v4/telemetry/event` today. The one expected change is for
+//! pass-through notifications: an adapter (notably the Codex pump) re-emits
+//! unrecognized frames unchanged, so a future `v4/telemetry` `tool.lifecycle`
+//! frame observed under `CountOnly` is now ignored where the pre-mode parser
+//! would have accepted it. That is the intended effect of strict mode, not a
+//! regression.
+//!
+//! # Registering a future acquisition mechanism
+//!
+//! Pick the archetype that matches how the adapter learns about tool calls,
+//! then implement it against the shared constructors in
+//! [`external_contract::activity`]:
+//!
+//! - **Event-lifecycle** (the Codex paradigm): the adapter whitelists the
+//!   tool item types it counts, tracks first-seen ids for the current turn,
+//!   and emits one count event per newly seen tool item. Register as
+//!   `CountOnly`.
+//! - **Polling**: a daemon-side poller observes the adapter's progress on an
+//!   interval and emits a count event carrying the delta observed since the
+//!   previous poll. Register as `CountOnly`.
+//! - **Cumulative counter**: the adapter owns a monotonic counter and emits a
+//!   count event carrying only the increment (never the running total, which
+//!   would double-count). Register as `CountOnly`.
+//! - **Post-hoc batch**: the adapter reports a completed batch of `N` calls
+//!   at once as a single count event with `count = N`. Register as
+//!   `CountOnly`.
+//!
+//! # Window and receipt-time semantics
+//!
+//! The wait window is a 60-second rolling window measured from the **receipt
+//! time** of each admitted sample, not from any producer-side timestamp.
+//! Re-delivering an admitted identity does not refresh that receipt time, and
+//! a late backfill (a count for work that happened earlier) is weighted at
+//! the moment the daemon observes it, exactly like any other sample.
+
+use external_contract::activity::MAX_TOOL_COUNT;
+
 use super::*;
 
-/// Upper bound on one count-only tool event's weight; larger values are
-/// treated as malformed so a hostile or confused producer cannot inflate the
-/// 60-second window with a single frame.
-const MAX_TOOL_COUNT: u64 = 1024;
+/// Which tool-activity vocabularies one adapter may emit, and therefore which
+/// this tracker accepts. See the module docs for the registration mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolActivityMode {
+    /// Accept only detailed tool phases; ignore count-only events.
+    Detailed,
+    /// Accept only count-only events; ignore every detailed tool phase.
+    CountOnly,
+    /// Accept both vocabularies (the pre-mode behavior and the safe default).
+    Mixed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivitySource {
@@ -79,10 +182,13 @@ impl ParsedActivity {
     }
 }
 
-pub(crate) fn parse_passive_activity(event: &RuntimeEvent) -> ParsedActivity {
+pub(crate) fn parse_passive_activity(
+    event: &RuntimeEvent,
+    mode: ToolActivityMode,
+) -> ParsedActivity {
     match event {
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(event))) => {
-            parse_activity_message(&event.method, &event.params, ActivitySource::Session)
+            parse_activity_message(&event.method, &event.params, ActivitySource::Session, mode)
         }
         RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => {
             let params = raw.get("params").unwrap_or(&serde_json::Value::Null);
@@ -93,7 +199,7 @@ pub(crate) fn parse_passive_activity(event: &RuntimeEvent) -> ParsedActivity {
             } else {
                 ActivitySource::Runtime
             };
-            parse_activity_message(method, params, source)
+            parse_activity_message(method, params, source, mode)
         }
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
             if request.method == INTERACTION_REQUEST_PERMISSION
@@ -119,6 +225,7 @@ fn parse_activity_message(
     method: &str,
     params: &serde_json::Value,
     source: ActivitySource,
+    mode: ToolActivityMode,
 ) -> ParsedActivity {
     let mut parsed = ParsedActivity::runtime();
     parsed.source = source;
@@ -163,8 +270,12 @@ fn parse_activity_message(
             }
             (Some("tool.updated" | "streamRecovery.updated"), _, _) => {
                 if payload_kind == Some("count") {
-                    parse_tool_count_activity(&mut parsed, payload, event_id);
-                } else {
+                    // A Detailed adapter never emits the count vocabulary:
+                    // ignore it rather than accepting a foreign sample.
+                    if mode != ToolActivityMode::Detailed {
+                        parse_tool_count_activity(&mut parsed, payload, event_id);
+                    }
+                } else if mode != ToolActivityMode::CountOnly {
                     parse_tool_activity(&mut parsed, payload, source);
                 }
             }
@@ -221,7 +332,11 @@ fn parse_activity_message(
                     ActivitySampleKind::TextDelta
                 });
             }
-            Some("tool.lifecycle") => parse_tool_activity(&mut parsed, params, source),
+            Some("tool.lifecycle") => {
+                if mode != ToolActivityMode::CountOnly {
+                    parse_tool_activity(&mut parsed, params, source);
+                }
+            }
             Some("model.request.status") => {
                 let started = params.get("status").and_then(serde_json::Value::as_str)
                     == Some("model_request_started");
@@ -401,6 +516,7 @@ mod tests {
             "session/event",
             &serde_json::json!({"type":"model.streaming","eventId":"e1","turnId":"t1","payload":{"kind":"text_delta","delta":"hi","assistantMessageId":"m1"}}),
             ActivitySource::Session,
+            ToolActivityMode::Mixed,
         );
         assert_eq!(text.identity.as_deref(), Some("stream:e1"));
         assert_eq!(text.stream_key.as_deref(), Some("t1:m1:text"));
@@ -410,6 +526,7 @@ mod tests {
             "session/event",
             &serde_json::json!({"type":"permission.requested","payload":{"requestId":"r1","toolCallId":"c1","toolName":"Bash"}}),
             ActivitySource::Session,
+            ToolActivityMode::Mixed,
         );
         assert_eq!(
             permission.transition,
@@ -424,6 +541,7 @@ mod tests {
             "v4/telemetry/event",
             &serde_json::json!({"kind":"future.event","secret":"not projected"}),
             ActivitySource::Telemetry,
+            ToolActivityMode::Mixed,
         );
         assert!(!parsed.telemetry_known);
         assert!(parsed.identity.is_none());
@@ -442,6 +560,7 @@ mod tests {
                 "payload": {"kind": "count", "count": 1}
             }),
             ActivitySource::Session,
+            ToolActivityMode::Mixed,
         );
         assert_eq!(parsed.identity.as_deref(), Some("tool:codex-event-1:count"));
         assert_eq!(
@@ -466,6 +585,7 @@ mod tests {
                 "payload": {"kind": "count", "count": 1024}
             }),
             ActivitySource::Session,
+            ToolActivityMode::Mixed,
         );
         assert_eq!(recovery.identity.as_deref(), Some("tool:e-2:count"));
         assert_eq!(
@@ -498,6 +618,7 @@ mod tests {
                     "payload": payload,
                 }),
                 ActivitySource::Session,
+                ToolActivityMode::Mixed,
             );
             assert!(parsed.identity.is_none(), "{payload}");
             assert!(parsed.sample.is_none(), "{payload}");
@@ -522,6 +643,7 @@ mod tests {
                     "payload": {"kind": "count", "count": 1},
                 }),
                 ActivitySource::Session,
+                ToolActivityMode::Mixed,
             );
             assert!(parsed.identity.is_none(), "{event_id}");
             assert!(parsed.sample.is_none(), "{event_id}");
@@ -539,6 +661,7 @@ mod tests {
                 "payload": {"kind": "started", "toolCallId": "c-1", "toolName": "Bash"}
             }),
             ActivitySource::Session,
+            ToolActivityMode::Mixed,
         );
         assert_eq!(parsed.identity.as_deref(), Some("tool:c-1:started"));
         assert_eq!(
@@ -548,5 +671,197 @@ mod tests {
                 count: 1,
             })
         );
+    }
+
+    #[test]
+    fn contract_constructors_round_trip_through_the_parser() {
+        use external_contract::activity::{
+            tool_count_event, tool_result_event, tool_started_event,
+        };
+
+        // count 3 -> weighted Started{Other, 3} with the count identity.
+        for mode in [ToolActivityMode::Mixed, ToolActivityMode::CountOnly] {
+            let count = parse_activity_message(
+                "session/event",
+                &tool_count_event("evt-count", "turn-1", 3),
+                ActivitySource::Session,
+                mode,
+            );
+            assert_eq!(count.identity.as_deref(), Some("tool:evt-count:count"));
+            assert_eq!(
+                count.sample,
+                Some(ActivitySampleKind::ToolStarted {
+                    kind: PassiveToolKind::Other,
+                    count: 3,
+                })
+            );
+            assert!(count.transition.is_none());
+        }
+
+        // started -> detailed sample + transition (named and unnamed).
+        let started = parse_activity_message(
+            "session/event",
+            &tool_started_event("evt-s", "turn-1", "call-1", Some("Read")),
+            ActivitySource::Session,
+            ToolActivityMode::Detailed,
+        );
+        assert_eq!(started.identity.as_deref(), Some("tool:call-1:started"));
+        assert_eq!(started.transition, Some(ActivityTransition::ToolStarted));
+        assert_eq!(started.tool_kind, PassiveToolKind::Read);
+        assert_eq!(
+            started.sample,
+            Some(ActivitySampleKind::ToolStarted {
+                kind: PassiveToolKind::Read,
+                count: 1,
+            })
+        );
+
+        let unnamed = parse_activity_message(
+            "session/event",
+            &tool_started_event("evt-s2", "turn-1", "call-2", None),
+            ActivitySource::Session,
+            ToolActivityMode::Detailed,
+        );
+        assert_eq!(unnamed.identity.as_deref(), Some("tool:call-2:started"));
+        assert_eq!(unnamed.transition, Some(ActivityTransition::ToolStarted));
+
+        // result -> ToolCompleted with the completed-phase identity.
+        let result = parse_activity_message(
+            "session/event",
+            &tool_result_event("evt-r", "turn-1", "call-1"),
+            ActivitySource::Session,
+            ToolActivityMode::Detailed,
+        );
+        assert_eq!(result.transition, Some(ActivityTransition::ToolCompleted));
+        assert_eq!(result.sample, Some(ActivitySampleKind::ToolCompleted));
+        assert_eq!(result.identity.as_deref(), Some("tool:call-1:completed"));
+    }
+
+    #[test]
+    fn count_bounds_come_from_the_shared_contract_constant() {
+        use external_contract::activity::tool_count_event;
+
+        for count in [1u64, MAX_TOOL_COUNT] {
+            let parsed = parse_activity_message(
+                "session/event",
+                &tool_count_event("evt", "turn-1", count),
+                ActivitySource::Session,
+                ToolActivityMode::Mixed,
+            );
+            assert_eq!(
+                parsed.sample,
+                Some(ActivitySampleKind::ToolStarted {
+                    kind: PassiveToolKind::Other,
+                    count,
+                }),
+                "count {count} must be accepted"
+            );
+        }
+        for count in [0u64, MAX_TOOL_COUNT + 1] {
+            let parsed = parse_activity_message(
+                "session/event",
+                &tool_count_event("evt", "turn-1", count),
+                ActivitySource::Session,
+                ToolActivityMode::Mixed,
+            );
+            assert!(
+                parsed.identity.is_none(),
+                "count {count} invented an identity"
+            );
+            assert!(parsed.sample.is_none(), "count {count} invented a sample");
+            assert!(
+                parsed.transition.is_none(),
+                "count {count} invented a transition"
+            );
+        }
+        assert_eq!(MAX_TOOL_COUNT, 1024, "the contract owns the single bound");
+    }
+
+    #[test]
+    fn gating_matrix_covers_every_entry_phase_and_mode() {
+        fn session_params(event_type: &str, phase: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": event_type,
+                "eventId": "evt-1",
+                "turnId": "turn-1",
+                "payload": {"kind": phase, "toolCallId": "call-1", "toolName": "Bash"},
+            })
+        }
+        fn telemetry_params(phase: &str) -> serde_json::Value {
+            serde_json::json!({
+                "kind": "tool.lifecycle",
+                "phase": phase,
+                "toolCallId": "call-1",
+                "toolName": "Bash",
+            })
+        }
+        let phases = ["scheduled", "started", "result", "error", "batch"];
+        // The vocabulary (tool.updated vs streamRecovery.updated) lives in
+        // params.type; the dispatch entry is the transport method.
+        let entries: [(&str, ActivitySource, fn(&str) -> serde_json::Value); 3] = [
+            ("session/event", ActivitySource::Session, |phase| {
+                session_params("tool.updated", phase)
+            }),
+            ("session/event", ActivitySource::Session, |phase| {
+                session_params("streamRecovery.updated", phase)
+            }),
+            (
+                "v4/telemetry/event",
+                ActivitySource::Telemetry,
+                telemetry_params,
+            ),
+        ];
+
+        for (method, source, build) in entries {
+            for phase in phases {
+                let params = build(phase);
+                let mixed =
+                    parse_activity_message(method, &params, source, ToolActivityMode::Mixed);
+                let detailed =
+                    parse_activity_message(method, &params, source, ToolActivityMode::Detailed);
+                // Detailed and Mixed accept every detailed phase identically;
+                // batch intentionally carries neither sample nor transition.
+                assert_eq!(detailed.identity, mixed.identity, "{method}/{phase}");
+                assert_eq!(detailed.sample, mixed.sample, "{method}/{phase}");
+                assert_eq!(detailed.transition, mixed.transition, "{method}/{phase}");
+
+                // CountOnly rejects the whole detailed vocabulary: no sample,
+                // no transition, no tool id (so active_tools cannot grow).
+                let count_only =
+                    parse_activity_message(method, &params, source, ToolActivityMode::CountOnly);
+                assert!(
+                    count_only.identity.is_none() && count_only.sample.is_none(),
+                    "CountOnly invented activity for {method}/{phase}"
+                );
+                assert!(
+                    count_only.transition.is_none() && count_only.tool_call_id.is_none(),
+                    "CountOnly bound tool state for {method}/{phase}"
+                );
+            }
+
+            if source == ActivitySource::Session {
+                // The count vocabulary is accepted by Mixed/CountOnly and
+                // refused by Detailed at both session entries.
+                let count_event =
+                    external_contract::activity::tool_count_event("evt-count", "turn-1", 2);
+                for (mode, accepted) in [
+                    (ToolActivityMode::Mixed, true),
+                    (ToolActivityMode::CountOnly, true),
+                    (ToolActivityMode::Detailed, false),
+                ] {
+                    let parsed = parse_activity_message(method, &count_event, source, mode);
+                    assert_eq!(
+                        parsed.sample.is_some(),
+                        accepted,
+                        "{method} count under {mode:?}"
+                    );
+                    assert_eq!(
+                        parsed.identity.is_some(),
+                        accepted,
+                        "{method} count identity under {mode:?}"
+                    );
+                }
+            }
+        }
     }
 }

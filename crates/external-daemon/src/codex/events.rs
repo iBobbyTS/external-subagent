@@ -118,7 +118,9 @@ impl CodexShared {
         if !update::observe_tool_item(&mut self.seen_tool_items.lock().unwrap(), item_id) {
             return true;
         }
-        self.emit_canonical(update::tool_count_payload(event_id, &turn_id, 1));
+        self.emit_canonical(external_contract::activity::tool_count_event(
+            event_id, &turn_id, 1,
+        ));
         false
     }
 

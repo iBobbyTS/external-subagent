@@ -65,16 +65,6 @@ pub fn tool_item_id(params: &serde_json::Value) -> Option<&str> {
         .filter(|id| !id.is_empty() && id.len() <= MAX_TOOL_ITEM_ID_BYTES && !id.contains('\0'))
 }
 
-/// The canonical count-only `tool.updated` payload for one counted tool item.
-pub fn tool_count_payload(event_id: &str, turn_id: &str, count: u64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "tool.updated",
-        "eventId": event_id,
-        "turnId": turn_id,
-        "payload": {"kind": "count", "count": count},
-    })
-}
-
 /// Bounded first-seen dedupe for tool item ids within one turn: a new id is
 /// recorded and returns `true`; an already-seen id returns `false` without
 /// changing the ring. At capacity the oldest entry is evicted first (the
@@ -443,9 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn tool_count_payload_has_the_count_only_shape() {
+    fn shared_count_constructor_has_the_count_only_shape() {
+        // The count vocabulary lives in external-contract; this crate now
+        // emits the shared shape verbatim.
         assert_eq!(
-            tool_count_payload("codex-event-9", "turn-1", 1),
+            external_contract::activity::tool_count_event("codex-event-9", "turn-1", 1),
             serde_json::json!({
                 "type": "tool.updated",
                 "eventId": "codex-event-9",

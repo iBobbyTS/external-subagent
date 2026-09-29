@@ -36,6 +36,7 @@ mod activity_parser;
 mod activity_tracker;
 use activity_parser::{
     parse_passive_activity, ActivitySample, ActivitySampleKind, ActivitySource, ActivityTransition,
+    ToolActivityMode,
 };
 pub mod agent_status;
 pub mod codex;
