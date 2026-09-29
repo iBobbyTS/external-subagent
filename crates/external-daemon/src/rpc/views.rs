@@ -552,7 +552,7 @@ pub(super) fn task_view(task: TaskRecord) -> TaskView {
     }
 }
 
-pub(super) fn task_activity_view(
+pub(crate) fn task_activity_view(
     _phase: TaskPhase,
     snapshot: Option<PassiveActivitySnapshot>,
 ) -> TaskActivityView {

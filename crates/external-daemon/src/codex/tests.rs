@@ -336,16 +336,19 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     );
     assert_eq!(activity.window_60s.other_tool_calls, 3);
 
+    // The wait public projection is a straight-through single line: whatever
+    // the tracker counted is exactly what wait exposes on the public field.
+    let projection =
+        crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
+    assert_eq!(projection.tool_calls_last_60s, 3);
+
     // observe stays exactly as before this feature: the count-only events are
-    // not tool calls and codex still projects no tool history or reasoning.
+    // not tool calls and codex still projects no tool history or reasoning. The
+    // full snapshot equality locks every field, not just the empty collections.
     let (observation, verified) = scheduler.observation_snapshot(&agent_id);
     assert!(!verified);
-    assert!(observation.tools.is_empty());
-    assert!(observation.reasoning.text.is_empty());
-    assert!(!observation.coverage.tool_history_complete);
-    assert!(!observation.coverage.reasoning_complete);
-    assert_eq!(observation.coverage.dropped_events, 0);
-    assert_eq!(observation.snapshot_seq, 0);
+    let expected = crate::observation::ObservationState::for_adapter("codex").snapshot();
+    assert_eq!(observation, expected);
 }
 
 #[test]

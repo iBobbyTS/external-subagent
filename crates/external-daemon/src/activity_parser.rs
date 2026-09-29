@@ -484,6 +484,7 @@ mod tests {
             serde_json::json!({"kind": "count", "count": 0}),
             serde_json::json!({"kind": "count", "count": -1}),
             serde_json::json!({"kind": "count", "count": 1.5}),
+            serde_json::json!({"kind": "count", "count": 2.0}),
             serde_json::json!({"kind": "count", "count": "3"}),
             serde_json::json!({"kind": "count", "count": 1025}),
             serde_json::json!({"kind": "count", "count": null}),

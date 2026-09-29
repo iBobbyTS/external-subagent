@@ -11,7 +11,7 @@ mod config;
 mod errors;
 mod handlers;
 mod types;
-mod views;
+pub(crate) mod views;
 mod wait;
 
 #[cfg(unix)]
