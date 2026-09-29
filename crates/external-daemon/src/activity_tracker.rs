@@ -633,6 +633,40 @@ mod tests {
         assert_eq!(zcode_window.bash_calls, 1);
         assert_eq!(zcode_window.tool_calls_completed, 1);
 
+        // Hand-written native frames (no shared constructor) so the ZCode
+        // assertion stays independent of the contract builders: a
+        // streamRecovery.updated started plus a result for an earlier call.
+        let zcode_native_events = || {
+            vec![
+                typed_session(serde_json::json!({
+                    "type": "streamRecovery.updated",
+                    "eventId": "z4",
+                    "turnId": "t1",
+                    "payload": {"kind": "started", "toolCallId": "call-3", "toolName": "Read"},
+                })),
+                typed_session(serde_json::json!({
+                    "type": "streamRecovery.updated",
+                    "eventId": "z5",
+                    "turnId": "t1",
+                    "payload": {"kind": "result", "toolCallId": "call-2"},
+                })),
+            ]
+        };
+        for event in zcode_native_events() {
+            zcode.observe_at(&event, now, 1_000);
+            zcode_mixed.observe_at(&event, now, 1_000);
+        }
+        assert_strict_matches_mixed(&zcode, &zcode_mixed, now);
+        let zcode_window = zcode.snapshot_at(now).window_60s;
+        assert_eq!(zcode_window.tool_calls_started, 3);
+        assert_eq!(zcode_window.read_calls, 2);
+        assert_eq!(zcode_window.bash_calls, 1);
+        assert_eq!(zcode_window.tool_calls_completed, 2);
+        let zcode_active = zcode.snapshot_at(now).active_tools;
+        assert_eq!(zcode_active.len(), 1);
+        assert_eq!(zcode_active[0].tool_call_id, "call-3");
+        assert_eq!(zcode_active[0].kind, PassiveToolKind::Read);
+
         // DSH canonical projections: named started, unnamed started, result.
         let dsh_events = || {
             let mut events = Vec::new();
@@ -698,7 +732,7 @@ mod tests {
         zcode.observe_at(&count_for_detailed, now, 2_000);
         assert_eq!(
             zcode.snapshot_at(now).window_60s.tool_calls_started,
-            2,
+            3,
             "Detailed must ignore the count vocabulary"
         );
         for event in zcode_events() {

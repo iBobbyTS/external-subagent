@@ -22,10 +22,15 @@
 //!
 //! These constructors are pure serialization helpers: they build the
 //! canonical wire shape from whatever arguments they are given and never
-//! validate, truncate, or error. Legality (bounded identities, non-empty
-//! names, `1 <= count <= MAX_TOOL_COUNT`) is enforced unilaterally by the
-//! daemon parser, so a producer that emits an out-of-range count simply has
-//! that event rejected rather than mis-serialized.
+//! validate, truncate, or error. Legality is enforced unilaterally by the
+//! daemon parser, and the rules it enforces are bounded identities (a
+//! non-empty, NUL-free id within the parser's byte cap) and
+//! `1 <= count <= MAX_TOOL_COUNT`; a producer that emits an out-of-range
+//! count or an unbounded id simply has that event rejected rather than
+//! mis-serialized. Tool names are not validated here either: the parser only
+//! classifies a `toolName` as Read/Bash/Other and accepts a missing or empty
+//! name as Other. (Name validation belongs to the separate observation
+//! vocabulary, not this activity contract.)
 
 use serde_json::Value;
 

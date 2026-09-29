@@ -26,7 +26,13 @@
 //!
 //! Both identities are stable and **re-delivery idempotent** at the tracker:
 //! an already-admitted identity neither adds weight nor refreshes the
-//! sample's receipt time.
+//! sample's receipt time. The one exception is a source upgrade: when a
+//! `v4/telemetry/event` sample for an identity is later replaced by the same
+//! identity delivered over `session/event`, the tracker accepts the session
+//! sample in place of the telemetry one and re-stamps it at the new receipt
+//! time (the Telemetry→Session replace path in `observe_at`). This models a
+//! producer upgrading a degraded telemetry frame to the authoritative session
+//! frame; after the replacement the identity is again re-delivery idempotent.
 //!
 //! # Emission modes
 //!
@@ -797,22 +803,31 @@ mod tests {
         }
         let phases = ["scheduled", "started", "result", "error", "batch"];
         // The vocabulary (tool.updated vs streamRecovery.updated) lives in
-        // params.type; the dispatch entry is the transport method.
-        let entries: [(&str, ActivitySource, fn(&str) -> serde_json::Value); 3] = [
-            ("session/event", ActivitySource::Session, |phase| {
-                session_params("tool.updated", phase)
-            }),
-            ("session/event", ActivitySource::Session, |phase| {
-                session_params("streamRecovery.updated", phase)
-            }),
+        // params.type; the dispatch entry is the transport method. Count
+        // events are emitted under both session types, so each session entry
+        // carries its own event type into the count assertion below.
+        let entries: [(&str, ActivitySource, fn(&str) -> serde_json::Value, Option<&str>); 3] = [
+            (
+                "session/event",
+                ActivitySource::Session,
+                |phase| session_params("tool.updated", phase),
+                Some("tool.updated"),
+            ),
+            (
+                "session/event",
+                ActivitySource::Session,
+                |phase| session_params("streamRecovery.updated", phase),
+                Some("streamRecovery.updated"),
+            ),
             (
                 "v4/telemetry/event",
                 ActivitySource::Telemetry,
                 telemetry_params,
+                None,
             ),
         ];
 
-        for (method, source, build) in entries {
+        for (method, source, build, count_type) in entries {
             for phase in phases {
                 let params = build(phase);
                 let mixed =
@@ -839,11 +854,14 @@ mod tests {
                 );
             }
 
-            if source == ActivitySource::Session {
+            if let Some(count_type) = count_type {
                 // The count vocabulary is accepted by Mixed/CountOnly and
-                // refused by Detailed at both session entries.
-                let count_event =
+                // refused by Detailed at both session entries. Each entry uses
+                // its own params.type so the count branch is exercised for
+                // streamRecovery.updated too, not only for tool.updated.
+                let mut count_event =
                     external_contract::activity::tool_count_event("evt-count", "turn-1", 2);
+                count_event["type"] = serde_json::json!(count_type);
                 for (mode, accepted) in [
                     (ToolActivityMode::Mixed, true),
                     (ToolActivityMode::CountOnly, true),
