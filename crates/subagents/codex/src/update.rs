@@ -21,13 +21,87 @@ const MAX_TURN_FAILURE_DETAIL_BYTES: usize = 512;
 const MAX_MCP_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Hard bound on the retired-turn memory.
 const MAX_RETIRED_TURNS: usize = 64;
+/// Hard bound on one counted tool item id, mirroring the daemon's activity id
+/// bound: an over-long id cannot become a stable dedupe identity.
+const MAX_TOOL_ITEM_ID_BYTES: usize = 512;
+/// Hard bound on the per-turn first-seen tool-item memory.
+const MAX_TRACKED_TOOL_ITEMS: usize = 4096;
+
+/// The Codex item types the adapter counts as one tool initiation. The
+/// whitelist is adapter-owned: the generic daemon protocol only ever receives
+/// the resulting count, never these names. Content items (agentMessage,
+/// reasoning, ...), mode switches, and output-side records stay excluded.
+pub const TOOL_ITEM_TYPES: [&str; 9] = [
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "webSearch",
+    "collabAgentToolCall",
+    "imageGeneration",
+    "imageView",
+    "sleep",
+];
+
+/// Whether an item type is on the adapter's tool whitelist.
+pub fn is_tool_item(item_type: &str) -> bool {
+    TOOL_ITEM_TYPES.contains(&item_type)
+}
+
+/// The counted tool item id of an `item/started`/`item/completed` frame: the
+/// item type must be whitelisted and the id present, bounded, and NUL-free.
+/// Any other item is not a count input.
+pub fn tool_item_id(params: &serde_json::Value) -> Option<&str> {
+    let item = params.get("item").unwrap_or(&serde_json::Value::Null);
+    if !item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(is_tool_item)
+    {
+        return None;
+    }
+    item.get("id")
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty() && id.len() <= MAX_TOOL_ITEM_ID_BYTES && !id.contains('\0'))
+}
+
+/// The canonical count-only `tool.updated` payload for one counted tool item.
+pub fn tool_count_payload(event_id: &str, turn_id: &str, count: u64) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool.updated",
+        "eventId": event_id,
+        "turnId": turn_id,
+        "payload": {"kind": "count", "count": count},
+    })
+}
+
+/// Bounded first-seen dedupe for tool item ids within one turn: a new id is
+/// recorded and returns `true`; an already-seen id returns `false` without
+/// changing the ring. At capacity the oldest entry is evicted first (the
+/// [`retire_turn`] style), so a pathological single-turn stream trades the
+/// oldest dedupe memory for bounded state.
+pub fn observe_tool_item(seen: &mut Vec<String>, id: &str) -> bool {
+    if seen.iter().any(|existing| existing == id) {
+        return false;
+    }
+    if seen.len() >= MAX_TRACKED_TOOL_ITEMS {
+        seen.remove(0);
+    }
+    seen.push(id.to_owned());
+    true
+}
 
 /// Whether a notification method is turn-scoped: its traffic must carry
 /// the active thread id and is only ever projected onto the current turn.
 pub fn is_turn_scoped(method: &str) -> bool {
     matches!(
         method,
-        "turn/started" | "item/agentMessage/delta" | "item/completed" | "turn/completed" | "error"
+        "turn/started"
+            | "item/started"
+            | "item/agentMessage/delta"
+            | "item/completed"
+            | "turn/completed"
+            | "error"
     )
 }
 
@@ -312,9 +386,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn turn_scoped_methods_are_the_five_projection_inputs() {
+    fn turn_scoped_methods_are_the_six_projection_inputs() {
         for method in [
             "turn/started",
+            "item/started",
             "item/agentMessage/delta",
             "item/completed",
             "turn/completed",
@@ -324,6 +399,79 @@ mod tests {
         }
         assert!(!is_turn_scoped("mcpServer/startupStatus/updated"));
         assert!(!is_turn_scoped("thread/started"));
+    }
+
+    #[test]
+    fn tool_item_whitelist_admits_calls_and_excludes_content() {
+        for item_type in TOOL_ITEM_TYPES {
+            assert!(is_tool_item(item_type), "{item_type}");
+        }
+        for item_type in [
+            "agentMessage",
+            "reasoning",
+            "subAgentActivity",
+            "functionCallOutput",
+            "userMessage",
+            "hookPrompt",
+            "plan",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "contextCompaction",
+            "unknownItem",
+        ] {
+            assert!(!is_tool_item(item_type), "{item_type}");
+        }
+    }
+
+    #[test]
+    fn tool_item_id_requires_a_whitelisted_typed_bounded_id() {
+        let valid = serde_json::json!({"item": {"type": "commandExecution", "id": "c-1"}});
+        assert_eq!(tool_item_id(&valid), Some("c-1"));
+        let empty = serde_json::json!({"item": {"type": "fileChange", "id": ""}});
+        assert_eq!(tool_item_id(&empty), None);
+        let nul = serde_json::json!({"item": {"type": "fileChange", "id": "a\0b"}});
+        assert_eq!(tool_item_id(&nul), None);
+        let long = serde_json::json!({
+            "item": {"type": "fileChange", "id": "x".repeat(MAX_TOOL_ITEM_ID_BYTES + 1)}
+        });
+        assert_eq!(tool_item_id(&long), None);
+        let no_id = serde_json::json!({"item": {"type": "fileChange"}});
+        assert_eq!(tool_item_id(&no_id), None);
+        let non_tool = serde_json::json!({"item": {"type": "agentMessage", "id": "m-1"}});
+        assert_eq!(tool_item_id(&non_tool), None);
+        assert_eq!(tool_item_id(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn tool_count_payload_has_the_count_only_shape() {
+        assert_eq!(
+            tool_count_payload("codex-event-9", "turn-1", 1),
+            serde_json::json!({
+                "type": "tool.updated",
+                "eventId": "codex-event-9",
+                "turnId": "turn-1",
+                "payload": {"kind": "count", "count": 1},
+            })
+        );
+    }
+
+    #[test]
+    fn observe_tool_item_is_first_seen_dedupe_with_fifo_eviction() {
+        let mut seen = Vec::new();
+        assert!(observe_tool_item(&mut seen, "seen-before"));
+        assert!(!observe_tool_item(&mut seen, "seen-before"));
+        assert_eq!(seen.len(), 1);
+        for index in 0..MAX_TRACKED_TOOL_ITEMS {
+            observe_tool_item(&mut seen, &format!("item-{index}"));
+        }
+        assert_eq!(seen.len(), MAX_TRACKED_TOOL_ITEMS);
+        assert!(
+            !seen.iter().any(|id| id == "seen-before"),
+            "oldest evicted first"
+        );
+        observe_tool_item(&mut seen, "item-new");
+        assert_eq!(seen.len(), MAX_TRACKED_TOOL_ITEMS);
+        assert!(seen.iter().any(|id| id == "item-new"));
     }
 
     #[test]

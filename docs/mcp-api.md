@@ -256,7 +256,7 @@ spawn 标注非幂等；返回超时不能直接推断未创建任务，不应�
 | `coverage.reasoning_complete` | boolean | 判断推理采集覆盖 | 易对缺失片段过度推断 |
 | `coverage.dropped_events` | integer | 量化丢弃事件 | 无法衡量证据缺口 |
 
-zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；工具调用计数可见，但当前 adapter 不投影工具输入，返回空参数对象并标记 `arguments_truncated: true`，`coverage.tool_history_complete: false`。codex 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`；其工具输入历史当前未由 adapter 完整投影，`coverage.tool_history_complete: false`。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
+zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；工具调用计数可见，但当前 adapter 不投影工具输入，返回空参数对象并标记 `arguments_truncated: true`，`coverage.tool_history_complete: false`。codex 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`；其工具输入历史当前未由 adapter 完整投影，`coverage.tool_history_complete: false`（codex 的 wait `tool_calls_last_60s` 计数有效，经适配器白名单 count-only 投影，但工具明细仍不经 observe 投影）。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
 
 不返回工具结果，因而不能据此证明执行成功、文件没有变化或任务失败。公开描述中的 `PROGRESSING / EXPECTED_WAIT / NEEDS_CLARIFICATION / NO_PROGRESS_LOOP / INSUFFICIENT_OBSERVABILITY` 是调用方判断用语，**不是返回字段或服务端分类结果**。
 
@@ -421,7 +421,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `latest_text_tail` | string | 增量投递：仅返回自上次任意 wait 之后新增的公开文本；空串表示无新增。每个字节最多经 wait 投递一次（后到的 wait 只见新内容）；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
 | `latest_text_truncated` | boolean | 为 true 表示本次返回相对上次投递存在缺口：尚未投递的字节已滚出 8 KiB 窗口，本次返回退化为整个窗口 | 易把片段当完整输出 |
 | `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex 不采集时为空串 |
-| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数 | 看不出近期是否有工具活动 |
+| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数（来源：zcode 原生 `tool.updated`、dsh ACP 归一化、codex 适配器白名单 count-only 投影） | 看不出近期是否有工具活动 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
 
 计数不能证明产生了有效任务进展。深度诊断（逐工具调用参数、覆盖率缺口）使用 observe。

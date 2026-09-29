@@ -46,6 +46,7 @@ impl CodexRuntimeOwner {
             start_in_flight: AtomicBool::new(false),
             last_message_item: Mutex::new(None),
             items: Mutex::new(HashMap::new()),
+            seen_tool_items: Mutex::new(Vec::new()),
             turn_failure: Mutex::new(None),
             mcp_tail: Mutex::new(String::new()),
             sequence: AtomicU64::new(0),

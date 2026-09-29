@@ -1,5 +1,10 @@
 use super::*;
 
+/// Upper bound on one count-only tool event's weight; larger values are
+/// treated as malformed so a hostile or confused producer cannot inflate the
+/// 60-second window with a single frame.
+const MAX_TOOL_COUNT: u64 = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivitySource {
     Session,
@@ -11,7 +16,7 @@ pub(crate) enum ActivitySource {
 pub(crate) enum ActivitySampleKind {
     ReasoningDelta,
     TextDelta,
-    ToolStarted { kind: PassiveToolKind },
+    ToolStarted { kind: PassiveToolKind, count: u64 },
     ToolCompleted,
     ToolFailed,
 }
@@ -157,7 +162,11 @@ fn parse_activity_message(
                 parsed.message_finished = true;
             }
             (Some("tool.updated" | "streamRecovery.updated"), _, _) => {
-                parse_tool_activity(&mut parsed, payload, source);
+                if payload_kind == Some("count") {
+                    parse_tool_count_activity(&mut parsed, payload, event_id);
+                } else {
+                    parse_tool_activity(&mut parsed, payload, source);
+                }
             }
             (Some("session.updated"), _, Some("model_request_started")) => {
                 parse_model_activity(&mut parsed, payload, true);
@@ -315,12 +324,40 @@ fn parse_tool_activity(
         parsed.sample = match phase {
             ActivityTransition::ToolStarted => Some(ActivitySampleKind::ToolStarted {
                 kind: parsed.tool_kind,
+                count: 1,
             }),
             ActivityTransition::ToolCompleted => Some(ActivitySampleKind::ToolCompleted),
             ActivityTransition::ToolFailed => Some(ActivitySampleKind::ToolFailed),
             _ => None,
         };
     }
+}
+
+/// The count-only tool vocabulary: `tool.updated` (and its
+/// `streamRecovery.updated` sibling) with `payload.kind == "count"` carries a
+/// pure initiation count and no tool identity. Only a bounded positive
+/// integer count plus a params-level `eventId` that survives [`activity_id`]
+/// yields an activity; anything malformed invents nothing (no identity, no
+/// sample, no transition).
+fn parse_tool_count_activity(
+    parsed: &mut ParsedActivity,
+    payload: &serde_json::Value,
+    event_id: Option<String>,
+) {
+    let Some(count) = payload.get("count").and_then(serde_json::Value::as_u64) else {
+        return;
+    };
+    if !(1..=MAX_TOOL_COUNT).contains(&count) {
+        return;
+    }
+    let Some(event_id) = event_id else {
+        return;
+    };
+    parsed.identity = Some(format!("tool:{event_id}:count"));
+    parsed.sample = Some(ActivitySampleKind::ToolStarted {
+        kind: PassiveToolKind::Other,
+        count,
+    });
 }
 
 fn stream_key(
@@ -392,5 +429,123 @@ mod tests {
         assert!(parsed.identity.is_none());
         assert!(parsed.sample.is_none());
         assert!(parsed.transition.is_none());
+    }
+
+    #[test]
+    fn count_only_tool_events_carry_a_weighted_started_sample() {
+        let parsed = parse_activity_message(
+            "session/event",
+            &serde_json::json!({
+                "type": "tool.updated",
+                "eventId": "codex-event-1",
+                "turnId": "turn-1",
+                "payload": {"kind": "count", "count": 1}
+            }),
+            ActivitySource::Session,
+        );
+        assert_eq!(parsed.identity.as_deref(), Some("tool:codex-event-1:count"));
+        assert_eq!(
+            parsed.sample,
+            Some(ActivitySampleKind::ToolStarted {
+                kind: PassiveToolKind::Other,
+                count: 1,
+            })
+        );
+        // Count-only carries no tool identity: no phase transition, no
+        // tool_call_id, so active-tool bookkeeping is untouched.
+        assert!(parsed.transition.is_none());
+        assert!(parsed.tool_call_id.is_none());
+
+        // streamRecovery.updated shares the arm and accepts the same shape; the
+        // upper bound 1024 is a legal weight.
+        let recovery = parse_activity_message(
+            "session/event",
+            &serde_json::json!({
+                "type": "streamRecovery.updated",
+                "eventId": "e-2",
+                "payload": {"kind": "count", "count": 1024}
+            }),
+            ActivitySource::Session,
+        );
+        assert_eq!(recovery.identity.as_deref(), Some("tool:e-2:count"));
+        assert_eq!(
+            recovery.sample,
+            Some(ActivitySampleKind::ToolStarted {
+                kind: PassiveToolKind::Other,
+                count: 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_count_payloads_invent_no_activity() {
+        for payload in [
+            serde_json::json!({"kind": "count"}),
+            serde_json::json!({"kind": "count", "count": 0}),
+            serde_json::json!({"kind": "count", "count": -1}),
+            serde_json::json!({"kind": "count", "count": 1.5}),
+            serde_json::json!({"kind": "count", "count": "3"}),
+            serde_json::json!({"kind": "count", "count": 1025}),
+            serde_json::json!({"kind": "count", "count": null}),
+            serde_json::json!({"kind": "count", "count": true}),
+        ] {
+            let parsed = parse_activity_message(
+                "session/event",
+                &serde_json::json!({
+                    "type": "tool.updated",
+                    "eventId": "e-1",
+                    "payload": payload,
+                }),
+                ActivitySource::Session,
+            );
+            assert!(parsed.identity.is_none(), "{payload}");
+            assert!(parsed.sample.is_none(), "{payload}");
+            assert!(parsed.transition.is_none(), "{payload}");
+        }
+    }
+
+    #[test]
+    fn count_requires_a_valid_params_level_event_id() {
+        for event_id in [
+            serde_json::Value::Null,
+            serde_json::json!(7),
+            serde_json::json!(""),
+            serde_json::json!("bad\0id"),
+            serde_json::json!("x".repeat(MAX_ACTIVITY_ID_BYTES + 1)),
+        ] {
+            let parsed = parse_activity_message(
+                "session/event",
+                &serde_json::json!({
+                    "type": "tool.updated",
+                    "eventId": event_id,
+                    "payload": {"kind": "count", "count": 1},
+                }),
+                ActivitySource::Session,
+            );
+            assert!(parsed.identity.is_none(), "{event_id}");
+            assert!(parsed.sample.is_none(), "{event_id}");
+            assert!(parsed.transition.is_none(), "{event_id}");
+        }
+    }
+
+    #[test]
+    fn detailed_tool_started_stays_a_single_count() {
+        let parsed = parse_activity_message(
+            "session/event",
+            &serde_json::json!({
+                "type": "tool.updated",
+                "eventId": "e-1",
+                "payload": {"kind": "started", "toolCallId": "c-1", "toolName": "Bash"}
+            }),
+            ActivitySource::Session,
+        );
+        assert_eq!(parsed.identity.as_deref(), Some("tool:c-1:started"));
+        assert_eq!(
+            parsed.sample,
+            Some(ActivitySampleKind::ToolStarted {
+                kind: PassiveToolKind::Bash,
+                count: 1,
+            })
+        );
     }
 }

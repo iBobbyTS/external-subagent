@@ -30,6 +30,10 @@ pub(super) struct CodexShared {
     pub(super) start_in_flight: AtomicBool,
     pub(super) last_message_item: Mutex<Option<String>>,
     pub(super) items: Mutex<HashMap<String, String>>,
+    /// First-seen tool item ids for the current turn: a repeated
+    /// started/completed item must not be counted twice. Cleared at every turn
+    /// boundary (a new `turn/started` and turn retirement).
+    pub(super) seen_tool_items: Mutex<Vec<String>>,
     pub(super) turn_failure: Mutex<Option<String>>,
     pub(super) mcp_tail: Mutex<String>,
     pub(super) sequence: AtomicU64,
@@ -92,6 +96,30 @@ impl CodexShared {
     fn retire_turn(&self, turn_id: &str) {
         update::retire_turn(&mut self.retired_turns.lock().unwrap(), turn_id);
         *self.current_turn.lock().unwrap() = None;
+        // The counted tool items are turn-scoped: a retired turn's dedupe
+        // memory must never suppress the next turn's first sighting.
+        self.seen_tool_items.lock().unwrap().clear();
+    }
+
+    /// Project one whitelisted, attributable, first-seen tool item as a
+    /// canonical count-only event. Returns `false` when the frame was fully
+    /// consumed; an item outside the adapter whitelist, one that cannot be
+    /// pinned to the current turn, or an already-counted id stays a
+    /// diagnostic observation (`true`), matching the daemon's fall-through
+    /// contract.
+    fn project_tool_item(&self, params: &serde_json::Value, event_id: &str) -> bool {
+        let Some(item_id) = update::tool_item_id(params) else {
+            return true;
+        };
+        let frame_turn = params.get("turnId").and_then(|value| value.as_str());
+        let Some(turn_id) = self.attributable_turn(frame_turn) else {
+            return true;
+        };
+        if !update::observe_tool_item(&mut self.seen_tool_items.lock().unwrap(), item_id) {
+            return true;
+        }
+        self.emit_canonical(update::tool_count_payload(event_id, &turn_id, 1));
+        false
     }
 
     fn turn_is_retired(&self, turn_id: &str) -> bool {
@@ -160,6 +188,9 @@ impl CodexShared {
                 }
                 *self.current_turn.lock().unwrap() = Some(turn_id.to_owned());
                 *self.last_message_item.lock().unwrap() = None;
+                // Tool-item dedupe is scoped to one turn: the new turn starts
+                // with an empty first-seen set.
+                self.seen_tool_items.lock().unwrap().clear();
                 // A stale failure detail from an earlier turn must never
                 // label this turn's boundary.
                 *self.turn_failure.lock().unwrap() = None;
@@ -171,6 +202,12 @@ impl CodexShared {
                 self.turn_tracker.observe(&event);
                 self.emit_lifecycle("turn.started");
                 false
+            }
+            "item/started" => {
+                // A whitelisted tool item's first sighting counts once; every
+                // other item type, unattributable frame, or repeat stays a
+                // diagnostic observation.
+                self.project_tool_item(&params, &event_id)
             }
             "item/agentMessage/delta" => {
                 let Some((delta, item_id)) = update::agent_message_delta(&params) else {
@@ -190,7 +227,10 @@ impl CodexShared {
             }
             "item/completed" => {
                 let Some((item_id, text)) = update::completed_agent_message(&params) else {
-                    return true;
+                    // Not an agent message: a whitelisted tool item counts here
+                    // as a backfill when its start was missed (the protocol does
+                    // not promise start/complete pairing).
+                    return self.project_tool_item(&params, &event_id);
                 };
                 let frame_turn = params.get("turnId").and_then(|value| value.as_str());
                 let Some(turn_id) = self.attributable_turn(frame_turn) else {

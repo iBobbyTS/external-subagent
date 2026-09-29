@@ -220,17 +220,17 @@ impl PassiveActivityTracker {
                 ActivitySampleKind::TextDelta => {
                     window.text_delta_events = window.text_delta_events.saturating_add(1);
                 }
-                ActivitySampleKind::ToolStarted { kind } => {
-                    window.tool_calls_started = window.tool_calls_started.saturating_add(1);
+                ActivitySampleKind::ToolStarted { kind, count } => {
+                    window.tool_calls_started = window.tool_calls_started.saturating_add(count);
                     match kind {
                         PassiveToolKind::Read => {
-                            window.read_calls = window.read_calls.saturating_add(1)
+                            window.read_calls = window.read_calls.saturating_add(count)
                         }
                         PassiveToolKind::Bash => {
-                            window.bash_calls = window.bash_calls.saturating_add(1)
+                            window.bash_calls = window.bash_calls.saturating_add(count)
                         }
                         PassiveToolKind::Other => {
-                            window.other_tool_calls = window.other_tool_calls.saturating_add(1)
+                            window.other_tool_calls = window.other_tool_calls.saturating_add(count)
                         }
                     }
                 }
@@ -411,6 +411,7 @@ impl PassiveActivityTracker {
                 observed_at: now,
                 kind: ActivitySampleKind::ToolStarted {
                     kind: PassiveToolKind::Bash,
+                    count: 1,
                 },
             },
         );
@@ -475,6 +476,55 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_samples_weight_the_window_and_expire_without_refresh() {
+        fn count_event(event_id: &str, count: u64) -> RuntimeEvent {
+            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                external_contract::EventEnvelope {
+                    method: "session/event".into(),
+                    params: serde_json::json!({
+                        "type": "tool.updated",
+                        "eventId": event_id,
+                        "turnId": "t1",
+                        "payload": {"kind": "count", "count": count},
+                    }),
+                },
+            )))
+        }
+        let tracker = PassiveActivityTracker::new(false);
+        let base = Instant::now();
+        tracker.observe_at(&count_event("a", 3), base, 1_000);
+        tracker.observe_at(&count_event("b", 2), base, 1_000);
+        let window = tracker.snapshot_at(base).window_60s;
+        assert_eq!(window.tool_calls_started, 5);
+        // The count-only path carries no tool name, so every unit lands in the
+        // internal Other bucket; read/bash stay zero.
+        assert_eq!(window.other_tool_calls, 5);
+        assert_eq!(window.read_calls, 0);
+        assert_eq!(window.bash_calls, 0);
+
+        // A re-delivery of an already-admitted identity is refused: no extra
+        // weight and the original sample time is not refreshed.
+        tracker.observe_at(&count_event("a", 3), base + Duration::from_secs(30), 2_000);
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_secs(30))
+                .window_60s
+                .tool_calls_started,
+            5
+        );
+
+        // Past the 60-second window measured from first receipt, both samples
+        // fall out even though "a" was re-delivered at t=30.
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_secs(61))
+                .window_60s
+                .tool_calls_started,
+            0
+        );
+    }
 
     #[test]
     fn stall_progress_ignores_malformed_and_oversized_frames() {

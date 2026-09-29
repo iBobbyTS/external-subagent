@@ -271,6 +271,160 @@ fn public_submit_reaches_persistent_thread_and_persists_the_id() {
 }
 
 #[test]
+fn whitelisted_tool_items_feed_wait_count_without_touching_observe() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let echo = start_echo(&directory, PermissionMode::Plan);
+    // One turn exercises the whole count contract: call-1 is started twice
+    // and completed (must count once), call-2 is a bare whitelisted start,
+    // call-3 is a whitelisted completion whose start was missed (backfill
+    // counts once), reasoning is non-whitelisted, and the last two tool frames
+    // carry a foreign thread, respectively a foreign turn. Three distinct
+    // whitelisted calls are expected.
+    //
+    // 双计数不变量：适配器不得对同一调用同时发详细 started 与 count（本适配器无详细
+    // 工具路径，此夹具锁定 count 单路径，防止回归时双重计数）。
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"fileChange","id":"call-2"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"mcpToolCall","id":"call-3"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"reasoning","id":"r-1"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"other-thread","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-4"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"other-turn","item":{{"type":"commandExecution","id":"call-5"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"TOOL_COUNT_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+    );
+    let scheduler = codex_scheduler(&directory, harness_factory(&script, &directory));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "count tools"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    // The count path never leaks into the result text.
+    assert_eq!(result.result.final_text, "TOOL_COUNT_OK");
+    await_terminal_task(&scheduler, &agent_id);
+
+    let activity = scheduler
+        .passive_activity_snapshot(&agent_id)
+        .expect("codex activity tracker is present");
+    assert_eq!(
+        activity.window_60s.tool_calls_started, 3,
+        "call-1 (deduped start+complete), call-2 (started), call-3 (completion backfill) only"
+    );
+    assert_eq!(activity.window_60s.other_tool_calls, 3);
+
+    // observe stays exactly as before this feature: the count-only events are
+    // not tool calls and codex still projects no tool history or reasoning.
+    let (observation, verified) = scheduler.observation_snapshot(&agent_id);
+    assert!(!verified);
+    assert!(observation.tools.is_empty());
+    assert!(observation.reasoning.text.is_empty());
+    assert!(!observation.coverage.tool_history_complete);
+    assert!(!observation.coverage.reasoning_complete);
+    assert_eq!(observation.coverage.dropped_events, 0);
+    assert_eq!(observation.snapshot_seq, 0);
+}
+
+#[test]
+fn tool_item_dedupe_clears_at_turn_boundaries() {
+    let _guard = scripted_test_guard();
+    // The same codex item id appears in two turns of one process: the
+    // first-seen set is turn-scoped, so the second turn counts it again
+    // instead of being suppressed by the retired turn's memory.
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let echo = start_echo(&directory, PermissionMode::Plan);
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"shared-call"}}}}}}'
+while [ ! -f release ]; do sleep 0.01; done
+printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"FIRST_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries.jsonl
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-2","item":{{"type":"commandExecution","id":"shared-call"}}}}}}' \
+  '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-2","item":{{"type":"agentMessage","id":"msg_2","text":"SECOND_OK"}}}}}}' \
+  '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-2","status":"completed","error":null}}}}}}'
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
+"#
+    );
+    let scheduler = codex_scheduler(&directory, harness_factory(&script, &directory));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(&directory, "two turns"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    loop {
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        if matches!(task.turn_state, external_store::TurnState::Active) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "first turn never became active");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        scheduler
+            .queue_message(&agent_id, "same-process-msg", "second turn")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    std::fs::write(directory.join("release"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "SECOND_OK");
+    await_terminal_task(&scheduler, &agent_id);
+
+    let activity = scheduler
+        .passive_activity_snapshot(&agent_id)
+        .expect("codex activity tracker is present");
+    assert_eq!(
+        activity.window_60s.tool_calls_started, 2,
+        "the same item id counts once per turn after the boundary clears the dedupe set"
+    );
+}
+
+#[test]
 fn yolo_submit_pins_danger_full_access_and_persists_the_id() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
