@@ -697,6 +697,128 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
 }
 
 #[test]
+fn publisher_latched_snapshot_does_not_wait_for_native_input_write() {
+    use super::events::AgyRuntimeShared;
+    use std::sync::mpsc;
+
+    let shared = Arc::new(AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
+        Arc::new(crate::TurnTracker::new()),
+    ));
+    let (writing, write_started) = mpsc::channel();
+    let (release_write, write_released) = mpsc::channel();
+    let writer_shared = Arc::clone(&shared);
+    let writer = thread::spawn(move || {
+        writer_shared.buffer_input(|| {
+            // 受控阻塞写持有 turn 锁，登记已完成且失败撤回尚未发生。
+            writing.send(()).unwrap();
+            write_released.recv().unwrap();
+            Err(crate::RuntimeCommandError::Transport(
+                "write refused".into(),
+            ))
+        })
+    });
+    write_started.recv_timeout(SCRIPTED_SYNC_WAIT).unwrap();
+    let (snapshot_sent, snapshot_ready) = mpsc::channel();
+    let monitor_shared = Arc::clone(&shared);
+    let monitor = thread::spawn(move || {
+        // 与 watchdog 相同：持 publisher latch 读取 snapshot。
+        // 此时 turn 锁确定由 writer 持有，旧实现必然阻塞。
+        let _latch = monitor_shared.publisher.decision_latch();
+        snapshot_sent.send(monitor_shared.turn_snapshot()).unwrap();
+    });
+    let snapshot = snapshot_ready.recv_timeout(Duration::from_secs(2));
+    // 先解除受控写再断言，旧实现失败时也能回收两个线程。
+    release_write.send(()).unwrap();
+    assert!(writer.join().unwrap().is_err());
+    monitor.join().unwrap();
+    assert!(
+        snapshot
+            .expect("publisher-latched snapshot waited for turn lock")
+            .active
+    );
+    assert!(
+        !shared.turn_snapshot().active,
+        "failed write was not withdrawn"
+    );
+}
+
+#[test]
+fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
+    use super::events::AgyRuntimeShared;
+    use std::sync::{mpsc, Mutex};
+
+    struct PausedSettlementSink {
+        publishing: mpsc::Sender<()>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+    impl LifecycleSink for PausedSettlementSink {
+        fn emit(&self, record: crate::LifecycleRecord) {
+            let crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+                external_contract::WireMessage::Event(event),
+            )) = record.event
+            else {
+                return;
+            };
+            if event.params["type"] == "turn.completed" {
+                if let Some(release) = self.release.lock().unwrap().take() {
+                    // 真实 result 发布正持 turn 与 publisher 锁；暂停首轮边界。
+                    self.publishing.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+            }
+        }
+    }
+
+    let (publishing, publication_started) = mpsc::channel();
+    let (release, publication_released) = mpsc::channel();
+    let shared = Arc::new(AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(PausedSettlementSink {
+            publishing,
+            release: Mutex::new(Some(publication_released)),
+        }))),
+        Arc::new(crate::TurnTracker::new()),
+    ));
+    shared.begin_turn();
+    shared.buffer_input(|| Ok(())).unwrap();
+    let result = |count| {
+        external_agent_agy::event::parse_line(&format!(r#"{{"event":"result","result":{{"conversation_id":"{CONV}","status":"SUCCESS","response":"turn {count}","num_turns":{count}}}}}"#)).unwrap()
+    };
+    let first_result = result(1);
+    let pump_shared = Arc::clone(&shared);
+    let pump = thread::spawn(move || pump_shared.project_event(&first_result));
+    publication_started
+        .recv_timeout(SCRIPTED_SYNC_WAIT)
+        .unwrap();
+    let (snapshot_sent, snapshot_ready) = mpsc::channel();
+    let snapshot_shared = Arc::clone(&shared);
+    let reader = thread::spawn(move || {
+        snapshot_sent.send(snapshot_shared.turn_snapshot()).unwrap();
+    });
+    let snapshot = snapshot_ready.recv_timeout(Duration::from_secs(2));
+    // 先释放真实发布路径，确保旧实现超时失败也不会遗留阻塞线程。
+    release.send(()).unwrap();
+    pump.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        snapshot
+            .expect("snapshot waited for result publication's turn lock")
+            .active
+    );
+    let first = shared.turn_snapshot();
+    assert!(
+        first.active,
+        "pending native input lost its completion protection"
+    );
+    assert_eq!(first.boundary, Some(crate::TurnBoundary::Completed));
+    shared.project_event(&result(2));
+    let second = shared.turn_snapshot();
+    assert!(!second.active);
+    assert_eq!(second.generation, first.generation + 1);
+    assert_eq!(second.boundary, Some(crate::TurnBoundary::Completed));
+}
+
+#[test]
 fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
     use super::events::AgyRuntimeShared;
     let tracker = Arc::new(crate::TurnTracker::new());

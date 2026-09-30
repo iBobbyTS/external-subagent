@@ -18,7 +18,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     time::{Duration, Instant},
@@ -50,8 +50,6 @@ pub(super) enum AgyStartState {
 struct AgyTurnState {
     classifier: TurnClassifier,
     open: bool,
-    // stdin 已接收、尚未由 user_input/result 开启消费的原生后续输入。
-    pending_inputs: usize,
 }
 
 pub(super) struct AgyRuntimeShared {
@@ -61,6 +59,8 @@ pub(super) struct AgyRuntimeShared {
     pub(super) start: Mutex<AgyStartState>,
     pub(super) start_changed: Condvar,
     turn: Mutex<AgyTurnState>,
+    // turn 锁串行化登记、撤回与消费；snapshot 原子读取，避免 publisher → turn 反向依赖。
+    pending_inputs: AtomicUsize,
     pub(super) sequence: AtomicU64,
     pub(super) stop_boundaries: AtomicU64,
     diagnostics: Mutex<String>,
@@ -77,8 +77,8 @@ impl AgyRuntimeShared {
             turn: Mutex::new(AgyTurnState {
                 classifier: TurnClassifier::new(),
                 open: false,
-                pending_inputs: 0,
             }),
+            pending_inputs: AtomicUsize::new(0),
             sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
             diagnostics: Mutex::new(String::new()),
@@ -184,27 +184,29 @@ impl AgyRuntimeShared {
         &self,
         write: impl FnOnce() -> Result<(), RuntimeCommandError>,
     ) -> Result<(), RuntimeCommandError> {
-        let mut turn = self.turn.lock().unwrap();
-        turn.pending_inputs += 1;
+        let _turn = self.turn.lock().unwrap();
+        self.pending_inputs.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = write() {
-            turn.pending_inputs -= 1;
+            self.pending_inputs.fetch_sub(1, Ordering::AcqRel);
             return Err(error);
         }
         Ok(())
     }
 
     pub(super) fn turn_snapshot(&self) -> crate::TurnSnapshot {
-        let turn = self.turn.lock().unwrap();
+        // 先读 pending，再读 tracker；消费方先发布 started 再递减，
+        // 避免同时读到旧的空闲 tracker 和消费后的零计数，导致提前回收。
+        let pending = self.pending_inputs.load(Ordering::Acquire);
         let mut snapshot = self.turn_tracker.snapshot();
         // 两轮之间仍有原生输入待消费，monitor 不得按首轮边界回收进程。
-        snapshot.active |= turn.pending_inputs > 0;
+        snapshot.active |= pending > 0;
         snapshot
     }
 
     fn begin_pending_turn(&self, turn: &mut AgyTurnState) {
-        turn.pending_inputs -= 1;
         turn.open = true;
         self.emit_started();
+        self.pending_inputs.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Wait for the bootstrap gate: `init` (identity recorded) or an
@@ -260,7 +262,7 @@ impl AgyRuntimeShared {
                 self.note_session(&step.conversation_id);
                 if step.step_type == StepType::UserInput {
                     let mut turn = self.turn.lock().unwrap();
-                    if !turn.open && turn.pending_inputs > 0 {
+                    if !turn.open && self.pending_inputs.load(Ordering::Acquire) > 0 {
                         self.begin_pending_turn(&mut turn);
                     }
                 }
@@ -303,7 +305,10 @@ impl AgyRuntimeShared {
         }
         let mut turn = self.turn.lock().unwrap();
         // 缺 user_input 的流可由递增 num_turns 开启；同一轮的重复 result 仍丢弃。
-        if !turn.open && turn.pending_inputs > 0 && result.num_turns > turn.classifier.num_turns() {
+        if !turn.open
+            && self.pending_inputs.load(Ordering::Acquire) > 0
+            && result.num_turns > turn.classifier.num_turns()
+        {
             self.begin_pending_turn(&mut turn);
         }
         let settlement = {
