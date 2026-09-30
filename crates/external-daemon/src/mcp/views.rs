@@ -529,6 +529,11 @@ pub struct PublicActivity {
     pub latest_reasoning: String,
     /// Tool calls started in the last 60 seconds, across all tools.
     pub tool_calls_last_60s: u64,
+    /// 任务级最近三次调用，按时间升序；参数统一为字符串。
+    #[schemars(length(max = 3))]
+    pub last_tool_calls: Vec<[String; 2]>,
+    pub last_activity_age_ms: Option<u64>,
+    pub model_request_active: bool,
     pub telemetry_status: PublicTelemetryStatus,
 }
 
@@ -539,6 +544,9 @@ impl From<TaskActivityView> for PublicActivity {
             latest_text_truncated: value.latest_text_truncated,
             latest_reasoning: value.latest_reasoning,
             tool_calls_last_60s: value.tool_calls_last_60s,
+            last_tool_calls: value.last_tool_calls,
+            last_activity_age_ms: value.last_activity_age_ms,
+            model_request_active: value.model_request_active,
             telemetry_status: match value.telemetry_status {
                 TelemetryStatusView::Healthy => PublicTelemetryStatus::Healthy,
                 TelemetryStatusView::Degraded => PublicTelemetryStatus::Degraded,
@@ -801,6 +809,72 @@ mod observation_contract_tests {
                 oversized.reasoning.as_mut().unwrap().text.push('x');
                 assert!(AgentObserveOutput::try_from(oversized).is_err());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod activity_projection_tests {
+    use super::*;
+
+    #[test]
+    fn public_activity_forwards_pairs_age_active_and_empty_defaults() {
+        let empty = crate::rpc::views::task_activity_view(external_store::TaskPhase::Queued, None);
+        let value = serde_json::to_value(PublicActivity::from(empty)).unwrap();
+        assert_eq!(value["last_tool_calls"], serde_json::json!([]));
+        assert!(value["last_activity_age_ms"].is_null());
+        assert_eq!(value["model_request_active"], false);
+        let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
+        for n in 0..4 {
+            tracker.observe(&crate::RuntimeEvent::Driver(
+                external_runtime::Inbound::Message(external_contract::WireMessage::Event(
+                    external_contract::EventEnvelope {
+                        method: "session/event".into(),
+                        params: external_contract::activity::tool_count_event(
+                            &format!("e{n}"),
+                            "t",
+                            1,
+                            Some("commandExecution"),
+                            Some(&format!("echo {n}")),
+                        ),
+                    },
+                )),
+            ));
+        }
+        tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+            external_contract::WireMessage::Event(external_contract::EventEnvelope {
+                method: "session/event".into(), params: serde_json::json!({"type":"session.updated","payload":{"type":"model_request_started","requestId":"r"}}),
+            }),
+        )));
+        let snapshot = tracker.snapshot();
+        let age = snapshot.last_activity_age_ms;
+        let rpc = crate::rpc::views::task_activity_view(
+            external_store::TaskPhase::Running,
+            Some(snapshot),
+        );
+        let value = serde_json::to_value(PublicActivity::from(rpc)).unwrap();
+        assert_eq!(
+            value["last_tool_calls"],
+            serde_json::json!([
+                ["commandExecution", "echo 1"],
+                ["commandExecution", "echo 2"],
+                ["commandExecution", "echo 3"]
+            ])
+        );
+        assert_eq!(value["last_activity_age_ms"], serde_json::json!(age));
+        assert_eq!(value["model_request_active"], true);
+        // 公共 schema 拒绝合并字符串、非二元组和第四条调用。
+        let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&value));
+        for calls in [
+            serde_json::json!(["commandExecution echo 1"]),
+            serde_json::json!([["tool"]]),
+            serde_json::json!([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]),
+        ] {
+            let mut invalid = value.clone();
+            invalid["last_tool_calls"] = calls;
+            assert!(!validator.is_valid(&invalid));
         }
     }
 }

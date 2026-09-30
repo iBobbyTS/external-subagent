@@ -118,8 +118,28 @@ impl CodexShared {
         if !update::observe_tool_item(&mut self.seen_tool_items.lock().unwrap(), item_id) {
             return true;
         }
+        // 仅在既有白名单、归因与首见去重门通过后抽取描述符。
+        let item = &params["item"];
+        let tool = item["type"].as_str().unwrap();
+        let detail = match tool {
+            "commandExecution" => item["command"].as_str().map(str::to_owned),
+            "fileChange" => item["changes"].as_array().map(|changes| {
+                changes
+                    .iter()
+                    .filter_map(|change| change["path"].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }),
+            _ => Some(item_id.to_owned()),
+        };
+        let bounded =
+            crate::activity_parser::bounded_tool_call(tool, detail.as_deref().unwrap_or(""));
         self.emit_canonical(external_contract::activity::tool_count_event(
-            event_id, &turn_id, 1,
+            event_id,
+            &turn_id,
+            1,
+            Some(&bounded[0]),
+            detail.as_ref().map(|_| bounded[1].as_str()),
         ));
         false
     }

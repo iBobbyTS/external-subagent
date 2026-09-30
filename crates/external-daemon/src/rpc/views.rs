@@ -272,6 +272,10 @@ pub struct TaskActivityView {
     pub latest_reasoning: String,
     /// Tool calls started in the last 60 seconds, across all tools.
     pub tool_calls_last_60s: u64,
+    /// 任务级最近三次调用，按时间升序；参数统一为字符串。
+    pub last_tool_calls: Vec<[String; 2]>,
+    pub last_activity_age_ms: Option<u64>,
+    pub model_request_active: bool,
     pub telemetry_status: TelemetryStatusView,
 }
 
@@ -563,6 +567,9 @@ pub(crate) fn task_activity_view(
             latest_text_truncated: false,
             latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
+            last_tool_calls: Vec::new(),
+            last_activity_age_ms: None,
+            model_request_active: false,
             telemetry_status: TelemetryStatusView::Unavailable,
         };
     };
@@ -571,6 +578,9 @@ pub(crate) fn task_activity_view(
         latest_text_truncated: snapshot.latest_text_truncated,
         latest_reasoning: snapshot.latest_reasoning,
         tool_calls_last_60s: snapshot.window_60s.tool_calls_started,
+        last_tool_calls: snapshot.last_tool_calls,
+        last_activity_age_ms: snapshot.last_activity_age_ms,
+        model_request_active: snapshot.model_request_active,
         telemetry_status: if snapshot.telemetry_degraded {
             TelemetryStatusView::Degraded
         } else {
@@ -597,6 +607,7 @@ mod activity_projection_tests {
             latest_text_updated_at: Some(950),
             latest_text_truncated: true,
             latest_reasoning: "recent reasoning".into(),
+            last_tool_calls: vec![["Bash".into(), "{}".into()]],
             active_tools: Vec::new(),
             oldest_active_tool_age_ms: None,
             window_60s: PassiveActivityWindow {
@@ -615,16 +626,26 @@ mod activity_projection_tests {
         assert_eq!(activity.latest_reasoning, "recent reasoning");
         assert_eq!(activity.tool_calls_last_60s, 4);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Degraded);
-        // The dropped signals never leak into the serialized projection.
+        assert_eq!(
+            activity.last_tool_calls,
+            vec![["Bash".to_owned(), "{}".to_owned()]]
+        );
+        assert_eq!(activity.last_activity_age_ms, Some(250));
+        assert!(activity.model_request_active);
+        // F2 有意透出活跃年龄和模型请求状态，其他内部信号仍不公开。
         let encoded = serde_json::to_value(&activity).unwrap();
+        assert_eq!(
+            encoded["last_tool_calls"],
+            serde_json::json!([["Bash", "{}"]])
+        );
+        assert_eq!(encoded["last_activity_age_ms"], 250);
+        assert_eq!(encoded["model_request_active"], true);
         for gone in [
             "state",
-            "model_request_active",
             "model_request_age_ms",
             "active_tools",
             "window_60s",
             "latest_progress",
-            "last_activity_age_ms",
         ] {
             assert_eq!(encoded.get(gone), None, "{gone} must not leak");
         }
@@ -637,6 +658,9 @@ mod activity_projection_tests {
         assert!(!activity.latest_text_truncated);
         assert_eq!(activity.latest_reasoning, "");
         assert_eq!(activity.tool_calls_last_60s, 0);
+        assert!(activity.last_tool_calls.is_empty());
+        assert_eq!(activity.last_activity_age_ms, None);
+        assert!(!activity.model_request_active);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Unavailable);
     }
 
@@ -746,6 +770,9 @@ mod result_paging_tests {
             latest_text_truncated: true,
             latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
+            last_tool_calls: Vec::new(),
+            last_activity_age_ms: None,
+            model_request_active: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

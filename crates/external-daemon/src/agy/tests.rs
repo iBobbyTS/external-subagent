@@ -404,6 +404,13 @@ fn tool_step_pair_feeds_the_wait_window_and_observe_stays_exempt() {
     assert_eq!(activity.window_60s.tool_calls_started, 1);
     assert_eq!(activity.window_60s.tool_calls_completed, 1);
     assert_eq!(activity.window_60s.other_tool_calls, 1);
+    assert_eq!(
+        activity.last_tool_calls,
+        vec![[
+            "run_command".to_owned(),
+            r#"{"CommandLine":"echo X"}"#.to_owned()
+        ]]
+    );
 
     // observe is exempt for agy like codex: available with no tool history and
     // empty reasoning (the runtime source is not verified).

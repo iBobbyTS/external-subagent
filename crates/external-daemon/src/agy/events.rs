@@ -274,7 +274,17 @@ impl AgyRuntimeShared {
                 }
                 let event_id = self.next_event_id();
                 let turn_id = self.effective_turn_id();
-                if let Some(activity) = canonical_activity(event, &event_id, &turn_id) {
+                if let Some(mut activity) = canonical_activity(event, &event_id, &turn_id) {
+                    // 参数只喂给既有 started 活动帧，不触碰 turn 锁或 pending_inputs。
+                    if activity["payload"]["kind"] == "started" {
+                        if let Some(input) = step
+                            .tool_info
+                            .as_ref()
+                            .and_then(|info| info.parameters.as_ref())
+                        {
+                            activity["payload"]["input"] = input.clone();
+                        }
+                    }
                     self.emit_and_observe(activity);
                 }
             }

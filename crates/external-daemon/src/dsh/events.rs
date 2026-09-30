@@ -213,7 +213,17 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "dsh-session".into());
-            for payload in update::canonical_event_payloads(&parsed, &event_id, &turn_id) {
+            for mut payload in update::canonical_event_payloads(&parsed, &event_id, &turn_id) {
+                // rawInput 在 subagents 的 UpdateKind 中已丢弃，只补给活动 started 帧。
+                // observe 的 tool_call 投影保持不变。
+                if matches!(parsed.kind, update::UpdateKind::ToolCall { .. })
+                    && payload["type"] == "tool.updated"
+                    && payload["payload"]["kind"] == "started"
+                {
+                    if let Some(input) = params.pointer("/update/rawInput") {
+                        payload["payload"]["input"] = input.clone();
+                    }
+                }
                 // Streaming events refresh turn-liveness exactly like inbound
                 // frames do on the ZCode path.
                 let event = shared.canonical_event(payload);

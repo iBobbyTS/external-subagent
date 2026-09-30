@@ -299,10 +299,10 @@ IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
 printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
   '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
-  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1","command":"/bin/zsh -lc \u0027echo 中\u0027"}}}}}}' \
   '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
   '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-1"}}}}}}' \
-  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"fileChange","id":"call-2"}}}}}}' \
+  '{{"method":"item/started","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"fileChange","id":"call-2","changes":[{{"path":"a.ts"}},{{"path":"b.ts"}}]}}}}}}' \
   '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"mcpToolCall","id":"call-3"}}}}}}' \
   '{{"method":"item/completed","params":{{"threadId":"{THREAD_ID}","turnId":"codex-turn-1","item":{{"type":"reasoning","id":"r-1"}}}}}}' \
   '{{"method":"item/started","params":{{"threadId":"other-thread","turnId":"codex-turn-1","item":{{"type":"commandExecution","id":"call-4"}}}}}}' \
@@ -335,12 +335,27 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         "call-1 (deduped start+complete), call-2 (started), call-3 (completion backfill) only"
     );
     assert_eq!(activity.window_60s.other_tool_calls, 3);
+    assert_eq!(
+        activity.last_tool_calls,
+        vec![
+            [
+                "commandExecution".to_owned(),
+                "/bin/zsh -lc 'echo 中'".to_owned()
+            ],
+            ["fileChange".to_owned(), "a.ts, b.ts".to_owned()],
+            ["mcpToolCall".to_owned(), "call-3".to_owned()],
+        ]
+    );
 
     // The wait public projection is a straight-through single line: whatever
     // the tracker counted is exactly what wait exposes on the public field.
     let projection =
         crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
     assert_eq!(projection.tool_calls_last_60s, 3);
+    assert_eq!(
+        serde_json::to_value(projection).unwrap()["last_tool_calls"],
+        serde_json::json!(activity.last_tool_calls)
+    );
 
     // observe stays exactly as before this feature: the count-only events are
     // not tool calls and codex still projects no tool history or reasoning. The
@@ -423,6 +438,14 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     assert_eq!(
         activity.window_60s.tool_calls_started, 2,
         "the same item id counts once per turn after the boundary clears the dedupe set"
+    );
+    // 计数去重按 turn 重置，工具历史仍保留两轮（缺 command 的描述符为空串）。
+    assert_eq!(
+        activity.last_tool_calls,
+        vec![
+            ["commandExecution".to_owned(), String::new()],
+            ["commandExecution".to_owned(), String::new()],
+        ]
     );
 }
 

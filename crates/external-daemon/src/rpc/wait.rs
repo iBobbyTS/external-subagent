@@ -1787,6 +1787,9 @@ pub(crate) mod wait_tests {
             latest_text_truncated: false,
             latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
+            last_tool_calls: Vec::new(),
+            last_activity_age_ms: None,
+            model_request_active: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

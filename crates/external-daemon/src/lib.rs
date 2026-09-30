@@ -205,6 +205,8 @@ pub struct PassiveActivitySnapshot {
     /// Verified-public reasoning tail (bounded Unicode chars); empty when the
     /// runtime source is not verified.
     pub latest_reasoning: String,
+    /// 最近三次工具调用的 [工具名, 参数串]，跨 turn 保留。
+    pub last_tool_calls: Vec<[String; 2]>,
     pub active_tools: Vec<PassiveActiveTool>,
     pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,

@@ -166,6 +166,7 @@ pub(crate) struct ParsedActivity {
     pub(crate) assistant_message_id: Option<String>,
     pub(crate) message_finished: bool,
     pub(crate) terminal_response: Option<String>,
+    pub(crate) tool_descriptor: Option<(String, [String; 2])>,
 }
 
 impl ParsedActivity {
@@ -184,6 +185,7 @@ impl ParsedActivity {
             assistant_message_id: None,
             message_finished: false,
             terminal_response: None,
+            tool_descriptor: None,
         }
     }
 }
@@ -243,6 +245,13 @@ fn parse_activity_message(
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
         let event_id = activity_id(params.get("eventId"));
         let turn_id = activity_id(params.get("turnId"));
+        // zcode 的参数仅在 tool_call 帧，独立读取，不增加计数样本。
+        if mode != ToolActivityMode::CountOnly
+            && kind == Some("model.streaming")
+            && payload_kind == Some("tool_call")
+        {
+            parse_detailed_descriptor(&mut parsed, params, payload);
+        }
         match (kind, payload_kind, payload_type) {
             (Some("model.streaming"), Some("reasoning_delta"), _) => {
                 parsed.stream_key = stream_key(params, payload, "reasoning");
@@ -280,9 +289,15 @@ fn parse_activity_message(
                     // ignore it rather than accepting a foreign sample.
                     if mode != ToolActivityMode::Detailed {
                         parse_tool_count_activity(&mut parsed, payload, event_id);
+                        if let Some((identity, _)) = parsed.tool_descriptor.as_mut() {
+                            *identity = format!("{}:{identity}", turn_id.as_deref().unwrap_or(""));
+                        }
                     }
                 } else if mode != ToolActivityMode::CountOnly {
                     parse_tool_activity(&mut parsed, payload, source);
+                    if payload_kind == Some("started") {
+                        parse_detailed_descriptor(&mut parsed, params, payload);
+                    }
                 }
             }
             (Some("session.updated"), _, Some("model_request_started")) => {
@@ -475,10 +490,52 @@ fn parse_tool_count_activity(
         return;
     };
     parsed.identity = Some(format!("tool:{event_id}:count"));
+    if let Some(tool) = payload.get("tool").and_then(serde_json::Value::as_str) {
+        let detail = payload
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        parsed.tool_descriptor = Some((
+            parsed.identity.clone().unwrap(),
+            bounded_tool_call(tool, detail),
+        ));
+    }
     parsed.sample = Some(ActivitySampleKind::ToolStarted {
         kind: PassiveToolKind::Other,
         count,
     });
+}
+
+// ring 统一保留二元组：工具名按字符截断，参数按 UTF-8 字节截断。
+pub(crate) fn bounded_tool_call(tool: &str, arg: &str) -> [String; 2] {
+    let mut end = arg.len().min(512);
+    while !arg.is_char_boundary(end) {
+        end -= 1;
+    }
+    [tool.chars().take(64).collect(), arg[..end].to_owned()]
+}
+
+fn parse_detailed_descriptor(
+    parsed: &mut ParsedActivity,
+    params: &serde_json::Value,
+    payload: &serde_json::Value,
+) {
+    let Some(call_id) = activity_id(payload.get("toolCallId")) else {
+        return;
+    };
+    let Some(tool) = payload.get("toolName").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    // inputOmitted 帧或旧事件没有参数，不能虚构空参数调用。
+    let Some(input) = payload.get("input") else {
+        return;
+    };
+    let arg = serde_json::to_string(input).expect("JSON value serialization");
+    let turn = activity_id(params.get("turnId")).unwrap_or_default();
+    parsed.tool_descriptor = Some((
+        format!("call:{turn}:{call_id}"),
+        bounded_tool_call(tool, &arg),
+    ));
 }
 
 fn stream_key(
@@ -689,7 +746,7 @@ mod tests {
         for mode in [ToolActivityMode::Mixed, ToolActivityMode::CountOnly] {
             let count = parse_activity_message(
                 "session/event",
-                &tool_count_event("evt-count", "turn-1", 3),
+                &tool_count_event("evt-count", "turn-1", 3, None, None),
                 ActivitySource::Session,
                 mode,
             );
@@ -750,7 +807,7 @@ mod tests {
         for count in [1u64, MAX_TOOL_COUNT] {
             let parsed = parse_activity_message(
                 "session/event",
-                &tool_count_event("evt", "turn-1", count),
+                &tool_count_event("evt", "turn-1", count, None, None),
                 ActivitySource::Session,
                 ToolActivityMode::Mixed,
             );
@@ -766,7 +823,7 @@ mod tests {
         for count in [0u64, MAX_TOOL_COUNT + 1] {
             let parsed = parse_activity_message(
                 "session/event",
-                &tool_count_event("evt", "turn-1", count),
+                &tool_count_event("evt", "turn-1", count, None, None),
                 ActivitySource::Session,
                 ToolActivityMode::Mixed,
             );
@@ -859,8 +916,13 @@ mod tests {
                 // refused by Detailed at both session entries. Each entry uses
                 // its own params.type so the count branch is exercised for
                 // streamRecovery.updated too, not only for tool.updated.
-                let mut count_event =
-                    external_contract::activity::tool_count_event("evt-count", "turn-1", 2);
+                let mut count_event = external_contract::activity::tool_count_event(
+                    "evt-count",
+                    "turn-1",
+                    2,
+                    None,
+                    None,
+                );
                 count_event["type"] = serde_json::json!(count_type);
                 for (mode, accepted) in [
                     (ToolActivityMode::Mixed, true),

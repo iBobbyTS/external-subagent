@@ -9,8 +9,8 @@
 //!   names one tool call (`toolCallId`) and optionally its `toolName`. Its
 //!   sample identity is `tool:{toolCallId}:{phase}`;
 //! - the **count-only** vocabulary (`tool.updated`/`streamRecovery.updated`
-//!   with `payload.kind == "count"`) carries a pure initiation weight and no
-//!   tool identity. Its sample identity is `tool:{eventId}:count`.
+//!   with `payload.kind == "count"`) carries a pure initiation weight and optional
+//!   tool descriptors. Its sample identity is `tool:{eventId}:count`.
 //!
 //! Both identities are bounded and re-delivery idempotent at the consumer: an
 //! already-admitted identity neither adds weight nor refreshes the sample's
@@ -40,13 +40,28 @@ use serde_json::Value;
 pub const MAX_TOOL_COUNT: u64 = 1024;
 
 /// Build the count-only `tool.updated` event carrying `count` tool
-/// initiations and no tool identity.
-pub fn tool_count_event(event_id: &str, turn_id: &str, count: u64) -> Value {
+/// initiations.
+///
+/// 可选 tool/detail 仅描述调用，不参与计数身份；缺省时保持旧 wire 形状。
+pub fn tool_count_event(
+    event_id: &str,
+    turn_id: &str,
+    count: u64,
+    tool: Option<&str>,
+    detail: Option<&str>,
+) -> Value {
+    let mut payload = serde_json::json!({"kind": "count", "count": count});
+    if let Some(tool) = tool {
+        payload["tool"] = tool.into();
+    }
+    if let Some(detail) = detail {
+        payload["detail"] = detail.into();
+    }
     serde_json::json!({
         "type": "tool.updated",
         "eventId": event_id,
         "turnId": turn_id,
-        "payload": {"kind": "count", "count": count},
+        "payload": payload,
     })
 }
 
@@ -96,7 +111,7 @@ mod tests {
         // Hand-written literal: the count vocabulary is exactly this shape,
         // with the params-level eventId as the only identity input.
         assert_eq!(
-            tool_count_event("codex-event-9", "turn-1", 3),
+            tool_count_event("codex-event-9", "turn-1", 3, None, None),
             serde_json::json!({
                 "type": "tool.updated",
                 "eventId": "codex-event-9",
@@ -104,6 +119,19 @@ mod tests {
                 "payload": {"kind": "count", "count": 3},
             })
         );
+    }
+
+    #[test]
+    fn count_event_descriptors_are_additive_and_optional() {
+        let value = tool_count_event("e", "t", 1, Some("commandExecution"), Some("echo 中"));
+        assert_eq!(
+            value["payload"],
+            serde_json::json!({"kind":"count","count":1,"tool":"commandExecution","detail":"echo 中"})
+        );
+        let no_detail = tool_count_event("e", "t", 1, Some("fileChange"), None);
+        assert!(no_detail["payload"].get("detail").is_none());
+        let old = tool_count_event("e", "t", 1, None, None);
+        assert!(old["payload"].get("tool").is_none());
     }
 
     #[test]
@@ -149,9 +177,12 @@ mod tests {
     fn constructors_are_pure_and_do_not_validate() {
         // Out-of-range counts serialize verbatim; the parser is the single
         // legality gate.
-        assert_eq!(tool_count_event("e", "t", 0)["payload"]["count"], 0);
         assert_eq!(
-            tool_count_event("e", "t", MAX_TOOL_COUNT + 1)["payload"]["count"],
+            tool_count_event("e", "t", 0, None, None)["payload"]["count"],
+            0
+        );
+        assert_eq!(
+            tool_count_event("e", "t", MAX_TOOL_COUNT + 1, None, None)["payload"]["count"],
             MAX_TOOL_COUNT + 1
         );
     }

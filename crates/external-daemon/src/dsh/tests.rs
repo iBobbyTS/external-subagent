@@ -495,7 +495,7 @@ read_frame
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[]}}'
 read_frame
 printf '%s\n' \
-  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"type":"tool_call","toolCallId":"tool-7","kind":"edit","title":"Edit fixture"}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"type":"tool_call","toolCallId":"tool-7","kind":"edit","title":"Edit fixture","rawInput":{"path":"a.ts","content":"中"}}}}' \
   '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"type":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}}' \
   '{"jsonrpc":"2.0","id":"srv-1","method":"session/request_permission","params":{"sessionId":"SESSION","toolCallId":"tool-7","options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
 read_frame
@@ -540,6 +540,14 @@ printf '%s\\n' \
     let payload: serde_json::Value = serde_json::from_str(&request.payload_json).unwrap();
     assert_eq!(payload["toolName"], "edit");
     assert_eq!(payload["toolCallId"], "tool-7");
+    let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+    assert_eq!(
+        activity.last_tool_calls,
+        vec![[
+            "edit".to_owned(),
+            r#"{"content":"中","path":"a.ts"}"#.to_owned()
+        ]]
+    );
 
     let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
     let error = service

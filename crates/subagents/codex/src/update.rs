@@ -437,7 +437,7 @@ mod tests {
         // The count vocabulary lives in external-contract; this crate now
         // emits the shared shape verbatim.
         assert_eq!(
-            external_contract::activity::tool_count_event("codex-event-9", "turn-1", 1),
+            external_contract::activity::tool_count_event("codex-event-9", "turn-1", 1, None, None),
             serde_json::json!({
                 "type": "tool.updated",
                 "eventId": "codex-event-9",
