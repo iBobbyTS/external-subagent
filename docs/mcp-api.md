@@ -100,7 +100,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `external_subagent_wait` | 有界等待可处理请求或终态结果 | 只读、幂等 |
 | `external_subagent_observe` | 疑似循环时查看观测事实 | 只读、幂等 |
 | `external_subagent_list` | 限定仓库范围列出任务 | 只读、幂等 |
-| `external_subagent_send` | 向运行中任务排队发送消息 | 非只读、非幂等 |
+| `external_subagent_send` | 按 queue/steer 模式投递补充指令 | 非只读、非幂等 |
 | `external_subagent_respond` | 响应权限或用户问题 | 非只读、幂等 |
 | `external_subagent_cancel` | 取消任务，保留历史 | 非只读、破坏性、幂等 |
 | `external_subagent_result` | 分页取终态结果正文 | 只读、幂等 |
@@ -286,20 +286,32 @@ zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道；
 
 ## 9. external_subagent_send
 
-向运行中任务排队发送消息，不是创建新任务或恢复终态任务的接口。
+发送补充指令，必须指定 `mode: "queue" | "steer"`。旧调用缺少 mode 或值非法均以 `validation` 拒绝，MCP 与 CLI 输入一致。符合恢复条件的终态 codex 任务经现有 resume 路径接续；保存请求的 mode，queue/steer 的恢复动作相同。
 
 | 输入参数 | 类型／要求 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
 | `agent_id` | integer；必填 | 选择消息收件任务 | 缺少报错；无法路由消息 |
 | `message_id` | string；可选 | 对同一消息进行重试、关联 wait 回执 | 省略由 daemon 生成；移除后无法在响应丢失时使用调用方已知 ID 去重 |
+| `mode` | `queue / steer`；必填 | queue 非破坏投递，steer 立即转向 | 缺失或非法值以 validation 拒绝 |
 | `content` | string；必填 | 传递补充指令 | 缺少报错；无法表达消息内容 |
 
-`content` 去掉空白后不能为空、无 NUL、最大16384字节。显式复用 message_id 应保持原任务和正文不变；冲突可能返回 `MESSAGE_ID_CONFLICT`。省略 ID 后重复调用可能产生多条消息，因此 MCP 标注非幂等。
+`content` 去掉空白后不能为空、无 NUL、最大16384字节。显式复用 message_id 应保持原任务、mode 和正文不变；冲突可能返回 `MESSAGE_ID_CONFLICT`。省略 ID 后重复调用可能产生多条消息，因此 MCP 标注非幂等。
 
 | 输出字段 | 类型 | 使用理由 | 移除影响 |
 |---|---|---|---|
 | `message_id` | string | 返回实际使用的 ID，供重试或 wait 查询 | 自动生成的消息无法被后续关联 |
-| `disposition` | `queued / delivered / already_delivered / failed` | 区分排队、送达、重复确认和失败 | 容易把排队成功当作已送达；送达也不代表指令执行完成 |
+| `disposition` | `queued / delivered / already_delivered / failed` | queued 仅指 es 暂存，原生直写／注入立即返回 delivered；另含重复确认和失败 | 容易把排队成功当作已送达；送达也不代表指令执行完成 |
+
+| subagent | 活跃时 queue | 活跃时 steer |
+|---|---|---|
+| codex | 并发 turn/start 注入当前 turn，下个步骤边界生效，不中断执行中的命令 | turn/interrupt 边界落定后 turn/start 新 turn |
+| zcode | es 暂存，turn 边界投递 | session/stop 后 session/send 新 turn |
+| dsh | es 暂存，turn 边界投递 | steer_unsupported |
+| agy | stdin 直写 user 事件，原生按序缓冲为后续 turn | steer_unsupported |
+
+steer 优先于尚未投递的 es queue 消息；queue 之间保持 FIFO。空闲 runtime 普通发送；agy 待消费的原生后续输入期间仍保持 RUNNING，不在首轮 result 后回收。`delivered` 表示 runtime 已接收，不表示执行完成；wait 的 `message_receipt.state` 为 `delivered`，字段不是 disposition。
+
+接入新 subagent 时，原生 mid-turn 投递优先于 es 暂存；es 暂存是文档化的标准兜底。codex inject 只接受回显当前 turn id：若检查后、wire 请求前 turn 恰好完成，provider 可能开出新 turn 并回显新 id，消息以 SESSION_SEND_FAILED 记为 Failed。此时内容可能已消费，重发存在重复风险；daemon 不把新 id 当成注入成功，也不开 start_in_flight 或等待新的 turn.started。
 
 ## 10. external_subagent_respond
 
@@ -464,7 +476,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 ```text
 validation, subagent_required, subagent_unknown, agent_disabled,
-agent_unsupported, model_selection_unsupported, codex_write_manifest_unsupported,
+agent_unsupported, steer_unsupported, model_selection_unsupported, codex_write_manifest_unsupported,
 agy_write_manifest_unsupported, agy_permission_mode_unsupported,
 oversized, protocol_error, not_found, conflict, runtime_command_failed,
 timeout, runtime_lost, result_invalid, persistence, internal,

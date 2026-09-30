@@ -157,6 +157,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             "agy supports only the build and yolo permission modes",
         ),
         RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
+        RpcErrorCode::SteerUnsupported => ("steer_unsupported", "该 subagent 不支持 steer"),
         RpcErrorCode::ModelSelectionUnsupported => (
             "model_selection_unsupported",
             "model selection is unsupported for zcode",
@@ -202,6 +203,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             | RpcErrorCode::AgentUnknown
             | RpcErrorCode::AgentDisabled
             | RpcErrorCode::AgentUnsupported
+            | RpcErrorCode::SteerUnsupported
             | RpcErrorCode::ModelSelectionUnsupported
     ) && detail != message
         && detail.len() <= 512
@@ -219,6 +221,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             | RpcErrorCode::AgentUnknown
             | RpcErrorCode::AgentDisabled
             | RpcErrorCode::AgentUnsupported
+            | RpcErrorCode::SteerUnsupported
             | RpcErrorCode::ModelSelectionUnsupported
     ) {
         projected.with_prompt_count(0)
@@ -260,6 +263,13 @@ pub(crate) fn protocol_error() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn steer_unsupported_has_a_distinct_public_code_and_zero_prompts() {
+        let error = public_error(RpcError::new(RpcErrorCode::SteerUnsupported, "steer_unsupported"));
+        assert_eq!(error.body.code, "steer_unsupported");
+        assert_eq!(error.body.prompt_count, Some(0));
+    }
 
     #[test]
     fn codex_manifest_rejection_has_a_distinct_public_code_and_zero_prompts() {

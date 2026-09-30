@@ -18,6 +18,7 @@ pub enum RpcErrorCode {
     AgentDisabled,
     AgentUnsupported,
     ModelSelectionUnsupported,
+    SteerUnsupported,
     NotFound,
     Conflict,
     Persistence,
@@ -74,7 +75,9 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
                 SchedulerError::RuntimeCommand { message, .. } => message.as_str(),
                 _ => unreachable!(),
             };
-            if message == "TERMINAL_SEND_UNSUPPORTED" {
+            if message == "steer_unsupported" {
+                RpcError::new(RpcErrorCode::SteerUnsupported, message)
+            } else if message == "TERMINAL_SEND_UNSUPPORTED" {
                 RpcError::new(RpcErrorCode::Validation, message)
             } else if message == "daemon_draining" {
                 RpcError::new(RpcErrorCode::Unavailable, message)

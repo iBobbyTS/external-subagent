@@ -541,18 +541,41 @@ printf '%s\\n' \
     assert_eq!(payload["toolName"], "edit");
     assert_eq!(payload["toolCallId"], "tool-7");
 
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let error = service
+        .dispatch(crate::rpc::RpcMethod::TaskMessage(
+            crate::rpc::MessageInput {
+                agent_id: agent_id.clone(),
+                message_id: Some("unsupported-steer".into()),
+                mode: "steer".into(),
+                content: "new direction".into(),
+            },
+        ))
+        .unwrap_err();
+    assert_eq!(error.code, crate::rpc::RpcErrorCode::SteerUnsupported);
+    assert!(scheduler
+        .store()
+        .message("unsupported-steer")
+        .unwrap()
+        .is_none());
+
     // Queue the follow-up while the turn is still blocked on permission;
     // delivery may only happen after settlement.
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "follow-up", "follow-up prompt")
+            .send_message(&agent_id, "follow-up", "queue", "follow-up prompt")
             .unwrap(),
         MessageDisposition::Queued
     );
 
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "second-follow-up", "second follow-up prompt")
+            .send_message(
+                &agent_id,
+                "second-follow-up",
+                "queue",
+                "second follow-up prompt"
+            )
             .unwrap(),
         MessageDisposition::Queued
     );
@@ -581,7 +604,7 @@ printf '%s\\n' \
     assert_eq!(receipt.state, MessageState::Delivered);
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "follow-up", "follow-up prompt")
+            .send_message(&agent_id, "follow-up", "queue", "follow-up prompt")
             .unwrap(),
         MessageDisposition::AlreadyDelivered
     );
@@ -1877,6 +1900,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
             agent_id: agent_id.clone(),
             message_id: Some("after-drain".into()),
             content: "must not run".into(),
+            mode: "queue".into(),
         }))
         .unwrap_err();
     assert_eq!(send.message, "daemon_draining");
@@ -2139,6 +2163,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
             agent_id: agent_id.clone(),
             message_id: Some("after-abort".into()),
             content: "queued once admission reopened".into(),
+            mode: "queue".into(),
         }))
         .unwrap();
 

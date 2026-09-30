@@ -211,6 +211,18 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(None)
     }
 
+    fn inject_turn(
+        &self,
+        session_id: &str,
+        content: &str,
+        _timeout: Duration,
+    ) -> Result<Option<String>, RuntimeCommandError> {
+        self.validate_session(session_id)?;
+        // 活跃时直写，后续输入的 turn 由原生 user_input/result 接续。
+        self.shared.buffer_input(|| self.send_user_line(content))?;
+        Ok(None)
+    }
+
     fn stop_turn(
         &self,
         session_id: &str,
@@ -243,7 +255,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.shared.turn_tracker.snapshot()
+        self.shared.turn_snapshot()
     }
 
     fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {

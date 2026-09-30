@@ -226,8 +226,14 @@ impl Store {
         &self,
         agent_id: &str,
         message_id: &str,
+        mode: &str,
         content: &str,
     ) -> StoreResult<bool> {
+        if !matches!(mode, "queue" | "steer") {
+            return Err(StoreError::InvalidState(
+                "message mode must be queue or steer".into(),
+            ));
+        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (
@@ -361,8 +367,8 @@ impl Store {
         )?;
         transaction.execute(
             "INSERT INTO messages(message_id,agent_id,mode,content,state,created_at)
-             VALUES (?1,?2,'queue',?3,'QUEUED',?4)",
-            params![message_id, agent_id, content, now_millis()],
+             VALUES (?1,?2,?3,?4,'QUEUED',?5)",
+            params![message_id, agent_id, mode, content, now_millis()],
         )?;
         transaction.commit()?;
         Ok(true)

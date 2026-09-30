@@ -184,6 +184,32 @@ impl CodexRuntimeOwner {
         started
     }
 
+    /// 实测并发 turn/start 回显当前 turn；此路径不打开 started 归因门，
+    /// 也不改 tracker 或 retirement。竞态开出新 turn 时必须拒绝该回显。
+    pub(super) fn inject_active_turn(
+        &self,
+        thread_id: &str,
+        current_turn: &str,
+        model: &str,
+        effort: Option<&str>,
+        content: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>, RuntimeCommandError> {
+        let response = self.driver.request(
+            "turn/start",
+            turn_start_params(thread_id, model, effort, content),
+            remaining_time(deadline)?,
+        )?;
+        let echoed =
+            turn_start_response_turn_id(response.result.as_ref()).map_err(runtime_command_error)?;
+        if echoed != current_turn {
+            return Err(RuntimeCommandError::InvalidSession(
+                "inject turn/start response does not match current turn".into(),
+            ));
+        }
+        Ok(None)
+    }
+
     fn drive_start_turn(
         &self,
         params: serde_json::Value,

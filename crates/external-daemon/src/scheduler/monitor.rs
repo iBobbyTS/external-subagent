@@ -520,6 +520,8 @@ impl Scheduler {
                     }
                 }
                 let turn = runtime.turn_snapshot();
+                // agy 的 snapshot 把尚未消费的原生后续输入视为活跃，
+                // 首轮完成到下一 user_input/result 的间隙不能回收 runtime。
                 if !turn.active && turn.generation > handled_generation {
                     let Some(boundary) = turn.boundary else {
                         continue;

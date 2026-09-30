@@ -39,3 +39,13 @@ For Antigravity (`agy`), local discovery resolves the executable from `AGY_RUNTI
 ZCode model selection is a catalog token, not native-only. Spawn admission and `agents.zcode.default_model` resolve the same three-level precedence as dsh — explicit spawn token, then the configured default, then no model (native) — and a malformed token is refused before any task exists with the exact format cause. A bare token keeps the legacy `zai/<value>` reading; an explicit `provider/model` token is applied as written. For `agent_models`, the daemon starts the configured ZCode app-server with the same read-only policy and provider environment as the `hi` probe, creates a `plan` session without sending a prompt, projects the create result's `settings.model.available` catalog to `provider/model` tokens (entries missing either ref segment are dropped), then closes the session and reaps the process. The result records source `zcode_session_create_settings`, executable version, exact workspace/home scope, check time, and a deduplicated token list; a failed start, create, or projection degrades to `supported=false`, an empty list, and a bounded reason (for example `transport`, `create_failed`, `missing`, or `model_catalog_empty`) instead of an error. `available` is a create-time fact that shrinks to the selected model after `session/setModel`, so the create result is the only durable directory source. A resumed session keeps the persisted model (session stickiness) and is neither re-applied nor re-validated.
 
 Executable version discovery uses the same bounded process discipline as catalog discovery: a dedicated process group, incremental capped stdout/stderr readers, a deadline-bounded wait, and group cleanup after the leader exits. It never waits for pipe EOF after leader exit, so a descendant inheriting the descriptors cannot extend the probe indefinitely. An unterminated output stream over the cap is rejected immediately as `oversized`.
+
+## send 双模式投递
+
+`external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
+
+活跃 queue：codex 原生 turn/start 注入当前 turn，agy stdin user 直写并原生按序缓冲，zcode/dsh 则由 es 暂存至 turn 边界。活跃 steer：codex interrupt+start，zcode stop+send；dsh/agy 返回 steer_unsupported。空闲 runtime 普通发送；符合条件的终态 codex 经 resume 接续，mode 原值落库。
+
+接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。
+
+codex inject 的回显必须等于当前 turn id；检查后 turn 恰好完成时可能收到新 id，按 SESSION_SEND_FAILED 结算 Failed，但内容可能已被消费，重发有重复风险。详见 [codex 竞态说明](codex.md#send-双模式投递)。

@@ -271,6 +271,45 @@ impl ManagedRuntime for CodexRuntimeOwner {
         )
     }
 
+    fn inject_turn(
+        &self,
+        session_id: &str,
+        content: &str,
+        timeout: Duration,
+    ) -> Result<Option<String>, RuntimeCommandError> {
+        self.validate_session(session_id)?;
+        let current = self
+            .shared
+            .current_turn
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                RuntimeCommandError::InvalidSession("codex has no active turn to inject".into())
+            })?;
+        let model = self
+            .shared
+            .admitted_model
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| {
+                RuntimeCommandError::InvalidSession("codex thread has no admitted model".into())
+            })?;
+        let effort = self.shared.admitted_effort.lock().unwrap().clone();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RuntimeCommandError::Timeout)?;
+        self.inject_active_turn(
+            session_id,
+            &current,
+            &model,
+            effort.as_deref(),
+            content,
+            deadline,
+        )
+    }
+
     fn stop_turn(
         &self,
         session_id: &str,

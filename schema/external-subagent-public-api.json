@@ -186,7 +186,7 @@
         "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
-        "external_subagent_send": { "input": ["agent_id", "message_id", "content"], "output": ["message_id", "disposition"] },
+        "external_subagent_send": { "input": ["agent_id", "message_id", "mode", "content"], "required": ["agent_id", "mode", "content"], "mode": ["queue", "steer"], "output": ["message_id", "disposition"] },
         "external_subagent_respond": { "input": ["agent_id", "request_id", "decision", "content"], "output": ["disposition", "requested_decision", "effective_decision", "policy_overrode", "policy_reason_code"] },
         "external_subagent_cancel": { "input": ["agent_id"], "output": ["task"] },
         "external_subagent_result": { "input": ["agent_id", "offset", "limit"], "output": ["task", "result"] },

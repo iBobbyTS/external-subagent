@@ -204,6 +204,7 @@ pub struct MessageInput {
     pub agent_id: String,
     #[serde(default)]
     pub message_id: Option<String>,
+    pub mode: String,
     pub content: String,
 }
 

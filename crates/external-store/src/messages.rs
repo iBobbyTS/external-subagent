@@ -13,9 +13,9 @@ impl Store {
         mode: &str,
         content: &str,
     ) -> StoreResult<bool> {
-        if mode != "queue" {
+        if !matches!(mode, "queue" | "steer") {
             return Err(StoreError::InvalidState(
-                "only queue message mode is supported".into(),
+                "message mode must be queue or steer".into(),
             ));
         }
         let mut connection = self.connection.lock().unwrap();
@@ -55,14 +55,18 @@ impl Store {
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (phase, _, _, close_requested, stop_requested) = query_guard(&transaction, agent_id)?;
-        if phase != TaskPhase::Running || close_requested || stop_requested {
+        if !matches!(phase, TaskPhase::Running | TaskPhase::WaitingInput)
+            || close_requested
+            || stop_requested
+        {
             transaction.commit()?;
             return Ok(None);
         }
+        // steer 立即转向，优先领取；queue 之间保持既有 FIFO。
         let id = transaction
             .query_row(
                 "SELECT message_id FROM messages WHERE agent_id=?1 AND state='QUEUED'
-                 ORDER BY created_at,rowid LIMIT 1",
+                 ORDER BY CASE mode WHEN 'steer' THEN 0 ELSE 1 END,created_at,rowid LIMIT 1",
                 [agent_id],
                 |row| row.get::<_, String>(0),
             )

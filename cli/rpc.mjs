@@ -136,8 +136,10 @@ function methodFor(command, input) {
       } };
     }
     case 'send': {
-      rejectUnknownFields('send', input, new Set(['agent_id', 'message_id', 'content']));
+      rejectUnknownFields('send', input, new Set(['agent_id', 'message_id', 'mode', 'content']));
+      if (!['queue', 'steer'].includes(input.mode)) throw new CliError('VALIDATION', 'send mode must be queue or steer', 2);
       return { method: 'task_message', params: {
+        mode: input.mode,
         agent_id: daemonTaskId(input.agent_id),
         ...(input.message_id ? { message_id: input.message_id } : {}),
         content: input.content,

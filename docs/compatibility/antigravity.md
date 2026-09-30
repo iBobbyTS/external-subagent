@@ -131,3 +131,11 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 3. build spawn（`gemini-3.8-flash-low`，映射 `--mode accept-edits`）→ 真实 agy 长驻进程完成文件写：outcome `COMPLETED`、final_text `DONE`、workspace 内 `smoke-build.txt` 内容 `AGY_BUILD_OK`（03/04）。
 4. yolo spawn（`--dangerously-skip-permissions`，prompt 要求以 `run_command` 执行 echo）→ outcome `COMPLETED`、final_text `done`、**`tool_calls_last_60s: 1`**（Detailed 词汇对真实 tool step 的计数验证，05/06）。
 5. plan 模式 spawn → admission fail-closed 拒绝：`agent_unsupported / AGY_PERMISSION_MODE_UNSUPPORTED`（07）。
+
+## send 双模式投递
+
+`external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
+
+活跃 queue 向 stdin 直写 user 事件，不 begin_turn，由原生缓冲按序成为后续 turn。daemon 记录已接收、尚未消费的输入，下一 user_input 或递增 num_turns 的 result 开启并结算对应 turn；首轮 result 与后续输入消费之间保持 RUNNING，monitor 不回收 runtime。无待消费输入时的空闲重复 result 仍视为噪声。空闲 queue 沿用 send_turn；steer 返回 steer_unsupported，不使用破坏性的信号中断。
+
+接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

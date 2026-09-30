@@ -75,6 +75,15 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     ) -> Result<Option<String>, RuntimeCommandError> {
         Err(RuntimeCommandError::Unsupported)
     }
+    /// 向原生活跃 turn 投递输入；不建立新的 daemon turn。
+    fn inject_turn(
+        &self,
+        _session_id: &str,
+        _content: &str,
+        _timeout: Duration,
+    ) -> Result<Option<String>, RuntimeCommandError> {
+        Err(RuntimeCommandError::Unsupported)
+    }
     fn stop_turn(
         &self,
         _session_id: &str,

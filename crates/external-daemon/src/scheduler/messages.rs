@@ -22,11 +22,32 @@ impl Scheduler {
             )?;
             return Err(error);
         }
-        match runtime.send_turn(
-            session_id,
-            &message.content,
-            self.runtime_phase_timeout(agent_id, deadline)?,
-        ) {
+        // claim 到结算由调用者的 operation 锁保护；内联路径还持有 admission 锁。
+        let mut operation = "session/send";
+        let mut failure_code = "SESSION_SEND_FAILED";
+        let delivery = (|| {
+            let active = runtime.turn_snapshot().active;
+            if message.mode == "steer" && active {
+                operation = "session/stop";
+                failure_code = "SESSION_STOP_FAILED";
+                runtime.stop_turn(
+                    session_id,
+                    self.runtime_phase_timeout(agent_id, deadline)
+                        .map_err(|_| RuntimeCommandError::Timeout)?,
+                )?;
+                operation = "session/send";
+                failure_code = "SESSION_SEND_FAILED";
+            }
+            let timeout = self
+                .runtime_phase_timeout(agent_id, deadline)
+                .map_err(|_| RuntimeCommandError::Timeout)?;
+            if message.mode == "queue" && active {
+                runtime.inject_turn(session_id, &message.content, timeout)
+            } else {
+                runtime.send_turn(session_id, &message.content, timeout)
+            }
+        })();
+        match delivery {
             Ok(turn_id) => {
                 if !self
                     .inner
@@ -41,20 +62,18 @@ impl Scheduler {
                 Ok(self.inner.store.message(&message.message_id)?)
             }
             Err(error) => {
-                let detail = error.diagnostic("session/send");
+                let detail = error.diagnostic(operation);
                 self.record_runtime_failure(
                     agent_id,
                     Some(session_id),
                     "message_delivery",
-                    "SESSION_SEND_FAILED",
+                    failure_code,
                     &detail,
                     Some(runtime.as_ref()),
                 );
-                self.inner.store.fail_message(
-                    &message.message_id,
-                    "SESSION_SEND_FAILED",
-                    &detail,
-                )?;
+                self.inner
+                    .store
+                    .fail_message(&message.message_id, failure_code, &detail)?;
                 Err(SchedulerError::RuntimeCommand {
                     agent_id: agent_id.into(),
                     message: detail,
@@ -63,15 +82,18 @@ impl Scheduler {
         }
     }
 
-    pub fn queue_message(
+    pub fn send_message(
         &self,
         agent_id: &str,
         message_id: &str,
+        mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
-        // Queue is the only generic message behavior; the fixed mode lives
-        // here instead of traveling on the wire.
-        let mode = "queue";
+        if !matches!(mode, "queue" | "steer") {
+            return Err(SchedulerError::InvalidConfig(
+                "mode must be queue or steer".into(),
+            ));
+        }
         let deadline = self.control_deadline();
         let _admission = self.inner.admission.lock().unwrap();
         #[cfg(test)]
@@ -97,13 +119,23 @@ impl Scheduler {
                 message: "daemon_draining".into(),
             });
         }
+        let task = self.inner.store.get_task(agent_id)?.ok_or_else(|| {
+            SchedulerError::Store(StoreError::InvalidState(format!("unknown task {agent_id}")))
+        })?;
+        let adapter = task_agent(&task);
+        if mode == "steer" && matches!(adapter.as_str(), "dsh" | "agy") {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: agent_id.into(),
+                message: "steer_unsupported".into(),
+            });
+        }
         if self
             .inner
             .store
             .get_task(agent_id)?
             .is_some_and(|task| task.phase == TaskPhase::Terminal)
         {
-            return self.resume_terminal_with_message(agent_id, message_id, content);
+            return self.resume_terminal_with_message(agent_id, message_id, mode, content);
         }
         let active = self.active_session(agent_id);
         let operation = active
@@ -141,6 +173,42 @@ impl Scheduler {
                 },
             );
         }
+        if let Some((_, runtime, session_id, _, runtime_lifecycle)) = active {
+            let native_queue = matches!(adapter.as_str(), "codex" | "agy");
+            if mode == "steer" || native_queue || !runtime.turn_snapshot().active {
+                // FIFO 消费 es 暂存；不得把较早消息的完成回执错认成此次请求。
+                while self
+                    .inner
+                    .store
+                    .message(message_id)?
+                    .is_some_and(|m| m.state == MessageState::Queued)
+                {
+                    if !native_queue && mode == "queue" && runtime.turn_snapshot().active {
+                        break;
+                    }
+                    if self
+                        .deliver_next_message(
+                            agent_id,
+                            &session_id,
+                            &runtime,
+                            &runtime_lifecycle,
+                            deadline,
+                        )?
+                        .is_none()
+                    {
+                        break;
+                    }
+                }
+                if self
+                    .inner
+                    .store
+                    .message(message_id)?
+                    .is_some_and(|m| m.state == MessageState::Delivered)
+                {
+                    return Ok(MessageDisposition::Delivered);
+                }
+            }
+        }
         Ok(MessageDisposition::Queued)
     }
 
@@ -158,6 +226,7 @@ impl Scheduler {
         &self,
         agent_id: &str,
         message_id: &str,
+        mode: &str,
         content: &str,
     ) -> Result<MessageDisposition, SchedulerError> {
         let task = self.inner.store.get_task(agent_id)?.ok_or_else(|| {
@@ -184,7 +253,7 @@ impl Scheduler {
         if !self
             .inner
             .store
-            .requeue_task_for_resume_with_message(agent_id, message_id, content)?
+            .requeue_task_for_resume_with_message(agent_id, message_id, mode, content)?
         {
             return Err(SchedulerError::RuntimeCommand {
                 agent_id: agent_id.into(),

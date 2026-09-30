@@ -96,3 +96,11 @@ hi request as `UNAVAILABLE/remote`; no credentials are modified. A successful
 authenticated hi remains unverified.
 Auth-only probing does not create a session or send a prompt; hi probing is the
 separate strict read-only operation.
+
+## send 双模式投递
+
+`external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
+
+活跃 queue 由 es 暂存，在既有 turn 边界投递；这是对旧版活跃时直接失败的行为改进。空闲 queue 沿用 session/prompt 路径。steer 始终公开返回 steer_unsupported，不降级为 queue，也不尝试硬杀。原生并发 prompt 实测 -32602，session/cancel 实测 -32601。
+
+接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

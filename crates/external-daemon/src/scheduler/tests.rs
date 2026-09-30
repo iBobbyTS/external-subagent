@@ -888,7 +888,7 @@ sleep 2
             )
             .unwrap();
         assert!(store
-            .requeue_task_for_resume_with_message(&agent_id, "resume-policy", "continue")
+            .requeue_task_for_resume_with_message(&agent_id, "resume-policy", "queue", "continue")
             .unwrap());
         let task = store.get_task(&agent_id).unwrap().unwrap();
         let prepared: external_core::PreparedGeneralTask =
@@ -949,6 +949,137 @@ sleep 2
     }
 
     #[test]
+    fn zcode_steer_stops_then_sends() {
+        let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+        let directory = workspace.path().to_owned();
+        let script = format!(
+            r#"{RUNNING_PROTOCOL}
+read request
+printf '%s\n' "$request" >> steer.jsonl
+printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+read request
+printf '%s\n' "$request" >> steer.jsonl
+printf '%s\n' '{{"id":5,"result":{{"turnId":"steered-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
+while read request; do
+  request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+done
+"#
+        );
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory =
+            Arc::new(CommandRuntimeFactory::new(move |_: &TaskRecord| {
+                let mut command = Command::new("sh");
+                command.args(["-c", &script]).current_dir(&directory);
+                Ok(command)
+            }));
+        scheduler.start_ready().unwrap();
+        assert_eq!(
+            scheduler
+                .send_message(&agent_id, "buffered", "queue", "later")
+                .unwrap(),
+            MessageDisposition::Queued
+        );
+        assert_eq!(
+            scheduler
+                .send_message(&agent_id, "steered", "steer", "new direction")
+                .unwrap(),
+            MessageDisposition::Delivered
+        );
+        let frames = fs::read_to_string(workspace.path().join("steer.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(frames[0]["method"], "session/stop");
+        assert_eq!(frames[1]["method"], "session/send");
+        assert_eq!(frames[1]["params"]["content"], "new direction");
+        assert_eq!(
+            scheduler
+                .store()
+                .message("steered")
+                .unwrap()
+                .unwrap()
+                .target_turn_id
+                .as_deref(),
+            Some("steered-turn")
+        );
+        assert_eq!(
+            scheduler
+                .store()
+                .message("buffered")
+                .unwrap()
+                .unwrap()
+                .state,
+            MessageState::Queued
+        );
+        scheduler.cancel_task(&agent_id).unwrap();
+    }
+
+    #[test]
+    fn zcode_steer_failures_settle_the_claim_with_the_failing_operation() {
+        for failure in ["stop", "send"] {
+            let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
+            let directory = workspace.path().to_owned();
+            let reply = if failure == "stop" {
+                r#"printf '%s\n' '{"id":4,"error":{"code":-32001,"message":"stop refused"}}'"#
+            } else {
+                r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"session/event","params":{"type":"turn.failed"}}'
+read request
+printf '%s\n' '{"id":5,"error":{"code":-32002,"message":"send refused"}}'"#
+            };
+            let script = format!(
+                r#"{RUNNING_PROTOCOL}
+read request
+{reply}
+while read request; do
+  request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+done
+"#
+            );
+            Arc::get_mut(&mut scheduler.inner).unwrap().factory =
+                Arc::new(CommandRuntimeFactory::new(move |_: &TaskRecord| {
+                    let mut command = Command::new("sh");
+                    command.args(["-c", &script]).current_dir(&directory);
+                    Ok(command)
+                }));
+            scheduler.start_ready().unwrap();
+            assert!(scheduler
+                .send_message(&agent_id, "failed-steer", "steer", "new direction")
+                .is_err());
+            let receipt = scheduler.store().message("failed-steer").unwrap().unwrap();
+            assert_eq!(receipt.state, MessageState::Failed);
+            assert_eq!(
+                receipt.failure_code.as_deref(),
+                Some(if failure == "stop" {
+                    "SESSION_STOP_FAILED"
+                } else {
+                    "SESSION_SEND_FAILED"
+                })
+            );
+            assert!(receipt.delivered_at.is_none());
+            assert_eq!(
+                scheduler
+                    .send_message(&agent_id, "failed-steer", "steer", "new direction")
+                    .unwrap(),
+                MessageDisposition::Failed
+            );
+            if failure == "stop" {
+                assert_eq!(
+                    scheduler
+                        .store()
+                        .get_task(&agent_id)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    TaskPhase::Running
+                );
+            }
+            scheduler.cancel_task(&agent_id).unwrap();
+        }
+    }
+
+    #[test]
     fn scheduler_queue_drains_once_through_driver_and_persists_receipt() {
         let (workspace, mut scheduler, agent_id) = diagnostic_scheduler("unused");
         let directory = workspace.path().to_owned();
@@ -974,7 +1105,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         for _ in 0..2 {
             assert_eq!(
                 scheduler
-                    .queue_message(&agent_id, "counted", "follow-up")
+                    .send_message(&agent_id, "counted", "queue", "follow-up")
                     .unwrap(),
                 MessageDisposition::Queued
             );
@@ -996,7 +1127,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert!(receipt.delivered_at.is_some());
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "counted", "follow-up")
+                .send_message(&agent_id, "counted", "queue", "follow-up")
                 .unwrap(),
             MessageDisposition::AlreadyDelivered
         );
@@ -1129,7 +1260,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                 )
                 .unwrap());
             scheduler
-                .queue_message(&agent_id, "unknown", "never replay")
+                .send_message(&agent_id, "unknown", "queue", "never replay")
                 .unwrap();
             assert_eq!(
                 store.claim_next_message(&agent_id).unwrap().unwrap().state,
@@ -1381,7 +1512,7 @@ sleep 2
             ("different-agent", "original"),
         ] {
             let error = scheduler
-                .queue_message(agent, "existing", content)
+                .send_message(agent, "existing", "queue", content)
                 .unwrap_err();
             assert!(
                 matches!(error, SchedulerError::Store(StoreError::Conflict(ref message)) if message == "MESSAGE_ID_CONFLICT")
@@ -1393,7 +1524,7 @@ sleep 2
         assert_eq!(message.state, MessageState::Queued);
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "existing", "original")
+                .send_message(&agent_id, "existing", "queue", "original")
                 .unwrap(),
             MessageDisposition::Queued
         );
@@ -3297,6 +3428,7 @@ mod stall_tests {
             .requeue_task_for_resume_with_message(
                 &harness.agent_id,
                 "resume-model-gate",
+                "queue",
                 "continue"
             )
             .unwrap());
@@ -3653,7 +3785,7 @@ mod stall_tests {
         // builds a fresh lifecycle with a fresh baseline.
         assert_eq!(
             scheduler
-                .queue_message(agent_id, "resume-msg", "continue the task")
+                .send_message(agent_id, "resume-msg", "queue", "continue the task")
                 .unwrap(),
             MessageDisposition::Queued
         );

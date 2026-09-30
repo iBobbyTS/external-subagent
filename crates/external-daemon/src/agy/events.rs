@@ -10,14 +10,11 @@
 //!
 //! # Turn settlement tri-state
 //!
-//! A turn is opened by [`AgyRuntimeShared::begin_turn`] (the daemon sent a
-//! `user` line) and closed by the **first** `result` after it was opened, not
-//! by process exit. A result that arrives with no open turn is stream noise:
-//! the measured idle-period signal trap emits a second `ERROR` result after a
-//! turn already settled (`docs/compatibility/antigravity.md` §4), and it must
-//! never overwrite the settled terminal. Before `init`, a result with no
-//! `conversation_id` is an admission/session-start failure, not a turn
-//! settlement, and it fails the bootstrap wait instead of emitting a boundary.
+//! 普通发送在 user 行发出前开启 turn，首个 result 结算。原生缓冲的
+//! 后续输入由下一 user_input 或递增 num_turns 的 result 开启对应 turn。
+//! 无待消费输入的空闲重复 result 仍是噪声，不覆盖已经结算的结果。
+//! init 前、缺少 conversation_id 的 result 属于会话准入失败，
+//! 使 bootstrap 等待失败，不结算 turn 或发出边界。
 
 use std::{
     sync::{
@@ -53,6 +50,8 @@ pub(super) enum AgyStartState {
 struct AgyTurnState {
     classifier: TurnClassifier,
     open: bool,
+    // stdin 已接收、尚未由 user_input/result 开启消费的原生后续输入。
+    pending_inputs: usize,
 }
 
 pub(super) struct AgyRuntimeShared {
@@ -78,6 +77,7 @@ impl AgyRuntimeShared {
             turn: Mutex::new(AgyTurnState {
                 classifier: TurnClassifier::new(),
                 open: false,
+                pending_inputs: 0,
             }),
             sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
@@ -166,12 +166,45 @@ impl AgyRuntimeShared {
     /// Open a new turn. Called before a `user` line leaves for the child, so a
     /// result can never be observed without an open turn.
     pub(super) fn begin_turn(&self) {
-        self.turn.lock().unwrap().open = true;
+        let mut turn = self.turn.lock().unwrap();
+        turn.open = true;
+        self.emit_started();
+    }
+
+    fn emit_started(&self) {
         let params = serde_json::json!({"type": "turn.started"});
         let started = self.canonical_event(params.clone());
         self.publisher.emit_driver(self.canonical_event(params), None);
         self.turn_tracker.observe(&started);
         self.emit_lifecycle("turn.started");
+    }
+
+    /// 写入和登记共用 turn 锁，防止 pump 在登记前结算快速回包；失败撤回登记。
+    pub(super) fn buffer_input(
+        &self,
+        write: impl FnOnce() -> Result<(), RuntimeCommandError>,
+    ) -> Result<(), RuntimeCommandError> {
+        let mut turn = self.turn.lock().unwrap();
+        turn.pending_inputs += 1;
+        if let Err(error) = write() {
+            turn.pending_inputs -= 1;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn turn_snapshot(&self) -> crate::TurnSnapshot {
+        let turn = self.turn.lock().unwrap();
+        let mut snapshot = self.turn_tracker.snapshot();
+        // 两轮之间仍有原生输入待消费，monitor 不得按首轮边界回收进程。
+        snapshot.active |= turn.pending_inputs > 0;
+        snapshot
+    }
+
+    fn begin_pending_turn(&self, turn: &mut AgyTurnState) {
+        turn.pending_inputs -= 1;
+        turn.open = true;
+        self.emit_started();
     }
 
     /// Wait for the bootstrap gate: `init` (identity recorded) or an
@@ -225,6 +258,12 @@ impl AgyRuntimeShared {
             }
             AgyEvent::StepUpdate(step) => {
                 self.note_session(&step.conversation_id);
+                if step.step_type == StepType::UserInput {
+                    let mut turn = self.turn.lock().unwrap();
+                    if !turn.open && turn.pending_inputs > 0 {
+                        self.begin_pending_turn(&mut turn);
+                    }
+                }
                 if step.step_type == StepType::AgentResponse {
                     if let Some(delta) = step.text_delta.as_deref().filter(|text| !text.is_empty()) {
                         let params = self.streaming_payload(delta);
@@ -262,8 +301,12 @@ impl AgyRuntimeShared {
                 self.start_changed.notify_all();
             }
         }
+        let mut turn = self.turn.lock().unwrap();
+        // 缺 user_input 的流可由递增 num_turns 开启；同一轮的重复 result 仍丢弃。
+        if !turn.open && turn.pending_inputs > 0 && result.num_turns > turn.classifier.num_turns() {
+            self.begin_pending_turn(&mut turn);
+        }
         let settlement = {
-            let mut turn = self.turn.lock().unwrap();
             if !turn.open {
                 // A result with no open turn is stream noise: the idle-period
                 // signal trap emits a second result after the turn settled,

@@ -274,3 +274,11 @@ effort keeps the pre-existing wire default. Evidence layers:
 - Installation into a real user `~/.codex` (requires explicit authorization).
 - Live two-agent tasks driven by a real Codex conversation.
 - Registry publication and any `npm publish` flow.
+
+## send 双模式投递
+
+`external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
+
+活跃 queue 使用原生并发 `turn/start{threadId,model,effort,input}` 注入当前 turn，在下一步骤边界生效，不中断执行中的命令、不建立新 turn、不打开 start_in_flight、不触碰 tracker/retirement、不等待新 turn.started。响应必须回显当前 turn id；回显不匹配时消息以 SESSION_SEND_FAILED 记为 Failed。若检查与 wire 请求之间 turn 恰好完成，provider 可能开出新 turn，消息内容可能已被消费而回执仍失败，重发存在重复风险。活跃 steer 则等待 turn/interrupt 边界落定，再 turn/start 新 turn。空闲时两种 mode 均普通 send_turn；符合现有条件的终态经 resume 接续，落库保留请求的 mode。
+
+接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

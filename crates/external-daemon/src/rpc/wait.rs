@@ -422,6 +422,7 @@ pub(crate) mod wait_tests {
             agent_id: id.clone(),
             message_id: Some("drain-msg".into()),
             content: "x".into(),
+            mode: "queue".into(),
         };
         service
             .dispatch(RpcMethod::TaskMessage(msg.clone()))
@@ -448,6 +449,7 @@ pub(crate) mod wait_tests {
             agent_id: id.clone(),
             message_id: Some("before-abort".into()),
             content: "delivered before the drain".into(),
+            mode: "queue".into(),
         };
         service
             .dispatch(RpcMethod::TaskMessage(original.clone()))
@@ -537,6 +539,7 @@ pub(crate) mod wait_tests {
                 agent_id: first_id,
                 message_id: Some("before-drain".into()),
                 content: "accepted before the drain linearization point".into(),
+                mode: "queue".into(),
             }))
         });
 
@@ -558,6 +561,7 @@ pub(crate) mod wait_tests {
                 agent_id: id,
                 message_id: Some("after-drain".into()),
                 content: "must be rejected".into(),
+                mode: "queue".into(),
             }))
             .unwrap_err();
         assert_eq!(error.code, RpcErrorCode::Unavailable);
@@ -1512,6 +1516,7 @@ pub(crate) mod wait_tests {
                 agent_id: id.clone(),
                 message_id: Some("assembled-message".into()),
                 content: "continue with the requested work".into(),
+                mode: "queue".into(),
             }))
             .unwrap();
         let RpcSuccess::Message { disposition, .. } = response else {
@@ -1536,6 +1541,7 @@ pub(crate) mod wait_tests {
                 agent_id: id.clone(),
                 message_id: None,
                 content: "continue without an explicit id".into(),
+                mode: "queue".into(),
             }))
             .unwrap();
         let RpcSuccess::Message {
@@ -1559,6 +1565,7 @@ pub(crate) mod wait_tests {
                 agent_id: id.clone(),
                 message_id: Some(message_id.clone()),
                 content: "continue without an explicit id".into(),
+                mode: "queue".into(),
             }))
             .unwrap();
         let RpcSuccess::Message {
@@ -1573,6 +1580,7 @@ pub(crate) mod wait_tests {
                 agent_id: id.clone(),
                 message_id: Some("explicit-conflict".into()),
                 content: "first".into(),
+                mode: "queue".into(),
             })),
             Ok(_)
         ));
@@ -1581,6 +1589,7 @@ pub(crate) mod wait_tests {
                 agent_id: id,
                 message_id: Some("explicit-conflict".into()),
                 content: "different".into(),
+                mode: "queue".into(),
             }))
             .is_err());
     }
@@ -1604,6 +1613,7 @@ pub(crate) mod wait_tests {
             agent_id: id.clone(),
             message_id: Some("terminal-message".into()),
             content: "must not resume".into(),
+            mode: "queue".into(),
         }));
         assert!(matches!(
             response,
@@ -2012,7 +2022,7 @@ pub(crate) mod wait_tests {
         // Resume clears the detail and deletes the immutable result.
         assert!(service
             .store
-            .requeue_task_for_resume_with_message(&id, "resume-detail", "continue")
+            .requeue_task_for_resume_with_message(&id, "resume-detail", "queue", "continue")
             .unwrap());
         let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
         service
@@ -2074,7 +2084,7 @@ pub(crate) mod wait_tests {
         let writer = std::thread::spawn(move || {
             assert!(writer_service
                 .store
-                .requeue_task_for_resume_with_message(&writer_id, "resume-concurrent", "continue")
+                .requeue_task_for_resume_with_message(&writer_id, "resume-concurrent", "queue", "continue")
                 .unwrap());
             let claim = writer_service
                 .store

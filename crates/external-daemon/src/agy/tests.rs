@@ -427,9 +427,9 @@ fn message_queue_delivers_a_second_turn_after_the_first_result() {
     await_turn_active(&scheduler, &agent_id);
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "queued-1", "second question")
+            .send_message(&agent_id, "queued-1", "queue", "second question")
             .unwrap(),
-        MessageDisposition::Queued
+        MessageDisposition::Delivered
     );
     std::fs::write(directory.join("release"), "").unwrap();
     let result = await_result(&scheduler, &agent_id);
@@ -629,4 +629,103 @@ fn routing_dispatches_agy_admissions_to_the_agy_factory() {
         error.to_string().contains("agy spawn gate is closed"),
         "{error}"
     );
+}
+
+#[test]
+fn native_buffer_keeps_runtime_running_between_results_and_rejects_steer() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+read_frame
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"FIRST","num_turns":1}}'
+touch first-settled
+while [ ! -f consume-native ]; do sleep 0.01; done
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"__CONV__","step_index":1,"state":"DONE","step_type":"user_input"}}'
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"SECOND","num_turns":2}}'
+"#.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let error = scheduler
+        .send_message(&agent_id, "unsupported", "steer", "turn now")
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::SchedulerError::RuntimeCommand { message, .. } if message == "steer_unsupported")
+    );
+    assert!(scheduler.store().message("unsupported").unwrap().is_none());
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "native", "queue", "second question")
+            .unwrap(),
+        MessageDisposition::Delivered
+    );
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while !workspace.path().join("first-settled").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    // 留出多个 monitor 周期，证明首轮 result 后 runtime 仍被保留。
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        TaskPhase::Running
+    );
+    assert_eq!(scheduler.active_count(), 1);
+    assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+    assert_eq!(
+        scheduler.store().message("native").unwrap().unwrap().state,
+        external_store::MessageState::Delivered
+    );
+    std::fs::write(workspace.path().join("consume-native"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.final_text, "SECOND");
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(
+        deliveries(workspace.path())
+            .iter()
+            .filter(|f| f["event"] == "user")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
+    use super::events::AgyRuntimeShared;
+    let tracker = Arc::new(crate::TurnTracker::new());
+    let shared = AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
+        tracker.clone(),
+    );
+    shared.begin_turn();
+    shared.buffer_input(|| Ok(())).unwrap();
+    let result = |count| {
+        external_agent_agy::event::parse_line(&format!(r#"{{"event":"result","result":{{"conversation_id":"{CONV}","status":"SUCCESS","response":"turn {count}","num_turns":{count}}}}}"#)).unwrap()
+    };
+    shared.project_event(&result(1));
+    assert!(shared.turn_snapshot().active);
+    let first = tracker.snapshot();
+    assert_eq!(first.boundary, Some(crate::TurnBoundary::Completed));
+    shared.project_event(&result(1));
+    assert_eq!(tracker.snapshot(), first);
+    shared.project_event(&result(2));
+    let second = shared.turn_snapshot();
+    assert!(!second.active);
+    assert_eq!(second.generation, first.generation + 1);
+    assert_eq!(second.boundary, Some(crate::TurnBoundary::Completed));
+    shared.project_event(&result(2));
+    assert_eq!(shared.turn_snapshot(), second);
+    assert!(shared
+        .buffer_input(|| Err(crate::RuntimeCommandError::Transport(
+            "write refused".into()
+        )))
+        .is_err());
+    assert_eq!(shared.turn_snapshot(), second);
 }

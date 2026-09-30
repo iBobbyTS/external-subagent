@@ -375,21 +375,23 @@ impl RpcService {
                 self.task_wait(query, deadline, interrupted)
             }
             RpcMethod::TaskMessage(input) => {
+                if !matches!(input.mode.as_str(), "queue" | "steer") {
+                    return Err(RpcError::new(
+                        RpcErrorCode::Validation,
+                        "mode must be queue or steer",
+                    ));
+                }
                 let task = self.require_task(&input.agent_id)?;
                 if let Some(message_id) = input.message_id.as_deref() {
                     validate_id(message_id, "message_id")?;
                 }
-                // The generic control plane only queues clarification. A
-                // terminal task may be resumed by the scheduler when the
-                // persisted ZCode session accepts a restore; other
-                // interrupt-and-continue paths remain private.
                 validate_text(&input.content, "content", 16 * 1024)?;
                 let message_id = input
                     .message_id
                     .unwrap_or_else(|| format!("subagent-message-{}", Uuid::new_v4()));
                 let disposition = self
                     .scheduler
-                    .queue_message(&task.agent_id, &message_id, &input.content)
+                    .send_message(&task.agent_id, &message_id, &input.mode, &input.content)
                     .map_err(map_scheduler)?;
                 let task = self.require_task(&input.agent_id)?;
                 Ok(RpcSuccess::Message {

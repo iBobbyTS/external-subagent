@@ -683,7 +683,7 @@ fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
         )
         .unwrap();
     assert!(store
-        .requeue_task_for_resume_with_message("agent", "resume-msg", "continue")
+        .requeue_task_for_resume_with_message("agent", "resume-msg", "queue", "continue")
         .unwrap());
     // The requeue row is not a TERMINAL row, so the stale failure still reads
     // until the resumed task terminalizes.
@@ -952,7 +952,7 @@ fn task_with_result_holds_one_lock_across_a_resume_and_second_failure() {
     let writer = std::thread::spawn(move || {
         start_rx.recv().unwrap();
         writer_store
-            .requeue_task_for_resume_with_message("agent", "resume-msg", "continue")
+            .requeue_task_for_resume_with_message("agent", "resume-msg", "queue", "continue")
             .unwrap();
         let claim = writer_store.claim_next("daemon", 10, 10).unwrap().unwrap();
         writer_store
@@ -1021,4 +1021,78 @@ fn task_with_result_holds_one_lock_across_a_resume_and_second_failure() {
     );
     assert_eq!(second_result.unwrap().result.outcome, TaskOutcome::Failed);
     assert_eq!(second_reason.as_deref(), Some("MODEL_REJECTED"));
+}
+
+#[test]
+fn message_modes_validate_and_steer_claim_precedes_buffered_queue() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("agent", "/repo", None))
+        .unwrap();
+    running(&store, "agent");
+    assert!(store
+        .insert_message("old-queue", "agent", "queue", "later")
+        .unwrap());
+    assert!(store
+        .insert_message("steer", "agent", "steer", "now")
+        .unwrap());
+    assert!(!store
+        .insert_message("steer", "agent", "steer", "now")
+        .unwrap());
+    assert!(store
+        .insert_message("steer", "agent", "queue", "now")
+        .is_err());
+    assert!(store
+        .insert_message("invalid", "agent", "other", "x")
+        .is_err());
+    assert!(store.message("invalid").unwrap().is_none());
+    let message = store.claim_next_message("agent").unwrap().unwrap();
+    assert_eq!(message.message_id, "steer");
+    assert_eq!(message.state, MessageState::Sending);
+    assert!(store.complete_message("steer", Some("new-turn")).unwrap());
+    assert_eq!(
+        store
+            .claim_next_message("agent")
+            .unwrap()
+            .unwrap()
+            .message_id,
+        "old-queue"
+    );
+}
+
+#[test]
+fn terminal_resume_persists_both_modes_and_rejects_invalid_mode_without_mutation() {
+    for mode in ["queue", "steer"] {
+        let (_directory, _path, store) = store();
+        store
+            .enqueue_task_authoritative(&task("agent", "/repo", None))
+            .unwrap();
+        let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+        assert!(store
+            .mark_session_running(
+                "agent",
+                claim.owner_epoch,
+                "runtime",
+                None,
+                Some("thread"),
+                None
+            )
+            .unwrap());
+        store
+            .store_task_result("agent", &result(TaskOutcome::Completed))
+            .unwrap();
+        assert!(store
+            .requeue_task_for_resume_with_message("agent", "invalid", "other", "x")
+            .is_err());
+        assert_eq!(
+            store.get_task("agent").unwrap().unwrap().phase,
+            TaskPhase::Terminal
+        );
+        assert!(store
+            .requeue_task_for_resume_with_message("agent", "resume", mode, "continue")
+            .unwrap());
+        let message = store.message("resume").unwrap().unwrap();
+        assert_eq!(message.mode, mode);
+        assert_eq!(message.state, MessageState::Queued);
+    }
 }

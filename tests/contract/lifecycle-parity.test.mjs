@@ -60,6 +60,7 @@ async function lifecycleServer(socketPath) {
         result = { task: task(), disposition: 'created' };
       } else if (request.method === 'task_message') {
         assert.equal(status, 'running');
+        assert.equal(request.params.mode, 'queue');
         result = { message_id: request.params.message_id, disposition: 'queued', task: task() };
       } else if (request.method === 'task_wait') {
         const projected = actionable();
@@ -130,7 +131,7 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     const created = await runCli(socket, 'spawn', { subagent: 'zcode', repository: directory, prompt: 'hello' });
     assert.equal(created.result.agent_id, agentId);
     assert.equal(created.result.status, 'running');
-    const sent = await runCli(socket, 'send', { agent_id: agentId, message_id: 'message-1', content: 'follow up' });
+    const sent = await runCli(socket, 'send', { agent_id: agentId, message_id: 'message-1', mode: 'queue', content: 'follow up' });
     assert.equal(sent.result.disposition, 'queued');
     const waited = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
     // The projection stays capped at 100 actionable records and the first

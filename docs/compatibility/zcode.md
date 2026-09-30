@@ -188,3 +188,11 @@ bridge itself is exercised live by the machine verification: spawning
 the exact pinned `command`/`args`/`env` from inside the restricted
 context completes initialize → tools/list (all ten tools) → a real
 `external_subagent_status` call.
+
+## send 双模式投递
+
+`external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
+
+活跃 queue 由 es 暂存，在既有 turn 边界经 session/send 投递。活跃 steer 先 session/stop，边界落定后 session/send 新 turn。空闲时两种 mode 均普通发送。原生并发 session/send 的实测 -32010 拒绝是暂存兜底的依据。
+
+接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

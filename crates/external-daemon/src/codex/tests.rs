@@ -406,12 +406,11 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         assert!(Instant::now() < deadline, "first turn never became active");
         thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(
-        scheduler
-            .queue_message(&agent_id, "same-process-msg", "second turn")
-            .unwrap(),
-        crate::MessageDisposition::Queued
-    );
+    // 预置 es 暂存以验证普通 send_turn；公开 queue 活跃注入由独立 fixture 覆盖。
+    scheduler
+        .store()
+        .insert_message("same-process-msg", &agent_id, "queue", "second turn")
+        .unwrap();
     std::fs::write(directory.join("release"), "").unwrap();
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
@@ -814,12 +813,11 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         assert!(Instant::now() < deadline, "first turn never became active");
         thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(
-        scheduler
-            .queue_message(&agent_id, "same-process-msg", "follow-up question")
-            .unwrap(),
-        crate::MessageDisposition::Queued
-    );
+    // 预置 es 暂存以验证普通 send_turn；公开 queue 活跃注入由独立 fixture 覆盖。
+    scheduler
+        .store()
+        .insert_message("same-process-msg", &agent_id, "queue", "follow-up question")
+        .unwrap();
     std::fs::write(directory.join("release"), "").unwrap();
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
@@ -867,6 +865,12 @@ impl crate::LifecycleSink for NoopSink {
 
 #[test]
 fn terminal_send_resumes_the_same_thread_in_a_new_process_without_replay() {
+    for mode in ["queue", "steer"] {
+        terminal_resume_for_mode(mode);
+    }
+}
+
+fn terminal_resume_for_mode(mode: &str) {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let directory = workspace.path().to_owned();
@@ -957,10 +961,33 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
     // Public terminal send is the explicit recovery trigger.
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "resume-msg-1", "follow-up question")
+            .send_message(&agent_id, "resume-msg-1", mode, "follow-up question")
             .unwrap(),
         crate::MessageDisposition::Queued
     );
+    assert_eq!(
+        scheduler
+            .store()
+            .message("resume-msg-1")
+            .unwrap()
+            .unwrap()
+            .mode,
+        mode
+    );
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "resume-msg-1", mode, "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    assert!(scheduler
+        .send_message(
+            &agent_id,
+            "resume-msg-1",
+            if mode == "queue" { "steer" } else { "queue" },
+            "follow-up question"
+        )
+        .is_err());
     // queue_message only requeues; the daemon claim loop performs the
     // spawn. Either this call or the finishing monitor's trailing claim
     // wins the single resume claim.
@@ -996,6 +1023,12 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
         "resume message was not delivered"
     );
     assert_eq!(message.target_turn_id.as_deref(), Some("codex-turn-2"));
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "resume-msg-1", mode, "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::AlreadyDelivered
+    );
 }
 
 #[test]
@@ -1061,7 +1094,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let error = scheduler
-        .queue_message(&zcode_task.agent_id, "zcode-msg", "nope")
+        .send_message(&zcode_task.agent_id, "zcode-msg", "queue", "nope")
         .unwrap_err();
     assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
 
@@ -1101,7 +1134,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let error = scheduler
-        .queue_message(&cancelled.agent_id, "cancel-msg", "nope")
+        .send_message(&cancelled.agent_id, "cancel-msg", "queue", "nope")
         .unwrap_err();
     assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
 
@@ -1150,7 +1183,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let error = scheduler
-        .queue_message(&sessionless.agent_id, "sessionless-msg", "nope")
+        .send_message(&sessionless.agent_id, "sessionless-msg", "queue", "nope")
         .unwrap_err();
     assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
 }
@@ -1674,7 +1707,7 @@ fn terminal_send_never_overwrites_a_committed_close_or_cancel() {
         .unwrap();
         assert_eq!(phase, TaskPhase::Terminal);
         let error = scheduler
-            .queue_message(&agent_id, "post-close-msg", "nope")
+            .send_message(&agent_id, "post-close-msg", "queue", "nope")
             .unwrap_err();
         assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
         let after = scheduler.store().get_task(&agent_id).unwrap().unwrap();
@@ -1722,7 +1755,7 @@ fn store_requeue_refuses_a_close_committed_after_the_scheduler_read() {
     // transaction can still refuse the resume.
     store.request_close(&agent_id).unwrap();
     let requeued = store
-        .requeue_task_for_resume_with_message(&agent_id, "race-msg", "content")
+        .requeue_task_for_resume_with_message(&agent_id, "race-msg", "queue", "content")
         .unwrap();
     assert!(!requeued, "a committed close must refuse the requeue");
     let task = store.get_task(&agent_id).unwrap().unwrap();
@@ -1769,7 +1802,7 @@ fn concurrent_terminal_send_and_close_never_lose_the_close() {
         let sender_message = message_id.clone();
         let send_handle = thread::spawn(move || {
             barrier.wait();
-            send_scheduler.queue_message(&send_agent, &sender_message, "follow-up")
+            send_scheduler.send_message(&send_agent, &sender_message, "queue", "follow-up")
         });
         let close_handle = thread::spawn(move || {
             close_barrier.wait();
@@ -1868,7 +1901,7 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
     // The scheduler precheck passes (codex, session, completed, no
     // close), so only the transaction's reap proof refuses this.
     let error = scheduler
-        .queue_message(&agent_id, "orphan-msg", "nope")
+        .send_message(&agent_id, "orphan-msg", "queue", "nope")
         .unwrap_err();
     assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
     let after = store.get_task(&agent_id).unwrap().unwrap();
@@ -1883,7 +1916,7 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
     // and only then may the requeue clear the old identity.
     store.reap_task(&agent_id).unwrap();
     assert!(store
-        .requeue_task_for_resume_with_message(&agent_id, "orphan-msg", "nope")
+        .requeue_task_for_resume_with_message(&agent_id, "orphan-msg", "queue", "nope")
         .unwrap());
     assert_eq!(
         store.get_task(&agent_id).unwrap().unwrap().phase,
@@ -2198,7 +2231,7 @@ sleep 1
 
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "fail-msg", "follow-up question")
+                .send_message(&agent_id, "fail-msg", "queue", "follow-up question")
                 .unwrap(),
             crate::MessageDisposition::Queued
         );
@@ -2324,7 +2357,7 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
 
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "yolo-resume-msg", "follow-up question")
+                .send_message(&agent_id, "yolo-resume-msg", "queue", "follow-up question")
                 .unwrap(),
             crate::MessageDisposition::Queued
         );
@@ -2400,7 +2433,7 @@ fn write_modes_resume_with_confirmed_workspace_write() {
 
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "write-resume-msg", "follow-up question")
+                .send_message(&agent_id, "write-resume-msg", "queue", "follow-up question")
                 .unwrap(),
             crate::MessageDisposition::Queued
         );
@@ -2526,7 +2559,12 @@ fn resume_keeps_the_admitted_effort_for_followup_turns() {
 
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "effort-resume-msg", "follow-up question")
+            .send_message(
+                &agent_id,
+                "effort-resume-msg",
+                "queue",
+                "follow-up question"
+            )
             .unwrap(),
         crate::MessageDisposition::Queued
     );
@@ -2599,7 +2637,7 @@ fn resume_without_an_effort_echo_proceeds_with_a_diagnostic() {
 
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "effort-none-msg", "follow-up question")
+            .send_message(&agent_id, "effort-none-msg", "queue", "follow-up question")
             .unwrap(),
         crate::MessageDisposition::Queued
     );
@@ -2672,7 +2710,7 @@ fn resume_fails_closed_when_the_effort_echo_diverges() {
 
     assert_eq!(
         scheduler
-            .queue_message(&agent_id, "effort-fail-msg", "follow-up question")
+            .send_message(&agent_id, "effort-fail-msg", "queue", "follow-up question")
             .unwrap(),
         crate::MessageDisposition::Queued
     );
@@ -2805,7 +2843,7 @@ sleep 1
 
         assert_eq!(
             scheduler
-                .queue_message(&agent_id, "fail-msg", "follow-up question")
+                .send_message(&agent_id, "fail-msg", "queue", "follow-up question")
                 .unwrap(),
             crate::MessageDisposition::Queued
         );
@@ -3013,4 +3051,246 @@ fn codex_oversized_frame_fails_explicitly_and_reaps_the_provider() {
         scheduler.store().task_result(&agent_id).unwrap().unwrap(),
         result
     );
+}
+
+// 首轮保持活跃，随后按 fixture 分支响应 inject 或 interrupt+start。
+fn send_modes_script(workspace: &Path, tail: &str) -> String {
+    let echo = start_echo(workspace, PermissionMode::Plan);
+    format!(
+        r#"
+IFS= read -r line
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> send-modes.jsonl
+IFS= read -r line
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> send-modes.jsonl
+{tail}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> send-modes.jsonl
+  case "$line" in
+    *turn/interrupt*)
+      request_id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" \
+        '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"interrupted","error":null}}}}}}' \
+        '{{"method":"turn/completed","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-2","status":"interrupted","error":null}}}}}}'
+      ;;
+  esac
+done
+"#
+    )
+}
+
+#[test]
+fn queue_inject_preserves_turn_and_fails_closed_on_foreign_or_racing_echo() {
+    let _guard = scripted_test_guard();
+    for (echo, race) in [
+        ("codex-turn-1", false),
+        ("foreign-turn", false),
+        ("codex-turn-2", true),
+    ] {
+        let workspace = codex_workspace();
+        let completion = if race {
+            r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}' '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"inProgress"}}}'"#
+        } else {
+            ""
+        };
+        let script = send_modes_script(
+            workspace.path(),
+            &format!(
+                r#"{completion}
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"{echo}","status":"inProgress"}}}}}}'
+"#
+            ),
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]).current_dir(workspace.path());
+        let owner = CodexRuntimeOwner::spawn(command, Arc::new(NoopSink)).unwrap();
+        let scheduler = codex_scheduler(workspace.path(), CodexRuntimeFactory::closed());
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "initial"),
+                Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+            )
+            .unwrap();
+        let task = scheduler
+            .store()
+            .get_task(&submitted.agent_id)
+            .unwrap()
+            .unwrap();
+        owner
+            .bootstrap_session_with_mcp(&task, &[], SCRIPTED_SYNC_WAIT)
+            .unwrap();
+        let before = owner.turn_snapshot();
+        let retired = owner.shared.retired_turns.lock().unwrap().clone();
+        let outcome = owner.inject_turn(THREAD_ID, "injected", SCRIPTED_SYNC_WAIT);
+        assert_eq!(outcome.is_ok(), echo == "codex-turn-1");
+        assert!(!owner
+            .shared
+            .start_in_flight
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(owner.turn_snapshot().generation, before.generation);
+        if !race {
+            assert_eq!(owner.turn_snapshot(), before);
+            assert_eq!(*owner.shared.retired_turns.lock().unwrap(), retired);
+        }
+        let wire = std::fs::read_to_string(workspace.path().join("send-modes.jsonl")).unwrap();
+        let request: serde_json::Value =
+            serde_json::from_str(wire.lines().last().unwrap()).unwrap();
+        assert_eq!(request["method"], "turn/start");
+        assert_eq!(request["params"]["effort"], "high");
+        assert_eq!(request["params"]["input"][0]["text"], "injected");
+        owner.stop(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn send_modes_inline_receipts_and_steer_interrupt_before_new_start() {
+    let _guard = scripted_test_guard();
+    for (mode, echoed, race) in [
+        ("queue", "codex-turn-1", false),
+        ("steer", "codex-turn-2", false),
+        ("queue", "foreign", false),
+        ("queue", "codex-turn-2", true),
+    ] {
+        let workspace = codex_workspace();
+        let tail = if mode == "queue" {
+            let completion = if race {
+                r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"completed","error":null}}}' '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"inProgress"}}}'"#
+            } else {
+                ""
+            };
+            format!(
+                r#"{completion}
+printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"{echoed}","status":"inProgress"}}}}}}'"#
+            )
+        } else {
+            r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-1","status":"interrupted","error":null}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> send-modes.jsonl
+printf '%s\n' '{"id":5,"result":{"turn":{"id":"codex-turn-2","status":"inProgress"}}}' '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"inProgress"}}}'"#.into()
+        };
+        let scheduler = codex_scheduler(
+            workspace.path(),
+            harness_factory(
+                &send_modes_script(workspace.path(), &tail),
+                workspace.path(),
+            ),
+        );
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for(workspace.path(), "initial"),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let outcome = scheduler.send_message(&submitted.agent_id, "inline", mode, "follow-up");
+        if mode == "queue" && echoed != "codex-turn-1" {
+            assert!(outcome.is_err());
+            let receipt = scheduler.store().message("inline").unwrap().unwrap();
+            assert_eq!(receipt.state, external_store::MessageState::Failed);
+            assert_eq!(receipt.failure_code.as_deref(), Some("SESSION_SEND_FAILED"));
+            if !race {
+                assert_eq!(
+                    scheduler
+                        .store()
+                        .get_task(&submitted.agent_id)
+                        .unwrap()
+                        .unwrap()
+                        .phase,
+                    TaskPhase::Running
+                );
+            }
+            scheduler.cancel_task(&submitted.agent_id).unwrap();
+            continue;
+        }
+        assert_eq!(outcome.unwrap(), crate::MessageDisposition::Delivered);
+        let receipt = scheduler.store().message("inline").unwrap().unwrap();
+        assert_eq!(receipt.state, external_store::MessageState::Delivered);
+        assert_eq!(receipt.mode, mode);
+        assert_eq!(
+            receipt.target_turn_id.as_deref(),
+            if mode == "queue" {
+                None
+            } else {
+                Some("codex-turn-2")
+            }
+        );
+        let wire = std::fs::read_to_string(workspace.path().join("send-modes.jsonl")).unwrap();
+        let methods = wire
+            .lines()
+            .filter_map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["method"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            if mode == "queue" {
+                vec!["initialized", "turn/start"]
+            } else {
+                vec!["initialized", "turn/interrupt", "turn/start"]
+            }
+        );
+        scheduler.cancel_task(&submitted.agent_id).unwrap();
+    }
+}
+
+#[test]
+fn concurrent_queue_injections_each_complete_their_own_receipt() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let tail = r#"printf '%s\n' '{"id":4,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> send-modes.jsonl
+printf '%s\n' '{"id":5,"result":{"turn":{"id":"codex-turn-1","status":"inProgress"}}}'"#;
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(&send_modes_script(workspace.path(), tail), workspace.path()),
+    );
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "initial"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    scheduler.start_ready().unwrap();
+    let handles = ["message-a", "message-b"].map(|id| {
+        let scheduler = scheduler.clone();
+        let agent_id = submitted.agent_id.clone();
+        thread::spawn(move || scheduler.send_message(&agent_id, id, "queue", id).unwrap())
+    });
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), crate::MessageDisposition::Delivered);
+    }
+    for id in ["message-a", "message-b"] {
+        let receipt = scheduler.store().message(id).unwrap().unwrap();
+        assert_eq!(receipt.state, external_store::MessageState::Delivered);
+        assert_eq!(receipt.content, id);
+        assert_eq!(
+            scheduler
+                .send_message(&submitted.agent_id, id, "queue", id)
+                .unwrap(),
+            crate::MessageDisposition::AlreadyDelivered
+        );
+    }
+    let wire = std::fs::read_to_string(workspace.path().join("send-modes.jsonl")).unwrap();
+    let mut texts = wire
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|frame| frame["method"] == "turn/start")
+        .map(|frame| {
+            frame["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, ["message-a", "message-b"]);
+    scheduler.cancel_task(&submitted.agent_id).unwrap();
 }

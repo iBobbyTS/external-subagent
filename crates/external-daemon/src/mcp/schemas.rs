@@ -198,12 +198,29 @@ pub struct AgentWaitInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicSendMode {
+    Queue,
+    Steer,
+}
+
+impl PublicSendMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Steer => "steer",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSendInput {
     #[schemars(range(min = 10000000, max = 99999999))]
     pub agent_id: u64,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub message_id: Option<String>,
+    pub mode: PublicSendMode,
     pub content: String,
 }
 

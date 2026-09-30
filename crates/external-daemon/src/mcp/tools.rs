@@ -476,7 +476,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_send",
     output_schema = tool_output_schema::<AgentSendOutput>(),
-    description = "Queue a bounded message for a running task; the daemon generates message_id when omitted and always returns the effective id",
+    description = "发送有界消息，必须指定 mode：queue 优先原生非破坏投递，必要时由 es 暂存；steer 中断后启动新 turn（仅 codex/zcode 支持）。省略 message_id 时 daemon 生成并返回有效 id",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -498,6 +498,7 @@ impl SubagentMcp {
         match self.rpc(RpcMethod::TaskMessage(MessageInput {
             agent_id: agent_id.clone(),
             message_id: input.message_id,
+            mode: input.mode.as_str().into(),
             content: input.content,
         }))? {
             RpcSuccess::Message {
@@ -746,6 +747,7 @@ mod contract_default_tests {
 
         let send: AgentSendInput = serde_json::from_value(serde_json::json!({
             "agent_id": 10000000,
+            "mode": "queue",
             "content": "continue"
         }))
         .unwrap();
@@ -1039,6 +1041,7 @@ mod contract_default_tests {
                 agent_id: public_task_id(&id).unwrap(),
                 message_id: None,
                 content: "continue".into(),
+                mode: crate::mcp::schemas::PublicSendMode::Queue,
             }))
             .await
             .unwrap();
@@ -1053,10 +1056,178 @@ mod contract_default_tests {
                 agent_id: public_task_id(&id).unwrap(),
                 message_id: Some("explicit-id".into()),
                 content: "retry".into(),
+                mode: crate::mcp::schemas::PublicSendMode::Queue,
             }))
             .await
             .unwrap();
         assert_eq!(explicit.0.message_id, "explicit-id");
+    }
+
+    #[tokio::test]
+    async fn send_projects_native_delivered_and_wait_receipt_state() {
+        use crate::{
+            ManagedRuntime, RuntimeCommandError, RuntimeTerminal, SessionReady, TurnSnapshot,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct NativeRuntime {
+            stopped: AtomicBool,
+        }
+        impl ManagedRuntime for NativeRuntime {
+            fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
+                None
+            }
+            fn stop(&self, _: std::time::Duration) -> RuntimeTerminal {
+                self.stopped.store(true, Ordering::Release);
+                RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                    external_runtime::ChildExit::Exited(Some(0)),
+                ))
+            }
+            fn wait_terminal(&self, _: std::time::Duration) -> Option<RuntimeTerminal> {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                self.stopped
+                    .load(Ordering::Acquire)
+                    .then(|| self.stop(std::time::Duration::ZERO))
+            }
+            fn bootstrap_session(
+                &self,
+                _: &external_store::TaskRecord,
+                _: std::time::Duration,
+            ) -> Result<SessionReady, RuntimeCommandError> {
+                Ok(SessionReady {
+                    session_id: "native-session".into(),
+                    initial_turn_id: Some("active-turn".into()),
+                    configured_model: Some("fixture-model".into()),
+                })
+            }
+            fn turn_snapshot(&self) -> TurnSnapshot {
+                TurnSnapshot {
+                    generation: 1,
+                    active: true,
+                    boundary: None,
+                }
+            }
+            fn inject_turn(
+                &self,
+                _: &str,
+                content: &str,
+                _: std::time::Duration,
+            ) -> Result<Option<String>, RuntimeCommandError> {
+                assert_eq!(content, "follow-up");
+                Ok(None)
+            }
+        }
+        struct NativeFactory;
+        impl crate::RuntimeFactory for NativeFactory {
+            fn spawn(
+                &self,
+                _: &external_store::TaskRecord,
+                _: Arc<dyn crate::LifecycleSink>,
+            ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
+                Ok(Arc::new(NativeRuntime {
+                    stopped: AtomicBool::new(false),
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(external_store::Store::open(directory.path().join("state.sqlite")).unwrap());
+        let scheduler = crate::Scheduler::new(
+            "native-mcp",
+            store.clone(),
+            Arc::new(NativeFactory),
+            crate::SchedulerConfig::default(),
+        )
+        .unwrap();
+        let task = scheduler
+            .enqueue_general_with_admission(
+                &external_core::GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: directory.path().canonicalize().unwrap(),
+                    permission_mode: external_core::PermissionMode::Plan,
+                    prompt: "initial".into(),
+                    write_manifest: Vec::new(),
+                },
+                Some(external_core::AdmissionIdentity {
+                    agent: "codex".into(),
+                    config_revision: 1,
+                    adapter_version: "fixture".into(),
+                    model: Some("fixture-model".into()),
+                    model_source: "catalog_token".into(),
+                    effort: None,
+                }),
+            )
+            .unwrap();
+        scheduler.start_ready().unwrap();
+        let facade = SubagentMcp::from_service(Arc::new(
+            crate::rpc::RpcService::new(scheduler.clone(), store).unwrap(),
+        ));
+        let input = || AgentSendInput {
+            agent_id: public_task_id(&task.agent_id).unwrap(),
+            message_id: Some("native-message".into()),
+            mode: crate::mcp::schemas::PublicSendMode::Queue,
+            content: "follow-up".into(),
+        };
+        let delivered = facade
+            .agent_send(rmcp::handler::server::wrapper::Parameters(input()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(delivered.0).unwrap()["disposition"],
+            "delivered"
+        );
+        let repeated = facade
+            .agent_send(rmcp::handler::server::wrapper::Parameters(input()))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(repeated.0).unwrap()["disposition"],
+            "already_delivered"
+        );
+        let waited = facade
+            .rpc_wait(
+                crate::rpc::TaskWaitQuery {
+                    agent_id: task.agent_id.clone(),
+                    wait_time: 0,
+                    message_id: Some("native-message".into()),
+                },
+                || false,
+            )
+            .await
+            .unwrap();
+        let receipt = serde_json::to_value(waited).unwrap()["message_receipt"].clone();
+        assert_eq!(receipt["state"], "delivered");
+        assert!(receipt.get("disposition").is_none());
+        scheduler.cancel_task(&task.agent_id).unwrap();
+    }
+
+    #[test]
+    fn send_mode_is_required_and_validated_by_mcp_and_rpc() {
+        let (_directory, service, id) = crate::rpc::wait_tests::fixture();
+        for mode in [
+            None,
+            Some(serde_json::json!("invalid")),
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(1)),
+        ] {
+            let mut input = serde_json::json!({"agent_id": public_task_id(&id).unwrap(), "content":"follow-up"});
+            if let Some(mode) = mode {
+                input["mode"] = mode;
+            }
+            assert!(serde_json::from_value::<AgentSendInput>(input.clone()).is_err());
+            input["agent_id"] = id.clone().into();
+            let response = service.handle_bytes(&serde_json::to_vec(&serde_json::json!({"request_id":"validation", "method":"task_message", "params":input})).unwrap());
+            assert!(
+                matches!(response.outcome, crate::rpc::RpcOutcome::Error { error } if error.code == crate::rpc::RpcErrorCode::Validation)
+            );
+        }
+        for mode in ["queue", "steer"] {
+            let input: AgentSendInput = serde_json::from_value(
+                serde_json::json!({"agent_id":10000000,"mode":mode,"content":"follow-up"}),
+            )
+            .unwrap();
+            assert_eq!(input.mode.as_str(), mode);
+        }
     }
 
     #[test]

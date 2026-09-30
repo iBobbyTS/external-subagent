@@ -90,7 +90,7 @@ test('CLI rejects daemon responses for a different request id', async () => {
 
 test('CLI rejects obsolete protocol fields before connecting', () => {
   assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: 10000001, after_revision: 0 }), /after_revision/);
-  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'send', { agent_id: 10000001, mode: 'queue', content: 'x' }), /mode/);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'send', { agent_id: 10000001, mode: 'invalid', content: 'x' }), /mode/);
   assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'respond', { agent_id: 10000001, request_id: 'r', decision: 'deny', reason: 'because' }), /reason/);
 });
 
@@ -133,8 +133,8 @@ test('CLI omits send message_id for daemon generation and projects the returned 
   }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
-    const result = await callDaemon(socketPath, 'send', { agent_id: 10000001, content: 'continue' });
-    assert.deepEqual(observedParams, { agent_id: '10000001', content: 'continue' });
+    const result = await callDaemon(socketPath, 'send', { agent_id: 10000001, mode: 'queue', content: 'continue' });
+    assert.deepEqual(observedParams, { agent_id: '10000001', mode: 'queue', content: 'continue' });
     assert.deepEqual(result, { message_id: 'subagent-message-generated', disposition: 'queued' });
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
@@ -318,4 +318,40 @@ test('CLI preserves a maximum control and Unicode result page', async () => {
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try { const result = await callDaemon(socketPath, 'result', { agent_id: 10000001, limit: 100000 }); assert.equal(result.result.final_text, expected); }
   finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('send mode is required and rejects invalid values before connecting', () => {
+  for (const mode of [undefined, null, 'invalid', 0, {}]) {
+    assert.throws(() => callDaemon('/no-such-socket', 'send', { agent_id: 10000001, mode, content: 'x' }),
+      (error) => error instanceof CliError && error.code === 'VALIDATION');
+  }
+});
+
+test('send forwards both modes and preserves each disposition', async () => {
+  for (const [mode, disposition] of [['queue', 'delivered'], ['queue', 'queued'], ['steer', 'delivered']]) {
+    const socketPath = path.join(os.tmpdir(), `es-send-mode-${process.pid}-${Date.now()}.sock`);
+    const server = net.createServer((socket) => socket.once('data', (chunk) => {
+      const request = JSON.parse(chunk);
+      assert.equal(request.params.mode, mode);
+      socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'message', message_id: 'mode-message', disposition } }) + '\n');
+    }));
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    try {
+      assert.deepEqual(await callDaemon(socketPath, 'send', { agent_id: 10000001, mode, content: 'x' }), { message_id: 'mode-message', disposition });
+    } finally { await new Promise((resolve) => server.close(resolve)); }
+  }
+});
+
+test('CLI preserves the steer_unsupported daemon error code', async () => {
+  const socketPath = path.join(os.tmpdir(), `es-send-unsupported-${process.pid}-${Date.now()}.sock`);
+  const server = net.createServer((socket) => socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    assert.equal(request.params.mode, 'steer');
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'steer_unsupported', message: 'steer_unsupported' } }) + '\n');
+  }));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    await assert.rejects(callDaemon(socketPath, 'send', { agent_id: 10000001, mode: 'steer', content: 'x' }),
+      (error) => error instanceof CliError && error.code === 'steer_unsupported');
+  } finally { await new Promise((resolve) => server.close(resolve)); }
 });
