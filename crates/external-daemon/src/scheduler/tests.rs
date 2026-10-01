@@ -4311,6 +4311,14 @@ mod spawn_established_return_tests {
                 configured_model: self.model.clone(),
             })
         }
+        fn resume_session_with_mcp(
+            &self,
+            record: &TaskRecord,
+            _mcp_servers: &[crate::StdioMcpServer],
+            timeout: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            self.bootstrap_session(record, timeout)
+        }
         fn turn_snapshot(&self) -> TurnSnapshot {
             TurnSnapshot {
                 generation: 1,
@@ -4842,14 +4850,19 @@ mod spawn_established_return_tests {
         let pause_gate_clone = Arc::clone(&pause_gate);
         let starter_reached = Arc::new(AtomicBool::new(false));
         let starter_reached_clone = Arc::clone(&starter_reached);
+        let bootstrap_entered = Arc::new(AtomicBool::new(false));
+        let bootstrap_entered_clone = Arc::clone(&bootstrap_entered);
 
-        let (dir, scheduler, store) = test_harness(|_| {
+        let (dir, scheduler, store) = test_harness(move |_| {
+            let bootstrap_clone = Arc::clone(&bootstrap_entered_clone);
             Ok(Arc::new(TestRuntime {
                 session_id: "session-never".into(),
                 model: Some("test-model".into()),
                 stopped: Arc::new(AtomicBool::new(false)),
                 identity: None,
-                bootstrap_hook: None,
+                bootstrap_hook: Some(Arc::new(move || {
+                    bootstrap_clone.store(true, Ordering::Release);
+                })),
                 fail_bootstrap: None,
             }))
         });
@@ -4887,6 +4900,10 @@ mod spawn_established_return_tests {
                     let record = store.get_task(&agent_id).unwrap().unwrap();
                     if record.phase == TaskPhase::Terminal {
                         assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+                        assert!(
+                            !bootstrap_entered.load(Ordering::Acquire),
+                            "starter must not enter bootstrap when cancelled in fresh check"
+                        );
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(5));
@@ -5031,6 +5048,9 @@ mod spawn_established_return_tests {
             .requeue_task_for_resume_with_message(&agent_id, "msg-1", "queue", "test-prompt")
             .unwrap();
 
+        let mismatch_queued = store.cancel_unstarted_if_still_fresh(&agent_id).unwrap();
+        assert!(matches!(mismatch_queued, Err(t) if t.phase == TaskPhase::Queued && t.session_id.is_some() && !t.stop_requested));
+
         store
             .claim_specific(&agent_id, "test-owner", 1)
             .unwrap();
@@ -5044,6 +5064,283 @@ mod spawn_established_return_tests {
         let intact = store.get_task(&agent_id).unwrap().unwrap();
         assert_eq!(intact.phase, TaskPhase::Preparing);
         assert!(!intact.stop_requested);
+    }
+
+    #[test]
+    fn ac4b_scheduler_poll_reads_queued_and_preparing_with_session_then_projects_running() {
+        let gate_claim = Arc::new(AtomicBool::new(false));
+        let gate_claim_clone = Arc::clone(&gate_claim);
+        let gate_bootstrap = Arc::new(AtomicBool::new(false));
+        let gate_bootstrap_clone = Arc::clone(&gate_bootstrap);
+
+        let saw_queued = Arc::new(AtomicBool::new(false));
+        let saw_queued_clone = Arc::clone(&saw_queued);
+        let saw_preparing = Arc::new(AtomicBool::new(false));
+        let saw_preparing_clone = Arc::clone(&saw_preparing);
+
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-preserved-interleaving".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        // 1. Starter thread pauses before claim so task starts in QUEUED
+        let store_path = store.database_path().to_path_buf();
+        scheduler.set_before_claim_hook(Some(Arc::new(move || {
+            // Simulate resumed task row having preserved session_id while still in QUEUED
+            let conn = rusqlite::Connection::open(&store_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET session_id='session-preserved-interleaving' WHERE phase='QUEUED'",
+                [],
+            )
+            .unwrap();
+            while !gate_claim_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        // 2. Starter thread pauses before starting handle/bootstrap so task stays in PREPARING
+        scheduler.set_before_starting_handle_hook(Some(Arc::new(move || {
+            while !gate_bootstrap_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        // 3. spawn_poll_hook observes the read confirmation of both QUEUED and PREPARING with session_id
+        let gate_claim_for_hook = Arc::clone(&gate_claim);
+        let gate_bootstrap_for_hook = Arc::clone(&gate_bootstrap);
+        scheduler.set_spawn_poll_hook(Some(Arc::new(move |task: &TaskRecord| {
+            if task.phase == TaskPhase::Queued && task.session_id.as_deref() == Some("session-preserved-interleaving") {
+                saw_queued_clone.store(true, Ordering::Release);
+                gate_claim_for_hook.store(true, Ordering::Release);
+            } else if task.phase == TaskPhase::Preparing && task.session_id.as_deref() == Some("session-preserved-interleaving") {
+                saw_preparing_clone.store(true, Ordering::Release);
+                gate_bootstrap_for_hook.store(true, Ordering::Release);
+            }
+        })));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+
+        let record = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .expect("must successfully project running once non-transient");
+
+        assert!(
+            saw_queued.load(Ordering::Acquire),
+            "poll hook must have confirmed reading QUEUED with session_id"
+        );
+        assert!(
+            saw_preparing.load(Ordering::Acquire),
+            "poll hook must have confirmed reading PREPARING with session_id"
+        );
+        assert_eq!(record.phase, TaskPhase::Running);
+        assert_eq!(
+            record.session_id.as_deref(),
+            Some("session-preserved-interleaving")
+        );
+    }
+
+    #[test]
+    fn ac4b_scheduler_resume_wait_budget_exhaustion_returns_resume_error_without_stop_or_kill() {
+        let gate_bootstrap = Arc::new(AtomicBool::new(false));
+        let gate_bootstrap_clone = Arc::clone(&gate_bootstrap);
+        let runtime_stopped = Arc::new(AtomicBool::new(false));
+        let runtime_stopped_clone = Arc::clone(&runtime_stopped);
+        let saw_preparing = Arc::new(AtomicBool::new(false));
+        let saw_preparing_clone = Arc::clone(&saw_preparing);
+
+        let (dir, scheduler, store) = test_harness({
+            let stopped = Arc::clone(&runtime_stopped_clone);
+            move |_| {
+                Ok(Arc::new(TestRuntime {
+                    session_id: "session-budget-exhaust".into(),
+                    model: Some("test-model".into()),
+                    stopped: Arc::clone(&stopped),
+                    identity: None,
+                    bootstrap_hook: None,
+                    fail_bootstrap: None,
+                }))
+            }
+        });
+
+        let store_path = store.database_path().to_path_buf();
+        scheduler.set_before_claim_hook(Some(Arc::new(move || {
+            let conn = rusqlite::Connection::open(&store_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET session_id='session-budget-exhaust' WHERE phase='QUEUED'",
+                [],
+            )
+            .unwrap();
+        })));
+
+        scheduler.set_before_starting_handle_hook(Some(Arc::new(move || {
+            while !gate_bootstrap_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        scheduler.set_spawn_poll_hook(Some(Arc::new(move |task: &TaskRecord| {
+            if task.phase == TaskPhase::Preparing && task.session_id.as_deref() == Some("session-budget-exhaust") {
+                saw_preparing_clone.store(true, Ordering::Release);
+            }
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+
+        let start = Instant::now();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .unwrap_err();
+        // AC 4b(d): application-level error before the MCP 125s / CLI 150s transport deadlines.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "resume budget exhaustion must return within the daemon design bound"
+        );
+
+        assert!(
+            saw_preparing.load(Ordering::Acquire),
+            "poll hook must have confirmed reading PREPARING with session_id before timeout"
+        );
+
+        let timed_out_agent_id = match err {
+            SchedulerError::StartTimeout { agent_id, message } => {
+                assert!(message.contains("session established"));
+                assert!(message.contains("resume"));
+                assert!(message.contains("uncancelled"));
+                agent_id
+            }
+            other => panic!("expected StartTimeout with resume variant message, got {other:?}"),
+        };
+
+        let task_during_timeout = store.get_task(&timed_out_agent_id).unwrap().unwrap();
+        assert!(!task_during_timeout.stop_requested, "must not write stop_requested");
+        assert_eq!(task_during_timeout.phase, TaskPhase::Preparing);
+        assert!(!runtime_stopped.load(Ordering::Acquire), "must not send kill on resume timeout");
+
+        // Follow-up proceeds normally: release gate, starter finishes bootstrap and transitions to Running
+        gate_bootstrap.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reached_running = false;
+        while Instant::now() < deadline {
+            let record = store.get_task(&timed_out_agent_id).unwrap().unwrap();
+            if record.phase == TaskPhase::Running {
+                assert_eq!(record.session_id.as_deref(), Some("session-budget-exhaust"));
+                assert!(!record.stop_requested);
+                reached_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reached_running, "follow-up must proceed to Running");
+    }
+
+    #[test]
+    fn ac4b_scheduler_cancel_race_after_last_poll_returns_resume_mismatch_without_stop() {
+        let claim_gate = Arc::new(AtomicBool::new(false));
+        let claim_gate_clone = Arc::clone(&claim_gate);
+        let runtime_stopped = Arc::new(AtomicBool::new(false));
+        let runtime_stopped_clone = Arc::clone(&runtime_stopped);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-raced".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::clone(&runtime_stopped_clone),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        // Hold the starter thread from claiming so the row stays fresh in
+        // QUEUED with session_id: None across every poll read.
+        scheduler.set_before_claim_hook(Some(Arc::new(move || {
+            while !claim_gate_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        // AC 4b(c): after the final fresh poll read and before the deadline
+        // cancel transaction, another client's terminal send requeues the row
+        // (session preserved, epoch unchanged). The conditional cancellation
+        // must mismatch and the call must reclassify from the latest row.
+        let store_path = store.database_path().to_path_buf();
+        let race_applied = Arc::new(AtomicBool::new(false));
+        let race_applied_clone = Arc::clone(&race_applied);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            race_applied_clone.store(true, Ordering::Release);
+            let conn = rusqlite::Connection::open(&store_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET phase='QUEUED', session_id='session-raced-requeued', stop_requested=0",
+                [],
+            )
+            .unwrap();
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+
+        let start = Instant::now();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .unwrap_err();
+        assert!(
+            race_applied.load(Ordering::Acquire),
+            "cancel-boundary requeue hook must have fired"
+        );
+        // AC 4b(d): the application-level error must return well before the
+        // MCP 125s / CLI 150s transport deadlines.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "resume mismatch must return an application error promptly"
+        );
+
+        match err {
+            SchedulerError::StartTimeout { agent_id, message } => {
+                assert!(message.contains("session established"));
+                assert!(message.contains("resume"));
+                assert!(message.contains("uncancelled"));
+
+                let task = store.get_task(&agent_id).unwrap().unwrap();
+                assert!(
+                    !task.stop_requested,
+                    "conditional cancellation must mismatch and not write stop"
+                );
+                assert_eq!(task.phase, TaskPhase::Queued);
+                assert_eq!(task.session_id.as_deref(), Some("session-raced-requeued"));
+                assert!(
+                    !runtime_stopped.load(Ordering::Acquire),
+                    "must not kill the runtime on a resume mismatch"
+                );
+            }
+            other => panic!("expected StartTimeout with resume mismatch message, got {other:?}"),
+        }
+
+        // Follow-up proceeds: release the claim gate, the starter claims the
+        // requeued row and drives it to Running.
+        claim_gate.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reached_running = false;
+        while Instant::now() < deadline {
+            let record = store.get_task("10000000").unwrap().unwrap();
+            if record.phase == TaskPhase::Running {
+                reached_running = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reached_running, "resume follow-up must proceed to Running");
     }
 
     #[test]

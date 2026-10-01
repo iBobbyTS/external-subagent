@@ -1838,6 +1838,69 @@ mod contract_default_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mcp_cancelled_notification_interrupts_spawn_without_mutating_task() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use crate::{LifecycleSink, ManagedRuntime, RuntimeFactory, RuntimeTerminal, Scheduler, SchedulerConfig, TurnSnapshot};
+        use crate::rpc::RpcService;
+        use external_store::{Store, TaskPhase, TaskRecord};
+
+        struct BlockingRuntime {
+            entered: Arc<AtomicBool>,
+            gate: Arc<AtomicBool>,
+        }
+        impl ManagedRuntime for BlockingRuntime {
+            fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
+                None
+            }
+            fn stop(&self, _timeout: Duration) -> RuntimeTerminal {
+                RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                    external_runtime::ChildExit::Exited(Some(0)),
+                ))
+            }
+            fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+                None
+            }
+            fn bootstrap_session(
+                &self,
+                _job: &TaskRecord,
+                _timeout: Duration,
+            ) -> Result<crate::SessionReady, crate::RuntimeCommandError> {
+                self.entered.store(true, Ordering::Release);
+                while !self.gate.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(crate::SessionReady {
+                    session_id: "mcp-blocked-session".into(),
+                    configured_model: None,
+                    initial_turn_id: None,
+                })
+            }
+            fn turn_snapshot(&self) -> TurnSnapshot {
+                TurnSnapshot {
+                    active: false,
+                    boundary: None,
+                    generation: 0,
+                }
+            }
+            fn stop_boundary_count(&self) -> u64 {
+                0
+            }
+        }
+
+        struct BlockingFactory {
+            entered: Arc<AtomicBool>,
+            gate: Arc<AtomicBool>,
+        }
+        impl RuntimeFactory for BlockingFactory {
+            fn spawn(
+                &self,
+                _task: &TaskRecord,
+                _sink: Arc<dyn LifecycleSink>,
+            ) -> Result<Arc<dyn ManagedRuntime>, std::io::Error> {
+                Ok(Arc::new(BlockingRuntime {
+                    entered: Arc::clone(&self.entered),
+                    gate: Arc::clone(&self.gate),
+                }))
+            }
+        }
 
         let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
         let config_root = tempfile::tempdir().unwrap();
@@ -1848,11 +1911,31 @@ mod contract_default_tests {
         )
         .unwrap();
         let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
-        let (_directory, service, _id) = crate::rpc::wait_tests::runnable_fixture();
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("s01-mcp-blocking-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let bootstrap_entered = Arc::new(AtomicBool::new(false));
+        let bootstrap_gate = Arc::new(AtomicBool::new(false));
+        let scheduler = Scheduler::new(
+            "mcp-blocking-test",
+            store.clone(),
+            Arc::new(BlockingFactory {
+                entered: Arc::clone(&bootstrap_entered),
+                gate: Arc::clone(&bootstrap_gate),
+            }),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let service = Arc::new(RpcService::new(scheduler, store.clone()).unwrap());
+
         let handler_interrupted = Arc::new(AtomicBool::new(false));
         let mut facade = SubagentMcp::from_service(service.clone());
         facade.spawn_handler_interrupted = Some(Arc::clone(&handler_interrupted));
-        let requests = Arc::clone(&facade.next_request);
         let (client, transport) = tokio::io::duplex(64 * 1024);
         let serving = tokio::spawn(async move {
             let server = facade.serve(transport).await.unwrap();
@@ -1888,15 +1971,20 @@ mod contract_default_tests {
             .write_all(format!("{call}\n").as_bytes())
             .await
             .unwrap();
-        // Wait until the real tool handler has dispatched its blocking RPC.
+
+        // 1. Wait until bootstrap is actively entered and blocked
         tokio::time::timeout(Duration::from_secs(2), async {
-            while requests.load(Ordering::Relaxed) == 1 {
+            while !bootstrap_entered.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
+        .expect("bootstrap must be entered and blocking");
+
+        let cancellation_started = std::time::Instant::now();
         writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"caller stopped waiting\"}}\n").await.unwrap();
+
+        // 2. Cancellation ends promptly in bounded time
         tokio::time::timeout(Duration::from_secs(1), async {
             while !handler_interrupted.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -1904,6 +1992,78 @@ mod contract_default_tests {
         })
         .await
         .expect("cancelled spawn handler did not get interrupted");
+
+        assert!(
+            cancellation_started.elapsed() < Duration::from_secs(2),
+            "cancellation must end in bounded time"
+        );
+
+        // rmcp drops response for cancelled request #2
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), lines.next_line())
+                .await
+                .is_err()
+        );
+
+        // Connection remains serviceable for subsequent tools/list request
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .expect("connection did not remain serviceable after cancellation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status).unwrap()["id"],
+            3
+        );
+
+        // 3. Test agent_spawn_inner error variant directly with interrupted token:
+        // must return timeout/interrupted variant carrying active_agent_id
+        let repo2 = tempfile::tempdir().unwrap();
+        let direct_facade = SubagentMcp::from_service(service.clone());
+        let spawn_input = AgentSpawnInput {
+            agent: Some("zcode".into()),
+            model: None,
+            effort: None,
+            repository: repo2.path().to_string_lossy().into_owned(),
+            permission_mode: PublicPermissionMode::Plan,
+            prompt: "direct interrupt test".into(),
+            write_manifest: vec![],
+        };
+        let err = direct_facade
+            .agent_spawn_inner(spawn_input, || true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "timeout");
+        assert!(err.body.message.contains("spawn interrupted while session establishment continues"));
+        assert!(err.body.agent_id.is_some(), "must carry active_agent_id");
+        assert!(err.legacy_text.contains("active_agent_id="));
+
+        // 4. Assert task in store for request #2: while blocked in bootstrap, stop_requested was not written
+        let task_id = "10000000";
+        let task = store.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.phase, TaskPhase::Preparing);
+        assert!(!task.stop_requested, "interrupted spawn must not write stop_requested");
+
+        // 5. Unblock bootstrap: task subsequently transitions to RUNNING without stop
+        bootstrap_gate.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut reached_running = false;
+        while std::time::Instant::now() < deadline {
+            if let Some(t) = store.get_task(task_id).unwrap() {
+                if t.phase == TaskPhase::Running {
+                    assert_eq!(t.session_id.as_deref(), Some("mcp-blocked-session"));
+                    assert!(!t.stop_requested);
+                    reached_running = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(reached_running, "task must subsequently reach RUNNING as normal");
 
         serving.abort();
         let _ = serving.await;
