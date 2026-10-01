@@ -14,6 +14,12 @@ use external_store::{
 };
 use std::sync::{Arc, Mutex};
 
+/// How long a respondable request that arrived before the RUNNING commit may
+/// keep retrying the store's phase gate. The commit itself is one transaction
+/// behind session-ready; only a pathological stuck-PREPARING row reaches the
+/// cap and latches the pre-fix fail-loud error.
+const PENDING_INSERT_RETRY_WINDOW_SECS: u64 = 30;
+
 pub(crate) struct StoreLifecycleSink {
     store: Arc<Store>,
     agent_id: String,
@@ -345,9 +351,10 @@ pub(crate) fn unreaped_general(
 
 impl LifecycleSink for StoreLifecycleSink {
     fn emit(&self, record: LifecycleRecord) {
-        let Some(_admission) = self.runtime_lifecycle.admit_event() else {
+        let mut admission = self.runtime_lifecycle.admit_event();
+        if admission.is_none() {
             return;
-        };
+        }
         #[cfg(test)]
         if let Some(hook) = self.after_admission_hook.lock().unwrap().clone() {
             hook();
@@ -401,16 +408,58 @@ impl LifecycleSink for StoreLifecycleSink {
                     INTERACTION_REQUEST_USER_INPUT => "user_input",
                     _ => "unsupported_input",
                 };
-                if let Err(error) = self.store.insert_pending_request(
-                    &request_id,
-                    &self.agent_id,
-                    &correlation_id,
-                    request_type,
-                    &request.params.to_string(),
-                ) {
-                    state.first_error = Some(error.to_string());
+                // A provider may emit a respondable request between
+                // session-ready and the RUNNING commit: the in-memory
+                // lifecycle has admitted since claim while the durable row is
+                // still PREPARING, so the store's phase gate conflicts. That
+                // arrival is not a sink failure — wait out the commit instead
+                // of latching an error that kills the task (the eager scripted
+                // providers and slow runners make this window real). The
+                // admission guard is dropped for the wait so terminalization
+                // (cancel, failed bootstrap) can proceed and close ingress;
+                // a request that lands after closure is dropped like any
+                // post-close event, and the deadline keeps a genuinely stuck
+                // PREPARING row from blocking the pump forever, preserving the
+                // pre-fix fail-loud path.
+                admission = None;
+                let pending_insert_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(PENDING_INSERT_RETRY_WINDOW_SECS);
+                let inserted = loop {
+                    match self.store.insert_pending_request(
+                        &request_id,
+                        &self.agent_id,
+                        &correlation_id,
+                        request_type,
+                        &request.params.to_string(),
+                    ) {
+                        Ok(_) => break true,
+                        Err(error @ StoreError::Conflict(_)) => {
+                            if !self.runtime_lifecycle.is_admitting() {
+                                break false;
+                            }
+                            if std::time::Instant::now() >= pending_insert_deadline {
+                                state.first_error = Some(error.to_string());
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(error) => {
+                            state.first_error = Some(error.to_string());
+                            return;
+                        }
+                    }
+                };
+                if !inserted {
                     return;
                 }
+                // The insert succeeded after the wait; re-verify ingress under
+                // the guard before the projection write, mirroring the
+                // hold-through-write invariant of every other event.
+                let readmission = self.runtime_lifecycle.admit_event();
+                if readmission.is_none() {
+                    return;
+                }
+                admission = readmission;
                 Some(request_id)
             }
             _ => None,

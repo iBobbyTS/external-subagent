@@ -3699,6 +3699,103 @@ mod turn_adjudication_tests {
             result
         );
     }
+
+    #[test]
+    fn early_permission_request_waits_for_the_running_commit_instead_of_failing() {
+        // A provider may emit a respondable request between session-ready and
+        // the RUNNING commit; the durable row is still PREPARING then, so the
+        // store's phase gate conflicts. The sink must wait out the commit
+        // instead of latching a sink error that kills the task (the eager
+        // scripted dsh providers hit this window on slow CI runners). On the
+        // unfixed code this test is red: the emit latches the conflict as the
+        // sink error and no pending request ever exists.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("sink-race-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let runtimes = Arc::new(Mutex::new(Vec::new()));
+        let factory = Arc::new(HarnessFactory {
+            runtimes,
+            respond_fails: false,
+            cleanup_calls: Arc::new(AtomicU64::new(0)),
+        });
+        let scheduler = Scheduler::new(
+            "sink-race-test",
+            Arc::clone(&store),
+            factory,
+            SchedulerConfig {
+                bootstrap_timeout: Duration::from_secs(30),
+                control_timeout: Duration::from_secs(30),
+                stop_grace: Duration::from_millis(250),
+                ..SchedulerConfig::default()
+            },
+        )
+        .unwrap();
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(),
+            permission_mode: external_core::PermissionMode::Plan,
+            prompt: "sink race fixture".into(),
+            write_manifest: Vec::new(),
+        };
+        let agent_id = scheduler.enqueue_general(&manifest).unwrap().agent_id;
+        let claim = store.claim_next("sink-race", 999, 1).unwrap().unwrap();
+        assert_eq!(claim.task.phase, TaskPhase::Preparing);
+
+        let lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
+        let sink = Arc::new(crate::lifecycle_sink::StoreLifecycleSink::new(
+            Arc::clone(&store),
+            agent_id.clone(),
+            "sink-race-runtime".into(),
+            claim.owner_epoch,
+            Arc::clone(&lifecycle),
+            Arc::new(crate::activity_tracker::PassiveActivityTracker::new(false)),
+        ));
+        let record = crate::LifecycleRecord {
+            sequence: 7,
+            event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(
+                external_contract::RequestEnvelope::new(
+                    WireId::String("srv-early".into()),
+                    external_contract::INTERACTION_REQUEST_PERMISSION,
+                    serde_json::json!({"options": []}),
+                ),
+            ))),
+        };
+        let emitter = {
+            let sink = Arc::clone(&sink);
+            thread::spawn(move || sink.emit(record))
+        };
+        // The emit is still inside the retry window: PREPARING conflicts and
+        // no pending request exists yet.
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            store.pending_requests(&agent_id).unwrap().is_empty(),
+            "the request must not be publishable before the RUNNING commit"
+        );
+        store
+            .mark_session_running(
+                &agent_id,
+                claim.owner_epoch,
+                "sink-race-runtime",
+                None,
+                Some("sink-race-session"),
+                None,
+            )
+            .unwrap();
+        emitter.join().unwrap();
+        let requests = store.pending_requests(&agent_id).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_type, "permission");
+        assert_eq!(requests[0].state, PendingRequestState::Pending);
+        assert!(
+            sink.error().is_none(),
+            "an early request must never latch a sink error"
+        );
+    }
 }
 
 mod wait_tail_inheritance_tests {

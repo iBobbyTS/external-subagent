@@ -241,6 +241,15 @@ impl RuntimeLifecycle {
             .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
         None
     }
+
+    /// Lock-free-of-caller admission probe: checks ingress without holding
+    /// the lifecycle state lock, for callers that must wait out the RUNNING
+    /// commit without blocking terminalization (the sink's pending-request
+    /// insert retry). Unlike [`Self::admit_event`] it grants no guard and
+    /// counts no late event.
+    pub(crate) fn is_admitting(&self) -> bool {
+        self.state.lock().unwrap().phase == RuntimeLifecyclePhase::Running
+    }
 }
 
 pub(super) struct ActiveRuntime {
