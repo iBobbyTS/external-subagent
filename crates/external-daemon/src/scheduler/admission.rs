@@ -198,19 +198,26 @@ impl Scheduler {
                         }
                     }
 
+                    // The conditional cancellation transaction above already
+                    // committed (stop_requested/CANCELLING persisted) and the
+                    // process-group kill was attempted, so this task is
+                    // converging to cancelled. An interrupt here must not be
+                    // reported as `Interrupted` ("session establishment
+                    // continues"): that would claim an uncancelled task while
+                    // the durable stop fact already says otherwise. Stop
+                    // polling promptly and report the committed cancellation
+                    // through the existing cancelled StartTimeout variants.
                     let conv_deadline = Instant::now() + self.convergence_budget();
                     let mut reached_terminal = false;
                     while Instant::now() < conv_deadline {
-                        if interrupted() {
-                            return Err(SchedulerError::Interrupted {
-                                agent_id: agent_id.clone(),
-                            });
-                        }
                         if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
                             if task.phase.is_terminal() {
                                 reached_terminal = true;
                                 break;
                             }
+                        }
+                        if interrupted() {
+                            break;
                         }
                         thread::sleep(Duration::from_millis(20));
                     }
