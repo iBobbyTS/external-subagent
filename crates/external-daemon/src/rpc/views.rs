@@ -274,6 +274,13 @@ pub struct TaskActivityView {
     pub tool_calls_last_60s: u64,
     /// 任务级最近三次调用，按时间升序；参数统一为字符串。
     pub last_tool_calls: Vec<[String; 2]>,
+    /// Number of tracked in-flight tool calls (scheduled or started without a
+    /// matching result/error/permission resolution). 0 when there is no
+    /// snapshot or the adapter has no per-call lifecycle tracking.
+    pub in_flight_tool_count: u64,
+    /// Age in milliseconds of the oldest tracked in-flight tool call, measured
+    /// from its first insertion; null when nothing is in flight.
+    pub oldest_in_flight_tool_age_ms: Option<u64>,
     pub last_activity_age_ms: Option<u64>,
     pub model_request_active: bool,
     pub telemetry_status: TelemetryStatusView,
@@ -568,6 +575,8 @@ pub(crate) fn task_activity_view(
             latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
             last_tool_calls: Vec::new(),
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
             telemetry_status: TelemetryStatusView::Unavailable,
@@ -579,6 +588,8 @@ pub(crate) fn task_activity_view(
         latest_reasoning: snapshot.latest_reasoning,
         tool_calls_last_60s: snapshot.window_60s.tool_calls_started,
         last_tool_calls: snapshot.last_tool_calls,
+        in_flight_tool_count: snapshot.active_tools.len() as u64,
+        oldest_in_flight_tool_age_ms: snapshot.oldest_active_tool_age_ms,
         last_activity_age_ms: snapshot.last_activity_age_ms,
         model_request_active: snapshot.model_request_active,
         telemetry_status: if snapshot.telemetry_degraded {
@@ -592,7 +603,9 @@ pub(crate) fn task_activity_view(
 #[cfg(test)]
 mod activity_projection_tests {
     use super::{agent_capabilities, task_activity_view, TelemetryStatusView};
-    use crate::{PassiveActivitySnapshot, PassiveActivityWindow};
+    use crate::{
+        PassiveActiveTool, PassiveActivitySnapshot, PassiveActivityWindow, PassiveToolKind,
+    };
     use external_store::TaskPhase;
 
     fn snapshot() -> PassiveActivitySnapshot {
@@ -608,8 +621,11 @@ mod activity_projection_tests {
             latest_text_truncated: true,
             latest_reasoning: "recent reasoning".into(),
             last_tool_calls: vec![["Bash".into(), "{}".into()]],
-            active_tools: Vec::new(),
-            oldest_active_tool_age_ms: None,
+            active_tools: vec![PassiveActiveTool {
+                tool_call_id: "call-1".into(),
+                kind: PassiveToolKind::Bash,
+            }],
+            oldest_active_tool_age_ms: Some(5_000),
             window_60s: PassiveActivityWindow {
                 tool_calls_started: 4,
                 ..PassiveActivityWindow::default()
@@ -632,7 +648,12 @@ mod activity_projection_tests {
         );
         assert_eq!(activity.last_activity_age_ms, Some(250));
         assert!(activity.model_request_active);
-        // F2 有意透出活跃年龄和模型请求状态，其他内部信号仍不公开。
+        // The in-flight aggregate is now a public contract: a count plus the
+        // oldest tracked age, both derived from the existing snapshot.
+        assert_eq!(activity.in_flight_tool_count, 1);
+        assert_eq!(activity.oldest_in_flight_tool_age_ms, Some(5_000));
+        // The projection intentionally exposes the liveness surface; the
+        // remaining internal signals stay private.
         let encoded = serde_json::to_value(&activity).unwrap();
         assert_eq!(
             encoded["last_tool_calls"],
@@ -640,6 +661,8 @@ mod activity_projection_tests {
         );
         assert_eq!(encoded["last_activity_age_ms"], 250);
         assert_eq!(encoded["model_request_active"], true);
+        assert_eq!(encoded["in_flight_tool_count"], 1);
+        assert_eq!(encoded["oldest_in_flight_tool_age_ms"], 5_000);
         for gone in [
             "state",
             "model_request_age_ms",
@@ -659,6 +682,8 @@ mod activity_projection_tests {
         assert_eq!(activity.latest_reasoning, "");
         assert_eq!(activity.tool_calls_last_60s, 0);
         assert!(activity.last_tool_calls.is_empty());
+        assert_eq!(activity.in_flight_tool_count, 0);
+        assert_eq!(activity.oldest_in_flight_tool_age_ms, None);
         assert_eq!(activity.last_activity_age_ms, None);
         assert!(!activity.model_request_active);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Unavailable);
@@ -771,6 +796,8 @@ mod result_paging_tests {
             latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
             last_tool_calls: Vec::new(),
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
             telemetry_status: TelemetryStatusView::Healthy,

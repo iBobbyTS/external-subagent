@@ -461,6 +461,10 @@ impl PublisherState {
 pub struct TerminalLatch<'a>(MutexGuard<'a, PublisherState>);
 
 impl TerminalLatch<'_> {
+    /// Retained accessor: fault decisions linearize on the transport latch
+    /// and durable re-validation, and this remains the test-fixture surface
+    /// for reading the terminal a publisher-latch holder must not miss.
+    #[allow(dead_code)]
     pub(crate) fn published_terminal(&self) -> Option<RuntimeTerminal> {
         self.0.published_terminal().cloned()
     }
@@ -1241,8 +1245,8 @@ impl RuntimeOwner {
         self.publisher.wait_terminal(timeout)
     }
 
-    /// Real cleanup for both scheduler fault closures (latched transport
-    /// failure and stalled task). `finish_process` is short-circuited by
+    /// Real cleanup for the scheduler transport fault closure (latched
+    /// transport failure). `finish_process` is short-circuited by
     /// `begin_stopping` once any terminal was published (for example a late
     /// `ChildExited` classified as `Orphaned`), so this entry always performs
     /// the actual stop/reap and reports its own outcome instead of trusting a

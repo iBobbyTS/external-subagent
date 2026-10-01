@@ -533,6 +533,13 @@ pub struct PublicActivity {
     /// 任务级最近三次调用，按时间升序；参数统一为字符串。
     #[schemars(length(max = 3))]
     pub last_tool_calls: Vec<[String; 2]>,
+    /// Number of tracked in-flight tool calls (scheduled or started without a
+    /// matching result/error/permission resolution); 0 when there is no
+    /// snapshot or the adapter has no per-call lifecycle tracking.
+    pub in_flight_tool_count: u64,
+    /// Age in milliseconds of the oldest tracked in-flight tool call, measured
+    /// from its first insertion; null when nothing is in flight.
+    pub oldest_in_flight_tool_age_ms: Option<u64>,
     pub last_activity_age_ms: Option<u64>,
     pub model_request_active: bool,
     pub telemetry_status: PublicTelemetryStatus,
@@ -546,6 +553,8 @@ impl From<TaskActivityView> for PublicActivity {
             latest_reasoning: value.latest_reasoning,
             tool_calls_last_60s: value.tool_calls_last_60s,
             last_tool_calls: value.last_tool_calls,
+            in_flight_tool_count: value.in_flight_tool_count,
+            oldest_in_flight_tool_age_ms: value.oldest_in_flight_tool_age_ms,
             last_activity_age_ms: value.last_activity_age_ms,
             model_request_active: value.model_request_active,
             telemetry_status: match value.telemetry_status {
@@ -825,6 +834,9 @@ mod activity_projection_tests {
         assert_eq!(value["last_tool_calls"], serde_json::json!([]));
         assert!(value["last_activity_age_ms"].is_null());
         assert_eq!(value["model_request_active"], false);
+        // No snapshot: the in-flight aggregate is honestly empty.
+        assert_eq!(value["in_flight_tool_count"], 0);
+        assert!(value["oldest_in_flight_tool_age_ms"].is_null());
         let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
         for n in 0..4 {
             tracker.observe(&crate::RuntimeEvent::Driver(
@@ -864,8 +876,22 @@ mod activity_projection_tests {
         );
         assert_eq!(value["last_activity_age_ms"], serde_json::json!(age));
         assert_eq!(value["model_request_active"], true);
+        // Codex is count-only: no per-call lifecycle, so 0 means "no tracking
+        // information", never "no command is running".
+        assert_eq!(value["in_flight_tool_count"], 0);
+        assert!(value["oldest_in_flight_tool_age_ms"].is_null());
         // 公共 schema 拒绝合并字符串、非二元组和第四条调用。
         let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
+        assert_eq!(schema["properties"]["in_flight_tool_count"]["type"], "integer");
+        assert_eq!(
+            schema["properties"]["oldest_in_flight_tool_age_ms"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("in_flight_tool_count")));
+        // The age is an Option field: schemars renders it nullable and leaves
+        // it out of `required`, matching its null-when-empty serialization.
+        assert!(!required.contains(&serde_json::json!("oldest_in_flight_tool_age_ms")));
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&value));
         for calls in [

@@ -3,9 +3,6 @@ use super::*;
 #[derive(Default)]
 struct PassiveActivityState {
     revision: u64,
-    /// Admitted-progress revision for the stall watchdog: every admitted
-    /// runtime event except `Malformed`/`OversizedLine` advances it.
-    progress_revision: u64,
     last_runtime_event_at: Option<(Instant, u64)>,
     active_model_requests: HashMap<String, Instant>,
     last_model_delta_at: Option<Instant>,
@@ -94,14 +91,6 @@ impl PassiveActivityTracker {
         }
         state.revision = state.revision.saturating_add(1);
         state.last_runtime_event_at = Some((now, wall_now_ms));
-        // A dropped or oversized frame is a loss, not progress: it must never
-        // restart the S02 no-activity window.
-        if !matches!(
-            event,
-            RuntimeEvent::Driver(Inbound::Malformed(_) | Inbound::OversizedLine { .. })
-        ) {
-            state.progress_revision = state.progress_revision.saturating_add(1);
-        }
         let parsed = parse_passive_activity(event, self.mode);
         if parsed.source == ActivitySource::Telemetry && !parsed.telemetry_known {
             state.telemetry_degraded = true;
@@ -232,12 +221,6 @@ impl PassiveActivityTracker {
 
     pub(crate) fn snapshot(&self) -> PassiveActivitySnapshot {
         self.snapshot_at(Instant::now())
-    }
-
-    /// Monotonic count of admitted progress events (losses excluded). The
-    /// stall watchdog restarts its window whenever this advances.
-    pub(crate) fn progress_revision(&self) -> u64 {
-        self.state.lock().unwrap().progress_revision
     }
 
     fn snapshot_at(&self, now: Instant) -> PassiveActivitySnapshot {
@@ -748,6 +731,169 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_projection_counts_tracked_calls_and_ages_them_from_first_insertion() {
+        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let base = Instant::now();
+        let scheduled = |id: &str| {
+            session_fixture(serde_json::json!({
+                "type":"tool.updated","turnId":"t",
+                "payload":{"kind":"scheduled","toolCallId":id,"toolName":"Bash","input":{"command":"sleep 60"}}
+            }))
+        };
+        tracker.observe_at(&scheduled("c1"), base, 0);
+        let snap = tracker.snapshot_at(base);
+        assert_eq!(snap.active_tools.len(), 1);
+        assert_eq!(snap.oldest_active_tool_age_ms, Some(0));
+        // A second started call lengthens the count but not the oldest age.
+        tracker.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"tool.updated","turnId":"t",
+                "payload":{"kind":"started","toolCallId":"c2","toolName":"Read","input":{"path":"x"}}
+            })),
+            base + Duration::from_secs(10),
+            10_000,
+        );
+        let snap = tracker.snapshot_at(base + Duration::from_secs(10));
+        assert_eq!(snap.active_tools.len(), 2);
+        assert_eq!(snap.oldest_active_tool_age_ms, Some(10_000));
+        // Age is measured from first insertion and grows with time.
+        assert_eq!(
+            tracker
+                .snapshot_at(base + Duration::from_secs(25))
+                .oldest_active_tool_age_ms,
+            Some(25_000)
+        );
+        // Resolving the oldest call leaves the younger one, aged from its own
+        // start rather than the resolved call's.
+        tracker.observe_at(
+            &session_fixture(external_contract::activity::tool_result_event(
+                "e1", "t", "c1",
+            )),
+            base + Duration::from_secs(30),
+            30_000,
+        );
+        let snap = tracker.snapshot_at(base + Duration::from_secs(30));
+        assert_eq!(snap.active_tools.len(), 1);
+        assert_eq!(snap.active_tools[0].tool_call_id, "c2");
+        assert_eq!(snap.oldest_active_tool_age_ms, Some(20_000));
+    }
+
+    #[test]
+    fn in_flight_projection_removes_on_settlement_and_clears_at_turn_edges() {
+        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let base = Instant::now();
+        let started = |id: &str| {
+            session_fixture(serde_json::json!({
+                "type":"tool.updated","turnId":"t",
+                "payload":{"kind":"started","toolCallId":id,"toolName":"Bash","input":{"command":"true"}}
+            }))
+        };
+        tracker.observe_at(&started("c1"), base, 0);
+        tracker.observe_at(&started("c2"), base, 0);
+        assert_eq!(tracker.snapshot_at(base).active_tools.len(), 2);
+        // A failure settles one call.
+        tracker.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"tool.updated","turnId":"t",
+                "payload":{"kind":"error","toolCallId":"c1","toolName":"Bash"}
+            })),
+            base + Duration::from_secs(1),
+            1_000,
+        );
+        assert_eq!(tracker.snapshot_at(base).active_tools.len(), 1);
+        // A permission resolution settles the other.
+        tracker.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"permission.resolved",
+                "payload":{"requestId":"r1","toolCallId":"c2","toolName":"Bash"}
+            })),
+            base + Duration::from_secs(2),
+            2_000,
+        );
+        let snap = tracker.snapshot_at(base + Duration::from_secs(2));
+        assert!(snap.active_tools.is_empty());
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+        // Turn boundaries clear everything in flight.
+        tracker.observe_at(&started("c3"), base + Duration::from_secs(3), 3_000);
+        tracker.observe_at(&started("c4"), base + Duration::from_secs(3), 3_000);
+        tracker.observe_at(
+            &session_fixture(serde_json::json!({"type":"turn.completed"})),
+            base + Duration::from_secs(4),
+            4_000,
+        );
+        let snap = tracker.snapshot_at(base + Duration::from_secs(4));
+        assert!(snap.active_tools.is_empty());
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+        tracker.observe_at(&started("c5"), base + Duration::from_secs(5), 5_000);
+        tracker.observe_at(
+            &session_fixture(serde_json::json!({"type":"turn.failed"})),
+            base + Duration::from_secs(6),
+            6_000,
+        );
+        let snap = tracker.snapshot_at(base + Duration::from_secs(6));
+        assert!(snap.active_tools.is_empty());
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+    }
+
+    #[test]
+    fn in_flight_projection_stays_empty_for_count_only_adapters() {
+        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let now = Instant::now();
+        codex.observe_at(
+            &session_fixture(external_contract::activity::tool_count_event(
+                "e",
+                "t",
+                3,
+                Some("commandExecution"),
+                Some("echo hi"),
+            )),
+            now,
+            0,
+        );
+        // Detailed frames are a foreign vocabulary for codex: they never
+        // manufacture a per-call lifecycle.
+        codex.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"tool.updated","turnId":"t",
+                "payload":{"kind":"started","toolCallId":"c1","toolName":"Bash"}
+            })),
+            now,
+            0,
+        );
+        let snap = codex.snapshot_at(now);
+        assert!(snap.active_tools.is_empty());
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+        assert_eq!(snap.window_60s.tool_calls_started, 3);
+    }
+
+    #[test]
+    fn in_flight_aggregate_is_independent_of_the_last_tool_calls_ring() {
+        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let base = Instant::now();
+        for n in 0..5 {
+            tracker.observe_at(
+                &session_fixture(serde_json::json!({
+                    "type":"tool.updated","turnId":"t",
+                    "payload":{"kind":"started","toolCallId":format!("c{n}"),"toolName":"Bash","input":{"n":n}}
+                })),
+                base + Duration::from_secs(n),
+                n,
+            );
+        }
+        let snap = tracker.snapshot_at(base + Duration::from_secs(4));
+        // The aggregate counts every tracked call even though the three-entry
+        // ring has evicted the earlier descriptors.
+        assert_eq!(snap.active_tools.len(), 5);
+        assert_eq!(snap.last_tool_calls.len(), 3);
+        assert_eq!(snap.oldest_active_tool_age_ms, Some(4_000));
+        assert_eq!(
+            crate::rpc::views::task_activity_view(external_store::TaskPhase::Running, Some(snap))
+                .in_flight_tool_count,
+            5
+        );
+    }
+
+    #[test]
     fn for_adapter_infers_the_activity_mode() {
         assert_eq!(
             PassiveActivityTracker::new(false).activity_mode(),
@@ -956,27 +1102,6 @@ mod tests {
             codex.snapshot_at(now).active_tools.is_empty(),
             "ignored detailed events must not enter active_tools"
         );
-    }
-
-    #[test]
-    fn stall_progress_ignores_malformed_and_oversized_frames() {
-        let tracker = PassiveActivityTracker::new(false);
-        let message = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
-            method: "session/event".into(),
-            raw: serde_json::json!({"method": "session/event", "params": {"type": "model.streaming"}}),
-        }));
-        tracker.observe(&message);
-        assert_eq!(tracker.progress_revision(), 1);
-        // A loss is not progress: it must never restart the stall window.
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Malformed("bad".into())));
-        tracker.observe(&RuntimeEvent::Driver(Inbound::OversizedLine { bytes: 42 }));
-        assert_eq!(tracker.progress_revision(), 1);
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Lifecycle {
-            sequence: 2,
-            method: "turn.started".into(),
-            order: external_contract::LifecycleOrder::InOrder,
-        }));
-        assert_eq!(tracker.progress_revision(), 2);
     }
 
     #[test]

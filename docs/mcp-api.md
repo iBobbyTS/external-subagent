@@ -222,13 +222,15 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
 | `result_available` | boolean | 快速判断有无终态结果 | 客户端须从结果等字段推导；属于显式便利信号 |
-| `activity` | PublicActivity | 查看文本尾部、推理尾部、近期工具频度与遥测可信度 | 难以判断运行中是在工作还是停滞 |
+| `activity` | PublicActivity | 查看文本尾部、推理尾部、近期工具频度、未决工具调用与遥测可信度 | 难以判断运行中是在工作还是停滞 |
 | `result` | PublicResult/null | 内嵌结果，避免再请求首段 | 必须额外调用 result，长结果仍需分页 |
 | `instruction` | string/null | 给出下一步响应或取分页的提示 | 客户端需自行从结构化字段实现同一判断；不能只解析该自然语言字段 |
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
 嵌入结果 `complete=true` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。
+
+**停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`last_tool_calls` 跑了哪条指令、`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 
 ## 7. external_subagent_observe
 
@@ -440,6 +442,8 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `latest_reasoning` | string，最多200 Unicode字符 | 已验证公开推理尾部；足以判断是否需要 observe | 需调用 observe 才能看到最近思路；来源未验证或 codex/agy 不采集时为空串 |
 | `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数（来源：zcode 原生 `tool.updated`、dsh ACP 归一化、agy stream-json 工具 step 归一化、codex 适配器白名单 count-only 投影；codex 错过 item/started 的回填按完成通知的接收时间计入窗口，发起可能早于窗口） | 看不出近期是否有工具活动 |
 | `last_tool_calls` | `[[tool, arg], …]`，最多3条二元组 | 每任务跨工具类别、跨 turn 保留，时间升序（最旧在前），与 terminal text 的单 turn 作用域不同；tool 最多64 Unicode字符，arg 最多512 UTF-8字节并按字符边界截断；空态 `[]`，daemon 重启后为空。arg 统一为字符串：codex commandExecution 为原始 command 行，fileChange 为路径列表以 `, ` join，其余白名单类型为 item id 或空串；zcode/dsh/agy 为参数 JSON 紧凑序列化 | 无法直接识别最近具体调用及参数 |
+| `in_flight_tool_count` | integer | 已跟踪的未决工具调用数：Detailed 事件 scheduled **或** started 起算，result/错误/权限落定移除，turn 完成或失败清零；聚合量不与 `last_tool_calls` 逐条对应（后者 ring 仅 3 条，长调用可被逐出后本计数仍报 1）；codex（count-only）无逐调用生命周期跟踪，恒为 0——0 表示无跟踪信息而非"无命令运行"；无快照（daemon 重启后）为 0 | 无法判断是否仍有已跟踪的工具调用尚未返回 |
+| `oldest_in_flight_tool_age_ms` | integer/null | 最久的未决工具调用自首次插入起算的毫秒数；无未决调用、无快照或 count-only adapter 时为 null | 无法判断那条未决调用已未返回多久 |
 | `last_activity_age_ms` | integer/null | 最近一次被采纳活动事件距快照的毫秒数；直接透出已有快照，尚无活动时为 null | 看不出活动新鲜程度 |
 | `model_request_active` | boolean | 直接透出已有快照中的模型请求活跃状态；无快照时为 false | 无法区分等待模型与其他阶段 |
 | `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |

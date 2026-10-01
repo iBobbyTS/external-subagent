@@ -729,7 +729,7 @@ fn publisher_latched_snapshot_does_not_wait_for_native_input_write() {
     let (snapshot_sent, snapshot_ready) = mpsc::channel();
     let monitor_shared = Arc::clone(&shared);
     let monitor = thread::spawn(move || {
-        // 与 watchdog 相同：持 publisher latch 读取 snapshot。
+        // 与 fault 决策相同：持 publisher latch 读取 snapshot。
         // 此时 turn 锁确定由 writer 持有，旧实现必然阻塞。
         let _latch = monitor_shared.publisher.decision_latch();
         snapshot_sent.send(monitor_shared.turn_snapshot()).unwrap();

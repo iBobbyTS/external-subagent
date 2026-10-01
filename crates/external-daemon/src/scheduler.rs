@@ -19,8 +19,7 @@ pub(crate) use self::diagnostics::{
 #[cfg(test)]
 use self::state::ResponseClaimHookStage;
 use self::state::{
-    ActiveCheck, ActiveRuntime, FaultDisposition, MonitorContext, StallStatus, TerminalDecision,
-    TerminalTarget,
+    ActiveCheck, ActiveRuntime, FaultDisposition, MonitorContext, TerminalDecision, TerminalTarget,
 };
 pub use self::state::{MessageDisposition, ResponseDisposition, ResponseOutcome, Scheduler};
 pub(crate) use self::state::{RuntimeLifecycle, RuntimeLifecyclePhase};

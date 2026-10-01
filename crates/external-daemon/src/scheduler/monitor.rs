@@ -1,4 +1,3 @@
-use super::types::STALLED_NO_ACTIVITY_REASON;
 use super::*;
 use crate::lifecycle_sink::TransportFrameLimit;
 use crate::TRANSPORT_FRAME_LIMIT_REASON;
@@ -64,9 +63,9 @@ impl Scheduler {
         )
     }
 
-    /// Handle the sink's latched transport fault on the loop paths that do
-    /// not run the stall decision. Re-validates ownership before the real
-    /// cleanup and the explicit `RUNTIME_TRANSPORT_FRAME_LIMIT` closure.
+    /// Handle the sink's latched transport fault. Re-validates ownership
+    /// before the real cleanup and the explicit
+    /// `RUNTIME_TRANSPORT_FRAME_LIMIT` closure.
     #[allow(clippy::too_many_arguments)]
     fn handle_transport_failure(
         &self,
@@ -95,7 +94,7 @@ impl Scheduler {
                 return FaultDisposition::Abandoned;
             }
             Err(error) => {
-                // A transient read failure must not orphan the watchdog:
+                // A transient read failure must not orphan the fault closure:
                 // report once and retry on the next tick.
                 if sink.runtime_lifecycle.note_decision_read_error() {
                     self.record_failure(agent_id, error.to_string());
@@ -121,149 +120,6 @@ impl Scheduler {
             operation,
             guard,
         );
-        FaultDisposition::Handled
-    }
-
-    /// Decide and execute a scheduler fault closure at the protected stall
-    /// decision point.
-    ///
-    /// The decision is linearized on the publisher latch (no terminal can be
-    /// published) and the admission latch (no event or pending input can be
-    /// admitted). Inside both latches it re-reads the transport latch, the
-    /// admitted-progress revision, the durable phase, pending input, and the
-    /// published terminal, then atomically switches the lifecycle to
-    /// terminating before releasing everything for the real stop/reap
-    /// (B-B03, review R1/R2).
-    #[allow(clippy::too_many_arguments)]
-    fn handle_stall(
-        &self,
-        agent_id: &str,
-        owner_epoch: u64,
-        runtime: &Arc<dyn ManagedRuntime>,
-        sink: &StoreLifecycleSink,
-        route: &TaskRoute,
-        operation: &Mutex<()>,
-        check: &ActiveCheck,
-    ) -> FaultDisposition {
-        let guard = operation.lock().unwrap();
-        #[cfg(test)]
-        self.run_before_stall_cleanup_hook();
-        // Outermost latch: while held, no pump can publish a terminal, and
-        // because pumps call the sink under it, no event or pending input can
-        // be admitted. The admission latch nests inside it, matching the
-        // sink's publisher -> admission order.
-        let publisher_latch = runtime.terminal_latch();
-        let published_terminal = publisher_latch
-            .as_ref()
-            .and_then(|state| state.published_terminal());
-        let mut admission = sink.runtime_lifecycle.decision_latch();
-
-        let current = match self.decision_task(agent_id) {
-            Ok(current) => current,
-            Err(error) => {
-                if sink.runtime_lifecycle.note_decision_read_error() {
-                    self.record_failure(agent_id, error.to_string());
-                }
-                return FaultDisposition::Suppressed;
-            }
-        };
-        let Some(task) = current.as_ref() else {
-            drop(admission);
-            drop(publisher_latch);
-            self.abandon_active_monitor(agent_id, owner_epoch);
-            return FaultDisposition::Abandoned;
-        };
-        if task.owner_epoch != owner_epoch
-            || task.phase.is_terminal()
-            || !self.active_instance_matches(agent_id, owner_epoch)
-        {
-            drop(admission);
-            drop(publisher_latch);
-            self.abandon_active_monitor(agent_id, owner_epoch);
-            return FaultDisposition::Abandoned;
-        }
-
-        let now = self.now();
-        // Re-read the transport latch inside the decision latch (review R2):
-        // a fault latched after the loop-top check always takes the S01
-        // closure with its transport reason and stage.
-        let transport = sink.transport_failure();
-        // Fold every admitted progress event; a revision that advanced after
-        // the expiry check restarts the window and suppresses the stall.
-        sink.runtime_lifecycle
-            .stall_observe_progress(sink.activity.progress_revision(), now);
-        let pending = self
-            .inner
-            .store
-            .completion_blockers(agent_id)
-            .map(|(pending, _)| pending)
-            .unwrap_or(true);
-
-        let stall_status = if transport.is_none()
-            && task.phase == TaskPhase::Running
-            && !task.stop_requested
-            && !task.close_requested
-            && published_terminal.is_none()
-            && !pending
-        {
-            sink.runtime_lifecycle
-                .stall_poll(now, self.inner.config.stall_timeout)
-        } else {
-            None
-        };
-
-        if transport.is_none() && stall_status.is_none() {
-            // Freeze the window while the task waits for user input before
-            // handing it back to the normal loop.
-            sink.runtime_lifecycle
-                .stall_set_waiting(task.phase == TaskPhase::WaitingInput, now);
-            drop(admission);
-            drop(publisher_latch);
-            return FaultDisposition::Suppressed;
-        }
-
-        // Atomic commit under both latches: close ingress and record the
-        // stall trigger before anything can be admitted or published.
-        RuntimeLifecycle::request_stop_locked(&mut admission, &runtime.turn_snapshot());
-        RuntimeLifecycle::force_terminating_locked(&mut admission);
-        if transport.is_none() {
-            sink.runtime_lifecycle.stall_mark_triggered();
-        }
-        drop(admission);
-        drop(publisher_latch);
-
-        match transport {
-            Some(failure) => {
-                self.commit_fault(
-                    agent_id,
-                    owner_epoch,
-                    runtime,
-                    sink,
-                    route,
-                    TRANSPORT_FRAME_LIMIT_REASON,
-                    |terminal| transport_failure_message(&failure, terminal),
-                    check,
-                    operation,
-                    guard,
-                );
-            }
-            None => {
-                let status = stall_status
-                    .expect("a stall status exists when no transport fault was latched");
-                self.commit_fault(
-                    agent_id,
-                    owner_epoch,
-                    runtime,
-                    sink,
-                    route,
-                    STALLED_NO_ACTIVITY_REASON,
-                    |_| stall_failure_message(&status),
-                    check,
-                    operation,
-                    guard,
-                );
-            }
-        }
         FaultDisposition::Handled
     }
 
@@ -492,33 +348,11 @@ impl Scheduler {
                     scheduler.release_active(&agent_id, owner_epoch);
                     return;
                 }
-                // S02: the stall watchdog shares this unified decision point.
-                // It runs after the confirmed terminal/sink failures but
-                // before turn adjudication. The window only advances on
-                // admitted runtime progress; the full decision (owner epoch,
-                // durable phase, pending, cancel/close, transport latch, and
-                // published terminal) is re-validated under the linearization
-                // latches inside `handle_stall`.
-                let stall_now = scheduler.now();
-                runtime_lifecycle
-                    .stall_observe_progress(sink.activity.progress_revision(), stall_now);
-                if runtime_lifecycle
-                    .stall_poll(stall_now, scheduler.inner.config.stall_timeout)
-                    .is_some()
-                {
-                    match scheduler.handle_stall(
-                        &agent_id,
-                        owner_epoch,
-                        &runtime,
-                        &sink,
-                        &route,
-                        &operation,
-                        &check,
-                    ) {
-                        FaultDisposition::Suppressed => {}
-                        FaultDisposition::Handled | FaultDisposition::Abandoned => return,
-                    }
-                }
+                // The daemon no longer makes an autonomous stall judgment: a
+                // RUNNING task is terminalized only by its closed set of real
+                // sources (natural completion, publish/exit terminals, an
+                // explicit cancel/close, a sink failure, or the latched
+                // transport fault re-checked below).
                 let turn = runtime.turn_snapshot();
                 // agy 的 snapshot 把尚未消费的原生后续输入视为活跃，
                 // 首轮完成到下一 user_input/result 的间隙不能回收 runtime。
@@ -526,6 +360,30 @@ impl Scheduler {
                     let Some(boundary) = turn.boundary else {
                         continue;
                     };
+                    // Deterministic transport arbitration: a fault latched after
+                    // the loop-top (or terminal) re-check outranks natural
+                    // completion. This must run BEFORE the operation lock is
+                    // taken: `handle_transport_failure` takes the same
+                    // non-reentrant mutex, so a re-check inside it would
+                    // deadlock. `Suppressed` retries from the loop top rather
+                    // than falling through into the natural turn closure.
+                    if sink.transport_failure().is_some() {
+                        match scheduler.handle_transport_failure(
+                            &agent_id,
+                            owner_epoch,
+                            &runtime,
+                            &sink,
+                            &route,
+                            &operation,
+                            &check,
+                        ) {
+                            FaultDisposition::Suppressed => {
+                                thread::sleep(Duration::from_millis(10));
+                                continue;
+                            }
+                            FaultDisposition::Handled | FaultDisposition::Abandoned => return,
+                        }
+                    }
                     let _guard = operation.lock().unwrap();
                     if boundary != TurnBoundary::Completed
                         && runtime_lifecycle.ingress_reason().is_some()
@@ -666,23 +524,6 @@ fn transport_failure_message(failure: &TransportFrameLimit, terminal: &RuntimeTe
         "cap": failure.cap,
         "last_event_seq": failure.last_event_seq,
         "cleanup_result": format!("{terminal:?}"),
-    })
-    .to_string()
-}
-
-/// Bounded diagnostic detail for the stall closure: elapsed window, the
-/// configured timeout, and the age of the last admitted progress.
-fn stall_failure_message(status: &StallStatus) -> String {
-    let millis = |value: Duration| u64::try_from(value.as_millis()).unwrap_or(u64::MAX);
-    serde_json::json!({
-        "message": format!(
-            "no admitted runtime activity for {}ms (stall_timeout={}ms)",
-            millis(status.elapsed),
-            millis(status.timeout)
-        ),
-        "stall_elapsed_ms": millis(status.elapsed),
-        "stall_timeout_ms": millis(status.timeout),
-        "last_progress_age_ms": status.last_progress_age.map(millis),
     })
     .to_string()
 }

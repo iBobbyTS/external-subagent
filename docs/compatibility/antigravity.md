@@ -79,7 +79,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 ## 7. 其他实测能力与陷阱
 
 - `--json-schema`：完整可用，result 附带独立的 `structured_output` 对象（与 `response` 文本分离，schema 回显）。
-- `--print-timeout` 默认 **0（无限等）**，非文档的 5m；超时触发时 result 是 **`status=SUCCESS` + 空 response + exit 0**，仅 stderr 提示 `print timeout ... returning partial output`——超时被伪装成成功，daemon **不要依赖该 flag**，应自管超时并走 §4 的信号路径。
+- `--print-timeout` 默认 **0（无限等）**，非文档的 5m；超时触发时 result 是 **`status=SUCCESS` + 空 response + exit 0**，仅 stderr 提示 `print timeout ... returning partial output`——超时被伪装成成功，daemon **不要依赖该 flag**；daemon 不做自动停滞判停，停滞判断归 host：host 依据 wait 的 `status`（RUNNING⇒进程活着）与 activity 观测（`last_tool_calls`、`in_flight_tool_count`、`oldest_in_flight_tool_age_ms`）自行决定 cancel，需要硬停时走 §4 的信号路径。
 - `--disable-slash-commands`：print 模式默认会展开 slash/skill（流模式禁用），host 注入的 prompt 若含 `/` 前缀文本需注意。
 - help 面新增（相对文档）：`--mode accept-edits|plan`、`--add-dir`（多目录 workspace）、`--new-project`/`--project`、`--remote-control`、`--log-file` 覆盖、`-i/--prompt-interactive`。
 - **无原生 ACP/app-server 模式**（1.2.12 无 `--experimental-acp` 类 flag）。

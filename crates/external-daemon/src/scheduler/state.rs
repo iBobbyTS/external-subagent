@@ -22,20 +22,20 @@ pub(crate) struct SchedulerInner {
     pub(super) admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     pub(super) before_transport_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    #[cfg(test)]
-    pub(super) before_stall_cleanup_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only hook fired just before the monitor waits for a terminal, so
     /// a test can publish a terminal and latch a fault in the window where
     /// the loop-top latch check has already run.
     #[cfg(test)]
     pub(super) before_terminal_wait_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Test-only decision read fault: returning true makes the protected
-    /// store read fail, so read-error recovery can be pinned.
+    /// store read fail, so the transport fault closure's read-error recovery
+    /// can be pinned.
     #[cfg(test)]
-    pub(super) stall_read_fault: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
-    /// Monotonic clock seam shared by every stall decision. Production uses
-    /// `Instant::now`; tests inject a manual clock so window arithmetic is
-    /// exercised on the same semantics as production.
+    pub(super) decision_read_fault: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    /// Test-only monotonic clock seam. Production never consults it; tests
+    /// inject a manual clock to prove that elapsed time alone never
+    /// terminalizes a RUNNING task.
+    #[cfg(test)]
     pub(super) clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     #[cfg(test)]
     pub(super) spawn_poll_hook: Mutex<Option<Arc<dyn Fn(&TaskRecord) + Send + Sync>>>,
@@ -110,35 +110,9 @@ pub(crate) struct RuntimeLifecycleSnapshot {
 
 pub(crate) struct RuntimeLifecycle {
     pub(crate) state: Mutex<RuntimeLifecycleSnapshot>,
-    stall: Mutex<StallWatchState>,
-}
-
-/// S02 stall watchdog state, owned by one launched `(agent_id, owner_epoch)`.
-///
-/// A re-claim builds a fresh `RuntimeLifecycle`, so the window, the observed
-/// progress revision, and the triggered flag can never leak across epochs.
-#[derive(Default)]
-struct StallWatchState {
-    /// Monotonic instant the current no-activity window started.
-    baseline: Option<Instant>,
-    /// Last admitted-progress revision observed by the watchdog.
-    observed_progress: u64,
-    /// Monotonic instant of the last admitted progress (diagnostics only).
-    last_progress_at: Option<Instant>,
-    /// True while the task waits for user input: the window is frozen.
-    waiting: bool,
-    /// Set when the watchdog closure has taken ownership once.
-    triggered: bool,
     /// One-shot flag so a transient store read failure is reported once
-    /// instead of on every retry tick.
-    read_error_reported: bool,
-}
-
-/// Bounded stall evidence handed to the closure diagnostics.
-pub(super) struct StallStatus {
-    pub(super) elapsed: Duration,
-    pub(super) last_progress_age: Option<Duration>,
-    pub(super) timeout: Duration,
+    /// instead of on every retry tick of the transport fault closure.
+    read_error_reported: AtomicBool,
 }
 
 /// Whether the monitor keeps looping after a fault decision.
@@ -146,8 +120,8 @@ pub(super) struct StallStatus {
 pub(super) enum FaultDisposition {
     /// A fault closure took the task; the monitor returns.
     Handled,
-    /// A concurrent activity, pending input, stop, or a transient read
-    /// failure suppressed the watchdog; the monitor keeps looping.
+    /// A transient store read failure suppressed the fault decision; the
+    /// monitor keeps looping.
     Suppressed,
     /// This monitor no longer owns the task; the monitor returns.
     Abandoned,
@@ -167,102 +141,23 @@ impl RuntimeLifecycle {
                 force_termination_count: 0,
                 late_event_count: 0,
             }),
-            stall: Mutex::new(StallWatchState::default()),
+            read_error_reported: AtomicBool::new(false),
         }
-    }
-
-    /// Establish the initial window baseline at the first RUNNING transition
-    /// (called synchronously by the claim path, before the monitor thread
-    /// starts, so the baseline never depends on polling delay).
-    pub(super) fn stall_start(&self, now: Instant) {
-        let mut state = self.stall.lock().unwrap();
-        if !state.triggered {
-            state.baseline.get_or_insert(now);
-        }
-    }
-
-    /// Freeze or unfreeze the no-activity window for user input. Entering a
-    /// wait discards the consumed window; leaving it (without an explicit
-    /// response resume) starts a fresh full window.
-    pub(super) fn stall_set_waiting(&self, waiting: bool, now: Instant) {
-        let mut state = self.stall.lock().unwrap();
-        if waiting == state.waiting {
-            return;
-        }
-        state.waiting = waiting;
-        if waiting {
-            state.baseline = None;
-        } else {
-            state.baseline = Some(now);
-            state.last_progress_at = Some(now);
-        }
-    }
-
-    /// Restart the window from the successful response that resolved the last
-    /// awaitable pending request (S02 B-B02 resume point).
-    pub(super) fn stall_resume(&self, now: Instant) {
-        let mut state = self.stall.lock().unwrap();
-        state.waiting = false;
-        state.baseline = Some(now);
-        state.last_progress_at = Some(now);
-    }
-
-    /// Fold in admitted-progress revisions. A new revision restarts the
-    /// window from `now`; `OversizedLine`/`Malformed` never advance the
-    /// revision, so they cannot mask a stalled task.
-    pub(super) fn stall_observe_progress(&self, revision: u64, now: Instant) {
-        let mut state = self.stall.lock().unwrap();
-        if revision == state.observed_progress {
-            return;
-        }
-        state.observed_progress = revision;
-        state.last_progress_at = Some(now);
-        if !state.waiting {
-            state.baseline = Some(now);
-        }
-    }
-
-    /// Report the current no-activity window once it reaches `timeout`
-    /// (`elapsed >= timeout`). `None` while waiting for input, already
-    /// triggered, disabled, or still inside the window.
-    pub(super) fn stall_poll(&self, now: Instant, timeout: Duration) -> Option<StallStatus> {
-        if timeout.is_zero() {
-            return None;
-        }
-        let mut state = self.stall.lock().unwrap();
-        state.baseline.get_or_insert(now);
-        if state.waiting || state.triggered {
-            return None;
-        }
-        let elapsed = now.saturating_duration_since(state.baseline?);
-        (elapsed >= timeout).then(|| StallStatus {
-            elapsed,
-            last_progress_age: state
-                .last_progress_at
-                .map(|at| now.saturating_duration_since(at)),
-            timeout,
-        })
-    }
-
-    pub(super) fn stall_mark_triggered(&self) {
-        self.stall.lock().unwrap().triggered = true;
     }
 
     /// Report a transient decision read failure at most once per claim.
     /// Returns true when this call is the first to report it.
     pub(super) fn note_decision_read_error(&self) -> bool {
-        let mut state = self.stall.lock().unwrap();
-        if state.read_error_reported {
-            false
-        } else {
-            state.read_error_reported = true;
-            true
-        }
+        !self.read_error_reported.swap(true, Ordering::AcqRel)
     }
 
     /// The admission latch shared with the lifecycle sink. While held, no
     /// event can be admitted (`admit_event` blocks), so a decision made under
     /// it sees exactly the events admitted before the linearization point.
+    ///
+    /// Retained as a test-fixture surface: production fault decisions now
+    /// linearize on the transport latch and durable re-validation.
+    #[allow(dead_code)]
     pub(super) fn decision_latch(&self) -> MutexGuard<'_, RuntimeLifecycleSnapshot> {
         self.state.lock().unwrap()
     }
@@ -464,11 +359,9 @@ impl Scheduler {
                 #[cfg(test)]
                 before_transport_cleanup_hook: Mutex::new(None),
                 #[cfg(test)]
-                before_stall_cleanup_hook: Mutex::new(None),
-                #[cfg(test)]
                 before_terminal_wait_hook: Mutex::new(None),
                 #[cfg(test)]
-                stall_read_fault: Mutex::new(None),
+                decision_read_fault: Mutex::new(None),
                 #[cfg(test)]
                 spawn_poll_hook: Mutex::new(None),
                 #[cfg(test)]
@@ -481,6 +374,7 @@ impl Scheduler {
                 spawn_convergence_budget: Mutex::new(None),
                 #[cfg(test)]
                 before_spawn_cancel_hook: Mutex::new(None),
+                #[cfg(test)]
                 clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
@@ -692,8 +586,11 @@ impl Scheduler {
             .is_some_and(|active| active.owner_epoch == owner_epoch)
     }
 
-    /// The scheduler's monotonic now. Production and tests share this one
-    /// seam, so window arithmetic never depends on which clock filled it.
+    /// Test-only monotonic now: production never consults the clock seam, and
+    /// tests inject a manual clock to prove elapsed time alone cannot
+    /// terminalize a RUNNING task. Retained as the seam's read side.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn now(&self) -> Instant {
         (self.inner.clock)()
     }
@@ -705,7 +602,7 @@ impl Scheduler {
         agent_id: &str,
     ) -> Result<Option<TaskRecord>, external_store::StoreError> {
         #[cfg(test)]
-        if let Some(fault) = self.inner.stall_read_fault.lock().unwrap().clone() {
+        if let Some(fault) = self.inner.decision_read_fault.lock().unwrap().clone() {
             if fault() {
                 return Err(external_store::StoreError::InvalidState(
                     "injected decision read failure".into(),
@@ -726,8 +623,8 @@ impl Scheduler {
     }
 
     #[cfg(test)]
-    pub(super) fn set_stall_read_fault(&self, fault: Arc<dyn Fn() -> bool + Send + Sync>) {
-        *self.inner.stall_read_fault.lock().unwrap() = Some(fault);
+    pub(super) fn set_decision_read_fault(&self, fault: Arc<dyn Fn() -> bool + Send + Sync>) {
+        *self.inner.decision_read_fault.lock().unwrap() = Some(fault);
     }
 
     #[cfg(test)]
@@ -738,11 +635,6 @@ impl Scheduler {
     }
 
     #[cfg(test)]
-    pub(super) fn set_before_stall_cleanup_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
-        *self.inner.before_stall_cleanup_hook.lock().unwrap() = Some(hook);
-    }
-
-    #[cfg(test)]
     pub(super) fn set_before_terminal_wait_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.inner.before_terminal_wait_hook.lock().unwrap() = Some(hook);
     }
@@ -750,13 +642,6 @@ impl Scheduler {
     #[cfg(test)]
     pub(super) fn run_before_terminal_wait_hook(&self) {
         if let Some(hook) = self.inner.before_terminal_wait_hook.lock().unwrap().clone() {
-            hook();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn run_before_stall_cleanup_hook(&self) {
-        if let Some(hook) = self.inner.before_stall_cleanup_hook.lock().unwrap().clone() {
             hook();
         }
     }

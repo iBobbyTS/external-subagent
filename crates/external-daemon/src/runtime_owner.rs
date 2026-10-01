@@ -18,8 +18,8 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     fn identity(&self) -> Option<ProcessIdentity>;
     fn stop(&self, grace: Duration) -> RuntimeTerminal;
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal>;
-    /// Real cleanup shared by both scheduler fault closures (S01 latched
-    /// transport failure and S02 stalled task).
+    /// Real cleanup shared by the scheduler transport fault closure (S01
+    /// latched transport failure).
     ///
     /// `stop` is short-circuited by the owner's publisher once any terminal
     /// was published, including a late child-exit classification that never
