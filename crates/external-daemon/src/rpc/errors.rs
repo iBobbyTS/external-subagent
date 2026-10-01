@@ -67,7 +67,12 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
                 format!("scheduler rejected the operation: {message}"),
             )
         }
-        SchedulerError::RuntimeSpawn { .. } | SchedulerError::LifecycleSink { .. } => {
+        SchedulerError::RuntimeSpawn { agent_id, .. } => {
+            let mut error = RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed");
+            error.active_agent_id = Some(agent_id);
+            error
+        }
+        SchedulerError::LifecycleSink { .. } => {
             RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed")
         }
         SchedulerError::RuntimeCommand { .. } => {
@@ -107,7 +112,7 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
                 (RpcErrorCode::Validation, format!("MODEL_REJECTED: {message}"))
             } else if reason.starts_with("PREPARED_") || reason.starts_with("TASK_ROUTE_") {
                 (RpcErrorCode::ResultInvalid, format!("{reason}: {message}"))
-            } else if reason == "DRAIN_CANCELLED" || reason == "CANCELLED" || reason == "daemon_draining" {
+            } else if reason == "DRAIN_CANCELLED" || reason == "CANCELLED" {
                 (RpcErrorCode::Unavailable, format!("task cancelled: {message}"))
             } else {
                 (RpcErrorCode::RuntimeLost, format!("{reason}: {message}"))
@@ -167,5 +172,77 @@ mod error_classification_tests {
         });
         assert_eq!(rejection.code, RpcErrorCode::Unavailable);
         assert_eq!(rejection.message, "RUNTIME_COMMAND_FAILED");
+    }
+
+    #[test]
+    fn map_scheduler_preserves_start_failed_reasons_and_active_agent_id() {
+        // 1. SESSION_START_FAILED -> RuntimeLost
+        let err_session = map_scheduler(SchedulerError::StartFailed {
+            agent_id: "10000001".into(),
+            reason: "SESSION_START_FAILED".into(),
+            message: "handshake failed".into(),
+        });
+        assert_eq!(err_session.code, RpcErrorCode::RuntimeLost);
+        assert_eq!(err_session.message, "SESSION_START_FAILED: handshake failed");
+        assert_eq!(err_session.active_agent_id.as_deref(), Some("10000001"));
+
+        // 2. MODEL_REJECTED -> Validation
+        let err_model = map_scheduler(SchedulerError::StartFailed {
+            agent_id: "10000002".into(),
+            reason: "MODEL_REJECTED".into(),
+            message: "unknown model".into(),
+        });
+        assert_eq!(err_model.code, RpcErrorCode::Validation);
+        assert_eq!(err_model.message, "MODEL_REJECTED: unknown model");
+        assert_eq!(err_model.active_agent_id.as_deref(), Some("10000002"));
+
+        // 3. PREPARED_* -> ResultInvalid
+        let err_prepared = map_scheduler(SchedulerError::StartFailed {
+            agent_id: "10000003".into(),
+            reason: "PREPARED_LAUNCH_FAILED".into(),
+            message: "invalid json".into(),
+        });
+        assert_eq!(err_prepared.code, RpcErrorCode::ResultInvalid);
+        assert_eq!(err_prepared.message, "PREPARED_LAUNCH_FAILED: invalid json");
+        assert_eq!(err_prepared.active_agent_id.as_deref(), Some("10000003"));
+
+        // 4. DRAIN_CANCELLED / CANCELLED -> Unavailable
+        let err_drain = map_scheduler(SchedulerError::StartFailed {
+            agent_id: "10000004".into(),
+            reason: "DRAIN_CANCELLED".into(),
+            message: "daemon draining".into(),
+        });
+        assert_eq!(err_drain.code, RpcErrorCode::Unavailable);
+        assert_eq!(err_drain.message, "task cancelled: daemon draining");
+        assert_eq!(err_drain.active_agent_id.as_deref(), Some("10000004"));
+    }
+
+    #[test]
+    fn map_scheduler_timeout_and_interrupted_variants_preserve_active_agent_id() {
+        let err_timeout = map_scheduler(SchedulerError::StartTimeout {
+            agent_id: "10000005".into(),
+            message: "timed out waiting for session".into(),
+        });
+        assert_eq!(err_timeout.code, RpcErrorCode::Timeout);
+        assert_eq!(err_timeout.message, "timed out waiting for session");
+        assert_eq!(err_timeout.active_agent_id.as_deref(), Some("10000005"));
+
+        let err_interrupted = map_scheduler(SchedulerError::Interrupted {
+            agent_id: "10000006".into(),
+        });
+        assert_eq!(err_interrupted.code, RpcErrorCode::Timeout);
+        assert_eq!(
+            err_interrupted.message,
+            "spawn interrupted while session establishment continues for 10000006"
+        );
+        assert_eq!(err_interrupted.active_agent_id.as_deref(), Some("10000006"));
+
+        let err_runtime_spawn = map_scheduler(SchedulerError::RuntimeSpawn {
+            agent_id: "10000007".into(),
+            message: "thread spawn failed".into(),
+        });
+        assert_eq!(err_runtime_spawn.code, RpcErrorCode::RuntimeLost);
+        assert_eq!(err_runtime_spawn.message, "runtime operation failed");
+        assert_eq!(err_runtime_spawn.active_agent_id.as_deref(), Some("10000007"));
     }
 }

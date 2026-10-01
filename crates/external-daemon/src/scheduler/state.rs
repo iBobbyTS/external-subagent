@@ -47,6 +47,12 @@ pub(crate) struct SchedulerInner {
     pub(super) spawn_wait_budget: Mutex<Option<Duration>>,
     #[cfg(test)]
     pub(super) spawn_convergence_budget: Mutex<Option<Duration>>,
+    /// Test-only hook fired in the RPC thread immediately before the deadline
+    /// cancel transaction, so a test can pin the window where the row is
+    /// requeued after the final fresh poll read and before the conditional
+    /// cancellation (AC 4b(c)).
+    #[cfg(test)]
+    pub(super) before_spawn_cancel_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(super) draining: AtomicBool,
     pub(super) drain_cancel_running: AtomicBool,
     pub(super) updater_fired: AtomicBool,
@@ -473,6 +479,8 @@ impl Scheduler {
                 spawn_wait_budget: Mutex::new(None),
                 #[cfg(test)]
                 spawn_convergence_budget: Mutex::new(None),
+                #[cfg(test)]
+                before_spawn_cancel_hook: Mutex::new(None),
                 clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
@@ -535,6 +543,11 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn set_spawn_convergence_budget(&self, budget: Option<Duration>) {
         *self.inner.spawn_convergence_budget.lock().unwrap() = budget;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_spawn_cancel_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.inner.before_spawn_cancel_hook.lock().unwrap() = hook;
     }
 
     #[cfg(test)]

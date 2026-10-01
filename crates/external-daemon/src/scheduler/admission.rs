@@ -108,9 +108,17 @@ impl Scheduler {
             };
 
             #[cfg(test)]
-            if let Some(hook) = self.inner.spawn_poll_hook.lock().unwrap().clone() {
+            let task = if let Some(hook) = self.inner.spawn_poll_hook.lock().unwrap().clone() {
                 hook(&task);
-            }
+                let Some(reloaded) = self.inner.store.get_task(&agent_id)? else {
+                    return Err(SchedulerError::Store(StoreError::InvalidState(format!(
+                        "task {agent_id} disappeared from store"
+                    ))));
+                };
+                reloaded
+            } else {
+                task
+            };
 
             if task.session_id.is_some() {
                 if !matches!(task.phase, TaskPhase::Queued | TaskPhase::Preparing) {
@@ -141,11 +149,15 @@ impl Scheduler {
             thread::sleep(Duration::from_millis(20));
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self.inner.before_spawn_cancel_hook.lock().unwrap().clone() {
+            hook();
+        }
         match self.inner.store.cancel_unstarted_if_still_fresh(&agent_id)? {
             Ok((prior_phase, epoch)) => {
                 if prior_phase == TaskPhase::Queued {
                     let route = task_route(&enqueued).map_err(SchedulerError::InvalidConfig)?;
-                    let _ = self.finish_unstarted_route(
+                    if let Err(e) = self.finish_unstarted_route(
                         &agent_id,
                         epoch,
                         &route,
@@ -157,7 +169,9 @@ impl Scheduler {
                             failure_message: None,
                         },
                         true,
-                    );
+                    ) {
+                        self.record_failure(&agent_id, e.to_string());
+                    }
                     return Err(SchedulerError::StartTimeout {
                         agent_id,
                         message: "spawn timed out waiting for session establishment (cancelled)".into(),
@@ -171,13 +185,13 @@ impl Scheduler {
                                 if pgid > 0 {
                                     unsafe {
                                         libc::kill(-pgid, libc::SIGKILL);
-                                        libc::kill(pgid, libc::SIGKILL);
                                     }
-                                }
-                                let pid = identity.pid;
-                                if pid > 0 {
-                                    unsafe {
-                                        libc::kill(pid as i32, libc::SIGKILL);
+                                } else {
+                                    let pid = identity.pid;
+                                    if pid > 0 {
+                                        unsafe {
+                                            libc::kill(pid as i32, libc::SIGKILL);
+                                        }
                                     }
                                 }
                             }
@@ -187,6 +201,11 @@ impl Scheduler {
                     let conv_deadline = Instant::now() + self.convergence_budget();
                     let mut reached_terminal = false;
                     while Instant::now() < conv_deadline {
+                        if interrupted() {
+                            return Err(SchedulerError::Interrupted {
+                                agent_id: agent_id.clone(),
+                            });
+                        }
                         if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
                             if task.phase.is_terminal() {
                                 reached_terminal = true;
@@ -215,6 +234,11 @@ impl Scheduler {
                         return Ok(current_task);
                     }
                     while Instant::now() < deadline {
+                        if interrupted() {
+                            return Err(SchedulerError::Interrupted {
+                                agent_id: agent_id.clone(),
+                            });
+                        }
                         thread::sleep(Duration::from_millis(20));
                         if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
                             if !matches!(task.phase, TaskPhase::Queued | TaskPhase::Preparing) {
@@ -242,6 +266,11 @@ impl Scheduler {
                 }
                 let conv_deadline = Instant::now() + self.convergence_budget();
                 while Instant::now() < conv_deadline {
+                    if interrupted() {
+                        return Err(SchedulerError::Interrupted {
+                            agent_id: agent_id.clone(),
+                        });
+                    }
                     if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
                         if task.phase.is_terminal() {
                             break;

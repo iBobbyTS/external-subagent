@@ -236,7 +236,7 @@ impl Scheduler {
                 "task was cancelled before bootstrap",
                 Some(runtime.as_ref()),
             );
-            let _ = self.finish_unstarted_route(
+            if let Err(e) = self.finish_unstarted_route(
                 &claim.task.agent_id,
                 claim.owner_epoch,
                 &route,
@@ -248,7 +248,9 @@ impl Scheduler {
                     failure_message: Some(failure_message),
                 },
                 resources_reaped,
-            );
+            ) {
+                self.record_failure(&claim.task.agent_id, e.to_string());
+            }
             return Ok(false);
         }
 
