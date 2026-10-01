@@ -3,12 +3,18 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { AGENT_PROBE_TRANSPORT_TIMEOUT_MS, callDaemon, daemonTransportTimeoutMs, MAX_RESULT_CHUNK_BYTES, projectDaemonResult, waitTransportTimeoutMs } from '../../cli/rpc.mjs';
+import { AGENT_PROBE_TRANSPORT_TIMEOUT_MS, SPAWN_TRANSPORT_TIMEOUT_MS, callDaemon, daemonTransportTimeoutMs, MAX_RESULT_CHUNK_BYTES, projectDaemonResult, waitTransportTimeoutMs } from '../../cli/rpc.mjs';
 
 test('wait transport timeout covers maximum wait without sleeping', () => {
   assert.equal(waitTransportTimeoutMs(0), 5000);
   assert.equal(waitTransportTimeoutMs(299), 304000);
   assert.throws(() => waitTransportTimeoutMs(300), /wait_time/);
+});
+
+test('spawn transport timeout is 150s with margin over daemon bound', () => {
+  assert.equal(SPAWN_TRANSPORT_TIMEOUT_MS, 150_000);
+  assert.equal(daemonTransportTimeoutMs('spawn'), 150_000);
+  assert.equal(daemonTransportTimeoutMs('create'), 150_000);
 });
 
 test('probe transport timeout covers local, two runtime deadlines, and cleanup', () => {
@@ -178,11 +184,12 @@ test('CLI spawn wire forwards effort beside the manifest without leaking it insi
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
     seen.push(request);
-    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'general_submitted', task: { agent_id: '10000001', status: 'queued', session_id: null, input_identity: null } } }) + '\n');
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'general_submitted', task: { agent_id: '10000001', status: 'running', session_id: 'session-123', input_identity: null } } }) + '\n');
   }));
   await new Promise((resolve) => server.listen(socketPath, resolve));
   try {
-    await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi', effort: 'high' });
+    const res1 = await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi', effort: 'high' });
+    assert.deepEqual(res1, { agent_id: 10000001, status: 'running', session_id: 'session-123' });
     await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi' });
   } finally { await new Promise((resolve) => server.close(resolve)); }
   assert.equal(seen[0].method, 'submit_general');

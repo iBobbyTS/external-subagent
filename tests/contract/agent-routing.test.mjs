@@ -54,7 +54,7 @@ test('spawn omits implicit agent and model so daemon owns default admission', as
   const socket = path.join(os.tmpdir(), `es-r-${process.pid}-${Date.now()}.sock`);
   configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } });
   const fixture = await withServer(socket, (request) => ({ outcome: 'success', result: {
-    kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'queued' },
+    kind: 'task_submitted', disposition: 'created', task: { agent_id: '10000001', status: 'running', session_id: 'session-123' },
   } }), () => runCli(home, socket, ['spawn', '--json', JSON.stringify({ repository: '/repo', prompt: 'hi' })]));
   assert.equal(fixture.result.code, 0, fixture.result.stderr);
   assert.equal(fixture.observed().method, 'submit_general');

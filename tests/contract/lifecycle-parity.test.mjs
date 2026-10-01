@@ -14,14 +14,14 @@ function task(status = 'running') {
   return {
     agent_id: agentId,
     status,
-    session_id: null,
+    session_id: 'session-123',
     input_identity: null,
   };
 }
 
 // The wait wire shape carries only the task lifecycle header.
 function taskHeader(status = 'running') {
-  return { agent_id: agentId, status, session_id: null };
+  return { agent_id: agentId, status, session_id: 'session-123' };
 }
 
 function rpcResult(requestId, result) {
@@ -131,6 +131,7 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     const created = await runCli(socket, 'spawn', { subagent: 'zcode', repository: directory, prompt: 'hello' });
     assert.equal(created.result.agent_id, agentId);
     assert.equal(created.result.status, 'running');
+    assert.equal(created.result.session_id, 'session-123');
     const sent = await runCli(socket, 'send', { agent_id: agentId, message_id: 'message-1', mode: 'queue', content: 'follow up' });
     assert.equal(sent.result.disposition, 'queued');
     const waited = await runCli(socket, 'wait', { agent_id: agentId, wait_time: 0 });
