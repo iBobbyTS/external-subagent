@@ -7,6 +7,7 @@ export const MAX_FRAME_BYTES = 512 * 1024;
 export const MAX_RESPONSE_FRAME_BYTES = 2 * 1024 * 1024;
 export const MAX_RESULT_CHUNK_BYTES = 256 * 1024;
 export const AGENT_PROBE_TRANSPORT_TIMEOUT_MS = 200_000;
+export const SPAWN_TRANSPORT_TIMEOUT_MS = 150_000;
 export const MIN_TASK_ID = 10_000_000;
 export const MAX_TASK_ID = 99_999_999;
 
@@ -38,6 +39,7 @@ export function waitTransportTimeoutMs(waitTime = 290) {
 export function daemonTransportTimeoutMs(command, params = {}) {
   if (command === 'wait') return waitTransportTimeoutMs(params.wait_time);
   if (command === 'agent-probe' || command === 'agent-models') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
+  if (command === 'create' || command === 'spawn') return SPAWN_TRANSPORT_TIMEOUT_MS;
   return 6000;
 }
 
@@ -207,7 +209,7 @@ export function projectDaemonResult(command, result) {
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;
     case 'create': case 'spawn':
-      return { agent_id: publicTaskId(result.task.agent_id), status: result.task.status };
+      return { agent_id: publicTaskId(result.task.agent_id), status: result.task.status, session_id: result.task.session_id ?? null };
     case 'wait': {
       const { result: taskResult, task, activity, kind: _kind, ...rest } = result;
       return { ...rest, task: publicTaskHeader(task), activity, result: publicResult(taskResult) };
