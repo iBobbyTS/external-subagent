@@ -4609,7 +4609,21 @@ mod spawn_established_return_tests {
     fn ac3a_starter_hangs_on_unread_stdin_killed_and_cancelled() {
         use std::process::{Command, Stdio};
         use std::os::unix::process::CommandExt;
-        let (dir, scheduler, store) = test_harness(|_| {
+
+        // Lock-free write acknowledgement: bootstrap flips `write_entered`
+        // once it starts the oversized write and `write_done` after it
+        // returns. Both are plain atomics, so an observer holding no store,
+        // state, or Driver lock can prove the deadline cancelled a genuinely
+        // in-flight, unfinished bootstrap write instead of merely a late
+        // claim/handle publication.
+        let write_entered = Arc::new(AtomicBool::new(false));
+        let write_done = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let write_entered_for_factory = Arc::clone(&write_entered);
+        let write_done_for_factory = Arc::clone(&write_done);
+        let stopped_for_factory = Arc::clone(&stopped);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
             let mut cmd = Command::new("sleep");
             cmd.arg("60")
                 .process_group(0)
@@ -4626,8 +4640,6 @@ mod spawn_established_return_tests {
                 uid: 0,
                 start_token: "token".into(),
             };
-            let stopped = Arc::new(AtomicBool::new(false));
-            let stopped_clone = Arc::clone(&stopped);
             let child = Arc::new(std::sync::Mutex::new(Some(child)));
             let child_clone = Arc::clone(&child);
 
@@ -4636,6 +4648,8 @@ mod spawn_established_return_tests {
                 stopped: Arc<AtomicBool>,
                 child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
                 stdin: std::sync::Mutex<Option<std::process::ChildStdin>>,
+                write_entered: Arc<AtomicBool>,
+                write_done: Arc<AtomicBool>,
             }
             impl ManagedRuntime for StdinHangingRuntime {
                 fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
@@ -4673,10 +4687,15 @@ mod spawn_established_return_tests {
                     _: Duration,
                 ) -> Result<SessionReady, RuntimeCommandError> {
                     use std::io::Write;
-                    let big_payload = vec![b'a'; 128 * 1024];
+                    // 4 MiB far exceeds any pipe buffer, so once this write
+                    // starts it cannot complete until the reader dies; `sleep`
+                    // never reads.
+                    let big_payload = vec![b'a'; 4 * 1024 * 1024];
+                    self.write_entered.store(true, Ordering::Release);
                     if let Some(mut writer) = self.stdin.lock().unwrap().take() {
                         let _ = writer.write_all(&big_payload);
                     }
+                    self.write_done.store(true, Ordering::Release);
                     Ok(SessionReady {
                         session_id: "never".into(),
                         initial_turn_id: None,
@@ -4693,11 +4712,34 @@ mod spawn_established_return_tests {
 
             Ok(Arc::new(StdinHangingRuntime {
                 identity,
-                stopped: stopped_clone,
+                stopped: Arc::clone(&stopped_for_factory),
                 child: child_clone,
                 stdin: std::sync::Mutex::new(Some(stdin)),
+                write_entered: Arc::clone(&write_entered_for_factory),
+                write_done: Arc::clone(&write_done_for_factory),
             }))
         });
+
+        // Deterministic ordering: the deadline cancellation runs only after
+        // the bootstrap write is confirmed entered and still unfinished.
+        let write_entered_for_cancel = Arc::clone(&write_entered);
+        let write_done_for_cancel = Arc::clone(&write_done);
+        let write_blocked_at_cancel = Arc::new(AtomicBool::new(false));
+        let blocked_for_cancel = Arc::clone(&write_blocked_at_cancel);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !write_entered_for_cancel.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "bootstrap never entered the blocking write before the deadline cancel"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            blocked_for_cancel.store(
+                !write_done_for_cancel.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        })));
 
         scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
         scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(150)));
@@ -4710,6 +4752,14 @@ mod spawn_established_return_tests {
             .unwrap_err();
         let elapsed = start_time.elapsed();
         assert!(elapsed < Duration::from_secs(5), "timeout took too long: {elapsed:?}");
+        assert!(
+            write_blocked_at_cancel.load(Ordering::Acquire),
+            "bootstrap write must have been in flight and unfinished when the deadline cancelled"
+        );
+        assert!(
+            write_done.load(Ordering::Acquire),
+            "the lock-free kill must make the blocking bootstrap write return"
+        );
         match err {
             SchedulerError::StartTimeout { agent_id, message } => {
                 assert!(message.contains("timed out"));
@@ -4719,13 +4769,32 @@ mod spawn_established_return_tests {
             }
             other => panic!("expected StartTimeout, got {other:?}"),
         }
+        // The starter consumed the committed cancellation and finished its
+        // cleanup: its stop() ran and no active runtime remains registered.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while !stopped.load(Ordering::Acquire) && Instant::now() < cleanup_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stopped.load(Ordering::Acquire), "starter cleanup must stop the runtime");
+        assert_eq!(scheduler.active_count(), 0, "starter cleanup must unregister the runtime");
     }
 
     #[test]
     fn ac3b_background_claim_hangs_timeout_and_cancelled() {
         use std::process::{Command, Stdio};
         use std::os::unix::process::CommandExt;
-        let (dir, scheduler, store) = test_harness(|_| {
+
+        // Lock-free write acknowledgement, as in AC3(a): proves the deadline
+        // cancelled an in-flight bootstrap write owned by the background claim
+        // thread, not a late claim/handle publication.
+        let write_entered = Arc::new(AtomicBool::new(false));
+        let write_done = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let write_entered_for_factory = Arc::clone(&write_entered);
+        let write_done_for_factory = Arc::clone(&write_done);
+        let stopped_for_factory = Arc::clone(&stopped);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
             let mut cmd = Command::new("sleep");
             cmd.arg("60")
                 .process_group(0)
@@ -4742,8 +4811,6 @@ mod spawn_established_return_tests {
                 uid: 0,
                 start_token: "token".into(),
             };
-            let stopped = Arc::new(AtomicBool::new(false));
-            let stopped_clone = Arc::clone(&stopped);
             let child = Arc::new(std::sync::Mutex::new(Some(child)));
             let child_clone = Arc::clone(&child);
 
@@ -4752,6 +4819,8 @@ mod spawn_established_return_tests {
                 stopped: Arc<AtomicBool>,
                 child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
                 stdin: std::sync::Mutex<Option<std::process::ChildStdin>>,
+                write_entered: Arc<AtomicBool>,
+                write_done: Arc<AtomicBool>,
             }
             impl ManagedRuntime for StdinHangingRuntime {
                 fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
@@ -4789,10 +4858,13 @@ mod spawn_established_return_tests {
                     _: Duration,
                 ) -> Result<SessionReady, RuntimeCommandError> {
                     use std::io::Write;
-                    let big_payload = vec![b'a'; 128 * 1024];
+                    // 4 MiB far exceeds any pipe buffer; `sleep` never reads.
+                    let big_payload = vec![b'a'; 4 * 1024 * 1024];
+                    self.write_entered.store(true, Ordering::Release);
                     if let Some(mut writer) = self.stdin.lock().unwrap().take() {
                         let _ = writer.write_all(&big_payload);
                     }
+                    self.write_done.store(true, Ordering::Release);
                     Ok(SessionReady {
                         session_id: "never".into(),
                         initial_turn_id: None,
@@ -4809,21 +4881,48 @@ mod spawn_established_return_tests {
 
             Ok(Arc::new(StdinHangingRuntime {
                 identity,
-                stopped: stopped_clone,
+                stopped: Arc::clone(&stopped_for_factory),
                 child: child_clone,
                 stdin: std::sync::Mutex::new(Some(stdin)),
+                write_entered: Arc::clone(&write_entered_for_factory),
+                write_done: Arc::clone(&write_done_for_factory),
             }))
         });
 
+        let bg_finished = Arc::new(AtomicBool::new(false));
+        let bg_finished_for_hook = Arc::clone(&bg_finished);
         let scheduler_for_bg = scheduler.clone();
         scheduler.set_before_claim_hook(Some(Arc::new(move || {
             if let Ok(Some(claim)) = scheduler_for_bg.inner.store.claim_next("bg-claim-thread", 10, 1) {
                 let s = scheduler_for_bg.clone();
+                let finished = Arc::clone(&bg_finished_for_hook);
                 std::thread::spawn(move || {
                     let _ = s.start_claim(claim);
+                    finished.store(true, Ordering::Release);
                 });
                 std::thread::sleep(Duration::from_millis(50));
             }
+        })));
+
+        // Deterministic ordering: the deadline cancellation only runs once the
+        // background claim's bootstrap write is confirmed entered and unfinished.
+        let write_entered_for_cancel = Arc::clone(&write_entered);
+        let write_done_for_cancel = Arc::clone(&write_done);
+        let write_blocked_at_cancel = Arc::new(AtomicBool::new(false));
+        let blocked_for_cancel = Arc::clone(&write_blocked_at_cancel);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !write_entered_for_cancel.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "background claim never entered the blocking write before the deadline cancel"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            blocked_for_cancel.store(
+                !write_done_for_cancel.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         })));
 
         scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
@@ -4831,9 +4930,19 @@ mod spawn_established_return_tests {
 
         let manifest = default_manifest(dir.path());
         let admission = default_admission();
+        let start = Instant::now();
         let err = scheduler
             .submit_and_start_general(&manifest, admission, &|| false)
             .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(5), "must be bounded");
+        assert!(
+            write_blocked_at_cancel.load(Ordering::Acquire),
+            "background bootstrap write must have been in flight and unfinished at cancellation"
+        );
+        assert!(
+            write_done.load(Ordering::Acquire),
+            "the lock-free kill must make the background claim's blocking write return"
+        );
         match err {
             SchedulerError::StartTimeout { agent_id, .. } => {
                 let record = store.get_task(&agent_id).unwrap().unwrap();
@@ -4842,6 +4951,17 @@ mod spawn_established_return_tests {
             }
             other => panic!("expected StartTimeout, got {other:?}"),
         }
+        // The background claim consumed the committed cancellation and exited
+        // its cleanup (stop() ran, runtime unregistered).
+        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
+        while (!bg_finished.load(Ordering::Acquire) || !stopped.load(Ordering::Acquire))
+            && Instant::now() < cleanup_deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(bg_finished.load(Ordering::Acquire), "background claim thread must exit");
+        assert!(stopped.load(Ordering::Acquire), "background claim cleanup must stop the runtime");
+        assert_eq!(scheduler.active_count(), 0, "background claim cleanup must unregister the runtime");
     }
 
     #[test]
@@ -4963,6 +5083,113 @@ mod spawn_established_return_tests {
             .submit_and_start_general(&manifest, admission, &|| false)
             .expect("workspace must be freed for new submission");
         assert_eq!(second_record.phase, TaskPhase::Running);
+    }
+
+    #[test]
+    fn ac3e_interrupt_after_cancel_commit_returns_cancelled_timeout_not_interrupted() {
+        // B-F01: once the conditional cancellation transaction has committed
+        // (stop_requested/CANCELLING persisted) the task is converging to
+        // cancelled. A request interrupt racing that convergence must not be
+        // reported as `Interrupted` ("session establishment continues"); it
+        // must surface the committed cancellation through the cancelled
+        // StartTimeout variant and stay responsive.
+        let starter_paused = Arc::new(AtomicBool::new(false));
+        let starter_paused_clone = Arc::clone(&starter_paused);
+        let pause_gate = Arc::new(AtomicBool::new(false));
+        let pause_gate_clone = Arc::clone(&pause_gate);
+
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-never-published".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        // Pause the starter after the factory returned but before it publishes
+        // the starting handle or enters bootstrap: the row stays PREPARING
+        // with no killable handle, so the only terminal path is the committed
+        // cancellation reaching the starter's fresh recheck.
+        scheduler.set_before_starting_handle_hook(Some(Arc::new(move || {
+            starter_paused_clone.store(true, Ordering::Release);
+            while !pause_gate_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(1000)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupted_clone = Arc::clone(&interrupted);
+
+        let scheduler_clone = scheduler.clone();
+        let join_handle = std::thread::spawn(move || {
+            scheduler_clone.submit_and_start_general(&manifest, admission, &move || {
+                interrupted_clone.load(Ordering::Acquire)
+            })
+        });
+
+        // Wait until the claim is owned (PREPARING) and the starter is parked.
+        let park_deadline = Instant::now() + Duration::from_secs(3);
+        while !starter_paused.load(Ordering::Acquire) {
+            assert!(Instant::now() < park_deadline, "starter never reached its pause point");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // Wait for the cancellation transaction to commit (durable stop fact),
+        // then assert the interrupt is observed before the next terminal read.
+        let commit_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let record = store.get_task("10000000").unwrap().unwrap();
+            if record.stop_requested {
+                assert_eq!(record.phase, TaskPhase::Cancelling);
+                break;
+            }
+            assert!(
+                Instant::now() < commit_deadline,
+                "conditional cancellation never committed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        interrupted.store(true, Ordering::Release);
+
+        let err = join_handle.join().unwrap().unwrap_err();
+        match err {
+            SchedulerError::StartTimeout { agent_id, message } => {
+                assert!(
+                    message.contains("cancelled"),
+                    "committed cancellation must be reported truthfully: {message}"
+                );
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert!(record.stop_requested, "durable stop fact must hold");
+                assert_eq!(record.phase, TaskPhase::Cancelling);
+            }
+            SchedulerError::Interrupted { .. } => panic!(
+                "interrupt after the cancellation commit must not claim establishment continues"
+            ),
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+
+        // The starter consumes the committed cancellation and terminates.
+        pause_gate.store(true, Ordering::Release);
+        let terminal_deadline = Instant::now() + Duration::from_secs(2);
+        let mut terminal = false;
+        while Instant::now() < terminal_deadline {
+            let record = store.get_task("10000000").unwrap().unwrap();
+            if record.phase == TaskPhase::Terminal {
+                assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+                terminal = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(terminal, "starter must converge the cancelled task to terminal");
     }
 
     #[test]
@@ -5147,19 +5374,33 @@ mod spawn_established_return_tests {
     }
 
     #[test]
-    fn ac4b_scheduler_resume_wait_budget_exhaustion_returns_resume_error_without_stop_or_kill() {
-        let gate_bootstrap = Arc::new(AtomicBool::new(false));
-        let gate_bootstrap_clone = Arc::clone(&gate_bootstrap);
+    fn ac4b_scheduler_resume_wait_shares_remaining_budget_without_renewal() {
+        // AC 4b(d): the resume-transient wait must consume the *remaining*
+        // part of the single total deadline. This fixture first burns most of
+        // the budget on the fresh (unestablished) wait, then performs a real
+        // establish -> terminal -> reap -> resume requeue (session preserved)
+        // and confirms the poll read the resume-transient row. A wrong
+        // implementation that granted a fresh full budget on entering resume
+        // would return at roughly consume + budget; the bound below is
+        // strictly earlier than that while leaving poll/scheduling slack.
+        let budget = Duration::from_millis(500);
+        let consume_target = Duration::from_millis(375);
+        let renewal_bound = Duration::from_millis(700);
+
+        let claim_gate = Arc::new(AtomicBool::new(false));
+        let claim_gate_clone = Arc::clone(&claim_gate);
         let runtime_stopped = Arc::new(AtomicBool::new(false));
         let runtime_stopped_clone = Arc::clone(&runtime_stopped);
-        let saw_preparing = Arc::new(AtomicBool::new(false));
-        let saw_preparing_clone = Arc::clone(&saw_preparing);
+        let saw_resume_transient = Arc::new(AtomicBool::new(false));
+        let saw_resume_transient_clone = Arc::clone(&saw_resume_transient);
+        let transition_applied = Arc::new(AtomicBool::new(false));
+        let transition_applied_clone = Arc::clone(&transition_applied);
 
         let (dir, scheduler, store) = test_harness({
             let stopped = Arc::clone(&runtime_stopped_clone);
             move |_| {
                 Ok(Arc::new(TestRuntime {
-                    session_id: "session-budget-exhaust".into(),
+                    session_id: "session-budget-shared".into(),
                     model: Some("test-model".into()),
                     stopped: Arc::clone(&stopped),
                     identity: None,
@@ -5169,46 +5410,91 @@ mod spawn_established_return_tests {
             }
         });
 
-        let store_path = store.database_path().to_path_buf();
+        // The starter never claims during the wait, so the row is only made
+        // resume-transient by the deterministic poll hook below; the gate is
+        // held until after the timeout so the resume driver belongs to the
+        // requeueing client, exactly like a real follow-up.
         scheduler.set_before_claim_hook(Some(Arc::new(move || {
-            let conn = rusqlite::Connection::open(&store_path).unwrap();
-            conn.execute(
-                "UPDATE tasks SET session_id='session-budget-exhaust' WHERE phase='QUEUED'",
-                [],
-            )
-            .unwrap();
-        })));
-
-        scheduler.set_before_starting_handle_hook(Some(Arc::new(move || {
-            while !gate_bootstrap_clone.load(Ordering::Acquire) {
+            while !claim_gate_clone.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(2));
             }
         })));
 
+        let store_for_poll = Arc::clone(&store);
+        let start = Instant::now();
         scheduler.set_spawn_poll_hook(Some(Arc::new(move |task: &TaskRecord| {
-            if task.phase == TaskPhase::Preparing && task.session_id.as_deref() == Some("session-budget-exhaust") {
-                saw_preparing_clone.store(true, Ordering::Release);
+            if !transition_applied_clone.load(Ordering::Acquire)
+                && start.elapsed() >= consume_target
+            {
+                // Persist the establishment fact on the still-QUEUED row,
+                // then complete it, reap it, and requeue for resume. The
+                // session id survives the requeue while stop/outcome clear.
+                let conn = rusqlite::Connection::open(store_for_poll.database_path()).unwrap();
+                conn.execute(
+                    "UPDATE tasks SET session_id='session-budget-shared' WHERE phase='QUEUED'",
+                    [],
+                )
+                .unwrap();
+                drop(conn);
+                store_for_poll
+                    .transition_terminal(
+                        &task.agent_id,
+                        task.owner_epoch,
+                        &external_store::TerminalUpdate {
+                            outcome: TaskOutcome::Completed,
+                            failure_code: None,
+                            failure_message: None,
+                        },
+                    )
+                    .unwrap();
+                store_for_poll.reap_task(&task.agent_id).unwrap();
+                assert!(
+                    store_for_poll
+                        .requeue_task_for_resume_with_message(
+                            &task.agent_id,
+                            "msg-budget-shared",
+                            "queue",
+                            "continue",
+                        )
+                        .unwrap(),
+                    "resume requeue must be admitted"
+                );
+                transition_applied_clone.store(true, Ordering::Release);
+            }
+            if transition_applied_clone.load(Ordering::Acquire)
+                && task.phase == TaskPhase::Queued
+                && task.session_id.as_deref() == Some("session-budget-shared")
+            {
+                saw_resume_transient_clone.store(true, Ordering::Release);
             }
         })));
 
-        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_wait_budget(Some(budget));
 
         let manifest = default_manifest(dir.path());
         let admission = default_admission();
 
-        let start = Instant::now();
         let err = scheduler
             .submit_and_start_general(&manifest, admission, &|| false)
             .unwrap_err();
-        // AC 4b(d): application-level error before the MCP 125s / CLI 150s transport deadlines.
+        let elapsed = start.elapsed();
+        // AC 4b(d): application-level error before the MCP 125s / CLI 150s
+        // transport deadlines, and before a renewed full budget could expire.
         assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "resume budget exhaustion must return within the daemon design bound"
+            elapsed < renewal_bound,
+            "resume wait must share the remaining budget, not renew it: {elapsed:?}"
         );
-
         assert!(
-            saw_preparing.load(Ordering::Acquire),
-            "poll hook must have confirmed reading PREPARING with session_id before timeout"
+            elapsed >= consume_target,
+            "the fresh wait must consume most of the budget before resume: {elapsed:?}"
+        );
+        assert!(
+            transition_applied.load(Ordering::Acquire),
+            "fixture must have completed establish->terminal->reap->requeue"
+        );
+        assert!(
+            saw_resume_transient.load(Ordering::Acquire),
+            "poll hook must have confirmed reading the resume-transient row"
         );
 
         let timed_out_agent_id = match err {
@@ -5223,17 +5509,22 @@ mod spawn_established_return_tests {
 
         let task_during_timeout = store.get_task(&timed_out_agent_id).unwrap().unwrap();
         assert!(!task_during_timeout.stop_requested, "must not write stop_requested");
-        assert_eq!(task_during_timeout.phase, TaskPhase::Preparing);
+        assert_eq!(task_during_timeout.phase, TaskPhase::Queued);
+        assert_eq!(
+            task_during_timeout.session_id.as_deref(),
+            Some("session-budget-shared")
+        );
         assert!(!runtime_stopped.load(Ordering::Acquire), "must not send kill on resume timeout");
 
-        // Follow-up proceeds normally: release gate, starter finishes bootstrap and transitions to Running
-        gate_bootstrap.store(true, Ordering::Release);
+        // Follow-up proceeds normally: release the gate, the starter claims
+        // the requeued row and resumes it to Running.
+        claim_gate.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut reached_running = false;
         while Instant::now() < deadline {
             let record = store.get_task(&timed_out_agent_id).unwrap().unwrap();
             if record.phase == TaskPhase::Running {
-                assert_eq!(record.session_id.as_deref(), Some("session-budget-exhaust"));
+                assert_eq!(record.session_id.as_deref(), Some("session-budget-shared"));
                 assert!(!record.stop_requested);
                 reached_running = true;
                 break;
