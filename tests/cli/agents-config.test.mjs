@@ -565,6 +565,5 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   assert.equal(dwait.task.status, 'completed', JSON.stringify(dwait));
   // The Codex fixture deliberately has no app-server. Admission must still open;
   // main.rs unit tests separately assert the production factory selection.
-  const ctask = await spawnTask('codex');
-  assert.ok(ctask.agent_id);
+  await assert.rejects(() => spawnTask('codex'), { code: 'runtime_lost' });
 });
