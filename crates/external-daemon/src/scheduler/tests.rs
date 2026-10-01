@@ -4605,6 +4605,52 @@ mod spawn_established_return_tests {
         }
     }
 
+    /// Fill a pipe's kernel buffer to capacity using non-blocking writes and
+    /// return only after the filling write has come back. A following blocking
+    /// `write_all` on a reader that never drains stdin (`sleep`) therefore
+    /// cannot complete on *any* schedule until the reader dies. Publishing
+    /// `write_entered` after this returns makes "entered && !done at cancel"
+    /// prove a write the lock-free kill is required to unblock, rather than a
+    /// marker set before the write call was reached.
+    fn prefill_pipe_buffer(writer: &std::process::ChildStdin) -> usize {
+        use std::os::unix::io::AsRawFd;
+        let fd = writer.as_raw_fd();
+        let original_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(original_flags >= 0, "F_GETFL must succeed");
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } >= 0,
+            "F_SETFL O_NONBLOCK must succeed"
+        );
+        let chunk = [b'a'; 4096];
+        let mut total = 0usize;
+        loop {
+            let written =
+                unsafe { libc::write(fd, chunk.as_ptr() as *const libc::c_void, chunk.len()) };
+            if written > 0 {
+                total += written as usize;
+                continue;
+            }
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    std::io::ErrorKind::WouldBlock => break,
+                    std::io::ErrorKind::Interrupted => continue,
+                    _ => panic!("pipe prefill write failed: {error}"),
+                }
+            }
+            break;
+        }
+        assert!(
+            total > 0,
+            "pipe prefill must have transferred data before the buffer filled"
+        );
+        assert!(
+            unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) } >= 0,
+            "F_SETFL restore must succeed"
+        );
+        total
+    }
+
     #[test]
     fn ac3a_starter_hangs_on_unread_stdin_killed_and_cancelled() {
         use std::process::{Command, Stdio};
@@ -4687,14 +4733,20 @@ mod spawn_established_return_tests {
                     _: Duration,
                 ) -> Result<SessionReady, RuntimeCommandError> {
                     use std::io::Write;
-                    // 4 MiB far exceeds any pipe buffer, so once this write
-                    // starts it cannot complete until the reader dies; `sleep`
-                    // never reads.
+                    let mut writer = self
+                        .stdin
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("bootstrap stdin must be available once");
+                    // Fill the pipe to capacity first and only then publish
+                    // `write_entered`: with a full pipe and a `sleep` reader
+                    // that never drains stdin, the following write cannot
+                    // return on any schedule until the reader dies.
+                    prefill_pipe_buffer(&writer);
                     let big_payload = vec![b'a'; 4 * 1024 * 1024];
                     self.write_entered.store(true, Ordering::Release);
-                    if let Some(mut writer) = self.stdin.lock().unwrap().take() {
-                        let _ = writer.write_all(&big_payload);
-                    }
+                    let _ = writer.write_all(&big_payload);
                     self.write_done.store(true, Ordering::Release);
                     Ok(SessionReady {
                         session_id: "never".into(),
@@ -4858,12 +4910,20 @@ mod spawn_established_return_tests {
                     _: Duration,
                 ) -> Result<SessionReady, RuntimeCommandError> {
                     use std::io::Write;
-                    // 4 MiB far exceeds any pipe buffer; `sleep` never reads.
+                    let mut writer = self
+                        .stdin
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("bootstrap stdin must be available once");
+                    // Fill the pipe to capacity first and only then publish
+                    // `write_entered`: with a full pipe and a `sleep` reader
+                    // that never drains stdin, the following write cannot
+                    // return on any schedule until the reader dies.
+                    prefill_pipe_buffer(&writer);
                     let big_payload = vec![b'a'; 4 * 1024 * 1024];
                     self.write_entered.store(true, Ordering::Release);
-                    if let Some(mut writer) = self.stdin.lock().unwrap().take() {
-                        let _ = writer.write_all(&big_payload);
-                    }
+                    let _ = writer.write_all(&big_payload);
                     self.write_done.store(true, Ordering::Release);
                     Ok(SessionReady {
                         session_id: "never".into(),
@@ -5190,6 +5250,90 @@ mod spawn_established_return_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(terminal, "starter must converge the cancelled task to terminal");
+    }
+
+    #[test]
+    fn ac3f_interrupt_on_mismatched_cancel_returns_cancelled_timeout_not_interrupted() {
+        // A-slot remaining gap: the mismatch convergence loop must not report
+        // `Interrupted` ("session establishment continues") for a row that
+        // already carries a durable stop (external cancel/close or a drain
+        // fence). Entering that loop requires the conditional cancellation
+        // transaction to mismatch while session_id is None and the phase is
+        // non-terminal, i.e. a stop that someone else already persisted.
+        let claim_gate = Arc::new(AtomicBool::new(false));
+        let claim_gate_clone = Arc::clone(&claim_gate);
+
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "never".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        // Keep the starter parked so the row stays fresh in QUEUED across the
+        // whole wait: it is another actor's stop, not this spawn, that lands.
+        scheduler.set_before_claim_hook(Some(Arc::new(move || {
+            while !claim_gate_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        // Persist a durable stop on the still-QUEUED row (external cancel /
+        // close), so the later conditional cancellation transaction mismatches
+        // with Err(current_task) and session_id None.
+        let stop_persisted = Arc::new(AtomicBool::new(false));
+        let store_for_poll = Arc::clone(&store);
+        scheduler.set_spawn_poll_hook(Some(Arc::new(move |task: &TaskRecord| {
+            if !stop_persisted.swap(true, Ordering::AcqRel) {
+                let prior = store_for_poll
+                    .cancel_unstarted_if_still_fresh(&task.agent_id)
+                    .unwrap();
+                assert!(prior.is_ok(), "row must be fresh for the external cancel");
+            }
+        })));
+
+        // The interrupt is raised only once the deadline cancel is about to
+        // run, i.e. while the mismatch convergence loop is entered.
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let interrupted_for_hook = Arc::clone(&interrupted);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            interrupted_for_hook.store(true, Ordering::Release);
+        })));
+        let interrupted_for_admission = Arc::clone(&interrupted);
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(200)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &move || {
+                interrupted_for_admission.load(Ordering::Acquire)
+            })
+            .unwrap_err();
+        assert!(interrupted.load(Ordering::Acquire));
+
+        match err {
+            SchedulerError::StartTimeout { agent_id, message } => {
+                assert!(
+                    message.contains("cancelled"),
+                    "a mismatched durable stop must be reported as cancelled: {message}"
+                );
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert!(record.stop_requested, "durable stop fact must hold");
+                assert_eq!(record.phase, TaskPhase::Cancelling);
+            }
+            SchedulerError::Interrupted { .. } => panic!(
+                "interrupt on a row with a durable stop must not claim establishment continues"
+            ),
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+
+        claim_gate.store(true, Ordering::Release);
     }
 
     #[test]
