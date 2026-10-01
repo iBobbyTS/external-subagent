@@ -60,6 +60,7 @@
     },
     "spawn": {
       "type": "object",
+      "description": "Start one durable subagent in an absolute repository workspace, returning after establishing the new session.",
       "required": ["repository", "prompt"],
       "properties": {
         "subagent": { "type": "string", "minLength": 1, "description": "Subagent route key; omission uses configured default_subagent or returns subagent_required. Null is invalid; dsh production spawn requires its enabled + spawn_supported + pinned-runtime configuration." },
@@ -182,7 +183,7 @@
       "additionalProperties": false,
       "properties": {
         "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents"] },
-        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "effort", "write_manifest"], "output": ["agent_id", "status"], "idempotent": false },
+        "external_subagent_spawn": { "input": ["subagent", "repository", "permission_mode", "prompt", "model", "effort", "write_manifest"], "output": ["agent_id", "status", "session_id"], "idempotent": false },
         "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },

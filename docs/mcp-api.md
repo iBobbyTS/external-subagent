@@ -192,11 +192,16 @@ dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
 | `agent_id` | integer | 保存后用于 wait/send/respond/result/cancel/close/observe | 无法可靠操作刚创建的任务 |
-| `status` | string | 获取提交后的单一生命周期状态 | 必须额外查询才能知道是否排队或运行；属于便利信息 |
+| `status` | string | 获取会话建立后的单一生命周期状态（通常为 running，亦可为建立后已完成/失败/等待输入等状态，不再返回内部 queued/preparing 瞬态） | 必须额外查询才能知道会话建立后状态；属于便利信息 |
+| `session_id` | string/null | 获取已建立的目标 subagent 会话 ID | 无法直接识别已建立的底层会话标识 |
 
 spawn 是有意非幂等的：每次成功提交都是新建任务（agent id 冲突或活动 workspace 冲突返回 `conflict` 错误，而不是复用已有任务），因此不再输出提交 disposition 字段。曾经存在的 `submission_disposition`（`created / existing`）的 `existing` 分支没有生产者，已随死表面一并移除。
 
-spawn 标注非幂等；返回超时不能直接推断未创建任务，不应通过无限重试推断唯一性。
+spawn 标注非幂等；返回超时按变体如实处理：
+- 普通超时：任务在建立前耗尽预算，daemon 已通过持久化 stop 栅栏与进程组 SIGKILL 完成确定性终态化（cancelled），不会留下幽灵 running 任务；
+- resume 变体：会话已建立、任务正被另一客户端的 resume 驱动且未经取消，调用方可稍后通过 wait/list 继续追踪；
+- D 态残余：已持久化栅栏但因 OS 级不可中断休眠等环境极限未完成终态收敛；
+- 传输层失败（如断开连接或客户端取消）：任务在 daemon 侧继续推进，调用方可凭 active_agent_id 经 list/wait 继续追踪，不应通过盲目重试产生重复任务。
 
 ## 6. external_subagent_wait
 
