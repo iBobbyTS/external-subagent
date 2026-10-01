@@ -271,17 +271,25 @@ impl Scheduler {
                         message,
                     });
                 }
+                // A mismatch here means the row already carried a durable stop
+                // (external cancel/close or a drain fence) before the
+                // conditional cancellation transaction ran: session_id is None
+                // and the phase is still non-terminal, so this task is
+                // converging to cancelled, not establishing. An interrupt must
+                // not be reported as `Interrupted` ("session establishment
+                // continues") against a durable stop fact; stop polling after
+                // the terminal read and report the existing cancelled
+                // StartTimeout variant, mirroring the committed-cancel branch
+                // above.
                 let conv_deadline = Instant::now() + self.convergence_budget();
                 while Instant::now() < conv_deadline {
-                    if interrupted() {
-                        return Err(SchedulerError::Interrupted {
-                            agent_id: agent_id.clone(),
-                        });
-                    }
                     if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
                         if task.phase.is_terminal() {
                             break;
                         }
+                    }
+                    if interrupted() {
+                        break;
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
