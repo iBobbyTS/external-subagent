@@ -3386,22 +3386,40 @@ mod turn_adjudication_tests {
     /// AC3: a RUNNING task that emits nothing for far longer than the former
     /// no-activity window must never be terminalized by the daemon, and it
     /// keeps its capacity slot. Advancing the injected test clock proves that
-    /// elapsed time alone cannot terminalize the task; the monitor is then
-    /// given room to run.
+    /// elapsed time alone cannot terminalize the task after a full monitor
+    /// iteration has consumed the advanced clock.
     #[test]
     fn silence_never_terminalizes_and_keeps_capacity() {
         let harness = harness(false, "");
         let scheduler = &harness.scheduler;
         let agent_id = &harness.agent_id;
+        let iterations = Arc::new(Mutex::new(0_u64));
+        let hook_iterations = Arc::clone(&iterations);
+        scheduler.set_before_terminal_wait_hook(Arc::new(move || {
+            *hook_iterations.lock().unwrap() += 1;
+        }));
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         await_phase(scheduler, agent_id, TaskPhase::Running);
 
-        harness.clock.advance(NO_ACTIVITY_WINDOW * 3);
-        // Wait for the monitor to actually execute after the advance instead
-        // of asserting on an unconsumed clock: admitted activity that would
-        // have reset the former window now proves the loop is live.
-        harness.runtimes.lock().unwrap()[0].emit_activity();
-        thread::sleep(Duration::from_millis(300));
+        let before_advance = {
+            let count = iterations.lock().unwrap();
+            harness.clock.advance(NO_ACTIVITY_WINDOW * 3);
+            *count
+        };
+        // Two post-advance wait entries acknowledge a full intervening loop.
+        // The count lock prevents a pre-advance entry from being counted;
+        // a watchdog result exits the wait so the assertion below exposes it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *iterations.lock().unwrap() < before_advance + 2 {
+            if scheduler.store().task_result(agent_id).unwrap().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "monitor did not complete a post-advance iteration"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
 
         assert!(
             scheduler.store().task_result(agent_id).unwrap().is_none(),

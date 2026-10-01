@@ -384,6 +384,11 @@ impl Scheduler {
                             FaultDisposition::Handled | FaultDisposition::Abandoned => return,
                         }
                     }
+                    // Until natural-completion ingress closes, a newly latched
+                    // transport fault can still lose to completion: the same
+                    // residual as published terminals, strictly narrower than
+                    // the removed watchdog's whole silence window. Closing it
+                    // requires natural-completion latch pairing, out of scope.
                     let _guard = operation.lock().unwrap();
                     if boundary != TurnBoundary::Completed
                         && runtime_lifecycle.ingress_reason().is_some()
