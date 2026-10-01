@@ -3,7 +3,7 @@
 //! Extracted mechanically from the former private `mcp::server` module; the
 //! facade at `crate::mcp` keeps every historical path importable.
 use super::errors::{
-    protocol_error, public_error, public_transport_error, validation_error, ToolError,
+    protocol_error, public_error_for_op, public_transport_error, validation_error, ToolError,
 };
 use super::schemas::{
     tool_output_schema, validate_text, AgentInput, AgentListInput, AgentRespondInput,
@@ -56,24 +56,28 @@ pub const PUBLIC_TOOLS: [&str; 10] = [
 #[derive(Clone)]
 pub struct SubagentMcp {
     socket: Option<PathBuf>,
-    timeout: Duration,
+    pub(crate) timeout: Duration,
     service: Option<Arc<RpcService>>,
     next_request: Arc<AtomicU64>,
     tool_router: ToolRouter<Self>,
     #[cfg(test)]
     wait_handler_interrupted: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    spawn_handler_interrupted: Option<Arc<AtomicBool>>,
 }
 
 impl SubagentMcp {
     pub fn new(socket: PathBuf, timeout: Duration) -> Self {
         Self {
             socket: Some(socket),
-            timeout,
+            timeout: timeout.max(Duration::from_secs(125)),
             service: None,
             next_request: Arc::new(AtomicU64::new(1)),
             tool_router: Self::tool_router(),
             #[cfg(test)]
             wait_handler_interrupted: None,
+            #[cfg(test)]
+            spawn_handler_interrupted: None,
         }
     }
 
@@ -86,6 +90,8 @@ impl SubagentMcp {
             tool_router: Self::tool_router(),
             #[cfg(test)]
             wait_handler_interrupted: None,
+            #[cfg(test)]
+            spawn_handler_interrupted: None,
         }
     }
 
@@ -129,6 +135,42 @@ impl SubagentMcp {
         })
         .await
         .map_err(|_| protocol_error().with_operation("wait"))?
+    }
+
+    async fn rpc_spawn(
+        &self,
+        input: GeneralSubmitInput,
+        request_cancelled: impl Fn() -> bool + Send + 'static,
+    ) -> Result<RpcSuccess, ToolError> {
+        struct InterruptOnDrop {
+            interrupted: Arc<AtomicBool>,
+            #[cfg(test)]
+            handler_interrupted: Option<Arc<AtomicBool>>,
+        }
+        impl Drop for InterruptOnDrop {
+            fn drop(&mut self) {
+                self.interrupted.store(true, Ordering::Release);
+                #[cfg(test)]
+                if let Some(latch) = &self.handler_interrupted {
+                    latch.store(true, Ordering::Release);
+                }
+            }
+        }
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let _guard = InterruptOnDrop {
+            interrupted: Arc::clone(&interrupted),
+            #[cfg(test)]
+            handler_interrupted: self.spawn_handler_interrupted.clone(),
+        };
+        let mut facade = self.clone();
+        facade.timeout = facade.timeout.max(Duration::from_secs(125));
+        tokio::task::spawn_blocking(move || {
+            facade.rpc_interruptible(RpcMethod::SubmitGeneral(input), &|| {
+                interrupted.load(Ordering::Acquire) || request_cancelled()
+            })
+        })
+        .await
+        .map_err(|_| protocol_error().with_operation("spawn"))?
     }
 
     fn rpc_interruptible(
@@ -185,7 +227,7 @@ impl SubagentMcp {
         }
         match response.outcome {
             RpcOutcome::Success { result } => Ok(*result),
-            RpcOutcome::Error { error } => Err(public_error(error)
+            RpcOutcome::Error { error } => Err(public_error_for_op(error, operation)
                 .with_operation(operation)
                 .with_request_id(request_id)
                 .with_agent_id(agent_id)),
@@ -309,7 +351,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace. Specify subagent unless default_subagent is configured. ZCode uses a provider/model token (a bare token keeps the backward-compatible zai/<token> reading); an omitted model falls back to agents.zcode.default_model and then to the native model; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Specify subagent unless default_subagent is configured. ZCode uses a provider/model token (a bare token keeps the backward-compatible zai/<token> reading); an omitted model falls back to agents.zcode.default_model and then to the native model; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -320,21 +362,39 @@ impl SubagentMcp {
     async fn agent_spawn(
         &self,
         Parameters(input): Parameters<AgentSpawnInput>,
+        context: RequestContext<RoleServer>,
     ) -> Result<Json<AgentSpawnOutput>, ToolError> {
+        self.agent_spawn_inner(input, move || context.ct.is_cancelled())
+            .await
+            .map(Json)
+    }
+
+    pub(crate) async fn agent_spawn_inner(
+        &self,
+        input: AgentSpawnInput,
+        request_cancelled: impl Fn() -> bool + Send + 'static,
+    ) -> Result<AgentSpawnOutput, ToolError> {
         let manifest = general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
-        let task = match self.rpc(RpcMethod::SubmitGeneral(GeneralSubmitInput {
-            agent: input.agent.clone(),
-            model: input.model.clone(),
-            effort: input.effort.clone(),
-            manifest,
-        }))? {
+        let task = match self
+            .rpc_spawn(
+                GeneralSubmitInput {
+                    agent: input.agent.clone(),
+                    model: input.model.clone(),
+                    effort: input.effort.clone(),
+                    manifest,
+                },
+                request_cancelled,
+            )
+            .await?
+        {
             RpcSuccess::GeneralSubmitted { task } => task,
             _ => return Err(protocol_error().with_operation("spawn")),
         };
-        Ok(Json(AgentSpawnOutput {
+        Ok(AgentSpawnOutput {
             agent_id: public_task_id(&task.agent_id).map_err(|e| e.with_operation("spawn"))?,
             status: task.status,
-        }))
+            session_id: task.session_id,
+        })
     }
 
     #[tool(
@@ -1333,7 +1393,7 @@ mod contract_default_tests {
                 write_manifest: vec![],
             };
             let error = facade
-                .agent_spawn(rmcp::handler::server::wrapper::Parameters(input))
+                .agent_spawn_inner(input, || false)
                 .await
                 .err()
                 .expect("admission must reject");
@@ -1369,7 +1429,7 @@ mod contract_default_tests {
         )
         .unwrap();
         let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
-        let (_directory, service, _id) = crate::rpc::wait_tests::fixture();
+        let (_directory, service, _id) = crate::rpc::wait_tests::runnable_fixture();
         let store = service.store_for_wait_test();
         let repository = tempfile::tempdir().unwrap();
         let facade = SubagentMcp::from_service(service);
@@ -1383,11 +1443,13 @@ mod contract_default_tests {
             write_manifest: Vec::new(),
         };
         let output = facade
-            .agent_spawn(rmcp::handler::server::wrapper::Parameters(input))
+            .agent_spawn_inner(input, || false)
             .await
             .unwrap();
+        assert_eq!(output.status, "running");
+        assert!(output.session_id.is_some());
         let stored = store
-            .get_task(&output.0.agent_id.to_string())
+            .get_task(&output.agent_id.to_string())
             .unwrap()
             .unwrap();
         assert!(
@@ -1571,7 +1633,7 @@ mod contract_default_tests {
             ("external_subagent_status", status),
             (
                 "external_subagent_spawn",
-                serde_json::json!({"agent_id":10000001,"status":"queued"}),
+                serde_json::json!({"agent_id":10000001,"status":"running","session_id":null}),
             ),
             ("external_subagent_wait", wait),
             ("external_subagent_observe", observation),
@@ -1735,5 +1797,145 @@ mod contract_default_tests {
                 validator.iter_errors(&success).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn socket_facade_timeout_lifted() {
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/socket.sock"), Duration::from_secs(1));
+        assert_eq!(facade.timeout, Duration::from_secs(125));
+        let custom = SubagentMcp::new(PathBuf::from("/tmp/socket.sock"), Duration::from_secs(200));
+        assert_eq!(custom.timeout, Duration::from_secs(200));
+    }
+
+    #[tokio::test]
+    async fn mcp_spawn_output_has_session_id() {
+        let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
+        let (_directory, service, _id) = crate::rpc::wait_tests::runnable_fixture();
+        let facade = SubagentMcp::from_service(service);
+        let repository = tempfile::tempdir().unwrap();
+        let input = AgentSpawnInput {
+            agent: Some("zcode".into()),
+            model: None,
+            effort: None,
+            repository: repository.path().to_string_lossy().into_owned(),
+            prompt: "spawn session test".into(),
+            permission_mode: PublicPermissionMode::Plan,
+            write_manifest: Vec::new(),
+        };
+        let output = facade.agent_spawn_inner(input, || false).await.unwrap();
+        assert_eq!(output.status, "running");
+        assert!(output.session_id.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mcp_cancelled_notification_interrupts_spawn_without_mutating_task() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
+        let (_directory, service, _id) = crate::rpc::wait_tests::runnable_fixture();
+        let handler_interrupted = Arc::new(AtomicBool::new(false));
+        let mut facade = SubagentMcp::from_service(service.clone());
+        facade.spawn_handler_interrupted = Some(Arc::clone(&handler_interrupted));
+        let requests = Arc::clone(&facade.next_request);
+        let (client, transport) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(async move {
+            let server = facade.serve(transport).await.unwrap();
+            server.waiting().await.unwrap();
+        });
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut lines = BufReader::new(reader).lines();
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"cancel-test\",\"version\":\"1\"}}}\n").await.unwrap();
+        let initialized = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&initialized).unwrap()["id"],
+            1
+        );
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        let call = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "external_subagent_spawn", "arguments": {
+                "subagent": "zcode",
+                "repository": repository.path().to_string_lossy(),
+                "prompt": "interrupt test",
+                "permission_mode": "plan"
+            }}
+        });
+        writer
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        // Wait until the real tool handler has dispatched its blocking RPC.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while requests.load(Ordering::Relaxed) == 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"caller stopped waiting\"}}\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handler_interrupted.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled spawn handler did not get interrupted");
+
+        serving.abort();
+        let _ = serving.await;
+    }
+
+    #[test]
+    fn mcp_spawn_error_fidelity_preserves_reason_id_and_distinguishable_messages() {
+        use super::public_error_for_op;
+        use crate::rpc::{RpcError, RpcErrorCode};
+
+        // 1. StartFailed: preserves reason code, active_agent_id
+        let mut failed = RpcError::new(RpcErrorCode::RuntimeLost, "SESSION_START_FAILED: adapter failed");
+        failed.active_agent_id = Some("10000001".into());
+        let tool_err = public_error_for_op(failed, "spawn");
+        assert_eq!(tool_err.body.code, "runtime_lost");
+        assert!(tool_err.body.message.contains("SESSION_START_FAILED"));
+        assert_eq!(tool_err.body.agent_id, Some(10000001));
+
+        // 2. StartTimeout (ordinary): preserves message and active_agent_id
+        let mut timeout = RpcError::new(RpcErrorCode::Timeout, "spawn start timed out: session establishment exceeded deadline and was cancelled");
+        timeout.active_agent_id = Some("10000002".into());
+        let tool_err = public_error_for_op(timeout, "spawn");
+        assert_eq!(tool_err.body.code, "timeout");
+        assert!(tool_err.body.message.contains("exceeded deadline and was cancelled"));
+        assert_eq!(tool_err.body.agent_id, Some(10000002));
+
+        // 3. Interrupted: distinguishes from timeout, preserves message and active_agent_id
+        let mut interrupted = RpcError::new(RpcErrorCode::Timeout, "spawn interrupted while session establishment continues for 10000003");
+        interrupted.active_agent_id = Some("10000003".into());
+        let tool_err = public_error_for_op(interrupted, "spawn");
+        assert_eq!(tool_err.body.code, "timeout");
+        assert!(tool_err.body.message.contains("spawn interrupted while session establishment continues"));
+        assert_eq!(tool_err.body.agent_id, Some(10000003));
     }
 }

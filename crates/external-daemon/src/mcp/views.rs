@@ -376,6 +376,7 @@ pub struct AgentSpawnOutput {
     #[schemars(range(min = 10000000, max = 99999999))]
     pub agent_id: u64,
     pub status: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

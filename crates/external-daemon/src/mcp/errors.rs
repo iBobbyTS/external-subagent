@@ -106,7 +106,12 @@ pub(crate) fn validation_error(detail: impl Into<String>) -> ToolError {
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn public_error(error: RpcError) -> ToolError {
+    public_error_for_op(error, "")
+}
+
+pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError {
     let detail = error.message.clone();
     // Admission sites compose the full public message and ship it as the RPC
     // detail (same Design B as the AgentUnknown roster branch below); project
@@ -120,6 +125,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
             if PASSTHROUGH_DETAIL_PREFIXES
                 .iter()
                 .any(|prefix| detail.starts_with(prefix))
+                || (operation == "spawn" && detail.starts_with("MODEL_REJECTED"))
             {
                 detail.as_str()
             } else {
@@ -173,12 +179,16 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
                 _ => "durable state conflict",
             },
         ),
+        RpcErrorCode::Unavailable if operation == "spawn" => ("unavailable", detail.as_str()),
         RpcErrorCode::Unavailable if detail == "RUNTIME_COMMAND_FAILED" => (
             "runtime_command_failed",
             "runtime could not complete the command",
         ),
+        RpcErrorCode::Timeout if operation == "spawn" => ("timeout", detail.as_str()),
         RpcErrorCode::Timeout => ("timeout", "daemon operation timed out"),
+        RpcErrorCode::RuntimeLost if operation == "spawn" => ("runtime_lost", detail.as_str()),
         RpcErrorCode::RuntimeLost => ("runtime_lost", "agent runtime was lost"),
+        RpcErrorCode::ResultInvalid if operation == "spawn" => ("result_invalid", detail.as_str()),
         RpcErrorCode::ResultInvalid => ("result_invalid", "stored task result failed verification"),
         RpcErrorCode::Persistence => ("persistence", "durable store operation failed"),
         RpcErrorCode::Internal => ("internal", "daemon operation failed"),
