@@ -120,8 +120,10 @@ fn wire_frames(workspace: &std::path::Path) -> Vec<serde_json::Value> {
 /// None of the waiters using it asserts deadline behavior; under the
 /// parallel suite the scripted children (real processes) can need seconds
 /// to become observable, so the budget matches the generous scheduler
-/// windows instead of a tight wall-clock guess.
-const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
+/// windows instead of a tight wall-clock guess. Degraded macOS CI runners
+/// have measured this sync beyond 30s (v0.3.1 release runs), so the budget
+/// must absorb runner slowdown, not just local load.
+const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(120);
 
 fn wait_for_frames(workspace: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
     let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
