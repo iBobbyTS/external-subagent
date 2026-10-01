@@ -37,10 +37,28 @@ pub(crate) struct SchedulerInner {
     /// `Instant::now`; tests inject a manual clock so window arithmetic is
     /// exercised on the same semantics as production.
     pub(super) clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+    #[cfg(test)]
+    pub(super) spawn_poll_hook: Mutex<Option<Arc<dyn Fn(&TaskRecord) + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) before_starting_handle_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) before_claim_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) spawn_wait_budget: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    pub(super) spawn_convergence_budget: Mutex<Option<Duration>>,
     pub(super) draining: AtomicBool,
     pub(super) drain_cancel_running: AtomicBool,
     pub(super) updater_fired: AtomicBool,
     pub(super) activation_claim: Mutex<Option<String>>,
+}
+
+#[derive(Clone)]
+pub(super) struct StartingHandle {
+    pub(super) owner_epoch: u64,
+    pub(super) identity: Option<StoredProcessIdentity>,
+    #[allow(dead_code)]
+    pub(super) runtime: Arc<dyn ManagedRuntime>,
 }
 
 #[cfg(test)]
@@ -59,6 +77,7 @@ pub(super) enum ResponseClaimHookStage {
 #[derive(Default)]
 pub(crate) struct SchedulerState {
     pub(super) active: HashMap<String, ActiveRuntime>,
+    pub(super) starting: HashMap<String, StartingHandle>,
     pub(crate) activities: HashMap<String, Arc<PassiveActivityTracker>>,
     pub(super) failures: HashMap<String, String>,
 }
@@ -444,6 +463,16 @@ impl Scheduler {
                 before_terminal_wait_hook: Mutex::new(None),
                 #[cfg(test)]
                 stall_read_fault: Mutex::new(None),
+                #[cfg(test)]
+                spawn_poll_hook: Mutex::new(None),
+                #[cfg(test)]
+                before_starting_handle_hook: Mutex::new(None),
+                #[cfg(test)]
+                before_claim_hook: Mutex::new(None),
+                #[cfg(test)]
+                spawn_wait_budget: Mutex::new(None),
+                #[cfg(test)]
+                spawn_convergence_budget: Mutex::new(None),
                 clock: Arc::new(Instant::now),
                 draining: AtomicBool::new(false),
                 drain_cancel_running: AtomicBool::new(false),
@@ -451,6 +480,61 @@ impl Scheduler {
                 activation_claim: Mutex::new(None),
             }),
         })
+    }
+
+    pub(super) fn starting_handle(&self, agent_id: &str) -> Option<StartingHandle> {
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .starting
+            .get(agent_id)
+            .cloned()
+    }
+
+    pub(super) fn spawn_wait_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self.inner.spawn_wait_budget.lock().unwrap() {
+            return budget;
+        }
+        self.inner.config.bootstrap_timeout
+            + self.inner.config.control_timeout
+            + Duration::from_secs(10)
+    }
+
+    pub(super) fn convergence_budget(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(budget) = *self.inner.spawn_convergence_budget.lock().unwrap() {
+            return budget;
+        }
+        self.inner.config.control_timeout
+            + self.inner.config.stop_grace
+            + Duration::from_secs(2)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spawn_poll_hook(&self, hook: Option<Arc<dyn Fn(&TaskRecord) + Send + Sync>>) {
+        *self.inner.spawn_poll_hook.lock().unwrap() = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_starting_handle_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.inner.before_starting_handle_hook.lock().unwrap() = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_claim_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.inner.before_claim_hook.lock().unwrap() = hook;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spawn_wait_budget(&self, budget: Option<Duration>) {
+        *self.inner.spawn_wait_budget.lock().unwrap() = budget;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spawn_convergence_budget(&self, budget: Option<Duration>) {
+        *self.inner.spawn_convergence_budget.lock().unwrap() = budget;
     }
 
     #[cfg(test)]

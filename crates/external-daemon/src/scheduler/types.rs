@@ -80,6 +80,9 @@ pub enum SchedulerError {
     RuntimeSpawn { agent_id: String, message: String },
     LifecycleSink { agent_id: String, message: String },
     RuntimeCommand { agent_id: String, message: String },
+    StartTimeout { agent_id: String, message: String },
+    Interrupted { agent_id: String },
+    StartFailed { agent_id: String, reason: String, message: String },
 }
 impl fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -94,6 +97,15 @@ impl fmt::Display for SchedulerError {
             }
             Self::RuntimeCommand { agent_id, message } => {
                 write!(f, "runtime command failed for {agent_id}: {message}")
+            }
+            Self::StartTimeout { agent_id, message } => {
+                write!(f, "start timeout for {agent_id}: {message}")
+            }
+            Self::Interrupted { agent_id } => {
+                write!(f, "start interrupted for {agent_id}")
+            }
+            Self::StartFailed { agent_id, reason, message } => {
+                write!(f, "start failed for {agent_id} ({reason}): {message}")
             }
         }
     }

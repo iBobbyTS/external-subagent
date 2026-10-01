@@ -411,7 +411,11 @@ pub(crate) mod wait_tests {
     use crate::rpc::{
         PendingRequestView, QuestionView, TaskActivityView, TaskHeaderView, TelemetryStatusView,
     };
-    use crate::{CommandRuntimeFactory, SchedulerConfig};
+    use crate::{
+        CommandRuntimeFactory, LifecycleSink, ManagedRuntime, RuntimeFactory, RuntimeTerminal,
+        SchedulerConfig, TurnSnapshot,
+    };
+    use external_runtime::ProcessIdentity;
     use external_store::TaskResult;
     use std::process::Command;
 
@@ -680,6 +684,78 @@ pub(crate) mod wait_tests {
             directory,
             Arc::new(RpcService::new(scheduler, store).unwrap()),
             id,
+        )
+    }
+
+    pub(crate) struct FakeRunnableRuntime;
+    impl ManagedRuntime for FakeRunnableRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _grace: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                external_runtime::ChildExit::Unknown,
+            ))
+        }
+        fn wait_terminal(&self, _timeout: Duration) -> Option<RuntimeTerminal> {
+            None
+        }
+        fn bootstrap_session(
+            &self,
+            job: &TaskRecord,
+            _timeout: Duration,
+        ) -> Result<crate::SessionReady, crate::RuntimeCommandError> {
+            let configured_model = serde_json::from_str::<serde_json::Value>(&job.prepared_launch_json)
+                .ok()
+                .and_then(|v| v.get("admission")?.get("model")?.as_str().map(str::to_owned));
+            Ok(crate::SessionReady {
+                session_id: "fake-session".into(),
+                configured_model,
+                initial_turn_id: None,
+            })
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            TurnSnapshot {
+                active: false,
+                boundary: None,
+                generation: 0,
+            }
+        }
+        fn stop_boundary_count(&self) -> u64 {
+            0
+        }
+    }
+
+    pub(crate) struct FakeRunnableFactory;
+    impl RuntimeFactory for FakeRunnableFactory {
+        fn spawn(
+            &self,
+            _task: &TaskRecord,
+            _sink: Arc<dyn LifecycleSink>,
+        ) -> Result<Arc<dyn ManagedRuntime>, std::io::Error> {
+            Ok(Arc::new(FakeRunnableRuntime))
+        }
+    }
+
+    pub(crate) fn runnable_fixture() -> (tempfile::TempDir, Arc<RpcService>, String) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("s01-runnable-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let scheduler = Scheduler::new(
+            "runnable-test",
+            store.clone(),
+            Arc::new(FakeRunnableFactory),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        (
+            directory,
+            Arc::new(RpcService::new(scheduler, store).unwrap()),
+            String::new(),
         )
     }
 

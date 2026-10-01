@@ -4260,3 +4260,905 @@ mod wait_tail_inheritance_tests {
         assert_eq!(scheduler.take_wait_tail(id).expect("new tracker").text, "");
     }
 }
+
+#[cfg(test)]
+mod spawn_established_return_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use external_core::PermissionMode;
+    use external_store::{TaskPhase, TaskOutcome};
+
+    struct TestRuntime {
+        session_id: String,
+        model: Option<String>,
+        stopped: Arc<AtomicBool>,
+        identity: Option<external_runtime::ProcessIdentity>,
+        bootstrap_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+        fail_bootstrap: Option<String>,
+    }
+
+    impl ManagedRuntime for TestRuntime {
+        fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
+            self.identity.clone()
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            self.stopped.store(true, Ordering::Release);
+            RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                external_runtime::ChildExit::Exited(Some(0)),
+            ))
+        }
+        fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+            std::thread::sleep(Duration::from_millis(1));
+            self.stopped
+                .load(Ordering::Acquire)
+                .then(|| self.stop(Duration::ZERO))
+        }
+        fn bootstrap_session(
+            &self,
+            _: &TaskRecord,
+            _: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            if let Some(hook) = &self.bootstrap_hook {
+                hook();
+            }
+            if let Some(err) = &self.fail_bootstrap {
+                return Err(RuntimeCommandError::Transport(err.clone()));
+            }
+            Ok(SessionReady {
+                session_id: self.session_id.clone(),
+                initial_turn_id: Some("turn-1".into()),
+                configured_model: self.model.clone(),
+            })
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            TurnSnapshot {
+                generation: 1,
+                active: true,
+                boundary: None,
+            }
+        }
+        fn inject_turn(
+            &self,
+            _: &str,
+            _: &str,
+            _: Duration,
+        ) -> Result<Option<String>, RuntimeCommandError> {
+            Ok(None)
+        }
+    }
+
+    struct TestFactory {
+        spawn_fn: Arc<dyn Fn(&TaskRecord) -> std::io::Result<Arc<dyn ManagedRuntime>> + Send + Sync>,
+    }
+
+    impl RuntimeFactory for TestFactory {
+        fn spawn(
+            &self,
+            record: &TaskRecord,
+            _: Arc<dyn LifecycleSink>,
+        ) -> std::io::Result<Arc<dyn ManagedRuntime>> {
+            (self.spawn_fn)(record)
+        }
+    }
+
+    fn test_harness(
+        spawn_fn: impl Fn(&TaskRecord) -> std::io::Result<Arc<dyn ManagedRuntime>> + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, Scheduler, Arc<Store>) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let factory = Arc::new(TestFactory {
+            spawn_fn: Arc::new(spawn_fn),
+        });
+        let scheduler = Scheduler::new(
+            "test-scheduler",
+            store.clone(),
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        (directory, scheduler, store)
+    }
+
+    fn default_manifest(repo: &std::path::Path) -> GeneralTaskManifest {
+        GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: repo.to_path_buf(),
+            permission_mode: PermissionMode::Plan,
+            prompt: "test prompt".into(),
+            write_manifest: vec![],
+        }
+    }
+
+    fn default_admission() -> Option<external_core::AdmissionIdentity> {
+        Some(external_core::AdmissionIdentity {
+            agent: "zcode".into(),
+            config_revision: 1,
+            adapter_version: "test".into(),
+            model: Some("test-model".into()),
+            model_source: "native".into(),
+            effort: None,
+        })
+    }
+
+    #[test]
+    fn ac1_submit_and_start_general_success_returns_running_with_session_id() {
+        let (dir, scheduler, _) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ac1".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let record = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .expect("spawn must succeed");
+        assert_eq!(record.phase, TaskPhase::Running);
+        assert_eq!(record.session_id.as_deref(), Some("session-ac1"));
+    }
+
+    #[test]
+    fn ac1b_fast_completed_before_first_poll_returns_completed_with_session_id() {
+        let poll_gate = Arc::new(AtomicBool::new(false));
+        let poll_gate_clone = Arc::clone(&poll_gate);
+        let task_started = Arc::new(AtomicBool::new(false));
+        let task_started_clone = Arc::clone(&task_started);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
+            task_started_clone.store(true, Ordering::Release);
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ac1b-completed".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        let poll_count = Arc::new(AtomicU64::new(0));
+        let poll_count_clone = Arc::clone(&poll_count);
+        scheduler.set_spawn_poll_hook(Some(Arc::new(move |_| {
+            if poll_count_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !poll_gate_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        })));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let scheduler_clone = scheduler.clone();
+        let join_handle = std::thread::spawn(move || {
+            scheduler_clone.submit_and_start_general(&manifest, admission, &|| false)
+        });
+
+        while !task_started.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut agent_id = String::new();
+        while Instant::now() < deadline {
+            if let Some(t) = store.get_task("10000000").unwrap() {
+                if t.phase == TaskPhase::Running {
+                    agent_id = t.agent_id.clone();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!agent_id.is_empty(), "task did not become Running");
+
+        store
+            .transition_terminal(
+                &agent_id,
+                1,
+                &external_store::TerminalUpdate {
+                    outcome: TaskOutcome::Completed,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            )
+            .unwrap();
+
+        poll_gate.store(true, Ordering::Release);
+
+        let record = join_handle.join().unwrap().expect("must succeed with completed");
+        assert_eq!(record.phase, TaskPhase::Terminal);
+        assert_eq!(record.outcome, Some(TaskOutcome::Completed));
+        assert_eq!(record.session_id.as_deref(), Some("session-ac1b-completed"));
+    }
+
+    #[test]
+    fn ac1b_fast_failed_after_established_returns_failed_with_session_id() {
+        let poll_gate = Arc::new(AtomicBool::new(false));
+        let poll_gate_clone = Arc::clone(&poll_gate);
+        let task_started = Arc::new(AtomicBool::new(false));
+        let task_started_clone = Arc::clone(&task_started);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
+            task_started_clone.store(true, Ordering::Release);
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ac1b-failed".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        let poll_count = Arc::new(AtomicU64::new(0));
+        let poll_count_clone = Arc::clone(&poll_count);
+        scheduler.set_spawn_poll_hook(Some(Arc::new(move |_| {
+            if poll_count_clone.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !poll_gate_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        })));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let scheduler_clone = scheduler.clone();
+        let join_handle = std::thread::spawn(move || {
+            scheduler_clone.submit_and_start_general(&manifest, admission, &|| false)
+        });
+
+        while !task_started.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut agent_id = String::new();
+        while Instant::now() < deadline {
+            if let Some(t) = store.get_task("10000000").unwrap() {
+                if t.phase == TaskPhase::Running {
+                    agent_id = t.agent_id.clone();
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!agent_id.is_empty(), "task did not become Running");
+
+        store
+            .transition_terminal(
+                &agent_id,
+                1,
+                &external_store::TerminalUpdate {
+                    outcome: TaskOutcome::Failed,
+                    failure_code: Some("RUNTIME_EXITED_EARLY".into()),
+                    failure_message: Some("fast failed result".into()),
+                },
+            )
+            .unwrap();
+
+        poll_gate.store(true, Ordering::Release);
+
+        let record = join_handle.join().unwrap().expect("must return record");
+        assert_eq!(record.phase, TaskPhase::Terminal);
+        assert_eq!(record.outcome, Some(TaskOutcome::Failed));
+        assert_eq!(record.session_id.as_deref(), Some("session-ac1b-failed"));
+    }
+
+    #[test]
+    fn ac2_spawn_or_bootstrap_failure_returns_start_failed_with_reason() {
+        let (dir, scheduler, store) = test_harness(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "executable not found",
+            ))
+        });
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission.clone(), &|| false)
+            .unwrap_err();
+        match err {
+            SchedulerError::StartFailed { reason, agent_id, .. } => {
+                assert_eq!(reason, "RUNTIME_SPAWN_FAILED");
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert_eq!(record.phase, TaskPhase::Terminal);
+                assert_eq!(record.outcome, Some(TaskOutcome::Failed));
+                assert!(record.session_id.is_none());
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+
+        let (dir2, scheduler2, store2) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "never".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: Some("connection refused".into()),
+            }))
+        });
+        let manifest2 = default_manifest(dir2.path());
+        let err2 = scheduler2
+            .submit_and_start_general(&manifest2, admission, &|| false)
+            .unwrap_err();
+        match err2 {
+            SchedulerError::StartFailed { reason, agent_id, .. } => {
+                assert_eq!(reason, "SESSION_START_FAILED");
+                let record = store2.get_task(&agent_id).unwrap().unwrap();
+                assert_eq!(record.phase, TaskPhase::Terminal);
+                assert_eq!(record.outcome, Some(TaskOutcome::Failed));
+                assert!(record.session_id.is_none());
+            }
+            other => panic!("expected StartFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3a_starter_hangs_on_unread_stdin_killed_and_cancelled() {
+        use std::process::{Command, Stdio};
+        use std::os::unix::process::CommandExt;
+        let (dir, scheduler, store) = test_harness(|_| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60")
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let pgid = pid as i32;
+            let stdin = child.stdin.take().unwrap();
+            let identity = external_runtime::ProcessIdentity {
+                pid,
+                pgid,
+                uid: 0,
+                start_token: "token".into(),
+            };
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stopped_clone = Arc::clone(&stopped);
+            let child = Arc::new(std::sync::Mutex::new(Some(child)));
+            let child_clone = Arc::clone(&child);
+
+            struct StdinHangingRuntime {
+                identity: external_runtime::ProcessIdentity,
+                stopped: Arc<AtomicBool>,
+                child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+                stdin: std::sync::Mutex<Option<std::process::ChildStdin>>,
+            }
+            impl ManagedRuntime for StdinHangingRuntime {
+                fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
+                    Some(self.identity.clone())
+                }
+                fn stop(&self, _: Duration) -> RuntimeTerminal {
+                    self.stopped.store(true, Ordering::Release);
+                    if let Some(mut child) = self.child.lock().unwrap().take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                        external_runtime::ChildExit::Exited(Some(0)),
+                    ))
+                }
+                fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Some(self.stop(Duration::ZERO));
+                    }
+                    if let Ok(mut lock) = self.child.try_lock() {
+                        if let Some(ref mut c) = *lock {
+                            if let Ok(Some(status)) = c.try_wait() {
+                                return Some(RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                                    external_runtime::ChildExit::Exited(status.code()),
+                                )));
+                            }
+                        }
+                    }
+                    None
+                }
+                fn bootstrap_session(
+                    &self,
+                    _: &TaskRecord,
+                    _: Duration,
+                ) -> Result<SessionReady, RuntimeCommandError> {
+                    use std::io::Write;
+                    let big_payload = vec![b'a'; 128 * 1024];
+                    if let Some(mut writer) = self.stdin.lock().unwrap().take() {
+                        let _ = writer.write_all(&big_payload);
+                    }
+                    Ok(SessionReady {
+                        session_id: "never".into(),
+                        initial_turn_id: None,
+                        configured_model: Some("test-model".into()),
+                    })
+                }
+                fn turn_snapshot(&self) -> TurnSnapshot {
+                    TurnSnapshot { generation: 1, active: true, boundary: None }
+                }
+                fn inject_turn(&self, _: &str, _: &str, _: Duration) -> Result<Option<String>, RuntimeCommandError> {
+                    Ok(None)
+                }
+            }
+
+            Ok(Arc::new(StdinHangingRuntime {
+                identity,
+                stopped: stopped_clone,
+                child: child_clone,
+                stdin: std::sync::Mutex::new(Some(stdin)),
+            }))
+        });
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(150)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let start_time = Instant::now();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .unwrap_err();
+        let elapsed = start_time.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "timeout took too long: {elapsed:?}");
+        match err {
+            SchedulerError::StartTimeout { agent_id, message } => {
+                assert!(message.contains("timed out"));
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert_eq!(record.phase, TaskPhase::Terminal);
+                assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+            }
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3b_background_claim_hangs_timeout_and_cancelled() {
+        use std::process::{Command, Stdio};
+        use std::os::unix::process::CommandExt;
+        let (dir, scheduler, store) = test_harness(|_| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60")
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = cmd.spawn().unwrap();
+            let pid = child.id();
+            let pgid = pid as i32;
+            let stdin = child.stdin.take().unwrap();
+            let identity = external_runtime::ProcessIdentity {
+                pid,
+                pgid,
+                uid: 0,
+                start_token: "token".into(),
+            };
+            let stopped = Arc::new(AtomicBool::new(false));
+            let stopped_clone = Arc::clone(&stopped);
+            let child = Arc::new(std::sync::Mutex::new(Some(child)));
+            let child_clone = Arc::clone(&child);
+
+            struct StdinHangingRuntime {
+                identity: external_runtime::ProcessIdentity,
+                stopped: Arc<AtomicBool>,
+                child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+                stdin: std::sync::Mutex<Option<std::process::ChildStdin>>,
+            }
+            impl ManagedRuntime for StdinHangingRuntime {
+                fn identity(&self) -> Option<external_runtime::ProcessIdentity> {
+                    Some(self.identity.clone())
+                }
+                fn stop(&self, _: Duration) -> RuntimeTerminal {
+                    self.stopped.store(true, Ordering::Release);
+                    if let Some(mut child) = self.child.lock().unwrap().take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                        external_runtime::ChildExit::Exited(Some(0)),
+                    ))
+                }
+                fn wait_terminal(&self, _: Duration) -> Option<RuntimeTerminal> {
+                    std::thread::sleep(Duration::from_millis(5));
+                    if self.stopped.load(Ordering::Acquire) {
+                        return Some(self.stop(Duration::ZERO));
+                    }
+                    if let Ok(mut lock) = self.child.try_lock() {
+                        if let Some(ref mut c) = *lock {
+                            if let Ok(Some(status)) = c.try_wait() {
+                                return Some(RuntimeTerminal::Stopped(external_runtime::StopOutcome::AlreadyExited(
+                                    external_runtime::ChildExit::Exited(status.code()),
+                                )));
+                            }
+                        }
+                    }
+                    None
+                }
+                fn bootstrap_session(
+                    &self,
+                    _: &TaskRecord,
+                    _: Duration,
+                ) -> Result<SessionReady, RuntimeCommandError> {
+                    use std::io::Write;
+                    let big_payload = vec![b'a'; 128 * 1024];
+                    if let Some(mut writer) = self.stdin.lock().unwrap().take() {
+                        let _ = writer.write_all(&big_payload);
+                    }
+                    Ok(SessionReady {
+                        session_id: "never".into(),
+                        initial_turn_id: None,
+                        configured_model: Some("test-model".into()),
+                    })
+                }
+                fn turn_snapshot(&self) -> TurnSnapshot {
+                    TurnSnapshot { generation: 1, active: true, boundary: None }
+                }
+                fn inject_turn(&self, _: &str, _: &str, _: Duration) -> Result<Option<String>, RuntimeCommandError> {
+                    Ok(None)
+                }
+            }
+
+            Ok(Arc::new(StdinHangingRuntime {
+                identity,
+                stopped: stopped_clone,
+                child: child_clone,
+                stdin: std::sync::Mutex::new(Some(stdin)),
+            }))
+        });
+
+        let scheduler_for_bg = scheduler.clone();
+        scheduler.set_before_claim_hook(Some(Arc::new(move || {
+            if let Ok(Some(claim)) = scheduler_for_bg.inner.store.claim_next("bg-claim-thread", 10, 1) {
+                let s = scheduler_for_bg.clone();
+                std::thread::spawn(move || {
+                    let _ = s.start_claim(claim);
+                });
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(150)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .unwrap_err();
+        match err {
+            SchedulerError::StartTimeout { agent_id, .. } => {
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert_eq!(record.phase, TaskPhase::Terminal);
+                assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+            }
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3c_cancel_before_starting_handle_published_starter_recheck_consumes() {
+        let pause_gate = Arc::new(AtomicBool::new(false));
+        let pause_gate_clone = Arc::clone(&pause_gate);
+        let starter_reached = Arc::new(AtomicBool::new(false));
+        let starter_reached_clone = Arc::clone(&starter_reached);
+
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-never".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        scheduler.set_before_starting_handle_hook(Some(Arc::new(move || {
+            starter_reached_clone.store(true, Ordering::Release);
+            while !pause_gate_clone.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(100)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+
+        let scheduler_clone = scheduler.clone();
+        let join_handle = std::thread::spawn(move || {
+            scheduler_clone.submit_and_start_general(&manifest, admission, &|| false)
+        });
+
+        while !starter_reached.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        std::thread::sleep(Duration::from_millis(80));
+        pause_gate.store(true, Ordering::Release);
+
+        let err = join_handle.join().unwrap().unwrap_err();
+        match err {
+            SchedulerError::StartTimeout { agent_id, .. } => {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    let record = store.get_task(&agent_id).unwrap().unwrap();
+                    if record.phase == TaskPhase::Terminal {
+                        assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("starter did not terminate task as cancelled");
+            }
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac3d_queued_never_claimed_rpc_in_place_finishes_and_frees_workspace() {
+        let spawned_anything = Arc::new(AtomicBool::new(false));
+        let spawned_clone = Arc::clone(&spawned_anything);
+
+        let (dir, scheduler, store) = test_harness(move |_| {
+            spawned_clone.store(true, Ordering::Release);
+            Ok(Arc::new(TestRuntime {
+                session_id: "never".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        scheduler.set_before_claim_hook(Some(Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(300));
+        })));
+
+        scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
+        scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(50)));
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+        let start = Instant::now();
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission.clone(), &|| false)
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(3), "must be bounded");
+        assert!(!spawned_anything.load(Ordering::Acquire), "must never spawn any runtime");
+
+        match err {
+            SchedulerError::StartTimeout { agent_id, .. } => {
+                let record = store.get_task(&agent_id).unwrap().unwrap();
+                assert_eq!(record.phase, TaskPhase::Terminal);
+                assert_eq!(record.outcome, Some(TaskOutcome::Cancelled));
+                assert!(record.reaped_at.is_some(), "must be reaped in-place");
+            }
+            other => panic!("expected StartTimeout, got {other:?}"),
+        }
+
+        scheduler.set_before_claim_hook(None);
+
+        let second_record = scheduler
+            .submit_and_start_general(&manifest, admission, &|| false)
+            .expect("workspace must be freed for new submission");
+        assert_eq!(second_record.phase, TaskPhase::Running);
+    }
+
+    #[test]
+    fn ac4_interrupted_while_starter_runs_returns_interrupted_task_continues() {
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ac4".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: Some(Arc::new(|| {
+                    std::thread::sleep(Duration::from_millis(30));
+                })),
+                fail_bootstrap: None,
+            }))
+        });
+
+        let interrupted_flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&interrupted_flag);
+
+        let manifest = default_manifest(dir.path());
+        let admission = default_admission();
+
+        let flag_setter = Arc::clone(&interrupted_flag);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            flag_setter.store(true, Ordering::Release);
+        });
+
+        let err = scheduler
+            .submit_and_start_general(&manifest, admission, &move || flag_clone.load(Ordering::Acquire))
+            .unwrap_err();
+
+        match err {
+            SchedulerError::Interrupted { agent_id } => {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    let record = store.get_task(&agent_id).unwrap().unwrap();
+                    if record.phase == TaskPhase::Running {
+                        assert_eq!(record.session_id.as_deref(), Some("session-ac4"));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                panic!("task was cancelled or failed instead of reaching Running");
+            }
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac4b_resume_transient_waits_for_running_and_does_not_cancel() {
+        let (dir, scheduler, store) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-resume".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        let manifest = default_manifest(dir.path());
+        let record = scheduler
+            .submit_and_start_general(&manifest, default_admission(), &|| false)
+            .unwrap();
+        let agent_id = record.agent_id.clone();
+        store
+            .transition_terminal(
+                &agent_id,
+                1,
+                &external_store::TerminalUpdate {
+                    outcome: TaskOutcome::Completed,
+                    failure_code: None,
+                    failure_message: None,
+                },
+            )
+            .unwrap();
+
+        store.reap_task(&agent_id).unwrap();
+        store
+            .requeue_task_for_resume_with_message(&agent_id, "msg-1", "queue", "test-prompt")
+            .unwrap();
+
+        store
+            .claim_specific(&agent_id, "test-owner", 1)
+            .unwrap();
+        let prep = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(prep.phase, TaskPhase::Preparing);
+        assert!(prep.session_id.is_some());
+
+        let fresh_check = store.cancel_unstarted_if_still_fresh(&agent_id).unwrap();
+        assert!(fresh_check.is_err(), "must mismatch because session_id is non-null");
+
+        let intact = store.get_task(&agent_id).unwrap().unwrap();
+        assert_eq!(intact.phase, TaskPhase::Preparing);
+        assert!(!intact.stop_requested);
+    }
+
+    #[test]
+    fn ac5_workspace_busy_and_drain_unavailable() {
+        let (dir, scheduler, _) = test_harness(|_| {
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ac5".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        let manifest = default_manifest(dir.path());
+        let _first = scheduler
+            .submit_and_start_general(&manifest, default_admission(), &|| false)
+            .unwrap();
+
+        let second_err = scheduler
+            .submit_and_start_general(&manifest, default_admission(), &|| false)
+            .unwrap_err();
+        match second_err {
+            SchedulerError::Store(external_store::StoreError::Conflict(msg)) => {
+                assert!(msg.starts_with("WORKSPACE_BUSY"), "expected WORKSPACE_BUSY, got {msg}");
+            }
+            other => panic!("expected Store Conflict WORKSPACE_BUSY, got {other:?}"),
+        }
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let manifest2 = default_manifest(dir2.path());
+        scheduler.begin_drain();
+        let drain_err = scheduler
+            .submit_and_start_general(&manifest2, default_admission(), &|| false)
+            .unwrap_err();
+        match drain_err {
+            SchedulerError::StartFailed { reason, .. } => {
+                assert!(reason == "DRAIN_CANCELLED" || reason == "daemon_draining");
+            }
+            SchedulerError::InvalidConfig(reason) => {
+                assert_eq!(reason, "daemon_draining");
+            }
+            other => panic!("expected StartFailed DRAIN_CANCELLED, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ac6_head_of_line_blocking_avoidance() {
+        let a_started = Arc::new(AtomicBool::new(false));
+        let a_started_clone = Arc::clone(&a_started);
+        let a_release = Arc::new(AtomicBool::new(false));
+        let a_release_clone = Arc::clone(&a_release);
+
+        let (dir, scheduler, _) = test_harness(move |record| {
+            if record.repository.contains("ws-a") {
+                a_started_clone.store(true, Ordering::Release);
+                while !a_release_clone.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            Ok(Arc::new(TestRuntime {
+                session_id: "session-ok".into(),
+                model: Some("test-model".into()),
+                stopped: Arc::new(AtomicBool::new(false)),
+                identity: None,
+                bootstrap_hook: None,
+                fail_bootstrap: None,
+            }))
+        });
+
+        let ws_a = dir.path().join("ws-a");
+        let ws_b = dir.path().join("ws-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
+        let manifest_a = default_manifest(&ws_a);
+        let manifest_b = default_manifest(&ws_b);
+
+        let sched_a = scheduler.clone();
+        let handle_a = std::thread::spawn(move || {
+            sched_a.submit_and_start_general(&manifest_a, default_admission(), &|| false)
+        });
+
+        while !a_started.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let start_b = Instant::now();
+        let record_b = scheduler
+            .submit_and_start_general(&manifest_b, default_admission(), &|| false)
+            .expect("Task B must succeed");
+        assert!(start_b.elapsed() < Duration::from_secs(2), "Task B was blocked behind A");
+        assert_eq!(record_b.phase, TaskPhase::Running);
+
+        scheduler.begin_drain();
+        let ws_c = dir.path().join("ws-c");
+        std::fs::create_dir_all(&ws_c).unwrap();
+        let manifest_c = default_manifest(&ws_c);
+        let start_c = Instant::now();
+        let err_c = scheduler
+            .submit_and_start_general(&manifest_c, default_admission(), &|| false)
+            .unwrap_err();
+        assert!(start_c.elapsed() < Duration::from_millis(500), "admission was blocked by A's wait loop");
+        match err_c {
+            SchedulerError::StartFailed { reason, .. } => {
+                assert!(reason == "DRAIN_CANCELLED" || reason == "daemon_draining");
+            }
+            SchedulerError::InvalidConfig(reason) => {
+                assert_eq!(reason, "daemon_draining");
+            }
+            other => panic!("expected drain refusal, got {other:?}"),
+        }
+
+        a_release.store(true, Ordering::Release);
+        let _ = handle_a.join().unwrap();
+    }
+}

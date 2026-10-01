@@ -295,7 +295,7 @@ impl RpcService {
                 let manifest = input.manifest;
                 let submitted = self
                     .scheduler
-                    .enqueue_general_with_admission(&manifest, Some(admission))
+                    .submit_and_start_general(&manifest, Some(admission), interrupted)
                     .map_err(map_scheduler)?;
                 Ok(RpcSuccess::GeneralSubmitted {
                     task: task_view(submitted),

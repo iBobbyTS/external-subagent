@@ -1,4 +1,5 @@
 use super::*;
+use external_store::StoreError;
 
 impl Scheduler {
     pub fn enqueue_general(
@@ -49,6 +50,211 @@ impl Scheduler {
         };
         let enqueued = self.inner.store.enqueue_task_authoritative(&task)?;
         Ok(enqueued)
+    }
+
+    pub fn submit_and_start_general(
+        &self,
+        manifest: &GeneralTaskManifest,
+        admission: Option<external_core::AdmissionIdentity>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<TaskRecord, SchedulerError> {
+        let enqueued = self.enqueue_general_with_admission(manifest, admission)?;
+        let agent_id = enqueued.agent_id.clone();
+        let starter_scheduler = self.clone();
+        let starter_agent_id = agent_id.clone();
+        let per_workspace_limit = self.inner.config.per_workspace_max_agents;
+
+        thread::Builder::new()
+            .name(format!("starter-{}", starter_agent_id))
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(hook) = starter_scheduler.inner.before_claim_hook.lock().unwrap().clone() {
+                    hook();
+                }
+                match starter_scheduler.inner.store.claim_specific(
+                    &starter_agent_id,
+                    &starter_scheduler.inner.owner_id,
+                    per_workspace_limit,
+                ) {
+                    Ok(Some(claim)) => {
+                        let _ = starter_scheduler.start_claim(claim);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        starter_scheduler.record_failure(&starter_agent_id, e.to_string());
+                    }
+                }
+            })
+            .map_err(|e| SchedulerError::RuntimeSpawn {
+                agent_id: agent_id.clone(),
+                message: format!("failed to spawn starter thread: {e}"),
+            })?;
+
+        let wait_budget = self.spawn_wait_budget();
+        let deadline = Instant::now() + wait_budget;
+
+        loop {
+            if interrupted() {
+                return Err(SchedulerError::Interrupted {
+                    agent_id: agent_id.clone(),
+                });
+            }
+
+            let task_opt = self.inner.store.get_task(&agent_id)?;
+            let Some(task) = task_opt else {
+                return Err(SchedulerError::Store(StoreError::InvalidState(format!(
+                    "task {agent_id} disappeared from store"
+                ))));
+            };
+
+            #[cfg(test)]
+            if let Some(hook) = self.inner.spawn_poll_hook.lock().unwrap().clone() {
+                hook(&task);
+            }
+
+            if task.session_id.is_some() {
+                if !matches!(task.phase, TaskPhase::Queued | TaskPhase::Preparing) {
+                    return Ok(task);
+                }
+                if Instant::now() >= deadline {
+                    return Err(SchedulerError::StartTimeout {
+                        agent_id: agent_id.clone(),
+                        message: format!(
+                            "session established for {agent_id}, being driven by resume, uncancelled"
+                        ),
+                    });
+                }
+            } else if task.phase.is_terminal() {
+                let reason = task.failure_code.unwrap_or_else(|| "START_FAILED".into());
+                let message = task
+                    .failure_message
+                    .unwrap_or_else(|| "task terminated before establishment".into());
+                return Err(SchedulerError::StartFailed {
+                    agent_id,
+                    reason,
+                    message,
+                });
+            } else if Instant::now() >= deadline {
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        match self.inner.store.cancel_unstarted_if_still_fresh(&agent_id)? {
+            Ok((prior_phase, epoch)) => {
+                if prior_phase == TaskPhase::Queued {
+                    let route = task_route(&enqueued).map_err(SchedulerError::InvalidConfig)?;
+                    let _ = self.finish_unstarted_route(
+                        &agent_id,
+                        epoch,
+                        &route,
+                        Some(&enqueued),
+                        UnstartedTerminal {
+                            outcome: CompletionOutcome::Cancelled,
+                            reason_code: "CANCELLED",
+                            message: "spawn timed out before claim",
+                            failure_message: None,
+                        },
+                        true,
+                    );
+                    return Err(SchedulerError::StartTimeout {
+                        agent_id,
+                        message: "spawn timed out waiting for session establishment (cancelled)".into(),
+                    });
+                } else {
+                    let handle = self.starting_handle(&agent_id);
+                    if let Some(handle) = handle {
+                        if handle.owner_epoch == epoch {
+                            if let Some(identity) = &handle.identity {
+                                let pgid = identity.process_group_id;
+                                if pgid > 0 {
+                                    unsafe {
+                                        libc::kill(-pgid, libc::SIGKILL);
+                                        libc::kill(pgid, libc::SIGKILL);
+                                    }
+                                }
+                                let pid = identity.pid;
+                                if pid > 0 {
+                                    unsafe {
+                                        libc::kill(pid as i32, libc::SIGKILL);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let conv_deadline = Instant::now() + self.convergence_budget();
+                    let mut reached_terminal = false;
+                    while Instant::now() < conv_deadline {
+                        if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
+                            if task.phase.is_terminal() {
+                                reached_terminal = true;
+                                break;
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+
+                    if reached_terminal {
+                        return Err(SchedulerError::StartTimeout {
+                            agent_id,
+                            message: "spawn timed out waiting for session establishment (cancelled)".into(),
+                        });
+                    } else {
+                        return Err(SchedulerError::StartTimeout {
+                            agent_id,
+                            message: "spawn timed out waiting for session establishment (cancelled, process termination pending)".into(),
+                        });
+                    }
+                }
+            }
+            Err(current_task) => {
+                if current_task.session_id.is_some() {
+                    if !matches!(current_task.phase, TaskPhase::Queued | TaskPhase::Preparing) {
+                        return Ok(current_task);
+                    }
+                    while Instant::now() < deadline {
+                        thread::sleep(Duration::from_millis(20));
+                        if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
+                            if !matches!(task.phase, TaskPhase::Queued | TaskPhase::Preparing) {
+                                return Ok(task);
+                            }
+                        }
+                    }
+                    return Err(SchedulerError::StartTimeout {
+                        agent_id: agent_id.clone(),
+                        message: format!(
+                            "session established for {agent_id}, being driven by resume, uncancelled"
+                        ),
+                    });
+                }
+                if current_task.phase.is_terminal() {
+                    let reason = current_task.failure_code.unwrap_or_else(|| "START_FAILED".into());
+                    let message = current_task
+                        .failure_message
+                        .unwrap_or_else(|| "task terminated before establishment".into());
+                    return Err(SchedulerError::StartFailed {
+                        agent_id,
+                        reason,
+                        message,
+                    });
+                }
+                let conv_deadline = Instant::now() + self.convergence_budget();
+                while Instant::now() < conv_deadline {
+                    if let Ok(Some(task)) = self.inner.store.get_task(&agent_id) {
+                        if task.phase.is_terminal() {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                return Err(SchedulerError::StartTimeout {
+                    agent_id,
+                    message: "spawn timed out waiting for session establishment (cancelled)".into(),
+                });
+            }
+        }
     }
 
     pub fn begin_drain(&self) {

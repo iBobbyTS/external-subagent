@@ -85,6 +85,37 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
                 RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
             }
         }
+        SchedulerError::StartTimeout { agent_id, message } => {
+            let mut error = RpcError::new(RpcErrorCode::Timeout, message);
+            error.active_agent_id = Some(agent_id);
+            error
+        }
+        SchedulerError::Interrupted { agent_id } => {
+            let mut error = RpcError::new(
+                RpcErrorCode::Timeout,
+                format!("spawn interrupted while session establishment continues for {agent_id}"),
+            );
+            error.active_agent_id = Some(agent_id);
+            error
+        }
+        SchedulerError::StartFailed {
+            agent_id,
+            reason,
+            message,
+        } => {
+            let (code, msg) = if reason == "MODEL_REJECTED" {
+                (RpcErrorCode::Validation, format!("MODEL_REJECTED: {message}"))
+            } else if reason.starts_with("PREPARED_") || reason.starts_with("TASK_ROUTE_") {
+                (RpcErrorCode::ResultInvalid, format!("{reason}: {message}"))
+            } else if reason == "DRAIN_CANCELLED" || reason == "CANCELLED" || reason == "daemon_draining" {
+                (RpcErrorCode::Unavailable, format!("task cancelled: {message}"))
+            } else {
+                (RpcErrorCode::RuntimeLost, format!("{reason}: {message}"))
+            };
+            let mut error = RpcError::new(code, msg);
+            error.active_agent_id = Some(agent_id);
+            error
+        }
     }
 }
 

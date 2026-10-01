@@ -1896,12 +1896,40 @@ mod admission_tests {
 pub(crate) mod admission_fixtures {
     use super::*;
 
-    pub(crate) fn config_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) struct ConfigEnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev_subagent: Option<std::ffi::OsString>,
+        prev_zcode: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            match self.prev_subagent.take() {
+                Some(v) => env::set_var("EXTERNAL_SUBAGENT_CONFIG", v),
+                None => env::remove_var("EXTERNAL_SUBAGENT_CONFIG"),
+            }
+            match self.prev_zcode.take() {
+                Some(v) => env::set_var("ZCODE_AGENT_CONFIG", v),
+                None => env::remove_var("ZCODE_AGENT_CONFIG"),
+            }
+        }
+    }
+
+    pub(crate) fn config_env_guard() -> ConfigEnvGuard {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD
+        let guard = GUARD
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_subagent = env::var_os("EXTERNAL_SUBAGENT_CONFIG");
+        let prev_zcode = env::var_os("ZCODE_AGENT_CONFIG");
+        env::remove_var("EXTERNAL_SUBAGENT_CONFIG");
+        env::remove_var("ZCODE_AGENT_CONFIG");
+        ConfigEnvGuard {
+            _guard: guard,
+            prev_subagent,
+            prev_zcode,
+        }
     }
 
     /// Installs `EXTERNAL_SUBAGENT_CONFIG` for the guard-held scope and
@@ -2420,7 +2448,7 @@ mod admission_policy_tests {
         let _env_guard = config_env_guard();
         let config_root = gated_dsh_config(Some("configured-provider:configured-default-token"));
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
-        let (directory, service, _id) = wait_tests::fixture();
+        let (directory, service, _id) = wait_tests::runnable_fixture();
         let store = service.store_for_wait_test();
         let spawn_root = admission_root("s04a-cli-dsh-admit-");
 
@@ -2571,7 +2599,7 @@ mod admission_policy_tests {
         let _env_guard = config_env_guard();
         let config_root = gated_dsh_config(None);
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
-        let (directory, service, _id) = wait_tests::fixture();
+        let (directory, service, _id) = wait_tests::runnable_fixture();
         let zcode_root = admission_root("s04a-cli-zcode-");
         for (request_id, mode, manifest) in [
             ("zcode-edit-exact", "edit", vec!["src/zone.rs"]),

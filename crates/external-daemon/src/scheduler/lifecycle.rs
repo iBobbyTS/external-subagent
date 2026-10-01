@@ -2,10 +2,16 @@ use super::types::{STALLED_NO_ACTIVITY_REASON, STALL_DIAGNOSTIC_STAGE};
 use super::*;
 use crate::{TRANSPORT_DIAGNOSTIC_STAGE, TRANSPORT_FRAME_LIMIT_REASON};
 use external_store::StoreError;
+use state::StartingHandle;
+
 impl Scheduler {
     pub fn start_ready(&self) -> Result<Vec<String>, SchedulerError> {
         let mut started = Vec::new();
         loop {
+            #[cfg(test)]
+            if let Some(hook) = self.inner.before_claim_hook.lock().unwrap().clone() {
+                hook();
+            }
             let claim = self.inner.store.claim_next(
                 &self.inner.owner_id,
                 usize::MAX,
@@ -23,7 +29,7 @@ impl Scheduler {
         }
     }
 
-    fn start_claim(&self, claim: TaskClaim) -> Result<bool, SchedulerError> {
+    pub(super) fn start_claim(&self, claim: TaskClaim) -> Result<bool, SchedulerError> {
         let task = self.inner.store.get_task(&claim.task.agent_id)?;
         let route = match task_route(&claim.task) {
             Ok(route) => route,
@@ -179,6 +185,73 @@ impl Scheduler {
                 });
             }
         };
+        let identity = runtime.identity().map(|identity| StoredProcessIdentity {
+            pid: identity.pid,
+            process_group_id: identity.pgid,
+            uid: identity.uid,
+            start_token: identity.start_token,
+        });
+
+        #[cfg(test)]
+        if let Some(hook) = self.inner.before_starting_handle_hook.lock().unwrap().clone() {
+            hook();
+        }
+
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            state.starting.insert(
+                claim.task.agent_id.clone(),
+                StartingHandle {
+                    owner_epoch: claim.owner_epoch,
+                    identity: identity.clone(),
+                    runtime: Arc::clone(&runtime),
+                },
+            );
+        }
+
+        let recheck = self.inner.store.get_task(&claim.task.agent_id)?;
+        let cancelled = match recheck {
+            Some(t) => {
+                t.owner_epoch == claim.owner_epoch
+                    && (t.phase == TaskPhase::Cancelling || t.stop_requested || t.close_requested)
+            }
+            None => true,
+        };
+        if cancelled {
+            {
+                let mut state = self.inner.state.lock().unwrap();
+                if let Some(handle) = state.starting.get(&claim.task.agent_id) {
+                    if handle.owner_epoch == claim.owner_epoch {
+                        state.starting.remove(&claim.task.agent_id);
+                    }
+                }
+            }
+            let terminal = runtime.stop(self.inner.config.stop_grace);
+            let resources_reaped = terminal_proves_process_group_reaped(&terminal);
+            let failure_message = self.record_runtime_failure(
+                &claim.task.agent_id,
+                claim.task.session_id.as_deref(),
+                "cancelled",
+                "CANCELLED",
+                "task was cancelled before bootstrap",
+                Some(runtime.as_ref()),
+            );
+            let _ = self.finish_unstarted_route(
+                &claim.task.agent_id,
+                claim.owner_epoch,
+                &route,
+                task.as_ref(),
+                UnstartedTerminal {
+                    outcome: CompletionOutcome::Cancelled,
+                    reason_code: "CANCELLED",
+                    message: "task was cancelled before bootstrap",
+                    failure_message: Some(failure_message),
+                },
+                resources_reaped,
+            );
+            return Ok(false);
+        }
+
         activity.confirm_runtime_source(observation::adapter_runtime_source_verified(
             &adapter,
             self.inner.config.runtime_source.as_deref(),
@@ -192,6 +265,14 @@ impl Scheduler {
         } {
             Ok(session) => session,
             Err(error) => {
+                {
+                    let mut state = self.inner.state.lock().unwrap();
+                    if let Some(handle) = state.starting.get(&claim.task.agent_id) {
+                        if handle.owner_epoch == claim.owner_epoch {
+                            state.starting.remove(&claim.task.agent_id);
+                        }
+                    }
+                }
                 let message = error.to_string();
                 let terminal = runtime.stop(self.inner.config.stop_grace);
                 let resources_reaped = terminal_proves_process_group_reaped(&terminal);
@@ -245,6 +326,14 @@ impl Scheduler {
                 requested_model.as_deref(),
                 session.configured_model.as_deref(),
             ) {
+                {
+                    let mut state = self.inner.state.lock().unwrap();
+                    if let Some(handle) = state.starting.get(&claim.task.agent_id) {
+                        if handle.owner_epoch == claim.owner_epoch {
+                            state.starting.remove(&claim.task.agent_id);
+                        }
+                    }
+                }
                 let message = "runtime model did not match the prepared request";
                 let terminal = runtime.stop(self.inner.config.stop_grace);
                 let failure_message = self.record_runtime_failure(
@@ -277,12 +366,6 @@ impl Scheduler {
                 });
             }
         }
-        let identity = runtime.identity().map(|identity| StoredProcessIdentity {
-            pid: identity.pid,
-            process_group_id: identity.pgid,
-            uid: identity.uid,
-            start_token: identity.start_token,
-        });
         let operation = Arc::new(Mutex::new(()));
         let check = Arc::new(ActiveCheck::default());
         let ready_turn_state = match runtime.turn_snapshot() {
@@ -295,6 +378,7 @@ impl Scheduler {
         };
         {
             let mut state = self.inner.state.lock().unwrap();
+            state.starting.remove(&claim.task.agent_id);
             // The wait text stream is per-task, not per-claim: a follow-up or
             // resume replaces the tracker, so the incoming one must inherit the
             // old window and byte cursors. Both the read of the old tracker and
