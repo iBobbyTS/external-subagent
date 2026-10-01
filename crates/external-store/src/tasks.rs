@@ -275,6 +275,113 @@ impl Store {
         }))
     }
 
+    pub fn claim_specific(
+        &self,
+        agent_id: &str,
+        owner_id: &str,
+        per_workspace_limit: usize,
+    ) -> StoreResult<Option<TaskClaim>> {
+        if per_workspace_limit == 0 {
+            return Ok(None);
+        }
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let candidate = transaction
+            .query_row(
+                "SELECT agent_id FROM tasks queued
+                 WHERE agent_id=?1 AND phase='QUEUED' AND close_requested=0 AND stop_requested=0
+                   AND (SELECT COUNT(*) FROM tasks active
+                        WHERE active.repository=queued.repository
+                          AND active.phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')) < ?2",
+                params![agent_id, usize_to_i64(per_workspace_limit)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(candidate_id) = candidate else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let now = now_millis();
+        let changed = transaction.execute(
+            "UPDATE tasks SET phase='PREPARING',owner_id=?1,owner_epoch=owner_epoch+1,
+                 started_at=COALESCE(started_at,?2),last_heartbeat_at=?2
+             WHERE agent_id=?3 AND phase='QUEUED' AND close_requested=0 AND stop_requested=0",
+            params![owner_id, now, candidate_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::Conflict(format!(
+                "task {candidate_id} lost its queue claim"
+            )));
+        }
+        let task = query_task(&transaction, &candidate_id)?
+            .ok_or_else(|| StoreError::InvalidState("claimed task disappeared".into()))?;
+        insert_ledger(
+            &transaction,
+            &candidate_id,
+            task.owner_epoch,
+            Some(TaskPhase::Queued),
+            TaskPhase::Preparing,
+            None,
+            Some("CLAIMED"),
+        )?;
+        transaction.commit()?;
+        Ok(Some(TaskClaim {
+            owner_epoch: task.owner_epoch,
+            task,
+        }))
+    }
+
+    pub fn cancel_unstarted_if_still_fresh(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Result<(TaskPhase, u64), TaskRecord>> {
+        let mut connection = self.connection.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = query_task(&transaction, agent_id)?
+            .ok_or_else(|| StoreError::InvalidState(format!("unknown task {agent_id}")))?;
+        let is_fresh = task.session_id.is_none()
+            && matches!(task.phase, TaskPhase::Queued | TaskPhase::Preparing)
+            && !task.stop_requested;
+        if !is_fresh {
+            transaction.commit()?;
+            return Ok(Err(task));
+        }
+        let changed = transaction.execute(
+            "UPDATE tasks SET phase='CANCELLING', stop_requested=1
+             WHERE agent_id=?1 AND session_id IS NULL
+               AND phase IN ('QUEUED','PREPARING') AND stop_requested=0",
+            params![agent_id],
+        )?;
+        if changed != 1 {
+            let current = query_task(&transaction, agent_id)?
+                .ok_or_else(|| StoreError::InvalidState(format!("task {agent_id} disappeared")))?;
+            transaction.commit()?;
+            return Ok(Err(current));
+        }
+        transaction.execute(
+            "UPDATE messages SET state='FAILED',failure_code='STOP_REQUESTED',
+                 failure_message='runtime is no longer available'
+             WHERE agent_id=?1 AND state IN ('QUEUED','SENDING')",
+            [agent_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_requests
+             WHERE agent_id=?1 AND state IN ('PENDING','SENDING')",
+            [agent_id],
+        )?;
+        insert_ledger(
+            &transaction,
+            agent_id,
+            task.owner_epoch,
+            Some(task.phase),
+            TaskPhase::Cancelling,
+            None,
+            Some("STOP_REQUESTED"),
+        )?;
+        transaction.commit()?;
+        Ok(Ok((task.phase, task.owner_epoch)))
+    }
+
     pub fn mark_session_running(
         &self,
         agent_id: &str,
@@ -520,4 +627,139 @@ pub(crate) fn query_guard(
         value.3 != 0,
         value.4 != 0,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_task(id: &str, repository: &str) -> NewTask {
+        NewTask {
+            agent_id: id.into(),
+            repository: repository.into(),
+            workspace_path: format!("/workspace/{id}"),
+            runtime_hash: Some("hash".into()),
+            prepared_launch_json: "{}".into(),
+            initial_prompt: "run".into(),
+        }
+    }
+
+    fn test_store() -> (TempDir, Store) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.sqlite3");
+        let store = Store::open(&path).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn test_claim_specific_predicate_and_ledger() {
+        let (_dir, store) = test_store();
+
+        // 1. Success path
+        store.enqueue_task_authoritative(&test_task("task-1", "/repo-a")).unwrap();
+        let claim = store.claim_specific("task-1", "starter-thread", 5).unwrap();
+        assert!(claim.is_some());
+        let claim = claim.unwrap();
+        assert_eq!(claim.owner_epoch, 1);
+        assert_eq!(claim.task.phase, TaskPhase::Preparing);
+        assert_eq!(claim.task.owner_id.as_deref(), Some("starter-thread"));
+
+        // Verify ledger recorded CLAIMED from QUEUED to PREPARING
+        let conn = store.connection.lock().unwrap();
+        let (from_phase, to_phase, reason): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT from_phase, to_phase, reason_code FROM lifecycle_ledger WHERE agent_id='task-1' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(from_phase.as_deref(), Some("QUEUED"));
+        assert_eq!(to_phase, "PREPARING");
+        assert_eq!(reason.as_deref(), Some("CLAIMED"));
+        drop(conn);
+
+        // 2. Already claimed / non-QUEUED -> Ok(None) and no row modification
+        let second = store.claim_specific("task-1", "other", 5).unwrap();
+        assert!(second.is_none());
+        let current = store.get_task("task-1").unwrap().unwrap();
+        assert_eq!(current.owner_id.as_deref(), Some("starter-thread"));
+        assert_eq!(current.owner_epoch, 1);
+
+        // 3. Capacity exceeded (active tasks count >= per_workspace_limit)
+        store.enqueue_task_authoritative(&test_task("task-2", "/repo-a")).unwrap();
+        // task-1 is in PREPARING, so active count in /repo-a is 1. With limit=1, task-2 cannot be claimed.
+        let blocked = store.claim_specific("task-2", "starter", 1).unwrap();
+        assert!(blocked.is_none());
+        // With limit=2, task-2 can be claimed
+        let allowed = store.claim_specific("task-2", "starter", 2).unwrap();
+        assert!(allowed.is_some());
+
+        // 4. close_requested or stop_requested -> Ok(None)
+        store.enqueue_task_authoritative(&test_task("task-3", "/repo-b")).unwrap();
+        store.request_stop("task-3").unwrap();
+        assert!(store.claim_specific("task-3", "starter", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cancel_unstarted_if_still_fresh_transitions() {
+        let (_dir, store) = test_store();
+
+        // 1. Fresh in QUEUED (session_id is None, phase=QUEUED, stop_requested=0)
+        store.enqueue_task_authoritative(&test_task("task-q", "/repo")).unwrap();
+        let cancel_res = store.cancel_unstarted_if_still_fresh("task-q").unwrap();
+        assert_eq!(cancel_res, Ok((TaskPhase::Queued, 0)));
+
+        let task_q = store.get_task("task-q").unwrap().unwrap();
+        assert_eq!(task_q.phase, TaskPhase::Cancelling);
+        assert!(task_q.stop_requested);
+
+        // Verify ledger
+        let conn = store.connection.lock().unwrap();
+        let (from_phase, to_phase, reason): (Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT from_phase, to_phase, reason_code FROM lifecycle_ledger WHERE agent_id='task-q' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(from_phase.as_deref(), Some("QUEUED"));
+        assert_eq!(to_phase, "CANCELLING");
+        assert_eq!(reason.as_deref(), Some("STOP_REQUESTED"));
+        drop(conn);
+
+        // 2. Fresh in PREPARING (session_id is None, phase=PREPARING, stop_requested=0)
+        store.enqueue_task_authoritative(&test_task("task-p", "/repo")).unwrap();
+        let claim = store.claim_specific("task-p", "starter", 5).unwrap().unwrap();
+        assert_eq!(claim.task.phase, TaskPhase::Preparing);
+        let cancel_p = store.cancel_unstarted_if_still_fresh("task-p").unwrap();
+        assert_eq!(cancel_p, Ok((TaskPhase::Preparing, claim.owner_epoch)));
+
+        let task_p = store.get_task("task-p").unwrap().unwrap();
+        assert_eq!(task_p.phase, TaskPhase::Cancelling);
+        assert!(task_p.stop_requested);
+
+        // 3. stop_requested already set -> mismatch does not write, returns current row
+        let mismatch_stop = store.cancel_unstarted_if_still_fresh("task-p").unwrap();
+        assert!(matches!(mismatch_stop, Err(t) if t.agent_id == "task-p" && t.stop_requested));
+
+        // 4. session_id is not None -> mismatch does not write, returns current row
+        store.enqueue_task_authoritative(&test_task("task-s", "/repo")).unwrap();
+        let claim_s = store.claim_specific("task-s", "starter", 5).unwrap().unwrap();
+        store
+            .mark_session_running(
+                "task-s",
+                claim_s.owner_epoch,
+                "runtime-1",
+                None,
+                Some("session-established-123"),
+                None,
+            )
+            .unwrap();
+        let mismatch_session = store.cancel_unstarted_if_still_fresh("task-s").unwrap();
+        assert!(matches!(mismatch_session, Err(t) if t.session_id.as_deref() == Some("session-established-123") && t.phase == TaskPhase::Running));
+        let task_s_after = store.get_task("task-s").unwrap().unwrap();
+        assert_eq!(task_s_after.phase, TaskPhase::Running);
+        assert!(!task_s_after.stop_requested);
+    }
 }
