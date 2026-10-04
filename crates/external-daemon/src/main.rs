@@ -42,6 +42,9 @@ const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__orphan-spawn")) {
+        external_runtime::orphan_spawn_main();
+    }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
     signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;

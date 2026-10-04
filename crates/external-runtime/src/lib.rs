@@ -1,3 +1,8 @@
+#[cfg(target_os = "macos")]
+mod detached;
+#[cfg(target_os = "macos")]
+pub use detached::{orphan_spawn_main, DetachedTestOptions, TestGate};
+
 use external_contract::{
     classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
     ResponseEnvelope, WireId, WireMessage,
@@ -21,6 +26,69 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+/// All daemon process creation must use this gate, including attached probes.
+/// Detached spawning holds it through descriptor transfer and helper-parent reap.
+pub static SPAWN_GATE: Mutex<()> = Mutex::new(());
+
+pub fn gated_spawn(command: &mut Command) -> io::Result<Child> {
+    let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    command.spawn()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnModel {
+    #[default]
+    Attached,
+    Detached,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn orphan_spawn_main() -> ! {
+    std::process::exit(126)
+}
+
+enum RuntimeInput {
+    Attached(ChildStdin),
+    #[cfg(target_os = "macos")]
+    Detached(std::fs::File),
+}
+impl Write for RuntimeInput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Attached(input) => input.write(bytes),
+            #[cfg(target_os = "macos")]
+            Self::Detached(input) => input.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Attached(input) => input.flush(),
+            #[cfg(target_os = "macos")]
+            Self::Detached(input) => input.flush(),
+        }
+    }
+}
+#[cfg(unix)]
+impl AsRawFd for RuntimeInput {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Attached(input) => input.as_raw_fd(),
+            #[cfg(target_os = "macos")]
+            Self::Detached(input) => input.as_raw_fd(),
+        }
+    }
+}
+
+struct StartedRuntime {
+    stdin: RuntimeInput,
+    stdout: Box<dyn Read + Send>,
+    stderr: Box<dyn Read + Send>,
+    identity: ProcessIdentity,
+    child: Option<Child>,
+    #[cfg(target_os = "macos")]
+    queue: Option<detached::ExitQueue>,
+}
 
 /// Hard cap for one NDJSON wire line, counted including the line delimiter.
 ///
@@ -197,7 +265,7 @@ enum BeginStop {
 }
 
 pub struct Driver {
-    stdin: Arc<Mutex<ChildStdin>>,
+    stdin: Arc<Mutex<RuntimeInput>>,
     incoming: Mutex<Receiver<Inbound>>,
     child: Arc<Mutex<Option<Child>>>,
     termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
@@ -209,6 +277,7 @@ pub struct Driver {
     diagnostics: Arc<Mutex<Vec<u8>>>,
     diagnostics_done: Arc<(Mutex<bool>, Condvar)>,
     codec: FrameCodec,
+    model: SpawnModel,
 }
 
 impl Driver {
@@ -221,7 +290,66 @@ impl Driver {
     /// requests/responses; NDJSON mode parses each inbound line as one JSON
     /// value and delivers it as a raw unknown-event frame. All other process,
     /// deadline, and correlation behavior is identical.
-    pub fn spawn_with_codec(mut command: Command, codec: FrameCodec) -> std::io::Result<Self> {
+    pub fn spawn_with_codec(command: Command, codec: FrameCodec) -> io::Result<Self> {
+        Self::spawn_with_codec_and_model(command, codec, SpawnModel::Attached)
+    }
+
+    /// Detached supports the Command program/args/cwd/env-set/env-remove subset.
+    /// env_clear, uid/gid, arg0 and caller pre_exec are outside that contract.
+    pub fn spawn_with_model(command: Command, model: SpawnModel) -> io::Result<Self> {
+        Self::spawn_with_codec_and_model(command, FrameCodec::ZcodeStrict, model)
+    }
+
+    pub fn spawn_with_codec_and_model(
+        command: Command,
+        codec: FrameCodec,
+        model: SpawnModel,
+    ) -> io::Result<Self> {
+        let started = match model {
+            SpawnModel::Attached => Self::start_attached(command)?,
+            SpawnModel::Detached => {
+                #[cfg(target_os = "macos")]
+                {
+                    detached::spawn(command, &std::env::current_exe()?, &Default::default())?
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "detached requires macOS",
+                    ));
+                }
+            }
+        };
+        Self::from_started(started, codec, model, Default::default())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    pub fn spawn_for_test(
+        command: Command,
+        codec: FrameCodec,
+        model: SpawnModel,
+        options: DetachedTestOptions,
+    ) -> io::Result<Self> {
+        if !cfg!(debug_assertions) {
+            return Err(io::Error::other("test hooks require a debug build"));
+        }
+        let started = match model {
+            SpawnModel::Attached => Self::start_attached(command)?,
+            SpawnModel::Detached => detached::spawn(
+                command,
+                options
+                    .helper
+                    .as_deref()
+                    .ok_or_else(|| io::Error::other("missing test helper"))?,
+                &options,
+            )?,
+        };
+        Self::from_started(started, codec, model, options)
+    }
+
+    fn start_attached(mut command: Command) -> io::Result<StartedRuntime> {
         #[cfg(unix)]
         {
             unsafe {
@@ -238,7 +366,7 @@ impl Driver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        let mut child = gated_spawn(&mut command)?;
         let identity = match observe_process(child.id()) {
             Ok(identity) => identity,
             Err(error) => {
@@ -252,13 +380,38 @@ impl Driver {
             let _ = child.wait();
             return Err(error);
         }
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr = child.stderr.take().expect("piped stderr");
+        Ok(StartedRuntime {
+            stdin: RuntimeInput::Attached(child.stdin.take().expect("piped stdin")),
+            stdout: Box::new(child.stdout.take().expect("piped stdout")),
+            stderr: Box::new(child.stderr.take().expect("piped stderr")),
+            identity,
+            child: Some(child),
+            #[cfg(target_os = "macos")]
+            queue: None,
+        })
+    }
+
+    fn from_started(
+        started: StartedRuntime,
+        codec: FrameCodec,
+        model: SpawnModel,
+        #[cfg(target_os = "macos")] hooks: DetachedTestOptions,
+        #[cfg(not(target_os = "macos"))] _hooks: (),
+    ) -> io::Result<Self> {
+        let stdin = Arc::new(Mutex::new(started.stdin));
+        let stdout = started.stdout;
+        let stderr = started.stderr;
+        let identity = started.identity;
         let (raw_tx, raw_rx) = mpsc::channel();
         let read_tx = raw_tx.clone();
         let (read_done_tx, read_done_rx) = mpsc::channel();
         let read_codec = codec;
+        #[cfg(target_os = "macos")]
+        let stdout = detached::GatedReader {
+            inner: stdout,
+            gate: hooks.reader_gate.clone(),
+            start_gate: hooks.reader_start_gate.clone(),
+        };
         thread::spawn(move || read_loop(stdout, read_tx, read_done_tx, read_codec));
         // Always drain diagnostics independently of the protocol stream. A
         // noisy runtime must not block stdout. The bounded diagnostic tail is
@@ -275,12 +428,29 @@ impl Driver {
                 cvar.notify_all();
             }
         });
-        let child_ref = Arc::new(Mutex::new(Some(child)));
+        let child_ref = Arc::new(Mutex::new(started.child));
         let monitor_ref = Arc::clone(&child_ref);
         let termination = Arc::new((Mutex::new(None), Condvar::new()));
         let monitor_termination = Arc::clone(&termination);
         thread::spawn(move || {
-            monitor_child(monitor_ref, raw_tx, monitor_termination, read_done_rx)
+            #[cfg(target_os = "macos")]
+            if let Some(queue) = started.queue {
+                let exit = queue.wait().unwrap_or(ChildExit::Unknown);
+                if let Some(gate) = hooks.monitor_gate {
+                    gate.arrive_and_wait();
+                }
+                let _ = read_done_rx.recv_timeout(Duration::from_secs(1));
+                publish_child_exit(exit, &raw_tx, &monitor_termination);
+                return;
+            }
+            monitor_child(
+                monitor_ref,
+                raw_tx,
+                monitor_termination,
+                read_done_rx,
+                #[cfg(target_os = "macos")]
+                hooks.monitor_gate,
+            )
         });
         let pending = Arc::new(Mutex::new(PendingMap::new()));
         let subscribers = Arc::new(Mutex::new(Vec::new()));
@@ -303,6 +473,7 @@ impl Driver {
             diagnostics,
             diagnostics_done,
             codec,
+            model,
         })
     }
     #[cfg(test)]
@@ -411,7 +582,7 @@ impl Driver {
 
         let fd = input.as_raw_fd();
         let mut flags = NonblockingFdFlags::install(fd).map_err(request_write_error)?;
-        let write_result = write_all_before(&mut input, frame, deadline);
+        let write_result = write_all_before(&mut *input, frame, deadline);
         let restore_result = flags.restore().map_err(request_write_error);
         match (write_result, restore_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -462,6 +633,12 @@ impl Driver {
     pub fn close(&self) -> std::io::Result<()> {
         self.stop()
     }
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[doc(hidden)]
+    pub fn replace_identity_for_test(&mut self, identity: ProcessIdentity) {
+        self.identity = identity;
+    }
+
     pub fn identity(&self) -> ProcessIdentity {
         self.identity.clone()
     }
@@ -587,6 +764,9 @@ impl Driver {
     }
 
     fn perform_stop(&self, timeout: Duration) -> io::Result<StopOutcome> {
+        if self.model == SpawnModel::Detached {
+            return self.perform_detached_stop(timeout);
+        }
         let mut child = self.child.lock().unwrap();
         let process = child
             .as_mut()
@@ -630,6 +810,52 @@ impl Driver {
                 io::Error::new(io::ErrorKind::TimedOut, "process group survived SIGKILL")
             })?;
         Ok(StopOutcome::Terminated(exit))
+    }
+
+    fn perform_detached_stop(&self, timeout: Duration) -> io::Result<StopOutcome> {
+        validate_spawn_identity(self.identity.pid, &self.identity)?;
+        let observed = match observe_process(self.identity.pid) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A dead leader cannot authorize signalling its remaining descendants.
+                ensure_group_empty(self.identity.pgid)?;
+                return Ok(StopOutcome::AlreadyExited(self.detached_exit()));
+            }
+            Err(error) => return Err(error),
+        };
+        validate_same_identity(&self.identity, &observed)?;
+        validate_owned_group(&self.identity, &observe_process_group(self.identity.pgid)?)?;
+        signal_group(self.identity.pgid, TERM_SIGNAL)?;
+        if !wait_for_persisted_group_death(self.identity.pgid, timeout)? {
+            validate_live_group_after_term(
+                &self.identity,
+                &observe_process_group(self.identity.pgid)?,
+            )?;
+            signal_group(self.identity.pgid, KILL_SIGNAL)?;
+            if !wait_for_persisted_group_death(self.identity.pgid, timeout)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "process group survived SIGKILL",
+                ));
+            }
+        }
+        Ok(StopOutcome::Terminated(self.detached_exit()))
+    }
+
+    fn detached_exit(&self) -> ChildExit {
+        // Stop never consumes kqueue or publishes a second terminal event.
+        let (result, ready) = &*self.termination;
+        let guard = result.lock().unwrap();
+        let (guard, _) = ready
+            .wait_timeout_while(guard, Duration::from_millis(1200), |v| v.is_none())
+            .unwrap();
+        guard.clone().unwrap_or_else(|| {
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .extend_from_slice(b"detached group died before terminal latch; Unknown\n");
+            ChildExit::Unknown
+        })
     }
 
     pub fn wait(&self) -> std::io::Result<Option<i32>> {
@@ -737,7 +963,7 @@ fn settable_fd_flags(flags: libc::c_int) -> libc::c_int {
 
 #[cfg(unix)]
 fn write_all_before(
-    input: &mut ChildStdin,
+    input: &mut (impl Write + AsRawFd),
     frame: &[u8],
     deadline: Instant,
 ) -> Result<(), RequestError> {
@@ -1440,6 +1666,7 @@ fn monitor_child(
     tx: Sender<Inbound>,
     termination: Arc<(Mutex<Option<ChildExit>>, Condvar)>,
     read_done: Receiver<()>,
+    #[cfg(target_os = "macos")] monitor_gate: Option<Arc<TestGate>>,
 ) {
     const READ_EXIT_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1459,19 +1686,16 @@ fn monitor_child(
             }
         };
         if let Some(status) = status {
+            #[cfg(target_os = "macos")]
+            if let Some(gate) = monitor_gate {
+                gate.arrive_and_wait();
+            }
             // A descendant may retain the stdout descriptor after the leader
             // exits. Preserve the reader ordering barrier when it completes,
             // but publish a bounded boundary so RuntimeOwner can classify a
             // still-live or ambiguous group without signalling it.
             let _ = read_done.recv_timeout(READ_EXIT_BOUNDARY_TIMEOUT);
-            let exit = exit_class(status);
-            let (result, cvar) = &*termination;
-            let mut guard = result.lock().unwrap();
-            if guard.is_none() {
-                *guard = Some(exit.clone());
-            }
-            cvar.notify_all();
-            let _ = tx.send(Inbound::ChildExited(exit));
+            publish_child_exit(exit_class(status), &tx, &termination);
             return;
         }
         thread::sleep(Duration::from_millis(10));
@@ -1487,9 +1711,9 @@ fn publish_child_exit(
     let mut guard = result.lock().unwrap();
     if guard.is_none() {
         *guard = Some(exit.clone());
+        cvar.notify_all();
+        let _ = tx.send(Inbound::ChildExited(exit));
     }
-    cvar.notify_all();
-    let _ = tx.send(Inbound::ChildExited(exit));
 }
 
 #[cfg(unix)]

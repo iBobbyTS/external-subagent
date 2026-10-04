@@ -9,3 +9,8 @@ external-contract = { path = "../external-contract" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
+
+# Integration-test executable only; native payload builds select daemon/mcp bins.
+[[bin]]
+name = "orphan-spawn-test"
+path = "src/bin/orphan-spawn-test.rs"
