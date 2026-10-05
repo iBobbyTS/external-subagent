@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -6,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { CliError } from '../../cli/errors.mjs';
-import { main } from '../../cli/main.mjs';
+import { HELP, main } from '../../cli/main.mjs';
 import { productPaths, profilesDir } from '../../cli/paths.mjs';
 import { callDaemon } from '../../cli/rpc.mjs';
 import {
@@ -18,12 +19,77 @@ import {
   scanProfilesDir,
 } from '../../cli/commands/tasks.mjs';
 
+const CORPUS_DIR = path.resolve(import.meta.dirname, 'profiles-corpus');
+const CLI_BIN = path.resolve(import.meta.dirname, '../../bin/external-subagent.mjs');
+const NO_ENV = Object.freeze({});
+
+// The category stored in each corpus expectation maps to a substring that the
+// scanner's diagnostic must contain, so failures point at the right rule.
+const REASON_MARKERS = Object.freeze({
+  unterminated_basic: 'Unterminated basic string',
+  unterminated_multiline: 'Unterminated multiline',
+  invalid_escape: 'Invalid escape sequence',
+  invalid_unicode: 'Invalid Unicode code point',
+  illegal_primitive: 'Invalid TOML primitive',
+  duplicate_key: 'duplicate key',
+  array_error: 'in array',
+  inline_table_error: 'in inline table',
+  lone_cr: 'Disallowed control character 0x0d',
+  basic_newline: 'Unescaped newline in basic string',
+  unknown_key: 'unknown top-level key',
+  table_header: 'unexpected table header',
+  dotted_key: 'dotted key',
+  missing_name: "missing required field 'name'",
+  name_not_string: "field 'name': must be a string",
+  empty_name: "field 'name': cannot be empty",
+  oversize_name: "field 'name': exceeds 128 bytes",
+  nul_name: "field 'name': cannot contain NUL byte",
+});
+
 function createTempEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-profiles-'));
   const paths = productPaths(home);
   const profilesPath = path.join(paths.data, 'profiles');
   fs.mkdirSync(profilesPath, { recursive: true });
   return { home, paths, profilesDir: profilesPath };
+}
+
+function listProfiles(paths, env = NO_ENV) {
+  return profileCommand(paths, ['list'], env);
+}
+
+function showProfile(paths, name, env = NO_ENV) {
+  return profileCommand(paths, ['show', name], env);
+}
+
+function runCli(args, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [CLI_BIN, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+async function withMockErrorDaemon(socketPath, message, fn) {
+  const server = net.createServer((socket) => socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk.toString('utf8'));
+    socket.end(`${JSON.stringify({
+      request_id: request.request_id,
+      outcome: 'error',
+      error: { code: 'validation', message },
+    })}\n`);
+  }));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    return await fn();
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +282,7 @@ name = "real"
   for (const [idx, content] of [[1, content1], [2, content2], [3, content3], [4, content4]]) {
     const singleEnv = createTempEnv();
     fs.writeFileSync(path.join(singleEnv.profilesDir, `test-${idx}.toml`), content);
-    const listRes = profileCommand(singleEnv.paths, ['list']);
+    const listRes = listProfiles(singleEnv.paths);
     assert.deepEqual(listRes.profiles, ['real'], `fixture ${idx} failed to yield 'real'`);
     assert.deepEqual(listRes.warnings, [], `fixture ${idx} unexpectedly reported warnings`);
     fs.rmSync(singleEnv.home, { recursive: true, force: true });
@@ -225,7 +291,7 @@ name = "real"
   // Write Fixture ④ into profiles directory: show real MUST hit this file
   const f4Path = path.join(profilesDir, 'escaped_key.toml');
   fs.writeFileSync(f4Path, content4);
-  const showRes = profileCommand(paths, ['show', 'real']);
+  const showRes = showProfile(paths, 'real');
   assert.equal(showRes.operation, 'show');
   assert.equal(showRes.name, 'real');
   assert.equal(showRes.file, f4Path);
@@ -238,7 +304,7 @@ test('AC3: missing profiles directory returns empty list with path note', () => 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'missing-profiles-dir-'));
   const paths = productPaths(home);
   // Do NOT create profiles directory
-  const res = profileCommand(paths, ['list']);
+  const res = listProfiles(paths);
   assert.equal(res.operation, 'list');
   assert.deepEqual(res.profiles, []);
   assert.deepEqual(res.warnings, []);
@@ -247,7 +313,7 @@ test('AC3: missing profiles directory returns empty list with path note', () => 
 
   // show on missing directory
   assert.throws(
-    () => profileCommand(paths, ['show', 'anything']),
+    () => showProfile(paths, 'anything'),
     (err) => {
       assert.equal(err.code, 'INVALID_ARGUMENT');
       assert.equal(err.exitCode, 2);
@@ -260,7 +326,7 @@ test('AC3: missing profiles directory returns empty list with path note', () => 
 
 test('AC3: empty profiles directory returns empty list', () => {
   const { paths } = createTempEnv();
-  const res = profileCommand(paths, ['list']);
+  const res = listProfiles(paths);
   assert.equal(res.operation, 'list');
   assert.deepEqual(res.profiles, []);
   assert.deepEqual(res.warnings, []);
@@ -291,7 +357,7 @@ test('AC3: warnings are reported and problematic files excluded from available p
   // Dotted name key
   fs.writeFileSync(path.join(profilesDir, 'dotted.toml'), 'name.sub = "dotted"');
 
-  const listRes = profileCommand(paths, ['list']);
+  const listRes = listProfiles(paths);
   // Only valid-profile should be in profiles
   assert.deepEqual(listRes.profiles, ['valid-profile']);
   // All others are in warnings
@@ -308,7 +374,7 @@ test('AC3: warnings are reported and problematic files excluded from available p
 
   // show unknown lists available profiles and includes broken files diagnostic
   assert.throws(
-    () => profileCommand(paths, ['show', 'nonexistent']),
+    () => showProfile(paths, 'nonexistent'),
     (err) => {
       assert.equal(err.code, 'INVALID_ARGUMENT');
       assert.equal(err.exitCode, 2);
@@ -329,7 +395,7 @@ test('AC3: duplicate profiles are evicted from list with warnings and trigger am
   fs.writeFileSync(path.join(profilesDir, 'b.toml'), 'name = "duplicate_worker"\nmodel = "claude-4"');
   fs.writeFileSync(path.join(profilesDir, 'c.toml'), 'name = "unique_worker"\nmodel = "gemini-2"');
 
-  const listRes = profileCommand(paths, ['list']);
+  const listRes = listProfiles(paths);
   // duplicate_worker evicted; only unique_worker is available
   assert.deepEqual(listRes.profiles, ['unique_worker']);
   assert.equal(listRes.warnings.length, 2);
@@ -337,7 +403,7 @@ test('AC3: duplicate profiles are evicted from list with warnings and trigger am
 
   // show on duplicate_worker reports ambiguity error with both conflicting files
   assert.throws(
-    () => profileCommand(paths, ['show', 'duplicate_worker']),
+    () => showProfile(paths, 'duplicate_worker'),
     (err) => {
       assert.equal(err.code, 'INVALID_ARGUMENT');
       assert.equal(err.exitCode, 2);
@@ -349,7 +415,7 @@ test('AC3: duplicate profiles are evicted from list with warnings and trigger am
   );
 
   // show on unique_worker succeeds
-  const showRes = profileCommand(paths, ['show', 'unique_worker']);
+  const showRes = showProfile(paths, 'unique_worker');
   assert.equal(showRes.name, 'unique_worker');
   assert.equal(showRes.file, path.join(profilesDir, 'c.toml'));
 
@@ -441,7 +507,7 @@ test('AC5: >512 byte ASCII and Unicode profile lists are fully preserved at CLI 
   asciiNames.sort();
 
   assert.throws(
-    () => profileCommand(paths, ['show', 'nonexistent_ascii']),
+    () => showProfile(paths, 'nonexistent_ascii'),
     (err) => {
       assert.equal(err.code, 'INVALID_ARGUMENT');
       assert.equal(err.exitCode, 2);
@@ -468,7 +534,7 @@ test('AC5: >512 byte ASCII and Unicode profile lists are fully preserved at CLI 
   unicodeNames.sort();
 
   assert.throws(
-    () => profileCommand(paths, ['show', 'nonexistent_unicode']),
+    () => showProfile(paths, 'nonexistent_unicode'),
     (err) => {
       assert.equal(err.code, 'INVALID_ARGUMENT');
       assert.equal(err.exitCode, 2);
@@ -537,4 +603,195 @@ test('CLI main dispatches profile list and profile show commands', async () => {
     else delete process.env.EXTERNAL_SUBAGENT_CONFIG;
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// S02 repair wave 1: shared differential corpus and fix-specific regressions
+// ---------------------------------------------------------------------------
+
+test('corpus: scanner output matches the shared TOML differential corpus item-for-item', () => {
+  const files = fs.readdirSync(CORPUS_DIR).filter((file) => file.endsWith('.toml')).sort();
+  assert.ok(files.length > 0, 'corpus must not be empty');
+  for (const file of files) {
+    const stem = file.slice(0, -'.toml'.length);
+    const expected = JSON.parse(fs.readFileSync(path.join(CORPUS_DIR, `${stem}.expected.json`), 'utf8'));
+    const result = scanProfileToml(fs.readFileSync(path.join(CORPUS_DIR, file), 'utf8'), file);
+    assert.equal(result.valid, expected.valid, `${stem}: valid mismatch`);
+    assert.equal(result.name ?? null, expected.name, `${stem}: name mismatch`);
+    if (expected.valid) {
+      assert.deepEqual(result.errors, [], `${stem}: valid item must carry no diagnostics`);
+    } else {
+      const marker = REASON_MARKERS[expected.reason];
+      assert.ok(marker, `${stem}: unknown reason category ${expected.reason}`);
+      assert.ok(
+        result.errors.some((error) => error.includes(marker)),
+        `${stem}: diagnostics ${JSON.stringify(result.errors)} must expose reason ${expected.reason}`,
+      );
+    }
+  }
+});
+
+test('fix3: only TOML-syntax-valid files own a name; broken files never evict valid ones', () => {
+  // good + broken sharing the same name, both orders.
+  const order1 = createTempEnv();
+  fs.writeFileSync(path.join(order1.profilesDir, 'a-broken.toml'), 'name = "real"\nmodel = "unclosed\n');
+  fs.writeFileSync(path.join(order1.profilesDir, 'b-good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  const res1 = listProfiles(order1.paths);
+  assert.deepEqual(res1.profiles, ['real']);
+  assert.equal(res1.warnings.length, 1);
+  assert.ok(res1.warnings[0].file.endsWith('a-broken.toml'));
+  fs.rmSync(order1.home, { recursive: true, force: true });
+
+  const order2 = createTempEnv();
+  fs.writeFileSync(path.join(order2.profilesDir, 'a-good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  fs.writeFileSync(path.join(order2.profilesDir, 'b-broken.toml'), 'name = "real"\nmodel = "unclosed\n');
+  const res2 = listProfiles(order2.paths);
+  assert.deepEqual(res2.profiles, ['real']);
+  assert.equal(res2.warnings.length, 1);
+  assert.ok(res2.warnings[0].file.endsWith('b-broken.toml'));
+  fs.rmSync(order2.home, { recursive: true, force: true });
+
+  // Three files: a valid owner, a syntax-broken same-name file (no owner), and a
+  // structurally valid but field-invalid same-name file (still an owner per S01).
+  const three = createTempEnv();
+  fs.writeFileSync(path.join(three.profilesDir, 'good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  fs.writeFileSync(path.join(three.profilesDir, 'broken.toml'), 'name = "real"\nmodel = "unclosed\n');
+  fs.writeFileSync(path.join(three.profilesDir, 'field_error.toml'), 'name = "real"\npermission_mode = "superuser"\n');
+  const res3 = listProfiles(three.paths);
+  // good and field_error both own "real" -> collision evicts the name entirely;
+  // broken contributes only its syntax diagnostic.
+  assert.deepEqual(res3.profiles, []);
+  assert.equal(res3.warnings.length, 3);
+  assert.ok(res3.warnings.some((w) => w.file.endsWith('broken.toml')));
+  const duplicates = res3.warnings.filter((w) => w.diagnostic.includes("duplicate profile name 'real'"));
+  assert.equal(duplicates.length, 2);
+  assert.ok(duplicates.some((w) => w.file.endsWith('good.toml')));
+  assert.ok(duplicates.some((w) => w.file.endsWith('field_error.toml')));
+  fs.rmSync(three.home, { recursive: true, force: true });
+});
+
+test('fix2/fix4: CRLF and LF names collide; malformed primitives and surrogates only warn', () => {
+  const { paths, profilesDir } = createTempEnv();
+  // LF and CRLF spell the same decoded name "dup".
+  fs.writeFileSync(path.join(profilesDir, 'a-lf.toml'), 'name = "dup"\nsubagent = "zcode"\n');
+  fs.writeFileSync(path.join(profilesDir, 'b-crlf.toml'), 'name = "dup"\r\nsubagent = "zcode"\r\n');
+  const dup = listProfiles(paths);
+  assert.deepEqual(dup.profiles, []);
+  assert.equal(dup.warnings.filter((w) => w.diagnostic.includes("duplicate profile name 'dup'")).length, 2);
+  for (const name of ['a-lf.toml', 'b-crlf.toml']) fs.rmSync(path.join(profilesDir, name));
+
+  // Illegal bare primitive and a NUL-containing name are only warnings.
+  fs.writeFileSync(path.join(profilesDir, 'good.toml'), 'name = "ok"\nsubagent = "zcode"\n');
+  fs.writeFileSync(path.join(profilesDir, 'bad_primitive.toml'), 'name = "prim"\nmodel = unquoted\n');
+  fs.writeFileSync(path.join(profilesDir, 'bad_surrogate.toml'), 'name = "sur\\uD800"\n');
+  const res = listProfiles(paths);
+  assert.deepEqual(res.profiles, ['ok']);
+  assert.equal(res.warnings.length, 2);
+  assert.ok(res.warnings.some((w) => w.diagnostic.includes('Invalid TOML primitive')));
+  assert.ok(res.warnings.some((w) => w.diagnostic.includes('Invalid Unicode code point')));
+  fs.rmSync(paths.home, { recursive: true, force: true });
+});
+
+test('fix5: directory scan follows symlinked .toml like the daemon', { skip: process.platform === 'win32' }, () => {
+  const { paths, profilesDir } = createTempEnv();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-links-'));
+  const target = path.join(outside, 'target.toml');
+  fs.writeFileSync(target, 'name = "linked"\n');
+  fs.symlinkSync(target, path.join(profilesDir, 'link.toml'));
+  assert.deepEqual(listProfiles(paths).profiles, ['linked']);
+
+  // Two links to different files with the same decoded name must collide.
+  const dupA = path.join(outside, 'dup-a.toml');
+  const dupB = path.join(outside, 'dup-b.toml');
+  fs.writeFileSync(dupA, 'name = "duplink"\n');
+  fs.writeFileSync(dupB, 'name = "duplink"\n');
+  fs.symlinkSync(dupA, path.join(profilesDir, 'duplink-a.toml'));
+  fs.symlinkSync(dupB, path.join(profilesDir, 'duplink-b.toml'));
+  const res = listProfiles(paths);
+  assert.deepEqual(res.profiles, ['linked']);
+  assert.equal(res.warnings.filter((w) => w.diagnostic.includes("duplicate profile name 'duplink'")).length, 2);
+
+  // A dangling link is not a file for the daemon either; it is silently skipped.
+  fs.symlinkSync(path.join(outside, 'does-not-exist.toml'), path.join(profilesDir, 'dangling.toml'));
+  assert.deepEqual(listProfiles(paths).profiles, ['linked']);
+
+  fs.rmSync(outside, { recursive: true, force: true });
+  fs.rmSync(paths.home, { recursive: true, force: true });
+});
+
+test('fix6: profiles directory follows daemon var_os presence, not truthiness', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-env-'));
+  const configPath = path.join(configDir, 'agents.json');
+  fs.mkdirSync(path.join(configDir, 'profiles'), { recursive: true });
+  const sibling = path.join(configDir, 'profiles');
+
+  // Presence selects the variable; an exported empty value means "no directory".
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '' }), null);
+  assert.equal(profilesDir({ ZCODE_AGENT_CONFIG: '' }), null);
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '', ZCODE_AGENT_CONFIG: configPath }), null);
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: configPath, ZCODE_AGENT_CONFIG: '' }), sibling);
+  assert.equal(profilesDir({ ZCODE_AGENT_CONFIG: configPath }), sibling);
+  assert.equal(profilesDir({}), path.join(productPaths(os.homedir()).data, 'profiles'));
+
+  // profileCommand honours the same presence semantics with explicit injection.
+  const { paths, profilesDir: realProfiles } = createTempEnv();
+  fs.writeFileSync(path.join(realProfiles, 'x.toml'), 'name = "x"\n');
+  const shadowed = listProfiles(paths, { EXTERNAL_SUBAGENT_CONFIG: '', ZCODE_AGENT_CONFIG: configPath });
+  assert.deepEqual(shadowed.profiles, []);
+  assert.match(shadowed.message, /disabled/u);
+  assert.throws(() => showProfile(paths, 'x', { EXTERNAL_SUBAGENT_CONFIG: '' }), /available profiles: none/u);
+  assert.deepEqual(listProfiles(paths, { EXTERNAL_SUBAGENT_CONFIG: path.join(paths.data, 'config.json') }).profiles, ['x']);
+
+  fs.rmSync(configDir, { recursive: true, force: true });
+  fs.rmSync(paths.home, { recursive: true, force: true });
+});
+
+test('fix7: real CLI spawn process preserves >512B ASCII and Unicode daemon error lists', async () => {
+  const asciiNames = Array.from({ length: 40 }, (_, i) => `standard_ascii_profile_item_${String(i).padStart(3, '0')}`).sort();
+  const asciiMessage = `profile 'missing' not found; available profiles: [${asciiNames.join(', ')}]`;
+  assert.ok(Buffer.byteLength(asciiMessage, 'utf8') > 512);
+
+  const asciiEnv = createTempEnv();
+  const asciiSocket = path.join(asciiEnv.home, 'mock.sock');
+  try {
+    const result = await withMockErrorDaemon(asciiSocket, asciiMessage, () => runCli(
+      ['spawn', '--profile', 'missing', '--repository', '/repo', '--prompt', 'hi'],
+      { ...process.env, EXTERNAL_SUBAGENT_SOCKET: asciiSocket },
+    ));
+    assert.equal(result.code, 1, `stderr: ${result.stderr}`);
+    const parsed = JSON.parse(result.stderr);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.error.code, 'validation');
+    assert.equal(parsed.error.message, asciiMessage, 'ASCII list must round-trip byte-for-byte');
+    for (const name of asciiNames) assert.ok(parsed.error.message.includes(name), `missing ${name}`);
+    assert.ok(!parsed.error.message.includes('\uFFFD'), 'ASCII message must be valid UTF-8');
+  } finally {
+    fs.rmSync(asciiEnv.home, { recursive: true, force: true });
+  }
+
+  const unicodeNames = Array.from({ length: 30 }, (_, i) => `子代理环境预设_智能调优配置_${String(i).padStart(3, '0')}`).sort();
+  const unicodeMessage = `profile 'missing' not found; available profiles: [${unicodeNames.join(', ')}]`;
+  assert.ok(Buffer.byteLength(unicodeMessage, 'utf8') > 512);
+
+  const unicodeEnv = createTempEnv();
+  const unicodeSocket = path.join(unicodeEnv.home, 'mock.sock');
+  try {
+    const result = await withMockErrorDaemon(unicodeSocket, unicodeMessage, () => runCli(
+      ['spawn', '--profile', 'missing', '--repository', '/repo', '--prompt', 'hi'],
+      { ...process.env, EXTERNAL_SUBAGENT_SOCKET: unicodeSocket },
+    ));
+    assert.equal(result.code, 1, `stderr: ${result.stderr}`);
+    const parsed = JSON.parse(result.stderr);
+    assert.equal(parsed.error.message, unicodeMessage, 'Unicode list must round-trip on character boundaries');
+    for (const name of unicodeNames) assert.ok(parsed.error.message.includes(name), `missing ${name}`);
+    assert.ok(!parsed.error.message.includes('\uFFFD'), 'Unicode message must not corrupt multi-byte characters');
+  } finally {
+    fs.rmSync(unicodeEnv.home, { recursive: true, force: true });
+  }
+});
+
+test('fix8: HELP documents that warned and duplicate files are excluded from available names', () => {
+  assert.match(HELP, /Inspect global spawn profiles/u);
+  assert.match(HELP, /path-based warnings/u);
+  assert.match(HELP, /excluded from the available\s+name set/u);
 });

@@ -1,0 +1,6 @@
+developer_instructions = """
+[example]
+some instructions that mention [table] style lines
+name = "fake"
+"""
+name = "real"

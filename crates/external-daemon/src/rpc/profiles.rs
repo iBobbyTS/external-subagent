@@ -1126,4 +1126,71 @@ permission_mode = "superuser"
         drop(_scope);
         drop(guard);
     }
+
+    /// Anchors the CLI's hand-written TOML scanner (`cli/commands/tasks.mjs`)
+    /// against the authoritative `toml` crate on a shared differential corpus
+    /// (`tests/cli/profiles-corpus/`). Each corpus item asserts two facets the
+    /// CLI scanner must reproduce:
+    ///   1. the decoded top-level `name` when the document is TOML-syntax valid
+    ///      (mirrors `toml::from_str::<LooseName>` used for owner registration);
+    ///   2. profile-shape validity: `RawProfile` (`deny_unknown_fields`) decodes
+    ///      and yields a usable name. Field-value validation (e.g.
+    ///      `permission_mode = "superuser"`) is intentionally excluded, because
+    ///      the CLI deliberately leaves value-level validation to the daemon.
+    #[test]
+    fn profile_corpus_matches_toml_crate_identity_and_shape() {
+        let corpus =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cli/profiles-corpus");
+        assert!(corpus.is_dir(), "corpus directory missing: {}", corpus.display());
+
+        let mut toml_files: Vec<PathBuf> = fs::read_dir(&corpus)
+            .expect("read corpus directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .collect();
+        toml_files.sort();
+        assert!(!toml_files.is_empty(), "corpus must contain at least one .toml input");
+
+        for toml_path in toml_files {
+            let stem = toml_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("corpus .toml stem");
+            let expected_path = corpus.join(format!("{stem}.expected.json"));
+            let expected: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&expected_path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", expected_path.display())),
+            )
+            .unwrap_or_else(|e| panic!("parse {}: {e}", expected_path.display()));
+            let expected_valid = expected["valid"].as_bool().expect("expected.valid must be bool");
+            let expected_name = expected["name"].as_str().map(str::to_string);
+            let content = fs::read_to_string(&toml_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", toml_path.display()));
+
+            let decoded_name = toml::from_str::<toml::Value>(&content)
+                .ok()
+                .and_then(|value| {
+                    let raw = value.get("name").and_then(|v| v.as_str())?;
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() || raw.len() > 128 || raw.contains('\0') {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                });
+
+            assert_eq!(
+                decoded_name, expected_name,
+                "corpus item {stem}: decoded top-level name disagrees with expectation"
+            );
+
+            let shape_ok = toml::from_str::<RawProfile>(&content).is_ok();
+            let computed_valid = shape_ok && decoded_name.is_some();
+            assert_eq!(
+                computed_valid, expected_valid,
+                "corpus item {stem}: profile-shape validity disagrees with expectation"
+            );
+        }
+    }
 }

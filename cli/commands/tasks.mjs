@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { profilesDir } from '../paths.mjs';
@@ -95,6 +94,54 @@ const ALLOWED_PROFILE_KEYS = new Set([
   'developer_instructions',
 ]);
 
+// Rust `str::trim` strips the Unicode White_Space property (which includes
+// U+0085 NEL and U+00A0 NBSP) but NOT U+FEFF, whereas JavaScript `String.trim`
+// strips U+FEFF and leaves U+0085. Name identity must match the daemon's
+// `raw.name.trim()`, so trim against Rust's exact character set.
+const RUST_WHITESPACE = /[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/u;
+
+function trimRust(value) {
+  let start = 0;
+  let end = value.length;
+  while (start < end && RUST_WHITESPACE.test(value[start])) start += 1;
+  while (end > start && RUST_WHITESPACE.test(value[end - 1])) end -= 1;
+  return value.slice(start, end);
+}
+
+// Bare (unquoted) TOML values are only legal when they are a boolean, an
+// integer, a float (including inf/nan), or a date/time. Anything else (e.g.
+// `unquoted`, `12abc`) makes the whole document invalid TOML, so a malformed
+// primitive must not be silently consumed as an opaque token.
+const TOML_DEC_INT = /^[+-]?(0|[1-9](_?[0-9])*)$/u;
+const TOML_HEX_INT = /^0x[0-9A-Fa-f](_?[0-9A-Fa-f])*$/u;
+const TOML_OCT_INT = /^0o[0-7](_?[0-7])*$/u;
+const TOML_BIN_INT = /^0b[01](_?[01])*$/u;
+const TOML_FLOAT = /^[+-]?(0|[1-9](_?[0-9])*)((\.([0-9](_?[0-9])*))([eE][+-]?[0-9](_?[0-9])*)?|([eE][+-]?[0-9](_?[0-9])*))$/u;
+const TOML_SPECIAL_FLOAT = /^[+-]?(inf|nan)$/u;
+const TOML_LOCAL_DATE = /^\d{4}-\d{2}-\d{2}$/u;
+const TOML_LOCAL_TIME = /^\d{2}:\d{2}:\d{2}(\.\d+)?$/u;
+const TOML_DATETIME = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})?$/u;
+
+function isValidTomlPrimitive(token) {
+  return TOML_DEC_INT.test(token)
+    || TOML_HEX_INT.test(token)
+    || TOML_OCT_INT.test(token)
+    || TOML_BIN_INT.test(token)
+    || TOML_FLOAT.test(token)
+    || TOML_SPECIAL_FLOAT.test(token)
+    || TOML_LOCAL_DATE.test(token)
+    || TOML_LOCAL_TIME.test(token)
+    || TOML_DATETIME.test(token);
+}
+
+function parseUnicodeEscape(hex, label) {
+  const codePoint = parseInt(hex, 16);
+  if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+    throw new Error(`Invalid Unicode code point in \\${label} escape: ${hex}`);
+  }
+  return String.fromCodePoint(codePoint);
+}
+
 export class TomlScanner {
   constructor(content, filePath = '<unknown>') {
     this.content = content;
@@ -173,7 +220,7 @@ export class TomlScanner {
             hex += this.advance();
           }
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`Invalid \\u escape: \\u${hex}`);
-          result += String.fromCodePoint(parseInt(hex, 16));
+          result += parseUnicodeEscape(hex, 'u');
         } else if (esc === 'U') {
           let hex = '';
           for (let i = 0; i < 8; i++) {
@@ -181,11 +228,7 @@ export class TomlScanner {
             hex += this.advance();
           }
           if (!/^[0-9a-fA-F]{8}$/.test(hex)) throw new Error(`Invalid \\U escape: \\U${hex}`);
-          const codePoint = parseInt(hex, 16);
-          if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
-            throw new Error(`Invalid Unicode code point in \\U escape: ${hex}`);
-          }
-          result += String.fromCodePoint(codePoint);
+          result += parseUnicodeEscape(hex, 'U');
         } else {
           throw new Error(`Invalid escape sequence: \\${esc}`);
         }
@@ -227,17 +270,19 @@ export class TomlScanner {
       if (this.peek() === '\\') {
         this.advance();
         if (this.pos >= this.len) throw new Error('Unterminated escape in multiline string');
-        const next = this.peek();
-        if (next === '\r' || next === '\n') {
-          if (next === '\r' && this.peekAt(1) === '\n') {
-            this.advance(); this.advance();
-          } else {
-            this.advance();
-          }
+        // TOML line-ending backslash: `\` + optional space/tab + required
+        // newline, then all following whitespace/newlines are trimmed.
+        let look = this.pos;
+        while (look < this.len && (this.content[look] === ' ' || this.content[look] === '\t')) look += 1;
+        if (look < this.len && (this.content[look] === '\n' || this.content[look] === '\r')) {
+          while (this.pos < look) this.advance();
+          this.consumeMultilineNewline('multiline basic string');
           while (this.pos < this.len) {
             const c = this.peek();
-            if (c === ' ' || c === '\t' || c === '\r' || c === '\n') {
+            if (c === ' ' || c === '\t' || c === '\n') {
               this.advance();
+            } else if (c === '\r') {
+              this.consumeMultilineNewline('multiline basic string');
             } else {
               break;
             }
@@ -254,31 +299,51 @@ export class TomlScanner {
         else if (esc === 't') result += '\t';
         else if (esc === 'u') {
           let hex = '';
-          for (let i = 0; i < 4; i++) hex += this.advance();
+          for (let i = 0; i < 4; i++) {
+            if (this.pos >= this.len) throw new Error('Unterminated \\u escape at EOF');
+            hex += this.advance();
+          }
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`Invalid \\u escape: \\u${hex}`);
-          result += String.fromCodePoint(parseInt(hex, 16));
+          result += parseUnicodeEscape(hex, 'u');
         } else if (esc === 'U') {
           let hex = '';
-          for (let i = 0; i < 8; i++) hex += this.advance();
-          if (!/^[0-9a-fA-F]{8}$/.test(hex)) throw new Error(`Invalid \\U escape: \\U${hex}`);
-          const codePoint = parseInt(hex, 16);
-          if (codePoint > 0x10ffff || (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
-            throw new Error(`Invalid Unicode code point in \\U escape: ${hex}`);
+          for (let i = 0; i < 8; i++) {
+            if (this.pos >= this.len) throw new Error('Unterminated \\U escape at EOF');
+            hex += this.advance();
           }
-          result += String.fromCodePoint(codePoint);
+          if (!/^[0-9a-fA-F]{8}$/.test(hex)) throw new Error(`Invalid \\U escape: \\U${hex}`);
+          result += parseUnicodeEscape(hex, 'U');
         } else {
           throw new Error(`Invalid escape sequence: \\${esc}`);
         }
         continue;
       }
+      if (this.peek() === '\r') {
+        // TOML decodes CRLF to LF inside multi-line strings; a lone CR is illegal.
+        this.consumeMultilineNewline('multiline basic string');
+        result += '\n';
+        continue;
+      }
       const ch = this.advance();
       const code = ch.charCodeAt(0);
-      if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+      if (code < 0x20 && code !== 0x09 && code !== 0x0a) {
         throw new Error(`Disallowed control character 0x${code.toString(16)} in multiline basic string`);
       }
       result += ch;
     }
     throw new Error('Unterminated multiline basic string');
+  }
+
+  // Consume a CRLF (decoded to one logical newline) or bare LF, rejecting a
+  // lone CR the same way the TOML grammar does.
+  consumeMultilineNewline(context) {
+    if (this.peek() === '\r') {
+      if (this.peekAt(1) !== '\n') throw new Error(`Disallowed control character 0x0d in ${context}`);
+      this.advance();
+      this.advance();
+    } else {
+      this.advance();
+    }
   }
 
   parseLiteralString() {
@@ -325,9 +390,15 @@ export class TomlScanner {
           continue;
         }
       }
+      if (this.peek() === '\r') {
+        // TOML decodes CRLF to LF inside multi-line strings; a lone CR is illegal.
+        this.consumeMultilineNewline('multiline literal string');
+        result += '\n';
+        continue;
+      }
       const ch = this.advance();
       const code = ch.charCodeAt(0);
-      if (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+      if (code < 0x20 && code !== 0x09 && code !== 0x0a) {
         throw new Error(`Disallowed control character 0x${code.toString(16)} in multiline literal string`);
       }
       result += ch;
@@ -481,18 +552,21 @@ export class TomlScanner {
       }
       token += this.advance();
     }
+    if (token.length === 0) throw new Error(`Expected value at line ${this.line}`);
     if (token === 'true') return { value: true, isString: false, isBoolean: true };
     if (token === 'false') return { value: false, isString: false, isBoolean: true };
-    if (token.length === 0) throw new Error(`Expected value at line ${this.line}`);
-    return { value: token, isString: false, isPrimitive: true };
+    if (isValidTomlPrimitive(token)) return { value: token, isString: false, isPrimitive: true };
+    throw new Error(`Invalid TOML primitive '${token}' at line ${this.line}`);
   }
 
   scanDocument() {
-    let topLevelName = null;
-    let nameRawValue = null;
+    let nameValue = null;
     let nameIsString = false;
+    let nameSeen = false;
     const topLevelKeys = new Set();
-    const errors = [];
+    const syntaxErrors = [];
+    const schemaErrors = [];
+    let syntaxValid = true;
 
     while (this.pos < this.len) {
       this.skipWhitespace();
@@ -507,7 +581,10 @@ export class TomlScanner {
         continue;
       }
       if (ch === '[') {
-        // Table header [table] or [[array_table]]
+        // Table header [table] or [[array_table]]: the rest of the file is not
+        // top-level. This is well-formed TOML, so it is a schema error, not a
+        // syntax error; the daemon's LooseName decode still exposes any name
+        // declared before the header (RawProfile then rejects the table).
         this.advance();
         const isArray = this.peek() === '[';
         if (isArray) this.advance();
@@ -523,7 +600,7 @@ export class TomlScanner {
         } else if (this.peek() === ']') {
           this.advance();
         }
-        errors.push(`unexpected table header '[${headerKey.join('.')}]' (profiles do not allow tables)`);
+        schemaErrors.push(`unexpected table header '[${headerKey.join('.')}]' (profiles do not allow tables)`);
         break;
       }
 
@@ -531,12 +608,14 @@ export class TomlScanner {
       try {
         keyParts = this.parseKey();
       } catch (err) {
-        errors.push(`syntax error in key: ${err.message}`);
+        syntaxErrors.push(`syntax error in key: ${err.message}`);
+        syntaxValid = false;
         break;
       }
       this.skipWhitespace();
       if (this.peek() !== '=') {
-        errors.push(`expected '=' after key '${keyParts.join('.')}' at line ${this.line}`);
+        syntaxErrors.push(`expected '=' after key '${keyParts.join('.')}' at line ${this.line}`);
+        syntaxValid = false;
         break;
       }
       this.advance();
@@ -545,61 +624,76 @@ export class TomlScanner {
       try {
         valObj = this.parseValue();
       } catch (err) {
-        errors.push(`syntax error in value for key '${keyParts.join('.')}' at line ${this.line}: ${err.message}`);
+        syntaxErrors.push(`syntax error in value for key '${keyParts.join('.')}' at line ${this.line}: ${err.message}`);
+        syntaxValid = false;
         break;
       }
 
       this.skipWhitespace();
       this.skipComment();
       if (this.pos < this.len && this.peek() !== '\r' && this.peek() !== '\n') {
-        errors.push(`unexpected trailing characters after value for key '${keyParts.join('.')}' at line ${this.line}`);
+        syntaxErrors.push(`unexpected trailing characters after value for key '${keyParts.join('.')}' at line ${this.line}`);
+        syntaxValid = false;
         break;
       }
 
       if (keyParts.length > 1) {
-        errors.push(`dotted key '${keyParts.join('.')}' is not allowed at top level of profile`);
+        schemaErrors.push(`dotted key '${keyParts.join('.')}' is not allowed at top level of profile`);
         continue;
       }
 
       const key = keyParts[0];
       if (topLevelKeys.has(key)) {
-        errors.push(`duplicate key '${key}' at line ${this.line}`);
-        continue;
+        // Duplicate keys make the document invalid TOML, not merely an invalid
+        // profile shape, so they must not leave a partial name owner behind.
+        syntaxErrors.push(`duplicate key '${key}' at line ${this.line}`);
+        syntaxValid = false;
+        break;
       }
       topLevelKeys.add(key);
 
       if (!ALLOWED_PROFILE_KEYS.has(key)) {
-        errors.push(`unknown top-level key '${key}'`);
+        schemaErrors.push(`unknown top-level key '${key}'`);
         continue;
       }
 
       if (key === 'name') {
+        nameSeen = true;
         nameIsString = valObj.isString;
-        nameRawValue = valObj.value;
+        nameValue = valObj.value;
       }
     }
 
-    if (!nameIsString && nameRawValue !== null) {
-      errors.push(`field 'name': must be a string`);
-    } else if (nameRawValue === null && !errors.some((e) => e.includes('name'))) {
-      errors.push(`missing required field 'name'`);
-    } else if (nameIsString) {
-      const trimmed = nameRawValue.trim();
-      if (trimmed.length === 0) {
-        errors.push(`field 'name': cannot be empty`);
-      } else if (Buffer.byteLength(nameRawValue, 'utf8') > 128) {
-        errors.push(`field 'name': exceeds 128 bytes`);
-      } else if (nameRawValue.includes('\0')) {
-        errors.push(`field 'name': cannot contain NUL byte`);
-      } else {
-        topLevelName = trimmed;
+    // Owner/identity name: only a fully TOML-syntax-valid document can provide a
+    // top-level name, mirroring the daemon's `toml::from_str::<LooseName>`
+    // (which fails wholesale on a syntax error, regardless of where the error
+    // sits). Field-level and schema-level problems do NOT erase the identity;
+    // the daemon still registers the name as an owner in those cases.
+    let name = null;
+    if (syntaxValid && nameIsString && nameValue !== null) {
+      const trimmed = trimRust(nameValue);
+      if (trimmed.length > 0
+        && Buffer.byteLength(nameValue, 'utf8') <= 128
+        && !nameValue.includes('\0')) {
+        name = trimmed;
       }
     }
 
+    const errors = [...syntaxErrors, ...schemaErrors];
+    if (syntaxValid && name === null) {
+      if (!nameSeen) errors.push("missing required field 'name'");
+      else if (!nameIsString) errors.push("field 'name': must be a string");
+      else if (trimRust(nameValue).length === 0) errors.push("field 'name': cannot be empty");
+      else if (Buffer.byteLength(nameValue, 'utf8') > 128) errors.push("field 'name': exceeds 128 bytes");
+      else errors.push("field 'name': cannot contain NUL byte");
+    }
+
+    const valid = syntaxValid && schemaErrors.length === 0 && name !== null;
     return {
-      name: errors.length === 0 ? topLevelName : null,
-      rawName: topLevelName,
-      valid: errors.length === 0 && topLevelName !== null,
+      name,
+      rawName: name,
+      valid,
+      syntaxValid,
       errors,
     };
   }
@@ -629,9 +723,19 @@ export function scanProfilesDir(dir) {
   try {
     const dirEntries = fs.readdirSync(dir, { withFileTypes: true });
     for (const entry of dirEntries) {
-      if (entry.isFile() && entry.name.endsWith('.toml')) {
-        entries.push(path.join(dir, entry.name));
+      if (!entry.name.endsWith('.toml')) continue;
+      const full = path.join(dir, entry.name);
+      // The daemon selects candidates with `Path::is_file()`, which follows
+      // symbolic links; `Dirent.isFile()` does not. Use stat, and silently
+      // skip entries that stat cannot resolve (e.g. dangling links), matching
+      // `is_file() == false`.
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
       }
+      if (stat.isFile()) entries.push(full);
     }
   } catch (err) {
     fileErrors.push({
@@ -665,9 +769,9 @@ export function scanProfilesDir(dir) {
     }
 
     const res = scanProfileToml(content, filePath);
-    if (res.rawName) {
-      if (!nameOwners.has(res.rawName)) nameOwners.set(res.rawName, []);
-      nameOwners.get(res.rawName).push(filePath);
+    if (res.name) {
+      if (!nameOwners.has(res.name)) nameOwners.set(res.name, []);
+      nameOwners.get(res.name).push(filePath);
     }
 
     if (res.valid) {
@@ -675,7 +779,7 @@ export function scanProfilesDir(dir) {
     } else {
       fileErrors.push({
         file: filePath,
-        profileName: res.rawName || null,
+        profileName: res.name || null,
         diagnostic: `profile file '${filePath}' is invalid: ${res.errors.join('; ')}`,
       });
     }
@@ -745,11 +849,20 @@ export function profileCommand(paths, inputOrArgs, env = process.env) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new CliError('INVALID_ARGUMENT', 'profile input must be an object', 2);
   }
-  const dir = (paths?.home && paths.home !== os.homedir() && env === process.env)
-    ? path.join(paths.data, 'profiles')
-    : profilesDir(env, paths?.home);
+  // Resolution is a pure function of the injected paths/env; there is no
+  // test-only production branch keyed on os.homedir().
+  const dir = profilesDir(env, paths?.home);
 
   if (input.operation === 'list') {
+    if (dir === null) {
+      return {
+        operation: 'list',
+        directory: null,
+        profiles: [],
+        warnings: [],
+        message: 'profiles are disabled: the configuration path environment variable is exported empty',
+      };
+    }
     const scanned = scanProfilesDir(dir);
     if (!scanned.exists) {
       return {
@@ -771,6 +884,7 @@ export function profileCommand(paths, inputOrArgs, env = process.env) {
   if (input.operation === 'show') {
     const name = input.name;
     if (!name || typeof name !== 'string') throw new CliError('INVALID_ARGUMENT', 'usage: profile show <name>', 2);
+    if (dir === null) throw new CliError('INVALID_ARGUMENT', `profile '${name}' not found; available profiles: none`, 2);
     const scanned = scanProfilesDir(dir);
     if (!scanned.exists) {
       throw new CliError('INVALID_ARGUMENT', `profile '${name}' not found; available profiles: none`, 2);

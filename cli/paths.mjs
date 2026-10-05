@@ -28,19 +28,28 @@ export function productPaths(home = os.homedir()) {
   };
 }
 
-export function profilesDir(envOrHome, maybeHome) {
-  let env = process.env;
-  let home = os.homedir();
-  if (typeof envOrHome === 'string') {
-    home = envOrHome;
-    if (maybeHome && typeof maybeHome === 'object') env = maybeHome;
-  } else if (envOrHome && typeof envOrHome === 'object') {
-    env = envOrHome;
-    if (typeof maybeHome === 'string') home = maybeHome;
+// Mirror the daemon's `profiles_directory()` exactly (rpc/profiles.rs):
+// `EXTERNAL_SUBAGENT_CONFIG` wins when it is *exported*, even when exported as
+// an empty string, and only then does `ZCODE_AGENT_CONFIG` apply; presence, not
+// truthiness, selects the variable (`var_os(...).or_else(...)`). An empty
+// exported path has no parent in Rust (`Path::new("").parent() == None`), so the
+// daemon loads no profiles directory at all; return null to represent that.
+// Otherwise take the sibling `profiles/` of the config file, or fall back to the
+// product data directory.
+export function profilesDir(env = {}, home = os.homedir()) {
+  const names = ['EXTERNAL_SUBAGENT_CONFIG', 'ZCODE_AGENT_CONFIG'];
+  let envPath;
+  let exported = false;
+  for (const name of names) {
+    if (env[name] !== undefined) {
+      envPath = env[name];
+      exported = true;
+      break;
+    }
   }
-  const envPath = env.EXTERNAL_SUBAGENT_CONFIG || env.ZCODE_AGENT_CONFIG;
-  if (envPath) {
-    return path.join(path.dirname(envPath), 'profiles');
-  }
-  return path.join(productPaths(home).data, 'profiles');
+  if (!exported) return path.join(productPaths(home).data, 'profiles');
+  if (envPath === '') return null;
+  const parent = path.dirname(envPath);
+  if (parent === envPath) return null; // e.g. "/" has no parent in Rust
+  return path.join(parent, 'profiles');
 }
