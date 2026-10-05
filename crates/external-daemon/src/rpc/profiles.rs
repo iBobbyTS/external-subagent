@@ -147,15 +147,11 @@ pub fn truncate_json_escaped(s: &mut String, max_json_bytes: usize) {
     }
 }
 
-/// Compose the diagnostic part of a rejection into a well-formed prefix.
 pub fn compose_diagnostic_text(rejection: &ProfileRejection) -> String {
     let diag = &rejection.diagnostic;
-    if diag.starts_with("profile file '")
-        || diag.starts_with("profile directory '")
-        || diag.starts_with("profile field '")
-        || diag.starts_with("profile '")
-        || diag.starts_with("profile is invalid")
-        || diag.starts_with("profile cannot be combined with")
+    if PROFILE_ERROR_PREFIXES
+        .iter()
+        .any(|prefix| diag.starts_with(prefix))
     {
         return diag.clone();
     }
@@ -243,13 +239,24 @@ pub fn format_profile_rejection(
     message
 }
 
-/// Construct an RpcError through the unified profile rejection formatting function.
-pub fn make_profile_rejection_error(
+/// Construct an RpcError through the unified profile rejection formatting function,
+/// preserving the provided error code.
+pub fn make_profile_rejection_error_with_code(
+    code: RpcErrorCode,
     rejection: &ProfileRejection,
     available_names: &[String],
 ) -> RpcError {
     let message = format_profile_rejection(rejection, available_names);
-    RpcError::new_profile_error(RpcErrorCode::Validation, message)
+    RpcError::new_profile_error(code, message)
+}
+
+/// Construct an RpcError through the unified profile rejection formatting function
+/// defaulting to Validation code.
+pub fn make_profile_rejection_error(
+    rejection: &ProfileRejection,
+    available_names: &[String],
+) -> RpcError {
+    make_profile_rejection_error_with_code(RpcErrorCode::Validation, rejection, available_names)
 }
 
 /// Formats a profile rejection error with file diagnostic and available profiles list,
@@ -587,11 +594,11 @@ pub fn load_profile(name: &str) -> Result<Profile, RpcError> {
     let mut available: Vec<String> = loaded.profiles.into_keys().collect();
     available.sort();
 
-    // 1. Check if the requested name matches any failed file's profile_name or file_stem
-    let matched_diag = loaded.file_errors.iter().find(|diag| {
-        diag.profile_name.as_deref() == Some(name)
-            || diag.file_path.file_stem().and_then(|s| s.to_str()) == Some(name)
-    });
+    // 1. Check if the requested name matches any failed file's decoded authoritative profile_name
+    let matched_diag = loaded
+        .file_errors
+        .iter()
+        .find(|diag| diag.profile_name.as_deref() == Some(name));
 
     let rejection = if let Some(d) = matched_diag {
         d.rejection.clone()
@@ -1055,5 +1062,68 @@ permission_mode = "superuser"
         assert!(loaded.profiles.contains_key("good"));
         assert_eq!(loaded.file_errors.len(), 1);
         assert!(loaded.file_errors[0].diagnostic.contains("NUL"));
+    }
+
+    #[test]
+    fn cross_name_invalid_profiles_attribute_diagnostic_by_authoritative_name_not_file_stem() {
+        // R3-02: a.toml (name="other", invalid) + b.toml (name="a", invalid).
+        // Referencing "a" must attribute diagnostic to b.toml, not preempted by a.toml file_stem.
+        let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
+        let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-cross-name-");
+        let profiles_dir = config_dir.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+
+        fs::write(
+            profiles_dir.join("a.toml"),
+            "name = \"other\"\npermission_mode = \"superuser\"\n",
+        )
+        .unwrap();
+        fs::write(
+            profiles_dir.join("b.toml"),
+            "name = \"a\"\npermission_mode = \"superuser\"\n",
+        )
+        .unwrap();
+        fs::write(
+            profiles_dir.join("good.toml"),
+            "name = \"good\"\nsubagent = \"zcode\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.path().join("agents.json");
+        let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
+
+        // 1. Referencing "a" points to b.toml (where name="a" is defined), NOT a.toml
+        let err_a = load_profile("a").unwrap_err();
+        assert_eq!(err_a.code, RpcErrorCode::Validation);
+        assert!(
+            err_a.message.contains("b.toml"),
+            "Diagnostic must point to b.toml which declared name='a', but got: {}",
+            err_a.message
+        );
+        assert!(
+            !err_a.message.contains("a.toml"),
+            "Diagnostic must NOT point to a.toml, but got: {}",
+            err_a.message
+        );
+        assert!(err_a.message.contains("available profiles: [good]"));
+
+        // 2. Referencing "other" points to a.toml (where name="other" is defined)
+        let err_other = load_profile("other").unwrap_err();
+        assert_eq!(err_other.code, RpcErrorCode::Validation);
+        assert!(
+            err_other.message.contains("a.toml"),
+            "Diagnostic must point to a.toml which declared name='other', but got: {}",
+            err_other.message
+        );
+        assert!(err_other.message.contains("available profiles: [good]"));
+
+        // 3. Referencing "b" (stem of b.toml, but no file has name="b") follows F02 not-found path
+        let err_b = load_profile("b").unwrap_err();
+        assert_eq!(err_b.code, RpcErrorCode::Validation);
+        assert!(err_b.message.contains("profile 'b' not found"));
+        assert!(err_b.message.contains("available profiles: [good]"));
+
+        drop(_scope);
+        drop(guard);
     }
 }

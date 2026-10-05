@@ -152,13 +152,20 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
         // message.
         RpcErrorCode::AgentUnknown => (
             "subagent_unknown",
-            if detail.starts_with("subagent is unknown") {
+            if is_profile_error(&detail) || detail.starts_with("subagent is unknown") {
                 detail.as_str()
             } else {
                 "subagent is unknown"
             },
         ),
-        RpcErrorCode::AgentDisabled => ("agent_disabled", "agent is disabled"),
+        RpcErrorCode::AgentDisabled => (
+            "agent_disabled",
+            if is_profile_error(&detail) {
+                detail.as_str()
+            } else {
+                "agent is disabled"
+            },
+        ),
         RpcErrorCode::AgentUnsupported if detail == "CODEX_WRITE_MANIFEST_UNSUPPORTED" => (
             "codex_write_manifest_unsupported",
             "codex does not support non-empty write_manifest",
@@ -174,7 +181,14 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
             "agy_permission_mode_unsupported",
             "agy supports only the build and yolo permission modes",
         ),
-        RpcErrorCode::AgentUnsupported => ("agent_unsupported", "agent is unsupported"),
+        RpcErrorCode::AgentUnsupported => (
+            "agent_unsupported",
+            if is_profile_error(&detail) {
+                detail.as_str()
+            } else {
+                "agent is unsupported"
+            },
+        ),
         RpcErrorCode::SteerUnsupported => ("steer_unsupported", "该 subagent 不支持 steer"),
         RpcErrorCode::ModelSelectionUnsupported => (
             "model_selection_unsupported",
@@ -611,5 +625,16 @@ mod tests {
         assert_eq!(tool_err.body.code, "validation");
         assert_eq!(tool_err.body.message, msg);
         assert_eq!(tool_err.legacy_text, format!("validation: {msg}"));
+
+        // AgentUnsupported preserves agent_unsupported code and projects full profile detail
+        let agy_msg = "profile file '/path/to/agy_bad.toml' is invalid: field 'permission_mode': AGY_PERMISSION_MODE_UNSUPPORTED; available profiles: [good]";
+        let rpc_agy_err = RpcError::new_profile_error(RpcErrorCode::AgentUnsupported, agy_msg);
+        let tool_agy_err = public_error_for_op(rpc_agy_err, "spawn");
+        assert_eq!(tool_agy_err.body.code, "agent_unsupported");
+        assert_eq!(tool_agy_err.body.message, agy_msg);
+        assert_eq!(
+            tool_agy_err.legacy_text,
+            format!("agent_unsupported: {agy_msg}")
+        );
     }
 }

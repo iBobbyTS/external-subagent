@@ -323,11 +323,7 @@ impl RpcService {
                     input.agent = profile.subagent.clone();
                     input.model = profile.model.clone();
                     input.effort = profile.effort.clone();
-                    input.manifest.permission_mode = Some(
-                        profile
-                            .permission_mode
-                            .unwrap_or(external_core::PermissionMode::Build),
-                    );
+                    input.manifest.permission_mode = profile.permission_mode;
                     (profile.developer_instructions.clone(), Some(profile))
                 } else {
                     (None, None)
@@ -345,6 +341,7 @@ impl RpcService {
                         &input,
                         &config,
                         developer_instructions.as_deref(),
+                        profile_context.as_ref(),
                     )
                 } else {
                     // other subagents fallback to prompt splicing when developer_instructions is non-empty
@@ -356,45 +353,37 @@ impl RpcService {
                             );
                         }
                     }
-                    resolve_admission_with_instructions(&input, &config, None)
+                    resolve_admission_with_instructions(
+                        &input,
+                        &config,
+                        None,
+                        profile_context.as_ref(),
+                    )
                 };
 
                 let admission = match admission_res {
                     Ok(adm) => adm,
-                    Err(err) => {
-                        if let Some(profile) = profile_context.as_ref() {
-                            let failing_field = if profile.model.is_some()
-                                && (err.message.contains("model") || err.message.contains("colon"))
-                            {
-                                Some("model")
-                            } else if profile.effort.is_some() && err.message.contains("effort") {
-                                Some("effort")
-                            } else if profile.subagent.is_some()
-                                && (err.message.contains("subagent") || err.message.contains("agent"))
-                            {
-                                Some("subagent")
-                            } else if profile.permission_mode.is_some()
-                                && err.message.contains("permission mode")
-                            {
-                                Some("permission_mode")
-                            } else {
-                                None
-                            };
-
-                            if let Some(field) = failing_field {
-                                let rejection = super::profiles::ProfileRejection::new(
-                                    Some(profile.source_path.clone()),
-                                    Some(field.to_string()),
-                                    err.message,
-                                );
-                                let available = super::profiles::available_profile_names();
-                                return Err(super::profiles::make_profile_rejection_error(
-                                    &rejection,
-                                    &available,
-                                ));
+                    Err(failure) => {
+                        if failure.profile_provided {
+                            if let Some(profile) = profile_context.as_ref() {
+                                if let Some(field) = failure.field.as_str() {
+                                    let rejection = super::profiles::ProfileRejection::new(
+                                        Some(profile.source_path.clone()),
+                                        Some(field.to_string()),
+                                        failure.error.message,
+                                    );
+                                    let available = super::profiles::available_profile_names();
+                                    return Err(
+                                        super::profiles::make_profile_rejection_error_with_code(
+                                            failure.error.code,
+                                            &rejection,
+                                            &available,
+                                        ),
+                                    );
+                                }
                             }
                         }
-                        return Err(err);
+                        return Err(failure.error);
                     }
                 };
 
@@ -2241,6 +2230,254 @@ subagent = "zcode"
                 "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile"
             );
             assert!(!err_mutex.message.contains("available profiles"));
+        }
+
+        #[test]
+        fn r3_01_structured_attribution_and_contrast_regressions() {
+            let env = setup_environment();
+
+            let agy_plan_toml = r#"
+name = "agy_plan"
+subagent = "agy"
+permission_mode = "plan"
+"#;
+            let codex_no_model_toml = r#"
+name = "codex_no_model"
+subagent = "codex"
+"#;
+            let codex_bad_effort_toml = r#"
+name = "codex_bad_effort"
+subagent = "codex"
+model = "gpt-5"
+effort = "ultra"
+"#;
+            let good_toml = r#"
+name = "good"
+subagent = "zcode"
+"#;
+            fs::write(env.profiles_dir.join("agy_plan.toml"), agy_plan_toml).unwrap();
+            fs::write(env.profiles_dir.join("codex_no_model.toml"), codex_no_model_toml).unwrap();
+            fs::write(env.profiles_dir.join("codex_bad_effort.toml"), codex_bad_effort_toml).unwrap();
+            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
+
+            // R3-01(a): Profile subagent="agy" permission_mode="plan" -> wrapped with AgentUnsupported code preserved
+            let input_agy_plan = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("agy_plan".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "agy plan prompt"),
+            };
+            let err_agy_plan = env.service.dispatch(RpcMethod::SubmitGeneral(input_agy_plan)).unwrap_err();
+            assert_eq!(err_agy_plan.code, RpcErrorCode::AgentUnsupported);
+            assert!(err_agy_plan.message.starts_with("profile file '"));
+            assert!(err_agy_plan.message.contains("agy_plan.toml"));
+            assert!(err_agy_plan.message.contains("field 'permission_mode'"));
+            assert!(err_agy_plan.message.contains("AGY_PERMISSION_MODE_UNSUPPORTED"));
+            assert!(err_agy_plan.message.contains("available profiles: ["));
+
+            // MCP projection preserves agent_unsupported code and full profile detail
+            let tool_err_agy = crate::mcp::errors::public_error_for_op(err_agy_plan.clone(), "spawn");
+            assert_eq!(tool_err_agy.body.code, "agent_unsupported");
+            assert_eq!(tool_err_agy.body.message, err_agy_plan.message);
+            assert_eq!(
+                tool_err_agy.legacy_text,
+                format!("agent_unsupported: {}", err_agy_plan.message)
+            );
+
+            // Contrast: non-profile agy with plan permission_mode returns bare AGY_PERMISSION_MODE_UNSUPPORTED
+            let mut manifest_agy_plain = test_manifest(env.workspace_dir.path(), "plain agy prompt");
+            manifest_agy_plain.permission_mode = Some(PermissionMode::Plan);
+            let input_agy_plain = GeneralSubmitInput {
+                agent: Some("agy".into()),
+                model: None,
+                effort: None,
+                profile: None,
+                manifest: manifest_agy_plain,
+            };
+            let err_agy_plain = env.service.dispatch(RpcMethod::SubmitGeneral(input_agy_plain)).unwrap_err();
+            assert_eq!(err_agy_plain.code, RpcErrorCode::AgentUnsupported);
+            assert_eq!(err_agy_plain.message, "AGY_PERMISSION_MODE_UNSUPPORTED");
+            let tool_err_agy_plain = crate::mcp::errors::public_error_for_op(err_agy_plain, "spawn");
+            assert_eq!(tool_err_agy_plain.body.code, "agy_permission_mode_unsupported");
+            assert_eq!(
+                tool_err_agy_plain.body.message,
+                "agy supports only the build and yolo permission modes"
+            );
+
+            // R3-01(b): Profile subagent="codex" omitting model when config has NO default_model -> NOT wrapped
+            // Overwrite agents.json to remove codex default_model
+            let codex_home = env._config_dir.path().join("codex-home");
+            let dummy_bin = env._config_dir.path().join("dummy_bin");
+            let config_no_default_model = serde_json::json!({
+                "schema_version": 2,
+                "revision": 2,
+                "default_subagent": "zcode",
+                "subagents": {
+                    "zcode": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": null,
+                    },
+                    "codex": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": null,
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": codex_home.to_string_lossy(),
+                        "profile": "app-server",
+                        "version": "test",
+                    },
+                    "dsh": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": "anthropic:claude-3-7-sonnet",
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": null,
+                        "profile": "acp",
+                        "version": "test",
+                    },
+                    "agy": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": "gemini-2.5-flash",
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": null,
+                        "profile": "cli",
+                        "version": "test",
+                    }
+                }
+            });
+            fs::write(
+                env._config_dir.path().join("agents.json"),
+                serde_json::to_string_pretty(&config_no_default_model).unwrap(),
+            )
+            .unwrap();
+
+            let input_codex_no_model = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_no_model".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
+            };
+            let err_codex_no_model = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_codex_no_model))
+                .unwrap_err();
+            assert_eq!(err_codex_no_model.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_codex_no_model.message,
+                "codex requires an explicit model or agents.codex.default_model"
+            );
+            assert!(!err_codex_no_model.message.contains("profile"));
+            assert!(!err_codex_no_model.message.contains("subagent"));
+            assert!(!err_codex_no_model.message.contains("available profiles"));
+
+            // Contrast: non-profile codex request without model has exact same error
+            let input_codex_plain_no_model = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: None,
+                effort: None,
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
+            };
+            let err_codex_plain = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_codex_plain_no_model))
+                .unwrap_err();
+            assert_eq!(err_codex_plain.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_codex_plain.message,
+                "codex requires an explicit model or agents.codex.default_model"
+            );
+
+            // R3-01: Illegal effort in profile -> wrapped with Validation code and field 'effort'
+            let input_bad_effort = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_bad_effort".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
+            };
+            let err_effort = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_bad_effort))
+                .unwrap_err();
+            assert_eq!(err_effort.code, RpcErrorCode::Validation);
+            assert!(err_effort.message.starts_with("profile file '"));
+            assert!(err_effort.message.contains("codex_bad_effort.toml"));
+            assert!(err_effort.message.contains("field 'effort'"));
+            assert!(err_effort.message.contains("codex effort must be one of low, medium, high, xhigh, max"));
+            assert!(err_effort.message.contains("available profiles: ["));
+
+            // Contrast: non-profile codex with illegal effort returns unwrapped error
+            let input_plain_effort = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                effort: Some("ultra".into()),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
+            };
+            let err_plain_effort = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_plain_effort))
+                .unwrap_err();
+            assert_eq!(err_plain_effort.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_plain_effort.message,
+                "codex effort must be one of low, medium, high, xhigh, max"
+            );
+
+            // Contrast: write_manifest path unchanged
+            let mut manifest_wm = test_manifest(env.workspace_dir.path(), "write manifest prompt");
+            manifest_wm.write_manifest = vec![PathBuf::from("restricted.txt")];
+            let input_wm_codex = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                effort: None,
+                profile: None,
+                manifest: manifest_wm.clone(),
+            };
+            let err_wm_codex = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_wm_codex))
+                .unwrap_err();
+            assert_eq!(err_wm_codex.code, RpcErrorCode::AgentUnsupported);
+            assert_eq!(err_wm_codex.message, "CODEX_WRITE_MANIFEST_UNSUPPORTED");
+
+            let input_wm_agy = GeneralSubmitInput {
+                agent: Some("agy".into()),
+                model: None,
+                effort: None,
+                profile: None,
+                manifest: manifest_wm,
+            };
+            let err_wm_agy = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_wm_agy))
+                .unwrap_err();
+            assert_eq!(err_wm_agy.code, RpcErrorCode::AgentUnsupported);
+            assert_eq!(err_wm_agy.message, "AGY_WRITE_MANIFEST_UNSUPPORTED");
+
+            // Contrast: prompt 256KiB exceed limit path byte-for-byte unchanged
+            let base_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
+            let input_oversized_prompt = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: None,
+                effort: None,
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), &base_prompt),
+            };
+            let err_prompt = env
+                .service
+                .dispatch(RpcMethod::SubmitGeneral(input_oversized_prompt))
+                .unwrap_err();
+            assert_eq!(err_prompt.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_prompt.message,
+                "scheduler rejected the operation: invalid manifest: invalid task identity or prompt"
+            );
         }
     }
 }

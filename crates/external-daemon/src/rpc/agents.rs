@@ -5,6 +5,7 @@
 use super::config::{AgentConfigEntry, AgentConfigSnapshot};
 use super::errors::{RpcError, RpcErrorCode};
 use super::handlers::validate_text;
+use super::profiles::Profile;
 use super::types::GeneralSubmitInput;
 use super::views::{
     AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
@@ -395,54 +396,125 @@ pub(super) fn unknown_agent_name_error(config: &AgentConfigSnapshot) -> RpcError
     unknown_agent_error(config.subagents.keys().map(String::as_str))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionField {
+    Model,
+    Effort,
+    Subagent,
+    PermissionMode,
+    None,
+}
+
+impl AdmissionField {
+    pub(crate) fn as_str(&self) -> Option<&'static str> {
+        match self {
+            Self::Model => Some("model"),
+            Self::Effort => Some("effort"),
+            Self::Subagent => Some("subagent"),
+            Self::PermissionMode => Some("permission_mode"),
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AdmissionFailure {
+    pub error: RpcError,
+    pub field: AdmissionField,
+    pub profile_provided: bool,
+}
+
+impl From<AdmissionFailure> for RpcError {
+    fn from(failure: AdmissionFailure) -> Self {
+        failure.error
+    }
+}
+
 #[allow(dead_code)]
 pub(super) fn resolve_admission(
     input: &GeneralSubmitInput,
     config: &AgentConfigSnapshot,
 ) -> Result<external_core::AdmissionIdentity, RpcError> {
-    resolve_admission_with_instructions(input, config, None)
+    resolve_admission_with_instructions(input, config, None, None).map_err(|f| f.error)
 }
 
 pub(super) fn resolve_admission_with_instructions(
     input: &GeneralSubmitInput,
     config: &AgentConfigSnapshot,
     developer_instructions: Option<&str>,
-) -> Result<external_core::AdmissionIdentity, RpcError> {
-    for (field, value) in [
-        ("agent", input.agent.as_deref()),
-        ("model", input.model.as_deref()),
+    profile: Option<&Profile>,
+) -> Result<external_core::AdmissionIdentity, AdmissionFailure> {
+    for (field, value, field_enum, from_profile) in [
+        (
+            "agent",
+            input.agent.as_deref(),
+            AdmissionField::Subagent,
+            input.agent.is_some() && profile.map_or(false, |p| p.subagent.is_some()),
+        ),
+        (
+            "model",
+            input.model.as_deref(),
+            AdmissionField::Model,
+            input.model.is_some() && profile.map_or(false, |p| p.model.is_some()),
+        ),
     ] {
         if let Some(value) = value {
-            validate_text(value.trim(), field, 4096)?;
+            if let Err(err) = validate_text(value.trim(), field, 4096) {
+                return Err(AdmissionFailure {
+                    error: err,
+                    field: field_enum,
+                    profile_provided: from_profile,
+                });
+            }
         }
     }
+    let subagent_from_profile =
+        input.agent.is_some() && profile.map_or(false, |p| p.subagent.is_some());
     let agent = input
         .agent
         .as_deref()
         .or(config.default_subagent.as_deref())
-        .ok_or_else(|| {
-            RpcError::new(
+        .ok_or_else(|| AdmissionFailure {
+            error: RpcError::new(
                 RpcErrorCode::AgentRequired,
                 "agent is required when no default_subagent is configured",
-            )
+            ),
+            field: AdmissionField::Subagent,
+            profile_provided: false,
         })?;
     let configured = config
         .subagents
         .get(agent)
-        .ok_or_else(|| unknown_subagent_error(config))?;
+        .ok_or_else(|| AdmissionFailure {
+            error: unknown_subagent_error(config),
+            field: AdmissionField::Subagent,
+            profile_provided: subagent_from_profile,
+        })?;
     if !configured.enabled {
-        return Err(RpcError::new(
-            RpcErrorCode::AgentDisabled,
-            "agent is disabled",
-        ));
+        return Err(AdmissionFailure {
+            error: RpcError::new(
+                RpcErrorCode::AgentDisabled,
+                "agent is disabled",
+            ),
+            field: AdmissionField::Subagent,
+            profile_provided: subagent_from_profile,
+        });
     }
     if !effective_spawn_supported(agent, configured) {
-        return Err(RpcError::new(
-            RpcErrorCode::AgentUnsupported,
-            format!("agent {agent} is unsupported"),
-        ));
+        return Err(AdmissionFailure {
+            error: RpcError::new(
+                RpcErrorCode::AgentUnsupported,
+                format!("agent {agent} is unsupported"),
+            ),
+            field: AdmissionField::Subagent,
+            profile_provided: subagent_from_profile,
+        });
     }
-    let effort = resolve_effort_selection(agent, input)?;
+    let effort_from_profile =
+        input.effort.is_some() && profile.map_or(false, |p| p.effort.is_some());
+    let effort = resolve_effort_selection(agent, input, effort_from_profile)?;
+    let model_from_profile =
+        input.model.is_some() && profile.map_or(false, |p| p.model.is_some());
     let (model, model_source) = if agent == "dsh" {
         // Explicit spawn token, then the configured default, then the
         // provider-native model. The configured default is a selection too:
@@ -458,10 +530,14 @@ pub(super) fn resolve_admission_with_instructions(
         match token {
             Some(token) => {
                 if external_agent_dsh::acp::model::parse_colon_token(token).is_err() {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        dsh_model_format_error(token),
-                    ));
+                    return Err(AdmissionFailure {
+                        error: RpcError::new(
+                            RpcErrorCode::Validation,
+                            dsh_model_format_error(token),
+                        ),
+                        field: AdmissionField::Model,
+                        profile_provided: model_from_profile,
+                    });
                 }
                 if input.model.is_some() {
                     (Some(token.to_owned()), "spawn_catalog")
@@ -480,16 +556,24 @@ pub(super) fn resolve_admission_with_instructions(
             .map(str::trim)
             .or_else(|| configured.default_model.as_deref().map(str::trim));
         let Some(token) = token else {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "codex requires an explicit model or agents.codex.default_model",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::Validation,
+                    "codex requires an explicit model or agents.codex.default_model",
+                ),
+                field: AdmissionField::Model,
+                profile_provided: false,
+            });
         };
         if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "model token is not a bounded non-empty string",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::Validation,
+                    "model token is not a bounded non-empty string",
+                ),
+                field: AdmissionField::Model,
+                profile_provided: model_from_profile,
+            });
         }
         if input.model.is_some() {
             (Some(token.to_owned()), "spawn_catalog")
@@ -510,10 +594,14 @@ pub(super) fn resolve_admission_with_instructions(
         match token {
             Some(token) => {
                 if !agy_model_is_valid(token) {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        agy_model_format_error(token),
-                    ));
+                    return Err(AdmissionFailure {
+                        error: RpcError::new(
+                            RpcErrorCode::Validation,
+                            agy_model_format_error(token),
+                        ),
+                        field: AdmissionField::Model,
+                        profile_provided: model_from_profile,
+                    });
                 }
                 if input.model.is_some() {
                     (Some(token.to_owned()), "spawn_catalog")
@@ -538,10 +626,14 @@ pub(super) fn resolve_admission_with_instructions(
         match token {
             Some(token) => {
                 let Some(normalized) = normalized_zcode_model(token) else {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Validation,
-                        zcode_model_format_error(token),
-                    ));
+                    return Err(AdmissionFailure {
+                        error: RpcError::new(
+                            RpcErrorCode::Validation,
+                            zcode_model_format_error(token),
+                        ),
+                        field: AdmissionField::Model,
+                        profile_provided: model_from_profile,
+                    });
                 };
                 if input.model.is_some() {
                     (Some(normalized), "spawn_catalog")
@@ -554,6 +646,8 @@ pub(super) fn resolve_admission_with_instructions(
     } else {
         (None, "native")
     };
+    let permission_mode_from_profile =
+        profile.map_or(false, |p| p.permission_mode.is_some());
     let permission_mode = input
         .manifest
         .permission_mode
@@ -563,10 +657,14 @@ pub(super) fn resolve_admission_with_instructions(
             permission_mode,
             external_core::PermissionMode::Build | external_core::PermissionMode::Plan
         ) {
-            return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "dsh first-launch admission supports only the build and plan permission modes",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::AgentUnsupported,
+                    "dsh first-launch admission supports only the build and plan permission modes",
+                ),
+                field: AdmissionField::PermissionMode,
+                profile_provided: permission_mode_from_profile,
+            });
         }
         // A caller write manifest is admitted for build tasks: the factory
         // routes a non-`["."]` manifest to the manifest-build composition
@@ -586,35 +684,49 @@ pub(super) fn resolve_admission_with_instructions(
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
         )
-        .map_err(|error| {
-            RpcError::new(
+        .map_err(|error| AdmissionFailure {
+            error: RpcError::new(
                 RpcErrorCode::Validation,
                 format!("dsh write manifest could not be serialized: {error}"),
-            )
+            ),
+            field: AdmissionField::None,
+            profile_provided: false,
         })?;
         if input.manifest.write_manifest.len() > MAX_DSH_WRITE_MANIFEST_ENTRIES
             || serialized.len() > MAX_DSH_WRITE_MANIFEST_BYTES
         {
-            return Err(RpcError::new(
-                RpcErrorCode::Validation,
-                "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::Validation,
+                    "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
+                ),
+                field: AdmissionField::None,
+                profile_provided: false,
+            });
         }
     }
     if agent == "codex" {
         if !input.manifest.write_manifest.is_empty() {
-            return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "CODEX_WRITE_MANIFEST_UNSUPPORTED",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::AgentUnsupported,
+                    "CODEX_WRITE_MANIFEST_UNSUPPORTED",
+                ),
+                field: AdmissionField::None,
+                profile_provided: false,
+            });
         }
         // Home precedence is agents.codex.home over the inherited CODEX_HOME;
         // neither being present rejects before the prompt, never ~/.codex.
         if configured.home.is_none() && env::var_os("CODEX_HOME").is_none() {
-            return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "codex home is unconfigured",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::AgentUnsupported,
+                    "codex home is unconfigured",
+                ),
+                field: AdmissionField::None,
+                profile_provided: false,
+            });
         }
     }
     if agent == "agy" {
@@ -625,18 +737,26 @@ pub(super) fn resolve_admission_with_instructions(
             permission_mode,
             external_core::PermissionMode::Build | external_core::PermissionMode::Yolo
         ) {
-            return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "AGY_PERMISSION_MODE_UNSUPPORTED",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::AgentUnsupported,
+                    "AGY_PERMISSION_MODE_UNSUPPORTED",
+                ),
+                field: AdmissionField::PermissionMode,
+                profile_provided: permission_mode_from_profile,
+            });
         }
         // agy has no write-manifest guard, so only an empty manifest is
         // admitted — even an explicit ["."] is refused before any task exists.
         if !input.manifest.write_manifest.is_empty() {
-            return Err(RpcError::new(
-                RpcErrorCode::AgentUnsupported,
-                "AGY_WRITE_MANIFEST_UNSUPPORTED",
-            ));
+            return Err(AdmissionFailure {
+                error: RpcError::new(
+                    RpcErrorCode::AgentUnsupported,
+                    "AGY_WRITE_MANIFEST_UNSUPPORTED",
+                ),
+                field: AdmissionField::None,
+                profile_provided: false,
+            });
         }
     }
     let developer_instructions = if agent == "codex" {
@@ -812,7 +932,8 @@ fn agy_model_format_error(token: &str) -> String {
 fn resolve_effort_selection(
     agent: &str,
     input: &GeneralSubmitInput,
-) -> Result<Option<String>, RpcError> {
+    profile_provided: bool,
+) -> Result<Option<String>, AdmissionFailure> {
     let Some(token) = input.effort.as_deref().map(str::trim) else {
         return Ok(None);
     };
@@ -823,24 +944,36 @@ fn resolve_effort_selection(
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
     {
-        return Err(RpcError::new(
-            RpcErrorCode::Validation,
-            "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL",
-        ));
+        return Err(AdmissionFailure {
+            error: RpcError::new(
+                RpcErrorCode::Validation,
+                "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL",
+            ),
+            field: AdmissionField::Effort,
+            profile_provided,
+        });
     }
     if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh" | "max") {
-        return Err(RpcError::new(
-            RpcErrorCode::Validation,
-            "codex effort must be one of low, medium, high, xhigh, max",
-        ));
+        return Err(AdmissionFailure {
+            error: RpcError::new(
+                RpcErrorCode::Validation,
+                "codex effort must be one of low, medium, high, xhigh, max",
+            ),
+            field: AdmissionField::Effort,
+            profile_provided,
+        });
     }
     // agy's measured closed set includes `max` (unlike the official docs) and
     // excludes every other well-formed token.
     if agent == "agy" && !matches!(token, "low" | "medium" | "high" | "max") {
-        return Err(RpcError::new(
-            RpcErrorCode::Validation,
-            "agy effort must be one of low, medium, high, max",
-        ));
+        return Err(AdmissionFailure {
+            error: RpcError::new(
+                RpcErrorCode::Validation,
+                "agy effort must be one of low, medium, high, max",
+            ),
+            field: AdmissionField::Effort,
+            profile_provided,
+        });
     }
     Ok(Some(token.to_owned()))
 }
