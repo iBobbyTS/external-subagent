@@ -390,7 +390,7 @@ impl SubagentMcp {
                 || input.effort.is_some())
         {
             return Err(validation_error(
-                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile",
+                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile",
             )
             .with_operation("spawn"));
         }

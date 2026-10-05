@@ -1,6 +1,6 @@
 //! Global spawn profile loading, validation, and error reporting.
 //!
-//! Profiles are defined in TOML files under the global `profiles/` directory
+//! Profiles are defined in JSON files under the global `profiles/` directory
 //! (sibling to the agent configuration file). Each file defines one profile
 //! with authoritative top-level name and optional presets:
 //! - subagent
@@ -30,6 +30,9 @@ pub struct Profile {
     pub source_path: PathBuf,
 }
 
+/// Canonical JSON shape of a profile file. Kept as the single source of truth
+/// for the fields, required/optional status, and unknown-field rejection; the
+/// differential corpus test deserializes it directly to anchor that shape.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawProfile {
@@ -45,6 +48,16 @@ struct RawProfile {
     #[serde(default)]
     developer_instructions: Option<String>,
 }
+
+/// Fields accepted at the top level of a profile JSON document.
+const PROFILE_FIELDS: [&str; 6] = [
+    "name",
+    "subagent",
+    "permission_mode",
+    "model",
+    "effort",
+    "developer_instructions",
+];
 
 /// Locates the global profiles directory from configuration environment variables.
 pub fn profiles_directory() -> Option<PathBuf> {
@@ -103,10 +116,20 @@ pub struct LoadedProfiles {
     pub file_errors: Vec<ProfileFileDiagnostic>,
 }
 
-#[derive(serde::Deserialize)]
-struct LooseName {
-    #[serde(default)]
-    name: Option<String>,
+/// Extract and validate the top-level `name` without requiring the rest of the
+/// document to be shape-valid. Mirrors the previous loose `name` scan: any
+/// syntax error yields `None`, while a type error in an unrelated field does not
+/// block name extraction. Returns the trimmed name only when it is a non-empty
+/// string of at most 128 bytes without NUL.
+fn loose_top_level_name(content: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let raw = value.get("name")?.as_str()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || raw.len() > 128 || raw.contains('\0') {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Calculate the byte length of a string when encoded inside a JSON string literal.
@@ -275,11 +298,68 @@ pub fn format_unknown_profile_error(requested: &str, names: &[String]) -> String
     format_profile_rejection(&rejection, names)
 }
 
-fn parse_profile_toml_internal(
+/// Returns a field-attributed rejection for a top-level field whose value cannot
+/// be decoded as the `RawProfile` field type (a string; `null` is allowed only
+/// for the optional fields). Unknown fields, non-object documents, and a missing
+/// `name` are left to the `RawProfile` decode so its error text supplies the
+/// attribution.
+fn attribute_profile_field_type_error(
+    value: &serde_json::Value,
+    file_path: &Path,
+) -> Option<ProfileRejection> {
+    let object = value.as_object()?;
+    for (field, field_value) in object {
+        if field == "name" {
+            if !matches!(field_value, serde_json::Value::String(_)) {
+                return Some(ProfileRejection::new(
+                    Some(file_path.to_path_buf()),
+                    Some("name".to_string()),
+                    "must be a string",
+                ));
+            }
+        } else if PROFILE_FIELDS.contains(&field.as_str())
+            && !matches!(
+                field_value,
+                serde_json::Value::String(_) | serde_json::Value::Null
+            )
+        {
+            return Some(ProfileRejection::new(
+                Some(file_path.to_path_buf()),
+                Some(field.clone()),
+                "must be a string",
+            ));
+        }
+    }
+    None
+}
+
+fn parse_profile_json_internal(
     content: &str,
     file_path: &Path,
 ) -> Result<Profile, ProfileRejection> {
-    let raw: RawProfile = match toml::from_str(content) {
+    let value: serde_json::Value = match serde_json::from_str(content) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(ProfileRejection::new(
+                Some(file_path.to_path_buf()),
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+
+    // Attribute field-level type errors before the canonical shape decode,
+    // because serde's derived error for a mistyped field does not name it.
+    // Unknown fields and missing `name` still carry their field name in the
+    // decoded `RawProfile` error text below.
+    if let Some(rejection) = attribute_profile_field_type_error(&value, file_path) {
+        return Err(rejection);
+    }
+
+    // Driving shape through `RawProfile` keeps `deny_unknown_fields`, field
+    // typing, and the required/optional distinction in one place. The value has
+    // already collapsed duplicate object keys with the standard last-wins rule.
+    let raw: RawProfile = match serde_json::from_value(value) {
         Ok(raw) => raw,
         Err(error) => {
             return Err(ProfileRejection::new(
@@ -364,14 +444,14 @@ fn parse_profile_toml_internal(
     })
 }
 
-/// Parse and validate a single profile from a TOML string and file path.
+/// Parse and validate a single profile from a JSON string and file path.
 #[allow(dead_code)]
-pub fn parse_profile_toml(content: &str, file_path: &Path) -> Result<Profile, RpcError> {
-    parse_profile_toml_internal(content, file_path)
+pub fn parse_profile_json(content: &str, file_path: &Path) -> Result<Profile, RpcError> {
+    parse_profile_json_internal(content, file_path)
         .map_err(|rejection| make_profile_rejection_error(&rejection, &[]))
 }
 
-/// Scan a directory for all profile TOML files, collecting valid and non-conflicting profiles
+/// Scan a directory for all profile JSON files, collecting valid and non-conflicting profiles
 /// alongside file-level diagnostics for unreadable, invalid, or duplicate files.
 pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
     let mut profiles = HashMap::new();
@@ -409,7 +489,7 @@ pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
     let mut entries = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
             entries.push(path);
         }
     }
@@ -440,26 +520,13 @@ pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
         };
 
         // F01 / F05: Extract and validate top-level name independently
-        let validated_name = match toml::from_str::<LooseName>(&content) {
-            Ok(loose) => match loose.name {
-                Some(raw) => {
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() || raw.len() > 128 || raw.contains('\0') {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                }
-                None => None,
-            },
-            Err(_) => None,
-        };
+        let validated_name = loose_top_level_name(&content);
 
         if let Some(ref name) = validated_name {
             name_owners.entry(name.clone()).or_default().push(path.clone());
         }
 
-        match parse_profile_toml_internal(&content, &path) {
+        match parse_profile_json_internal(&content, &path) {
             Ok(profile) => {
                 candidates.push(profile);
             }
@@ -575,7 +642,7 @@ pub fn available_profile_names() -> Vec<String> {
 }
 
 /// Load a specific profile by name from the global profiles directory.
-/// If the requested profile does not exist or was rejected (invalid TOML/duplicate/unreadable),
+/// If the requested profile does not exist or was rejected (invalid JSON/duplicate/unreadable),
 /// returns an error with file diagnostic and available profile names.
 pub fn load_profile(name: &str) -> Result<Profile, RpcError> {
     let profiles_dir = profiles_directory();
@@ -639,18 +706,15 @@ mod tests {
 
     #[test]
     fn parse_valid_profile_with_all_fields() {
-        let toml = r#"
-name = "full-profile"
-subagent = "codex"
-permission_mode = "edit"
-model = "gpt-5"
-effort = "high"
-developer_instructions = """
-Line 1
-Line 2
-"""
-"#;
-        let profile = parse_profile_toml(toml, Path::new("test.toml")).unwrap();
+        let json = r#"{
+  "name": "full-profile",
+  "subagent": "codex",
+  "permission_mode": "edit",
+  "model": "gpt-5",
+  "effort": "high",
+  "developer_instructions": "Line 1\nLine 2\n"
+}"#;
+        let profile = parse_profile_json(json, Path::new("test.json")).unwrap();
         assert_eq!(profile.name, "full-profile");
         assert_eq!(profile.subagent.as_deref(), Some("codex"));
         assert_eq!(profile.permission_mode, Some(PermissionMode::Edit));
@@ -664,15 +728,15 @@ Line 2
 
     #[test]
     fn parse_valid_profile_with_empty_and_omitted_fields() {
-        let toml = r#"
-name = "minimal-profile"
-subagent = ""
-permission_mode = ""
-model = ""
-effort = ""
-developer_instructions = ""
-"#;
-        let profile = parse_profile_toml(toml, Path::new("test.toml")).unwrap();
+        let json = r#"{
+  "name": "minimal-profile",
+  "subagent": "",
+  "permission_mode": "",
+  "model": "",
+  "effort": "",
+  "developer_instructions": ""
+}"#;
+        let profile = parse_profile_json(json, Path::new("test.json")).unwrap();
         assert_eq!(profile.name, "minimal-profile");
         assert_eq!(profile.subagent, None);
         assert_eq!(profile.permission_mode, None);
@@ -683,11 +747,11 @@ developer_instructions = ""
 
     #[test]
     fn parse_unicode_and_multiline_developer_instructions() {
-        let toml = r#"
-name = "unicode-中文-profile"
-developer_instructions = "你好，世界！\n第二行。"
-"#;
-        let profile = parse_profile_toml(toml, Path::new("test.toml")).unwrap();
+        let json = r#"{
+  "name": "unicode-中文-profile",
+  "developer_instructions": "你好，世界！\n第二行。"
+}"#;
+        let profile = parse_profile_json(json, Path::new("test.json")).unwrap();
         assert_eq!(profile.name, "unicode-中文-profile");
         assert_eq!(
             profile.developer_instructions.as_deref(),
@@ -697,69 +761,56 @@ developer_instructions = "你好，世界！\n第二行。"
 
     #[test]
     fn parse_rejects_missing_name() {
-        let toml = r#"
-subagent = "codex"
-"#;
-        let err = parse_profile_toml(toml, Path::new("no-name.toml")).unwrap_err();
+        let json = r#"{ "subagent": "codex" }"#;
+        let err = parse_profile_json(json, Path::new("no-name.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("no-name.toml"));
+        assert!(err.message.contains("no-name.json"));
         assert!(err.message.contains("name"));
     }
 
     #[test]
     fn parse_rejects_empty_name() {
-        let toml = r#"
-name = "  "
-"#;
-        let err = parse_profile_toml(toml, Path::new("empty-name.toml")).unwrap_err();
+        let json = r#"{ "name": "  " }"#;
+        let err = parse_profile_json(json, Path::new("empty-name.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("empty-name.toml"));
+        assert!(err.message.contains("empty-name.json"));
         assert!(err.message.contains("name"));
     }
 
     #[test]
     fn parse_rejects_oversized_name() {
         let long_name = "a".repeat(129);
-        let toml = format!(r#"name = "{long_name}""#);
-        let err = parse_profile_toml(&toml, Path::new("long-name.toml")).unwrap_err();
+        let json = format!(r#"{{ "name": "{long_name}" }}"#);
+        let err = parse_profile_json(&json, Path::new("long-name.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("long-name.toml"));
+        assert!(err.message.contains("long-name.json"));
         assert!(err.message.contains("128 bytes"));
     }
 
     #[test]
     fn parse_rejects_unknown_field() {
-        let toml = r#"
-name = "test"
-unknown_field = "value"
-"#;
-        let err = parse_profile_toml(toml, Path::new("unknown.toml")).unwrap_err();
+        let json = r#"{ "name": "test", "unknown_field": "value" }"#;
+        let err = parse_profile_json(json, Path::new("unknown.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("unknown.toml"));
+        assert!(err.message.contains("unknown.json"));
         assert!(err.message.contains("unknown_field"));
     }
 
     #[test]
     fn parse_rejects_invalid_field_type() {
-        let toml = r#"
-name = "test"
-model = 12345
-"#;
-        let err = parse_profile_toml(toml, Path::new("type-err.toml")).unwrap_err();
+        let json = r#"{ "name": "test", "model": 12345 }"#;
+        let err = parse_profile_json(json, Path::new("type-err.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("type-err.toml"));
+        assert!(err.message.contains("type-err.json"));
         assert!(err.message.contains("model"));
     }
 
     #[test]
     fn parse_rejects_invalid_permission_mode() {
-        let toml = r#"
-name = "test"
-permission_mode = "superuser"
-"#;
-        let err = parse_profile_toml(toml, Path::new("bad-mode.toml")).unwrap_err();
+        let json = r#"{ "name": "test", "permission_mode": "superuser" }"#;
+        let err = parse_profile_json(json, Path::new("bad-mode.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("bad-mode.toml"));
+        assert!(err.message.contains("bad-mode.json"));
         assert!(err.message.contains("permission_mode"));
         assert!(err.message.contains("superuser"));
     }
@@ -767,19 +818,19 @@ permission_mode = "superuser"
     #[test]
     fn load_profiles_detects_duplicate_names() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.toml"), "name = \"dup\"\n").unwrap();
-        fs::write(dir.path().join("b.toml"), "name = \"dup\"\n").unwrap();
+        fs::write(dir.path().join("a.json"), r#"{ "name": "dup" }"#).unwrap();
+        fs::write(dir.path().join("b.json"), r#"{ "name": "dup" }"#).unwrap();
         let err = load_profiles_from_dir(dir.path()).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
         assert!(err.message.contains("duplicate profile name 'dup'"));
-        assert!(err.message.contains("a.toml"));
-        assert!(err.message.contains("b.toml"));
+        assert!(err.message.contains("a.json"));
+        assert!(err.message.contains("b.json"));
     }
 
     #[test]
-    fn load_profiles_ignores_non_toml_files() {
+    fn load_profiles_ignores_non_json_files() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("profile.toml"), "name = \"good\"\n").unwrap();
+        fs::write(dir.path().join("profile.json"), r#"{ "name": "good" }"#).unwrap();
         fs::write(dir.path().join("README.md"), "junk\n").unwrap();
         let profiles = load_profiles_from_dir(dir.path()).unwrap();
         assert_eq!(profiles.len(), 1);
@@ -845,16 +896,16 @@ permission_mode = "superuser"
     }
 
     #[test]
-    fn load_profile_with_bad_and_good_toml_reports_diagnostic_and_available_list() {
+    fn load_profile_with_bad_and_good_json_reports_diagnostic_and_available_list() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
-            dir.path().join("good.toml"),
-            "name = \"good\"\nsubagent = \"zcode\"\npermission_mode = \"edit\"\n",
+            dir.path().join("good.json"),
+            r#"{ "name": "good", "subagent": "zcode", "permission_mode": "edit" }"#,
         )
         .unwrap();
         fs::write(
-            dir.path().join("bad.toml"),
-            "name = \"bad\"\npermission_mode = \"superuser\"\n",
+            dir.path().join("bad.json"),
+            r#"{ "name": "bad", "permission_mode": "superuser" }"#,
         )
         .unwrap();
 
@@ -864,10 +915,10 @@ permission_mode = "superuser"
         assert_eq!(loaded.file_errors.len(), 1);
         assert!(loaded.file_errors[0].diagnostic.contains("superuser"));
 
-        // Direct directory load returns Err with bad.toml diagnostic AND available profiles: [good]
+        // Direct directory load returns Err with bad.json diagnostic AND available profiles: [good]
         let err = load_profiles_from_dir(dir.path()).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("bad.toml"));
+        assert!(err.message.contains("bad.json"));
         assert!(err.message.contains("superuser"));
         assert!(err.message.contains("available profiles: [good]"));
     }
@@ -875,9 +926,9 @@ permission_mode = "superuser"
     #[test]
     fn duplicate_profiles_removed_from_available_and_reports_diagnostic_with_available() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.toml"), "name = \"dup\"\n").unwrap();
-        fs::write(dir.path().join("b.toml"), "name = \"dup\"\n").unwrap();
-        fs::write(dir.path().join("c.toml"), "name = \"good\"\n").unwrap();
+        fs::write(dir.path().join("a.json"), r#"{ "name": "dup" }"#).unwrap();
+        fs::write(dir.path().join("b.json"), r#"{ "name": "dup" }"#).unwrap();
+        fs::write(dir.path().join("c.json"), r#"{ "name": "good" }"#).unwrap();
 
         let loaded = scan_profiles_dir(dir.path());
         assert_eq!(loaded.profiles.len(), 1);
@@ -892,46 +943,46 @@ permission_mode = "superuser"
 
     #[test]
     fn duplicate_profiles_with_invalid_fields_evicted_both_orders_and_three_files() {
-        // F01: Test Order 1: a.toml (valid "dup"), b.toml (invalid "dup" with superuser), good.toml (valid "good")
+        // F01: Test Order 1: a.json (valid "dup"), b.json (invalid "dup" with superuser), good.json (valid "good")
         let dir1 = tempfile::tempdir().unwrap();
-        fs::write(dir1.path().join("a.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(dir1.path().join("a.json"), r#"{ "name": "dup", "subagent": "zcode" }"#).unwrap();
         fs::write(
-            dir1.path().join("b.toml"),
-            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+            dir1.path().join("b.json"),
+            r#"{ "name": "dup", "permission_mode": "superuser" }"#,
         )
         .unwrap();
-        fs::write(dir1.path().join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(dir1.path().join("good.json"), r#"{ "name": "good", "subagent": "zcode" }"#).unwrap();
 
         let loaded1 = scan_profiles_dir(dir1.path());
         assert_eq!(loaded1.profiles.len(), 1);
         assert!(loaded1.profiles.contains_key("good"));
         assert!(!loaded1.profiles.contains_key("dup"), "dup must be evicted from available profiles");
 
-        // F01: Test Order 2: a.toml (invalid "dup" with superuser), b.toml (valid "dup"), good.toml (valid "good")
+        // F01: Test Order 2: a.json (invalid "dup" with superuser), b.json (valid "dup"), good.json (valid "good")
         let dir2 = tempfile::tempdir().unwrap();
         fs::write(
-            dir2.path().join("a.toml"),
-            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+            dir2.path().join("a.json"),
+            r#"{ "name": "dup", "permission_mode": "superuser" }"#,
         )
         .unwrap();
-        fs::write(dir2.path().join("b.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
-        fs::write(dir2.path().join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(dir2.path().join("b.json"), r#"{ "name": "dup", "subagent": "zcode" }"#).unwrap();
+        fs::write(dir2.path().join("good.json"), r#"{ "name": "good", "subagent": "zcode" }"#).unwrap();
 
         let loaded2 = scan_profiles_dir(dir2.path());
         assert_eq!(loaded2.profiles.len(), 1);
         assert!(loaded2.profiles.contains_key("good"));
         assert!(!loaded2.profiles.contains_key("dup"), "dup must be evicted from available profiles in reverse order");
 
-        // F01: Test 3 files: a.toml (valid "dup"), b.toml (invalid "dup"), c.toml (valid "dup"), good.toml (valid "good")
+        // F01: Test 3 files: a.json (valid "dup"), b.json (invalid "dup"), c.json (valid "dup"), good.json (valid "good")
         let dir3 = tempfile::tempdir().unwrap();
-        fs::write(dir3.path().join("a.toml"), "name = \"dup\"\n").unwrap();
+        fs::write(dir3.path().join("a.json"), r#"{ "name": "dup" }"#).unwrap();
         fs::write(
-            dir3.path().join("b.toml"),
-            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+            dir3.path().join("b.json"),
+            r#"{ "name": "dup", "permission_mode": "superuser" }"#,
         )
         .unwrap();
-        fs::write(dir3.path().join("c.toml"), "name = \"dup\"\n").unwrap();
-        fs::write(dir3.path().join("good.toml"), "name = \"good\"\n").unwrap();
+        fs::write(dir3.path().join("c.json"), r#"{ "name": "dup" }"#).unwrap();
+        fs::write(dir3.path().join("good.json"), r#"{ "name": "good" }"#).unwrap();
 
         let loaded3 = scan_profiles_dir(dir3.path());
         assert_eq!(loaded3.profiles.len(), 1);
@@ -943,9 +994,9 @@ permission_mode = "superuser"
         let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-dup-");
         let profiles_dir = config_dir.path().join("profiles");
         fs::create_dir_all(&profiles_dir).unwrap();
-        fs::write(profiles_dir.join("a.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
-        fs::write(profiles_dir.join("b.toml"), "name = \"dup\"\npermission_mode = \"superuser\"\n").unwrap();
-        fs::write(profiles_dir.join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(profiles_dir.join("a.json"), r#"{ "name": "dup", "subagent": "zcode" }"#).unwrap();
+        fs::write(profiles_dir.join("b.json"), r#"{ "name": "dup", "permission_mode": "superuser" }"#).unwrap();
+        fs::write(profiles_dir.join("good.json"), r#"{ "name": "good", "subagent": "zcode" }"#).unwrap();
         let config_path = config_dir.path().join("agents.json");
         let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
         let err_load = load_profile("dup").unwrap_err();
@@ -957,21 +1008,22 @@ permission_mode = "superuser"
     }
 
     #[test]
-    fn broken_toml_syntax_diagnostic_preserved_in_not_found_with_available_profiles() {
-        // F02: worker.toml has name="broken" but syntax is broken (unclosed quote on model)
-        // referencing broken -> returns "profile 'broken' not found", preserves worker.toml parse diagnostic, and available profiles: [good]
+    fn broken_json_syntax_diagnostic_preserved_in_not_found_with_available_profiles() {
+        // F02: worker.json has a broken syntax document (unterminated string) so no
+        // name can be decoded; referencing "broken" -> returns "profile 'broken' not
+        // found", preserves the worker.json parse diagnostic, and available profiles: [good]
         let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
         let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-broken-");
         let profiles_dir = config_dir.path().join("profiles");
         fs::create_dir_all(&profiles_dir).unwrap();
         fs::write(
-            profiles_dir.join("worker.toml"),
-            "name = \"broken\"\nmodel = \"unclosed string\n",
+            profiles_dir.join("worker.json"),
+            r#"{ "name": "broken", "model": "unclosed }"#,
         )
         .unwrap();
         fs::write(
-            profiles_dir.join("good.toml"),
-            "name = \"good\"\nsubagent = \"zcode\"\n",
+            profiles_dir.join("good.json"),
+            r#"{ "name": "good", "subagent": "zcode" }"#,
         )
         .unwrap();
 
@@ -985,7 +1037,7 @@ permission_mode = "superuser"
             "Must preserve unknown profile explanation"
         );
         assert!(
-            err.message.contains("worker.toml"),
+            err.message.contains("worker.json"),
             "Must preserve broken file diagnostic"
         );
         assert!(
@@ -1005,8 +1057,8 @@ permission_mode = "superuser"
         let profiles_dir = config_dir.path().join("profiles");
         fs::create_dir_all(&profiles_dir).unwrap();
         let long_val = "x".repeat(2 * 1024 * 1024 + 100);
-        let toml_content = format!("name = \"long_bad\"\npermission_mode = \"{long_val}\"\n");
-        fs::write(profiles_dir.join("long_bad.toml"), toml_content).unwrap();
+        let json_content = format!(r#"{{ "name": "long_bad", "permission_mode": "{long_val}" }}"#);
+        fs::write(profiles_dir.join("long_bad.json"), json_content).unwrap();
 
         let config_path = config_dir.path().join("agents.json");
         let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
@@ -1033,11 +1085,11 @@ permission_mode = "superuser"
 
     #[test]
     fn parse_rejects_name_with_nul_byte() {
-        // F05: name contains \0 (TOML \u0000) -> rejected and reports name field problem
-        let toml = "name = \"call\\u0000name\"\n";
-        let err = parse_profile_toml(toml, Path::new("nul.toml")).unwrap_err();
+        // F05: name contains \0 (JSON \u0000) -> rejected and reports name field problem
+        let json = r#"{ "name": "call\u0000name" }"#;
+        let err = parse_profile_json(json, Path::new("nul.json")).unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Validation);
-        assert!(err.message.contains("nul.toml"));
+        assert!(err.message.contains("nul.json"));
         assert!(err.message.contains("name"));
         assert!(err.message.contains("NUL"));
     }
@@ -1047,13 +1099,13 @@ permission_mode = "superuser"
         // F05: File with NUL in name does not enter available profiles
         let dir = tempfile::tempdir().unwrap();
         fs::write(
-            dir.path().join("nul_file.toml"),
-            "name = \"call\\u0000name\"\nsubagent = \"zcode\"\n",
+            dir.path().join("nul_file.json"),
+            r#"{ "name": "call\u0000name", "subagent": "zcode" }"#,
         )
         .unwrap();
         fs::write(
-            dir.path().join("good.toml"),
-            "name = \"good\"\nsubagent = \"zcode\"\n",
+            dir.path().join("good.json"),
+            r#"{ "name": "good", "subagent": "zcode" }"#,
         )
         .unwrap();
 
@@ -1066,58 +1118,58 @@ permission_mode = "superuser"
 
     #[test]
     fn cross_name_invalid_profiles_attribute_diagnostic_by_authoritative_name_not_file_stem() {
-        // R3-02: a.toml (name="other", invalid) + b.toml (name="a", invalid).
-        // Referencing "a" must attribute diagnostic to b.toml, not preempted by a.toml file_stem.
+        // R3-02: a.json (name="other", invalid) + b.json (name="a", invalid).
+        // Referencing "a" must attribute diagnostic to b.json, not preempted by a.json file_stem.
         let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
         let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-cross-name-");
         let profiles_dir = config_dir.path().join("profiles");
         fs::create_dir_all(&profiles_dir).unwrap();
 
         fs::write(
-            profiles_dir.join("a.toml"),
-            "name = \"other\"\npermission_mode = \"superuser\"\n",
+            profiles_dir.join("a.json"),
+            r#"{ "name": "other", "permission_mode": "superuser" }"#,
         )
         .unwrap();
         fs::write(
-            profiles_dir.join("b.toml"),
-            "name = \"a\"\npermission_mode = \"superuser\"\n",
+            profiles_dir.join("b.json"),
+            r#"{ "name": "a", "permission_mode": "superuser" }"#,
         )
         .unwrap();
         fs::write(
-            profiles_dir.join("good.toml"),
-            "name = \"good\"\nsubagent = \"zcode\"\n",
+            profiles_dir.join("good.json"),
+            r#"{ "name": "good", "subagent": "zcode" }"#,
         )
         .unwrap();
 
         let config_path = config_dir.path().join("agents.json");
         let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
 
-        // 1. Referencing "a" points to b.toml (where name="a" is defined), NOT a.toml
+        // 1. Referencing "a" points to b.json (where name="a" is defined), NOT a.json
         let err_a = load_profile("a").unwrap_err();
         assert_eq!(err_a.code, RpcErrorCode::Validation);
         assert!(
-            err_a.message.contains("b.toml"),
-            "Diagnostic must point to b.toml which declared name='a', but got: {}",
+            err_a.message.contains("b.json"),
+            "Diagnostic must point to b.json which declared name='a', but got: {}",
             err_a.message
         );
         assert!(
-            !err_a.message.contains("a.toml"),
-            "Diagnostic must NOT point to a.toml, but got: {}",
+            !err_a.message.contains("a.json"),
+            "Diagnostic must NOT point to a.json, but got: {}",
             err_a.message
         );
         assert!(err_a.message.contains("available profiles: [good]"));
 
-        // 2. Referencing "other" points to a.toml (where name="other" is defined)
+        // 2. Referencing "other" points to a.json (where name="other" is defined)
         let err_other = load_profile("other").unwrap_err();
         assert_eq!(err_other.code, RpcErrorCode::Validation);
         assert!(
-            err_other.message.contains("a.toml"),
-            "Diagnostic must point to a.toml which declared name='other', but got: {}",
+            err_other.message.contains("a.json"),
+            "Diagnostic must point to a.json which declared name='other', but got: {}",
             err_other.message
         );
         assert!(err_other.message.contains("available profiles: [good]"));
 
-        // 3. Referencing "b" (stem of b.toml, but no file has name="b") follows F02 not-found path
+        // 3. Referencing "b" (stem of b.json, but no file has name="b") follows F02 not-found path
         let err_b = load_profile("b").unwrap_err();
         assert_eq!(err_b.code, RpcErrorCode::Validation);
         assert!(err_b.message.contains("profile 'b' not found"));
@@ -1127,38 +1179,44 @@ permission_mode = "superuser"
         drop(guard);
     }
 
-    /// Anchors the CLI's hand-written TOML scanner (`cli/commands/tasks.mjs`)
-    /// against the authoritative `toml` crate on a shared differential corpus
-    /// (`tests/cli/profiles-corpus/`). Each corpus item asserts two facets the
-    /// CLI scanner must reproduce:
-    ///   1. the decoded top-level `name` when the document is TOML-syntax valid
-    ///      (mirrors `toml::from_str::<LooseName>` used for owner registration);
+    /// Anchors the shared JSON differential corpus (`tests/cli/profiles-corpus/`)
+    /// against the daemon's serde_json parsing. Each corpus item asserts two
+    /// facets a JSON consumer must reproduce:
+    ///   1. the decoded top-level `name` when the document parses as JSON
+    ///      (mirrors `loose_top_level_name` used for owner registration);
     ///   2. profile-shape validity: `RawProfile` (`deny_unknown_fields`) decodes
     ///      and yields a usable name. Field-value validation (e.g.
-    ///      `permission_mode = "superuser"`) is intentionally excluded, because
+    ///      `"permission_mode": "superuser"`) is intentionally excluded, because
     ///      the CLI deliberately leaves value-level validation to the daemon.
     /// A byte-level item whose bytes are not valid UTF-8 is asserted to own no
     /// name and to be invalid, mirroring `fs::read_to_string` failing.
     #[test]
-    fn profile_corpus_matches_toml_crate_identity_and_shape() {
+    fn profile_corpus_matches_serde_json_identity_and_shape() {
         let corpus =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/cli/profiles-corpus");
         assert!(corpus.is_dir(), "corpus directory missing: {}", corpus.display());
 
-        let mut toml_files: Vec<PathBuf> = fs::read_dir(&corpus)
+        let mut json_files: Vec<PathBuf> = fs::read_dir(&corpus)
             .expect("read corpus directory")
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("toml"))
+            .filter(|path| {
+                let is_json = path.extension().and_then(|e| e.to_str()) == Some("json");
+                let is_expected = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".expected.json"));
+                is_json && !is_expected
+            })
             .collect();
-        toml_files.sort();
-        assert!(!toml_files.is_empty(), "corpus must contain at least one .toml input");
+        json_files.sort();
+        assert!(!json_files.is_empty(), "corpus must contain at least one .json input");
 
-        for toml_path in toml_files {
-            let stem = toml_path
+        for json_path in json_files {
+            let stem = json_path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .expect("corpus .toml stem");
+                .expect("corpus .json stem");
             let expected_path = corpus.join(format!("{stem}.expected.json"));
             let expected: serde_json::Value = serde_json::from_str(
                 &fs::read_to_string(&expected_path)
@@ -1167,8 +1225,8 @@ permission_mode = "superuser"
             .unwrap_or_else(|e| panic!("parse {}: {e}", expected_path.display()));
             let expected_valid = expected["valid"].as_bool().expect("expected.valid must be bool");
             let expected_name = expected["name"].as_str().map(str::to_string);
-            let bytes = fs::read(&toml_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", toml_path.display()));
+            let bytes = fs::read(&json_path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", json_path.display()));
             let content = match String::from_utf8(bytes) {
                 Ok(content) => content,
                 Err(_) => {
@@ -1187,24 +1245,21 @@ permission_mode = "superuser"
                 }
             };
 
-            let decoded_name = toml::from_str::<toml::Value>(&content)
-                .ok()
-                .and_then(|value| {
-                    let raw = value.get("name").and_then(|v| v.as_str())?;
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() || raw.len() > 128 || raw.contains('\0') {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                });
+            let decoded_name = loose_top_level_name(&content);
 
             assert_eq!(
                 decoded_name, expected_name,
                 "corpus item {stem}: decoded top-level name disagrees with expectation"
             );
 
-            let shape_ok = toml::from_str::<RawProfile>(&content).is_ok();
+            // Parse through `Value` first so that duplicate object keys collapse
+            // with the standard last-wins rule, matching `JSON.parse` and the
+            // daemon's own scanner. (Deserializing `RawProfile` directly from the
+            // text would instead surface serde's derived duplicate-field error,
+            // which JSON producers cannot reproduce.)
+            let shape_ok = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .is_some_and(|value| serde_json::from_value::<RawProfile>(value).is_ok());
             let computed_valid = shape_ok && decoded_name.is_some();
             assert_eq!(
                 computed_valid, expected_valid,

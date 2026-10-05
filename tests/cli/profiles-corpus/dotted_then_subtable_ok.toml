@@ -1,4 +1,0 @@
-name = "real"
-a.b = 1
-[a.c]
-d = 2

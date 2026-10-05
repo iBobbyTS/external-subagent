@@ -63,7 +63,7 @@
       "description": "Start one durable subagent in an absolute repository workspace, returning after establishing the new session.",
       "required": ["repository", "prompt"],
       "properties": {
-        "profile": { "type": "string", "minLength": 1, "description": "Profile name referencing a TOML preset in profiles/*.toml. Mutually exclusive with subagent, permission_mode, model, and effort." },
+        "profile": { "type": "string", "minLength": 1, "description": "Profile name referencing a JSON preset in profiles/*.json. Mutually exclusive with subagent, permission_mode, model, and effort." },
         "subagent": { "type": "string", "minLength": 1, "description": "Subagent route key; omission uses configured default_subagent or returns subagent_required. Null is invalid; dsh production spawn requires its enabled + spawn_supported + pinned-runtime configuration." },
         "repository": { "type": "string", "minLength": 1 },
         "permission_mode": { "$ref": "#/properties/permission_mode", "description": "codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; agy supports only build (--mode accept-edits) and yolo (--dangerously-skip-permissions)." },

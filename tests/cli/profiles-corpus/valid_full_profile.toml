@@ -1,9 +1,0 @@
-name = "full-profile"
-subagent = "codex"
-permission_mode = "edit"
-model = "gpt-5"
-effort = "high"
-developer_instructions = """
-Line 1
-Line 2
-"""

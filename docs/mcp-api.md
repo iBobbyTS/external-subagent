@@ -173,7 +173,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 参数 | 类型／必填与默认 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
-| `profile` | string；可选 | 引用 profiles/*.toml 中定义的全局预设（subagent、permission_mode、model、effort、developer_instructions） | 省略则使用独立参数；指定 profile 时与 subagent、permission_mode、model、effort 互斥 |
+| `profile` | string；可选 | 引用 profiles/*.json 中定义的全局预设（subagent、permission_mode、model、effort、developer_instructions） | 省略则使用独立参数；指定 profile 时与 subagent、permission_mode、model、effort 互斥 |
 | `subagent` | string；可选 | 选择 subagent，或避免默认配置变化影响路由 | 省略使用 `default_subagent`，未配置则 `subagent_required`；移除后无法逐任务选 subagent |
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |

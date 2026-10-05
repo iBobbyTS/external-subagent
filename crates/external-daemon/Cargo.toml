@@ -30,7 +30,6 @@ rmcp-macros = "=3.1.4"
 schemars = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "net"] }
-toml = "0.8"
 
 [dev-dependencies]
 jsonschema = { version = "0.51", default-features = false }

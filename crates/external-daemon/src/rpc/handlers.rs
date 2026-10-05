@@ -301,7 +301,7 @@ impl RpcService {
                 {
                     return Err(RpcError::new_profile_error(
                         RpcErrorCode::Validation,
-                        "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile",
+                        "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile",
                     ));
                 }
 
@@ -1306,7 +1306,7 @@ mod observe_gate_tests {
     mod s01_profile_acceptance_tests {
         use super::*;
         use crate::rpc::agents::admission_fixtures::{admission_root, config_env_guard, ConfigEnvScope};
-        use crate::rpc::profiles::{load_profile, load_profiles_from_dir, parse_profile_toml};
+        use crate::rpc::profiles::{load_profile, load_profiles_from_dir, parse_profile_json};
         use crate::rpc::types::GeneralSubmitInput;
         use crate::{Scheduler, SchedulerConfig};
         use external_agent_codex::session::{codex_posture, thread_start_params, CodexPermissionMode};
@@ -1432,18 +1432,15 @@ mod observe_gate_tests {
             let env = setup_environment();
 
             // 1. Valid profile with Unicode and multiline instructions
-            let valid_toml = r#"
-name = "full_worker"
-subagent = "zcode"
-permission_mode = "edit"
-model = "zai/GLM-5.3"
-effort = "high"
-developer_instructions = """
-Line 1: 遵循准则
-Line 2: Be precise
-"""
-"#;
-            fs::write(env.profiles_dir.join("worker.toml"), valid_toml).unwrap();
+            let valid_json = r#"{
+  "name": "full_worker",
+  "subagent": "zcode",
+  "permission_mode": "edit",
+  "model": "zai/GLM-5.3",
+  "effort": "high",
+  "developer_instructions": "Line 1: 遵循准则\nLine 2: Be precise\n"
+}"#;
+            fs::write(env.profiles_dir.join("worker.json"), valid_json).unwrap();
             let loaded = load_profile("full_worker").unwrap();
             assert_eq!(loaded.name, "full_worker");
             assert_eq!(loaded.subagent.as_deref(), Some("zcode"));
@@ -1457,45 +1454,45 @@ Line 2: Be precise
 
             // 2. Error reporting specifies file path and field name
             // 2a. Unknown field
-            let unknown_field_toml = "name = \"bad\"\nunknown_key = 123\n";
-            let err = parse_profile_toml(unknown_field_toml, Path::new("bad_field.toml")).unwrap_err();
+            let unknown_field_json = r#"{ "name": "bad", "unknown_key": 123 }"#;
+            let err = parse_profile_json(unknown_field_json, Path::new("bad_field.json")).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
-            assert!(err.message.contains("bad_field.toml"));
+            assert!(err.message.contains("bad_field.json"));
             assert!(err.message.contains("unknown_key"));
 
             // 2b. Missing name
-            let missing_name_toml = "subagent = \"zcode\"\n";
-            let err = parse_profile_toml(missing_name_toml, Path::new("missing_name.toml")).unwrap_err();
+            let missing_name_json = r#"{ "subagent": "zcode" }"#;
+            let err = parse_profile_json(missing_name_json, Path::new("missing_name.json")).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
-            assert!(err.message.contains("missing_name.toml"));
+            assert!(err.message.contains("missing_name.json"));
             assert!(err.message.contains("name"));
 
             // 2c. Empty name
-            let empty_name_toml = "name = \"  \"\n";
-            let err = parse_profile_toml(empty_name_toml, Path::new("empty_name.toml")).unwrap_err();
+            let empty_name_json = r#"{ "name": "  " }"#;
+            let err = parse_profile_json(empty_name_json, Path::new("empty_name.json")).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
-            assert!(err.message.contains("empty_name.toml"));
+            assert!(err.message.contains("empty_name.json"));
             assert!(err.message.contains("name"));
 
             // 2d. Name > 128 bytes
             let long_name = "x".repeat(129);
-            let long_name_toml = format!("name = \"{long_name}\"\n");
-            let err = parse_profile_toml(&long_name_toml, Path::new("long_name.toml")).unwrap_err();
+            let long_name_json = format!(r#"{{ "name": "{long_name}" }}"#);
+            let err = parse_profile_json(&long_name_json, Path::new("long_name.json")).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
-            assert!(err.message.contains("long_name.toml"));
+            assert!(err.message.contains("long_name.json"));
             assert!(err.message.contains("128 bytes"));
 
             // 2e. Invalid type
-            let bad_type_toml = "name = \"ok\"\nsubagent = 999\n";
-            let err = parse_profile_toml(bad_type_toml, Path::new("bad_type.toml")).unwrap_err();
+            let bad_type_json = r#"{ "name": "ok", "subagent": 999 }"#;
+            let err = parse_profile_json(bad_type_json, Path::new("bad_type.json")).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
-            assert!(err.message.contains("bad_type.toml"));
+            assert!(err.message.contains("bad_type.json"));
             assert!(err.message.contains("subagent"));
 
             // 2f. Duplicate profile name across files
             let dup_dir = tempfile::tempdir().unwrap();
-            fs::write(dup_dir.path().join("p1.toml"), "name = \"same_name\"\n").unwrap();
-            fs::write(dup_dir.path().join("p2.toml"), "name = \"same_name\"\n").unwrap();
+            fs::write(dup_dir.path().join("p1.json"), r#"{ "name": "same_name" }"#).unwrap();
+            fs::write(dup_dir.path().join("p2.json"), r#"{ "name": "same_name" }"#).unwrap();
             let err = load_profiles_from_dir(dup_dir.path()).unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
             assert!(err.message.contains("same_name"));
@@ -1514,7 +1511,7 @@ Line 2: Be precise
             let env = setup_environment();
 
             // Create a valid profile
-            fs::write(env.profiles_dir.join("worker.toml"), "name = \"worker\"\n").unwrap();
+            fs::write(env.profiles_dir.join("worker.json"), r#"{ "name": "worker" }"#).unwrap();
 
             // 1. Daemon mutex validation: profile cannot be combined with agent, model, effort, or permission_mode
             let test_cases = [
@@ -1565,7 +1562,7 @@ Line 2: Be precise
         #[test]
         fn ac2_direct_rpc_permission_mode_four_cases_and_wire_null() {
             let env = setup_environment();
-            fs::write(env.profiles_dir.join("worker.toml"), "name = \"worker\"\n").unwrap();
+            fs::write(env.profiles_dir.join("worker.json"), r#"{ "name": "worker" }"#).unwrap();
 
             // Case 1: Direct RPC with explicit "permission_mode": "build" + profile -> rejected by daemon mutex
             let raw_case1 = serde_json::json!({
@@ -1656,14 +1653,14 @@ Line 2: Be precise
             let env = setup_environment();
 
             // 1. Profile with all four fields explicit
-            let full_toml = r#"
-name = "full_profile"
-subagent = "zcode"
-permission_mode = "edit"
-model = "zai/GLM-5.3"
-effort = "high"
-"#;
-            fs::write(env.profiles_dir.join("full.toml"), full_toml).unwrap();
+            let full_json = r#"{
+  "name": "full_profile",
+  "subagent": "zcode",
+  "permission_mode": "edit",
+  "model": "zai/GLM-5.3",
+  "effort": "high"
+}"#;
+            fs::write(env.profiles_dir.join("full.json"), full_json).unwrap();
 
             let input = GeneralSubmitInput {
                 agent: None,
@@ -1685,10 +1682,8 @@ effort = "high"
             assert_eq!(admission.effort.as_deref(), Some("high"));
 
             // 2. Profile with omitted/empty fields falls back to defaults
-            let minimal_toml = r#"
-name = "minimal_profile"
-"#;
-            fs::write(env.profiles_dir.join("minimal.toml"), minimal_toml).unwrap();
+            let minimal_json = r#"{ "name": "minimal_profile" }"#;
+            fs::write(env.profiles_dir.join("minimal.json"), minimal_json).unwrap();
 
             let input_min = GeneralSubmitInput {
                 agent: None,
@@ -1714,12 +1709,12 @@ name = "minimal_profile"
             let env = setup_environment();
 
             // 1. dsh: provider:model format accepted
-            let dsh_toml = r#"
-name = "dsh_worker"
-subagent = "dsh"
-model = "anthropic:claude-3-7-sonnet"
-"#;
-            fs::write(env.profiles_dir.join("dsh.toml"), dsh_toml).unwrap();
+            let dsh_json = r#"{
+  "name": "dsh_worker",
+  "subagent": "dsh",
+  "model": "anthropic:claude-3-7-sonnet"
+}"#;
+            fs::write(env.profiles_dir.join("dsh.json"), dsh_json).unwrap();
             let input = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1730,12 +1725,12 @@ model = "anthropic:claude-3-7-sonnet"
             assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input)).is_ok());
 
             // 1b. dsh: invalid model format (no colon) rejected
-            let dsh_bad_toml = r#"
-name = "dsh_bad"
-subagent = "dsh"
-model = "bare_model_without_colon"
-"#;
-            fs::write(env.profiles_dir.join("dsh_bad.toml"), dsh_bad_toml).unwrap();
+            let dsh_bad_json = r#"{
+  "name": "dsh_bad",
+  "subagent": "dsh",
+  "model": "bare_model_without_colon"
+}"#;
+            fs::write(env.profiles_dir.join("dsh_bad.json"), dsh_bad_json).unwrap();
             let input_bad = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1748,12 +1743,12 @@ model = "bare_model_without_colon"
             assert!(err.message.contains("{provider}:{model}"));
 
             // 2. zcode: provider/model or bare token accepted
-            let zcode_slash_toml = r#"
-name = "zcode_slash"
-subagent = "zcode"
-model = "provider/model-name"
-"#;
-            fs::write(env.profiles_dir.join("zcode_slash.toml"), zcode_slash_toml).unwrap();
+            let zcode_slash_json = r#"{
+  "name": "zcode_slash",
+  "subagent": "zcode",
+  "model": "provider/model-name"
+}"#;
+            fs::write(env.profiles_dir.join("zcode_slash.json"), zcode_slash_json).unwrap();
             let input_z1 = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1763,12 +1758,12 @@ model = "provider/model-name"
             };
             assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_z1)).is_ok());
 
-            let zcode_bare_toml = r#"
-name = "zcode_bare"
-subagent = "zcode"
-model = "bare_model"
-"#;
-            fs::write(env.profiles_dir.join("zcode_bare.toml"), zcode_bare_toml).unwrap();
+            let zcode_bare_json = r#"{
+  "name": "zcode_bare",
+  "subagent": "zcode",
+  "model": "bare_model"
+}"#;
+            fs::write(env.profiles_dir.join("zcode_bare.json"), zcode_bare_json).unwrap();
             let input_z2 = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1779,12 +1774,12 @@ model = "bare_model"
             assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_z2)).is_ok());
 
             // 3. codex: bare slug accepted, slash rejected
-            let codex_slug_toml = r#"
-name = "codex_slug"
-subagent = "codex"
-model = "gpt-5"
-"#;
-            fs::write(env.profiles_dir.join("codex_slug.toml"), codex_slug_toml).unwrap();
+            let codex_slug_json = r#"{
+  "name": "codex_slug",
+  "subagent": "codex",
+  "model": "gpt-5"
+}"#;
+            fs::write(env.profiles_dir.join("codex_slug.json"), codex_slug_json).unwrap();
             let input_c1 = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1794,12 +1789,12 @@ model = "gpt-5"
             };
             assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_c1)).is_ok());
 
-            let codex_slash_toml = r#"
-name = "codex_slash"
-subagent = "codex"
-model = "openai/gpt-5"
-"#;
-            fs::write(env.profiles_dir.join("codex_slash.toml"), codex_slash_toml).unwrap();
+            let codex_slash_json = r#"{
+  "name": "codex_slash",
+  "subagent": "codex",
+  "model": "openai/gpt-5"
+}"#;
+            fs::write(env.profiles_dir.join("codex_slash.json"), codex_slash_json).unwrap();
             let input_c2 = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1816,13 +1811,13 @@ model = "openai/gpt-5"
             let env = setup_environment();
 
             // 1. Codex: developer_instructions routed via native channel, initial_prompt is verbatim
-            let codex_toml = r#"
-name = "codex_worker"
-subagent = "codex"
-model = "gpt-5"
-developer_instructions = "Custom instructions for codex"
-"#;
-            fs::write(env.profiles_dir.join("codex.toml"), codex_toml).unwrap();
+            let codex_json = r#"{
+  "name": "codex_worker",
+  "subagent": "codex",
+  "model": "gpt-5",
+  "developer_instructions": "Custom instructions for codex"
+}"#;
+            fs::write(env.profiles_dir.join("codex.json"), codex_json).unwrap();
             let input_codex = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1857,12 +1852,12 @@ developer_instructions = "Custom instructions for codex"
             );
 
             // 2. Non-codex (zcode): prompt is spliced with Developer Instructions prefix
-            let zcode_toml = r#"
-name = "zcode_worker"
-subagent = "zcode"
-developer_instructions = "Custom instructions for zcode"
-"#;
-            fs::write(env.profiles_dir.join("zcode.toml"), zcode_toml).unwrap();
+            let zcode_json = r#"{
+  "name": "zcode_worker",
+  "subagent": "zcode",
+  "developer_instructions": "Custom instructions for zcode"
+}"#;
+            fs::write(env.profiles_dir.join("zcode.json"), zcode_json).unwrap();
             let input_zcode = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1886,13 +1881,13 @@ developer_instructions = "Custom instructions for zcode"
             );
 
             // 2b. Non-codex (dsh): prompt is spliced with Developer Instructions prefix
-            let dsh_toml = r#"
-name = "dsh_worker"
-subagent = "dsh"
-model = "anthropic:claude-3-7-sonnet"
-developer_instructions = "Custom instructions for dsh"
-"#;
-            fs::write(env.profiles_dir.join("dsh.toml"), dsh_toml).unwrap();
+            let dsh_json = r#"{
+  "name": "dsh_worker",
+  "subagent": "dsh",
+  "model": "anthropic:claude-3-7-sonnet",
+  "developer_instructions": "Custom instructions for dsh"
+}"#;
+            fs::write(env.profiles_dir.join("dsh.json"), dsh_json).unwrap();
             let input_dsh = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1911,14 +1906,14 @@ developer_instructions = "Custom instructions for dsh"
             assert_eq!(prepared_dsh.admission.unwrap().developer_instructions, None);
 
             // 2c. Non-codex (agy): prompt is spliced with Developer Instructions prefix
-            let agy_toml = r#"
-name = "agy_worker"
-subagent = "agy"
-model = "gemini-2.5-flash"
-effort = "high"
-developer_instructions = "Custom instructions for agy"
-"#;
-            fs::write(env.profiles_dir.join("agy.toml"), agy_toml).unwrap();
+            let agy_json = r#"{
+  "name": "agy_worker",
+  "subagent": "agy",
+  "model": "gemini-2.5-flash",
+  "effort": "high",
+  "developer_instructions": "Custom instructions for agy"
+}"#;
+            fs::write(env.profiles_dir.join("agy.json"), agy_json).unwrap();
             let input_agy = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1937,12 +1932,8 @@ developer_instructions = "Custom instructions for agy"
             assert_eq!(prepared_agy.admission.unwrap().developer_instructions, None);
 
             // 3. Empty developer_instructions: prompt unchanged on codex and zcode
-            let empty_toml = r#"
-name = "empty_di_worker"
-subagent = "zcode"
-developer_instructions = ""
-"#;
-            fs::write(env.profiles_dir.join("empty.toml"), empty_toml).unwrap();
+            let empty_json = r#"{ "name": "empty_di_worker", "subagent": "zcode", "developer_instructions": "" }"#;
+            fs::write(env.profiles_dir.join("empty.json"), empty_json).unwrap();
             let input_empty = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1955,12 +1946,8 @@ developer_instructions = ""
             let record_empty = env.store.get_task(&task_empty.agent_id).unwrap().unwrap();
             assert_eq!(record_empty.initial_prompt, "Unchanged prompt");
 
-            let codex_empty_toml = r#"
-name = "codex_empty_worker"
-subagent = "codex"
-developer_instructions = ""
-"#;
-            fs::write(env.profiles_dir.join("codex_empty.toml"), codex_empty_toml).unwrap();
+            let codex_empty_json = r#"{ "name": "codex_empty_worker", "subagent": "codex", "developer_instructions": "" }"#;
+            fs::write(env.profiles_dir.join("codex_empty.json"), codex_empty_json).unwrap();
             let input_codex_empty = GeneralSubmitInput {
                 agent: None,
                 model: None,
@@ -1977,10 +1964,10 @@ developer_instructions = ""
 
             // 4. Spliced prompt exceeding MAX_PROMPT_BYTES (256 KiB) is rejected
             let di_text = "Instructions: ".repeat(20); // ~280 bytes
-            let big_di_toml = format!(
-                "name = \"big_di\"\nsubagent = \"zcode\"\ndeveloper_instructions = \"{di_text}\"\n"
+            let big_di_json = format!(
+                r#"{{ "name": "big_di", "subagent": "zcode", "developer_instructions": "{di_text}" }}"#
             );
-            fs::write(env.profiles_dir.join("big_di.toml"), big_di_toml).unwrap();
+            fs::write(env.profiles_dir.join("big_di.json"), big_di_json).unwrap();
             // Make base prompt just 50 bytes under MAX_PROMPT_BYTES so splicing exceeds the limit
             let base_prompt = "a".repeat(MAX_PROMPT_BYTES - 50);
             let input_oversized = GeneralSubmitInput {
@@ -1998,18 +1985,18 @@ developer_instructions = ""
         fn b02_invalid_profile_reference_outputs_diagnostic_and_available_list() {
             let env = setup_environment();
 
-            // Create good.toml and bad.toml
-            let good_toml = r#"
-name = "good"
-subagent = "zcode"
-permission_mode = "edit"
-"#;
-            let bad_toml = r#"
-name = "bad"
-permission_mode = "superuser"
-"#;
-            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
-            fs::write(env.profiles_dir.join("bad.toml"), bad_toml).unwrap();
+            // Create good.json and bad.json
+            let good_json = r#"{
+  "name": "good",
+  "subagent": "zcode",
+  "permission_mode": "edit"
+}"#;
+            let bad_json = r#"{
+  "name": "bad",
+  "permission_mode": "superuser"
+}"#;
+            fs::write(env.profiles_dir.join("good.json"), good_json).unwrap();
+            fs::write(env.profiles_dir.join("bad.json"), bad_json).unwrap();
 
             // 1. Reference bad profile -> returns error containing bad diagnostic AND available profiles: [good]
             let input_bad = GeneralSubmitInput {
@@ -2021,7 +2008,7 @@ permission_mode = "superuser"
             };
             let err_bad = env.service.dispatch(RpcMethod::SubmitGeneral(input_bad)).unwrap_err();
             assert_eq!(err_bad.code, RpcErrorCode::Validation);
-            assert!(err_bad.message.contains("bad.toml"));
+            assert!(err_bad.message.contains("bad.json"));
             assert!(err_bad.message.contains("superuser"));
             assert!(err_bad.message.contains("available profiles: [good]"));
 
@@ -2068,9 +2055,9 @@ permission_mode = "superuser"
             let env = setup_environment();
 
             // 1. Profiles listed in stable alphabetical sort
-            fs::write(env.profiles_dir.join("c.toml"), "name = \"charlie\"\n").unwrap();
-            fs::write(env.profiles_dir.join("a.toml"), "name = \"alpha\"\n").unwrap();
-            fs::write(env.profiles_dir.join("b.toml"), "name = \"bravo\"\n").unwrap();
+            fs::write(env.profiles_dir.join("c.json"), r#"{ "name": "charlie" }"#).unwrap();
+            fs::write(env.profiles_dir.join("a.json"), r#"{ "name": "alpha" }"#).unwrap();
+            fs::write(env.profiles_dir.join("b.json"), r#"{ "name": "bravo" }"#).unwrap();
 
             let err = load_profile("missing").unwrap_err();
             assert_eq!(err.code, RpcErrorCode::Validation);
@@ -2084,8 +2071,8 @@ permission_mode = "superuser"
             for i in 0..40 {
                 let name = format!("profile_worker_long_name_{:02}", i);
                 fs::write(
-                    large_dir.path().join(format!("p_{:02}.toml", i)),
-                    format!("name = \"{name}\"\n"),
+                    large_dir.path().join(format!("p_{:02}.json", i)),
+                    format!(r#"{{ "name": "{name}" }}"#),
                 )
                 .unwrap();
             }
@@ -2164,17 +2151,17 @@ permission_mode = "superuser"
         fn f03_profile_derived_admission_error_and_non_profile_regression() {
             let env = setup_environment();
 
-            let dsh_bad_toml = r#"
-name = "dsh_bad"
-subagent = "dsh"
-model = "bare_model_without_colon"
-"#;
-            let good_toml = r#"
-name = "good"
-subagent = "zcode"
-"#;
-            fs::write(env.profiles_dir.join("dsh_bad.toml"), dsh_bad_toml).unwrap();
-            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
+            let dsh_bad_json = r#"{
+  "name": "dsh_bad",
+  "subagent": "dsh",
+  "model": "bare_model_without_colon"
+}"#;
+            let good_json = r#"{
+  "name": "good",
+  "subagent": "zcode"
+}"#;
+            fs::write(env.profiles_dir.join("dsh_bad.json"), dsh_bad_json).unwrap();
+            fs::write(env.profiles_dir.join("good.json"), good_json).unwrap();
 
             // 1. Profile-derived admission failure returns file/field diagnostic + available profiles
             let input_profile_bad = GeneralSubmitInput {
@@ -2187,7 +2174,7 @@ subagent = "zcode"
             let err_prof = env.service.dispatch(RpcMethod::SubmitGeneral(input_profile_bad)).unwrap_err();
             assert_eq!(err_prof.code, RpcErrorCode::Validation);
             assert!(err_prof.message.starts_with("profile file '"));
-            assert!(err_prof.message.contains("dsh_bad.toml"));
+            assert!(err_prof.message.contains("dsh_bad.json"));
             assert!(err_prof.message.contains("field 'model'"));
             assert!(err_prof.message.contains("dsh model must be {provider}:{model}"));
             assert!(err_prof.message.contains("available profiles: [dsh_bad, good]"));
@@ -2227,7 +2214,7 @@ subagent = "zcode"
             assert_eq!(err_mutex.code, RpcErrorCode::Validation);
             assert_eq!(
                 err_mutex.message,
-                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile"
+                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile"
             );
             assert!(!err_mutex.message.contains("available profiles"));
         }
@@ -2236,29 +2223,29 @@ subagent = "zcode"
         fn r3_01_structured_attribution_and_contrast_regressions() {
             let env = setup_environment();
 
-            let agy_plan_toml = r#"
-name = "agy_plan"
-subagent = "agy"
-permission_mode = "plan"
-"#;
-            let codex_no_model_toml = r#"
-name = "codex_no_model"
-subagent = "codex"
-"#;
-            let codex_bad_effort_toml = r#"
-name = "codex_bad_effort"
-subagent = "codex"
-model = "gpt-5"
-effort = "ultra"
-"#;
-            let good_toml = r#"
-name = "good"
-subagent = "zcode"
-"#;
-            fs::write(env.profiles_dir.join("agy_plan.toml"), agy_plan_toml).unwrap();
-            fs::write(env.profiles_dir.join("codex_no_model.toml"), codex_no_model_toml).unwrap();
-            fs::write(env.profiles_dir.join("codex_bad_effort.toml"), codex_bad_effort_toml).unwrap();
-            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
+            let agy_plan_json = r#"{
+  "name": "agy_plan",
+  "subagent": "agy",
+  "permission_mode": "plan"
+}"#;
+            let codex_no_model_json = r#"{
+  "name": "codex_no_model",
+  "subagent": "codex"
+}"#;
+            let codex_bad_effort_json = r#"{
+  "name": "codex_bad_effort",
+  "subagent": "codex",
+  "model": "gpt-5",
+  "effort": "ultra"
+}"#;
+            let good_json = r#"{
+  "name": "good",
+  "subagent": "zcode"
+}"#;
+            fs::write(env.profiles_dir.join("agy_plan.json"), agy_plan_json).unwrap();
+            fs::write(env.profiles_dir.join("codex_no_model.json"), codex_no_model_json).unwrap();
+            fs::write(env.profiles_dir.join("codex_bad_effort.json"), codex_bad_effort_json).unwrap();
+            fs::write(env.profiles_dir.join("good.json"), good_json).unwrap();
 
             // R3-01(a): Profile subagent="agy" permission_mode="plan" -> wrapped with AgentUnsupported code preserved
             let input_agy_plan = GeneralSubmitInput {
@@ -2271,7 +2258,7 @@ subagent = "zcode"
             let err_agy_plan = env.service.dispatch(RpcMethod::SubmitGeneral(input_agy_plan)).unwrap_err();
             assert_eq!(err_agy_plan.code, RpcErrorCode::AgentUnsupported);
             assert!(err_agy_plan.message.starts_with("profile file '"));
-            assert!(err_agy_plan.message.contains("agy_plan.toml"));
+            assert!(err_agy_plan.message.contains("agy_plan.json"));
             assert!(err_agy_plan.message.contains("field 'permission_mode'"));
             assert!(err_agy_plan.message.contains("AGY_PERMISSION_MODE_UNSUPPORTED"));
             assert!(err_agy_plan.message.contains("available profiles: ["));
@@ -2406,7 +2393,7 @@ subagent = "zcode"
                 .unwrap_err();
             assert_eq!(err_effort.code, RpcErrorCode::Validation);
             assert!(err_effort.message.starts_with("profile file '"));
-            assert!(err_effort.message.contains("codex_bad_effort.toml"));
+            assert!(err_effort.message.contains("codex_bad_effort.json"));
             assert!(err_effort.message.contains("field 'effort'"));
             assert!(err_effort.message.contains("codex effort must be one of low, medium, high, xhigh, max"));
             assert!(err_effort.message.contains("available profiles: ["));
