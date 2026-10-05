@@ -55,6 +55,7 @@ fn agy_admission_with_effort(model: Option<&str>, effort: Option<&str>) -> Admis
         model: model.map(str::to_owned),
         model_source: "catalog_token".into(),
         effort: effort.map(str::to_owned),
+        developer_instructions: None,
     }
 }
 
@@ -67,7 +68,7 @@ fn manifest_for_mode(
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: "agy-test".into(),
         repository: workspace.canonicalize().unwrap(),
-        permission_mode,
+        permission_mode: Some(permission_mode),
         prompt: prompt.into(),
         write_manifest: Vec::new(),
     }

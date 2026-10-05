@@ -82,11 +82,15 @@ pub(super) fn tool_output_schema<T: JsonSchema + 'static>() -> Arc<JsonObject> {
 pub struct AgentSpawnInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
+    pub profile: Option<String>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    #[schemars(with = "String")]
     #[serde(rename = "subagent")]
     pub agent: Option<String>,
     pub repository: String,
-    #[serde(default)]
-    pub permission_mode: PublicPermissionMode,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    #[schemars(with = "PublicPermissionMode")]
+    pub permission_mode: Option<PublicPermissionMode>,
     pub prompt: String,
     /// Caller write scope for the task. codex and agy reject a non-empty
     /// manifest before task creation (codex_write_manifest_unsupported /

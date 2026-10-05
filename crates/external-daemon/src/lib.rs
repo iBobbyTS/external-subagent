@@ -1652,6 +1652,7 @@ mod zcode_effort_tests {
             model: None,
             model_source: "catalog".into(),
             effort: effort.map(str::to_owned),
+            developer_instructions: None,
         }
     }
 
@@ -1665,7 +1666,7 @@ mod zcode_effort_tests {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
             agent_id: agent_id.into(),
             repository: directory.canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "effort passthrough".into(),
             write_manifest: Vec::new(),
         };
@@ -1787,7 +1788,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     schema: external_core::GENERAL_TASK_SCHEMA.into(),
                     agent_id: String::new(),
                     repository: workspace.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Plan,
+                    permission_mode: Some(external_core::PermissionMode::Plan),
                     prompt: "effort passthrough".into(),
                     write_manifest: Vec::new(),
                 },
@@ -1822,7 +1823,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     schema: external_core::GENERAL_TASK_SCHEMA.into(),
                     agent_id: String::new(),
                     repository: workspace.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Plan,
+                    permission_mode: Some(external_core::PermissionMode::Plan),
                     prompt: "effort passthrough".into(),
                     write_manifest: Vec::new(),
                 },
@@ -1872,7 +1873,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     schema: external_core::GENERAL_TASK_SCHEMA.into(),
                     agent_id: String::new(),
                     repository: workspace.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Plan,
+                    permission_mode: Some(external_core::PermissionMode::Plan),
                     prompt: "effort passthrough".into(),
                     write_manifest: Vec::new(),
                 },
@@ -1904,7 +1905,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
                     schema: external_core::GENERAL_TASK_SCHEMA.into(),
                     agent_id: String::new(),
                     repository: workspace.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Plan,
+                    permission_mode: Some(external_core::PermissionMode::Plan),
                     prompt: "effort passthrough".into(),
                     write_manifest: Vec::new(),
                 },
@@ -2064,7 +2065,7 @@ mod task_route_tests {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
             agent_id: "s01-legacy-row".into(),
             repository: repository.path().to_path_buf(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "legacy row".into(),
             write_manifest: Vec::new(),
         };
@@ -2083,6 +2084,7 @@ mod task_route_tests {
                 model: None,
                 model_source: "native".into(),
                 effort: None,
+                developer_instructions: None,
             })
             .unwrap();
         let legacy_json = serde_json::to_string(&prepared).unwrap();
@@ -2107,7 +2109,7 @@ mod task_route_tests {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
             agent_id: "s02-admission-model".into(),
             repository: repository.path().to_path_buf(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "model".into(),
             write_manifest: Vec::new(),
         };
@@ -2122,6 +2124,7 @@ mod task_route_tests {
                 model: Some("zai/GLM-5.3".into()),
                 model_source: "catalog".into(),
                 effort: None,
+                developer_instructions: None,
             })
             .unwrap();
         let record = record(&prepared);

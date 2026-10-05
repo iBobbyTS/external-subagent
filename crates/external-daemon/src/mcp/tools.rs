@@ -8,7 +8,7 @@ use super::errors::{
 use super::schemas::{
     tool_output_schema, validate_text, AgentInput, AgentListInput, AgentRespondInput,
     AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, EmptyInput,
-    MAX_MESSAGE_BYTES,
+    PublicPermissionMode, MAX_MESSAGE_BYTES,
 };
 use super::types::{internal_task_id, public_task_id, PublicDecision, PublicResponseDisposition};
 use super::views::{
@@ -280,11 +280,20 @@ fn general_manifest(input: &AgentSpawnInput) -> Result<GeneralTaskManifest, Tool
     let repository = PathBuf::from(&input.repository);
     let agent_id = "daemon-prepared".to_owned();
     let write_manifest = input.write_manifest.iter().map(PathBuf::from).collect();
+    let permission_mode = match input.profile.as_ref() {
+        Some(_) => None,
+        None => Some(
+            input
+                .permission_mode
+                .unwrap_or(PublicPermissionMode::Build)
+                .into(),
+        ),
+    };
     Ok(GeneralTaskManifest {
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: agent_id.clone(),
         repository,
-        permission_mode: input.permission_mode.into(),
+        permission_mode,
         prompt: input.prompt.clone(),
         // Validate caller scope before the daemon applies its execution policy.
         write_manifest,
@@ -351,7 +360,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Specify subagent unless default_subagent is configured. ZCode uses a provider/model token (a bare token keeps the backward-compatible zai/<token> reading); an omitted model falls back to agents.zcode.default_model and then to the native model; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, and effort cannot be specified. Specify subagent unless default_subagent is configured. ZCode uses a provider/model token (a bare token keeps the backward-compatible zai/<token> reading); an omitted model falls back to agents.zcode.default_model and then to the native model; dsh spawns when its enabled + spawn_supported + pinned-runtime configuration admits it. A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -374,10 +383,22 @@ impl SubagentMcp {
         input: AgentSpawnInput,
         request_cancelled: impl Fn() -> bool + Send + 'static,
     ) -> Result<AgentSpawnOutput, ToolError> {
+        if input.profile.is_some()
+            && (input.agent.is_some()
+                || input.permission_mode.is_some()
+                || input.model.is_some()
+                || input.effort.is_some())
+        {
+            return Err(validation_error(
+                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile",
+            )
+            .with_operation("spawn"));
+        }
         let manifest = general_manifest(&input).map_err(|error| error.with_operation("spawn"))?;
         let task = match self
             .rpc_spawn(
                 GeneralSubmitInput {
+                    profile: input.profile.clone(),
                     agent: input.agent.clone(),
                     model: input.model.clone(),
                     effort: input.effort.clone(),
@@ -1204,7 +1225,7 @@ mod contract_default_tests {
                     schema: external_core::GENERAL_TASK_SCHEMA.into(),
                     agent_id: String::new(),
                     repository: directory.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Plan,
+                    permission_mode: Some(external_core::PermissionMode::Plan),
                     prompt: "initial".into(),
                     write_manifest: Vec::new(),
                 },
@@ -1215,6 +1236,7 @@ mod contract_default_tests {
                     model: Some("fixture-model".into()),
                     model_source: "catalog_token".into(),
                     effort: None,
+                    developer_instructions: None,
                 }),
             )
             .unwrap();
@@ -1384,12 +1406,13 @@ mod contract_default_tests {
             ),
         ] {
             let input = AgentSpawnInput {
+                profile: None,
                 agent: Some(agent.into()),
                 model: model.map(str::to_owned),
                 effort: None,
                 repository: "invalid-relative-path".into(),
                 prompt: "".into(),
-                permission_mode: PublicPermissionMode::Plan,
+                permission_mode: Some(PublicPermissionMode::Plan),
                 write_manifest: vec![],
             };
             let error = facade
@@ -1434,12 +1457,13 @@ mod contract_default_tests {
         let repository = tempfile::tempdir().unwrap();
         let facade = SubagentMcp::from_service(service);
         let input = AgentSpawnInput {
+            profile: None,
             agent: Some("zcode".into()),
             model: None,
             effort: Some("high".into()),
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "effort passthrough".into(),
-            permission_mode: PublicPermissionMode::Plan,
+            permission_mode: Some(PublicPermissionMode::Plan),
             write_manifest: Vec::new(),
         };
         let output = facade
@@ -1462,6 +1486,7 @@ mod contract_default_tests {
     #[test]
     fn spawn_rpc_context_omits_the_preallocation_placeholder() {
         let method = RpcMethod::SubmitGeneral(GeneralSubmitInput {
+            profile: None,
             agent: Some("zcode".into()),
             model: None,
             effort: None,
@@ -1469,7 +1494,7 @@ mod contract_default_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
                 repository: PathBuf::from("/tmp/repository"),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "test".into(),
                 write_manifest: Vec::new(),
             },
@@ -1824,12 +1849,13 @@ mod contract_default_tests {
         let facade = SubagentMcp::from_service(service);
         let repository = tempfile::tempdir().unwrap();
         let input = AgentSpawnInput {
+            profile: None,
             agent: Some("zcode".into()),
             model: None,
             effort: None,
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "spawn session test".into(),
-            permission_mode: PublicPermissionMode::Plan,
+            permission_mode: Some(PublicPermissionMode::Plan),
             write_manifest: Vec::new(),
         };
         let output = facade.agent_spawn_inner(input, || false).await.unwrap();
@@ -2027,11 +2053,12 @@ mod contract_default_tests {
         let repo2 = tempfile::tempdir().unwrap();
         let direct_facade = SubagentMcp::from_service(service.clone());
         let spawn_input = AgentSpawnInput {
+            profile: None,
             agent: Some("zcode".into()),
             model: None,
             effort: None,
             repository: repo2.path().to_string_lossy().into_owned(),
-            permission_mode: PublicPermissionMode::Plan,
+            permission_mode: Some(PublicPermissionMode::Plan),
             prompt: "direct interrupt test".into(),
             write_manifest: vec![],
         };
@@ -2099,5 +2126,80 @@ mod contract_default_tests {
         assert_eq!(tool_err.body.code, "timeout");
         assert!(tool_err.body.message.contains("spawn interrupted while session establishment continues"));
         assert_eq!(tool_err.body.agent_id, Some(10000003));
+    }
+
+    #[tokio::test]
+    async fn facade_spawn_profile_mutex_and_json_shape() {
+        // 1. General manifest for profile request omits permission_mode key from JSON
+        let profile_input: AgentSpawnInput = serde_json::from_value(serde_json::json!({
+            "profile": "fast-worker",
+            "repository": "/tmp/repo",
+            "prompt": "inspect",
+        }))
+        .unwrap();
+        let manifest = general_manifest(&profile_input).unwrap();
+        assert_eq!(manifest.permission_mode, None);
+        let manifest_json = serde_json::to_value(&manifest).unwrap();
+        assert!(
+            manifest_json.get("permission_mode").is_none(),
+            "profile request must omit permission_mode key: {manifest_json}"
+        );
+
+        // 2. Facade mutex validation rejects profile with any of subagent, model, effort, permission_mode
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/facade-test.sock"), Duration::from_secs(125));
+        let base = serde_json::json!({
+            "profile": "fast-worker",
+            "repository": "/tmp/repo",
+            "prompt": "inspect",
+        });
+
+        // 2a. With subagent
+        let mut with_subagent = base.clone();
+        with_subagent["subagent"] = serde_json::json!("codex");
+        let err = facade
+            .agent_spawn_inner(serde_json::from_value(with_subagent).unwrap(), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "validation");
+        assert!(err.body.message.contains("profile cannot be combined with"));
+
+        // 2b. With model
+        let mut with_model = base.clone();
+        with_model["model"] = serde_json::json!("gpt-5");
+        let err = facade
+            .agent_spawn_inner(serde_json::from_value(with_model).unwrap(), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "validation");
+        assert!(err.body.message.contains("profile cannot be combined with"));
+
+        // 2c. With effort
+        let mut with_effort = base.clone();
+        with_effort["effort"] = serde_json::json!("high");
+        let err = facade
+            .agent_spawn_inner(serde_json::from_value(with_effort).unwrap(), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "validation");
+        assert!(err.body.message.contains("profile cannot be combined with"));
+
+        // 2d. With permission_mode
+        let mut with_mode = base.clone();
+        with_mode["permission_mode"] = serde_json::json!("plan");
+        let err = facade
+            .agent_spawn_inner(serde_json::from_value(with_mode).unwrap(), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "validation");
+        assert!(err.body.message.contains("profile cannot be combined with"));
+
+        // 3. Wire three-state: explicit null rejected via optional_non_null
+        let mut null_profile = base.clone();
+        null_profile["profile"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AgentSpawnInput>(null_profile).is_err());
+
+        let mut null_mode = base.clone();
+        null_mode["permission_mode"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AgentSpawnInput>(null_mode).is_err());
     }
 }

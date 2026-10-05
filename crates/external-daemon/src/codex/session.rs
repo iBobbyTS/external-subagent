@@ -105,6 +105,7 @@ impl CodexRuntimeOwner {
                     // the retired legacy model read (lib.rs) where the field
                     // is not actually persisted.
                     effort: admission.effort.clone(),
+                    developer_instructions: admission.developer_instructions.clone(),
                     permission_mode,
                 })
             }
@@ -118,10 +119,11 @@ impl CodexRuntimeOwner {
         workspace_path: &str,
         permission_mode: CodexPermissionMode,
         requested_effort: Option<&str>,
+        developer_instructions: Option<&str>,
         deadline: Instant,
     ) -> Result<String, RuntimeCommandError> {
         let posture = codex_posture(permission_mode);
-        let params = thread_start_params(model, workspace_path, &posture);
+        let params = thread_start_params(model, workspace_path, &posture, developer_instructions);
         let response = self
             .driver
             .request("thread/start", params, remaining_time(deadline)?)?;
@@ -244,6 +246,7 @@ impl CodexRuntimeOwner {
 pub(super) struct AdmittedThread {
     pub(super) model: String,
     pub(super) effort: Option<String>,
+    pub(super) developer_instructions: Option<String>,
     pub(super) permission_mode: CodexPermissionMode,
 }
 

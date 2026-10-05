@@ -395,9 +395,18 @@ pub(super) fn unknown_agent_name_error(config: &AgentConfigSnapshot) -> RpcError
     unknown_agent_error(config.subagents.keys().map(String::as_str))
 }
 
+#[allow(dead_code)]
 pub(super) fn resolve_admission(
     input: &GeneralSubmitInput,
     config: &AgentConfigSnapshot,
+) -> Result<external_core::AdmissionIdentity, RpcError> {
+    resolve_admission_with_instructions(input, config, None)
+}
+
+pub(super) fn resolve_admission_with_instructions(
+    input: &GeneralSubmitInput,
+    config: &AgentConfigSnapshot,
+    developer_instructions: Option<&str>,
 ) -> Result<external_core::AdmissionIdentity, RpcError> {
     for (field, value) in [
         ("agent", input.agent.as_deref()),
@@ -545,9 +554,13 @@ pub(super) fn resolve_admission(
     } else {
         (None, "native")
     };
+    let permission_mode = input
+        .manifest
+        .permission_mode
+        .unwrap_or(external_core::PermissionMode::Build);
     if agent == "dsh" {
         if !matches!(
-            input.manifest.permission_mode,
+            permission_mode,
             external_core::PermissionMode::Build | external_core::PermissionMode::Plan
         ) {
             return Err(RpcError::new(
@@ -609,7 +622,7 @@ pub(super) fn resolve_admission(
         // refused before the prompt. The public code is projected from the
         // sentinel detail by mcp::errors (agy_permission_mode_unsupported).
         if !matches!(
-            input.manifest.permission_mode,
+            permission_mode,
             external_core::PermissionMode::Build | external_core::PermissionMode::Yolo
         ) {
             return Err(RpcError::new(
@@ -626,6 +639,13 @@ pub(super) fn resolve_admission(
             ));
         }
     }
+    let developer_instructions = if agent == "codex" {
+        developer_instructions
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
     Ok(external_core::AdmissionIdentity {
         agent: agent.to_owned(),
         config_revision: config.revision,
@@ -633,6 +653,7 @@ pub(super) fn resolve_admission(
         model,
         model_source: model_source.into(),
         effort,
+        developer_instructions,
     })
 }
 
@@ -830,6 +851,7 @@ mod admission_tests {
 
     fn input(repository: &Path) -> GeneralSubmitInput {
         GeneralSubmitInput {
+            profile: None,
             agent: Some("zcode".into()),
             model: None,
             effort: None,
@@ -837,7 +859,7 @@ mod admission_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
                 repository: repository.into(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "identity fixture".into(),
                 write_manifest: vec![],
             },
@@ -999,6 +1021,7 @@ mod admission_tests {
         dsh.profile = Some("acp".into());
         dsh.version = Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into());
         let input = GeneralSubmitInput {
+            profile: None,
             agent: Some("dsh".into()),
             model: None,
             effort: None,
@@ -1006,7 +1029,7 @@ mod admission_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "gate-test".into(),
                 repository: directory.path().into(),
-                permission_mode: external_core::PermissionMode::Build,
+                permission_mode: Some(external_core::PermissionMode::Build),
                 prompt: "test".into(),
                 write_manifest: vec![],
             },
@@ -1043,6 +1066,7 @@ mod admission_tests {
         mode: external_core::PermissionMode,
     ) -> GeneralSubmitInput {
         GeneralSubmitInput {
+            profile: None,
             agent: Some("codex".into()),
             model: Some("gpt-5.6-terra".into()),
             effort: None,
@@ -1050,7 +1074,7 @@ mod admission_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "codex-gate-test".into(),
                 repository: directory.into(),
-                permission_mode: mode,
+                permission_mode: Some(mode),
                 prompt: "test".into(),
                 write_manifest: vec![],
             },
@@ -1248,6 +1272,7 @@ mod admission_tests {
         mode: external_core::PermissionMode,
     ) -> GeneralSubmitInput {
         GeneralSubmitInput {
+            profile: None,
             agent: Some("agy".into()),
             model: Some("claude-sonnet-4-6".into()),
             effort: None,
@@ -1255,7 +1280,7 @@ mod admission_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "agy-gate-test".into(),
                 repository: directory.into(),
-                permission_mode: mode,
+                permission_mode: Some(mode),
                 prompt: "test".into(),
                 write_manifest: vec![],
             },
@@ -2026,6 +2051,7 @@ mod admission_policy_tests {
         write_manifest: &[&str],
     ) -> GeneralSubmitInput {
         GeneralSubmitInput {
+            profile: None,
             agent: agent.map(str::to_owned),
             model: model.map(str::to_owned),
             effort: None,
@@ -2033,7 +2059,7 @@ mod admission_policy_tests {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "admission-oracle".into(),
                 repository: PathBuf::from("/admission-oracle-repository"),
-                permission_mode,
+                permission_mode: Some(permission_mode),
                 prompt: "admission oracle".into(),
                 write_manifest: write_manifest.iter().map(PathBuf::from).collect(),
             },

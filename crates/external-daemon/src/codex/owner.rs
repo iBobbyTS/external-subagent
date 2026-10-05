@@ -182,6 +182,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
             &task.workspace_path,
             admitted.permission_mode,
             admitted.effort.as_deref(),
+            admitted.developer_instructions.as_deref(),
             deadline,
         )?;
         *self.shared.session_id.lock().unwrap() = Some(thread_id.clone());

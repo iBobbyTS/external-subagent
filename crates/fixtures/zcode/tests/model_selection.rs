@@ -26,6 +26,7 @@ fn admission(model: Option<&str>, effort: Option<&str>) -> external_core::Admiss
         model: model.map(str::to_owned),
         model_source: "catalog".into(),
         effort: effort.map(str::to_owned),
+        developer_instructions: None,
     }
 }
 
@@ -34,7 +35,7 @@ fn manifest(workspace: &Path) -> external_core::GeneralTaskManifest {
         schema: external_core::GENERAL_TASK_SCHEMA.into(),
         agent_id: String::new(),
         repository: workspace.canonicalize().unwrap(),
-        permission_mode: external_core::PermissionMode::Plan,
+        permission_mode: Some(external_core::PermissionMode::Plan),
         prompt: "auto_complete".into(),
         write_manifest: Vec::new(),
     }

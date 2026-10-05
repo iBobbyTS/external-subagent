@@ -50,14 +50,26 @@ impl PermissionMode {
     }
 }
 
+fn optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneralTaskManifest {
     pub schema: String,
     pub agent_id: String,
     pub repository: PathBuf,
-    #[serde(default)]
-    pub permission_mode: PermissionMode,
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_mode: Option<PermissionMode>,
     pub prompt: String,
     #[serde(default)]
     pub write_manifest: Vec<PathBuf>,
@@ -87,6 +99,8 @@ pub struct AdmissionIdentity {
     /// bytes free of a synthetic `"effort": null`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +181,7 @@ impl GeneralTaskPreparer {
         } else {
             allocate_submission(&repository, &manifest.agent_id)?
         };
-        let permission_mode = manifest.permission_mode;
+        let permission_mode = manifest.permission_mode.unwrap_or(PermissionMode::Build);
         let write_manifest = manifest
             .write_manifest
             .iter()
@@ -179,7 +193,7 @@ impl GeneralTaskPreparer {
         } else {
             write_manifest
         };
-        validate_write_scope(manifest.permission_mode, &write_manifest)?;
+        validate_write_scope(permission_mode, &write_manifest)?;
 
         let prepared = PreparedGeneralTask {
             admission: None,
@@ -402,7 +416,10 @@ fn hash(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GeneralTaskManifest, GeneralTaskPreparer, PermissionMode, GENERAL_TASK_SCHEMA};
+    use super::{
+        AdmissionIdentity, GeneralTaskManifest, GeneralTaskPreparer, PermissionMode,
+        GENERAL_TASK_SCHEMA,
+    };
     use serde_json::json;
 
     #[test]
@@ -456,7 +473,7 @@ mod tests {
             schema: GENERAL_TASK_SCHEMA.into(),
             agent_id: "daemon-prepared".into(),
             repository: repository.path().to_path_buf(),
-            permission_mode: PermissionMode::Plan,
+            permission_mode: Some(PermissionMode::Plan),
             prompt: "inspect".into(),
             write_manifest: Vec::new(),
         };
@@ -477,7 +494,7 @@ mod tests {
             schema: GENERAL_TASK_SCHEMA.into(),
             agent_id: "10000000".into(),
             repository: repository.path().to_path_buf(),
-            permission_mode: PermissionMode::Plan,
+            permission_mode: Some(PermissionMode::Plan),
             prompt: "inspect".into(),
             write_manifest: Vec::new(),
         };
@@ -503,7 +520,7 @@ mod tests {
             schema: GENERAL_TASK_SCHEMA.into(),
             agent_id: "no-runtime-deadline".into(),
             repository: repository.path().to_path_buf(),
-            permission_mode: PermissionMode::Plan,
+            permission_mode: Some(PermissionMode::Plan),
             prompt: "wait for the official runtime".into(),
             write_manifest: Vec::new(),
         };
@@ -523,5 +540,75 @@ mod tests {
                 "prepared task leaked {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn permission_mode_three_state_wire_invariants() {
+        // 1. Omission decodes to None, resolves to Build in prepare_direct_submission
+        let json_omitted = serde_json::json!({
+            "schema": GENERAL_TASK_SCHEMA,
+            "agent_id": "10000001",
+            "repository": "/tmp",
+            "prompt": "hello"
+        });
+        let manifest: GeneralTaskManifest = serde_json::from_value(json_omitted).unwrap();
+        assert_eq!(manifest.permission_mode, None);
+
+        // Serialization skips None (no "permission_mode" key emitted)
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        assert!(!serialized.contains("permission_mode"));
+
+        // 2. Explicit non-null decodes to Some(mode)
+        let json_explicit = serde_json::json!({
+            "schema": GENERAL_TASK_SCHEMA,
+            "agent_id": "10000001",
+            "repository": "/tmp",
+            "permission_mode": "edit",
+            "prompt": "hello"
+        });
+        let manifest_explicit: GeneralTaskManifest = serde_json::from_value(json_explicit).unwrap();
+        assert_eq!(manifest_explicit.permission_mode, Some(PermissionMode::Edit));
+
+        // 3. Explicit null is rejected
+        let json_null = serde_json::json!({
+            "schema": GENERAL_TASK_SCHEMA,
+            "agent_id": "10000001",
+            "repository": "/tmp",
+            "permission_mode": null,
+            "prompt": "hello"
+        });
+        assert!(serde_json::from_value::<GeneralTaskManifest>(json_null).is_err());
+    }
+
+    #[test]
+    fn admission_identity_developer_instructions_round_trips() {
+        let identity = AdmissionIdentity {
+            agent: "codex".into(),
+            config_revision: 1,
+            adapter_version: "0.3.2".into(),
+            model: Some("gpt-5".into()),
+            model_source: "spawn_catalog".into(),
+            effort: Some("high".into()),
+            developer_instructions: Some("be concise".into()),
+        };
+        let encoded = serde_json::to_string(&identity).unwrap();
+        assert!(encoded.contains("\"developer_instructions\":\"be concise\""));
+        let decoded: AdmissionIdentity = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.developer_instructions, Some("be concise".into()));
+
+        // Omitted / None
+        let identity_none = AdmissionIdentity {
+            agent: "codex".into(),
+            config_revision: 1,
+            adapter_version: "0.3.2".into(),
+            model: None,
+            model_source: "native".into(),
+            effort: None,
+            developer_instructions: None,
+        };
+        let encoded_none = serde_json::to_string(&identity_none).unwrap();
+        assert!(!encoded_none.contains("developer_instructions"));
+        let decoded_none: AdmissionIdentity = serde_json::from_str(&encoded_none).unwrap();
+        assert_eq!(decoded_none.developer_instructions, None);
     }
 }

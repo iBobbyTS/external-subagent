@@ -69,14 +69,21 @@ pub fn thread_start_params(
     model: &str,
     workspace_path: &str,
     posture: &CodexPosture,
+    developer_instructions: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "model": model,
         "cwd": workspace_path,
         "approvalPolicy": "never",
         "sandbox": posture.sandbox,
         "ephemeral": false,
-    })
+    });
+    if let Some(instructions) = developer_instructions {
+        if !instructions.is_empty() {
+            params["developerInstructions"] = serde_json::Value::String(instructions.to_string());
+        }
+    }
+    params
 }
 
 /// The `thread/resume` request parameters: the persistent thread identity
@@ -489,7 +496,7 @@ mod tests {
 
     #[test]
     fn start_params_pin_the_admitted_posture() {
-        let params = thread_start_params("gpt-test", WORKSPACE, &codex_posture(YOLO));
+        let params = thread_start_params("gpt-test", WORKSPACE, &codex_posture(YOLO), None);
         assert_eq!(
             params,
             serde_json::json!({
@@ -497,6 +504,45 @@ mod tests {
                 "cwd": WORKSPACE,
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access",
+                "ephemeral": false,
+            })
+        );
+    }
+
+    #[test]
+    fn start_params_include_developer_instructions_when_present() {
+        let params = thread_start_params(
+            "gpt-test",
+            WORKSPACE,
+            &codex_posture(WRITE),
+            Some("guidelines here"),
+        );
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "model": "gpt-test",
+                "cwd": WORKSPACE,
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
+                "ephemeral": false,
+                "developerInstructions": "guidelines here",
+            })
+        );
+
+        // Empty developer instructions are omitted
+        let empty_params = thread_start_params(
+            "gpt-test",
+            WORKSPACE,
+            &codex_posture(WRITE),
+            Some(""),
+        );
+        assert_eq!(
+            empty_params,
+            serde_json::json!({
+                "model": "gpt-test",
+                "cwd": WORKSPACE,
+                "approvalPolicy": "never",
+                "sandbox": "workspace-write",
                 "ephemeral": false,
             })
         );

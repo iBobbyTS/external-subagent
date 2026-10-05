@@ -35,6 +35,7 @@ fn dsh_admission_with_effort(model: Option<&str>, effort: Option<&str>) -> Admis
         model: model.map(str::to_owned),
         model_source: "catalog".into(),
         effort: effort.map(str::to_owned),
+        developer_instructions: None,
     }
 }
 
@@ -187,7 +188,7 @@ fn manifest_for(workspace: &std::path::Path, prompt: &str) -> GeneralTaskManifes
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: "dsh-build".into(),
         repository: workspace.canonicalize().unwrap(),
-        permission_mode: PermissionMode::Build,
+        permission_mode: Some(PermissionMode::Build),
         prompt: prompt.into(),
         write_manifest: Vec::new(),
     }
@@ -221,7 +222,7 @@ fn manifest_with_write_scope(
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: "dsh-build".into(),
         repository: workspace.canonicalize().unwrap(),
-        permission_mode: PermissionMode::Build,
+        permission_mode: Some(PermissionMode::Build),
         prompt: "build the fixture".into(),
         write_manifest: write_manifest
             .iter()

@@ -252,6 +252,7 @@ pub(crate) fn flat_identity(view: &InputIdentityView) -> Option<external_core::A
         model: view.model.clone(),
         model_source: view.model_source.clone()?,
         effort: view.effort.clone(),
+        developer_instructions: None,
     })
 }
 

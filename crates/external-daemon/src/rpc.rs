@@ -10,6 +10,7 @@ mod agents;
 mod config;
 mod errors;
 mod handlers;
+pub(crate) mod profiles;
 mod types;
 pub(crate) mod views;
 mod wait;

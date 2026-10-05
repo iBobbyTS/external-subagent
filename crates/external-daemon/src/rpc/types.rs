@@ -159,6 +159,12 @@ pub struct GeneralSubmitInput {
         deserialize_with = "optional_non_null",
         skip_serializing_if = "Option::is_none"
     )]
+    pub profile: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "optional_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[serde(alias = "subagent")]
     pub agent: Option<String>,
     #[serde(

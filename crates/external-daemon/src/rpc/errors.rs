@@ -37,10 +37,30 @@ pub struct RpcError {
     pub active_agent_id: Option<String>,
 }
 
+pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
+    if s.len() > max_bytes {
+        let mut boundary = max_bytes;
+        while !s.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        s.truncate(boundary);
+    }
+}
+
 impl RpcError {
     pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
         let mut message = message.into();
-        message.truncate(512);
+        truncate_utf8(&mut message, 512);
+        Self {
+            code,
+            message,
+            active_agent_id: None,
+        }
+    }
+
+    pub fn new_profile_error(code: RpcErrorCode, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        truncate_utf8(&mut message, crate::rpc::types::MAX_RESPONSE_FRAME_BYTES - 8192);
         Self {
             code,
             message,
@@ -244,5 +264,29 @@ mod error_classification_tests {
         assert_eq!(err_runtime_spawn.code, RpcErrorCode::RuntimeLost);
         assert_eq!(err_runtime_spawn.message, "runtime operation failed");
         assert_eq!(err_runtime_spawn.active_agent_id.as_deref(), Some("10000007"));
+    }
+
+    #[test]
+    fn truncate_utf8_is_character_boundary_safe() {
+        // ASCII truncates exactly at limit
+        let mut ascii = "a".repeat(600);
+        super::truncate_utf8(&mut ascii, 512);
+        assert_eq!(ascii.len(), 512);
+
+        // UTF-8 multi-byte characters: 3-byte '中'
+        // 170 * 3 = 510 bytes, + 1 '中' = 513 bytes
+        let mut chinese = "中".repeat(171); // 513 bytes
+        super::truncate_utf8(&mut chinese, 512);
+        assert_eq!(chinese.len(), 510); // Stepped back to 510 to avoid splitting '中'
+        assert_eq!(chinese, "中".repeat(170));
+
+        // RpcError::new does not panic on UTF-8 multi-byte boundary
+        let err = RpcError::new(RpcErrorCode::Validation, "中".repeat(171));
+        assert_eq!(err.message.len(), 510);
+
+        // new_profile_error is exempt from 512-byte truncate
+        let big_msg = "profile_name_".repeat(50); // 650 bytes
+        let err_profile = RpcError::new_profile_error(RpcErrorCode::Validation, &big_msg);
+        assert_eq!(err_profile.message, big_msg);
     }
 }

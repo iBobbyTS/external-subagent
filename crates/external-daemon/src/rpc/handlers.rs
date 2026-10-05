@@ -3,8 +3,9 @@
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::agents::{
-    configured_agent_statuses, resolve_admission, unavailable_agent_statuses,
-    unknown_agent_name_error, validate_agent_models_input, validate_agent_probe_input,
+    configured_agent_statuses, resolve_admission_with_instructions,
+    unavailable_agent_statuses, unknown_agent_name_error, validate_agent_models_input,
+    validate_agent_probe_input,
 };
 use super::config::read_agent_config_snapshot;
 use super::errors::{map_scheduler, map_store, RpcError, RpcErrorCode};
@@ -289,9 +290,69 @@ impl RpcService {
                     catalog: self.agent_evidence.models(&input, config.revision),
                 })
             }
-            RpcMethod::SubmitGeneral(input) => {
+            RpcMethod::SubmitGeneral(mut input) => {
+                // Mutex validation: profile cannot be combined with agent, model, effort, or manifest permission_mode.
+                // This check MUST run before attempting to load or read any profile file.
+                if input.profile.is_some()
+                    && (input.agent.is_some()
+                        || input.model.is_some()
+                        || input.effort.is_some()
+                        || input.manifest.permission_mode.is_some())
+                {
+                    return Err(RpcError::new_profile_error(
+                        RpcErrorCode::Validation,
+                        "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile",
+                    ));
+                }
+
+                let developer_instructions = if let Some(profile_name) = input.profile.as_deref() {
+                    let trimmed = profile_name.trim();
+                    if trimmed.is_empty() || profile_name.len() > 128 || profile_name.contains('\0') {
+                        return Err(RpcError::new_profile_error(
+                            RpcErrorCode::Validation,
+                            "profile is invalid",
+                        ));
+                    }
+                    let profile = super::profiles::load_profile(trimmed)?;
+                    input.agent = profile.subagent;
+                    input.model = profile.model;
+                    input.effort = profile.effort;
+                    input.manifest.permission_mode = Some(
+                        profile
+                            .permission_mode
+                            .unwrap_or(external_core::PermissionMode::Build),
+                    );
+                    profile.developer_instructions
+                } else {
+                    None
+                };
+
                 let config = read_agent_config_snapshot()?;
-                let admission = resolve_admission(&input, &config)?;
+                let effective_agent = input
+                    .agent
+                    .as_deref()
+                    .or(config.default_subagent.as_deref());
+
+                let admission = if effective_agent == Some("codex") {
+                    // codex uses native developerInstructions on thread/start; prompt remains verbatim
+                    resolve_admission_with_instructions(
+                        &input,
+                        &config,
+                        developer_instructions.as_deref(),
+                    )?
+                } else {
+                    // other subagents fallback to prompt splicing when developer_instructions is non-empty
+                    if let Some(di) = developer_instructions.as_deref() {
+                        if !di.is_empty() {
+                            input.manifest.prompt = format!(
+                                "Developer Instructions: {di}\n----------\n{}",
+                                input.manifest.prompt
+                            );
+                        }
+                    }
+                    resolve_admission_with_instructions(&input, &config, None)?
+                };
+
                 let manifest = input.manifest;
                 let submitted = self
                     .scheduler
@@ -1073,6 +1134,7 @@ mod observe_gate_tests {
             model: None,
             model_source: "catalog".into(),
             effort: None,
+            developer_instructions: None,
         }
     }
 
@@ -1100,7 +1162,7 @@ mod observe_gate_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: String::new(),
             repository: directory.canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "observe gate fixture".into(),
             write_manifest: Vec::new(),
         };
@@ -1203,6 +1265,725 @@ mod observe_gate_tests {
                 assert!(reasoning.text.is_empty());
                 assert_eq!(reasoning.source, crate::observation::ReasoningSource::dsh());
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod s01_profile_acceptance_tests {
+        use super::*;
+        use crate::rpc::agents::admission_fixtures::{admission_root, config_env_guard, ConfigEnvScope};
+        use crate::rpc::profiles::{load_profile, load_profiles_from_dir, parse_profile_toml};
+        use crate::rpc::types::GeneralSubmitInput;
+        use crate::{Scheduler, SchedulerConfig};
+        use external_agent_codex::session::{codex_posture, thread_start_params, CodexPermissionMode};
+        use external_core::{
+            GeneralTaskManifest, PermissionMode, PreparedGeneralTask, GENERAL_TASK_SCHEMA,
+        };
+        const MAX_PROMPT_BYTES: usize = 256 * 1024;
+        use external_store::Store;
+        use std::fs;
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+
+        struct TestEnvironment {
+            _scope: ConfigEnvScope,
+            _config_dir: tempfile::TempDir,
+            profiles_dir: PathBuf,
+            workspace_dir: tempfile::TempDir,
+            service: Arc<RpcService>,
+            store: Arc<Store>,
+            _guard: crate::rpc::agents::admission_fixtures::ConfigEnvGuard,
+        }
+
+        fn setup_environment() -> TestEnvironment {
+            let guard = config_env_guard();
+            let config_dir = admission_root("s01-test-config-");
+            let profiles_dir = config_dir.path().join("profiles");
+            fs::create_dir_all(&profiles_dir).unwrap();
+            let codex_home = config_dir.path().join("codex-home");
+            fs::create_dir_all(&codex_home).unwrap();
+
+            let dummy_bin = config_dir.path().join("dummy_bin");
+            fs::write(&dummy_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+            #[cfg(unix)]
+            {
+                let mut perms = fs::metadata(&dummy_bin).unwrap().permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&dummy_bin, perms).unwrap();
+            }
+
+            let config_json = serde_json::json!({
+                "schema_version": 2,
+                "revision": 1,
+                "default_subagent": "zcode",
+                "subagents": {
+                    "zcode": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": null,
+                    },
+                    "codex": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": "gpt-5",
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": codex_home.to_string_lossy(),
+                        "profile": "app-server",
+                        "version": "test",
+                    },
+                    "dsh": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": "anthropic:claude-3-7-sonnet",
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": null,
+                        "profile": "acp",
+                        "version": external_agent_dsh::profile::PINNED_DSH_VERSION,
+                    },
+                    "agy": {
+                        "enabled": true,
+                        "spawn_supported": true,
+                        "default_model": "gemini-2.5-flash",
+                        "runtime_path": dummy_bin.to_string_lossy(),
+                        "home": null,
+                        "profile": "cli",
+                        "version": "test",
+                    }
+                }
+            });
+            let config_path = config_dir.path().join("agents.json");
+            fs::write(&config_path, serde_json::to_vec(&config_json).unwrap()).unwrap();
+            let scope = ConfigEnvScope::install(&config_path);
+
+            let workspace_dir = admission_root("s01-test-workspace-");
+            let store = Arc::new(Store::open(workspace_dir.path().join("state.sqlite")).unwrap());
+            let factory = Arc::new(crate::rpc::wait::wait_tests::FakeRunnableFactory);
+            let scheduler = Scheduler::new(
+                "s01-test",
+                Arc::clone(&store),
+                factory,
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let service = Arc::new(RpcService::new(scheduler, Arc::clone(&store)).unwrap());
+
+            TestEnvironment {
+                _scope: scope,
+                _config_dir: config_dir,
+                profiles_dir,
+                workspace_dir,
+                service,
+                store,
+                _guard: guard,
+            }
+        }
+
+        fn test_manifest(_workspace: &Path, prompt: &str) -> GeneralTaskManifest {
+            let ws = admission_root("s01-ws-");
+            let path = ws.path().canonicalize().unwrap();
+            std::mem::forget(ws);
+            GeneralTaskManifest {
+                schema: GENERAL_TASK_SCHEMA.into(),
+                agent_id: String::new(),
+                repository: path,
+                permission_mode: None,
+                prompt: prompt.into(),
+                write_manifest: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn ac1_profile_loading_validation_and_errors() {
+            let env = setup_environment();
+
+            // 1. Valid profile with Unicode and multiline instructions
+            let valid_toml = r#"
+name = "full_worker"
+subagent = "zcode"
+permission_mode = "edit"
+model = "zai/GLM-5.3"
+effort = "high"
+developer_instructions = """
+Line 1: 遵循准则
+Line 2: Be precise
+"""
+"#;
+            fs::write(env.profiles_dir.join("worker.toml"), valid_toml).unwrap();
+            let loaded = load_profile("full_worker").unwrap();
+            assert_eq!(loaded.name, "full_worker");
+            assert_eq!(loaded.subagent.as_deref(), Some("zcode"));
+            assert_eq!(loaded.permission_mode, Some(PermissionMode::Edit));
+            assert_eq!(loaded.model.as_deref(), Some("zai/GLM-5.3"));
+            assert_eq!(loaded.effort.as_deref(), Some("high"));
+            assert_eq!(
+                loaded.developer_instructions.as_deref(),
+                Some("Line 1: 遵循准则\nLine 2: Be precise\n")
+            );
+
+            // 2. Error reporting specifies file path and field name
+            // 2a. Unknown field
+            let unknown_field_toml = "name = \"bad\"\nunknown_key = 123\n";
+            let err = parse_profile_toml(unknown_field_toml, Path::new("bad_field.toml")).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("bad_field.toml"));
+            assert!(err.message.contains("unknown_key"));
+
+            // 2b. Missing name
+            let missing_name_toml = "subagent = \"zcode\"\n";
+            let err = parse_profile_toml(missing_name_toml, Path::new("missing_name.toml")).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("missing_name.toml"));
+            assert!(err.message.contains("name"));
+
+            // 2c. Empty name
+            let empty_name_toml = "name = \"  \"\n";
+            let err = parse_profile_toml(empty_name_toml, Path::new("empty_name.toml")).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("empty_name.toml"));
+            assert!(err.message.contains("name"));
+
+            // 2d. Name > 128 bytes
+            let long_name = "x".repeat(129);
+            let long_name_toml = format!("name = \"{long_name}\"\n");
+            let err = parse_profile_toml(&long_name_toml, Path::new("long_name.toml")).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("long_name.toml"));
+            assert!(err.message.contains("128 bytes"));
+
+            // 2e. Invalid type
+            let bad_type_toml = "name = \"ok\"\nsubagent = 999\n";
+            let err = parse_profile_toml(bad_type_toml, Path::new("bad_type.toml")).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("bad_type.toml"));
+            assert!(err.message.contains("subagent"));
+
+            // 2f. Duplicate profile name across files
+            let dup_dir = tempfile::tempdir().unwrap();
+            fs::write(dup_dir.path().join("p1.toml"), "name = \"same_name\"\n").unwrap();
+            fs::write(dup_dir.path().join("p2.toml"), "name = \"same_name\"\n").unwrap();
+            let err = load_profiles_from_dir(dup_dir.path()).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("same_name"));
+            assert!(err.message.contains("duplicate profile name"));
+
+            // 3. Missing or empty directory reports "available profiles: none"
+            let empty_dir = tempfile::tempdir().unwrap();
+            let profiles = load_profiles_from_dir(empty_dir.path()).unwrap();
+            assert!(profiles.is_empty());
+            let err_empty = load_profiles_from_dir(&empty_dir.path().join("not_found")).unwrap();
+            assert!(err_empty.is_empty());
+        }
+
+        #[test]
+        fn ac2_daemon_mutex_four_fields_and_precedence() {
+            let env = setup_environment();
+
+            // Create a valid profile
+            fs::write(env.profiles_dir.join("worker.toml"), "name = \"worker\"\n").unwrap();
+
+            // 1. Daemon mutex validation: profile cannot be combined with agent, model, effort, or permission_mode
+            let test_cases = [
+                (Some("zcode"), None, None, None),
+                (None, Some("gpt-5"), None, None),
+                (None, None, Some("high"), None),
+                (None, None, None, Some(PermissionMode::Plan)),
+            ];
+
+            for (agent, model, effort, mode) in test_cases {
+                let mut manifest = test_manifest(env.workspace_dir.path(), "test prompt");
+                manifest.permission_mode = mode;
+                let input = GeneralSubmitInput {
+                    agent: agent.map(str::to_owned),
+                    model: model.map(str::to_owned),
+                    effort: effort.map(str::to_owned),
+                    profile: Some("worker".into()),
+                    manifest,
+                };
+                let err = env.service.dispatch(RpcMethod::SubmitGeneral(input)).unwrap_err();
+                assert_eq!(err.code, RpcErrorCode::Validation);
+                assert!(
+                    err.message.contains("profile cannot be combined with subagent, permission_mode, model, or effort"),
+                    "Error must contain user guidance: {}",
+                    err.message
+                );
+            }
+
+            // 2. Mutex validation runs BEFORE file read:
+            // Non-existent profile + conflicting parameter returns MUTEX error, not "profile not found"!
+            let input_non_existent = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: None,
+                effort: None,
+                profile: Some("non_existent_profile_xyz".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err = env.service.dispatch(RpcMethod::SubmitGeneral(input_non_existent)).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(
+                err.message.contains("profile cannot be combined with"),
+                "Mutex check must precede profile file read: {}",
+                err.message
+            );
+            assert!(!err.message.contains("not found"));
+        }
+
+        #[test]
+        fn ac2_direct_rpc_permission_mode_four_cases_and_wire_null() {
+            let env = setup_environment();
+            fs::write(env.profiles_dir.join("worker.toml"), "name = \"worker\"\n").unwrap();
+
+            // Case 1: Direct RPC with explicit "permission_mode": "build" + profile -> rejected by daemon mutex
+            let raw_case1 = serde_json::json!({
+                "profile": "worker",
+                "manifest": {
+                    "schema": GENERAL_TASK_SCHEMA,
+                    "agent_id": "",
+                    "repository": env.workspace_dir.path().canonicalize().unwrap(),
+                    "permission_mode": "build",
+                    "prompt": "test prompt",
+                    "write_manifest": []
+                }
+            });
+            let input_case1: GeneralSubmitInput = serde_json::from_value(raw_case1).unwrap();
+            let err_case1 = env.service.dispatch(RpcMethod::SubmitGeneral(input_case1)).unwrap_err();
+            assert_eq!(err_case1.code, RpcErrorCode::Validation);
+            assert!(err_case1.message.contains("profile cannot be combined with"));
+
+            // Case 2: Direct RPC with explicit "permission_mode": "plan" + profile -> rejected by daemon mutex
+            let raw_case2 = serde_json::json!({
+                "profile": "worker",
+                "manifest": {
+                    "schema": GENERAL_TASK_SCHEMA,
+                    "agent_id": "",
+                    "repository": env.workspace_dir.path().canonicalize().unwrap(),
+                    "permission_mode": "plan",
+                    "prompt": "test prompt",
+                    "write_manifest": []
+                }
+            });
+            let input_case2: GeneralSubmitInput = serde_json::from_value(raw_case2).unwrap();
+            let err_case2 = env.service.dispatch(RpcMethod::SubmitGeneral(input_case2)).unwrap_err();
+            assert_eq!(err_case2.code, RpcErrorCode::Validation);
+            assert!(err_case2.message.contains("profile cannot be combined with"));
+
+            // Case 3: Direct RPC with explicit "permission_mode": null + profile -> rejected at wire deserialization
+            let raw_case3 = serde_json::json!({
+                "profile": "worker",
+                "manifest": {
+                    "schema": GENERAL_TASK_SCHEMA,
+                    "agent_id": "",
+                    "repository": env.workspace_dir.path().canonicalize().unwrap(),
+                    "permission_mode": null,
+                    "prompt": "test prompt",
+                    "write_manifest": []
+                }
+            });
+            assert!(
+                serde_json::from_value::<GeneralSubmitInput>(raw_case3).is_err(),
+                "Explicit null permission_mode must be rejected by optional_non_null deserializer"
+            );
+
+            // Case 4: Direct RPC with omitted permission_mode + profile -> passes deserialization and mutex, proceeds
+            let raw_case4 = serde_json::json!({
+                "profile": "worker",
+                "manifest": {
+                    "schema": GENERAL_TASK_SCHEMA,
+                    "agent_id": "",
+                    "repository": env.workspace_dir.path().canonicalize().unwrap(),
+                    "prompt": "test prompt",
+                    "write_manifest": []
+                }
+            });
+            let input_case4: GeneralSubmitInput = serde_json::from_value(raw_case4).unwrap();
+            assert_eq!(input_case4.manifest.permission_mode, None);
+            let res_case4 = env.service.dispatch(RpcMethod::SubmitGeneral(input_case4));
+            assert!(res_case4.is_ok());
+
+            // Negative case: non-profile direct RPC with explicit "permission_mode": null -> rejected at wire deserialization
+            let raw_non_profile_null = serde_json::json!({
+                "manifest": {
+                    "schema": GENERAL_TASK_SCHEMA,
+                    "agent_id": "",
+                    "repository": env.workspace_dir.path().canonicalize().unwrap(),
+                    "permission_mode": null,
+                    "prompt": "test prompt",
+                    "write_manifest": []
+                }
+            });
+            assert!(
+                serde_json::from_value::<GeneralSubmitInput>(raw_non_profile_null).is_err(),
+                "Explicit null permission_mode on non-profile request must be rejected"
+            );
+        }
+
+        #[test]
+        fn ac3_profile_four_fields_merge_and_defaults() {
+            let env = setup_environment();
+
+            // 1. Profile with all four fields explicit
+            let full_toml = r#"
+name = "full_profile"
+subagent = "zcode"
+permission_mode = "edit"
+model = "zai/GLM-5.3"
+effort = "high"
+"#;
+            fs::write(env.profiles_dir.join("full.toml"), full_toml).unwrap();
+
+            let input = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("full_profile".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "merge test"),
+            };
+            let response = env.service.dispatch(RpcMethod::SubmitGeneral(input)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task } = response else { panic!() };
+
+            let record = env.store.get_task(&task.agent_id).unwrap().unwrap();
+            let prepared: PreparedGeneralTask = serde_json::from_str(&record.prepared_launch_json).unwrap();
+            assert_eq!(prepared.permission_mode, PermissionMode::Edit);
+            let admission = prepared.admission.unwrap();
+            assert_eq!(admission.agent, "zcode");
+            assert_eq!(admission.model.as_deref(), Some("zai/GLM-5.3"));
+            assert_eq!(admission.model_source, "spawn_catalog");
+            assert_eq!(admission.effort.as_deref(), Some("high"));
+
+            // 2. Profile with omitted/empty fields falls back to defaults
+            let minimal_toml = r#"
+name = "minimal_profile"
+"#;
+            fs::write(env.profiles_dir.join("minimal.toml"), minimal_toml).unwrap();
+
+            let input_min = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("minimal_profile".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "minimal test"),
+            };
+            let response_min = env.service.dispatch(RpcMethod::SubmitGeneral(input_min)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_min } = response_min else { panic!() };
+
+            let record_min = env.store.get_task(&task_min.agent_id).unwrap().unwrap();
+            let prepared_min: PreparedGeneralTask = serde_json::from_str(&record_min.prepared_launch_json).unwrap();
+            assert_eq!(prepared_min.permission_mode, PermissionMode::Build);
+            let admission_min = prepared_min.admission.unwrap();
+            assert_eq!(admission_min.agent, "zcode"); // defaulted to config.default_subagent
+            assert_eq!(admission_min.model, None);
+            assert_eq!(admission_min.effort, None);
+        }
+
+        #[test]
+        fn ac3_model_token_conventions_for_subagents() {
+            let env = setup_environment();
+
+            // 1. dsh: provider:model format accepted
+            let dsh_toml = r#"
+name = "dsh_worker"
+subagent = "dsh"
+model = "anthropic:claude-3-7-sonnet"
+"#;
+            fs::write(env.profiles_dir.join("dsh.toml"), dsh_toml).unwrap();
+            let input = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("dsh_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "dsh prompt"),
+            };
+            assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input)).is_ok());
+
+            // 1b. dsh: invalid model format (no colon) rejected
+            let dsh_bad_toml = r#"
+name = "dsh_bad"
+subagent = "dsh"
+model = "bare_model_without_colon"
+"#;
+            fs::write(env.profiles_dir.join("dsh_bad.toml"), dsh_bad_toml).unwrap();
+            let input_bad = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("dsh_bad".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "dsh prompt"),
+            };
+            let err = env.service.dispatch(RpcMethod::SubmitGeneral(input_bad)).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert!(err.message.contains("{provider}:{model}"));
+
+            // 2. zcode: provider/model or bare token accepted
+            let zcode_slash_toml = r#"
+name = "zcode_slash"
+subagent = "zcode"
+model = "provider/model-name"
+"#;
+            fs::write(env.profiles_dir.join("zcode_slash.toml"), zcode_slash_toml).unwrap();
+            let input_z1 = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("zcode_slash".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "zcode prompt"),
+            };
+            assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_z1)).is_ok());
+
+            let zcode_bare_toml = r#"
+name = "zcode_bare"
+subagent = "zcode"
+model = "bare_model"
+"#;
+            fs::write(env.profiles_dir.join("zcode_bare.toml"), zcode_bare_toml).unwrap();
+            let input_z2 = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("zcode_bare".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "zcode prompt"),
+            };
+            assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_z2)).is_ok());
+
+            // 3. codex: bare slug accepted, slash rejected
+            let codex_slug_toml = r#"
+name = "codex_slug"
+subagent = "codex"
+model = "gpt-5"
+"#;
+            fs::write(env.profiles_dir.join("codex_slug.toml"), codex_slug_toml).unwrap();
+            let input_c1 = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_slug".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
+            };
+            assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_c1)).is_ok());
+
+            let codex_slash_toml = r#"
+name = "codex_slash"
+subagent = "codex"
+model = "openai/gpt-5"
+"#;
+            fs::write(env.profiles_dir.join("codex_slash.toml"), codex_slash_toml).unwrap();
+            let input_c2 = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_slash".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
+            };
+            let err_c2 = env.service.dispatch(RpcMethod::SubmitGeneral(input_c2)).unwrap_err();
+            assert_eq!(err_c2.code, RpcErrorCode::Validation);
+        }
+
+        #[test]
+        fn ac4_developer_instructions_dispatch_channel() {
+            let env = setup_environment();
+
+            // 1. Codex: developer_instructions routed via native channel, initial_prompt is verbatim
+            let codex_toml = r#"
+name = "codex_worker"
+subagent = "codex"
+model = "gpt-5"
+developer_instructions = "Custom instructions for codex"
+"#;
+            fs::write(env.profiles_dir.join("codex.toml"), codex_toml).unwrap();
+            let input_codex = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Verbatim codex prompt"),
+            };
+            let response_codex = env.service.dispatch(RpcMethod::SubmitGeneral(input_codex)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_codex } = response_codex else { panic!() };
+
+            let record_codex = env.store.get_task(&task_codex.agent_id).unwrap().unwrap();
+            // initial_prompt is verbatim (NOT spliced!)
+            assert_eq!(record_codex.initial_prompt, "Verbatim codex prompt");
+            let prepared_codex: PreparedGeneralTask = serde_json::from_str(&record_codex.prepared_launch_json).unwrap();
+            let admission_codex = prepared_codex.admission.unwrap();
+            assert_eq!(
+                admission_codex.developer_instructions.as_deref(),
+                Some("Custom instructions for codex")
+            );
+
+            // Verify thread_start_params serialization with developerInstructions
+            let posture = codex_posture(CodexPermissionMode::WorkspaceWrite);
+            let params = thread_start_params(
+                "gpt-5",
+                "/tmp/ws",
+                &posture,
+                admission_codex.developer_instructions.as_deref(),
+            );
+            assert_eq!(
+                params["developerInstructions"],
+                "Custom instructions for codex"
+            );
+
+            // 2. Non-codex (zcode): prompt is spliced with Developer Instructions prefix
+            let zcode_toml = r#"
+name = "zcode_worker"
+subagent = "zcode"
+developer_instructions = "Custom instructions for zcode"
+"#;
+            fs::write(env.profiles_dir.join("zcode.toml"), zcode_toml).unwrap();
+            let input_zcode = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("zcode_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Original zcode prompt"),
+            };
+            let response_zcode = env.service.dispatch(RpcMethod::SubmitGeneral(input_zcode)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_zcode } = response_zcode else { panic!() };
+
+            let record_zcode = env.store.get_task(&task_zcode.agent_id).unwrap().unwrap();
+            // initial_prompt is spliced
+            assert_eq!(
+                record_zcode.initial_prompt,
+                "Developer Instructions: Custom instructions for zcode\n----------\nOriginal zcode prompt"
+            );
+            let prepared_zcode: PreparedGeneralTask = serde_json::from_str(&record_zcode.prepared_launch_json).unwrap();
+            assert_eq!(
+                prepared_zcode.admission.unwrap().developer_instructions,
+                None
+            );
+
+            // 3. Empty developer_instructions: prompt unchanged on both
+            let empty_toml = r#"
+name = "empty_di_worker"
+subagent = "zcode"
+developer_instructions = ""
+"#;
+            fs::write(env.profiles_dir.join("empty.toml"), empty_toml).unwrap();
+            let input_empty = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("empty_di_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Unchanged prompt"),
+            };
+            let response_empty = env.service.dispatch(RpcMethod::SubmitGeneral(input_empty)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_empty } = response_empty else { panic!() };
+            let record_empty = env.store.get_task(&task_empty.agent_id).unwrap().unwrap();
+            assert_eq!(record_empty.initial_prompt, "Unchanged prompt");
+
+            // 4. Spliced prompt exceeding MAX_PROMPT_BYTES (256 KiB) is rejected
+            let di_text = "Instructions: ".repeat(20); // ~280 bytes
+            let big_di_toml = format!(
+                "name = \"big_di\"\nsubagent = \"zcode\"\ndeveloper_instructions = \"{di_text}\"\n"
+            );
+            fs::write(env.profiles_dir.join("big_di.toml"), big_di_toml).unwrap();
+            // Make base prompt just 50 bytes under MAX_PROMPT_BYTES so splicing exceeds the limit
+            let base_prompt = "a".repeat(MAX_PROMPT_BYTES - 50);
+            let input_oversized = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("big_di".into()),
+                manifest: test_manifest(env.workspace_dir.path(), &base_prompt),
+            };
+            let err_oversized = env.service.dispatch(RpcMethod::SubmitGeneral(input_oversized)).unwrap_err();
+            assert_eq!(err_oversized.code, RpcErrorCode::Validation);
+        }
+
+        #[test]
+        fn ac5_discovery_and_truncation_fidelity() {
+            let env = setup_environment();
+
+            // 1. Profiles listed in stable alphabetical sort
+            fs::write(env.profiles_dir.join("c.toml"), "name = \"charlie\"\n").unwrap();
+            fs::write(env.profiles_dir.join("a.toml"), "name = \"alpha\"\n").unwrap();
+            fs::write(env.profiles_dir.join("b.toml"), "name = \"bravo\"\n").unwrap();
+
+            let err = load_profile("missing").unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err.message,
+                "profile 'missing' not found; available profiles: [alpha, bravo, charlie]"
+            );
+
+            // 2. Large ASCII list > 512 bytes preserved without truncation in RPC and MCP
+            let large_dir = tempfile::tempdir().unwrap();
+            for i in 0..40 {
+                let name = format!("profile_worker_long_name_{:02}", i);
+                fs::write(
+                    large_dir.path().join(format!("p_{:02}.toml", i)),
+                    format!("name = \"{name}\"\n"),
+                )
+                .unwrap();
+            }
+            let profiles = load_profiles_from_dir(large_dir.path()).unwrap();
+            let mut names: Vec<String> = profiles.into_keys().collect();
+            names.sort();
+            let err_msg = crate::rpc::profiles::format_unknown_profile_error("missing", &names);
+            assert!(
+                err_msg.len() > 512,
+                "List must exceed 512 bytes: len={}",
+                err_msg.len()
+            );
+            assert!(err_msg.contains("profile_worker_long_name_39"));
+
+            let rpc_err = RpcError::new_profile_error(RpcErrorCode::Validation, &err_msg);
+            assert_eq!(rpc_err.message, err_msg, "RPC message must not be truncated to 512 bytes");
+
+            // 3. Large Unicode list > 512 bytes character boundary safe without panic
+            let mut unicode_names = Vec::new();
+            for i in 0..30 {
+                unicode_names.push(format!("中文配置预设名称_{:02}", i));
+            }
+            let unicode_err_msg = crate::rpc::profiles::format_unknown_profile_error("missing", &unicode_names);
+            assert!(unicode_err_msg.len() > 512);
+            assert!(unicode_err_msg.contains("中文配置预设名称_29"));
+
+            let unicode_rpc_err = RpcError::new_profile_error(RpcErrorCode::Validation, &unicode_err_msg);
+            assert_eq!(unicode_rpc_err.message, unicode_err_msg);
+        }
+
+        #[test]
+        fn ac6_non_profile_regression() {
+            let env = setup_environment();
+
+            // Request without profile: explicit subagent, model, effort, permission_mode
+            let mut manifest = test_manifest(env.workspace_dir.path(), "regression prompt");
+            manifest.permission_mode = Some(PermissionMode::Plan);
+            let input = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: Some("zai/GLM-5.3".into()),
+                effort: Some("high".into()),
+                profile: None,
+                manifest,
+            };
+            let response = env.service.dispatch(RpcMethod::SubmitGeneral(input)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task } = response else { panic!() };
+
+            let record = env.store.get_task(&task.agent_id).unwrap().unwrap();
+            let prepared: PreparedGeneralTask = serde_json::from_str(&record.prepared_launch_json).unwrap();
+            assert_eq!(prepared.permission_mode, PermissionMode::Plan);
+            let admission = prepared.admission.unwrap();
+            assert_eq!(admission.agent, "zcode");
+            assert_eq!(admission.model.as_deref(), Some("zai/GLM-5.3"));
+            assert_eq!(admission.effort.as_deref(), Some("high"));
+            assert_eq!(admission.developer_instructions, None);
+            assert_eq!(record.initial_prompt, "regression prompt");
+
+            // Request without profile and omitted permission_mode defaults to Build
+            let mut manifest_default = test_manifest(env.workspace_dir.path(), "default mode prompt");
+            manifest_default.permission_mode = None;
+            let input_default = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: None,
+                effort: None,
+                profile: None,
+                manifest: manifest_default,
+            };
+            let response_default = env.service.dispatch(RpcMethod::SubmitGeneral(input_default)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_def } = response_default else { panic!() };
+            let record_def = env.store.get_task(&task_def.agent_id).unwrap().unwrap();
+            let prepared_def: PreparedGeneralTask = serde_json::from_str(&record_def.prepared_launch_json).unwrap();
+            assert_eq!(prepared_def.permission_mode, PermissionMode::Build);
         }
     }
 }

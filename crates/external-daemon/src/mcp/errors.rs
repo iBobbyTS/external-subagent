@@ -98,12 +98,26 @@ impl IntoCallToolResult for ToolError {
 
 pub(crate) fn validation_error(detail: impl Into<String>) -> ToolError {
     let detail = detail.into();
+    let message = if is_profile_error(&detail) {
+        detail.clone()
+    } else {
+        "request validation failed".to_string()
+    };
     ToolError::new(
         "validation",
-        "request validation failed",
+        message,
         format!("validation: {detail}"),
         "facade",
     )
+}
+
+pub(crate) fn is_profile_error(detail: &str) -> bool {
+    detail.starts_with("profile ")
+        || detail.starts_with("profile:")
+        || detail.starts_with("profile '")
+        || detail.starts_with("unknown profile ")
+        || detail.contains("profile file '")
+        || detail.contains("available profiles:")
 }
 
 #[allow(dead_code)]
@@ -126,6 +140,7 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
                 .iter()
                 .any(|prefix| detail.starts_with(prefix))
                 || (operation == "spawn" && detail.starts_with("MODEL_REJECTED"))
+                || is_profile_error(&detail)
             {
                 detail.as_str()
             } else {
@@ -200,6 +215,8 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
     let agent_id = error.active_agent_id;
     let legacy_text = if let Some(agent_id) = agent_id.as_ref() {
         format!("{code}: {message} (active_agent_id={agent_id})")
+    } else if is_profile_error(&detail) {
+        format!("{code}: {detail}")
     } else if matches!(error.code, RpcErrorCode::Validation | RpcErrorCode::Malformed)
         && detail != message
         && detail.len() <= 512
@@ -517,5 +534,48 @@ mod tests {
             "agent_unsupported: agent is unsupported: private capability detail"
         );
         assert_eq!(unsupported.body.prompt_count, Some(0));
+    }
+
+    #[test]
+    fn profile_error_is_preserved_through_mcp_projection() {
+        let msg = "profile 'missing' not found; available profiles: [a, b, c]";
+        let err = RpcError::new_profile_error(RpcErrorCode::Validation, msg);
+        let projected = public_error(err);
+        assert_eq!(projected.body.code, "validation");
+        assert_eq!(projected.body.message, msg);
+        assert_eq!(projected.legacy_text, format!("validation: {msg}"));
+
+        // Profile error with large list (> 512 bytes) preserves full list without truncation
+        let large_msg = format!(
+            "profile 'missing' not found; available profiles: [{}]",
+            "p".repeat(600)
+        );
+        let err_large = RpcError::new_profile_error(RpcErrorCode::Validation, &large_msg);
+        let projected_large = public_error(err_large);
+        assert_eq!(projected_large.body.code, "validation");
+        assert_eq!(projected_large.body.message, large_msg);
+        assert_eq!(
+            projected_large.legacy_text,
+            format!("validation: {large_msg}")
+        );
+
+        // Profile error with large Unicode list (> 512 bytes)
+        let mut unicode_names = Vec::new();
+        for i in 0..30 {
+            unicode_names.push(format!("中文配置预设名称_{:02}", i));
+        }
+        let unicode_msg = format!(
+            "profile 'missing' not found; available profiles: [{}]",
+            unicode_names.join(", ")
+        );
+        assert!(unicode_msg.len() > 512);
+        let err_unicode = RpcError::new_profile_error(RpcErrorCode::Validation, &unicode_msg);
+        let projected_unicode = public_error(err_unicode);
+        assert_eq!(projected_unicode.body.code, "validation");
+        assert_eq!(projected_unicode.body.message, unicode_msg);
+        assert_eq!(
+            projected_unicode.legacy_text,
+            format!("validation: {unicode_msg}")
+        );
     }
 }

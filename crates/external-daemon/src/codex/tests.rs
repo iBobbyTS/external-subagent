@@ -32,6 +32,7 @@ fn codex_admission_with_effort(model: Option<&str>, effort: Option<&str>) -> Adm
         model: model.map(str::to_owned),
         model_source: "spawn_catalog".into(),
         effort: effort.map(str::to_owned),
+        developer_instructions: None,
     }
 }
 
@@ -75,7 +76,7 @@ fn manifest_for_mode(
         schema: GENERAL_TASK_SCHEMA.into(),
         agent_id: "codex-test".into(),
         repository: workspace.to_path_buf(),
-        permission_mode,
+        permission_mode: Some(permission_mode),
         prompt: prompt.into(),
         write_manifest: Vec::new(),
     }
@@ -1589,6 +1590,7 @@ fn routing_keeps_zcode_and_dsh_on_their_factories() {
         model: None,
         model_source: "native".into(),
         effort: None,
+        developer_instructions: None,
     };
     let prepared = external_core::GeneralTaskPreparer::new(Vec::new())
         .unwrap()

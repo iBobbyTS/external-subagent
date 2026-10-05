@@ -45,7 +45,7 @@ mod queued_recovery_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: String::new(),
                 repository: directory.path().canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Build,
+                permission_mode: Some(external_core::PermissionMode::Build),
                 prompt: "never execute this fenced queue".into(),
                 write_manifest: vec![],
             })
@@ -160,7 +160,7 @@ mod queued_recovery_tests {
                     schema: "zcode-general-task/v1".into(),
                     agent_id: String::new(),
                     repository: directory.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Build,
+                    permission_mode: Some(external_core::PermissionMode::Build),
                     prompt: "invalid runtime identity".into(),
                     write_manifest: vec![],
                 })
@@ -221,6 +221,7 @@ mod observation_evidence_tests {
             model: None,
             model_source: "catalog".into(),
             effort: None,
+            developer_instructions: None,
         }
     }
 
@@ -229,7 +230,7 @@ mod observation_evidence_tests {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
             agent_id: format!("{agent}-observe"),
             repository: directory.canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Build,
+            permission_mode: Some(external_core::PermissionMode::Build),
             prompt: "observation evidence binding".into(),
             write_manifest: Vec::new(),
         }
@@ -480,7 +481,7 @@ mod failure_log_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: "diagnostic-agent".into(),
                 repository: workspace.path().canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "diagnostic fixture".into(),
                 write_manifest: Vec::new(),
             })
@@ -529,7 +530,7 @@ mod failure_log_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: "caller-value-is-ignored".into(),
             repository: directory.path().join("does-not-exist"),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "preparation failure".into(),
             write_manifest: Vec::new(),
         };
@@ -713,7 +714,7 @@ sleep 2
                 schema: "zcode-general-task/v1".into(),
                 agent_id: "10000007".into(),
                 repository: workspace.path().canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "spawn failure fixture".into(),
                 write_manifest: Vec::new(),
             })
@@ -2147,7 +2148,7 @@ mod bare_prompt_admission_tests {
                     schema: "zcode-general-task/v1".into(),
                     agent_id: String::new(),
                     repository: directory.path().canonicalize().unwrap(),
-                    permission_mode: external_core::PermissionMode::Build,
+                    permission_mode: Some(external_core::PermissionMode::Build),
                     prompt: prompt.into(),
                     write_manifest: vec![],
                 })
@@ -2238,7 +2239,7 @@ mod legacy_row_recovery_tests {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
             agent_id: String::new(),
             repository: directory.path().canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Build,
+            permission_mode: Some(external_core::PermissionMode::Build),
             prompt: "fresh work after upgrade".into(),
             write_manifest: vec![],
         }
@@ -2415,7 +2416,7 @@ mod transport_failure_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: String::new(),
                 repository: directory.canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: prompt.into(),
                 write_manifest: Vec::new(),
             })
@@ -3247,7 +3248,7 @@ mod turn_adjudication_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: String::new(),
             repository: directory.path().canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "turn fixture".into(),
             write_manifest: Vec::new(),
         };
@@ -3264,6 +3265,7 @@ mod turn_adjudication_tests {
                         model: Some("fixture-model".into()),
                         model_source: "catalog".into(),
                         effort: None,
+                        developer_instructions: None,
                     }),
                 )
                 .unwrap()
@@ -3738,7 +3740,7 @@ mod turn_adjudication_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: String::new(),
             repository: directory.path().canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "sink race fixture".into(),
             write_manifest: Vec::new(),
         };
@@ -3916,7 +3918,7 @@ mod wait_tail_inheritance_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: String::new(),
                 repository: directory.path().canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "wait tail inheritance".into(),
                 write_manifest: Vec::new(),
             })
@@ -4185,7 +4187,7 @@ mod spawn_established_return_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: String::new(),
             repository: repo.to_path_buf(),
-            permission_mode: PermissionMode::Plan,
+            permission_mode: Some(PermissionMode::Plan),
             prompt: "test prompt".into(),
             write_manifest: vec![],
         }
@@ -4199,6 +4201,7 @@ mod spawn_established_return_tests {
             model: Some("test-model".into()),
             model_source: "native".into(),
             effort: None,
+            developer_instructions: None,
         })
     }
 

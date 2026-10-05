@@ -504,7 +504,7 @@ pub(crate) mod wait_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: String::new(),
                 repository: workspace.canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "admitted after the aborted drain".into(),
                 write_manifest: vec![],
             })
@@ -591,7 +591,7 @@ pub(crate) mod wait_tests {
             schema: "zcode-general-task/v1".into(),
             agent_id: String::new(),
             repository: task_workspace.canonicalize().unwrap(),
-            permission_mode: external_core::PermissionMode::Plan,
+            permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "accepted before the drain linearization point".into(),
             write_manifest: vec![],
         };
@@ -670,7 +670,7 @@ pub(crate) mod wait_tests {
                 schema: "zcode-general-task/v1".into(),
                 agent_id: "".into(),
                 repository: directory.path().canonicalize().unwrap(),
-                permission_mode: external_core::PermissionMode::Plan,
+                permission_mode: Some(external_core::PermissionMode::Plan),
                 prompt: "wait fixture".into(),
                 write_manifest: vec![],
             })

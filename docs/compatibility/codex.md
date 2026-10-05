@@ -269,6 +269,13 @@ effort keeps the pre-existing wire default. Evidence layers:
   path is **NOT_RUN**, and the non-`max` tiers keep their static-binary and
   unauthenticated-probe evidence only.
 
+## Developer instructions native channel (SOURCE_INSPECTED, tag verified)
+
+Upstream Codex app-server supports native `developer_instructions` on `thread/start`:
+- **SOURCE_INSPECTED**: Verified in upstream GitHub source repository tags `rust-v0.154.0` and `rust-v0.160.0`. `ThreadStartParams.developer_instructions: Option<String>` is a standard, non-experimental field.
+- **Wire serialization**: CamelCase `developerInstructions` in `thread/start` payload (`{"model": ..., "cwd": ..., "approvalPolicy": "never", "sandbox": ..., "ephemeral": false, "developerInstructions": "..."}`).
+- **Echo behavior**: `thread/start` response does not echo an inline instruction text field (`instruction_sources` lists loaded instruction files). Validation is performed at outbound request frame composition; turn/start receives the caller prompt verbatim without developer instruction splicing.
+
 ## NOT_RUN
 
 - Installation into a real user `~/.codex` (requires explicit authorization).
