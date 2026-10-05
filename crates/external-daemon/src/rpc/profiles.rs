@@ -1137,6 +1137,8 @@ permission_mode = "superuser"
     ///      and yields a usable name. Field-value validation (e.g.
     ///      `permission_mode = "superuser"`) is intentionally excluded, because
     ///      the CLI deliberately leaves value-level validation to the daemon.
+    /// A byte-level item whose bytes are not valid UTF-8 is asserted to own no
+    /// name and to be invalid, mirroring `fs::read_to_string` failing.
     #[test]
     fn profile_corpus_matches_toml_crate_identity_and_shape() {
         let corpus =
@@ -1165,8 +1167,25 @@ permission_mode = "superuser"
             .unwrap_or_else(|e| panic!("parse {}: {e}", expected_path.display()));
             let expected_valid = expected["valid"].as_bool().expect("expected.valid must be bool");
             let expected_name = expected["name"].as_str().map(str::to_string);
-            let content = fs::read_to_string(&toml_path)
+            let bytes = fs::read(&toml_path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", toml_path.display()));
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(_) => {
+                    // The daemon reads each profile with `fs::read_to_string`;
+                    // invalid UTF-8 fails that read, so the file is skipped
+                    // entirely: it owns no name and is never a valid profile.
+                    assert!(
+                        expected_name.is_none(),
+                        "corpus item {stem}: non-UTF8 file must not own a name"
+                    );
+                    assert!(
+                        !expected_valid,
+                        "corpus item {stem}: non-UTF8 file must not be a valid profile"
+                    );
+                    continue;
+                }
+            };
 
             let decoded_name = toml::from_str::<toml::Value>(&content)
                 .ok()

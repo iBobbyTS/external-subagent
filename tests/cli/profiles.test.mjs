@@ -44,6 +44,12 @@ const REASON_MARKERS = Object.freeze({
   empty_name: "field 'name': cannot be empty",
   oversize_name: "field 'name': exceeds 128 bytes",
   nul_name: "field 'name': cannot contain NUL byte",
+  namespace_conflict: 'namespace conflict',
+  table_header_syntax: 'malformed table header',
+  multiline_quotes: 'Too many consecutive quotes',
+  del_char: 'Disallowed control character 0x7f',
+  comment_control: 'in comment',
+  field_type: 'must be a string',
 });
 
 function createTempEnv() {
@@ -615,7 +621,20 @@ test('corpus: scanner output matches the shared TOML differential corpus item-fo
   for (const file of files) {
     const stem = file.slice(0, -'.toml'.length);
     const expected = JSON.parse(fs.readFileSync(path.join(CORPUS_DIR, `${stem}.expected.json`), 'utf8'));
-    const result = scanProfileToml(fs.readFileSync(path.join(CORPUS_DIR, file), 'utf8'), file);
+    const bytes = fs.readFileSync(path.join(CORPUS_DIR, file));
+    if (expected.reason === 'read-error') {
+      // Byte-level corpus items are not decodable UTF-8; the daemon's
+      // `fs::read_to_string` fails and skips the file without an owner.
+      assert.throws(
+        () => new TextDecoder('utf-8', { fatal: true }).decode(bytes),
+        `${stem}: expected invalid UTF-8`,
+      );
+      assert.equal(expected.valid, false, `${stem}: read-error must not be valid`);
+      assert.equal(expected.name, null, `${stem}: read-error must not own a name`);
+      continue;
+    }
+    const content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const result = scanProfileToml(content, file);
     assert.equal(result.valid, expected.valid, `${stem}: valid mismatch`);
     assert.equal(result.name ?? null, expected.name, `${stem}: name mismatch`);
     if (expected.valid) {
@@ -668,6 +687,59 @@ test('fix3: only TOML-syntax-valid files own a name; broken files never evict va
   assert.ok(duplicates.some((w) => w.file.endsWith('good.toml')));
   assert.ok(duplicates.some((w) => w.file.endsWith('field_error.toml')));
   fs.rmSync(three.home, { recursive: true, force: true });
+});
+
+test('fix-F1: table headers do not hide later syntax damage; conflicts erase the owner', () => {
+  // A good top-level profile plus two same-named files that are damaged only
+  // after a (valid) table header. Both damaged files must fail the full-document
+  // syntax check and therefore not own "real", leaving the good file usable.
+  const { paths, profilesDir } = createTempEnv();
+  fs.writeFileSync(path.join(profilesDir, 'good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  fs.writeFileSync(path.join(profilesDir, 'a-broken-table.toml'), 'name = "real"\n[extra]\nx = "unclosed');
+  fs.writeFileSync(path.join(profilesDir, 'b-namespace.toml'), 'name = "real"\nname.x = 1\n');
+  const res = listProfiles(paths);
+  assert.deepEqual(res.profiles, ['real']);
+  assert.equal(res.warnings.length, 2);
+  assert.ok(res.warnings.some((w) => w.file.endsWith('a-broken-table.toml') && w.diagnostic.includes('Unterminated basic string')));
+  assert.ok(res.warnings.some((w) => w.file.endsWith('b-namespace.toml') && w.diagnostic.includes('namespace conflict')));
+  fs.rmSync(paths.home, { recursive: true, force: true });
+
+  // A scalar followed by a table of the same name is a syntax error, so a name
+  // defined earlier must not survive as an owner.
+  const scalar = scanProfileToml('name = "real"\nx = 1\n[x]\n', 'scalar.toml');
+  assert.equal(scalar.syntaxValid, false);
+  assert.equal(scalar.name, null);
+});
+
+test('fix-F4: invalid UTF-8 bytes are a read warning and never own a name', () => {
+  const { paths, profilesDir } = createTempEnv();
+  fs.writeFileSync(path.join(profilesDir, 'good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  // Same top-level name, but the raw bytes are not valid UTF-8: the daemon's
+  // `fs::read_to_string` fails, so this file must not evict the good owner.
+  fs.writeFileSync(path.join(profilesDir, 'bad-bytes.toml'), Buffer.from('name = "real"\n# \xff\n', 'latin1'));
+  const res = listProfiles(paths);
+  assert.deepEqual(res.profiles, ['real']);
+  assert.equal(res.warnings.length, 1);
+  assert.ok(res.warnings[0].file.endsWith('bad-bytes.toml'));
+  assert.ok(res.warnings[0].diagnostic.includes('is unreadable'));
+  fs.rmSync(paths.home, { recursive: true, force: true });
+});
+
+test('fix-F3: non-string field values keep the name owner but are not usable', () => {
+  const { paths, profilesDir } = createTempEnv();
+  fs.writeFileSync(path.join(profilesDir, 'a-typed.toml'), 'name = "real"\nmodel = true\n');
+  const single = listProfiles(paths);
+  assert.deepEqual(single.profiles, []);
+  assert.equal(single.warnings.length, 1);
+  assert.ok(single.warnings[0].diagnostic.includes('must be a string'));
+
+  // The daemon keeps `validated_name` for RawProfile field-type failures, so a
+  // field-type-invalid file still owns its name and evicts a valid same name.
+  fs.writeFileSync(path.join(profilesDir, 'b-good.toml'), 'name = "real"\nsubagent = "zcode"\n');
+  const collide = listProfiles(paths);
+  assert.deepEqual(collide.profiles, []);
+  assert.equal(collide.warnings.filter((w) => w.diagnostic.includes("duplicate profile name 'real'")).length, 2);
+  fs.rmSync(paths.home, { recursive: true, force: true });
 });
 
 test('fix2/fix4: CRLF and LF names collide; malformed primitives and surrogates only warn', () => {
