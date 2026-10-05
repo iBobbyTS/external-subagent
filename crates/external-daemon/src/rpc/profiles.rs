@@ -54,92 +54,60 @@ pub fn profiles_directory() -> Option<PathBuf> {
     path.parent().map(|p| p.join("profiles"))
 }
 
-/// Parse and validate a single profile from a TOML string and file path.
-pub fn parse_profile_toml(content: &str, file_path: &Path) -> Result<Profile, RpcError> {
-    let raw: RawProfile = toml::from_str(content).map_err(|error| {
-        RpcError::new_profile_error(
-            RpcErrorCode::Validation,
-            format!("profile file '{}' is invalid: {error}", file_path.display()),
-        )
-    })?;
-
-    let name = raw.name.trim().to_string();
-    if name.is_empty() {
-        return Err(RpcError::new_profile_error(
-            RpcErrorCode::Validation,
-            format!(
-                "profile file '{}' is invalid: field 'name' cannot be empty",
-                file_path.display()
-            ),
-        ));
-    }
-    if raw.name.len() > 128 {
-        return Err(RpcError::new_profile_error(
-            RpcErrorCode::Validation,
-            format!(
-                "profile file '{}' is invalid: field 'name' exceeds 128 bytes",
-                file_path.display()
-            ),
-        ));
-    }
-
-    let permission_mode = match raw.permission_mode {
-        Some(mode) => {
-            let trimmed = mode.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                match trimmed {
-                    "build" => Some(PermissionMode::Build),
-                    "edit" => Some(PermissionMode::Edit),
-                    "plan" => Some(PermissionMode::Plan),
-                    "yolo" => Some(PermissionMode::Yolo),
-                    other => {
-                        return Err(RpcError::new_profile_error(
-                            RpcErrorCode::Validation,
-                            format!(
-                                "profile file '{}' is invalid: field 'permission_mode' must be build, edit, plan, yolo, or empty, got '{other}'",
-                                file_path.display()
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-        None => None,
-    };
-
-    let subagent = raw
-        .subagent
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let model = raw
-        .model
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let effort = raw
-        .effort
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let developer_instructions = raw
-        .developer_instructions
-        .filter(|s| !s.trim().is_empty());
-
-    Ok(Profile {
-        name,
-        subagent,
-        permission_mode,
-        model,
-        effort,
-        developer_instructions,
-        source_path: file_path.to_path_buf(),
-    })
-}
-
-/// Load all profiles from a specified directory, detecting duplicates and TOML errors.
 pub const PROFILE_ERROR_ENVELOPE_OVERHEAD: usize = 8192;
 pub const MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES: usize =
     MAX_RESPONSE_FRAME_BYTES - PROFILE_ERROR_ENVELOPE_OVERHEAD;
+
+pub const PROFILE_ERROR_PREFIXES: [&str; 6] = [
+    "profile cannot be combined with",
+    "profile is invalid",
+    "profile file '",
+    "profile directory '",
+    "profile field '",
+    "profile '",
+];
+
+/// Internal rejection representation carrying problem file path, field, and diagnostic message.
+#[derive(Debug, Clone)]
+pub struct ProfileRejection {
+    pub file_path: Option<PathBuf>,
+    pub field: Option<String>,
+    pub diagnostic: String,
+}
+
+impl ProfileRejection {
+    pub fn new(
+        file_path: Option<PathBuf>,
+        field: Option<String>,
+        diagnostic: impl Into<String>,
+    ) -> Self {
+        Self {
+            file_path,
+            field,
+            diagnostic: diagnostic.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileFileDiagnostic {
+    pub file_path: PathBuf,
+    pub profile_name: Option<String>,
+    pub diagnostic: String,
+    pub rejection: ProfileRejection,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedProfiles {
+    pub profiles: HashMap<String, Profile>,
+    pub file_errors: Vec<ProfileFileDiagnostic>,
+}
+
+#[derive(serde::Deserialize)]
+struct LooseName {
+    #[serde(default)]
+    name: Option<String>,
+}
 
 /// Calculate the byte length of a string when encoded inside a JSON string literal.
 pub fn json_escaped_byte_len(s: &str) -> usize {
@@ -179,15 +147,75 @@ pub fn truncate_json_escaped(s: &mut String, max_json_bytes: usize) {
     }
 }
 
-/// Formats a profile rejection error with file diagnostic and available profiles list,
-/// ensuring the JSON-encoded size stays safely within the RPC frame cap.
-pub fn format_profile_error_with_names(diagnostic: &str, names: &[String]) -> String {
-    if names.is_empty() {
-        return format!("{diagnostic}; available profiles: none");
+/// Compose the diagnostic part of a rejection into a well-formed prefix.
+pub fn compose_diagnostic_text(rejection: &ProfileRejection) -> String {
+    let diag = &rejection.diagnostic;
+    if diag.starts_with("profile file '")
+        || diag.starts_with("profile directory '")
+        || diag.starts_with("profile field '")
+        || diag.starts_with("profile '")
+        || diag.starts_with("profile is invalid")
+        || diag.starts_with("profile cannot be combined with")
+    {
+        return diag.clone();
     }
+    match (&rejection.file_path, &rejection.field) {
+        (Some(path), Some(field)) => {
+            if diag.starts_with(&format!("field '{field}'")) {
+                format!("profile file '{}' is invalid: {diag}", path.display())
+            } else if diag.starts_with("cannot ")
+                || diag.starts_with("exceeds ")
+                || diag.starts_with("must be ")
+            {
+                format!(
+                    "profile file '{}' is invalid: field '{field}' {diag}",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "profile file '{}' is invalid: field '{field}': {diag}",
+                    path.display()
+                )
+            }
+        }
+        (Some(path), None) => {
+            format!("profile file '{}' is invalid: {diag}", path.display())
+        }
+        (None, Some(field)) => {
+            format!("profile field '{field}' is invalid: {diag}")
+        }
+        (None, None) => {
+            format!("profile is invalid: {diag}")
+        }
+    }
+}
+
+/// Unified error formatting function for all profile-related rejections.
+/// Always:
+/// (a) Pre-reserves budget for the fixed suffix ("; available profiles: [...]" or "; available profiles: none")
+///     based on JSON encoding before truncating the diagnostic.
+/// (b) Appends stably sorted available names list.
+pub fn format_profile_rejection(
+    rejection: &ProfileRejection,
+    available_names: &[String],
+) -> String {
+    let mut sorted_names = available_names.to_vec();
+    sorted_names.sort();
+
+    let diag_text = compose_diagnostic_text(rejection);
+
+    if sorted_names.is_empty() {
+        const EMPTY_SUFFIX: &str = "; available profiles: none";
+        let suffix_json_len = json_escaped_byte_len(EMPTY_SUFFIX);
+        let max_diag_json = MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES.saturating_sub(suffix_json_len);
+        let mut diag = diag_text;
+        truncate_json_escaped(&mut diag, max_diag_json);
+        return format!("{diag}{EMPTY_SUFFIX}");
+    }
+
     const SUFFIX_RESERVE: usize = 32;
     let max_diag_json = MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES.saturating_sub(256);
-    let mut diag = diagnostic.to_string();
+    let mut diag = diag_text;
     truncate_json_escaped(&mut diag, max_diag_json);
 
     let prefix = format!("{diag}; available profiles: [");
@@ -195,12 +223,12 @@ pub fn format_profile_error_with_names(diagnostic: &str, names: &[String]) -> St
     let mut current_json_len = json_escaped_byte_len(&message);
     let mut truncated_count = 0;
 
-    for (i, name) in names.iter().enumerate() {
+    for (i, name) in sorted_names.iter().enumerate() {
         let separator = if i == 0 { "" } else { ", " };
         let addition = format!("{separator}{name}");
         let addition_json_len = json_escaped_byte_len(&addition);
         if current_json_len + addition_json_len + SUFFIX_RESERVE > MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES {
-            truncated_count = names.len() - i;
+            truncated_count = sorted_names.len() - i;
             break;
         }
         message.push_str(&addition);
@@ -215,31 +243,125 @@ pub fn format_profile_error_with_names(diagnostic: &str, names: &[String]) -> St
     message
 }
 
-/// Formats the unknown profile error message with available profiles list.
+/// Construct an RpcError through the unified profile rejection formatting function.
+pub fn make_profile_rejection_error(
+    rejection: &ProfileRejection,
+    available_names: &[String],
+) -> RpcError {
+    let message = format_profile_rejection(rejection, available_names);
+    RpcError::new_profile_error(RpcErrorCode::Validation, message)
+}
+
+/// Formats a profile rejection error with file diagnostic and available profiles list,
+/// delegating to the unified constructor.
+#[allow(dead_code)]
+pub fn format_profile_error_with_names(diagnostic: &str, names: &[String]) -> String {
+    let rejection = ProfileRejection::new(None, None, diagnostic);
+    format_profile_rejection(&rejection, names)
+}
+
+/// Formats the unknown profile error message with available profiles list,
+/// delegating to the unified constructor.
+#[allow(dead_code)]
 pub fn format_unknown_profile_error(requested: &str, names: &[String]) -> String {
-    format_profile_error_with_names(
-        &format!("profile '{requested}' not found"),
-        names,
-    )
+    let rejection = ProfileRejection::new(None, None, format!("profile '{requested}' not found"));
+    format_profile_rejection(&rejection, names)
 }
 
-#[derive(Debug, Clone)]
-pub struct ProfileFileDiagnostic {
-    pub file_path: PathBuf,
-    pub profile_name: Option<String>,
-    pub diagnostic: String,
+fn parse_profile_toml_internal(
+    content: &str,
+    file_path: &Path,
+) -> Result<Profile, ProfileRejection> {
+    let raw: RawProfile = match toml::from_str(content) {
+        Ok(raw) => raw,
+        Err(error) => {
+            return Err(ProfileRejection::new(
+                Some(file_path.to_path_buf()),
+                None,
+                error.to_string(),
+            ));
+        }
+    };
+
+    let trimmed = raw.name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(ProfileRejection::new(
+            Some(file_path.to_path_buf()),
+            Some("name".to_string()),
+            "cannot be empty",
+        ));
+    }
+    if raw.name.len() > 128 {
+        return Err(ProfileRejection::new(
+            Some(file_path.to_path_buf()),
+            Some("name".to_string()),
+            "exceeds 128 bytes",
+        ));
+    }
+    if raw.name.contains('\0') {
+        return Err(ProfileRejection::new(
+            Some(file_path.to_path_buf()),
+            Some("name".to_string()),
+            "cannot contain NUL byte",
+        ));
+    }
+
+    let permission_mode = match raw.permission_mode {
+        Some(mode) => {
+            let trimmed_mode = mode.trim();
+            if trimmed_mode.is_empty() {
+                None
+            } else {
+                match trimmed_mode {
+                    "build" => Some(PermissionMode::Build),
+                    "edit" => Some(PermissionMode::Edit),
+                    "plan" => Some(PermissionMode::Plan),
+                    "yolo" => Some(PermissionMode::Yolo),
+                    other => {
+                        return Err(ProfileRejection::new(
+                            Some(file_path.to_path_buf()),
+                            Some("permission_mode".to_string()),
+                            format!("must be build, edit, plan, yolo, or empty, got '{other}'"),
+                        ));
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+
+    let subagent = raw
+        .subagent
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let model = raw
+        .model
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let effort = raw
+        .effort
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let developer_instructions = raw
+        .developer_instructions
+        .filter(|s| !s.trim().is_empty());
+
+    Ok(Profile {
+        name: trimmed,
+        subagent,
+        permission_mode,
+        model,
+        effort,
+        developer_instructions,
+        source_path: file_path.to_path_buf(),
+    })
 }
 
-#[derive(Debug, Clone)]
-pub struct LoadedProfiles {
-    pub profiles: HashMap<String, Profile>,
-    pub file_errors: Vec<ProfileFileDiagnostic>,
-}
-
-#[derive(serde::Deserialize)]
-struct LooseName {
-    #[serde(default)]
-    name: Option<String>,
+/// Parse and validate a single profile from a TOML string and file path.
+#[allow(dead_code)]
+pub fn parse_profile_toml(content: &str, file_path: &Path) -> Result<Profile, RpcError> {
+    parse_profile_toml_internal(content, file_path)
+        .map_err(|rejection| make_profile_rejection_error(&rejection, &[]))
 }
 
 /// Scan a directory for all profile TOML files, collecting valid and non-conflicting profiles
@@ -247,7 +369,6 @@ struct LooseName {
 pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
     let mut profiles = HashMap::new();
     let mut file_errors = Vec::new();
-    let mut conflicting_names = std::collections::HashSet::new();
 
     if !dir.is_dir() {
         return LoadedProfiles {
@@ -256,14 +377,20 @@ pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
         };
     }
 
-    let mut entries = Vec::new();
     let read_dir = match fs::read_dir(dir) {
         Ok(read_dir) => read_dir,
         Err(err) => {
+            let rejection = ProfileRejection::new(
+                Some(dir.to_path_buf()),
+                None,
+                format!("profile directory '{}' is unreadable: {err}", dir.display()),
+            );
+            let diagnostic = compose_diagnostic_text(&rejection);
             file_errors.push(ProfileFileDiagnostic {
                 file_path: dir.to_path_buf(),
                 profile_name: None,
-                diagnostic: format!("profile directory '{}' is unreadable: {err}", dir.display()),
+                diagnostic,
+                rejection,
             });
             return LoadedProfiles {
                 profiles,
@@ -272,68 +399,132 @@ pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
         }
     };
 
+    let mut entries = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
         if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("toml") {
             entries.push(path);
         }
     }
-    // Sort file paths for stable, deterministic processing and error reporting
     entries.sort();
+
+    // F01: Map valid_name -> Vec<PathBuf>
+    let mut name_owners: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let mut candidates: Vec<Profile> = Vec::new();
 
     for path in entries {
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) => {
+                let rejection = ProfileRejection::new(
+                    Some(path.clone()),
+                    None,
+                    format!("profile file '{}' is unreadable: {error}", path.display()),
+                );
+                let diagnostic = compose_diagnostic_text(&rejection);
                 file_errors.push(ProfileFileDiagnostic {
                     file_path: path.clone(),
                     profile_name: None,
-                    diagnostic: format!("profile file '{}' is unreadable: {error}", path.display()),
+                    diagnostic,
+                    rejection,
                 });
                 continue;
             }
         };
 
-        let raw_name = toml::from_str::<LooseName>(&content)
-            .ok()
-            .and_then(|l| l.name)
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty());
-
-        match parse_profile_toml(&content, &path) {
-            Ok(profile) => {
-                if conflicting_names.contains(&profile.name) {
-                    file_errors.push(ProfileFileDiagnostic {
-                        file_path: path.clone(),
-                        profile_name: Some(profile.name.clone()),
-                        diagnostic: format!(
-                            "profile file '{}' is invalid: duplicate profile name '{}'",
-                            path.display(),
-                            profile.name,
-                        ),
-                    });
-                } else if let Some(existing) = profiles.remove(&profile.name) {
-                    conflicting_names.insert(profile.name.clone());
-                    file_errors.push(ProfileFileDiagnostic {
-                        file_path: path.clone(),
-                        profile_name: Some(profile.name.clone()),
-                        diagnostic: format!(
-                            "profile file '{}' is invalid: duplicate profile name '{}' already defined in '{}'",
-                            path.display(),
-                            profile.name,
-                            existing.source_path.display()
-                        ),
-                    });
-                } else {
-                    profiles.insert(profile.name.clone(), profile);
+        // F01 / F05: Extract and validate top-level name independently
+        let validated_name = match toml::from_str::<LooseName>(&content) {
+            Ok(loose) => match loose.name {
+                Some(raw) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() || raw.len() > 128 || raw.contains('\0') {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
                 }
+                None => None,
+            },
+            Err(_) => None,
+        };
+
+        if let Some(ref name) = validated_name {
+            name_owners.entry(name.clone()).or_default().push(path.clone());
+        }
+
+        match parse_profile_toml_internal(&content, &path) {
+            Ok(profile) => {
+                candidates.push(profile);
             }
-            Err(err) => {
+            Err(rejection) => {
+                let diagnostic = compose_diagnostic_text(&rejection);
                 file_errors.push(ProfileFileDiagnostic {
                     file_path: path.clone(),
-                    profile_name: raw_name,
-                    diagnostic: err.message,
+                    profile_name: validated_name,
+                    diagnostic,
+                    rejection,
                 });
+            }
+        }
+    }
+
+    // Process collisions and candidates (F01)
+    for profile in candidates {
+        let owners = name_owners.get(&profile.name).cloned().unwrap_or_default();
+        if owners.len() > 1 {
+            let other = owners.iter().find(|p| **p != profile.source_path).unwrap();
+            let rejection = ProfileRejection::new(
+                Some(profile.source_path.clone()),
+                Some("name".to_string()),
+                format!(
+                    "profile file '{}' is invalid: duplicate profile name '{}' already defined in '{}'",
+                    profile.source_path.display(),
+                    profile.name,
+                    other.display()
+                ),
+            );
+            let diagnostic = compose_diagnostic_text(&rejection);
+            file_errors.push(ProfileFileDiagnostic {
+                file_path: profile.source_path.clone(),
+                profile_name: Some(profile.name.clone()),
+                diagnostic,
+                rejection,
+            });
+            // Candidate evicted from available profiles map
+        } else {
+            profiles.insert(profile.name.clone(), profile);
+        }
+    }
+
+    // Ensure all conflicting files (even those with field errors) have duplicate diagnostics reported (F01)
+    for (name, owners) in &name_owners {
+        if owners.len() > 1 {
+            for owner in owners {
+                let has_dup_diag = file_errors.iter().any(|d| {
+                    d.file_path == *owner
+                        && d.profile_name.as_deref() == Some(name)
+                        && d.diagnostic.contains("duplicate profile name")
+                });
+                if !has_dup_diag {
+                    let other = owners.iter().find(|p| *p != owner).unwrap();
+                    let rejection = ProfileRejection::new(
+                        Some(owner.clone()),
+                        Some("name".to_string()),
+                        format!(
+                            "profile file '{}' is invalid: duplicate profile name '{}' already defined in '{}'",
+                            owner.display(),
+                            name,
+                            other.display()
+                        ),
+                    );
+                    let diagnostic = compose_diagnostic_text(&rejection);
+                    file_errors.push(ProfileFileDiagnostic {
+                        file_path: owner.clone(),
+                        profile_name: Some(name.clone()),
+                        diagnostic,
+                        rejection,
+                    });
+                }
             }
         }
     }
@@ -346,14 +537,17 @@ pub fn scan_profiles_dir(dir: &Path) -> LoadedProfiles {
 
 /// Load all profiles from a specified directory. If any file failed or conflicted,
 /// returns a validation error containing the first diagnostic and the available profile list.
+#[allow(dead_code)]
 pub fn load_profiles_from_dir(dir: &Path) -> Result<HashMap<String, Profile>, RpcError> {
     let loaded = scan_profiles_dir(dir);
     let mut available_names: Vec<String> = loaded.profiles.keys().cloned().collect();
     available_names.sort();
 
     if let Some(first_err) = loaded.file_errors.first() {
-        let message = format_profile_error_with_names(&first_err.diagnostic, &available_names);
-        return Err(RpcError::new_profile_error(RpcErrorCode::Validation, message));
+        return Err(make_profile_rejection_error(
+            &first_err.rejection,
+            &available_names,
+        ));
     }
 
     Ok(loaded.profiles)
@@ -393,22 +587,43 @@ pub fn load_profile(name: &str) -> Result<Profile, RpcError> {
     let mut available: Vec<String> = loaded.profiles.into_keys().collect();
     available.sort();
 
-    // Check if the requested name matches any failed file's profile_name or file_stem
+    // 1. Check if the requested name matches any failed file's profile_name or file_stem
     let matched_diag = loaded.file_errors.iter().find(|diag| {
         diag.profile_name.as_deref() == Some(name)
             || diag.file_path.file_stem().and_then(|s| s.to_str()) == Some(name)
     });
 
-    let diagnostic = match matched_diag {
-        Some(d) => d.diagnostic.clone(),
-        None => format!("profile '{name}' not found"),
+    let rejection = if let Some(d) = matched_diag {
+        d.rejection.clone()
+    } else {
+        // F02: Check if there are unattributed diagnostics (syntax error / I/O error)
+        let unattributed: Vec<&ProfileFileDiagnostic> = loaded
+            .file_errors
+            .iter()
+            .filter(|diag| diag.profile_name.is_none())
+            .collect();
+
+        if !unattributed.is_empty() {
+            let details = unattributed
+                .iter()
+                .map(|d| d.diagnostic.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            ProfileRejection::new(
+                None,
+                None,
+                format!("profile '{name}' not found ({details})"),
+            )
+        } else {
+            ProfileRejection::new(
+                None,
+                None,
+                format!("profile '{name}' not found"),
+            )
+        }
     };
 
-    let message = format_profile_error_with_names(&diagnostic, &available);
-    Err(RpcError::new_profile_error(
-        RpcErrorCode::Validation,
-        message,
-    ))
+    Err(make_profile_rejection_error(&rejection, &available))
 }
 
 #[cfg(test)]
@@ -666,5 +881,179 @@ permission_mode = "superuser"
         assert_eq!(err.code, RpcErrorCode::Validation);
         assert!(err.message.contains("duplicate profile name 'dup'"));
         assert!(err.message.contains("available profiles: [good]"));
+    }
+
+    #[test]
+    fn duplicate_profiles_with_invalid_fields_evicted_both_orders_and_three_files() {
+        // F01: Test Order 1: a.toml (valid "dup"), b.toml (invalid "dup" with superuser), good.toml (valid "good")
+        let dir1 = tempfile::tempdir().unwrap();
+        fs::write(dir1.path().join("a.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(
+            dir1.path().join("b.toml"),
+            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+        )
+        .unwrap();
+        fs::write(dir1.path().join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+
+        let loaded1 = scan_profiles_dir(dir1.path());
+        assert_eq!(loaded1.profiles.len(), 1);
+        assert!(loaded1.profiles.contains_key("good"));
+        assert!(!loaded1.profiles.contains_key("dup"), "dup must be evicted from available profiles");
+
+        // F01: Test Order 2: a.toml (invalid "dup" with superuser), b.toml (valid "dup"), good.toml (valid "good")
+        let dir2 = tempfile::tempdir().unwrap();
+        fs::write(
+            dir2.path().join("a.toml"),
+            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+        )
+        .unwrap();
+        fs::write(dir2.path().join("b.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(dir2.path().join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+
+        let loaded2 = scan_profiles_dir(dir2.path());
+        assert_eq!(loaded2.profiles.len(), 1);
+        assert!(loaded2.profiles.contains_key("good"));
+        assert!(!loaded2.profiles.contains_key("dup"), "dup must be evicted from available profiles in reverse order");
+
+        // F01: Test 3 files: a.toml (valid "dup"), b.toml (invalid "dup"), c.toml (valid "dup"), good.toml (valid "good")
+        let dir3 = tempfile::tempdir().unwrap();
+        fs::write(dir3.path().join("a.toml"), "name = \"dup\"\n").unwrap();
+        fs::write(
+            dir3.path().join("b.toml"),
+            "name = \"dup\"\npermission_mode = \"superuser\"\n",
+        )
+        .unwrap();
+        fs::write(dir3.path().join("c.toml"), "name = \"dup\"\n").unwrap();
+        fs::write(dir3.path().join("good.toml"), "name = \"good\"\n").unwrap();
+
+        let loaded3 = scan_profiles_dir(dir3.path());
+        assert_eq!(loaded3.profiles.len(), 1);
+        assert!(loaded3.profiles.contains_key("good"));
+        assert!(!loaded3.profiles.contains_key("dup"), "dup must be evicted when three files conflict");
+
+        // Reference evicted name:
+        let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
+        let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-dup-");
+        let profiles_dir = config_dir.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(profiles_dir.join("a.toml"), "name = \"dup\"\nsubagent = \"zcode\"\n").unwrap();
+        fs::write(profiles_dir.join("b.toml"), "name = \"dup\"\npermission_mode = \"superuser\"\n").unwrap();
+        fs::write(profiles_dir.join("good.toml"), "name = \"good\"\nsubagent = \"zcode\"\n").unwrap();
+        let config_path = config_dir.path().join("agents.json");
+        let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
+        let err_load = load_profile("dup").unwrap_err();
+        assert_eq!(err_load.code, RpcErrorCode::Validation);
+        assert!(err_load.message.contains("dup"));
+        assert!(err_load.message.contains("available profiles: [good]"));
+        drop(_scope);
+        drop(guard);
+    }
+
+    #[test]
+    fn broken_toml_syntax_diagnostic_preserved_in_not_found_with_available_profiles() {
+        // F02: worker.toml has name="broken" but syntax is broken (unclosed quote on model)
+        // referencing broken -> returns "profile 'broken' not found", preserves worker.toml parse diagnostic, and available profiles: [good]
+        let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
+        let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-broken-");
+        let profiles_dir = config_dir.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        fs::write(
+            profiles_dir.join("worker.toml"),
+            "name = \"broken\"\nmodel = \"unclosed string\n",
+        )
+        .unwrap();
+        fs::write(
+            profiles_dir.join("good.toml"),
+            "name = \"good\"\nsubagent = \"zcode\"\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.path().join("agents.json");
+        let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
+
+        let err = load_profile("broken").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Validation);
+        assert!(
+            err.message.contains("profile 'broken' not found"),
+            "Must preserve unknown profile explanation"
+        );
+        assert!(
+            err.message.contains("worker.toml"),
+            "Must preserve broken file diagnostic"
+        );
+        assert!(
+            err.message.contains("available profiles: [good]"),
+            "Must preserve available profiles list"
+        );
+        drop(_scope);
+        drop(guard);
+    }
+
+    #[test]
+    fn oversized_invalid_permission_mode_preserves_none_suffix_and_bounds_frame() {
+        // F04: Single file whose permission_mode is an ultra-long invalid string (>2MiB).
+        // Message must still contain "; available profiles: none" and frame <= MAX_RESPONSE_FRAME_BYTES.
+        let guard = crate::rpc::agents::admission_fixtures::config_env_guard();
+        let config_dir = crate::rpc::agents::admission_fixtures::admission_root("test-oversized-");
+        let profiles_dir = config_dir.path().join("profiles");
+        fs::create_dir_all(&profiles_dir).unwrap();
+        let long_val = "x".repeat(2 * 1024 * 1024 + 100);
+        let toml_content = format!("name = \"long_bad\"\npermission_mode = \"{long_val}\"\n");
+        fs::write(profiles_dir.join("long_bad.toml"), toml_content).unwrap();
+
+        let config_path = config_dir.path().join("agents.json");
+        let _scope = crate::rpc::agents::admission_fixtures::ConfigEnvScope::install(&config_path);
+
+        let err = load_profile("long_bad").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Validation);
+        assert!(
+            err.message.ends_with("; available profiles: none"),
+            "Oversized diagnostic must preserve '; available profiles: none'"
+        );
+        let escaped_len = json_escaped_byte_len(&err.message);
+        assert!(
+            escaped_len <= MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES,
+            "JSON escaped length {escaped_len} must be <= {MAX_ALLOWED_PROFILE_ERROR_JSON_BYTES}"
+        );
+        let frame_len = escaped_len + PROFILE_ERROR_ENVELOPE_OVERHEAD;
+        assert!(
+            frame_len <= MAX_RESPONSE_FRAME_BYTES,
+            "Total frame length {frame_len} must be <= {MAX_RESPONSE_FRAME_BYTES}"
+        );
+        drop(_scope);
+        drop(guard);
+    }
+
+    #[test]
+    fn parse_rejects_name_with_nul_byte() {
+        // F05: name contains \0 (TOML \u0000) -> rejected and reports name field problem
+        let toml = "name = \"call\\u0000name\"\n";
+        let err = parse_profile_toml(toml, Path::new("nul.toml")).unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Validation);
+        assert!(err.message.contains("nul.toml"));
+        assert!(err.message.contains("name"));
+        assert!(err.message.contains("NUL"));
+    }
+
+    #[test]
+    fn scan_excludes_file_with_nul_name_from_available_profiles() {
+        // F05: File with NUL in name does not enter available profiles
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("nul_file.toml"),
+            "name = \"call\\u0000name\"\nsubagent = \"zcode\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("good.toml"),
+            "name = \"good\"\nsubagent = \"zcode\"\n",
+        )
+        .unwrap();
+
+        let loaded = scan_profiles_dir(dir.path());
+        assert_eq!(loaded.profiles.len(), 1);
+        assert!(loaded.profiles.contains_key("good"));
+        assert_eq!(loaded.file_errors.len(), 1);
+        assert!(loaded.file_errors[0].diagnostic.contains("NUL"));
     }
 }

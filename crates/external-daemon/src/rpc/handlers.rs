@@ -305,31 +305,32 @@ impl RpcService {
                     ));
                 }
 
-                let developer_instructions = if let Some(profile_name) = input.profile.as_deref() {
+                let (developer_instructions, profile_context) = if let Some(profile_name) = input.profile.as_deref() {
                     let trimmed = profile_name.trim();
                     if trimmed.is_empty() || profile_name.len() > 128 || profile_name.contains('\0') {
                         let available = super::profiles::available_profile_names();
-                        let message = super::profiles::format_profile_error_with_names(
+                        let rejection = super::profiles::ProfileRejection::new(
+                            None,
+                            Some("profile".to_string()),
                             "profile is invalid",
-                            &available,
                         );
-                        return Err(RpcError::new_profile_error(
-                            RpcErrorCode::Validation,
-                            message,
+                        return Err(super::profiles::make_profile_rejection_error(
+                            &rejection,
+                            &available,
                         ));
                     }
                     let profile = super::profiles::load_profile(trimmed)?;
-                    input.agent = profile.subagent;
-                    input.model = profile.model;
-                    input.effort = profile.effort;
+                    input.agent = profile.subagent.clone();
+                    input.model = profile.model.clone();
+                    input.effort = profile.effort.clone();
                     input.manifest.permission_mode = Some(
                         profile
                             .permission_mode
                             .unwrap_or(external_core::PermissionMode::Build),
                     );
-                    profile.developer_instructions
+                    (profile.developer_instructions.clone(), Some(profile))
                 } else {
-                    None
+                    (None, None)
                 };
 
                 let config = read_agent_config_snapshot()?;
@@ -338,13 +339,13 @@ impl RpcService {
                     .as_deref()
                     .or(config.default_subagent.as_deref());
 
-                let admission = if effective_agent == Some("codex") {
+                let admission_res = if effective_agent == Some("codex") {
                     // codex uses native developerInstructions on thread/start; prompt remains verbatim
                     resolve_admission_with_instructions(
                         &input,
                         &config,
                         developer_instructions.as_deref(),
-                    )?
+                    )
                 } else {
                     // other subagents fallback to prompt splicing when developer_instructions is non-empty
                     if let Some(di) = developer_instructions.as_deref() {
@@ -355,7 +356,46 @@ impl RpcService {
                             );
                         }
                     }
-                    resolve_admission_with_instructions(&input, &config, None)?
+                    resolve_admission_with_instructions(&input, &config, None)
+                };
+
+                let admission = match admission_res {
+                    Ok(adm) => adm,
+                    Err(err) => {
+                        if let Some(profile) = profile_context.as_ref() {
+                            let failing_field = if profile.model.is_some()
+                                && (err.message.contains("model") || err.message.contains("colon"))
+                            {
+                                Some("model")
+                            } else if profile.effort.is_some() && err.message.contains("effort") {
+                                Some("effort")
+                            } else if profile.subagent.is_some()
+                                && (err.message.contains("subagent") || err.message.contains("agent"))
+                            {
+                                Some("subagent")
+                            } else if profile.permission_mode.is_some()
+                                && err.message.contains("permission mode")
+                            {
+                                Some("permission_mode")
+                            } else {
+                                None
+                            };
+
+                            if let Some(field) = failing_field {
+                                let rejection = super::profiles::ProfileRejection::new(
+                                    Some(profile.source_path.clone()),
+                                    Some(field.to_string()),
+                                    err.message,
+                                );
+                                let available = super::profiles::available_profile_names();
+                                return Err(super::profiles::make_profile_rejection_error(
+                                    &rejection,
+                                    &available,
+                                ));
+                            }
+                        }
+                        return Err(err);
+                    }
                 };
 
                 let manifest = input.manifest;
@@ -2129,6 +2169,78 @@ permission_mode = "superuser"
             let record_def = env.store.get_task(&task_def.agent_id).unwrap().unwrap();
             let prepared_def: PreparedGeneralTask = serde_json::from_str(&record_def.prepared_launch_json).unwrap();
             assert_eq!(prepared_def.permission_mode, PermissionMode::Build);
+        }
+
+        #[test]
+        fn f03_profile_derived_admission_error_and_non_profile_regression() {
+            let env = setup_environment();
+
+            let dsh_bad_toml = r#"
+name = "dsh_bad"
+subagent = "dsh"
+model = "bare_model_without_colon"
+"#;
+            let good_toml = r#"
+name = "good"
+subagent = "zcode"
+"#;
+            fs::write(env.profiles_dir.join("dsh_bad.toml"), dsh_bad_toml).unwrap();
+            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
+
+            // 1. Profile-derived admission failure returns file/field diagnostic + available profiles
+            let input_profile_bad = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("dsh_bad".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_prof = env.service.dispatch(RpcMethod::SubmitGeneral(input_profile_bad)).unwrap_err();
+            assert_eq!(err_prof.code, RpcErrorCode::Validation);
+            assert!(err_prof.message.starts_with("profile file '"));
+            assert!(err_prof.message.contains("dsh_bad.toml"));
+            assert!(err_prof.message.contains("field 'model'"));
+            assert!(err_prof.message.contains("dsh model must be {provider}:{model}"));
+            assert!(err_prof.message.contains("available profiles: [dsh_bad, good]"));
+
+            // Verify MCP projection preserves the full profile error without truncation
+            let tool_err = crate::mcp::errors::public_error_for_op(err_prof.clone(), "spawn");
+            assert_eq!(tool_err.body.code, "validation");
+            assert_eq!(tool_err.body.message, err_prof.message);
+            assert_eq!(tool_err.legacy_text, format!("validation: {}", err_prof.message));
+
+            // 2. Invariant regression: Non-profile request failing admission returns unchanged byte-for-byte error
+            let input_plain_bad = GeneralSubmitInput {
+                agent: Some("dsh".into()),
+                model: Some("bare_model_without_colon".into()),
+                effort: None,
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_plain = env.service.dispatch(RpcMethod::SubmitGeneral(input_plain_bad)).unwrap_err();
+            assert_eq!(err_plain.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_plain.message,
+                "dsh model must be {provider}:{model}; the ':' separator is missing"
+            );
+            assert!(!err_plain.message.contains("profile"));
+            assert!(!err_plain.message.contains("available profiles"));
+
+            // 3. Invariant regression: Mutex precedence path remains unchanged
+            let input_mutex = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: None,
+                effort: None,
+                profile: Some("good".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_mutex = env.service.dispatch(RpcMethod::SubmitGeneral(input_mutex)).unwrap_err();
+            assert_eq!(err_mutex.code, RpcErrorCode::Validation);
+            assert_eq!(
+                err_mutex.message,
+                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile TOML or omit profile"
+            );
+            assert!(!err_mutex.message.contains("available profiles"));
         }
     }
 }

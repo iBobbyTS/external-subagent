@@ -6,7 +6,7 @@
 //! in `mcp::types`. This facade re-exports every historical path so
 //! existing `use crate::mcp::X` consumers keep resolving unchanged.
 
-mod errors;
+pub(crate) mod errors;
 mod schemas;
 mod tools;
 mod types;

@@ -112,14 +112,7 @@ pub(crate) fn validation_error(detail: impl Into<String>) -> ToolError {
 }
 
 pub(crate) fn is_profile_error(detail: &str) -> bool {
-    const PROFILE_ERROR_PREFIXES: [&str; 5] = [
-        "profile cannot be combined with",
-        "profile is invalid",
-        "profile file '",
-        "profile directory '",
-        "profile '",
-    ];
-    PROFILE_ERROR_PREFIXES
+    crate::rpc::profiles::PROFILE_ERROR_PREFIXES
         .iter()
         .any(|prefix| detail.starts_with(prefix))
 }
@@ -608,5 +601,15 @@ mod tests {
             "request validation failed",
             "Non-profile request containing 'profile file \'' must NOT project detail into body.message"
         );
+    }
+
+    #[test]
+    fn profile_derived_field_admission_error_is_preserved_through_mcp_projection() {
+        let msg = "profile file '/path/to/dsh_bad.toml' is invalid: field 'model': dsh model must be '{provider}:{model}'; the ':' separator is missing; available profiles: [good]";
+        let rpc_err = RpcError::new_profile_error(RpcErrorCode::Validation, msg);
+        let tool_err = public_error_for_op(rpc_err, "spawn");
+        assert_eq!(tool_err.body.code, "validation");
+        assert_eq!(tool_err.body.message, msg);
+        assert_eq!(tool_err.legacy_text, format!("validation: {msg}"));
     }
 }
