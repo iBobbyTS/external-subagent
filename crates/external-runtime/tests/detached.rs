@@ -464,9 +464,11 @@ fn terminal_frame_before_exit_under_reader_and_monitor_interleavings() {
         for reader_first in [false, true] {
             let reader = Arc::new(TestGate::default());
             let monitor = Arc::new(TestGate::default());
+            let (done_tx, done_rx) = mpsc::channel();
             let mut hooks = options();
             hooks.reader_start_gate = Some(reader.clone());
             hooks.monitor_gate = Some(monitor.clone());
+            hooks.reader_done = Some(done_tx);
             let mut cmd = fixture("__terminal");
             cmd.arg("7");
             let d = spawn(cmd, model, hooks).unwrap();
@@ -476,6 +478,7 @@ fn terminal_frame_before_exit_under_reader_and_monitor_interleavings() {
             if reader_first {
                 reader.release();
                 assert!(matches!(event(&d), Inbound::Message(_)));
+                done_rx.recv_timeout(BOUND).unwrap();
                 monitor.release();
             } else {
                 monitor.release();
@@ -580,8 +583,14 @@ fn natural_exit_concurrent_stop_and_drop_stop_keep_one_terminal_publication() {
             tx.send(waiter.wait()).unwrap();
         });
         let stop = d.clone();
-        let worker = thread::spawn(move || stop.stop_and_reap(Duration::from_millis(80)).unwrap());
-        thread::sleep(Duration::from_millis(30));
+        let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            // Rendezvous at the stop call while the monitor is still gated.
+            stop_tx.send(()).unwrap();
+            stop.stop_and_reap(Duration::from_millis(80)).unwrap()
+        });
+        stop_rx.recv_timeout(BOUND).unwrap();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         monitor.release();
         assert_eq!(rx.recv_timeout(BOUND).unwrap().unwrap(), Some(7));
         assert_eq!(
