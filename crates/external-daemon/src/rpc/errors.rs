@@ -60,7 +60,10 @@ impl RpcError {
 
     pub fn new_profile_error(code: RpcErrorCode, message: impl Into<String>) -> Self {
         let mut message = message.into();
-        truncate_utf8(&mut message, crate::rpc::types::MAX_RESPONSE_FRAME_BYTES - 8192);
+        crate::rpc::profiles::truncate_json_escaped(
+            &mut message,
+            crate::rpc::types::MAX_RESPONSE_FRAME_BYTES - 8192,
+        );
         Self {
             code,
             message,
@@ -288,5 +291,11 @@ mod error_classification_tests {
         let big_msg = "profile_name_".repeat(50); // 650 bytes
         let err_profile = RpcError::new_profile_error(RpcErrorCode::Validation, &big_msg);
         assert_eq!(err_profile.message, big_msg);
+
+        // new_profile_error truncates when JSON-escaped length exceeds MAX_RESPONSE_FRAME_BYTES - 8192
+        let huge_backslashes = "\\".repeat(crate::rpc::types::MAX_RESPONSE_FRAME_BYTES);
+        let err_huge = RpcError::new_profile_error(RpcErrorCode::Validation, &huge_backslashes);
+        let escaped_len = crate::rpc::profiles::json_escaped_byte_len(&err_huge.message);
+        assert!(escaped_len <= crate::rpc::types::MAX_RESPONSE_FRAME_BYTES - 8192);
     }
 }

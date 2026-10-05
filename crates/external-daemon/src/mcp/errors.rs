@@ -112,12 +112,16 @@ pub(crate) fn validation_error(detail: impl Into<String>) -> ToolError {
 }
 
 pub(crate) fn is_profile_error(detail: &str) -> bool {
-    detail.starts_with("profile ")
-        || detail.starts_with("profile:")
-        || detail.starts_with("profile '")
-        || detail.starts_with("unknown profile ")
-        || detail.contains("profile file '")
-        || detail.contains("available profiles:")
+    const PROFILE_ERROR_PREFIXES: [&str; 5] = [
+        "profile cannot be combined with",
+        "profile is invalid",
+        "profile file '",
+        "profile directory '",
+        "profile '",
+    ];
+    PROFILE_ERROR_PREFIXES
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
 }
 
 #[allow(dead_code)]
@@ -576,6 +580,33 @@ mod tests {
         assert_eq!(
             projected_unicode.legacy_text,
             format!("validation: {unicode_msg}")
+        );
+    }
+
+    #[test]
+    fn non_profile_validation_error_with_profile_substrings_does_not_project_detail() {
+        // write_manifest counterexample:
+        // scheduler rejects with "scheduler rejected the operation: invalid path ../available profiles:: path must be repository-relative"
+        let rpc_err = RpcError::new(
+            RpcErrorCode::Validation,
+            "scheduler rejected the operation: invalid path ../available profiles:: path must be repository-relative",
+        );
+        let tool_err = public_error_for_op(rpc_err, "spawn");
+        assert_eq!(
+            tool_err.body.message,
+            "request validation failed",
+            "Non-profile request containing 'available profiles:' must NOT project detail into body.message"
+        );
+
+        let rpc_err2 = RpcError::new(
+            RpcErrorCode::Validation,
+            "scheduler rejected the operation: invalid path ../profile file 'test': path must be repository-relative",
+        );
+        let tool_err2 = public_error_for_op(rpc_err2, "spawn");
+        assert_eq!(
+            tool_err2.body.message,
+            "request validation failed",
+            "Non-profile request containing 'profile file \'' must NOT project detail into body.message"
         );
     }
 }

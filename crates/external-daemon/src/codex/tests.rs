@@ -272,6 +272,98 @@ fn public_submit_reaches_persistent_thread_and_persists_the_id() {
 }
 
 #[test]
+fn codex_owner_bootstrap_sends_developer_instructions_and_verbatim_turn_prompt() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
+    );
+    let prompt_text = "Verbatim codex prompt for turn/start";
+    let mut admission = codex_admission(Some(MODEL));
+    admission.developer_instructions = Some("Custom instructions for codex bootstrap".into());
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), prompt_text),
+            Some(admission),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "CODEX_OK");
+
+    let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+    let mut requests = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap());
+    let thread_start = requests
+        .find(|frame| frame["method"] == "thread/start")
+        .expect("thread/start frame");
+    assert_eq!(
+        thread_start["params"]["developerInstructions"],
+        "Custom instructions for codex bootstrap"
+    );
+
+    let turn_start = requests
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("turn/start frame");
+    assert_eq!(
+        turn_start["params"]["input"][0]["text"],
+        prompt_text,
+        "Codex turn/start input must be verbatim prompt without developer_instructions splicing"
+    );
+}
+
+#[test]
+fn codex_owner_bootstrap_omits_developer_instructions_when_empty_or_none() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
+    );
+    let prompt_text = "Verbatim prompt without instructions";
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), prompt_text),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+
+    let deliveries = std::fs::read_to_string(workspace.path().join("deliveries.jsonl")).unwrap();
+    let mut requests = deliveries
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap());
+    let thread_start = requests
+        .find(|frame| frame["method"] == "thread/start")
+        .expect("thread/start frame");
+    assert!(
+        thread_start["params"].get("developerInstructions").is_none(),
+        "developerInstructions must be omitted when None"
+    );
+
+    let turn_start = requests
+        .find(|frame| frame["method"] == "turn/start")
+        .expect("turn/start frame");
+    assert_eq!(
+        turn_start["params"]["input"][0]["text"],
+        prompt_text
+    );
+}
+
+#[test]
 fn whitelisted_tool_items_feed_wait_count_without_touching_observe() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();

@@ -308,9 +308,14 @@ impl RpcService {
                 let developer_instructions = if let Some(profile_name) = input.profile.as_deref() {
                     let trimmed = profile_name.trim();
                     if trimmed.is_empty() || profile_name.len() > 128 || profile_name.contains('\0') {
+                        let available = super::profiles::available_profile_names();
+                        let message = super::profiles::format_profile_error_with_names(
+                            "profile is invalid",
+                            &available,
+                        );
                         return Err(RpcError::new_profile_error(
                             RpcErrorCode::Validation,
-                            "profile is invalid",
+                            message,
                         ));
                     }
                     let profile = super::profiles::load_profile(trimmed)?;
@@ -1851,7 +1856,58 @@ developer_instructions = "Custom instructions for zcode"
                 None
             );
 
-            // 3. Empty developer_instructions: prompt unchanged on both
+            // 2b. Non-codex (dsh): prompt is spliced with Developer Instructions prefix
+            let dsh_toml = r#"
+name = "dsh_worker"
+subagent = "dsh"
+model = "anthropic:claude-3-7-sonnet"
+developer_instructions = "Custom instructions for dsh"
+"#;
+            fs::write(env.profiles_dir.join("dsh.toml"), dsh_toml).unwrap();
+            let input_dsh = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("dsh_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Original dsh prompt"),
+            };
+            let response_dsh = env.service.dispatch(RpcMethod::SubmitGeneral(input_dsh)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_dsh } = response_dsh else { panic!() };
+            let record_dsh = env.store.get_task(&task_dsh.agent_id).unwrap().unwrap();
+            assert_eq!(
+                record_dsh.initial_prompt,
+                "Developer Instructions: Custom instructions for dsh\n----------\nOriginal dsh prompt"
+            );
+            let prepared_dsh: PreparedGeneralTask = serde_json::from_str(&record_dsh.prepared_launch_json).unwrap();
+            assert_eq!(prepared_dsh.admission.unwrap().developer_instructions, None);
+
+            // 2c. Non-codex (agy): prompt is spliced with Developer Instructions prefix
+            let agy_toml = r#"
+name = "agy_worker"
+subagent = "agy"
+model = "gemini-2.5-flash"
+effort = "high"
+developer_instructions = "Custom instructions for agy"
+"#;
+            fs::write(env.profiles_dir.join("agy.toml"), agy_toml).unwrap();
+            let input_agy = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("agy_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Original agy prompt"),
+            };
+            let response_agy = env.service.dispatch(RpcMethod::SubmitGeneral(input_agy)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_agy } = response_agy else { panic!() };
+            let record_agy = env.store.get_task(&task_agy.agent_id).unwrap().unwrap();
+            assert_eq!(
+                record_agy.initial_prompt,
+                "Developer Instructions: Custom instructions for agy\n----------\nOriginal agy prompt"
+            );
+            let prepared_agy: PreparedGeneralTask = serde_json::from_str(&record_agy.prepared_launch_json).unwrap();
+            assert_eq!(prepared_agy.admission.unwrap().developer_instructions, None);
+
+            // 3. Empty developer_instructions: prompt unchanged on codex and zcode
             let empty_toml = r#"
 name = "empty_di_worker"
 subagent = "zcode"
@@ -1870,6 +1926,26 @@ developer_instructions = ""
             let record_empty = env.store.get_task(&task_empty.agent_id).unwrap().unwrap();
             assert_eq!(record_empty.initial_prompt, "Unchanged prompt");
 
+            let codex_empty_toml = r#"
+name = "codex_empty_worker"
+subagent = "codex"
+developer_instructions = ""
+"#;
+            fs::write(env.profiles_dir.join("codex_empty.toml"), codex_empty_toml).unwrap();
+            let input_codex_empty = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("codex_empty_worker".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "Unchanged codex prompt"),
+            };
+            let response_codex_empty = env.service.dispatch(RpcMethod::SubmitGeneral(input_codex_empty)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_codex_empty } = response_codex_empty else { panic!() };
+            let record_codex_empty = env.store.get_task(&task_codex_empty.agent_id).unwrap().unwrap();
+            assert_eq!(record_codex_empty.initial_prompt, "Unchanged codex prompt");
+            let prepared_codex_empty: PreparedGeneralTask = serde_json::from_str(&record_codex_empty.prepared_launch_json).unwrap();
+            assert_eq!(prepared_codex_empty.admission.unwrap().developer_instructions, None);
+
             // 4. Spliced prompt exceeding MAX_PROMPT_BYTES (256 KiB) is rejected
             let di_text = "Instructions: ".repeat(20); // ~280 bytes
             let big_di_toml = format!(
@@ -1887,6 +1963,75 @@ developer_instructions = ""
             };
             let err_oversized = env.service.dispatch(RpcMethod::SubmitGeneral(input_oversized)).unwrap_err();
             assert_eq!(err_oversized.code, RpcErrorCode::Validation);
+        }
+
+        #[test]
+        fn b02_invalid_profile_reference_outputs_diagnostic_and_available_list() {
+            let env = setup_environment();
+
+            // Create good.toml and bad.toml
+            let good_toml = r#"
+name = "good"
+subagent = "zcode"
+permission_mode = "edit"
+"#;
+            let bad_toml = r#"
+name = "bad"
+permission_mode = "superuser"
+"#;
+            fs::write(env.profiles_dir.join("good.toml"), good_toml).unwrap();
+            fs::write(env.profiles_dir.join("bad.toml"), bad_toml).unwrap();
+
+            // 1. Reference bad profile -> returns error containing bad diagnostic AND available profiles: [good]
+            let input_bad = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("bad".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_bad = env.service.dispatch(RpcMethod::SubmitGeneral(input_bad)).unwrap_err();
+            assert_eq!(err_bad.code, RpcErrorCode::Validation);
+            assert!(err_bad.message.contains("bad.toml"));
+            assert!(err_bad.message.contains("superuser"));
+            assert!(err_bad.message.contains("available profiles: [good]"));
+
+            // 2. Reference good profile -> succeeds
+            let input_good = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("good".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let res_good = env.service.dispatch(RpcMethod::SubmitGeneral(input_good));
+            assert!(res_good.is_ok());
+
+            // 3. Reference invalid profile parameter (e.g. empty) -> returns error containing available profiles: [good]
+            let input_invalid_param = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_inv = env.service.dispatch(RpcMethod::SubmitGeneral(input_invalid_param)).unwrap_err();
+            assert_eq!(err_inv.code, RpcErrorCode::Validation);
+            assert!(err_inv.message.contains("profile is invalid"));
+            assert!(err_inv.message.contains("available profiles: [good]"));
+
+            // 4. Reference unknown profile -> returns error containing available profiles: [good]
+            let input_missing = GeneralSubmitInput {
+                agent: None,
+                model: None,
+                effort: None,
+                profile: Some("missing_profile".into()),
+                manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
+            };
+            let err_missing = env.service.dispatch(RpcMethod::SubmitGeneral(input_missing)).unwrap_err();
+            assert_eq!(err_missing.code, RpcErrorCode::Validation);
+            assert!(err_missing.message.contains("profile 'missing_profile' not found"));
+            assert!(err_missing.message.contains("available profiles: [good]"));
         }
 
         #[test]

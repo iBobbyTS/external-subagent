@@ -580,4 +580,73 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(250));
         peer.join().unwrap();
     }
+
+    #[test]
+    fn profile_error_escape_expansion_socket_boundary_preserves_names_and_more_count() {
+        use crate::rpc::profiles::format_unknown_profile_error;
+
+        // Construct 9,000 valid profile names, each 128 bytes containing 122 backslashes,
+        // quotes, and control characters (which expand heavily in JSON).
+        let mut names = Vec::with_capacity(9000);
+        for i in 0..9000 {
+            let mut name = format!("p_{:04}\\", i);
+            while name.len() < 127 {
+                name.push('\\');
+            }
+            name.push('"');
+            assert_eq!(name.len(), 128);
+            names.push(name);
+        }
+
+        let formatted = format_unknown_profile_error("missing", &names);
+        assert!(
+            formatted.contains("+"),
+            "Formatted message must contain truncation indicator"
+        );
+        assert!(
+            formatted.contains(" more]"),
+            "Formatted message must contain +N more]"
+        );
+
+        let rpc_error = RpcError::new_profile_error(RpcErrorCode::Validation, formatted);
+        let request_id = "req_".to_string() + &"x".repeat(120); // 124 byte request ID
+        let response = RpcResponse::error(Some(request_id), rpc_error);
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let reader_thread = thread::spawn(move || {
+            let mut reader = BufReader::new(&mut client);
+            read_limited_frame(&mut reader, MAX_RESPONSE_FRAME_BYTES).unwrap()
+        });
+
+        write_response(&mut server, response).unwrap();
+        drop(server);
+
+        let frame = reader_thread.join().unwrap();
+        assert!(
+            frame.len() <= MAX_RESPONSE_FRAME_BYTES,
+            "Frame length {} must be <= MAX_RESPONSE_FRAME_BYTES {}",
+            frame.len(),
+            MAX_RESPONSE_FRAME_BYTES
+        );
+
+        let decoded: RpcResponse = serde_json::from_slice(&frame).unwrap();
+        match decoded.outcome {
+            RpcOutcome::Error { error } => {
+                assert_eq!(error.code, RpcErrorCode::Validation);
+                assert!(
+                    !error.message.contains("response frame exceeds cap"),
+                    "Response must NOT be replaced with oversized fallback"
+                );
+                assert!(
+                    error.message.contains("p_0000"),
+                    "Response must preserve initial profile names"
+                );
+                assert!(
+                    error.message.contains(" more]"),
+                    "Response must preserve +N more count"
+                );
+            }
+            _ => panic!("Expected error outcome"),
+        }
+    }
 }
