@@ -296,6 +296,10 @@ impl Driver {
 
     /// Detached supports the Command program/args/cwd/env-set/env-remove subset.
     /// env_clear, uid/gid, arg0 and caller pre_exec are outside that contract.
+    /// std hides its NUL-input flag behind getters: an argv containing NUL is
+    /// exposed as `<string-with-nul>`. Detached accepts that literal, whereas
+    /// attached rejects the original NUL input. Environment NUL values still
+    /// fail in both modes.
     pub fn spawn_with_model(command: Command, model: SpawnModel) -> io::Result<Self> {
         Self::spawn_with_codec_and_model(command, FrameCodec::ZcodeStrict, model)
     }
@@ -412,7 +416,15 @@ impl Driver {
             gate: hooks.reader_gate.clone(),
             start_gate: hooks.reader_start_gate.clone(),
         };
-        thread::spawn(move || read_loop(stdout, read_tx, read_done_tx, read_codec));
+        #[cfg(target_os = "macos")]
+        let reader_done = hooks.reader_done.clone();
+        thread::spawn(move || {
+            read_loop(stdout, read_tx, read_done_tx, read_codec);
+            #[cfg(target_os = "macos")]
+            if let Some(done) = reader_done {
+                let _ = done.send(());
+            }
+        });
         // Always drain diagnostics independently of the protocol stream. A
         // noisy runtime must not block stdout. The bounded diagnostic tail is
         // retained for the daemon's failure projection, never raw-unbounded.
@@ -637,6 +649,12 @@ impl Driver {
     #[doc(hidden)]
     pub fn replace_identity_for_test(&mut self, identity: ProcessIdentity) {
         self.identity = identity;
+    }
+
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[doc(hidden)]
+    pub fn termination_for_test(&self) -> Arc<(Mutex<Option<ChildExit>>, Condvar)> {
+        Arc::clone(&self.termination)
     }
 
     pub fn identity(&self) -> ProcessIdentity {
@@ -1730,6 +1748,9 @@ fn exit_class(status: ExitStatus) -> ChildExit {
 fn exit_class(status: ExitStatus) -> ChildExit {
     ChildExit::Exited(status.code())
 }
+
+#[cfg(test)]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {

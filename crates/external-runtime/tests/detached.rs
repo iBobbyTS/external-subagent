@@ -251,11 +251,15 @@ fn ack_deadline_after_parent_reap_epipe_never_authorizes_cleanup() {
     let trace = temp.path("trace");
     let mut hooks = options();
     hooks.trace = Some(trace.clone());
-    hooks.after_parent_reap_delay = Duration::from_millis(10_300);
+    hooks.after_first_frame_delay = Duration::from_millis(10_300);
     let diagnostic = error(fixture("__linger"), hooks);
     assert!(
         diagnostic.contains("helper lost") && diagnostic.contains("no cleanup authorization"),
         "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("os error 32"),
+        "expected EPIPE: {diagnostic}"
     );
     assert!(
         observe_process(trace_pid(&trace, "runtime:")).is_ok(),
@@ -263,6 +267,8 @@ fn ack_deadline_after_parent_reap_epipe_never_authorizes_cleanup() {
     );
     let log = fs::read_to_string(&trace).unwrap();
     assert!(log.contains("helper_timeout"));
+    assert!(log.find("parent_reaped").unwrap() < log.find("first_frame_read").unwrap());
+    assert!(log.find("first_frame_read").unwrap() < log.find("helper_timeout").unwrap());
     assert!(!log.contains("directive:"));
     kill_residual(&trace);
     assert_gate_reusable();
@@ -337,7 +343,20 @@ fn command_spec_rejects_non_utf8_oversize_nul_and_invalid_cwd() {
     assert!(error(cmd, options()).contains("helper spawn"));
     let mut cmd = fixture("__fixture");
     cmd.arg("a\0b");
-    assert!(error(cmd, options()).contains("NUL"));
+    // std getters hide saw_nul and expose this literal: accepted I6 v9.1 deviation.
+    let d = detached(cmd);
+    d.send(&serde_json::json!({})).unwrap();
+    match event(&d) {
+        Inbound::Message(WireMessage::UnknownEvent { raw, .. }) => {
+            assert_eq!(raw["args"], serde_json::json!(["<string-with-nul>"]));
+        }
+        other => panic!("{other:?}"),
+    }
+    exit_once(&d, ChildExit::Exited(Some(0)));
+    let mut cmd = fixture("__fixture");
+    cmd.arg("a\0b");
+    let failure = spawn(cmd, SpawnModel::Attached, options()).err().unwrap();
+    assert!(failure.to_string().contains("nul byte found"));
     assert_gate_reusable();
 }
 fn run_fixture(mut cmd: Command, model: SpawnModel) -> serde_json::Value {
@@ -432,11 +451,10 @@ fn path_six_cases_match_attached() {
 #[test]
 fn sigpipe_default_matches_attached() {
     for model in [SpawnModel::Attached, SpawnModel::Detached] {
-        let d = spawn(fixture("__fixture"), model, options()).unwrap();
-        assert_eq!(
-            unsafe { libc::kill(d.identity().pid as i32, libc::SIGPIPE) },
-            0
-        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "read line; kill -PIPE $$"]);
+        let d = spawn(cmd, model, options()).unwrap();
+        d.send(&serde_json::json!({})).unwrap();
         exit_once(&d, ChildExit::Signaled(13));
     }
 }
@@ -608,4 +626,272 @@ fn sixteen_parallel_detached_attached_and_gated_probes_preserve_eof() {
         worker.join().unwrap();
     }
     assert_gate_reusable();
+}
+
+#[test]
+fn invalid_observed_identity_nack_never_authorizes_cleanup() {
+    let temp = Temp::new();
+    let trace = temp.path("trace");
+    let mut hooks = options();
+    hooks.trace = Some(trace.clone());
+    hooks.observed_identity = Some(external_runtime::ProcessIdentity {
+        pid: 1,
+        pgid: 1,
+        uid: 0,
+        start_token: String::new(),
+    });
+    let diagnostic = error(fixture("__linger"), hooks);
+    assert!(
+        diagnostic.contains("no validated identity, no cleanup"),
+        "{diagnostic}"
+    );
+    assert!(fs::read_to_string(&trace)
+        .unwrap()
+        .contains("directive:NACK"));
+    assert!(observe_process(trace_pid(&trace, "runtime:")).is_ok());
+    kill_residual(&trace);
+    assert_gate_reusable();
+}
+
+#[test]
+fn non_esrch_registration_failure_nacks_and_cleans_validated_identity() {
+    let temp = Temp::new();
+    let trace = temp.path("trace");
+    let mut hooks = options();
+    hooks.trace = Some(trace.clone());
+    hooks.register_error = Some(libc::ENOMEM);
+    let diagnostic = error(fixture("__linger"), hooks);
+    assert!(diagnostic.contains("identity cleanup=Ok"), "{diagnostic}");
+    let log = fs::read_to_string(&trace).unwrap();
+    assert!(log.contains("observed") && log.contains("directive:NACK"));
+    assert!(!log.contains("directive:REAP"));
+    assert!(observe_process(trace_pid(&trace, "runtime:")).is_err());
+    assert_gate_reusable();
+}
+
+#[test]
+fn helper_command_spawn_failure_closes_all_descriptors() {
+    const CHILD: &str = "ES_TEST_FD_COUNT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // An isolated process makes fd counts independent of parallel tests.
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "helper_command_spawn_failure_closes_all_descriptors",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(CHILD, "1");
+        assert!(gated_spawn(&mut cmd).unwrap().wait().unwrap().success());
+        return;
+    }
+    let count = || {
+        (0..4096)
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } >= 0)
+            .count()
+    };
+    let before = count();
+    for _ in 0..32 {
+        let mut hooks = options();
+        hooks.helper = Some("/nonexistent/es-helper".into());
+        assert!(error(fixture("__linger"), hooks).contains("No such file"));
+        assert_eq!(count(), before, "helper spawn Err leaked descriptors");
+    }
+    assert_gate_reusable();
+}
+
+#[test]
+fn drop_stop_read_done_before_after_and_timeout_publish_once() {
+    for model in [SpawnModel::Attached, SpawnModel::Detached] {
+        for order in 0..3 {
+            let reader = Arc::new(TestGate::default());
+            let monitor = Arc::new(TestGate::default());
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut hooks = options();
+            hooks.reader_gate = Some(reader.clone());
+            hooks.monitor_gate = Some(monitor.clone());
+            hooks.reader_done = Some(done_tx);
+            let d = spawn(fixture("__term_exit"), model, hooks).unwrap();
+            assert!(matches!(event(&d), Inbound::Message(_)));
+            let events = d.subscribe();
+            let latch = d.termination_for_test();
+            let (wait_tx, wait_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let (state, ready) = &*latch;
+                let value = ready
+                    .wait_while(state.lock().unwrap(), |v| v.is_none())
+                    .unwrap();
+                wait_tx.send(value.clone().unwrap()).unwrap();
+            });
+            let dropper = thread::spawn(move || drop(d));
+            assert!(reader.wait_arrived(BOUND));
+            assert!(monitor.wait_arrived(BOUND));
+            let start = Instant::now();
+            match order {
+                0 => {
+                    // read_done precedes the monitor boundary
+                    reader.release();
+                    done_rx.recv_timeout(BOUND).unwrap();
+                    monitor.release();
+                }
+                1 => {
+                    // monitor boundary waits for late read_done
+                    monitor.release();
+                    assert!(events.recv_timeout(Duration::from_millis(60)).is_err());
+                    assert!(wait_rx.try_recv().is_err());
+                    reader.release();
+                    done_rx.recv_timeout(BOUND).unwrap();
+                }
+                _ => {
+                    // read_done stays blocked beyond the one-second boundary
+                    monitor.release();
+                }
+            }
+            assert_eq!(
+                events.recv_timeout(BOUND).unwrap(),
+                Inbound::ChildExited(ChildExit::Exited(Some(23)))
+            );
+            assert_eq!(
+                wait_rx.recv_timeout(BOUND).unwrap(),
+                ChildExit::Exited(Some(23))
+            );
+            if order == 2 {
+                assert!(start.elapsed() >= Duration::from_millis(950));
+                assert!(start.elapsed() < Duration::from_millis(1300));
+                reader.release();
+                done_rx.recv_timeout(BOUND).unwrap();
+            }
+            dropper.join().unwrap();
+            assert!(events.recv_timeout(Duration::from_millis(80)).is_err());
+        }
+    }
+}
+
+#[test]
+fn detached_terminal_exit_fails_all_pending_waiters_and_wakes_wait() {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "read first; read second; exit 7"]);
+    let d = Driver::spawn_for_test(
+        cmd,
+        FrameCodec::ZcodeStrict,
+        SpawnModel::Detached,
+        options(),
+    )
+    .unwrap();
+    let first = d.begin_request("one", serde_json::json!({})).unwrap();
+    let second = d.begin_request("two", serde_json::json!({})).unwrap();
+    for pending in [first, second] {
+        assert!(matches!(
+            pending.wait(BOUND),
+            Err(external_runtime::RequestError::ChildExited(
+                ChildExit::Exited(Some(7))
+            ))
+        ));
+    }
+    exit_once(&d, ChildExit::Exited(Some(7)));
+}
+
+#[test]
+fn malformed_pid_and_pgid_stop_refuses_signal_in_both_modes() {
+    for model in [SpawnModel::Attached, SpawnModel::Detached] {
+        let mut d = spawn(fixture("__term_exit"), model, options()).unwrap();
+        assert!(matches!(event(&d), Inbound::Message(_)));
+        let actual = d.identity();
+        for (pid, pgid) in [
+            (0, actual.pgid),
+            (1, actual.pgid),
+            (u32::MAX, actual.pgid),
+            (actual.pid, 0),
+            (actual.pid, 1),
+            (actual.pid, i32::MIN),
+            (actual.pid, actual.pgid + 1),
+        ] {
+            let mut invalid = actual.clone();
+            invalid.pid = pid;
+            invalid.pgid = pgid;
+            d.replace_identity_for_test(invalid);
+            assert!(d.stop_and_reap(Duration::from_millis(80)).is_err());
+            assert_eq!(observe_process(actual.pid).unwrap(), actual);
+        }
+        d.replace_identity_for_test(actual);
+        assert_eq!(
+            d.stop_and_reap(Duration::from_secs(1)).unwrap(),
+            StopOutcome::Terminated(ChildExit::Exited(Some(23)))
+        );
+        exit_once(&d, ChildExit::Exited(Some(23)));
+    }
+}
+
+#[test]
+fn dead_leader_with_live_descendant_refuses_cleanup_in_both_modes() {
+    for model in [SpawnModel::Attached, SpawnModel::Detached] {
+        let d = spawn(fixture("__descendant"), model, options()).unwrap();
+        let child = match event(&d) {
+            Inbound::Message(WireMessage::UnknownEvent { raw, .. }) => {
+                raw["pid"].as_u64().unwrap() as u32
+            }
+            other => panic!("{other:?}"),
+        };
+        let group = d.identity().pgid;
+        wait_until(|| observe_process(child).is_ok());
+        d.send(&serde_json::json!({})).unwrap();
+        exit_once(&d, ChildExit::Exited(Some(7)));
+        let diagnostic = d
+            .stop_and_reap(Duration::from_millis(80))
+            .unwrap_err()
+            .to_string();
+        assert!(diagnostic.contains("descendants remain"), "{diagnostic}");
+        assert_eq!(observe_process(child).unwrap().pgid, group);
+        // The test owns this verified fixture group; production stop refused it.
+        assert_eq!(unsafe { libc::killpg(group, libc::SIGKILL) }, 0);
+        wait_until(|| {
+            observe_process_group(group)
+                .map(|v| v.is_empty())
+                .unwrap_or(false)
+        });
+    }
+}
+
+#[test]
+fn term_natural_exit_returns_exact_code_without_kill_in_both_modes() {
+    for model in [SpawnModel::Attached, SpawnModel::Detached] {
+        let d = spawn(fixture("__term_exit"), model, options()).unwrap();
+        assert!(matches!(event(&d), Inbound::Message(_)));
+        assert_eq!(
+            d.stop_and_reap(Duration::from_secs(1)).unwrap(),
+            StopOutcome::Terminated(ChildExit::Exited(Some(23)))
+        );
+        exit_once(&d, ChildExit::Exited(Some(23)));
+    }
+}
+
+#[test]
+fn delayed_terminal_latch_unknown_comparison_preserves_mode_authority() {
+    for model in [SpawnModel::Attached, SpawnModel::Detached] {
+        let monitor = Arc::new(TestGate::default());
+        let mut hooks = options();
+        hooks.monitor_gate = Some(monitor.clone());
+        let d = Arc::new(spawn(fixture("__ignore_term"), model, hooks).unwrap());
+        assert!(matches!(event(&d), Inbound::Message(_)));
+        let stop = d.clone();
+        let worker = thread::spawn(move || stop.stop_and_reap(Duration::from_millis(80)).unwrap());
+        assert!(monitor.wait_arrived(BOUND));
+        let outcome = worker.join().unwrap();
+        // Attached owns waitpid status. Detached stop only reads the terminal
+        // latch; absent a monitor publication its frozen P4 result is Unknown.
+        assert_eq!(
+            outcome,
+            StopOutcome::Terminated(if model == SpawnModel::Detached {
+                ChildExit::Unknown
+            } else {
+                ChildExit::Signaled(9)
+            })
+        );
+        assert_eq!(
+            d.diagnostic_tail().contains("Unknown"),
+            model == SpawnModel::Detached
+        );
+        assert!(d.recv_timeout(Duration::from_millis(50)).is_err());
+        monitor.release();
+        exit_once(&d, ChildExit::Signaled(9));
+    }
 }

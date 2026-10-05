@@ -45,6 +45,39 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
+        Some("__term_exit") => {
+            extern "C" fn term_exit(_: libc::c_int) {
+                unsafe { libc::_exit(23) }
+            }
+            unsafe {
+                libc::signal(libc::SIGTERM, term_exit as *const () as libc::sighandler_t);
+            }
+            println!("{}", serde_json::json!({"event":"ready"}));
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        Some("__descendant") => {
+            let child = unsafe { libc::fork() };
+            assert!(child >= 0);
+            if child == 0 {
+                unsafe {
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    for fd in 0..=2 {
+                        libc::close(fd);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
+            }
+            println!("{}", serde_json::json!({"event":"descendant", "pid":child}));
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line).unwrap();
+            std::process::exit(7);
+        }
         Some("__linger") => {
             // Deliberately retain the runtime across daemon failure/EOF to make
             // unauthorized cleanup observable. Integration tests reap it.

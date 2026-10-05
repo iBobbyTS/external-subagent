@@ -100,7 +100,10 @@ pub struct DetachedTestOptions {
     pub helper: Option<PathBuf>,
     pub helper_env: BTreeMap<String, String>,
     pub trace: Option<PathBuf>,
-    pub after_parent_reap_delay: Duration,
+    pub after_first_frame_delay: Duration,
+    pub observed_identity: Option<ProcessIdentity>,
+    pub register_error: Option<i32>,
+    pub reader_done: Option<Sender<()>>,
     pub before_observe_delay: Duration,
     pub before_register_delay: Duration,
     pub force_nack: bool,
@@ -220,7 +223,6 @@ pub(super) fn spawn(
     trace(hooks.trace.as_deref(), "parent_reaped");
     drop(gate);
     let handshake_deadline = Instant::now() + hooks.handshake_timeout.unwrap_or(HANDSHAKE_TIMEOUT);
-    thread::sleep(hooks.after_parent_reap_delay);
     let mut handshake = File::from(handshake_r);
     let first = read_frame(&mut handshake, handshake_deadline).map_err(|e| {
         io::Error::new(
@@ -241,6 +243,8 @@ pub(super) fn spawn(
         .ok_or_else(|| {
             io::Error::other("detached first frame has invalid pid; no cleanup authorization")
         })?;
+    trace(hooks.trace.as_deref(), "first_frame_read");
+    thread::sleep(hooks.after_first_frame_delay);
     thread::sleep(hooks.before_observe_delay);
     let observed = observe_process(pid);
     let identity = match observed {
@@ -250,13 +254,18 @@ pub(super) fn spawn(
         }
         Err(error) => return nack(&directive_w, None, error, hooks),
     };
+    let identity = hooks.observed_identity.clone().unwrap_or(identity);
     if let Err(error) = validate_spawn_identity(pid, &identity) {
         // A malformed identity is NEVER a signalling target, even if NACK succeeds.
         return nack(&directive_w, None, error, hooks);
     }
     trace(hooks.trace.as_deref(), "observed");
     thread::sleep(hooks.before_register_delay);
-    let queue = match ExitQueue::register(pid) {
+    let registration = match hooks.register_error {
+        Some(code) => Err(io::Error::from_raw_os_error(code)),
+        None => ExitQueue::register(pid),
+    };
+    let queue = match registration {
         Ok(queue) => queue,
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {
             return reap_reply(&directive_w, &mut handshake, hooks);
