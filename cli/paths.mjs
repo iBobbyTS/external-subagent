@@ -24,5 +24,23 @@ export function productPaths(home = os.homedir()) {
     launchAgent: path.join(home, 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`),
     zcodeConfig: path.join(home, '.zcode', 'cli', 'config.json'),
     zcodePlugin: path.join(data, 'zcode-plugin', PLUGIN_NAME),
+    profiles: path.join(data, 'profiles'),
   };
+}
+
+export function profilesDir(envOrHome, maybeHome) {
+  let env = process.env;
+  let home = os.homedir();
+  if (typeof envOrHome === 'string') {
+    home = envOrHome;
+    if (maybeHome && typeof maybeHome === 'object') env = maybeHome;
+  } else if (envOrHome && typeof envOrHome === 'object') {
+    env = envOrHome;
+    if (typeof maybeHome === 'string') home = maybeHome;
+  }
+  const envPath = env.EXTERNAL_SUBAGENT_CONFIG || env.ZCODE_AGENT_CONFIG;
+  if (envPath) {
+    return path.join(path.dirname(envPath), 'profiles');
+  }
+  return path.join(productPaths(home).data, 'profiles');
 }

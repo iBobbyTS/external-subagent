@@ -87,7 +87,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.output, ['agent_id', 'status', 'session_id']);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.input, [
-    'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest',
+    'profile', 'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [
