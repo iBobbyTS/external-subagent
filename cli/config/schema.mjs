@@ -2,7 +2,8 @@ import { CliError } from '../errors.mjs';
 
 export const CONFIG_SCHEMA_VERSION = 2;
 export const SUBAGENT_IDS = Object.freeze(['zcode', 'dsh', 'codex', 'agy']);
-const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_subagent', 'subagents']);
+export const RUNTIME_PROCESS_MODELS = Object.freeze(['auto', 'detached', 'attached']);
+const CONFIG_FIELDS = new Set(['schema_version', 'revision', 'default_subagent', 'subagents', 'runtime_process_model']);
 const AGENT_FIELDS = new Set(['enabled', 'spawn_supported', 'default_model', 'runtime_path', 'home', 'profile', 'version']);
 
 function plainObject(value) {
@@ -20,6 +21,7 @@ export function defaultConfig() {
     schema_version: CONFIG_SCHEMA_VERSION,
     revision: 0,
     default_subagent: null,
+    runtime_process_model: 'auto',
     subagents: {
       zcode: { enabled: false, spawn_supported: false, default_model: null },
       dsh: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
@@ -52,8 +54,10 @@ export function validateConfig(input) {
   if (input.schema_version !== undefined && input.schema_version !== CONFIG_SCHEMA_VERSION) throw new CliError('CONFIG_INVALID', 'unsupported config schema version', 2);
   if (input.revision !== undefined && (!Number.isInteger(input.revision) || input.revision < 0)) throw new CliError('CONFIG_INVALID', 'revision must be a non-negative integer', 2);
   if (input.default_subagent !== undefined && input.default_subagent !== null && !SUBAGENT_IDS.includes(input.default_subagent)) throw new CliError('CONFIG_INVALID', 'default_subagent is unknown', 2);
+  if (input.runtime_process_model !== undefined && !RUNTIME_PROCESS_MODELS.includes(input.runtime_process_model)) throw new CliError('CONFIG_INVALID', `runtime_process_model must be one of ${RUNTIME_PROCESS_MODELS.join(', ')}`, 2);
   config.revision = input.revision ?? 0;
   config.default_subagent = input.default_subagent ?? null;
+  config.runtime_process_model = input.runtime_process_model ?? 'auto';
   if (input.subagents !== undefined && !plainObject(input.subagents)) throw new CliError('CONFIG_INVALID', 'subagents must be an object', 2);
   for (const agent of Object.keys(input.subagents || {})) {
     if (!SUBAGENT_IDS.includes(agent)) throw new CliError('CONFIG_INVALID', `subagents contains unknown subagent: ${agent}`, 2);

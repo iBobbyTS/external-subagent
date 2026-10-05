@@ -9,6 +9,7 @@ use std::{
 };
 
 use external_agent_agy::launch::{launch_args, AgyEffort, AgyLaunchOptions, AgyPermissionMode};
+use external_runtime::SpawnModel;
 use external_store::TaskRecord;
 
 use super::owner::AgyRuntimeOwner;
@@ -100,32 +101,38 @@ fn env_runtime_path() -> Result<Option<PathBuf>, io::Error> {
 /// routing can register the factory without enabling `agy` spawn support.
 pub struct AgyRuntimeFactory {
     gate: AgySpawnGate,
+    process_model: SpawnModel,
     #[cfg(test)]
     executable: Option<PathBuf>,
 }
 
 impl AgyRuntimeFactory {
     pub fn closed() -> Self {
-        Self {
-            gate: AgySpawnGate::Closed,
-            #[cfg(test)]
-            executable: None,
-        }
+        Self::with_gate(AgySpawnGate::Closed, SpawnModel::Attached)
     }
 
     pub fn enabled() -> Self {
-        Self {
-            gate: AgySpawnGate::Enabled,
-            #[cfg(test)]
-            executable: None,
-        }
+        Self::with_gate(AgySpawnGate::Enabled, SpawnModel::Attached)
+    }
+
+    /// Production constructor carrying the persisted process model.
+    pub fn enabled_with_model(process_model: SpawnModel) -> Self {
+        Self::with_gate(AgySpawnGate::Enabled, process_model)
     }
 
     #[cfg(test)]
     pub fn test_harness(executable: Option<PathBuf>) -> Self {
+        let mut factory = Self::with_gate(AgySpawnGate::TestHarness, SpawnModel::Attached);
+        factory.executable = executable;
+        factory
+    }
+
+    fn with_gate(gate: AgySpawnGate, process_model: SpawnModel) -> Self {
         Self {
-            gate: AgySpawnGate::TestHarness,
-            executable,
+            gate,
+            process_model,
+            #[cfg(test)]
+            executable: None,
         }
     }
 
@@ -212,9 +219,10 @@ impl RuntimeFactory for AgyRuntimeFactory {
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
         let launch = self.resolve_launch(task)?;
         let cwd = PathBuf::from(&task.workspace_path);
-        Ok(Arc::new(AgyRuntimeOwner::spawn(
+        Ok(Arc::new(AgyRuntimeOwner::spawn_with_model(
             launch.command(&cwd),
             sink,
+            self.process_model,
         )?))
     }
 }

@@ -10,7 +10,7 @@ use external_contract::{
 };
 use external_runtime::{
     observe_process, observe_process_group, stop_and_reap_persisted_process_group, ChildExit,
-    Driver, Inbound, ProcessIdentity, RequestError, StopOutcome,
+    Driver, Inbound, ProcessIdentity, RequestError, SpawnModel, StopOutcome,
 };
 use external_store::{
     MessageState, NewTask, PendingRequestState, PendingResponseClaimDisposition, Store,
@@ -715,7 +715,17 @@ impl OfferedPermissionCache {
 
 impl RuntimeOwner {
     pub fn spawn(command: Command, sink: Arc<dyn LifecycleSink>) -> io::Result<Self> {
-        let driver = Arc::new(Driver::spawn(command)?);
+        Self::spawn_with_model(command, sink, SpawnModel::Attached)
+    }
+
+    /// Owner ingress for the persisted process model. The driver owns the
+    /// protocol; this only selects attached vs detached spawning.
+    pub fn spawn_with_model(
+        command: Command,
+        sink: Arc<dyn LifecycleSink>,
+        model: SpawnModel,
+    ) -> io::Result<Self> {
+        let driver = Arc::new(Driver::spawn_with_model(command, model)?);
         let publisher = Arc::new(Publisher::new(sink));
         let shutdown_pump = Arc::new(AtomicBool::new(false));
         let turn_tracker = Arc::new(TurnTracker::new());

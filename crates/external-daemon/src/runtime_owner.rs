@@ -4,7 +4,7 @@ use crate::{
 };
 use external_contract::StdioMcpServer;
 use external_core::ValidatedPermissionDenial;
-use external_runtime::ProcessIdentity;
+use external_runtime::{ProcessIdentity, SpawnModel};
 use external_store::TaskRecord;
 use std::{
     io,
@@ -261,20 +261,36 @@ pub trait RuntimeFactory: Send + Sync + 'static {
 pub struct CommandRuntimeFactory<F> {
     command: F,
     require_prepared: bool,
+    process_model: SpawnModel,
 }
 
 impl<F> CommandRuntimeFactory<F> {
     pub fn new(command: F) -> Self {
-        Self {
-            command,
-            require_prepared: false,
-        }
+        Self::new_with_model(command, SpawnModel::Attached)
     }
 
     pub fn new_prepared(command: F) -> Self {
+        Self::new_prepared_with_model(command, SpawnModel::Attached)
+    }
+
+    /// Thread the persisted `runtime_process_model` decision into every
+    /// spawned ZCode runtime. See the S01 driver contract: detached supports
+    /// the Command program/args/cwd/env-set/env-remove subset only; env_clear,
+    /// uid/gid, arg0 and caller pre_exec stay attached-only (production uses
+    /// none of them).
+    pub fn new_with_model(command: F, process_model: SpawnModel) -> Self {
+        Self {
+            command,
+            require_prepared: false,
+            process_model,
+        }
+    }
+
+    pub fn new_prepared_with_model(command: F, process_model: SpawnModel) -> Self {
         Self {
             command,
             require_prepared: true,
+            process_model,
         }
     }
 }
@@ -356,6 +372,10 @@ where
         }
         let mut command = (self.command)(task)?;
         apply_agent_policy_environment(&mut command, task)?;
-        Ok(Arc::new(RuntimeOwner::spawn(command, sink)?))
+        Ok(Arc::new(RuntimeOwner::spawn_with_model(
+            command,
+            sink,
+            self.process_model,
+        )?))
     }
 }

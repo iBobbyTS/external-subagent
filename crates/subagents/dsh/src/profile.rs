@@ -231,11 +231,13 @@ fn bounded_output(
     use std::os::unix::process::CommandExt;
     let deadline = Instant::now() + timeout;
     command.process_group(0);
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Run the preflight probe through the process-wide spawn gate so it cannot
+    // fork between another thread's pipe creation and CLOEXEC (I7).
+    let mut child = external_runtime::gated_spawn(command)
         .map_err(|e| format!("dsh probe spawn failed: {e}"))?;
     collect_probe(&mut child, deadline, cap)
 }

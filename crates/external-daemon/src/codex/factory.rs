@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use external_runtime::SpawnModel;
 use external_store::TaskRecord;
 
 use super::owner::CodexRuntimeOwner;
@@ -161,32 +162,39 @@ fn env_runtime_path() -> Result<Option<PathBuf>, io::Error> {
 /// routing can register the factory without enabling Codex spawn support.
 pub struct CodexRuntimeFactory {
     gate: CodexSpawnGate,
+    process_model: SpawnModel,
     #[cfg(test)]
     launch: Option<CodexLaunch>,
 }
 
 impl CodexRuntimeFactory {
     pub fn closed() -> Self {
-        Self {
-            gate: CodexSpawnGate::Closed,
-            #[cfg(test)]
-            launch: None,
-        }
+        Self::with_gate(CodexSpawnGate::Closed, SpawnModel::Attached)
     }
 
     pub fn enabled() -> Self {
-        Self {
-            gate: CodexSpawnGate::Enabled,
-            #[cfg(test)]
-            launch: None,
-        }
+        Self::with_gate(CodexSpawnGate::Enabled, SpawnModel::Attached)
+    }
+
+    /// Production constructor carrying the persisted process model; the
+    /// `Debug`/`test_harness` constructors keep the attached default.
+    pub fn enabled_with_model(process_model: SpawnModel) -> Self {
+        Self::with_gate(CodexSpawnGate::Enabled, process_model)
     }
 
     #[cfg(test)]
     pub fn test_harness(launch: Option<CodexLaunch>) -> Self {
+        let mut factory = Self::with_gate(CodexSpawnGate::TestHarness, SpawnModel::Attached);
+        factory.launch = launch;
+        factory
+    }
+
+    fn with_gate(gate: CodexSpawnGate, process_model: SpawnModel) -> Self {
         Self {
-            gate: CodexSpawnGate::TestHarness,
-            launch,
+            gate,
+            process_model,
+            #[cfg(test)]
+            launch: None,
         }
     }
 
@@ -244,9 +252,10 @@ impl RuntimeFactory for CodexRuntimeFactory {
     ) -> io::Result<Arc<dyn ManagedRuntime>> {
         let launch = self.resolve_launch(task)?;
         let cwd = PathBuf::from(&task.workspace_path);
-        Ok(Arc::new(CodexRuntimeOwner::spawn(
+        Ok(Arc::new(CodexRuntimeOwner::spawn_with_model(
             launch.command(&cwd),
             sink,
+            self.process_model,
         )?))
     }
 }

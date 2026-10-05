@@ -16,6 +16,11 @@ pub(super) struct AgentConfigSnapshot {
     pub(super) revision: u64,
     #[serde(default)]
     pub(super) default_subagent: Option<String>,
+    /// Top-level process model for spawned runtimes. Absent means `auto`.
+    /// Accepted values mirror cli/config/schema.mjs and main.rs parse_config:
+    /// `auto`, `detached`, `attached` (validated in parse_agent_config_snapshot).
+    #[serde(default)]
+    pub(super) runtime_process_model: Option<String>,
     #[serde(default)]
     pub(super) subagents: BTreeMap<String, AgentConfigEntry>,
 }
@@ -43,6 +48,7 @@ impl Default for AgentConfigSnapshot {
             schema_version: 2,
             revision: 0,
             default_subagent: None,
+            runtime_process_model: None,
             subagents: BTreeMap::from([
                 (
                     "zcode".into(),
@@ -136,6 +142,19 @@ fn parse_agent_config_snapshot(bytes: &[u8]) -> Result<AgentConfigSnapshot, RpcE
         return Err(RpcError::new(
             RpcErrorCode::Validation,
             "unsupported agent config schema version",
+        ));
+    }
+    // I5: the three-value enum is shared with cli/config/schema.mjs and
+    // main.rs parse_config. An unknown value names the key on the way out
+    // instead of surfacing the generic "agent config is invalid".
+    if snapshot
+        .runtime_process_model
+        .as_deref()
+        .is_some_and(|model| !matches!(model, "auto" | "detached" | "attached"))
+    {
+        return Err(RpcError::new(
+            RpcErrorCode::Validation,
+            "agent config runtime_process_model must be one of auto, detached, attached",
         ));
     }
     if snapshot
@@ -336,6 +355,36 @@ mod config_migration_tests {
         assert_eq!(
             configured.subagents["agy"].runtime_path.as_deref(),
             Some("/opt/agy")
+        );
+    }
+
+    #[test]
+    fn runtime_process_model_is_accepted_and_validated() {
+        // A top-level key must not fail deny_unknown_fields and disable the
+        // dsh/codex/agy gates; the snapshot and startup projection both keep it.
+        for model in ["auto", "detached", "attached"] {
+            let input = format!(
+                r#"{{"schema_version":2,"runtime_process_model":"{model}","subagents":{{"codex":{{"enabled":true,"spawn_supported":true}}}}}}"#
+            );
+            let config = parse_agent_config_snapshot(input.as_bytes()).unwrap();
+            assert_eq!(config.runtime_process_model.as_deref(), Some(model));
+            assert!(config.subagents["codex"].enabled && config.subagents["codex"].spawn_supported);
+            let value = parse_subagent_config(input.as_bytes()).unwrap();
+            assert_eq!(value["runtime_process_model"], model);
+            assert_eq!(value["subagents"]["codex"]["enabled"], true);
+        }
+        // Absent means auto; the parser leaves it unset instead of inventing one.
+        let config = parse_agent_config_snapshot(br#"{"schema_version":2}"#).unwrap();
+        assert!(config.runtime_process_model.is_none());
+        // Unknown values are rejected by name.
+        let error = parse_agent_config_snapshot(
+            br#"{"schema_version":2,"runtime_process_model":"sometimes"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("runtime_process_model"),
+            "rejection must name the key: {}",
+            error.message
         );
     }
 

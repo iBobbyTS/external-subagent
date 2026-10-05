@@ -8,7 +8,7 @@ use external_contract::{
     SESSION_CLOSE, SESSION_CREATE, SESSION_EVENT, SESSION_REQUEST_RUNTIME_PREFERENCES,
     SESSION_SEND, SESSION_SUBSCRIBE,
 };
-use external_runtime::{Driver, Inbound, RequestError};
+use external_runtime::{gated_spawn, Driver, Inbound, RequestError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
@@ -565,7 +565,7 @@ fn probe_agy_hi(
             Ok(())
         });
     }
-    let mut child = match command.spawn() {
+    let mut child = match gated_spawn(&mut command) {
         Ok(child) => child,
         Err(_) => return (unknown, unavailable(scope, version, checked, "transport")),
     };
@@ -1097,7 +1097,7 @@ fn run_agy_catalog(
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let mut child = gated_spawn(&mut command).map_err(|_| "transport".to_owned())?;
     let process_group = child.id() as i32;
     let (Some(output), Some(diagnostic)) = (child.stdout.take(), child.stderr.take()) else {
         cleanup_catalog_process(&mut child, process_group, Duration::from_millis(500));
@@ -1244,7 +1244,7 @@ fn run_dsh_catalog(
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let mut child = gated_spawn(&mut command).map_err(|_| "transport".to_owned())?;
     let process_group = child.id() as i32;
     let (Some(mut input), Some(output), Some(diagnostic)) =
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
@@ -1584,7 +1584,7 @@ fn executable_version(path: &Path) -> Result<String, String> {
             Ok(())
         });
     }
-    let mut child = command.spawn().map_err(|_| "transport".to_owned())?;
+    let mut child = gated_spawn(&mut command).map_err(|_| "transport".to_owned())?;
     let process_group = child.id() as i32;
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         cleanup_catalog_process(&mut child, process_group, Duration::from_millis(250));
@@ -1886,7 +1886,7 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Durati
             Ok(())
         });
     }
-    let Ok(mut child) = command.spawn() else {
+    let Ok(mut child) = gated_spawn(&mut command) else {
         return false;
     };
     let group = child.id() as i32;

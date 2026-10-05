@@ -19,7 +19,7 @@ use external_agent_dsh::acp::{
     session::AcpSession,
 };
 use external_contract::WireId;
-use external_runtime::{Driver, FrameCodec};
+use external_runtime::{Driver, FrameCodec, SpawnModel};
 use external_store::TaskRecord;
 
 use super::events::DshRuntimeShared;
@@ -43,12 +43,34 @@ impl DshRuntimeOwner {
         Self::spawn_with_patch(command, sink, None)
     }
 
+    /// Owner ingress for the persisted process model (see RuntimeOwner).
+    pub fn spawn_with_model(
+        command: Command,
+        sink: Arc<dyn LifecycleSink>,
+        model: SpawnModel,
+    ) -> io::Result<Self> {
+        Self::spawn_with_patch_with_model(command, sink, None, model)
+    }
+
     pub(super) fn spawn_with_patch(
         command: Command,
         sink: Arc<dyn LifecycleSink>,
         patch_directory: Option<tempfile::TempDir>,
     ) -> io::Result<Self> {
-        let driver = Arc::new(Driver::spawn_with_codec(command, FrameCodec::JsonRpc2)?);
+        Self::spawn_with_patch_with_model(command, sink, patch_directory, SpawnModel::Attached)
+    }
+
+    pub(super) fn spawn_with_patch_with_model(
+        command: Command,
+        sink: Arc<dyn LifecycleSink>,
+        patch_directory: Option<tempfile::TempDir>,
+        model: SpawnModel,
+    ) -> io::Result<Self> {
+        let driver = Arc::new(Driver::spawn_with_codec_and_model(
+            command,
+            FrameCodec::JsonRpc2,
+            model,
+        )?);
         AcpSession::codec_check(&driver).map_err(|error| io::Error::other(error.to_string()))?;
         let publisher = Arc::new(Publisher::new(sink));
         let shared = Arc::new(DshRuntimeShared {

@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use external_runtime::{Driver, FrameCodec};
+use external_runtime::{Driver, FrameCodec, SpawnModel};
 use external_store::TaskRecord;
 
 use super::events::AgyRuntimeShared;
@@ -31,7 +31,20 @@ pub struct AgyRuntimeOwner {
 
 impl AgyRuntimeOwner {
     pub fn spawn(command: Command, sink: Arc<dyn LifecycleSink>) -> io::Result<Self> {
-        let driver = Arc::new(Driver::spawn_with_codec(command, FrameCodec::Ndjson)?);
+        Self::spawn_with_model(command, sink, SpawnModel::Attached)
+    }
+
+    /// Owner ingress for the persisted process model (see RuntimeOwner).
+    pub fn spawn_with_model(
+        command: Command,
+        sink: Arc<dyn LifecycleSink>,
+        model: SpawnModel,
+    ) -> io::Result<Self> {
+        let driver = Arc::new(Driver::spawn_with_codec_and_model(
+            command,
+            FrameCodec::Ndjson,
+            model,
+        )?);
         let publisher = Arc::new(Publisher::new(sink));
         let shared = Arc::new(AgyRuntimeShared::new(
             Arc::clone(&publisher),

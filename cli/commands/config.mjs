@@ -9,6 +9,7 @@ import { launchAgentPlist } from '../install/service-macos.mjs';
 const CONFIG_INPUT_FIELDS = new Set(['operation', 'patch', 'key']);
 const GET_KEYS = new Set([
   'default_subagent',
+  'runtime_process_model',
   ...SUBAGENT_IDS.flatMap((agent) => [`subagents.${agent}.enabled`, `subagents.${agent}.spawn_supported`, `subagents.${agent}.default_model`, `subagents.${agent}.runtime_path`, `subagents.${agent}.home`, `subagents.${agent}.profile`, `subagents.${agent}.version`]),
 ]);
 const SET_KEYS = GET_KEYS;
@@ -37,6 +38,7 @@ function patchFor(key, value) {
 function unsetPatch(key) {
   if (!SET_KEYS.has(key)) throw new CliError('INVALID_ARGUMENT', `unsupported config key: ${key}`, 2);
   if (key === 'default_subagent') return { default_subagent: null };
+  if (key === 'runtime_process_model') return { runtime_process_model: 'auto' };
   const [, agent, field] = key.split('.');
   const defaults = {
     enabled: false,

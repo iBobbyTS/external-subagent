@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use external_runtime::SpawnModel;
 use external_store::TaskRecord;
 
 use super::owner::DshRuntimeOwner;
@@ -30,35 +31,41 @@ pub enum DshSpawnGate {
 /// register the factory without enabling DSH spawn support.
 pub struct DshRuntimeFactory {
     gate: DshSpawnGate,
+    process_model: SpawnModel,
     #[cfg(test)]
     executable: Option<PathBuf>,
 }
 
 impl DshRuntimeFactory {
     pub fn closed() -> Self {
-        Self {
-            gate: DshSpawnGate::Closed,
-            #[cfg(test)]
-            executable: None,
-        }
+        Self::with_gate(DshSpawnGate::Closed, SpawnModel::Attached)
     }
 
     /// Construct the production factory.  The strict patch is resolved from
     /// an explicit environment override so packaged binaries cannot depend on
     /// their current working directory.
     pub fn enabled() -> Self {
-        Self {
-            gate: DshSpawnGate::Enabled,
-            #[cfg(test)]
-            executable: None,
-        }
+        Self::with_gate(DshSpawnGate::Enabled, SpawnModel::Attached)
+    }
+
+    /// Production constructor carrying the persisted process model.
+    pub fn enabled_with_model(process_model: SpawnModel) -> Self {
+        Self::with_gate(DshSpawnGate::Enabled, process_model)
     }
 
     #[cfg(test)]
     pub fn test_harness(executable: Option<PathBuf>) -> Self {
+        let mut factory = Self::with_gate(DshSpawnGate::TestHarness, SpawnModel::Attached);
+        factory.executable = executable;
+        factory
+    }
+
+    fn with_gate(gate: DshSpawnGate, process_model: SpawnModel) -> Self {
         Self {
-            gate: DshSpawnGate::TestHarness,
-            executable,
+            gate,
+            process_model,
+            #[cfg(test)]
+            executable: None,
         }
     }
 }
@@ -303,10 +310,11 @@ impl RuntimeFactory for DshRuntimeFactory {
                     external_agent_dsh::profile::preflight(&launch)
                         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                     let command = external_agent_dsh::profile::resolve_launch(&launch)?;
-                    Ok(Arc::new(DshRuntimeOwner::spawn_with_patch(
+                    Ok(Arc::new(DshRuntimeOwner::spawn_with_patch_with_model(
                         command,
                         _sink,
                         managed_patch,
+                        self.process_model,
                     )?))
                 } else if is_workspace_root_manifest(&prepared.write_manifest) {
                     // Legacy build: no patch, `preflight_build`, byte-identical
@@ -322,7 +330,11 @@ impl RuntimeFactory for DshRuntimeFactory {
                     external_agent_dsh::profile::preflight_build(&launch)
                         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
                     let command = external_agent_dsh::profile::resolve_launch(&launch)?;
-                    Ok(Arc::new(DshRuntimeOwner::spawn(command, _sink)?))
+                    Ok(Arc::new(DshRuntimeOwner::spawn_with_model(
+                        command,
+                        _sink,
+                        self.process_model,
+                    )?))
                 } else {
                     // A caller write manifest: materialize the guard tree and
                     // the manifest-build patch, then preflight the composition.
@@ -332,10 +344,11 @@ impl RuntimeFactory for DshRuntimeFactory {
                         home,
                         &prepared.write_manifest,
                     )?;
-                    Ok(Arc::new(DshRuntimeOwner::spawn_with_patch(
+                    Ok(Arc::new(DshRuntimeOwner::spawn_with_patch_with_model(
                         materialized.command,
                         _sink,
                         Some(materialized.directory),
+                        self.process_model,
                     )?))
                 }
             }

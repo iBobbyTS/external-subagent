@@ -38,5 +38,10 @@
   {"name":"agy runtime_path schema 2", "valid":true, "input":{"schema_version":2,"default_subagent":"agy","subagents":{"agy":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/agy/bin/agy"}}}},
   {"name":"agy default_model schema 2", "valid":true, "input":{"schema_version":2,"subagents":{"agy":{"enabled":true,"spawn_supported":true,"default_model":"claude-sonnet-4-6"}}}},
   {"name":"dsh codex runtime_path schema 1", "valid":true, "input":{"schema_version":1,"revision":2,"default_agent":"dsh","agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/dsh/acp"},"codex":{"enabled":true,"spawn_supported":true,"runtime_path":"/opt/homebrew/bin/codex"}}}},
-  {"name":"empty subagent entries remain disabled","valid":true, "input":{"schema_version":2,"subagents":{"zcode":{},"dsh":{},"codex":{},"agy":{}}}}
+  {"name":"empty subagent entries remain disabled","valid":true, "input":{"schema_version":2,"subagents":{"zcode":{},"dsh":{},"codex":{},"agy":{}}}},
+  {"name":"runtime_process_model detached","valid":true, "input":{"schema_version":2,"runtime_process_model":"detached","subagents":{"codex":{"enabled":true,"spawn_supported":true}}}},
+  {"name":"runtime_process_model attached","valid":true, "input":{"schema_version":2,"runtime_process_model":"attached"}},
+  {"name":"runtime_process_model auto","valid":true, "input":{"schema_version":2,"runtime_process_model":"auto"}},
+  {"name":"runtime_process_model unknown value","valid":false, "input":{"schema_version":2,"runtime_process_model":"sometimes"}},
+  {"name":"runtime_process_model non-string","valid":false, "input":{"schema_version":2,"runtime_process_model":7}}
 ]

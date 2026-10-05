@@ -151,6 +151,38 @@ test('codex config persists runtime, home, and default model through every path'
   assert.throws(() => parseConfigArgs(['set', 'subagents.other.enabled', 'true']), (error) => error.code === 'INVALID_ARGUMENT');
 });
 
+test('runtime_process_model round-trips through schema, set, and unset', () => {
+  const { paths } = fixture();
+  fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+  // An absent key reads back the auto default and never lands on disk unknown.
+  assert.equal(readConfig(paths.config).runtime_process_model, 'auto');
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, runtime_process_model: 'detached' }));
+  assert.equal(readConfig(paths.config).runtime_process_model, 'detached');
+  assert.doesNotThrow(() => launchAgentPlist(paths));
+  // Every allowed value persists exactly through the locked write path.
+  for (const model of ['detached', 'attached', 'auto']) {
+    const config = configCommand(paths, parseConfigArgs(['set', 'runtime_process_model', model])).config;
+    assert.equal(config.runtime_process_model, model);
+    assert.equal(readConfig(paths.config).runtime_process_model, model);
+    assert.deepEqual(configCommand(paths, parseConfigArgs(['get', 'runtime_process_model'])), {
+      key: 'runtime_process_model', value: model, revision: config.revision,
+    });
+  }
+  // Invalid values are rejected by key name.
+  assert.throws(
+    () => configCommand(paths, parseConfigArgs(['set', 'runtime_process_model', 'sometimes'])),
+    (error) => error.code === 'CONFIG_INVALID' && /runtime_process_model/u.test(error.message),
+  );
+  // A hand-written invalid value is rejected by read as well.
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, runtime_process_model: 'sometimes' }));
+  assert.throws(() => readConfig(paths.config), (error) => error.code === 'CONFIG_INVALID' && /runtime_process_model/u.test(error.message));
+  // Unset restores the auto default through the top-level branch.
+  fs.writeFileSync(paths.config, JSON.stringify({ schema_version: 2, revision: 3, runtime_process_model: 'detached' }));
+  const unset = configCommand(paths, parseConfigArgs(['unset', 'runtime_process_model'])).config;
+  assert.equal(unset.runtime_process_model, 'auto');
+  assert.equal(readConfig(paths.config).runtime_process_model, 'auto');
+});
+
 test('LaunchAgent forwards the persisted Codex runtime and home exactly', () => {
   const { paths } = fixture();
   configCommand(paths, { operation: 'set', patch: { subagents: { codex: {

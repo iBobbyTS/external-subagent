@@ -7,6 +7,7 @@ use external_daemon::{
     zcode::{apply_provider_environment, data_root_from_environment},
     CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
+use external_runtime::SpawnModel;
 use external_store::Store;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
@@ -36,6 +37,11 @@ struct Config {
     runtime: Option<PathBuf>,
     diagnostic_log: Option<PathBuf>,
     agent_config: Option<PathBuf>,
+    /// Resolved from the top-level `runtime_process_model` config key (I5):
+    /// `auto` (default) picks detached on macOS with kqueue, otherwise
+    /// attached with one diagnostic; an explicit `detached` fails startup when
+    /// unavailable; an explicit `attached` keeps the pre-feature behavior.
+    process_model: SpawnModel,
 }
 
 const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
@@ -69,25 +75,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
     let data_root = data_root_from_environment();
-    let zcode = CommandRuntimeFactory::new_prepared(move |_task: &external_store::TaskRecord| {
-        let mut command = runtime_command(runtime.as_deref())?;
-        if let (Some(runtime), Some(data_root)) = (runtime.as_deref(), data_root.as_deref()) {
-            apply_provider_environment(&mut command, runtime, data_root);
-        }
-        Ok(command)
-    });
+    let zcode = CommandRuntimeFactory::new_prepared_with_model(
+        move |_task: &external_store::TaskRecord| {
+            let mut command = runtime_command(runtime.as_deref())?;
+            if let (Some(runtime), Some(data_root)) = (runtime.as_deref(), data_root.as_deref()) {
+                apply_provider_environment(&mut command, runtime, data_root);
+            }
+            Ok(command)
+        },
+        config.process_model,
+    );
     let dsh_factory = if dsh_production_enabled(config.agent_config.as_deref()) {
-        DshRuntimeFactory::enabled()
+        DshRuntimeFactory::enabled_with_model(config.process_model)
     } else {
         DshRuntimeFactory::closed()
     };
     let codex_factory = if codex_production_enabled(config.agent_config.as_deref()) {
-        CodexRuntimeFactory::enabled()
+        CodexRuntimeFactory::enabled_with_model(config.process_model)
     } else {
         CodexRuntimeFactory::closed()
     };
     let agy_factory = if agy_production_enabled(config.agent_config.as_deref()) {
-        AgyRuntimeFactory::enabled()
+        AgyRuntimeFactory::enabled_with_model(config.process_model)
     } else {
         AgyRuntimeFactory::closed()
     };
@@ -407,13 +416,120 @@ fn parse_config() -> io::Result<Config> {
             "runtime path is not a regular file",
         ));
     }
+    let requested = read_runtime_process_model(agent_config.as_deref())?;
+    let (process_model, diagnostic) =
+        resolve_runtime_process_model(requested, detached_runtime_available())
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    if let Some(diagnostic) = diagnostic {
+        eprintln!("external-subagentd: {diagnostic}");
+    }
     Ok(Config {
         database,
         socket,
         runtime,
         diagnostic_log,
         agent_config,
+        process_model,
     })
+}
+
+/// The persisted top-level enum shared with cli/config/schema.mjs and
+/// rpc/config.rs. Parsing is separated from resolution so the decision table
+/// stays a pure function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeProcessModel {
+    Auto,
+    Detached,
+    Attached,
+}
+
+impl RuntimeProcessModel {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "detached" => Some(Self::Detached),
+            "attached" => Some(Self::Attached),
+            _ => None,
+        }
+    }
+}
+
+const RUNTIME_PROCESS_MODEL_VALUES: &str = "auto, detached, attached";
+
+/// Pure decision table (I5). `detached_available` is injected so both arms are
+/// testable: production derives it from the host (macOS with a working
+/// kqueue). `auto` degrades to attached with one diagnostic; an explicit
+/// `detached` request on an incapable host is a loud startup failure.
+fn resolve_runtime_process_model(
+    requested: RuntimeProcessModel,
+    detached_available: bool,
+) -> Result<(SpawnModel, Option<String>), String> {
+    match (requested, detached_available) {
+        (RuntimeProcessModel::Attached, _) => Ok((SpawnModel::Attached, None)),
+        (RuntimeProcessModel::Detached, true) => Ok((SpawnModel::Detached, None)),
+        (RuntimeProcessModel::Detached, false) => Err(format!(
+            "runtime_process_model=detached is unavailable: this host needs macOS with kqueue"
+        )),
+        (RuntimeProcessModel::Auto, true) => Ok((SpawnModel::Detached, None)),
+        (RuntimeProcessModel::Auto, false) => Ok((
+            SpawnModel::Attached,
+            Some("runtime_process_model=auto: detached is unavailable; using attached".to_owned()),
+        )),
+    }
+}
+
+/// Host capability for detached spawn: macOS plus a usable kqueue descriptor.
+/// On other targets detached is not compiled in, so auto stays attached.
+fn detached_runtime_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return false;
+        }
+        unsafe { libc::close(fd) };
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Read the top-level key from the same config.json main already resolves
+/// (database directory, mirroring cli/paths.mjs). Absent/unreadable/malformed
+/// configurations keep the `auto` default; the value enum itself is strict so
+/// a hand-written invalid value fails startup by key name instead of silently
+/// downgrading.
+fn read_runtime_process_model(path: Option<&Path>) -> io::Result<RuntimeProcessModel> {
+    let Some(path) = path else {
+        return Ok(RuntimeProcessModel::Auto);
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RuntimeProcessModel::Auto)
+        }
+        // Read failures are handled fail-closed by the per-agent gates; do not
+        // turn a transient unreadable config into a startup crash here.
+        Err(_) => return Ok(RuntimeProcessModel::Auto),
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(RuntimeProcessModel::Auto);
+    };
+    let Some(raw) = value.get("runtime_process_model") else {
+        return Ok(RuntimeProcessModel::Auto);
+    };
+    raw.as_str()
+        .and_then(RuntimeProcessModel::parse)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "config runtime_process_model must be one of {RUNTIME_PROCESS_MODEL_VALUES}"
+                ),
+            )
+        })
 }
 
 fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
@@ -563,5 +679,94 @@ mod tests {
             std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
             assert!(!dsh_production_enabled(Some(&config_path)));
         }
+    }
+
+    #[test]
+    fn runtime_process_model_decision_table_covers_both_injected_arms() {
+        // auto + capable host → detached.
+        assert_eq!(
+            resolve_runtime_process_model(RuntimeProcessModel::Auto, true).unwrap(),
+            (SpawnModel::Detached, None)
+        );
+        // auto + incapable host → attached with exactly one diagnostic.
+        let (model, diagnostic) =
+            resolve_runtime_process_model(RuntimeProcessModel::Auto, false).unwrap();
+        assert_eq!(model, SpawnModel::Attached);
+        let diagnostic = diagnostic.expect("auto fallback must carry a diagnostic");
+        assert!(diagnostic.contains("auto") && diagnostic.contains("attached"));
+        // explicit detached + capable → detached.
+        assert_eq!(
+            resolve_runtime_process_model(RuntimeProcessModel::Detached, true).unwrap(),
+            (SpawnModel::Detached, None)
+        );
+        // explicit detached + incapable → loud failure.
+        let error = resolve_runtime_process_model(RuntimeProcessModel::Detached, false)
+            .expect_err("explicit detached must fail loudly");
+        assert!(error.contains("detached"));
+        // explicit attached is the pre-feature behavior regardless of host.
+        for available in [true, false] {
+            assert_eq!(
+                resolve_runtime_process_model(RuntimeProcessModel::Attached, available).unwrap(),
+                (SpawnModel::Attached, None)
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_process_model_config_key_is_read_strictly() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+
+        // Missing path and absent key both mean auto.
+        assert_eq!(
+            read_runtime_process_model(None).unwrap(),
+            RuntimeProcessModel::Auto
+        );
+        std::fs::write(&config_path, br#"{"schema_version":2}"#).unwrap();
+        assert_eq!(
+            read_runtime_process_model(Some(&config_path)).unwrap(),
+            RuntimeProcessModel::Auto
+        );
+        // Malformed JSON does not crash startup; the per-agent gates fail closed.
+        std::fs::write(&config_path, b"{not json").unwrap();
+        assert_eq!(
+            read_runtime_process_model(Some(&config_path)).unwrap(),
+            RuntimeProcessModel::Auto
+        );
+        // Each allowed value round-trips.
+        for (raw, expected) in [
+            ("auto", RuntimeProcessModel::Auto),
+            ("detached", RuntimeProcessModel::Detached),
+            ("attached", RuntimeProcessModel::Attached),
+        ] {
+            std::fs::write(
+                &config_path,
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 2,
+                    "runtime_process_model": raw,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                read_runtime_process_model(Some(&config_path)).unwrap(),
+                expected
+            );
+        }
+        // Invalid or non-string values fail by key name.
+        std::fs::write(
+            &config_path,
+            br#"{"schema_version":2,"runtime_process_model":"sometimes"}"#,
+        )
+        .unwrap();
+        let error = read_runtime_process_model(Some(&config_path)).unwrap_err();
+        assert!(error.to_string().contains("runtime_process_model"));
+        std::fs::write(
+            &config_path,
+            br#"{"schema_version":2,"runtime_process_model":7}"#,
+        )
+        .unwrap();
+        let error = read_runtime_process_model(Some(&config_path)).unwrap_err();
+        assert!(error.to_string().contains("runtime_process_model"));
     }
 }
