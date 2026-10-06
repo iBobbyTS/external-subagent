@@ -543,3 +543,13 @@ dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单�
 | 诊断 | identity、config_revision、活动时间、各类计数 | 不一定阻止执行，但会降低排障和可追溯性 |
 
 本文只说明现有接口及其设计代价，不修改协议。后续修改参数时，应同步 Rust 输入／输出及 handler、静态契约、相关回归测试和本文；以实际行为为准处理 schema 与运行时校验差异。
+
+### 5.x Profiles 已知限制（接受的残余）
+
+CLI `profile list`/`profile show` 与 daemon 的 JSON 身份判定在以下**手工构造的极端输入**上可能分歧（正常业务不可达；spawn 一律由 daemon 权威校验，不影响任务正确性）：
+
+- 数值 one-ulp 边界：`1.7976931348623158e308` 附近 serde_json（默认非 `float_roundtrip` 累加器）与 JS 正确舍入存在一 Ulp 分叉，可能影响该文件的 CLI owner 判定；
+- 值级字段校验（如 `permission_mode` 枚举值、model/effort token 合法性）由 daemon 在 spawn 时拒绝并返回带文件诊断与可用名单的错误，CLI list 可能仍展示该 profile 名；
+- profiles 目录路径含重复分隔符（`a//b`）时 CLI 展示字符串与 daemon 不同（`a//profiles` vs `a/profiles`），指向同一目录；
+- 可用名列表排序为 UTF-16 码元序，与 daemon 的字节序在增补平面字符与 BMP 混排时顺序不同（仅展示顺序）；
+- MCP 出口对 profile 错误消息无独立的 512 字节限制，保真上限为 RPC 响应帧上限（2 MiB）。
