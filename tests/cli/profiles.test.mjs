@@ -601,6 +601,46 @@ test('N5: profilesDir mirrors Rust Path::parent()+join() without lexical folding
   assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '' }), null);
 });
 
+test('N5: rustPathParent drops non-leading trailing "." components like Rust Path::components', () => {
+  // Rust: `Path::new("a/.").parent() == Some("")` -> "profiles".
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/.' }), 'profiles');
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/.' }), 'a/profiles');
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '/.' }), null);
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/./.' }), 'profiles');
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: './.' }), 'profiles');
+  // `..` is retained; only a non-leading `.` component is dropped.
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/../.' }), 'a/profiles');
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/..' }), 'a/profiles');
+  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a//.' }), 'profiles');
+});
+
+test('N5: candidate paths do not fold symlink/.. (daemon DirEntry::path() equivalence)', { skip: process.platform === 'win32' }, () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-nofold-'));
+  const elsewhere = path.join(base, 'elsewhere');
+  fs.mkdirSync(path.join(elsewhere, 'subdir'), { recursive: true });
+  fs.mkdirSync(path.join(elsewhere, 'profiles'), { recursive: true });
+  fs.writeFileSync(path.join(elsewhere, 'profiles', 'linked.json'), '{"name":"elsewhere_profile"}');
+  // A decoy that lexical folding (`path.join`) would have selected instead.
+  fs.mkdirSync(path.join(base, 'profiles'), { recursive: true });
+  fs.writeFileSync(path.join(base, 'profiles', 'local.json'), '{"name":"local_profile"}');
+  fs.symlinkSync(path.join(elsewhere, 'subdir'), path.join(base, 'link'));
+
+  // Build the config path by string concatenation: `path.join` would fold
+  // `link/..` to `base` before the filesystem ever sees it.
+  const configPath = `${base}/link/../agents.json`;
+  const env = { EXTERNAL_SUBAGENT_CONFIG: configPath };
+  assert.equal(profilesDir(env), `${base}/link/../profiles`);
+  // The filesystem resolves `link` -> elsewhere/subdir and `..` -> elsewhere,
+  // so the daemon reads elsewhere/profiles, never the base/profiles decoy.
+  const res = profileCommand({}, ['list'], env);
+  assert.deepEqual(res.profiles, ['elsewhere_profile']);
+  assert.deepEqual(res.warnings, []);
+  const shown = profileCommand({}, ['show', 'elsewhere_profile'], env);
+  assert.equal(shown.content, '{"name":"elsewhere_profile"}');
+
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
 test('N6: candidate selection matches Rust Path::extension() ("json", case-sensitive)', () => {
   const { paths, profilesDir } = createTempEnv();
   fs.writeFileSync(path.join(profilesDir, 'real.json'), '{"name":"real"}');
@@ -636,6 +676,91 @@ test('JSON alignment: lone surrogate escapes are rejected, valid pairs accepted'
   const pair = scanProfileJson('{"name":"emoji \\uD83D\\uDE00 ok"}', 'pair.json');
   assert.equal(pair.valid, true);
   assert.equal(pair.name, 'emoji \u{1F600} ok');
+});
+
+test('JSON alignment: a shadowed lone surrogate escape still rejects the document', () => {
+  // A later duplicate key hides the bad value from a collapsed-object scan; the
+  // raw-text gate sees the first value regardless.
+  const shadowed = scanProfileJson('{"name":"\\uD800","name":"real"}', 'dup.json');
+  assert.equal(shadowed.valid, false);
+  assert.equal(shadowed.name, null);
+  assert.ok(shadowed.errors.some((e) => e.includes('lone surrogate')));
+
+  // An escaped backslash followed by "uD800" is literal text, not an escape.
+  const literal = scanProfileJson('{"name":"real\\\\uD800"}', 'lit.json');
+  assert.equal(literal.valid, true);
+  assert.equal(literal.name, 'real\\uD800');
+});
+
+test('JSON alignment: raw-number gate matches serde_json f64 fallback (not bignum bounds)', () => {
+  // serde_json parses integers beyond u64/i64 as a finite f64, so they are
+  // accepted; the number is still a shape error for a string field, so the
+  // loose name owner is retained.
+  const accepted = ['18446744073709551615', '18446744073709551616', '-9223372036854775808', '-9223372036854775809', '1.7976931348623157e308', '1e-400', '0e400'];
+  for (const token of accepted) {
+    const res = scanProfileJson(`{"name":"real","model":${token}}`, 'n.json');
+    assert.equal(res.name, 'real', `${token}: owner retained`);
+    assert.equal(res.valid, false, `${token}: not a valid field type`);
+    assert.ok(res.errors.some((e) => e.includes('must be a string')), token);
+  }
+  // A non-finite f64 conversion rejects the whole document.
+  const rejected = ['1e400', '-1e400', '1.7976931348623159e308', '1e309'];
+  for (const token of rejected) {
+    const res = scanProfileJson(`{"name":"real","model":${token}}`, 'n.json');
+    assert.equal(res.name, null, `${token}: no owner`);
+    assert.equal(res.valid, false, token);
+    assert.ok(res.errors.some((e) => e.includes('number out of range')), token);
+  }
+  const digitRes = scanProfileJson(`{"name":"real","model":${'9'.repeat(400)}}`, 'big.json');
+  assert.equal(digitRes.name, null);
+  assert.ok(digitRes.errors.some((e) => e.includes('number out of range')));
+
+  // A duplicate key must not hide an overflowing token from the raw gate.
+  const shadowed = scanProfileJson('{"name":"real","model":1e400,"model":"ok"}', 'shadow.json');
+  assert.equal(shadowed.name, null);
+  assert.ok(shadowed.errors.some((e) => e.includes('number out of range')));
+});
+
+test('JSON alignment: container-depth gate mirrors serde_json and never overflows the stack', () => {
+  // serde_json's boundary: 127 nested containers accepted, the 128th rejected
+  // (de.rs remaining_depth starts at 128 and errors when it reaches 0).
+  const ok = `{"name":"deep","x":${'['.repeat(126)}${']'.repeat(126)}}`;
+  const okRes = scanProfileJson(ok, 'd127.json');
+  assert.equal(okRes.name, 'deep');
+  assert.ok(okRes.errors.some((e) => e.includes('unknown top-level key')));
+
+  for (const count of [127, 128, 130]) {
+    const res = scanProfileJson(`{"name":"deep","x":${'['.repeat(count)}${']'.repeat(count)}}`, 'deep.json');
+    assert.equal(res.name, null, `depth ${count + 1}`);
+    assert.equal(res.valid, false);
+    assert.ok(res.errors.some((e) => e.includes('recursion limit exceeded')), `depth ${count + 1}`);
+  }
+
+  // A 10000-deep document must come back as a diagnostic, never a RangeError.
+  assert.doesNotThrow(() => {
+    const deep = scanProfileJson('['.repeat(10000) + ']'.repeat(10000), 'over.json');
+    assert.equal(deep.valid, false);
+    assert.equal(deep.name, null);
+    assert.ok(deep.errors.some((e) => e.includes('recursion limit exceeded')));
+  });
+});
+
+test('JSON alignment: whole-document rejects own no name and never evict a valid same name', () => {
+  const { paths, profilesDir } = createTempEnv();
+  fs.writeFileSync(path.join(profilesDir, 'good-real.json'), '{"name":"real"}');
+  fs.writeFileSync(path.join(profilesDir, 'shadow-number.json'), '{"name":"real","model":1e400}');
+  fs.writeFileSync(path.join(profilesDir, 'shadow-depth.json'), `{"name":"real","x":${'['.repeat(127)}${']'.repeat(127)}}`);
+  fs.writeFileSync(path.join(profilesDir, 'shadow-surrogate.json'), '{"name":"real\\uD800"}');
+
+  const res = listProfiles(paths);
+  assert.deepEqual(res.profiles, ['real']);
+  assert.equal(res.warnings.length, 3);
+  for (const warning of res.warnings) {
+    assert.ok(warning.diagnostic.includes('invalid JSON'), warning.diagnostic);
+  }
+  assert.equal(showProfile(paths, 'real').name, 'real');
+
+  fs.rmSync(paths.home, { recursive: true, force: true });
 });
 
 test('JSON alignment: a leading BOM is invalid JSON and never a candidate', () => {

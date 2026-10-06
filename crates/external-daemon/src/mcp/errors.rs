@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn profile_derived_field_admission_error_is_preserved_through_mcp_projection() {
-        let msg = "profile file '/path/to/dsh_bad.toml' is invalid: field 'model': dsh model must be '{provider}:{model}'; the ':' separator is missing; available profiles: [good]";
+        let msg = "profile file '/path/to/dsh_bad.json' is invalid: field 'model': dsh model must be '{provider}:{model}'; the ':' separator is missing; available profiles: [good]";
         let rpc_err = RpcError::new_profile_error(RpcErrorCode::Validation, msg);
         let tool_err = public_error_for_op(rpc_err, "spawn");
         assert_eq!(tool_err.body.code, "validation");
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(tool_err.legacy_text, format!("validation: {msg}"));
 
         // AgentUnsupported preserves agent_unsupported code and projects full profile detail
-        let agy_msg = "profile file '/path/to/agy_bad.toml' is invalid: field 'permission_mode': AGY_PERMISSION_MODE_UNSUPPORTED; available profiles: [good]";
+        let agy_msg = "profile file '/path/to/agy_bad.json' is invalid: field 'permission_mode': AGY_PERMISSION_MODE_UNSUPPORTED; available profiles: [good]";
         let rpc_agy_err = RpcError::new_profile_error(RpcErrorCode::AgentUnsupported, agy_msg);
         let tool_agy_err = public_error_for_op(rpc_agy_err, "spawn");
         assert_eq!(tool_agy_err.body.code, "agent_unsupported");

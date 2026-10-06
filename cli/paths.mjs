@@ -39,14 +39,24 @@ export function productPaths(home = os.homedir()) {
 
 // Rust `Path::parent()` semantics on Unix, implemented with plain string
 // slicing (never `path.dirname`/`path.join`, which lexically normalise and would
-// fold `..` components away). Trailing separators are ignored, a bare relative
-// name has the empty path as parent (`Some("")`), and a path consisting only of
-// separators (e.g. "/") has no parent (`None`).
+// fold `..` components away). Rust's `Path::components` drops trailing
+// separators and any `.` component that is not the first, so a trailing `.` is
+// not a component of its own: `a/.` has parent `Some("")`, `a/b/.` has parent
+// `Some("a")`, and `/.` is the root with no parent (`None`). `..` is retained.
 function rustPathParent(value) {
   if (value === '') return null;
   let end = value.length;
-  while (end > 1 && value[end - 1] === '/') end -= 1;
+  for (;;) {
+    while (end > 1 && value[end - 1] === '/') end -= 1;
+    const componentStart = value.lastIndexOf('/', end - 1) + 1;
+    if (end - componentStart === 1 && value[componentStart] === '.' && componentStart > 0) {
+      end = componentStart - 1; // drop the non-leading "." and its separator
+      continue;
+    }
+    break;
+  }
   const trimmed = value.slice(0, end);
+  if (trimmed === '') return null; // "/." and friends normalise to the root
   if (/^\/+$/u.test(trimmed)) return null; // root has no parent
   const slash = trimmed.lastIndexOf('/');
   if (slash < 0) return ''; // bare name: parent is Some("")

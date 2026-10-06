@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import path from 'node:path';
 import { CliError } from '../errors.mjs';
 import { profilesDir } from '../paths.mjs';
 
@@ -99,17 +98,121 @@ function trimRust(value) {
   return value.slice(start, end);
 }
 
-// A profile file is strict JSON. `JSON.parse` implements the same grammar the
-// daemon's serde_json uses for every case this scanner distinguishes, with two
-// alignment fixes layered on top:
+// A profile file is strict JSON, and the scanner must reproduce the daemon's
+// `serde_json` decisions. `JSON.parse` differs from serde_json on three points
+// that matter here, so the raw document text is validated *before* parsing.
+// Validating the text (rather than the collapsed object) makes duplicate-key
+// shadowing structurally irrelevant: a shadowed bad value is still visible.
 //   1. lone surrogate escapes (`"\uD800"`) are accepted by `JSON.parse` but
-//      rejected by serde_json, so a decoded document containing an unpaired
-//      surrogate is rejected here as well;
-//   2. a leading UTF-8 BOM is stripped by `TextDecoder` unless `ignoreBOM` is
-//      set, and serde_json rejects a BOM; `scanProfilesDir` therefore preserves
-//      the BOM so that `JSON.parse` fails exactly like serde_json.
+//      rejected by serde_json, so every `\u` escape in a string is paired here
+//      (high D800-DBFF immediately followed by low DC00-DFFF) and an unpaired
+//      escape rejects the whole document;
+//   2. `JSON.parse` accepts lossless integer literals of any magnitude, while
+//      serde_json parses an integer that does not fit `u64`/`i64` as an `f64`
+//      and rejects the document only when that conversion is infinite (de.rs
+//      `parse_exponent_overflow` / `f64_long_from_parts`); every number literal
+//      outside a string is therefore rejected iff `Number(token)` is not finite.
+//      This uses correctly-rounded IEEE rounding; serde_json's default
+//      accumulator can round to infinity within one ulp of `f64::MAX` (a
+//      recorded residual, see S02-HANDOFF).
+//   3. `JSON.parse` has no container-depth limit (it is iterative), while
+//      serde_json starts with `remaining_depth = 128` (de.rs:63) and
+//      `check_recursion` decrements before descending and errors when it reaches
+//      zero (de.rs:1372-1387); the 128th nested `{`/`[` is rejected, so at most
+//      127 containers may nest.
+// A leading UTF-8 BOM is also stripped by `TextDecoder` unless `ignoreBOM` is
+// set, and serde_json rejects a BOM; `scanProfilesDir` therefore preserves the
+// BOM so that `JSON.parse` fails exactly like serde_json.
 const PROFILE_FIELDS = ['name', 'subagent', 'permission_mode', 'model', 'effort', 'developer_instructions'];
 
+// Match a complete JSON number literal (RFC 8259) at the sticky lastIndex.
+const JSON_NUMBER = /-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?/y;
+
+function decodeHex4(text, index) {
+  const hex = text.slice(index, index + 4);
+  if (!/^[0-9a-fA-F]{4}$/u.test(hex)) return null;
+  return parseInt(hex, 16);
+}
+
+// Validate the raw JSON text against serde_json's lexical rules and recursion
+// limit that `JSON.parse` does not enforce. Returns a diagnostic fragment, or
+// null when the text is acceptable. Structural syntax errors are left to
+// `JSON.parse`; this walk only needs to track string/escape state so that
+// braces, digits and `\u` escapes are interpreted in the right context.
+function rawJsonDiagnostic(text) {
+  let inString = false;
+  let depth = 0;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '"') {
+        inString = false;
+        i += 1;
+        continue;
+      }
+      if (ch === '\\') {
+        const esc = text[i + 1];
+        if (esc === 'u') {
+          const code = decodeHex4(text, i + 2);
+          if (code === null) {
+            // Malformed escape: let JSON.parse report the syntax error.
+            i += 2;
+            continue;
+          }
+          if (code >= 0xd800 && code <= 0xdbff) {
+            let paired = false;
+            if (text[i + 6] === '\\' && text[i + 7] === 'u') {
+              const low = decodeHex4(text, i + 8);
+              paired = low !== null && low >= 0xdc00 && low <= 0xdfff;
+            }
+            if (!paired) return 'lone surrogate code point';
+            i += 12; // consume both escapes of a valid surrogate pair
+            continue;
+          }
+          if (code >= 0xdc00 && code <= 0xdfff) return 'lone surrogate code point';
+          i += 6;
+          continue;
+        }
+        // \" \\ \/ \b \f \n \r \t: an escaped backslash never starts a `\u`.
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      depth += 1;
+      if (depth >= 128) return 'recursion limit exceeded';
+      i += 1;
+      continue;
+    }
+    if (ch === '}' || ch === ']') {
+      if (depth > 0) depth -= 1;
+      i += 1;
+      continue;
+    }
+    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      JSON_NUMBER.lastIndex = i;
+      const match = JSON_NUMBER.exec(text);
+      if (match !== null) {
+        if (!Number.isFinite(Number(match[0]))) return `number out of range: ${match[0]}`;
+        i += match[0].length;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  return null;
+}
+
+// A decoded astral character is a legitimate UTF-16 surrogate pair in a JS
+// string; an unpaired code unit is a lone surrogate.
 function containsLoneSurrogate(text) {
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
@@ -124,12 +227,26 @@ function containsLoneSurrogate(text) {
   return false;
 }
 
+// Iterative traversal (never recursive) so an arbitrarily deep decoded value
+// can never raise a `RangeError`; the raw depth gate already rejects documents
+// deeper than serde_json's limit before `JSON.parse` runs.
 function hasLoneSurrogate(value) {
-  if (typeof value === 'string') return containsLoneSurrogate(value);
-  if (Array.isArray(value)) return value.some((entry) => hasLoneSurrogate(entry));
-  if (value !== null && typeof value === 'object') {
-    for (const [key, entry] of Object.entries(value)) {
-      if (containsLoneSurrogate(key) || hasLoneSurrogate(entry)) return true;
+  const stack = [value];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (typeof current === 'string') {
+      if (containsLoneSurrogate(current)) return true;
+      continue;
+    }
+    if (Array.isArray(current)) {
+      for (const entry of current) stack.push(entry);
+      continue;
+    }
+    if (current !== null && typeof current === 'object') {
+      for (const [key, entry] of Object.entries(current)) {
+        if (containsLoneSurrogate(key)) return true;
+        stack.push(entry);
+      }
     }
   }
   return false;
@@ -148,6 +265,9 @@ function invalidJson(diagnostic) {
 // optional field a string or null) and a usable name. Field *value* validation
 // (for example the permission_mode enum) is deliberately left to the daemon.
 export function scanProfileJson(content, filePath = '<unknown>') {
+  const rawDiagnostic = rawJsonDiagnostic(content);
+  if (rawDiagnostic !== null) return invalidJson(`${rawDiagnostic} in ${filePath}`);
+
   let value;
   try {
     value = JSON.parse(content);
@@ -219,6 +339,15 @@ function rustExtension(fileName) {
   return fileName.slice(dot + 1);
 }
 
+// Build a child path by string concatenation, never `path.join`, which
+// lexically folds `..` away. Mirrors Rust `Path::join` for the shapes produced
+// by `profilesDir` (an empty directory yields the bare name).
+function joinChild(dir, name) {
+  if (dir === '') return name;
+  if (dir.endsWith('/')) return dir + name;
+  return `${dir}/${name}`;
+}
+
 export function scanProfilesDir(dir) {
   const profiles = new Map();
   const fileErrors = [];
@@ -243,7 +372,7 @@ export function scanProfilesDir(dir) {
       // yields "json" (case-sensitive) from the file name, so a file named
       // exactly ".json" has no extension and is never a candidate.
       if (rustExtension(entry.name) !== 'json') continue;
-      const full = path.join(dir, entry.name);
+      const full = joinChild(dir, entry.name);
       // The daemon selects candidates with `Path::is_file()`, which follows
       // symbolic links; `Dirent.isFile()` does not. Use stat, and silently
       // skip entries that stat cannot resolve (e.g. dangling links), matching
