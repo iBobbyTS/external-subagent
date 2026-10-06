@@ -36,6 +36,32 @@ export function productPaths(home = os.homedir()) {
 // daemon loads no profiles directory at all; return null to represent that.
 // Otherwise take the sibling `profiles/` of the config file, or fall back to the
 // product data directory.
+
+// Rust `Path::parent()` semantics on Unix, implemented with plain string
+// slicing (never `path.dirname`/`path.join`, which lexically normalise and would
+// fold `..` components away). Trailing separators are ignored, a bare relative
+// name has the empty path as parent (`Some("")`), and a path consisting only of
+// separators (e.g. "/") has no parent (`None`).
+function rustPathParent(value) {
+  if (value === '') return null;
+  let end = value.length;
+  while (end > 1 && value[end - 1] === '/') end -= 1;
+  const trimmed = value.slice(0, end);
+  if (/^\/+$/u.test(trimmed)) return null; // root has no parent
+  const slash = trimmed.lastIndexOf('/');
+  if (slash < 0) return ''; // bare name: parent is Some("")
+  if (slash === 0) return '/';
+  return trimmed.slice(0, slash);
+}
+
+// Rust `Path::parent().join("profiles")` without normalisation: appending to the
+// empty path yields "profiles", and existing `..`/`.` components are preserved.
+function joinProfiles(parent) {
+  if (parent === '') return 'profiles';
+  if (parent === '/') return '/profiles';
+  return `${parent}/profiles`;
+}
+
 export function profilesDir(env = {}, home = os.homedir()) {
   const names = ['EXTERNAL_SUBAGENT_CONFIG', 'ZCODE_AGENT_CONFIG'];
   let envPath;
@@ -48,8 +74,7 @@ export function profilesDir(env = {}, home = os.homedir()) {
     }
   }
   if (!exported) return path.join(productPaths(home).data, 'profiles');
-  if (envPath === '') return null;
-  const parent = path.dirname(envPath);
-  if (parent === envPath) return null; // e.g. "/" has no parent in Rust
-  return path.join(parent, 'profiles');
+  const parent = rustPathParent(envPath);
+  if (parent === null) return null;
+  return joinProfiles(parent);
 }
