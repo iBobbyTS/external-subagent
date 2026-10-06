@@ -91,6 +91,52 @@ stale or missing binaries) and `postpack` runs the static tarball checks. A
 development checkout packs the same way (`npm pack` after `cargo` is
 available); see [docs/operations.md](docs/operations.md) for release checks.
 
+## Spawn profiles
+
+A spawn profile is a named JSON preset for the spawn inputs, stored as one
+JSON file per profile in the `profiles/` directory next to `config.json`
+(`~/Library/Application Support/external-subagent/profiles/` by default;
+`profile list` reports the exact path in use). Every `*.json` file in the
+directory is discovered by its `name` field; the same name defined in two
+files is rejected, and invalid files are reported as warnings and excluded
+from the available set.
+
+```json
+{
+  "name": "codex-yolo",
+  "subagent": "codex",
+  "model": "gpt-5",
+  "permission_mode": "yolo",
+  "developer_instructions": "Always reply in English."
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Required, unique across files; trimmed, non-empty, at most 128 bytes |
+| `subagent` | `zcode`, `dsh`, `codex`, or `agy` |
+| `model` | Model token, named per target: `dsh` wants `provider:model`, `zcode` accepts `provider/model` or a bare token, `codex` and `agy` take a bare slug |
+| `effort` | Effort token; some runtime models require one (for example `agy` rejects `gemini-3.8-flash` without `--effort`) and the spawn error surfaces the runtime's message verbatim |
+| `permission_mode` | `build`, `edit`, `plan`, or `yolo`; defaults to `build` when unset |
+| `developer_instructions` | Free-form instructions, delivered as described below |
+
+`--profile` cannot be combined with `--subagent`, `--model`, `--effort`, or
+`--permission_mode`; put those in the profile JSON or omit `profile`. Fields
+left out of the profile fall back to the same defaults as an unprofiled
+spawn. `developer_instructions` rides the codex runtime's native
+`developerInstructions` channel when the effective subagent is `codex`; every
+other subagent receives it silently concatenated in front of the prompt:
+
+```
+Developer Instructions: {developer_instructions}
+----------
+{prompt}
+```
+
+Inspect what is loaded with `external-subagent profile list` and
+`external-subagent profile show <name>`; an empty `profile list` result
+carries a `hint` field with this format summary.
+
 ## Publishing
 
 Releases publish from CI via npm Trusted Publishing (OIDC): pushing a `vX.Y.Z`

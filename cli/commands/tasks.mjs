@@ -499,6 +499,13 @@ export function parseProfileArgs(args) {
   throw new CliError('INVALID_ARGUMENT', `unsupported profile operation: ${operation}`, 2);
 }
 
+// Attached to `profile list` only when no usable profile exists, so a fresh
+// installation sees the format reference instead of an unexplained empty list.
+const EMPTY_PROFILES_HINT = 'no profiles found; create one JSON file per profile in this directory, '
+  + 'e.g. {"name":"codex-yolo","subagent":"codex","model":"gpt-5","permission_mode":"yolo"}; '
+  + 'fields: name (required), subagent, model, effort, permission_mode (build|edit|plan|yolo), '
+  + 'developer_instructions; see the "Spawn profiles" section of README.md';
+
 export function profileCommand(paths, inputOrArgs, env = process.env) {
   const input = Array.isArray(inputOrArgs) ? parseProfileArgs(inputOrArgs) : inputOrArgs;
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
@@ -526,6 +533,7 @@ export function profileCommand(paths, inputOrArgs, env = process.env) {
         profiles: [],
         warnings: [],
         message: `profiles directory does not exist: ${dir}`,
+        hint: EMPTY_PROFILES_HINT,
       };
     }
     return {
@@ -533,6 +541,7 @@ export function profileCommand(paths, inputOrArgs, env = process.env) {
       directory: dir,
       profiles: scanned.availableNames,
       warnings: scanned.warnings.map((w) => ({ file: w.file, diagnostic: w.diagnostic })),
+      ...(scanned.availableNames.length === 0 ? { hint: EMPTY_PROFILES_HINT } : {}),
     };
   }
 

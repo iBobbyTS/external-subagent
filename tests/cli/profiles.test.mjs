@@ -248,6 +248,8 @@ test('AC3: missing profiles directory returns empty list with path note', () => 
   assert.deepEqual(res.profiles, []);
   assert.deepEqual(res.warnings, []);
   assert.match(res.message, /profiles directory does not exist/u);
+  assert.match(res.hint, /no profiles found/u);
+  assert.match(res.hint, /"Spawn profiles"/u);
   assert.ok(res.directory.endsWith(path.join('Application Support', 'external-subagent', 'profiles')));
 
   // show on missing directory
@@ -269,6 +271,25 @@ test('AC3: empty profiles directory returns empty list', () => {
   assert.equal(res.operation, 'list');
   assert.deepEqual(res.profiles, []);
   assert.deepEqual(res.warnings, []);
+  assert.match(res.hint, /no profiles found/u);
+  assert.match(res.hint, /"name":"codex-yolo"/u);
+  fs.rmSync(paths.home, { recursive: true, force: true });
+});
+
+test('AC3: hint appears when every file is invalid and is absent once a profile is usable', () => {
+  const { paths, profilesDir } = createTempEnv();
+
+  fs.writeFileSync(path.join(profilesDir, 'broken.json'), '{"name": "broken"');
+  const invalidOnly = listProfiles(paths);
+  assert.deepEqual(invalidOnly.profiles, []);
+  assert.equal(invalidOnly.warnings.length, 1);
+  assert.match(invalidOnly.hint, /no profiles found/u);
+
+  fs.writeFileSync(path.join(profilesDir, 'good.json'), '{"name":"usable","subagent":"codex"}');
+  const withUsable = listProfiles(paths);
+  assert.deepEqual(withUsable.profiles, ['usable']);
+  assert.equal(Object.hasOwn(withUsable, 'hint'), false);
+
   fs.rmSync(paths.home, { recursive: true, force: true });
 });
 
@@ -298,6 +319,7 @@ test('AC3: warnings are reported and problematic files excluded from available p
   const listRes = listProfiles(paths);
   assert.deepEqual(listRes.profiles, ['valid-profile']);
   assert.equal(listRes.warnings.length, 9);
+  assert.equal(Object.hasOwn(listRes, 'hint'), false);
   assert.ok(listRes.warnings.some((w) => w.file.endsWith('broken.json') && w.diagnostic.includes('invalid JSON')));
   assert.ok(listRes.warnings.some((w) => w.file.endsWith('unknown_key.json') && w.diagnostic.includes('unknown top-level key')));
   assert.ok(listRes.warnings.some((w) => w.file.endsWith('no_name.json') && w.diagnostic.includes('missing required field')));
