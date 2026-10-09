@@ -8,7 +8,7 @@ import test from 'node:test';
 
 import { CliError } from '../../cli/errors.mjs';
 import { HELP, main } from '../../cli/main.mjs';
-import { productPaths, profilesDir } from '../../cli/paths.mjs';
+import { productPaths, profilesDir, platform } from '../../cli/paths.mjs';
 import { callDaemon } from '../../cli/rpc.mjs';
 import {
   parseSpawnArgs,
@@ -42,6 +42,14 @@ function createTempEnv() {
   const profilesPath = path.join(paths.data, 'profiles');
   fs.mkdirSync(profilesPath, { recursive: true });
   return { home, paths, profilesDir: profilesPath };
+}
+
+// The product data profiles directory for the host layout: macOS
+// `~/Library/Application Support`, else the XDG data root.
+function expectedProfilesDir(home) {
+  return platform() === 'darwin'
+    ? path.join(home, 'Library', 'Application Support', 'external-subagent', 'profiles')
+    : path.join(home, '.local', 'share', 'external-subagent', 'profiles');
 }
 
 function listProfiles(paths, env = NO_ENV) {
@@ -250,7 +258,8 @@ test('AC3: missing profiles directory returns empty list with path note', () => 
   assert.match(res.message, /profiles directory does not exist/u);
   assert.match(res.hint, /no profiles found/u);
   assert.match(res.hint, /"Spawn profiles"/u);
-  assert.ok(res.directory.endsWith(path.join('Application Support', 'external-subagent', 'profiles')));
+  assert.ok(res.directory.endsWith(path.join('external-subagent', 'profiles')));
+  assert.equal(res.directory, expectedProfilesDir(home));
 
   // show on missing directory
   assert.throws(
@@ -397,10 +406,10 @@ test('AC3: directory resolution mirrors daemon env priority', () => {
   const resolved2 = profilesDir({ ZCODE_AGENT_CONFIG: configPath });
   assert.equal(resolved2, siblingProfiles);
 
-  // 3. Fallback when neither env is set
+  // 3. Fallback when neither env is set (host product data directory)
   const home = '/Users/fakehome';
   const resolvedFallback = profilesDir({}, home);
-  assert.equal(resolvedFallback, path.join(home, 'Library', 'Application Support', 'external-subagent', 'profiles'));
+  assert.equal(resolvedFallback, expectedProfilesDir(home));
 
   fs.rmSync(customConfigDir, { recursive: true, force: true });
 });

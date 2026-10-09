@@ -9,16 +9,24 @@ import { stageDebugPlugin } from '../../scripts/release/stage-debug-plugin.mjs';
 import { installMcp } from '../../cli/install/codex.mjs';
 import { installZcodePlugin } from '../../cli/install/zcode.mjs';
 import { productPaths } from '../../cli/paths.mjs';
-import { pluginSourceRoot } from '../../cli/install/layout.mjs';
+import { nativePlatform, pluginSourceRoot } from '../../cli/install/layout.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
+
+// The staged payload directory follows the host tuple (S01), independent of the
+// layout seam; the released payload and its debug twin live under the same
+// platform directory name.
+const hostPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;
 
 function moduleUrl(relative) {
   return JSON.stringify(pathToFileURL(path.join(repoRoot, relative)).href);
 }
 
 // constants.mjs reads the variant token at module load, so every variant
-// assertion runs in a child process with the env set before import.
+// assertion runs in a child process with the env set before import.  The
+// darwin test-platform seam pins the *layout* under test to the frozen macOS
+// tree (the XDG layout is covered by tests/platform/linux.test.mjs), so this
+// suite stays host-independent.
 function variantProbe(extraEnv, home) {
   const code = `
     const constants = await import(${moduleUrl('cli/constants.mjs')});
@@ -42,7 +50,7 @@ function variantProbe(extraEnv, home) {
   `;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
     encoding: 'utf8',
-    env: { ...process.env, ...extraEnv },
+    env: { ...process.env, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', ...extraEnv },
   });
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
@@ -54,7 +62,7 @@ test('release variant keeps the released identity', () => {
   assert.equal(probe.productId, 'external_subagent');
   assert.equal(probe.label, 'com.external-subagent.daemon');
   assert.deepEqual([...probe.binaries], ['external-subagentd', 'external-subagent-mcp']);
-  assert.ok(probe.payloadDir.endsWith(path.join('npm', 'native', 'darwin-arm64')), probe.payloadDir);
+  assert.ok(probe.payloadDir.endsWith(path.join('npm', 'native', hostPlatform)), probe.payloadDir);
   assert.ok(probe.data.endsWith(path.join('Application Support', 'external-subagent')), probe.data);
   assert.ok(probe.socket.endsWith('external-subagent.sock'), probe.socket);
   assert.ok(probe.pluginSource.endsWith(path.join('plugins', 'codex', 'external-subagent')), probe.pluginSource);
@@ -69,7 +77,7 @@ test('debug variant derives a fully parallel identity', () => {
   assert.equal(probe.daemonBin, 'external-subagent-debugd');
   assert.equal(probe.mcpBin, 'external-subagent-debug-mcp');
   assert.deepEqual([...probe.binaries], ['external-subagent-debugd', 'external-subagent-debug-mcp']);
-  assert.ok(probe.payloadDir.endsWith(path.join('npm', 'native-debug', 'darwin-arm64')), probe.payloadDir);
+  assert.ok(probe.payloadDir.endsWith(path.join('npm', 'native-debug', hostPlatform)), probe.payloadDir);
   assert.ok(probe.data.endsWith(path.join('Application Support', 'external-subagent-debug')), probe.data);
   assert.ok(probe.socket.endsWith('external-subagent-debug.sock'), probe.socket);
   assert.ok(probe.launchAgent.endsWith('com.external-subagent-debug.daemon.plist'), probe.launchAgent);
@@ -144,16 +152,20 @@ test('zcode binding accepts the debug plugin beside the release plugin', () => {
 
     const debugStaging = path.join(home, 'stage-debug');
     const script = path.join(home, 'debug-install-plugin.mjs');
+    // The child reports its own debug socket so the assertion is
+    // host-independent: the release paths above resolve the host layout, the
+    // debug child derives the same layout for the parallel debug identity.
     fs.writeFileSync(script, `
       process.env.EXTERNAL_SUBAGENT_VARIANT = 'debug';
       const { installZcodePlugin } = await import(${moduleUrl('cli/install/zcode.mjs')});
       const { productPaths } = await import(${moduleUrl('cli/paths.mjs')});
-      const result = installZcodePlugin(productPaths(${JSON.stringify(home)}), {
+      const paths = productPaths(${JSON.stringify(home)});
+      const result = installZcodePlugin(paths, {
         source: ${JSON.stringify(debugSource)},
         stagingPath: ${JSON.stringify(debugStaging)},
         configPath: ${JSON.stringify(config)},
       });
-      process.stdout.write(JSON.stringify({ installed: result.installed, plugin_id: result.plugin_id }));
+      process.stdout.write(JSON.stringify({ installed: result.installed, plugin_id: result.plugin_id, socket: paths.socket }));
     `);
     const run = spawnSync(process.execPath, [script], { encoding: 'utf8' });
     assert.equal(run.status, 0, run.stderr);
@@ -166,16 +178,10 @@ test('zcode binding accepts the debug plugin beside the release plugin', () => {
     const releaseServer = JSON.parse(fs.readFileSync(path.join(releaseStaging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
     const debugServer = JSON.parse(fs.readFileSync(path.join(debugStaging, '.mcp.json'), 'utf8')).mcpServers.external_subagent;
     assert.equal(releaseServer.env.EXTERNAL_SUBAGENT_SOCKET, releasePaths.socket);
-    assert.equal(debugServer.env.EXTERNAL_SUBAGENT_SOCKET, productPathsVariantDebug(home));
+    assert.equal(debugServer.env.EXTERNAL_SUBAGENT_SOCKET, debug.socket);
     assert.notEqual(releaseServer.env.EXTERNAL_SUBAGENT_SOCKET, debugServer.env.EXTERNAL_SUBAGENT_SOCKET);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(debugSource, { recursive: true, force: true });
   }
 });
-
-// Expected debug socket computed out-of-process so this test file stays a
-// release-variant module; the string is stable by construction.
-function productPathsVariantDebug(home) {
-  return path.join(home, 'Library', 'Application Support', 'external-subagent-debug', 'external-subagent-debug.sock');
-}

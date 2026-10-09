@@ -9,8 +9,9 @@ import { subagentsCommand } from '../../cli/commands/agents.mjs';
 import { parseSubagentsArgs } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
+import { lockHelperInvocation } from '../../cli/config/write.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from '../../cli/commands/tasks.mjs';
-import { productPaths } from '../../cli/paths.mjs';
+import { productPaths, platform } from '../../cli/paths.mjs';
 import { launchAgentPlist } from '../../cli/install/service-macos.mjs';
 
 function fixture() { const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-')); return { home, paths: productPaths(home) }; }
@@ -70,23 +71,32 @@ test('legacy read preserves bytes and next locked write persists only canonical 
 });
 
 test('config writes regenerate an installed service definition and never create one', () => {
+  // The launchd plist is regenerated on macOS only; the Linux systemd unit is
+  // owned by the S03 service backend, so a Linux config write must not emit a
+  // plist to the unit path.
+  const macos = platform() === 'darwin';
   const stale = fixture();
   fs.mkdirSync(path.dirname(stale.paths.config), { recursive: true });
   fs.writeFileSync(stale.paths.config, JSON.stringify({ schema_version: 2, revision: 21, subagents: { codex: { home: '/stale/codex-home' } } }));
   fs.mkdirSync(path.dirname(stale.paths.launchAgent), { recursive: true });
-  fs.writeFileSync(stale.paths.launchAgent, Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>/gone/external-subagentd</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HOME</key><string>/stale/codex-home</string><key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>21</string><key>USER_ADDED_KEY</key><string>dropped-by-regeneration</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`), { mode: 0o600 });
+  const staleDefinition = Buffer.from(`<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>com.external-subagent.daemon</string>\n<key>ProgramArguments</key><array><string>/gone/external-subagentd</string></array>\n<key>EnvironmentVariables</key><dict><key>CODEX_HOME</key><string>/stale/codex-home</string><key>EXTERNAL_SUBAGENT_CONFIG_REVISION</key><string>21</string><key>USER_ADDED_KEY</key><string>dropped-by-regeneration</string></dict>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n`);
+  fs.writeFileSync(stale.paths.launchAgent, staleDefinition, { mode: 0o600 });
 
   const result = configCommand(stale.paths, parseConfigArgs(['set', 'subagents.codex.home', '/fresh/codex-home']));
-  assert.equal(result.service_definition_refreshed, true, 'an installed definition is regenerated on config writes');
+  assert.equal(result.service_definition_refreshed, macos, 'the service definition is regenerated on macOS only');
   assert.equal(result.config.revision, 22);
-  const text = fs.readFileSync(stale.paths.launchAgent, 'utf8');
-  assert.match(text, /<key>CODEX_HOME<\/key><string>\/fresh\/codex-home<\/string>/);
-  assert.match(text, /<key>EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>22<\/string>/);
-  assert.doesNotMatch(text, /USER_ADDED_KEY/);
-  assert.doesNotMatch(text, /\/stale\/codex-home/);
-  // The regenerated definition re-derives the daemon entry from the installed
-  // package, not from the previous plist's program.
-  assert.doesNotMatch(text, /\/gone\/external-subagentd/);
+  if (macos) {
+    const text = fs.readFileSync(stale.paths.launchAgent, 'utf8');
+    assert.match(text, /<key>CODEX_HOME<\/key><string>\/fresh\/codex-home<\/string>/);
+    assert.match(text, /<key>EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>22<\/string>/);
+    assert.doesNotMatch(text, /USER_ADDED_KEY/);
+    assert.doesNotMatch(text, /\/stale\/codex-home/);
+    // The regenerated definition re-derives the daemon entry from the installed
+    // package, not from the previous plist's program.
+    assert.doesNotMatch(text, /\/gone\/external-subagentd/);
+  } else {
+    assert.deepEqual(fs.readFileSync(stale.paths.launchAgent), staleDefinition, 'a Linux config write leaves the service definition untouched');
+  }
 
   const absent = fixture();
   fs.mkdirSync(path.dirname(absent.paths.config), { recursive: true });
@@ -337,6 +347,25 @@ test('config writer recovers a stale lock from a dead owner', () => {
   const result = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
   assert.equal(result.revision, 5);
   assert.equal(result.default_subagent, 'zcode');
+});
+
+test('config lock backend derives from the host OS with an equivalent contract', () => {
+  // macOS lockf and Linux flock both run a command under an exclusive lock and
+  // give up after a 2s wait; only the binary and its timeout flag differ, so
+  // the timeout and mutual-exclusion semantics stay equivalent.
+  const darwin = lockHelperInvocation('/tmp/lock', '/tmp/ready', 'darwin');
+  assert.equal(darwin.command, '/usr/bin/lockf');
+  assert.deepEqual(darwin.args.slice(0, 2), ['-t', '2']);
+  const linux = lockHelperInvocation('/tmp/lock', '/tmp/ready', 'linux');
+  assert.equal(linux.command, '/usr/bin/flock');
+  assert.deepEqual(linux.args.slice(0, 2), ['-w', '2']);
+  assert.deepEqual(darwin.args.slice(3), linux.args.slice(3), 'both run the same ready/held lock command');
+
+  // A real write on this host succeeds through that backend.
+  const { paths } = fixture();
+  const written = configCommand(paths, { operation: 'set', patch: { default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } } }).config;
+  assert.equal(written.revision, 1);
+  assert.equal(written.default_subagent, 'zcode');
 });
 
 test('unknown config fields and operations fail closed', () => {

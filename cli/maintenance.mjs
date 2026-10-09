@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { CliError } from './errors.mjs';
 import { jsonBytes, sha256 } from './fs-atomic.mjs';
-import { productPaths } from './paths.mjs';
+import { platform, productPaths } from './paths.mjs';
 import { bootoutService } from './install/service-macos.mjs';
 
 function copyTree(source, destination, records, root = source) {
@@ -82,13 +82,20 @@ function removeOne(target) {
 // removal-confirmation bootoutService owns — before its definition file is
 // removed.  A service that is not registered is not an error (idempotent
 // uninstall); a bootout that cannot complete fails the command rather than
-// deleting the definition out from under a still-running service.
+// deleting the definition out from under a still-running service.  The
+// launchd bootout and the `removed_launch_agent` field are macOS-only; on
+// Linux the systemd stop and `removed_service_definition` are wired by S03,
+// and S02 removes the definition file without inventing a launchd result.
 export function uninstall(paths = productPaths(), options = {}) {
-  const service = bootoutService(paths, process.getuid(), options);
+  const macos = platform() === 'darwin';
+  const service = macos
+    ? bootoutService(paths, process.getuid(), options)
+    : { already_stopped: true, skipped: true, reason: 'systemd service backend is wired in S03' };
+  const removed = removeOne(paths.launchAgent);
   return {
     service_stopped: true,
     service_already_stopped: Boolean(service.already_stopped),
-    removed_launch_agent: removeOne(paths.launchAgent),
+    ...(macos ? { removed_launch_agent: removed } : { removed_service_definition: removed }),
     data_retained: true,
     data: paths.data,
   };

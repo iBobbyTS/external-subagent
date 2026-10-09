@@ -59,12 +59,58 @@ const PROFILE_FIELDS: [&str; 6] = [
     "developer_instructions",
 ];
 
-/// Locates the global profiles directory from configuration environment variables.
+/// Locates the global profiles directory, mirroring `profilesDir` in
+/// `cli/paths.mjs` byte-for-byte.
+///
+/// `EXTERNAL_SUBAGENT_CONFIG` wins over `ZCODE_AGENT_CONFIG`, selected by
+/// presence (an exported empty value has no parent and disables profiles, the
+/// same `Path::parent()` rule the CLI's `rustPathParent` reproduces). When
+/// neither variable is exported, fall back to the product data directory so
+/// both sides resolve one directory: `~/Library/Application Support/<product>`
+/// on macOS, and `$XDG_DATA_HOME/<product>` (defaulting to
+/// `~/.local/share`) elsewhere.
 pub fn profiles_directory() -> Option<PathBuf> {
-    let env_path = env::var_os("EXTERNAL_SUBAGENT_CONFIG")
-        .or_else(|| env::var_os("ZCODE_AGENT_CONFIG"))?;
-    let path = PathBuf::from(env_path);
-    path.parent().map(|p| p.join("profiles"))
+    if let Some(env_path) =
+        env::var_os("EXTERNAL_SUBAGENT_CONFIG").or_else(|| env::var_os("ZCODE_AGENT_CONFIG"))
+    {
+        let path = PathBuf::from(env_path);
+        return path.parent().map(|p| p.join("profiles"));
+    }
+    default_data_root().map(|root| root.join("profiles"))
+}
+
+/// Released product name; mirrors `PRODUCT_NAME` in `cli/constants.mjs`. The
+/// debug variant always receives an explicit `EXTERNAL_SUBAGENT_CONFIG`, so
+/// this fallback is only reached for the released identity.
+const PRODUCT_NAME: &str = "external-subagent";
+
+/// XDG data base directory for the current user, per the specification: an
+/// exported absolute `XDG_DATA_HOME` wins, and an empty or relative value is
+/// ignored in favour of `$HOME/.local/share`.
+#[cfg(not(target_os = "macos"))]
+fn xdg_data_home(home: &Path) -> PathBuf {
+    env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local").join("share"))
+}
+
+/// Default product data directory under the current `$HOME`, matching the
+/// CLI's platform dispatch in `cli/paths.mjs`.
+#[cfg(target_os = "macos")]
+fn default_data_root() -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME")?);
+    Some(
+        home.join("Library")
+            .join("Application Support")
+            .join(PRODUCT_NAME),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_data_root() -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME")?);
+    Some(xdg_data_home(&home).join(PRODUCT_NAME))
 }
 
 pub const PROFILE_ERROR_ENVELOPE_OVERHEAD: usize = 8192;
@@ -703,6 +749,81 @@ pub fn load_profile(name: &str) -> Result<Profile, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon side of the CLI/daemon profiles alignment: an exported
+    /// config path keeps its sibling `profiles/`; with no exported path the
+    /// platform data root applies, and an absolute `XDG_DATA_HOME` overrides
+    /// the `$HOME` fallback on Linux. `config_env_guard` serializes the
+    /// environment mutation against the other env-sensitive tests.
+    #[test]
+    fn profiles_directory_prefers_env_sibling_then_platform_data_root() {
+        use crate::rpc::agents::admission_fixtures::config_env_guard;
+
+        let _guard = config_env_guard();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = env::var_os("HOME");
+        let previous_xdg = env::var_os("XDG_DATA_HOME");
+        env::set_var("HOME", home.path());
+
+        // An exported sibling config wins, preserving the existing contract.
+        let config = home.path().join("custom").join("agents.json");
+        env::set_var("EXTERNAL_SUBAGENT_CONFIG", &config);
+        assert_eq!(
+            profiles_directory(),
+            Some(home.path().join("custom").join("profiles"))
+        );
+        env::remove_var("EXTERNAL_SUBAGENT_CONFIG");
+
+        // No exported config: the platform data root resolves the fallback.
+        env::remove_var("XDG_DATA_HOME");
+        #[cfg(target_os = "macos")]
+        let expected = home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("external-subagent")
+            .join("profiles");
+        #[cfg(not(target_os = "macos"))]
+        let expected = home
+            .path()
+            .join(".local")
+            .join("share")
+            .join("external-subagent")
+            .join("profiles");
+        assert_eq!(profiles_directory(), Some(expected));
+
+        // Linux obeys XDG_DATA_HOME (absolute wins, relative is ignored).
+        #[cfg(not(target_os = "macos"))]
+        {
+            let xdg = home.path().join("xdg-data");
+            env::set_var("XDG_DATA_HOME", &xdg);
+            assert_eq!(
+                profiles_directory(),
+                Some(xdg.join("external-subagent").join("profiles"))
+            );
+            env::set_var("XDG_DATA_HOME", "relative/data");
+            assert_eq!(
+                profiles_directory(),
+                Some(
+                    home.path()
+                        .join(".local")
+                        .join("share")
+                        .join("external-subagent")
+                        .join("profiles")
+                )
+            );
+            env::remove_var("XDG_DATA_HOME");
+        }
+
+        match previous_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
+        match previous_xdg {
+            Some(value) => env::set_var("XDG_DATA_HOME", value),
+            None => env::remove_var("XDG_DATA_HOME"),
+        }
+    }
 
     #[test]
     fn parse_valid_profile_with_all_fields() {

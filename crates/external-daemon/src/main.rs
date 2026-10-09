@@ -401,6 +401,12 @@ fn parse_config() -> io::Result<Config> {
             "EXTERNAL_SUBAGENT_STORE or --database is required",
         )
     })?)?;
+    // The default agent config is the sibling `config.json` of the resolved
+    // database. The service passes `--database <data>/<product>.sqlite3`
+    // (macOS `~/Library/Application Support`, Linux XDG data), so this stays
+    // platform-agnostic and matches the CLI's product data directory; exported
+    // below as `EXTERNAL_SUBAGENT_CONFIG`, it also drives the profiles directory
+    // resolution in rpc/profiles.rs.
     let agent_config =
         agent_config.or_else(|| database.parent().map(|parent| parent.join("config.json")));
     let socket = absolute_path(socket.ok_or_else(|| {

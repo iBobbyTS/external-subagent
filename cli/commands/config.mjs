@@ -5,6 +5,7 @@ import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { hasInstalledService } from '../install/service-activation.mjs';
 import { launchAgentPlist } from '../install/service-macos.mjs';
+import { platform } from '../paths.mjs';
 
 const CONFIG_INPUT_FIELDS = new Set(['operation', 'patch', 'key']);
 const GET_KEYS = new Set([
@@ -94,8 +95,12 @@ export function parseConfigArgs(args) {
 // launchd (subagent homes, config revision), so every successful write also
 // regenerates the service definition from the new config.  Only the file is
 // rewritten — launchd picks the environment up at its next load, so a running
-// daemon is never restarted or disturbed here.
+// daemon is never restarted or disturbed here.  The launchd plist is macOS
+// only; the Linux systemd unit is re-rendered by the S03 service backend, so a
+// Linux config write refreshes nothing yet instead of writing a plist to the
+// unit path.
 function refreshServiceDefinition(paths) {
+  if (platform() !== 'darwin') return false;
   if (!hasInstalledService(paths)) return false;
   atomicWrite(paths.launchAgent, launchAgentPlist(paths), 0o600);
   return true;

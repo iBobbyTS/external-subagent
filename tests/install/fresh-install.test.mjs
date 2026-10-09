@@ -24,9 +24,16 @@ import { spawn, spawnSync } from 'node:child_process';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
+import { nativePlatform } from '../../cli/install/layout.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
+// The staged payload directory is the host tuple (S01); the acceptance fixture
+// is macOS-arm64-gated today, so this resolves to `darwin-arm64` on the gate
+// and stays correct if the gate ever widens to Linux (the service assertions
+// below remain macOS-specific until the S03 systemd backend lands).
+const PAYLOAD_PLATFORM = nativePlatform() ?? `${process.platform}-${process.arch}`;
+const PAYLOAD_DIR = ['npm', 'native', PAYLOAD_PLATFORM];
 
 // The user debug constraint: this feature builds only the debug profile, and
 // the shared payload entry reads the profile from EXTERNAL_SUBAGENT_CARGO_PROFILE.
@@ -141,7 +148,7 @@ async function doInstall() {
   ctx.packageRoot = path.join(ctx.prefix, 'lib', 'node_modules', 'external-subagent');
   ctx.cli = path.join(ctx.prefix, 'bin', 'external-subagent');
   ctx.mcpFacade = path.join(ctx.prefix, 'bin', 'external-subagent-mcp');
-  ctx.daemon = path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagentd');
+  ctx.daemon = path.join(ctx.packageRoot, ...PAYLOAD_DIR, 'external-subagentd');
 
   const installHome = path.join(ctx.workDir, 'install-home');
   fs.mkdirSync(installHome, { recursive: true });
@@ -168,11 +175,11 @@ test('install-only stages the package and payload without touching the home', { 
   assert.equal(installedPackage.scripts?.postinstall, 'node cli/install/npm-hook.mjs',
     'postinstall must only run the stage-only-safe coordination bridge');
 
-  const payload = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
+  const payload = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, ...PAYLOAD_DIR, 'payload.json'), 'utf8'));
   assert.equal(payload.version, installedPackage.version, 'payload version must match the package version');
-  assert.equal(payload.platform, 'darwin-arm64');
+  assert.equal(payload.platform, PAYLOAD_PLATFORM);
   for (const file of payload.files) {
-    const target = path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', file.name);
+    const target = path.join(ctx.packageRoot, ...PAYLOAD_DIR, file.name);
     const stat = fs.statSync(target);
     assert.equal(stat.mode & 0o777, 0o755, `${file.name} must keep release permissions`);
     const bytes = fs.readFileSync(target);
@@ -248,7 +255,7 @@ test('explicit init installs the standalone service only and binds no host', { s
   const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
   assert.equal(state.schema_version, 2, 'a successful verified init publishes the activation state');
   assert.equal(state.active.version, report.payload.version);
-  const manifest = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'payload.json'), 'utf8'));
+  const manifest = JSON.parse(fs.readFileSync(path.join(ctx.packageRoot, ...PAYLOAD_DIR, 'payload.json'), 'utf8'));
   const daemonSha = manifest.files.find((file) => file.name === 'external-subagentd').sha256;
   assert.equal(state.active.daemon_entry_sha256, daemonSha);
   const retained = path.join(data, 'payload-store', report.payload.version, 'external-subagentd');
@@ -297,7 +304,7 @@ test('an explicit install-plugin after standalone init binds the codex host and 
   const staged = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
   // Node resolves the CLI through its realpath (/private/var under tmpdirs),
   // which is the stable entry the staging must pin.
-  assert.equal(staged.mcpServers.external_subagent.command, fs.realpathSync(path.join(ctx.packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagent-mcp')));
+  assert.equal(staged.mcpServers.external_subagent.command, fs.realpathSync(path.join(ctx.packageRoot, ...PAYLOAD_DIR, 'external-subagent-mcp')));
   assert.equal(staged.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, path.join(home, 'Library', 'Application Support', 'external-subagent', 'external-subagent.sock'));
 
   const calls = fs.readFileSync(fake.log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));

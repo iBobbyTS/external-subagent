@@ -9,7 +9,13 @@ import { loadCodexHomes, registerCodexHome } from '../../cli/install/reconcile.m
 import { bootstrapService, bootoutService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
 import { runInit } from '../../cli/install/init.mjs';
 import { CliError } from '../../cli/errors.mjs';
-import { productPaths } from '../../cli/paths.mjs';
+import { productPaths, platform } from '../../cli/paths.mjs';
+
+// The launchd bootout/removal-confirmation behaviour is macOS-only; on Linux the
+// equivalent systemd backend is wired by S03, so those backend-specific tests
+// are host-gated. Path/layout and data-retention assertions stay host-neutral.
+const macos = platform() === 'darwin';
+const removedServiceDefinition = macos ? 'removed_launch_agent' : 'removed_service_definition';
 
 test('backup verifies bytes and restore replaces product data', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-data-'));
@@ -58,13 +64,14 @@ test('uninstall retains data, while purge is an explicit separate operation', ()
   assert.equal(result.data_retained, true);
   assert.equal(result.service_stopped, true);
   assert.equal(result.service_already_stopped, true, 'an unregistered service is not an uninstall error');
+  assert.equal(result[removedServiceDefinition], true, 'the service definition is removed');
   assert.equal(fs.existsSync(paths.data), true);
   assert.equal(fs.existsSync(paths.launchAgent), false);
   purge(paths);
   assert.equal(fs.existsSync(paths.data), false);
 });
 
-test('uninstall boots out the loaded ES service before removing its definition', () => {
+test('uninstall boots out the loaded ES service before removing its definition', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-'));
   const paths = productPaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
@@ -81,7 +88,7 @@ test('uninstall boots out the loaded ES service before removing its definition',
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('uninstall reports a bootout it cannot complete instead of removing the definition', () => {
+test('uninstall reports a bootout it cannot complete instead of removing the definition', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-stuck-'));
   const paths = productPaths(home);
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
@@ -98,7 +105,7 @@ test('uninstall reports a bootout it cannot complete instead of removing the def
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('product uninstall keeps every registry claim when the bootout cannot complete', () => {
+test('product uninstall keeps every registry claim when the bootout cannot complete', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-stuck-'));
   const paths = productPaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
@@ -158,10 +165,15 @@ test('product uninstall removes the service first, then releases every claim whi
   }
   const launchctl = recordingLaunchctl({ loaded: true });
   const result = uninstallProduct(paths, { launchctl: launchctl.control });
-  assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'uninstall must boot out the service it owns');
   assert.equal(result.service_stopped, true);
-  assert.equal(result.service_already_stopped, false);
-  assert.equal(result.removed_launch_agent, true);
+  if (macos) {
+    assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'uninstall must boot out the service it owns');
+    assert.equal(result.service_already_stopped, false);
+  } else {
+    assert.deepEqual(launchctl.calls, [], 'Linux removes the definition without a launchd bootout');
+    assert.equal(result.service_already_stopped, true);
+  }
+  assert.equal(result[removedServiceDefinition], true);
   assert.equal(result.codex_homes_unregistered, 2, 'every claimed home is released');
   assert.equal(result.data_retained, true);
   assert.equal(fs.existsSync(paths.data), true, 'uninstall never purges retained data');

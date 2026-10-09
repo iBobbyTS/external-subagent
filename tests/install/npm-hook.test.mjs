@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { updateCommand } from '../../cli/commands/update.mjs';
+import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const hook = path.join(repoRoot, 'cli/install/npm-hook.mjs');
@@ -12,7 +13,9 @@ const hook = path.join(repoRoot, 'cli/install/npm-hook.mjs');
 test('non-global postinstall never coordinates an initialized version drift', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-'));
   try {
-    const data = path.join(home, 'Library', 'Application Support', 'external-subagent');
+    // Resolve the host layout (macOS `~/Library`, Linux XDG) so the seeded
+    // state lands where the hook's own productPaths() will look for it.
+    const data = productPaths(home).data;
     fs.mkdirSync(data, { recursive: true });
     const state = { schema_version: 1, phase: 'active', active: { version: '9.9.9' } };
     fs.writeFileSync(path.join(data, 'install-state.json'), JSON.stringify(state));
