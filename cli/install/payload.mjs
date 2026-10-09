@@ -4,17 +4,48 @@ import { CliError } from '../errors.mjs';
 import { sha256 } from '../fs-atomic.mjs';
 import { NATIVE_DIR_NAME, PRODUCT_NAME } from '../constants.mjs';
 import {
-  NATIVE_PLATFORM, cliVersion, nativePayloadDir, nativePlatform, packageVersion, payloadManifestPath,
+  NATIVE_PLATFORMS, cliVersion, nativePayloadDir, nativePlatform, packageVersion, payloadManifestPath,
 } from './layout.mjs';
 
 const MH_MAGIC_64 = 0xfeedfacf;
 const CPU_TYPE_ARM64 = 0x0100000c;
+
+// ELF64 header identity, read little-endian:
+//   e_ident[0..3] = 0x7f 'E' 'L' 'F' (0x464c457f as a LE uint32)
+//   e_ident[4]    = EI_CLASS  (2 = ELFCLASS64)
+//   e_ident[5]    = EI_DATA   (1 = ELFDATA2LSB)
+//   e_machine     = uint16 at offset 18 (0x3e = EM_X86_64)
+const ELF_MAGIC = 0x464c457f;
+const ELFCLASS64 = 2;
+const ELFDATA2LSB = 1;
+const EM_X86_64 = 0x3e;
+const ELF_E_MACHINE_OFFSET = 18;
+const ELF_HEADER_MIN_BYTES = ELF_E_MACHINE_OFFSET + 2;
 
 export function machoArch(bytes) {
   if (bytes.length < 8) return null;
   if (bytes.readUInt32LE(0) !== MH_MAGIC_64) return null;
   return bytes.readUInt32LE(4) === CPU_TYPE_ARM64 ? 'arm64' : null;
 }
+
+// The Linux image check mirrors machoArch: only a 64-bit little-endian x86-64
+// ELF is a supported payload.  A truncated header (shorter than e_machine), a
+// 32-bit or big-endian image, or any other machine returns null and is
+// rejected as an unsupported architecture.
+export function elfArch(bytes) {
+  if (bytes.length < ELF_HEADER_MIN_BYTES) return null;
+  if (bytes.readUInt32LE(0) !== ELF_MAGIC) return null;
+  if (bytes[4] !== ELFCLASS64 || bytes[5] !== ELFDATA2LSB) return null;
+  return bytes.readUInt16LE(ELF_E_MACHINE_OFFSET) === EM_X86_64 ? 'x64' : null;
+}
+
+// Each supported platform has exactly one image identity.  verifyPayload reads
+// the tuple once and uses the paired probe, so a valid image of the *other*
+// platform can never satisfy this one.
+const IMAGE_CHECKS = Object.freeze({
+  'darwin-arm64': { arch: 'arm64', image: 'Mach-O arm64 image', probe: machoArch },
+  'linux-x64': { arch: 'x64', image: 'ELF x86-64 image', probe: elfArch },
+});
 
 export function readPayloadManifest(options = {}) {
   const platform = options.platform || nativePlatform();
@@ -41,9 +72,10 @@ export function readPayloadManifest(options = {}) {
 // defect, never a silent downgrade path.
 export function verifyPayload(options = {}) {
   const platform = options.platform || nativePlatform();
-  if (platform === null) {
-    throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${process.platform}-${process.arch}; supported platforms: ${NATIVE_PLATFORM}`);
+  if (!NATIVE_PLATFORMS.includes(platform)) {
+    throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${platform ?? `${process.platform}-${process.arch}`}; supported platforms: ${NATIVE_PLATFORMS.join(', ')}`);
   }
+  const image = IMAGE_CHECKS[platform];
   const manifest = readPayloadManifest({ platform, root: options.root });
   if (manifest.platform !== platform) {
     throw new CliError('PAYLOAD_PLATFORM_MISMATCH', `payload manifest declares ${manifest.platform}, expected ${platform}`);
@@ -74,9 +106,9 @@ export function verifyPayload(options = {}) {
     if (bytes.length !== record.bytes || sha256(bytes) !== record.sha256) {
       throw new CliError('PAYLOAD_DIGEST_MISMATCH', `native payload file ${record.name} does not match the release digest`);
     }
-    const arch = machoArch(bytes);
-    if (arch !== 'arm64') {
-      throw new CliError('PAYLOAD_ARCH_UNSUPPORTED', `native payload file ${record.name} is not a Mach-O arm64 image`);
+    const arch = image.probe(bytes);
+    if (arch !== image.arch) {
+      throw new CliError('PAYLOAD_ARCH_UNSUPPORTED', `native payload file ${record.name} is not a ${image.image}`);
     }
     return { name: record.name, bytes: bytes.length, mode: '755', sha256: record.sha256, arch };
   });

@@ -42,11 +42,12 @@ A plain npm install only stages the package and its native payload:
 - `npm install -g external-subagent` places the CLI (`external-subagent`) and
   the MCP facade (`external-subagent-mcp`) on the npm global bin path.
 - The versioned payload lives at
-  `<package>/npm/native/darwin-arm64/{external-subagentd,external-subagent-mcp}`
-  plus a `payload.json` manifest (version, platform, bytes, sha256, mode).
-  Release builds are produced and verified by
-  `scripts/release/build-native-payload.mjs`; supported platforms never
-  compile Rust at install time.
+  `<package>/npm/native/<platform>/{external-subagentd,external-subagent-mcp}`
+  plus a `payload.json` manifest (version, platform, bytes, sha256, mode); the
+  staged `<platform>` is `darwin-arm64` on macOS arm64 and `linux-x64` on
+  Linux x86_64. Release builds are produced and verified by
+  `scripts/release/build-native-payload.mjs`, which derives the platform from
+  the running host; supported platforms never compile Rust at install time.
 - Nothing else happens on a fresh install: no daemon start, no Codex writes,
   no subagent probes, and no shell profile edits. The single lifecycle script
   is a `postinstall` bridge that only reads local state: a never-initialized
@@ -65,9 +66,10 @@ external-subagent init [--dry-run] [--resume] [--install-hooks]
 ```
 
 `init` installs the standalone daemon service only. Its steps, in order:
-verify the staged payload (manifest, digest, mode 755, Mach-O arm64,
-version agreement between payload/package/CLI), report PATH findings (never
-write profiles) and an honest fixed-ZCode-runtime observation
+verify the staged payload (manifest, digest, mode 755, the platform's image
+— Mach-O arm64 or ELF x86-64, version agreement between payload/package/CLI),
+report PATH findings (never write profiles) and an honest fixed-ZCode-runtime
+observation
 (`runtime: {path, present}` — never a probe that can fail setup), create the
 private data/log directories, write the product config, install the
 LaunchAgent, bootstrap the service, and — after all of that — publish the

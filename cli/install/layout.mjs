@@ -10,7 +10,14 @@ import { DAEMON_BIN_NAME, MCP_BIN_NAME, NATIVE_DIR_NAME, PRODUCT_NAME, VERSION }
 // constants.mjs, so the debug variant resolves its own payload directory,
 // binary names, and plugin source without a parallel code path.
 export const PLUGIN_NAME = PRODUCT_NAME;
-export const NATIVE_PLATFORM = 'darwin-arm64';
+// Every platform tuple that ships a prebuilt payload maps to its own staged
+// directory name.  The tuple is the package's platform identity: the payload
+// directory, the manifest `platform` field, and the image check in
+// payload.mjs all key off the same value.  A tuple outside this table has no
+// payload and is rejected by the installer, never silently downgraded.
+// NATIVE_PLATFORM stays the reference platform (the released macOS identity).
+export const NATIVE_PLATFORMS = Object.freeze(['darwin-arm64', 'linux-x64']);
+export const NATIVE_PLATFORM = NATIVE_PLATFORMS[0];
 export const NATIVE_BINARIES = Object.freeze([DAEMON_BIN_NAME, MCP_BIN_NAME]);
 
 export function packageRoot() {
@@ -18,12 +25,12 @@ export function packageRoot() {
 }
 
 export function nativePlatform(platform = process.platform, arch = process.arch) {
-  if (platform === 'darwin' && arch === 'arm64') return NATIVE_PLATFORM;
-  return null;
+  const tuple = `${platform}-${arch}`;
+  return NATIVE_PLATFORMS.includes(tuple) ? tuple : null;
 }
 
 export function nativePayloadDir(platform = nativePlatform()) {
-  if (platform !== NATIVE_PLATFORM) return null;
+  if (!NATIVE_PLATFORMS.includes(platform)) return null;
   return path.join(packageRoot(), 'npm', NATIVE_DIR_NAME, platform);
 }
 

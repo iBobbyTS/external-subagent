@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { LAUNCH_AGENT_LABEL } from '../constants.mjs';
+import { LAUNCH_AGENT_LABEL, NATIVE_DIR_NAME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
@@ -49,7 +49,12 @@ function hookInstallerPath() {
 }
 
 export function installPlan(paths, options = {}) {
-  const manifest = payloadManifestPath() ?? path.join(packageRoot(), 'npm', 'native', 'darwin-arm64', 'payload.json');
+  // The plan reports the payload the verifier will read.  When the running
+  // tuple has a supported payload this is the resolved manifest path; on an
+  // unsupported host the fallback derives the same tuple from the process so
+  // the reported path matches the layout instead of a hard-coded platform.
+  const manifest = payloadManifestPath()
+    ?? path.join(packageRoot(), 'npm', NATIVE_DIR_NAME, `${process.platform}-${process.arch}`, 'payload.json');
   const plan = [
     { id: 'verify-payload', action: 'verify staged native payload', path: manifest },
     { id: 'check-path', action: 'report PATH availability without writing profiles' },

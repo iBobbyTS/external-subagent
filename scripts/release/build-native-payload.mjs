@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Build the versioned native payload for the npm package: release binaries
 // for external-subagentd and external-subagent-mcp are copied into
-// npm/native/darwin-arm64 together with a deterministic payload.json manifest
-// (version, platform, per-file bytes/sha256/mode).  Installed-package code
+// npm/native/<platform> together with a deterministic payload.json manifest
+// (version, platform, per-file bytes/sha256/mode), where <platform> is derived
+// from the running host (darwin-arm64, linux-x64).  Installed-package code
 // verifies against this manifest, so it must never contain volatile fields.
 //
 // `--variant debug` stages the parallel development payload instead: the same
-// cargo artifacts are copied under debug names into npm/native-debug/darwin-arm64
+// cargo artifacts are copied under debug names into npm/native-debug/<platform>
 // (manifest product external-subagent-debug), and the debug plugin source is
 // staged at plugins/codex/external-subagent-debug.  The debug payload is a
 // development checkout product and is rejected from release tarballs by
@@ -20,8 +21,19 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { stageDebugPlugin } from './stage-debug-plugin.mjs';
+import { nativePlatform } from '../../cli/install/layout.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+// The staged directory and the manifest `platform` field derive from the
+// running host through the shared platform table, so one script stages the
+// correct tuple everywhere (release: darwin-arm64, linux-x64) and an
+// unsupported host fails before touching the tree.  The debug variant reuses
+// the same tuple under its parallel native-debug directory.
+const platform = nativePlatform();
+if (platform === null) {
+  process.stderr.write(`no native payload for ${process.platform}-${process.arch}\n`);
+  process.exit(2);
+}
 const variantIndex = process.argv.indexOf('--variant');
 const variant = variantIndex === -1 ? '' : (process.argv[variantIndex + 1] ?? '');
 if (variant !== '' && variant !== 'debug') {
@@ -42,7 +54,7 @@ const productName = isDebug ? 'external-subagent-debug' : 'external-subagent';
 const binaries = isDebug
   ? [['external-subagentd', 'external-subagent-debugd'], ['external-subagent-mcp', 'external-subagent-debug-mcp']]
   : [['external-subagentd', 'external-subagentd'], ['external-subagent-mcp', 'external-subagent-mcp']];
-const platformDir = path.join(packageRoot, 'npm', nativeDirName, 'darwin-arm64');
+const platformDir = path.join(packageRoot, 'npm', nativeDirName, platform);
 const manifestPath = path.join(platformDir, 'payload.json');
 const sourceRoots = ['crates', 'profiles'].map((dir) => path.join(packageRoot, dir))
   .concat([path.join(packageRoot, 'Cargo.toml'), path.join(packageRoot, 'Cargo.lock')]);
@@ -73,7 +85,7 @@ function stagedIsCurrent(version) {
   if (!fs.existsSync(manifestPath)) return false;
   let manifest;
   try { manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')); } catch { return false; }
-  if (manifest.version !== version || manifest.platform !== 'darwin-arm64' || manifest.product !== productName) return false;
+  if (manifest.version !== version || manifest.platform !== platform || manifest.product !== productName) return false;
   if ((manifest.profile ?? 'release') !== cargoProfile) return false;
   const inputs = newestInputMs();
   for (const file of manifest.files) {
@@ -121,7 +133,7 @@ for (const [source, name] of binaries) {
   files.push({ name, bytes: bytes.length, mode: '755', sha256: sha256(bytes) });
 }
 
-const manifest = { schema_version: 1, product: productName, version, platform: 'darwin-arm64' };
+const manifest = { schema_version: 1, product: productName, version, platform };
 // The debug profile is recorded so --if-stale can tell a debug-staged payload
 // from a release one; the release manifest stays byte-identical to before.
 if (cargoProfile !== 'release') manifest.profile = cargoProfile;
