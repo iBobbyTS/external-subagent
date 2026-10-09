@@ -10,6 +10,13 @@ two versions and is recorded per version below. All evidence was gathered
 with `CODEX_HOME` pointed at throwaway directories; no real user Codex home
 was modified while gathering this evidence.
 
+A second baseline — codex-cli **0.162.0** on Linux x86_64 (Ubuntu 26.04, the
+nvm launcher `/home/ibobby/.nvm/versions/node/v24.17.0/bin/codex`, a Node shim)
+— was verified live on 2026-10-09 through the external-subagent CLI; the
+app-server deltas from 0.154.0 and the live full-chain evidence are recorded in
+"Linux x86_64, codex-cli 0.162.0 (observed 2026-10-09)" below and in
+[docs/acceptance/S04-linux-codex-smoke.md](../acceptance/S04-linux-codex-smoke.md).
+
 ## Implementation layout
 
 The Codex protocol face lives in the `external-agent-codex` crate
@@ -275,6 +282,56 @@ Upstream Codex app-server supports native `developer_instructions` on `thread/st
 - **SOURCE_INSPECTED**: Verified in upstream GitHub source repository tags `rust-v0.154.0` and `rust-v0.160.0`. `ThreadStartParams.developer_instructions: Option<String>` is a standard, non-experimental field.
 - **Wire serialization**: CamelCase `developerInstructions` in `thread/start` payload (`{"model": ..., "cwd": ..., "approvalPolicy": "never", "sandbox": ..., "ephemeral": false, "developerInstructions": "..."}`).
 - **Echo behavior**: `thread/start` response does not echo an inline instruction text field (`instruction_sources` lists loaded instruction files). Validation is performed at outbound request frame composition; turn/start receives the caller prompt verbatim without developer instruction splicing.
+
+## Linux x86_64, codex-cli 0.162.0 (observed 2026-10-09)
+
+Evidence gathered with `CODEX_HOME=/tmp/es-s04-codex-home` (throwaway) and a
+probe under `tools/probes/codex-app-server/probe.mjs`; the real user Codex home
+was only read. The daemon drove three live turns (build/plan/yolo) that all
+settled `COMPLETED` with `final_text = "pong"` for `gpt-6-luna`
+([acceptance record](../acceptance/S04-linux-codex-smoke.md)).
+
+Deltas from the 0.154.0 baseline, all additive — nothing the daemon reads moved:
+
+- `initialize` result gained `userAgent` (`external-subagent-probe/0.162.0
+  (Ubuntu 26.4.0; x86_64) dumb (external-subagent-probe; 0)`),
+  `platformFamily` (`"unix"`), and `platformOs` (`"linux"`) alongside the
+  existing `codexHome`.
+- New server notifications observed on the wire and safely ignored by the
+  daemon's `item/*`/`turn/*` folding: `remoteControl/status/changed`,
+  `mcpServer/startupStatus/updated`, `thread/status/changed`,
+  `thread/tokenUsage/updated`, `account/updated`,
+  `account/rateLimits/updated`.
+- `thread/start` result root gained `approvalsReviewer` (`"user"`),
+  `activePermissionProfile`, `multiAgentMode` (`"explicitRequestOnly"`),
+  `runtimeWorkspaceRoots`, `serviceTier`, `disabledPluginIds`; the embedded
+  `thread` object gained `environments`, `sessionId`, `path`, `cliVersion`,
+  `source` (`"vscode"`), `canAcceptDirectInput`, `historyMode`, etc. The
+  pointers the daemon reads (`/thread/id`, `ephemeral`, root/thread `model`,
+  `approvalPolicy`, `sandbox`, `cwd`) are unchanged.
+- `turn/start` response `turn` gained `rootTurnId`, `itemsView`, `startedAt`,
+  `completedAt`, `durationMs`; `/turn/id` is unchanged.
+- Request-preset → resolved-sandbox echoes are byte-identical to 0.154.0:
+  `workspace-write` → `{"type":"workspaceWrite","writableRoots":[],
+  "networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}`;
+  `read-only` → `{"type":"readOnly","networkAccess":false}`;
+  `danger-full-access` → `{"type":"dangerFullAccess"}`. `approvalPolicy`
+  echoed `"never"`, `model`/`cwd` echoed at the result root. A live
+  `item/agentMessage/delta` + `item/completed` + `turn/completed` sequence
+  folded to `pong` exactly as on 0.154.0.
+- Linux runtime resolution (fixed 2026-10-09, not a protocol drift): the nvm
+  `codex` is a Node launcher (`#! /usr/bin/env node`), so a daemon whose `PATH`
+  lacked that interpreter failed closed — the S03 systemd unit's fixed `PATH`
+  had no Node, and `spawn` returned `SESSION_START_FAILED`/
+  `stderr_tail: env: 'node': No such file or directory`. The Linux service PATH
+  now appends `path.dirname(process.execPath)` (the directory of the Node that
+  rendered the unit) after the fixed system set, exactly as the macOS fixed PATH
+  carries the Homebrew bin holding its own `node`; the darwin plist is
+  unchanged. Verified under a genuine `systemctl --user` service (transient
+  `systemd-run` unit with the generated unit PATH): the daemon spawned
+  `node …/bin/codex app-server --listen stdio://` → the vendored native codex
+  binary in the unit cgroup, and live build/plan chains completed
+  ([acceptance record](../acceptance/S04-linux-codex-smoke.md)).
 
 ## NOT_RUN
 

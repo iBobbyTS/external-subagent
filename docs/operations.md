@@ -116,12 +116,19 @@ definition pins the daemon binary, and the staged plugin `.mcp.json` pins the
 MCP facade inside the installed package. That staged `.mcp.json` also sets
 `timeoutMs: 300000` on the zcode-side server entry, because the zcode host
 caps MCP tool calls at a default 30000ms — below the product's 299s
-`external_subagent_wait` ceiling. The daemon itself runs with a fixed,
-platform-owned PATH — `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
-on macOS, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` on
-Linux (covering systemctl and the payload's system-tool dependencies);
-user-level runtime installs (nvm and friends) are never assumed, because the
-persisted subagent runtimes are forwarded to the service as absolute paths.
+`external_subagent_wait` ceiling. The daemon itself runs with a
+platform-owned PATH. On macOS it is the fixed
+`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`. On Linux it is
+the fixed system-tool set
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` (covering
+systemctl and the payload's system-tool dependencies) plus the interpreter
+directory of the Node that rendered the unit (`path.dirname(process.execPath)`),
+appended by the unit generator. The fixed prefix keeps system commands
+deterministic; the appended directory lets a persisted shim-style subagent
+runtime — an nvm-installed Codex Node launcher whose shebang resolves `node`
+from PATH — run under the service, mirroring how the macOS fixed PATH carries
+the Homebrew bin that holds its own `node`. Persisted subagent runtimes are
+still forwarded to the service as absolute paths.
 `init` reports whether `external-subagent` is on the shell PATH; repairing a
 user profile stays an explicit user action (the product never edits shell
 startup files).

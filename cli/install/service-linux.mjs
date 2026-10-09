@@ -5,7 +5,7 @@ import { DAEMON_BIN_NAME, PRODUCT_NAME, ZCODE_RUNTIME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
-import { SYSTEMD_FIXED_PATH } from './path.mjs';
+import { systemdServicePath } from './path.mjs';
 import { readConfig } from '../config/read.mjs';
 
 // The one Linux service backend for the product daemon: a systemd USER unit,
@@ -172,7 +172,7 @@ export function systemdUnit(paths, options = {}) {
     quotedArgument(path.join(paths.logs, 'daemon-error.log')),
   ].join(' ');
   const environment = [
-    environmentLine('PATH', SYSTEMD_FIXED_PATH),
+    environmentLine('PATH', systemdServicePath()),
     ...(configRevision === null ? [] : [environmentLine('EXTERNAL_SUBAGENT_CONFIG_REVISION', configRevision)]),
     ...(dshRuntime ? [environmentLine('DSH_RUNTIME_PATH', dshRuntime)] : []),
     ...(dshHome ? [environmentLine('DSH_HOME', dshHome)] : []),

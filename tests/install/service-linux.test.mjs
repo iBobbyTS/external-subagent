@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths, platform } from '../../cli/paths.mjs';
-import { SYSTEMD_FIXED_PATH, pathReport, which } from '../../cli/install/path.mjs';
+import { SYSTEMD_FIXED_PATH, pathReport, systemdServicePath, which } from '../../cli/install/path.mjs';
 import { runInit } from '../../cli/install/init.mjs';
 import { activateService } from '../../cli/install/service-activation.mjs';
 import {
@@ -95,7 +95,7 @@ test('the systemd unit mirrors the plist parameterization one-to-one', () => {
     assert.match(unit, new RegExp(`ExecStart="${path.join(home, 'payload', 'external-subagentd')}" "--database" "${paths.database}" "--socket" "${paths.socket}" "--diagnostic-log" "${path.join(paths.logs, 'daemon-error.log')}"`));
     assert.doesNotMatch(unit, /--runtime/u, 'an absent pinned ZCode runtime is never forwarded');
     // Environment forwarding, one-to-one with the plist keys.
-    assert.match(unit, new RegExp(`^Environment="PATH=${SYSTEMD_FIXED_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
+    assert.match(unit, new RegExp(`^Environment="PATH=${systemdServicePath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"$`, 'm'));
     assert.match(unit, /^Environment="EXTERNAL_SUBAGENT_CONFIG_REVISION=5"$/m);
     assert.match(unit, /^Environment="DSH_RUNTIME_PATH=\/opt\/dsh\/acp"$/m);
     assert.match(unit, /^Environment="DSH_HOME=\/var\/lib\/dsh"$/m);
@@ -458,14 +458,21 @@ test('a missing user session fails control with the linger hint and degrades the
 
 test('the Linux fixed PATH resolves systemctl and stays platform-trueful', () => {
   assert.equal(SYSTEMD_FIXED_PATH.includes('/opt/homebrew'), false);
+  // The service PATH is the fixed system set plus the interpreter directory of
+  // the node that rendered the unit, so a Node-launcher Codex runtime resolves
+  // `node` from the unit environment (the bounded S04 fix).
+  assert.equal(systemdServicePath(), `${SYSTEMD_FIXED_PATH}:${path.dirname(process.execPath)}`);
+  assert.equal(systemdServicePath().startsWith(`${SYSTEMD_FIXED_PATH}:`), true);
   // The fixed set must actually find systemctl, the tool the service itself
   // depends on (verified on a real Linux host).
   if (linuxHost) {
     assert.equal(fs.existsSync(SYSTEMCTL_PATH), true, 'the pinned systemctl path must exist on a supported Linux host');
     assert.equal(which('systemctl', { PATH: SYSTEMD_FIXED_PATH }), SYSTEMCTL_PATH);
+    assert.equal(which('systemctl', { PATH: systemdServicePath() }), SYSTEMCTL_PATH);
   }
   const report = pathReport({ env: { ...LINUX, PATH: '' } });
-  assert.equal(report.systemd.path, SYSTEMD_FIXED_PATH);
+  assert.equal(report.systemd.path, systemdServicePath());
+  assert.equal(report.systemd.path.startsWith(`${SYSTEMD_FIXED_PATH}:`), true);
   assert.equal(report.launchd, undefined, 'a Linux report never claims the launchd key');
   const darwinReport = pathReport({ env: { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', PATH: '' } });
   assert.equal(darwinReport.launchd.path, '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin');
@@ -736,7 +743,7 @@ test('a successful activation regenerates the systemd unit environment from the 
     assert.match(text, /Environment="CODEX_HOME=\/fresh\/codex-home"/);
     assert.match(text, /Environment="CODEX_RUNTIME_PATH=\/opt\/codex-runtime"/);
     assert.match(text, /Environment="DSH_HOME=\/fresh\/dsh-home"/);
-    assert.match(text, new RegExp(`Environment="PATH=${SYSTEMD_FIXED_PATH.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`));
+    assert.match(text, new RegExp(`Environment="PATH=${systemdServicePath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`));
     assert.doesNotMatch(text, /codex-multi-2/);
     assert.doesNotMatch(text, /USER_ADDED_KEY/);
     assert.doesNotMatch(text, /="21"/);
