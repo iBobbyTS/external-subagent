@@ -42,3 +42,4 @@ plugins/codex/external-subagent-debug/
 
 # Parallel worktrees (AGENTS.md convention)
 /git-worktree/
+.agent-work
