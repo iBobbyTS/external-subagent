@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { BUSINESS_COMMANDS, PRODUCT_NAME, VERSION, ZCODE_RUNTIME } from './constants.mjs';
+import { BUSINESS_COMMANDS, PRODUCT_NAME, VERSION, zcodeRuntimePath } from './constants.mjs';
 import { CliError } from './errors.mjs';
 import { installHooks, installPlan, runInit } from './install/init.mjs';
 import { nativeBinary } from './install/layout.mjs';
@@ -267,7 +267,11 @@ async function diagnose(paths, args) {
     scope: agent ? { agent_id: agent } : { kind: 'global' },
     platform: platform(),
     runtime: {
-      configured_artifact: fileArtifact(ZCODE_RUNTIME, 'cli_packaged_configuration'),
+      // The same platform-aware resolution the service generators use
+      // (constants.mjs): explicit ZCODE_RUNTIME_PATH, then the platform's
+      // conventional installation, then the packaged pin — reported as an
+      // artifact observation, never a probe.
+      configured_artifact: fileArtifact(zcodeRuntimePath(paths.home), 'cli_resolved_configuration'),
       running_identity: null,
       running_identity_source: 'not_observed_by_cli',
     },

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { DAEMON_BIN_NAME, LAUNCH_AGENT_LABEL, ZCODE_RUNTIME } from '../constants.mjs';
+import { DAEMON_BIN_NAME, LAUNCH_AGENT_LABEL, zcodeRuntimePath } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
@@ -28,7 +28,7 @@ function escapeXml(value) {
 export function runtimeObservations(paths, options = {}) {
   const config = readConfig(paths.config);
   return Object.fromEntries(['zcode', 'dsh', 'codex', 'agy'].map((agent) => {
-    const runtime = agent === 'zcode' ? (options.zcodeRuntime ?? ZCODE_RUNTIME) : config.subagents[agent].runtime_path;
+    const runtime = agent === 'zcode' ? (options.zcodeRuntime ?? zcodeRuntimePath(paths.home)) : config.subagents[agent].runtime_path;
     return [agent, { path: runtime, present: Boolean(runtime && fs.existsSync(runtime)), enabled: config.subagents[agent].enabled }];
   }));
 }
@@ -44,13 +44,14 @@ export function launchAgentPlist(paths, options = {}) {
   const { runtime_path: agyRuntime } = config.subagents.agy;
   const configRevision = config.revision;
   // AUD-005/D1: the standalone service never depends on an unrelated runtime.
-  // The pinned ZCode runtime is forwarded only when that installation exists;
-  // without it the daemon still starts and the zcode adapter fails closed at
-  // spawn ("ZCODE_RUNTIME_PATH is unavailable") instead of the whole service
-  // dying on launchd because --runtime cannot canonicalize.  Installing (or
-  // removing) ZCode later is picked up by the next init, which rewrites the
-  // plist.  The seam exists so tests can pin both branches deterministically.
-  const zcodeRuntime = options.zcodeRuntime ?? ZCODE_RUNTIME;
+  // The pinned ZCode runtime (platform-discovered, constants.mjs) is forwarded
+  // only when that installation exists; without it the daemon still starts and
+  // the zcode adapter fails closed at spawn ("ZCODE_RUNTIME_PATH is
+  // unavailable") instead of the whole service dying on launchd because
+  // --runtime cannot canonicalize.  Installing (or removing) ZCode later is
+  // picked up by the next init, which rewrites the plist.  The seam exists so
+  // tests can pin both branches deterministically.
+  const zcodeRuntime = options.zcodeRuntime ?? zcodeRuntimePath(paths.home);
   const programArguments = [
     `<string>${escapeXml(daemon)}</string>`,
     '<string>--database</string>',

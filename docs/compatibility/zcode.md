@@ -8,6 +8,10 @@ arm64 against ZCode **25.6.0** (`/Applications/ZCode.app`,
 installation produces. No marketplace, cache, or install-record state
 owned by the ZCode client is ever written by this product.
 
+Linux evidence (2026-10-09, Ubuntu 26.04 x86_64) is recorded in
+"Linux runtime distribution and discovery (observed 2026-10-09)" below and in
+[docs/acceptance/S05-linux-subagents-host-bindings.md](../acceptance/S05-linux-subagents-host-bindings.md).
+
 ## Restricted spawn environments kill native binaries (verified live)
 
 ZCode starts plugin MCP servers inside a restricted execution context.
@@ -102,7 +106,9 @@ bundled and marketplace plugins: **inline directories** — every path in
   shapes abort with `ZCODE_CONFIG_INVALID` before any write, and
   `install-plugin zcode --uninstall` removes exactly the one managed
   entry plus the product-owned staging tree
-  (`~/Library/Application Support/external-subagent/zcode-plugin/external-subagent/`).
+  (`<product data>/zcode-plugin/external-subagent/`: `~/Library/Application
+  Support/external-subagent/…` on macOS, `~/.local/share/external-subagent/…`
+  on Linux).
   If a client update silently drops inline discovery, the install still
   succeeds and `--uninstall` still cleans up; only the binding's effect
   goes inert.
@@ -176,6 +182,85 @@ bundle; when re-verifying, match the stable strings
 - Live read-back verification against a real ZCode session is **NOT_RUN**
   (user prohibition on production spawns); the chain above is
   static-inspection evidence pinned by the fake-runtime protocol tests.
+
+## Linux runtime distribution and discovery (observed 2026-10-09)
+
+There is no `/Applications/ZCode.app` on Linux. The observed ZCode Linux
+form is the **desktop attached-remote server runtime** the ZCode desktop
+deploys to the host it drives over SSH (observed on Ubuntu 26.04 x86_64,
+desktop `ZCODE_APP_VERSION=3.14.5`):
+
+- `~/.zcode/server/` is the runtime root; the desktop exports
+  `ZCODE_SERVER_RUNTIME_ROOT` pointing at it, and the official
+  `~/.zcode/server/agents/glm/zcode-agent` launcher is a POSIX shell script
+  that resolves the root as `${ZCODE_SERVER_RUNTIME_ROOT:-$HOME/.zcode/server}`
+  and execs `<root>/node <root>/agents/glm/zcode.cjs "$@"`.
+- `<root>/node` is a bundled Node (v22.16.0 observed); the runtime script is
+  `agents/glm/zcode.cjs` (`zcode.cjs --version` → `0.16.9`;
+  `agents/glm/.version` → `0.13.3`). `~/.zcode/cli/` holds only client state
+  (config, sessions, plugins), never an executable runtime — probing it for a
+  runtime would be inventing a probe point.
+
+**Product discovery** (`zcodeRuntimePath` in `cli/constants.mjs`, consumed by
+the service generators and the runtime observations report): explicit
+configuration first — `ZCODE_RUNTIME_PATH`, the same variable the daemon
+itself resolves — then the platform's conventional location (the app bundle
+on darwin, `<product home>/.zcode/server/agents/glm/zcode.cjs` on Linux),
+then the packaged macOS constant is reported honestly as an absent pin.
+Forwarding to the daemon stays presence-gated exactly as before. The
+deployment's `ZCODE_SERVER_RUNTIME_ROOT` is deliberately **not** consulted:
+service generation must stay independent of the interactive shell
+environment (the same design the fixed unit PATH follows), and the product
+home already owns `~/.zcode`. The daemon runs the script with the `node` on
+its PATH (the systemd unit PATH carries the unit-rendering Node's bin
+directory since S04); `zcode.cjs --version` prints the same `0.16.9` under
+the nvm Node v24.17.0 and the bundled v22.16.0.
+
+**Live verification** (isolated product HOME/XDG, real runtime, throwaway
+credentials copied then deleted): `agents enable zcode` probes
+`local.state=READY`, `version=0.16.9`, and a full
+`spawn → wait → result → close` chain with `permission_mode=plan` completed
+with `final_text="pong"` (`input_identity.model_source="native"`). The
+runtime writes its own logs/state under the spawn environment's `~/.zcode`
+(the isolated home), never the real tree.
+
+**Read-only probe layers on this runtime line — two gaps found and fixed
+(2026-10-09, both re-verified live end-to-end after the fix):**
+
+1. The staged scope policy verifier
+   (`plugins/codex/external-subagent/scripts/policy-verifier.mjs`) joined
+   its provenance as the macOS `<home>/Library/Application Support/…` path
+   unconditionally, so on Linux it exited 2 and every `--hi`/`models` probe
+   reported `policy_unverified` (the daemon-side lookup was already
+   platform-aware). The script now derives the provenance candidates with
+   the same semantics as the daemon's `policy_verifier_candidates`: the
+   frozen macOS bytes on darwin; elsewhere an exported absolute
+   `$XDG_DATA_HOME/<product>/` first, then the `<home>/.local/share/<product>`
+   XDG fallback. An existing installation picks the fixed script up on the
+   next `hooks install`, which restages the verifier beside the provenance.
+2. `session/create` on this runtime issues a new server request
+   `interaction/requestOfficialMcpAuthHeaders` (official-MCP auth, e.g. for
+   the `image-search` plugin) and proceeds with an anonymous fallback no
+   matter how the client answers. The daemon's read-only probe loops
+   (request wait, turn wait, event drain) answered unrecognized server
+   requests with `-32601` and aborted the wait, misclassifying a healthy
+   create as `transport`/`create_failed`. They now answer method-not-found
+   and keep waiting — the same safe-ignore posture applied to unknown
+   notifications — while a genuinely failed request still surfaces through
+   its own error response or the probe deadline
+   (`respond_unsupported_probe_request`, pinned by the
+   `zcode_catalog_survives_an_unsupported_server_request_during_create`
+   unit test). After both fixes, the live chain on the real runtime reads:
+   `subagents models zcode` → `supported: true` with the projected catalog,
+   and `subagents probe zcode --hi` → local/auth/hi all `READY`.
+
+Further protocol observations recorded for this runtime line (no product
+change): no `initialize` method (`-32601 Method not found`);
+`session/requestRuntimePreferences` arrives with scope
+`runtime-materialization`; the create result reports
+`session.mode`/`settings.mode.current` as `build` for a `plan` request
+(the env-level `ZCODE_AGENT_PERMISSION_MODE=plan` policy still held for the
+completed plan-mode turn).
 
 ## Oracles
 

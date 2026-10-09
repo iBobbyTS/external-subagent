@@ -25,8 +25,22 @@ const script = hook?.args?.find((candidate) => typeof candidate === 'string' && 
 const guard = events.PreToolUse.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
 const audit = events.PostToolUse?.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
 if (!script || !fs.statSync(script).isFile() || hook.command !== process.execPath || !guard || !fs.statSync(guard).isFile() || !audit || !fs.statSync(audit).isFile()) process.exit(2);
-const provenancePath = path.join(home, 'Library', 'Application Support', 'external-subagent', 'zcode-agent-hook-provenance.json');
-if (!fs.existsSync(provenancePath)) process.exit(2);
+// The provenance is staged by install-agent-hooks.mjs beside this verifier,
+// inside the product data directory of the probe home. The candidates mirror
+// the daemon's policy_verifier_candidates exactly: the frozen macOS
+// `~/Library/Application Support` bytes on darwin; elsewhere an exported
+// absolute $XDG_DATA_HOME is probed first, then the `~/.local/share` XDG
+// fallback for the scope home.
+const provenanceCandidates = process.platform === 'darwin'
+  ? [path.join(home, 'Library', 'Application Support', 'external-subagent', 'zcode-agent-hook-provenance.json')]
+  : [
+      ...(typeof process.env.XDG_DATA_HOME === 'string' && path.isAbsolute(process.env.XDG_DATA_HOME)
+        ? [path.join(process.env.XDG_DATA_HOME, 'external-subagent', 'zcode-agent-hook-provenance.json')]
+        : []),
+      path.join(home, '.local', 'share', 'external-subagent', 'zcode-agent-hook-provenance.json'),
+    ];
+const provenancePath = provenanceCandidates.find((candidate) => fs.existsSync(candidate));
+if (!provenancePath) process.exit(2);
 const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));
 const hash = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 const policy = path.resolve(path.dirname(script), '../lib/agent-file-policy.mjs');

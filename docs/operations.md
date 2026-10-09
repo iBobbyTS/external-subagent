@@ -68,9 +68,12 @@ external-subagent init [--dry-run] [--resume] [--install-hooks]
 `init` installs the standalone daemon service only. Its steps, in order:
 verify the staged payload (manifest, digest, mode 755, the platform's image
 — Mach-O arm64 or ELF x86-64, version agreement between payload/package/CLI),
-report PATH findings (never write profiles) and an honest fixed-ZCode-runtime
-observation
-(`runtime: {path, present}` — never a probe that can fail setup), create the
+report PATH findings (never write profiles) and an honest ZCode-runtime
+observation (`runtime: {path, present}` — never a probe that can fail setup;
+the pinned runtime resolves per platform: the app-bundle resource on macOS,
+`<home>/.zcode/server/agents/glm/zcode.cjs` — the ZCode desktop's
+attached-remote server runtime — on Linux, with an explicit
+`ZCODE_RUNTIME_PATH` winning on both), create the
 private data/log directories, write the product config, install the service
 definition (the launchd LaunchAgent plist on macOS; the systemd user unit on
 Linux), start the service, and — after all of that — publish the
@@ -223,9 +226,11 @@ overwritten; drift or foreign ownership is rejected (`PLUGIN_STAGING_CONFLICT`,
 `PLUGIN_MARKETPLACE_CONFLICT`). `install-mcp` provides the alternative direct
 TOML binding with the same ten-tool surface.
 
-Successful claims are recorded in
-`~/Library/Application Support/external-subagent/codex-homes.json` — the single
-D08 registry. Uninstalling a plugin or the product releases the claim.
+Successful claims are recorded in the product data directory's
+`codex-homes.json` — the single D08 registry
+(`~/Library/Application Support/external-subagent/` on macOS,
+`~/.local/share/external-subagent/` — or an absolute `XDG_DATA_HOME` — on
+Linux). Uninstalling a plugin or the product releases the claim.
 Reconciliation only ever writes homes that are both registered and writable,
 reports per-home results, and replaces a corrupted registry atomically while
 preserving the damaged bytes for inspection.

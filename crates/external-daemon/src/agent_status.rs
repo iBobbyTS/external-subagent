@@ -3,10 +3,10 @@ use external_agent_dsh::{
     profile::{preflight, resolve_launch, DshLaunch, STRICT_PLAN_PATCH_YAML},
 };
 use external_contract::{
-    event_type, CreateSessionParams, RuntimePreferences, SendParams, SessionCreateProjection,
-    SessionParams, SubscribeParams, WireMessage, WorkspaceRef, INTERACTION_REQUEST_PERMISSION,
-    SESSION_CLOSE, SESSION_CREATE, SESSION_EVENT, SESSION_REQUEST_RUNTIME_PREFERENCES,
-    SESSION_SEND, SESSION_SUBSCRIBE,
+    event_type, CreateSessionParams, RequestEnvelope, RuntimePreferences, SendParams,
+    SessionCreateProjection, SessionParams, SubscribeParams, WireMessage, WorkspaceRef,
+    INTERACTION_REQUEST_PERMISSION, SESSION_CLOSE, SESSION_CREATE, SESSION_EVENT,
+    SESSION_REQUEST_RUNTIME_PREFERENCES, SESSION_SEND, SESSION_SUBSCRIBE,
 };
 use external_runtime::{gated_spawn, Driver, Inbound, RequestError};
 use serde::{Deserialize, Serialize};
@@ -1848,17 +1848,62 @@ fn probe_zcode_hi(
     (auth, hi)
 }
 
+/// Default scope policy verifier candidates under the probe scope home. The
+/// CLI stages the verifier beside the hook provenance inside the product data
+/// directory (`plugins/codex/external-subagent/scripts/install-agent-hooks.mjs`),
+/// which is `~/Library/Application Support/<product>` on macOS and the XDG
+/// `$XDG_DATA_HOME/<product>` / `~/.local/share/<product>` convention
+/// elsewhere (D-S02, matching `cli/paths.mjs` and `rpc/profiles.rs`). On XDG
+/// hosts an exported absolute `XDG_DATA_HOME` is the first candidate — the
+/// same environment rule the CLI's own layout resolution applies — followed by
+/// the scope-home fallback, so the probe finds the tree the CLI wrote in both
+/// the default and the redirected layout. An exported
+/// `EXTERNAL_SUBAGENT_POLICY_VERIFIER` remains the explicit override.
+fn policy_verifier_candidates(home: &str) -> Vec<PathBuf> {
+    policy_verifier_candidates_for(home, env::var_os("XDG_DATA_HOME"))
+}
+
+fn policy_verifier_candidates_for(
+    home: &str,
+    xdg_data_home: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = xdg_data_home;
+        vec![Path::new(home).join(
+            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
+        )]
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut candidates = Vec::new();
+        if let Some(xdg) = xdg_data_home.map(PathBuf::from) {
+            if xdg.is_absolute() {
+                candidates.push(xdg.join("external-subagent/external-subagent-policy-verifier"));
+            }
+        }
+        candidates.push(
+            Path::new(home)
+                .join(".local/share/external-subagent/external-subagent-policy-verifier"),
+        );
+        candidates
+    }
+}
+
 fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Duration) -> bool {
     let Some(home) = scope.home.as_deref() else {
         return false;
     };
     let verifier = env::var_os("EXTERNAL_SUBAGENT_POLICY_VERIFIER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(home).join(
-                "Library/Application Support/external-subagent/external-subagent-policy-verifier",
-            )
+        .or_else(|| {
+            policy_verifier_candidates(home)
+                .into_iter()
+                .find(|candidate| candidate.is_file())
         });
+    let Some(verifier) = verifier else {
+        return false;
+    };
     if !verifier.is_file() {
         return false;
     }
@@ -1977,17 +2022,29 @@ fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, Stri
                     );
                     return Err("policy_violation".into());
                 }
-                let _ = driver.respond_error(
-                    request.id,
-                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
-                );
-                return Err("transport".into());
+                respond_unsupported_probe_request(&driver, &request);
             }
             Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err("transport".into()),
         }
     }
+}
+
+/// Answer an unrecognized server request with method-not-found WITHOUT
+/// failing the probe: the runtime treats -32601 as "this client does not
+/// implement the extension" and proceeds (observed live on the Linux server
+/// runtime 0.16.9, whose `interaction/requestOfficialMcpAuthHeaders` falls
+/// back to anonymous while `session/create` still completes). Aborting on the
+/// unknown request misclassified a healthy create as `transport`/
+/// `create_failed`; this is the same safe-ignore posture the event drain
+/// applies to unknown notifications, and a genuinely failed request still
+/// surfaces through its own error response or the probe deadline.
+fn respond_unsupported_probe_request(driver: &Driver, request: &RequestEnvelope) {
+    let _ = driver.respond_error(
+        request.id.clone(),
+        serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
+    );
 }
 
 fn request_with_runtime_preferences(
@@ -2046,11 +2103,7 @@ fn request_with_runtime_preferences(
                     );
                     return Err("policy_violation".into());
                 }
-                let _ = driver.respond_error(
-                    request.id,
-                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
-                );
-                return Err("transport".into());
+                respond_unsupported_probe_request(&driver, &request);
             }
             Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2081,11 +2134,7 @@ fn drain_probe_events(driver: &Driver, events: &mut ProbeEventCache) -> Result<(
                     );
                     return Err("policy_violation".into());
                 }
-                let _ = driver.respond_error(
-                    request.id,
-                    serde_json::json!({"code":-32601,"message":"unsupported probe request"}),
-                );
-                return Err("transport".into());
+                respond_unsupported_probe_request(driver, &request);
             }
             Ok(inbound) => events.observe(&inbound, &driver.diagnostic_tail())?,
             Err(mpsc::RecvTimeoutError::Timeout) => return Ok(()),
@@ -2775,9 +2824,9 @@ process.stdin.on('data', (chunk) => {
         after_terminal: &str,
     ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
-        let verifier = directory.path().join(
-            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
-        );
+        let verifier = policy_verifier_candidates(&directory.path().to_string_lossy())
+            .pop()
+            .expect("at least one policy verifier candidate");
         fs::create_dir_all(verifier.parent().unwrap()).unwrap();
         fs::write(
             &verifier,
@@ -2853,6 +2902,53 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[test]
+    fn policy_verifier_candidates_follow_the_platform_data_directory() {
+        // The scope policy verifier is looked up where the CLI stages it (the
+        // product data directory): the frozen macOS `~/Library/Application
+        // Support` bytes on darwin, the XDG `~/.local/share` convention
+        // everywhere else (D-S02), so the probe and `install-agent-hooks.mjs`
+        // agree on one location per platform. The last candidate is always the
+        // scope-home fallback the fixtures install; the pure form keeps the
+        // oracle free of process-environment mutation.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            policy_verifier_candidates_for("/home/a", Some("/xdg-redirect".into())),
+            vec![PathBuf::from(
+                "/home/a/Library/Application Support/external-subagent/external-subagent-policy-verifier"
+            )]
+        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            let fallback = PathBuf::from(
+                "/home/a/.local/share/external-subagent/external-subagent-policy-verifier",
+            );
+            // Without an exported absolute XDG_DATA_HOME the scope-home
+            // fallback is the only candidate; a relative or empty export is
+            // ignored per the XDG rule.
+            assert_eq!(
+                policy_verifier_candidates_for("/home/a", None),
+                vec![fallback.clone()]
+            );
+            assert_eq!(
+                policy_verifier_candidates_for("/home/a", Some("relative/data".into())),
+                vec![fallback.clone()]
+            );
+            // An exported absolute override is probed first; the scope-home
+            // fallback stays last, so a redirected product tree and a plain
+            // scope home are both covered.
+            assert_eq!(
+                policy_verifier_candidates_for("/home/a", Some("/xdg-redirect".into())),
+                vec![
+                    PathBuf::from(
+                        "/xdg-redirect/external-subagent/external-subagent-policy-verifier"
+                    ),
+                    fallback
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn hi_probe_refuses_prompt_without_scope_policy_verifier() {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, log) = fake_hi_runtime(
@@ -2884,9 +2980,9 @@ process.stdin.on('data', (chunk) => {
         // LOCAL_PROBE_TIMEOUT; fixture probes widen it to survive a
         // parallel suite without weakening the fail-closed semantics).
         let directory = tempfile::tempdir().unwrap();
-        let verifier = directory.path().join(
-            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
-        );
+        let verifier = policy_verifier_candidates(&directory.path().to_string_lossy())
+            .pop()
+            .expect("at least one policy verifier candidate");
         fs::create_dir_all(verifier.parent().unwrap()).unwrap();
         fs::write(&verifier, "#!/bin/sh\nsleep 1\nexit 0\n").unwrap();
         {
@@ -3337,14 +3433,25 @@ process.stdin.on('data', (chunk) => {
     /// `--version`, completes the create-time runtime-preferences handshake,
     /// returns a controllable `settings.model.available` catalog (or a create
     /// error), and answers `session/close`. Every inbound frame is logged so
-    /// the test can assert the probe never sent a prompt.
-    fn fake_models_runtime(executable: &Path, log: &Path, catalog: &Value, create_error: bool) {
+    /// the test can assert the probe never sent a prompt. When
+    /// `emit_unknown_request` is set, the create flow first issues an
+    /// unrecognized server request (the Linux server runtime 0.16.9's
+    /// official-MCP auth header question) and proceeds regardless of the
+    /// client's answer, exactly like the real runtime's anonymous fallback.
+    fn fake_models_runtime(
+        executable: &Path,
+        log: &Path,
+        catalog: &Value,
+        create_error: bool,
+        emit_unknown_request: bool,
+    ) {
         let source = r#"
 import fs from 'node:fs';
 if (process.argv.includes('--version')) { process.stdout.write('3.8.1\n'); process.exit(0); }
 const log = __LOG__;
 const catalog = __CATALOG__;
 const createError = __CREATE_ERROR__;
+const emitUnknownRequest = __EMIT_UNKNOWN_REQUEST__;
 let pendingCreate = null;
 let buffer = '';
 function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
@@ -3365,6 +3472,7 @@ process.stdin.on('data', (chunk) => {
       if (value.params.mode !== 'plan') { write({ id: value.id, error: { code: -32602, message: 'not plan' } }); continue; }
       if (createError) { write({ id: value.id, error: { code: -32603, message: 'fixture create failed' } }); continue; }
       pendingCreate = value.id;
+      if (emitUnknownRequest) write({ id: 'auth-1', method: 'interaction/requestOfficialMcpAuthHeaders', params: { mcpKey: 'image_search' } });
       write({ id: 'preferences', method: 'session/requestRuntimePreferences', params: { scope: 'session', sessionId: 'catalog-session' } });
     } else if (value.id === 'preferences' && value.result) {
       write({ id: pendingCreate, result: { session: { sessionId: 'catalog-session' }, settings: { model: { current: { providerId: 'zai', modelId: 'GLM-5.3' }, available: catalog } } } });
@@ -3376,16 +3484,20 @@ process.stdin.on('data', (chunk) => {
 "#
         .replace("__LOG__", &serde_json::to_string(log).unwrap())
         .replace("__CATALOG__", &catalog.to_string())
-        .replace("__CREATE_ERROR__", if create_error { "true" } else { "false" });
+        .replace("__CREATE_ERROR__", if create_error { "true" } else { "false" })
+        .replace(
+            "__EMIT_UNKNOWN_REQUEST__",
+            if emit_unknown_request { "true" } else { "false" },
+        );
         fs::write(executable, source).unwrap();
     }
 
     /// Install the scope policy verifier the read-only probes require under the
     /// scope home, so the models probe can reach `session/create`.
     fn install_policy_verifier(directory: &Path) {
-        let verifier = directory.join(
-            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
-        );
+        let verifier = policy_verifier_candidates(&directory.to_string_lossy())
+            .pop()
+            .expect("at least one policy verifier candidate");
         fs::create_dir_all(verifier.parent().unwrap()).unwrap();
         fs::write(&verifier, b"#!/bin/sh\nexit 0\n").unwrap();
         {
@@ -3409,7 +3521,7 @@ process.stdin.on('data', (chunk) => {
             {"label": "no-ref"},
             {"ref": {"providerId": "zai"}}
         ]);
-        fake_models_runtime(&runtime, &log, &catalog, false);
+        fake_models_runtime(&runtime, &log, &catalog, false, false);
         install_policy_verifier(directory.path());
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
@@ -3458,11 +3570,68 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[test]
+    fn zcode_catalog_survives_an_unsupported_server_request_during_create() {
+        // The Linux server runtime 0.16.9 asks for official MCP auth headers
+        // mid-create (falling back to anonymous regardless of the answer).
+        // The probe must answer method-not-found and KEEP WAITING: the create
+        // result still arrives and the catalog is projected, instead of the
+        // historical abort that classified the healthy create as
+        // `create_failed`.
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("zcode-models-unknown.mjs");
+        let log = directory.path().join("models.jsonl");
+        let catalog = serde_json::json!([
+            {"ref": {"providerId": "zai", "modelId": "GLM-5.3"}},
+        ]);
+        fake_models_runtime(&runtime, &log, &catalog, false, true);
+        install_policy_verifier(directory.path());
+        let scope = ProbeScope {
+            workspace: Some(directory.path().to_string_lossy().into_owned()),
+            home: Some(directory.path().to_string_lossy().into_owned()),
+            profile: None,
+            version: None,
+        };
+        let backend = ProcessProbeBackend {
+            runtime_source: Some(runtime),
+            verifier_deadline: Some(Duration::from_secs(30)),
+        };
+        let output = backend.models(&AgentModelsInput {
+            agent: "zcode".into(),
+            scope,
+        });
+        assert!(output.supported, "{output:?}");
+        assert_eq!(output.models, vec!["zai/GLM-5.3".to_owned()]);
+        assert_eq!(output.reason, None);
+        // The runtime received exactly one method-not-found answer for the
+        // unrecognized request, and the create still completed afterwards.
+        let frames = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let rejections = frames
+            .iter()
+            .filter(|frame| {
+                frame["value"]["id"] == "auth-1" && frame["value"]["error"]["code"] == -32601
+            })
+            .count();
+        assert_eq!(rejections, 1, "{frames:?}");
+        // The catalog projection above already proves the create result was
+        // received after the rejection; the wire log confirms the create and
+        // the close both reached the runtime around it.
+        let methods = frames
+            .iter()
+            .filter_map(|frame| frame["value"]["method"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, ["session/create", "session/close"], "{frames:?}");
+    }
+
+    #[test]
     fn zcode_catalog_degrades_when_session_create_fails() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("zcode-models.mjs");
         let log = directory.path().join("models.jsonl");
-        fake_models_runtime(&runtime, &log, &serde_json::json!([]), true);
+        fake_models_runtime(&runtime, &log, &serde_json::json!([]), true, false);
         install_policy_verifier(directory.path());
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
@@ -3488,7 +3657,7 @@ process.stdin.on('data', (chunk) => {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("zcode-models.mjs");
         let log = directory.path().join("models.jsonl");
-        fake_models_runtime(&runtime, &log, &serde_json::json!([]), false);
+        fake_models_runtime(&runtime, &log, &serde_json::json!([]), false, false);
         // No verifier under the scope home: the models probe must hold the hi
         // probe's read-only policy gate and degrade before spawning anything.
         let backend = ProcessProbeBackend {

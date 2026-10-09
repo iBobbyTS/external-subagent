@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { DAEMON_BIN_NAME, PRODUCT_NAME, ZCODE_RUNTIME } from '../constants.mjs';
+import { DAEMON_BIN_NAME, PRODUCT_NAME, zcodeRuntimePath } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
@@ -160,7 +160,7 @@ export function systemdUnit(paths, options = {}) {
   const { runtime_path: codexRuntime, home: codexHome } = config.subagents.codex;
   const { runtime_path: agyRuntime } = config.subagents.agy;
   const configRevision = config.revision;
-  const zcodeRuntime = options.zcodeRuntime ?? ZCODE_RUNTIME;
+  const zcodeRuntime = options.zcodeRuntime ?? zcodeRuntimePath(paths.home);
   const execStart = [
     quotedArgument(daemon),
     quotedArgument('--database'),

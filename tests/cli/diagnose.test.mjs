@@ -25,6 +25,35 @@ test('global diagnose is bounded and marks missing logs incomplete', async () =>
   assert.equal(report.facade.running_identity_source, 'not_observed_by_cli');
 });
 
+test('diagnose reports the platform-resolved zcode runtime, not the packaged macOS constant', async () => {
+  // Same resolution source as the service generators (constants.mjs):
+  // without a conventional installation under the product home the absent
+  // packaged pin is reported, and a present conventional installation
+  // (Linux: ~/.zcode/server/agents/glm/zcode.cjs) is observed as the
+  // configured artifact.
+  const absent = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diagnose-runtime-'));
+  const previous = process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM;
+  process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM = 'linux';
+  try {
+    const report = await diagnose(pathsFor(absent), []);
+    assert.equal(report.runtime.configured_artifact.path, '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs');
+    assert.equal(report.runtime.configured_artifact.source, 'cli_resolved_configuration');
+    assert.equal(report.runtime.configured_artifact.sha256, undefined);
+
+    const present = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diagnose-runtime-'));
+    const runtime = path.join(present, '.zcode', 'server', 'agents', 'glm', 'zcode.cjs');
+    fs.mkdirSync(path.dirname(runtime), { recursive: true });
+    fs.writeFileSync(runtime, 'runtime');
+    const observed = await diagnose(pathsFor(present), []);
+    assert.equal(observed.runtime.configured_artifact.path, runtime);
+    assert.equal(typeof observed.runtime.configured_artifact.sha256, 'string');
+    fs.rmSync(present, { recursive: true, force: true });
+  } finally {
+    if (previous === undefined) delete process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM;
+    else process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM = previous;
+  }
+});
+
 test('artifact identity hashes only its labeled file and records source and capture time', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-artifact-identity-'));
   const running = path.join(home, 'running');

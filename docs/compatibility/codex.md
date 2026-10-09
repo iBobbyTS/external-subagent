@@ -333,6 +333,42 @@ Deltas from the 0.154.0 baseline, all additive — nothing the daemon reads move
   binary in the unit cgroup, and live build/plan chains completed
   ([acceptance record](../acceptance/S04-linux-codex-smoke.md)).
 
+### Plugin/MCP host-binding surface on Linux 0.162.0 (observed 2026-10-09)
+
+The full managed binding surface was exercised live on Linux through the
+product CLI with a throwaway `CODEX_HOME` and an isolated product HOME/XDG
+tree ([S05 acceptance](../acceptance/S05-linux-subagents-host-bindings.md)):
+`install-plugin codex` (staging → official `marketplace add` + `plugin add`,
+cache verified, D08 claim), a repeat install (idempotent, claim deduplicated),
+`install-plugin codex --uninstall` (official `plugin remove`, cache cleared,
+claim released), `install-mcp` (TOML section written, listed by the CLI) and
+`install-mcp --uninstall` (exactly the managed section removed, unrelated
+sections preserved). The `--json` result shapes are **identical to the 0.154.0
+macOS table above** — the diff table:
+
+| Command | 0.154.0 macOS | 0.162.0 Linux x86_64 | Delta |
+|---|---|---|---|
+| `plugin marketplace add <root> --json` | `{marketplaceName, installedRoot, alreadyAdded}` | same | none |
+| `plugin add <name> --marketplace <m> --json` | `{pluginId, name, marketplaceName, version, installedPath, authPolicy}` | same | none |
+| `plugin remove <name>@<m> --json` | `{pluginId, name, marketplaceName}` | same | none; cache directory removed, marketplace registration kept |
+| `plugin list --json` | `{installed: [...], available: [...]}` | same per-plugin fields (`pluginId`, `enabled`, `source.path`, `marketplaceSource`) | none |
+| `mcp list` | (not in the macOS table) | human table: `Name / Command / Args / Env / Cwd / Status / Auth`, one row per server, exit 0 | surface present on 0.162.0 |
+| `mcp list --json` | (not in the macOS table) | array of `{name, enabled, disabled_reason, transport{type,command,args,env,env_vars,cwd}, startup_timeout_sec, tool_timeout_sec, auth_status}` | surface present on 0.162.0 |
+
+`config.toml` side effects inside `CODEX_HOME` are the same as macOS
+(`[marketplaces.<name>]` with `source_type`/`source`, `[plugins."<n>@<m>"]`
+with `enabled = true`, plugin tree copied into
+`plugins/cache/<marketplace>/<name>/<version>`), and the managed
+`[mcp_servers.external_subagent]` TOML written by `install-mcp` is listed by
+`codex mcp list` with `Status: enabled`.
+
+One environment-dependent stderr note: with `CODEX_HOME` under `/tmp`, every
+codex invocation prints `WARNING: proceeding, even though we could not create
+PATH aliases: Refusing to create helper binaries under temporary dir "/tmp" …`
+before the JSON. It is a warning only (exit 0, JSON intact) and does not
+affect any binding read-back; a `CODEX_HOME` outside temporary directories
+does not produce it.
+
 ## NOT_RUN
 
 - Installation into a real user `~/.codex` (requires explicit authorization).
