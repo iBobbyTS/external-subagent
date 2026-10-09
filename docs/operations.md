@@ -71,8 +71,9 @@ verify the staged payload (manifest, digest, mode 755, the platform's image
 report PATH findings (never write profiles) and an honest fixed-ZCode-runtime
 observation
 (`runtime: {path, present}` — never a probe that can fail setup), create the
-private data/log directories, write the product config, install the
-LaunchAgent, bootstrap the service, and — after all of that — publish the
+private data/log directories, write the product config, install the service
+definition (the launchd LaunchAgent plist on macOS; the systemd user unit on
+Linux), start the service, and — after all of that — publish the
 verified active payload with its retained byte-for-byte copy under product
 data, so a successful `init` itself establishes the version and retention
 baseline for every later upgrade. The publication reuses the locked update
@@ -80,8 +81,10 @@ owner (same verification, retention, and lock rules as `update`), so the
 standard sequence `npm A → init A → use A → npm B` never depends on an extra
 "A update" step. `--resume` continues after an environmental failure using
 the step journal; failures roll tracked files back — including the product
-configuration, the LaunchAgent, and the baseline the same run published — so
-a partial install never looks complete.
+configuration, the service definition, and the baseline the same run
+published — so a partial install never looks complete. A service the failed
+init itself started is stopped again by the rollback; a service that was
+already running before the init is never touched.
 
 `init` binds no host. The retired `--skip-runtime-probe`,
 `--skip-codex-plugin`, and `--codex-home` flags are rejected with an
@@ -95,24 +98,30 @@ product never installs subagent runtimes itself.
 
 When DSH is explicitly enabled, configure its `runtime_path`, `home`, `profile`,
 and pinned `version` through the public config command. `init` renders the
-LaunchAgent template once with those values; after a `config set`, the service
+service template once with those values; after a `config set`, the service
 environment refreshes on the next service restart (`stop` + `start`, or an
 `update` that activates a new payload), because the daemon re-reads the product
 config and re-exports the DSH environment at every startup (`update`/`reconcile`
-never re-render the plist). The DSH
+never re-render the definition; on macOS a `config set` refreshes the plist
+in place, while a Linux `config set` leaves the unit to the next
+init/update). The DSH
 adapter consumes and validates the profile/version rather than relying on the
 interactive shell.
 
 ## PATH behavior
 
-The launchd/GUI environment does not inherit the interactive shell PATH, so
-every managed entry is absolute: the LaunchAgent pins the daemon binary, and
-the staged plugin `.mcp.json` pins the MCP facade inside the installed
-package. That staged `.mcp.json` also sets `timeoutMs: 300000` on the
-zcode-side server entry, because the zcode host caps MCP tool calls at a
-default 30000ms — below the product's 299s `external_subagent_wait` ceiling.
-The daemon itself runs with the fixed PATH
-`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+The launchd/GUI and systemd user-manager environments do not inherit the
+interactive shell PATH, so every managed entry is absolute: the service
+definition pins the daemon binary, and the staged plugin `.mcp.json` pins the
+MCP facade inside the installed package. That staged `.mcp.json` also sets
+`timeoutMs: 300000` on the zcode-side server entry, because the zcode host
+caps MCP tool calls at a default 30000ms — below the product's 299s
+`external_subagent_wait` ceiling. The daemon itself runs with a fixed,
+platform-owned PATH — `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`
+on macOS, `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` on
+Linux (covering systemctl and the payload's system-tool dependencies);
+user-level runtime installs (nvm and friends) are never assumed, because the
+persisted subagent runtimes are forwarded to the service as absolute paths.
 `init` reports whether `external-subagent` is on the shell PATH; repairing a
 user profile stays an explicit user action (the product never edits shell
 startup files).
@@ -120,48 +129,69 @@ startup files).
 ## Service control
 
 ```
-external-subagent start   # launchctl bootstrap gui/<uid> <plist> — idempotent
-external-subagent stop    # launchctl bootout gui/<uid>/com.external-subagent.daemon — waits for removal
+external-subagent start   # macOS: launchctl bootstrap gui/<uid> <plist>
+                           # Linux: systemctl --user daemon-reload + enable --now
+external-subagent stop    # macOS: launchctl bootout gui/<uid>/com.external-subagent.daemon
+                           # Linux: systemctl --user disable --now external-subagent.service
 external-subagent status          # essential service/install/daemon readiness
 external-subagent status --verbose # add payload, registry, and daemon diagnostics
 ```
 
-`start` (and init's start-service step) is idempotent: launchd answers a
-bootstrap whose label is already loaded in the target domain with
-`Bootstrap failed: 5: Input/output error`, so the product first looks the
-label up with `launchctl print`; an already-loaded job is reported as
-`already_loaded` with its current `state`/`pid` — no second bootstrap, no
-second daemon process, and the loaded service is left untouched. A bootstrap
-that loses a race to another loader resolves through the same lookup; only a
-real control failure surfaces as `DAEMON_CONTROL_FAILED`.
+Both backends carry the same contract. `start` (and init's start-service step)
+is idempotent: launchd answers a bootstrap whose label is already loaded in
+the target domain with `Bootstrap failed: 5: Input/output error`, and systemd
+reporting is racy around concurrent starters, so the product first looks the
+service up (`launchctl print` / `systemctl --user show`); an already-live
+service is reported as `already_loaded` with its current `state`/`pid` — no
+second start, no second daemon process, and the loaded service is left
+untouched. A start that loses a race to another starter resolves through the
+same lookup; only a real control failure surfaces as `DAEMON_CONTROL_FAILED`.
 
-`stop` is idempotent the same way: a job that is not registered reports
-`already_stopped`, and a job that a concurrent removal took out mid-stop is
-settled through the lookup instead of failing. A bootout only succeeds once
-the registration probe confirms the job is actually gone — launchd completes
-the removal asynchronously, and a `start` issued in that window can otherwise
-be swept away by the still-running teardown (observed live). A job that stays
-registered past the bounded deadline fails with `SERVICE_UNLOAD_TIMEOUT`
-instead of pretending removal.
+`stop` is idempotent the same way: a service that is not registered reports
+`already_stopped`, and a service a concurrent removal took down mid-stop is
+settled through the lookup instead of failing. A stop only succeeds once the
+backend confirms the removal actually completed — launchd completes a bootout
+asynchronously, and a systemd `disable --now` returns before the unit has
+necessarily finished its teardown, so the stop polls (bounded) until the job
+is gone / the unit is `inactive` with its process exited and the daemon socket
+removed. A service that stays up past the bounded deadline fails with
+`SERVICE_UNLOAD_TIMEOUT` instead of pretending removal.
+
+On Linux the user manager must be reachable: without a login session
+(`$XDG_RUNTIME_DIR`/`$DBUS_SESSION_BUS_ADDRESS` absent), start/stop/init fail
+with `NO_USER_SYSTEMD_SESSION` and an explicit remedy (log in, or
+`loginctl enable-linger <user>`). The product never enables linger, never
+modifies unrelated units, and never contacts the system (PID 1) manager; the
+read-only `status` degrades its service view to `unavailable` with the same
+hint instead of failing.
 
 A failing init rolls its own service work back symmetrically: a daemon the
-failed init itself bootstrapped is booted back out together with the plist
-and install state, while a service that was already loaded before the init
-is never booted out by the rollback.
+failed init itself started is stopped again together with the service
+definition and install state, while a service that was already running before
+the init is never stopped by the rollback.
 
-`status` separates the launchd view from the RPC view. The default output is
-an operational summary: install/data presence, payload verification state,
-registered service state, daemon component readiness, subagent enablement and
-spawn support, and each probe scope's `state` plus `checked_at_ms`.
-`status --verbose` adds diagnostic-only details such as payload file hashes,
-registry recovery data, daemon capabilities, service generation, transport and
-permission metadata, and daemon identity. `diagnose` remains the bounded
-failure/incident report. This keeps routine status readable without removing
-the underlying RPC fields used by health checks and upgrades.
+`status` separates the backend service view from the RPC view. The default
+output is an operational summary: install/data presence, payload verification
+state, the registered service's real state (a crashed Linux unit reports
+`failed`, never a fake healthy), daemon component readiness, subagent
+enablement and spawn support, and each probe scope's `state` plus
+`checked_at_ms`. `status --verbose` adds diagnostic-only details such as
+payload file hashes, registry recovery data, daemon capabilities, service
+generation, transport and permission metadata, and daemon identity.
+`diagnose` remains the bounded failure/incident report. This keeps routine
+status readable without removing the underlying RPC fields used by health
+checks and upgrades.
 
-The plist template is documented in
+The macOS plist template is documented in
 `launchd/com.external-subagent.daemon.plist.template` and generated by
-`cli/install/service-macos.mjs` with `RunAtLoad`/`KeepAlive`.
+`cli/install/service-macos.mjs` with `RunAtLoad`/`KeepAlive`. The Linux unit
+is generated by `cli/install/service-linux.mjs` into
+`~/.config/systemd/user/external-subagent.service` (mode 0600) with
+`Restart=always` and `WantedBy=default.target`; its environment forwarding is
+one-to-one with the plist, the daemon's `--diagnostic-log` writes
+`daemon-error.log` under `~/.local/state/external-subagent/`, and the
+daemon's stdout/stderr go to the user journal
+(`journalctl --user -u external-subagent.service`).
 
 ## Codex binding and the D08 homes registry
 
@@ -221,12 +251,12 @@ external-subagent uninstall    # releases Codex claims, boots out + deregisters 
 external-subagent purge --yes  # explicitly deletes product data
 ```
 
-`uninstall` first boots the ES-owned service out — with the same bounded
-removal confirmation `stop` uses — and only then deletes the LaunchAgent
-definition; a service that was not registered is not an error
-(`service_already_stopped`). Deleting the plist alone would leave a job
-launchd already loaded running until the next logout, so a bootout that
-cannot complete fails the command (`SERVICE_UNLOAD_TIMEOUT`) rather than
+`uninstall` first stops the ES-owned service — with the same bounded
+removal confirmation `stop` uses, on both backends — and only then deletes
+the service definition; a service that is not registered is not an error
+(`service_already_stopped`). Deleting the definition alone would leave a job
+the service manager already loaded running until the next logout, so a stop
+that cannot complete fails the command (`SERVICE_UNLOAD_TIMEOUT`) rather than
 stranding a running daemon without its definition. Product data and subagent
 credentials are always retained, and installations owned by other products
 are never touched; the managed Codex plugin and MCP binding are removed

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { LAUNCH_AGENT_LABEL, NATIVE_DIR_NAME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
+import { platform } from '../paths.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
 import { verifyPayload } from './payload.mjs';
@@ -10,7 +11,7 @@ import { pathReport } from './path.mjs';
 import { packageRoot, payloadManifestPath } from './layout.mjs';
 import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
-import { bootstrapService, bootoutService, installLaunchAgent, runtimeObservations } from './service-macos.mjs';
+import { SYSTEMD_UNIT_NAME, bootstrapService, bootoutService, installServiceDefinition, runtimeObservations } from './service-macos.mjs';
 
 // Standalone-install coordination (S05, AUD-005 decision D1).  A plain npm
 // install only stages the package and payload; an explicit `init` installs
@@ -20,8 +21,12 @@ import { bootstrapService, bootoutService, installLaunchAgent, runtimeObservatio
 //   check-path         PATH findings are reported, never written
 //   create-data        private data/log directories
 //   write-product-config  republish the current agent config schema
-//   install-launch-agent  the one macOS service template
-//   start-service      launchctl bootstrap (best-effort, reported)
+//   install-launch-agent  the one service template: the launchd LaunchAgent
+//                      plist on macOS, the systemd user unit on Linux (the
+//                      step id predates the Linux backend and stays stable so
+//                      resume journals keep matching)
+//   start-service      launchctl bootstrap / systemctl --user daemon-reload +
+//                      enable --now (best-effort, reported)
 //   publish-active-payload  the verified active identity and retained bytes
 //                      (B-3): a successful init establishes the version and
 //                      retention baseline itself, so the standard `npm A ->
@@ -55,13 +60,14 @@ export function installPlan(paths, options = {}) {
   // the reported path matches the layout instead of a hard-coded platform.
   const manifest = payloadManifestPath()
     ?? path.join(packageRoot(), 'npm', NATIVE_DIR_NAME, `${process.platform}-${process.arch}`, 'payload.json');
+  const darwin = platform() === 'darwin';
   const plan = [
     { id: 'verify-payload', action: 'verify staged native payload', path: manifest },
     { id: 'check-path', action: 'report PATH availability without writing profiles' },
     { id: 'create-data', action: 'create private product data and log directories', paths: [paths.data, paths.logs] },
     { id: 'write-product-config', action: 'republish the product agent config schema', path: paths.config },
-    { id: 'install-launch-agent', action: 'install daemon LaunchAgent', path: paths.launchAgent, label: LAUNCH_AGENT_LABEL },
-    { id: 'start-service', action: 'bootstrap the daemon service', path: paths.launchAgent, label: LAUNCH_AGENT_LABEL },
+    { id: 'install-launch-agent', action: darwin ? 'install daemon LaunchAgent' : 'install daemon systemd user unit', path: paths.launchAgent, ...(darwin ? { label: LAUNCH_AGENT_LABEL } : { unit: SYSTEMD_UNIT_NAME }) },
+    { id: 'start-service', action: darwin ? 'bootstrap the daemon service' : 'enable and start the daemon service', path: paths.launchAgent, ...(darwin ? { label: LAUNCH_AGENT_LABEL } : { unit: SYSTEMD_UNIT_NAME }) },
     { id: 'publish-active-payload', action: 'publish the verified active payload and retained-byte baseline', path: paths.state },
   ];
   if (options.installHooks) plan.splice(plan.findIndex((step) => step.id === 'publish-active-payload'), 0, { id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });
@@ -144,12 +150,12 @@ export function runInit(options = {}) {
       mark('write-product-config');
     }
     if (!completed.has('install-launch-agent')) {
-      installLaunchAgent(paths);
+      installServiceDefinition(paths);
       failAt('install-launch-agent');
       mark('install-launch-agent');
     }
     if (!completed.has('start-service') && !options.skipServiceStart) {
-      service = bootstrapService(paths, process.getuid(), { launchctl: options.launchctl });
+      service = bootstrapService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl });
       serviceLoadedByThisRun = !service.skipped && !service.already_loaded;
       mark('start-service');
     }
@@ -188,7 +194,7 @@ export function runInit(options = {}) {
       ...removeCreatedDirectories(directories),
     ];
     if (serviceLoadedByThisRun) {
-      try { bootoutService(paths, process.getuid(), { launchctl: options.launchctl }); } catch (bootoutError) {
+      try { bootoutService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl }); } catch (bootoutError) {
         rollbackErrors.push(`service rollback (bootout) failed: ${bootoutError.message}`);
       }
     }

@@ -7,8 +7,14 @@ import { atomicWrite } from '../fs-atomic.mjs';
 import { nativeBinary } from './layout.mjs';
 import { LAUNCHD_FIXED_PATH } from './path.mjs';
 import { readConfig } from '../config/read.mjs';
+import { platform } from '../paths.mjs';
+import {
+  SYSTEMD_UNIT_NAME, bootstrapServiceSystemd, bootoutServiceSystemd, installServiceUnit,
+  systemdServiceRegistrationStatus,
+} from './service-linux.mjs';
 
-// The one macOS service template for the product daemon.  The plist pins
+// The macOS service backend for the product daemon, plus the platform
+// dispatch into the systemd user backend (service-linux.mjs).  The plist pins
 // absolute payload paths and a fixed PATH so the GUI/launchd environment can
 // never depend on the interactive shell.  Launchctl activation honors the
 // EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL seam so fixture runs never load real
@@ -103,7 +109,7 @@ export function launchctl(args) {
 // A repeat init/start must stay idempotent instead of failing the whole run,
 // so the registration lookup below — the same print/absent discriminator the
 // update owner uses — decides between "already loaded" and a real failure.
-export function serviceRegistrationStatus(uid = process.getuid(), options = {}) {
+export function launchdServiceRegistrationStatus(uid = process.getuid(), options = {}) {
   const control = options.launchctl || launchctl;
   const result = control(['print', `gui/${uid}/${LAUNCH_AGENT_LABEL}`]);
   if (result.skipped) return { query: 'skipped', registered: null, reason: result.reason };
@@ -113,20 +119,20 @@ export function serviceRegistrationStatus(uid = process.getuid(), options = {}) 
   return { registered: true, state, pid: Number.isInteger(pid) && pid > 0 ? pid : null };
 }
 
-export function bootstrapService(paths, uid = process.getuid(), options = {}) {
+export function bootstrapLaunchdService(paths, uid = process.getuid(), options = {}) {
   const control = options.launchctl || launchctl;
   const alreadyLoaded = (lookup) => ({
     action: 'bootstrap', label: LAUNCH_AGENT_LABEL, already_loaded: true,
     state: lookup.state ?? null, pid: lookup.pid ?? null,
   });
-  const existing = serviceRegistrationStatus(uid, { launchctl: control });
+  const existing = launchdServiceRegistrationStatus(uid, { launchctl: control });
   if (existing.registered) return alreadyLoaded(existing);
   try {
     return control(['bootstrap', `gui/${uid}`, paths.launchAgent]);
   } catch (error) {
     // Another loader (a racing init, or launchd itself re-reading the plist)
     // may have won after the check above; confirm before reporting failure.
-    const loaded = serviceRegistrationStatus(uid, { launchctl: control });
+    const loaded = launchdServiceRegistrationStatus(uid, { launchctl: control });
     if (loaded.registered) return alreadyLoaded(loaded);
     throw error;
   }
@@ -138,9 +144,9 @@ export function bootstrapService(paths, uid = process.getuid(), options = {}) {
 // service unregistered roughly one time in three).  The stop owner therefore
 // confirms the job is actually gone — bounded, with the same print/absent
 // discriminator the update owner's unload uses — before reporting success.
-export function bootoutService(paths, uid = process.getuid(), options = {}) {
+export function bootoutLaunchdService(paths, uid = process.getuid(), options = {}) {
   const control = options.launchctl || launchctl;
-  const existing = serviceRegistrationStatus(uid, { launchctl: control });
+  const existing = launchdServiceRegistrationStatus(uid, { launchctl: control });
   if (!existing.registered) return { action: 'bootout', label: LAUNCH_AGENT_LABEL, already_stopped: true };
   let result;
   try {
@@ -149,15 +155,49 @@ export function bootoutService(paths, uid = process.getuid(), options = {}) {
     // A racing removal (another stop, or launchd itself) may have taken the
     // job out between the registration probe and the bootout; confirm before
     // reporting failure, so a repeated stop stays idempotent.
-    const settled = serviceRegistrationStatus(uid, { launchctl: control });
+    const settled = launchdServiceRegistrationStatus(uid, { launchctl: control });
     if (!settled.registered) return { action: 'bootout', label: LAUNCH_AGENT_LABEL, already_stopped: true };
     throw error;
   }
   const deadline = Date.now() + (options.unloadTimeoutMs ?? 10_000);
   for (;;) {
-    const probe = serviceRegistrationStatus(uid, { launchctl: control });
+    const probe = launchdServiceRegistrationStatus(uid, { launchctl: control });
     if (!probe.registered) return { ...result, label: LAUNCH_AGENT_LABEL, removed: true };
     if (Date.now() >= deadline) throw new CliError('SERVICE_UNLOAD_TIMEOUT', 'launchd service remained registered after bootout');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
   }
 }
+
+// Platform dispatch (S03): the service backend is selected by the process
+// platform — launchd on macOS, the systemd user manager on Linux — behind the
+// same call surface every caller (init, start/stop, uninstall, status) already
+// uses.  The macOS arms below are the verbatim launchd implementations; the
+// Linux arms carry the same idempotence/removal-confirmation contract through
+// `systemctl --user` (options.systemctl is the injectable seam, the twin of
+// options.launchctl).
+export function serviceRegistrationStatus(uid = process.getuid(), options = {}) {
+  return platform() === 'darwin'
+    ? launchdServiceRegistrationStatus(uid, options)
+    : systemdServiceRegistrationStatus(options);
+}
+
+export function bootstrapService(paths, uid = process.getuid(), options = {}) {
+  return platform() === 'darwin'
+    ? bootstrapLaunchdService(paths, uid, options)
+    : bootstrapServiceSystemd(paths, uid, options);
+}
+
+export function bootoutService(paths, uid = process.getuid(), options = {}) {
+  return platform() === 'darwin'
+    ? bootoutLaunchdService(paths, uid, options)
+    : bootoutServiceSystemd(paths, uid, options);
+}
+
+// The service-definition installer behind init's install-launch-agent step:
+// the launchd plist on macOS, the systemd user unit (0600, absolute verified
+// payload, Restart=always) on Linux, both at paths.launchAgent.
+export function installServiceDefinition(paths, options = {}) {
+  return platform() === 'darwin' ? installLaunchAgent(paths, options) : installServiceUnit(paths, options);
+}
+
+export { SYSTEMD_UNIT_NAME };

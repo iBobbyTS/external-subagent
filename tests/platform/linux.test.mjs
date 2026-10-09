@@ -97,15 +97,24 @@ test('Linux profile list reports the XDG directory without writing HOME', () => 
   assert.deepEqual(fs.readdirSync(home), [], 'profile list must not create the profiles directory');
 });
 
-test('Linux status reports a transitional service view without probing launchd', () => {
+test('Linux status reports the real systemd service view without probing launchd', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-linux-status-'));
   // No launchd test seam: the real Linux path must not invoke /bin/launchctl.
+  // The systemd view is the REAL `systemctl --user show` probe (S03): an
+  // uninitialized install reports the unit as absent, and a host without a
+  // reachable user manager degrades to an explicit unavailable view with the
+  // linger hint instead of failing the read-only command.
   const result = run(home, ['status']);
   assert.equal(result.status, 0, result.stderr);
   const parsed = JSON.parse(result.stdout);
   assert.equal(parsed.ok, true);
-  assert.equal(parsed.service.skipped, true, 'the systemd service view is deferred to S03');
-  assert.match(parsed.service.reason, /S03/u);
+  assert.equal(parsed.service.skipped, undefined, 'the transitional skipped view is gone');
+  if (parsed.service.query === 'unavailable') {
+    assert.equal(parsed.service.registered, null);
+    assert.match(parsed.service.reason, /enable-linger/u, 'a missing user session carries the linger hint');
+  } else {
+    assert.equal(parsed.service.registered, false, 'an uninitialized install has no loaded unit');
+  }
   assert.equal(parsed.service_definition, false, 'an uninitialized install has no service definition');
   assert.equal(parsed.daemon_status, null);
   assert.ok(parsed.daemon_error, 'the missing daemon is reported as a daemon_error');

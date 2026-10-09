@@ -6,16 +6,53 @@ import test from 'node:test';
 import { backupData, purge, restoreData, uninstall } from '../../cli/maintenance.mjs';
 import { uninstall as uninstallProduct } from '../../cli/commands/maintenance.mjs';
 import { loadCodexHomes, registerCodexHome } from '../../cli/install/reconcile.mjs';
-import { bootstrapService, bootoutService, serviceRegistrationStatus } from '../../cli/install/service-macos.mjs';
+import { SYSTEMD_UNIT_NAME } from '../../cli/install/service-linux.mjs';
+import { bootstrapService, bootoutService, launchdServiceRegistrationStatus } from '../../cli/install/service-macos.mjs';
 import { runInit } from '../../cli/install/init.mjs';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths, platform } from '../../cli/paths.mjs';
 
-// The launchd bootout/removal-confirmation behaviour is macOS-only; on Linux the
-// equivalent systemd backend is wired by S03, so those backend-specific tests
-// are host-gated. Path/layout and data-retention assertions stay host-neutral.
+// The service-removal confirmation behaviour is owned per backend: launchd
+// bootout/removal on macOS, systemctl --user disable --now plus the bounded
+// inactive confirmation on Linux (its seam twins live in
+// tests/install/service-linux.test.mjs). The backend-specific tests below are
+// host-gated to their backend; path/layout and data-retention assertions stay
+// host-neutral.
 const macos = platform() === 'darwin';
+const linux = platform() === 'linux';
 const removedServiceDefinition = macos ? 'removed_launch_agent' : 'removed_service_definition';
+
+// The seams each backend reads: uninstall/init accept both injectable
+// controls and the platform dispatch picks its own.
+function bothSeams(launchctlControl, systemctlControl) {
+  return { launchctl: launchctlControl, systemctl: systemctlControl };
+}
+
+// Stateful systemctl double mirroring recordingLaunchctl: show/enable/disable
+// track one unit, so the uninstall oracles below observe exactly what the
+// user manager would.
+function recordingSystemd({ loaded = false, active = false } = {}) {
+  const calls = [];
+  const state = { loaded, active };
+  return {
+    calls,
+    state,
+    control(args) {
+      calls.push(args.join(' '));
+      if (args[0] === 'show') {
+        if (!state.loaded) return { action: 'show', status: 0, stdout: 'LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n' };
+        return {
+          action: 'show', status: 0,
+          stdout: `LoadState=loaded\nActiveState=${state.active ? 'active' : 'inactive'}\nSubState=${state.active ? 'running' : 'dead'}\nMainPID=${state.active ? 999 : 0}\n`,
+        };
+      }
+      if (args[0] === 'daemon-reload') return { action: 'daemon-reload', status: 0 };
+      if (args[0] === 'enable') { state.loaded = true; state.active = true; return { action: 'enable', status: 0 }; }
+      if (args[0] === 'disable') { state.active = false; state.loaded = false; return { action: 'disable', status: 0 }; }
+      throw new Error(`unexpected systemctl call: ${args.join(' ')}`);
+    },
+  };
+}
 
 test('backup verifies bytes and restore replaces product data', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-data-'));
@@ -60,7 +97,9 @@ test('uninstall retains data, while purge is an explicit separate operation', ()
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
-  const result = uninstall(paths, { launchctl: recordingLaunchctl().control });
+  const launchctl = recordingLaunchctl();
+  const systemd = recordingSystemd();
+  const result = uninstall(paths, bothSeams(launchctl.control, systemd.control));
   assert.equal(result.data_retained, true);
   assert.equal(result.service_stopped, true);
   assert.equal(result.service_already_stopped, true, 'an unregistered service is not an uninstall error');
@@ -86,6 +125,81 @@ test('uninstall boots out the loaded ES service before removing its definition',
   assert.equal(result.removed_launch_agent, true);
   assert.equal(fs.existsSync(paths.data), true, 'uninstall never purges retained data');
   fs.rmSync(home, { recursive: true, force: true });
+});
+
+// The systemd twin of the three launchd uninstall oracles above.
+test('uninstall disables the loaded ES unit before removing its definition', { skip: !linux }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-linux-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, '[Unit]\n');
+  const systemd = recordingSystemd({ loaded: true, active: true });
+  const result = uninstall(paths, { systemctl: systemd.control });
+  assert.ok(systemd.calls.includes(`disable --now ${SYSTEMD_UNIT_NAME}`), 'uninstall must stop and disable the unit it owns');
+  assert.equal(systemd.state.active, false);
+  assert.equal(result.service_stopped, true);
+  assert.equal(result.service_already_stopped, false);
+  assert.equal(result.removed_service_definition, true);
+  assert.equal(fs.existsSync(paths.data), true, 'uninstall never purges retained data');
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('uninstall reports a stop it cannot complete instead of removing the definition', { skip: !linux }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-stuck-linux-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, '[Unit]\n');
+  // A unit that stays active after disable --now: the command must fail loudly
+  // and leave the definition in place rather than strand a running service.
+  const stuck = (args) => {
+    if (args[0] === 'show') return { action: 'show', status: 0, stdout: 'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=999\n' };
+    if (args[0] === 'disable') return { action: 'disable', status: 0 };
+    throw new Error(`unexpected systemctl call: ${args.join(' ')}`);
+  };
+  assert.throws(() => uninstall(paths, { systemctl: stuck, unloadTimeoutMs: 150 }), (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT');
+  assert.equal(fs.existsSync(paths.launchAgent), true);
+  fs.rmSync(home, { recursive: true, force: true });
+});
+
+test('product uninstall keeps every registry claim when the systemd stop cannot complete', { skip: !linux }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-stuck-linux-'));
+  const paths = productPaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, '[Unit]\n');
+  const codexHome = path.join(home, 'codex-claimed');
+  fs.mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(codexHome, 'binding.json'), 'managed binding');
+  registerCodexHome(paths, codexHome, { version: '0.1.0', digest: 'deadbeef', status: 'claimed' });
+  const stuck = (args) => {
+    if (args[0] === 'show') return { action: 'show', status: 0, stdout: 'LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=999\n' };
+    if (args[0] === 'disable') return { action: 'disable', status: 0 };
+    throw new Error(`unexpected systemctl call: ${args.join(' ')}`);
+  };
+  try {
+    assert.throws(
+      () => uninstallProduct(paths, { systemctl: stuck, unloadTimeoutMs: 150 }),
+      (error) => error.code === 'SERVICE_UNLOAD_TIMEOUT',
+    );
+    const registry = loadCodexHomes(paths).registry;
+    assert.deepEqual(registry.homes.map((entry) => entry.home), [fs.realpathSync(codexHome)],
+      'a failed service removal must not release any claim');
+    assert.equal(registry.homes[0].digest, 'deadbeef', 'per-home registry state survives the failed uninstall verbatim');
+    assert.equal(fs.readFileSync(path.join(codexHome, 'binding.json'), 'utf8'), 'managed binding',
+      'the bound home is left untouched for the retry');
+    assert.equal(fs.existsSync(paths.launchAgent), true, 'the service definition stays in place');
+
+    // The intermediate state is retry-safe: the same uninstall completes once
+    // the user manager gives the unit up, and only then are the claims released.
+    const systemd = recordingSystemd({ loaded: true, active: true });
+    const retried = uninstallProduct(paths, { systemctl: systemd.control });
+    assert.equal(retried.codex_homes_unregistered, 1);
+    assert.deepEqual(loadCodexHomes(paths).registry.homes, []);
+    assert.equal(fs.existsSync(paths.launchAgent), false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('uninstall reports a bootout it cannot complete instead of removing the definition', { skip: !macos }, () => {
@@ -164,14 +278,16 @@ test('product uninstall removes the service first, then releases every claim whi
     claimed.push(codexHome);
   }
   const launchctl = recordingLaunchctl({ loaded: true });
-  const result = uninstallProduct(paths, { launchctl: launchctl.control });
+  const systemd = recordingSystemd({ loaded: true, active: true });
+  const result = uninstallProduct(paths, bothSeams(launchctl.control, systemd.control));
   assert.equal(result.service_stopped, true);
   if (macos) {
     assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'uninstall must boot out the service it owns');
     assert.equal(result.service_already_stopped, false);
   } else {
-    assert.deepEqual(launchctl.calls, [], 'Linux removes the definition without a launchd bootout');
-    assert.equal(result.service_already_stopped, true);
+    assert.ok(systemd.calls.includes(`disable --now ${SYSTEMD_UNIT_NAME}`), 'uninstall must stop and disable the unit it owns');
+    assert.equal(systemd.state.active, false);
+    assert.equal(result.service_already_stopped, false);
   }
   assert.equal(result[removedServiceDefinition], true);
   assert.equal(result.codex_homes_unregistered, 2, 'every claimed home is released');
@@ -193,7 +309,7 @@ function servicePaths() {
   return productPaths(fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-boot-')));
 }
 
-test('bootstrap reports already-loaded instead of surfacing the launchd EIO', () => {
+test('bootstrap reports already-loaded instead of surfacing the launchd EIO', { skip: !macos }, () => {
   const paths = servicePaths();
   const calls = [];
   const control = (args) => {
@@ -208,12 +324,12 @@ test('bootstrap reports already-loaded instead of surfacing the launchd EIO', ()
   assert.equal(started.state, 'running');
   assert.equal(started.pid, 4242);
 
-  const status = serviceRegistrationStatus(501, { launchctl: control });
+  const status = launchdServiceRegistrationStatus(501, { launchctl: control });
   assert.equal(status.registered, true);
   assert.equal(status.pid, 4242);
 });
 
-test('bootstrap resolves a lost race through the registration lookup and still fails real errors', () => {
+test('bootstrap resolves a lost race through the registration lookup and still fails real errors', { skip: !macos }, () => {
   const paths = servicePaths();
   // First print: absent. bootstrap: EIO (a racing loader won). Second print: loaded.
   let prints = 0;
@@ -229,14 +345,14 @@ test('bootstrap resolves a lost race through the registration lookup and still f
   // Both prints absent and bootstrap still failing is a genuine control failure.
   const absent = (args) => (args[0] === 'print' ? { action: 'print', absent: true } : (() => { throw new CliError('DAEMON_CONTROL_FAILED', 'Bootstrap failed: 5: Input/output error'); })());
   assert.throws(() => bootstrapService(paths, 501, { launchctl: absent }), (error) => error.code === 'DAEMON_CONTROL_FAILED');
-  assert.equal(serviceRegistrationStatus(501, { launchctl: absent }).registered, false);
+  assert.equal(launchdServiceRegistrationStatus(501, { launchctl: absent }).registered, false);
 });
 
-test('service status lookup stays neutralized under the launchd test seam', () => {
+test('service status lookup stays neutralized under the launchd test seam', { skip: !macos }, () => {
   const previous = process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL;
   process.env.EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL = '1';
   try {
-    const status = serviceRegistrationStatus();
+    const status = launchdServiceRegistrationStatus();
     assert.equal(status.registered, null);
     assert.equal(status.query, 'skipped');
     const started = bootstrapService(servicePaths());
@@ -269,6 +385,18 @@ function recordingLaunchctl({ loaded = false } = {}) {
   };
 }
 
+// The active backend double for the init fixtures: the recording launchctl on
+// macOS, the recording systemctl on Linux, each with the seam key the
+// dispatched backend reads.
+function recordingBackend({ loaded = false } = {}) {
+  if (macos) {
+    const launchctl = recordingLaunchctl({ loaded });
+    return { seams: () => ({ launchctl: launchctl.control }), calls: launchctl.calls, state: launchctl.state };
+  }
+  const systemd = recordingSystemd({ loaded, active: loaded });
+  return { seams: () => ({ systemctl: systemd.control }), calls: systemd.calls, state: systemd.state };
+}
+
 function initFixture({ failStep = 'publish-active-payload' } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-service-'));
   const paths = productPaths(home);
@@ -286,12 +414,17 @@ function initFixture({ failStep = 'publish-active-payload' } = {}) {
 
 test('a failed init boots back out the service that init itself loaded', () => {
   const { paths, run } = initFixture();
-  const launchctl = recordingLaunchctl();
+  const backend = recordingBackend();
   try {
-    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at publish-active-payload/u);
-    assert.ok(launchctl.calls.some((call) => call.startsWith('bootout gui/')), 'rollback must undo the bootstrap init performed');
-    assert.equal(launchctl.state.loaded, false);
-    assert.equal(fs.existsSync(paths.launchAgent), false, 'the LaunchAgent still rolls back with the service');
+    assert.throws(() => run(backend.seams()), /injected failure at publish-active-payload/u);
+    if (macos) {
+      assert.ok(backend.calls.some((call) => call.startsWith('bootout gui/')), 'rollback must undo the bootstrap init performed');
+      assert.equal(backend.state.loaded, false);
+    } else {
+      assert.ok(backend.calls.includes(`disable --now ${SYSTEMD_UNIT_NAME}`), 'rollback must undo the enable init performed');
+      assert.equal(backend.state.active, false);
+    }
+    assert.equal(fs.existsSync(paths.launchAgent), false, 'the service definition still rolls back with the service');
   } finally {
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
@@ -299,18 +432,24 @@ test('a failed init boots back out the service that init itself loaded', () => {
 
 test('a failed init never boots out a service that was already loaded before it', () => {
   const { paths, run } = initFixture();
-  const launchctl = recordingLaunchctl({ loaded: true });
+  const backend = recordingBackend({ loaded: true });
   try {
-    assert.throws(() => run({ launchctl: launchctl.control }), /injected failure at publish-active-payload/u);
-    assert.equal(launchctl.calls.some((call) => call.startsWith('bootstrap ')), false, 'an already-loaded label is not bootstrapped again');
-    assert.equal(launchctl.calls.some((call) => call.startsWith('bootout')), false, 'rollback must not touch a service init did not load');
-    assert.equal(launchctl.state.loaded, true);
+    assert.throws(() => run(backend.seams()), /injected failure at publish-active-payload/u);
+    if (macos) {
+      assert.equal(backend.calls.some((call) => call.startsWith('bootstrap ')), false, 'an already-loaded label is not bootstrapped again');
+      assert.equal(backend.calls.some((call) => call.startsWith('bootout')), false, 'rollback must not touch a service init did not load');
+      assert.equal(backend.state.loaded, true);
+    } else {
+      assert.equal(backend.calls.some((call) => call.startsWith('enable')), false, 'an already-live unit is not enabled again');
+      assert.equal(backend.calls.some((call) => call.startsWith('disable')), false, 'rollback must not touch a service init did not load');
+      assert.equal(backend.state.active, true);
+    }
   } finally {
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
 });
 
-test('stop confirms launchd removal before returning and stays idempotent', () => {
+test('stop confirms launchd removal before returning and stays idempotent', { skip: !macos }, () => {
   const paths = servicePaths();
   try {
     // Loaded job: bootout unloads, and the stop only succeeds once the
@@ -332,7 +471,7 @@ test('stop confirms launchd removal before returning and stays idempotent', () =
   }
 });
 
-test('a stop whose job stays registered fails bounded instead of pretending removal', () => {
+test('a stop whose job stays registered fails bounded instead of pretending removal', { skip: !macos }, () => {
   const paths = servicePaths();
   try {
     const stuck = (args) => {
@@ -349,7 +488,7 @@ test('a stop whose job stays registered fails bounded instead of pretending remo
   }
 });
 
-test('a stop racing an external removal treats the gone job as stopped', () => {
+test('a stop racing an external removal treats the gone job as stopped', { skip: !macos }, () => {
   const paths = servicePaths();
   try {
     // The registration probe sees the job, but by the time bootout runs a

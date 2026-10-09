@@ -75,22 +75,20 @@ function removeOne(target) {
   }
 }
 
-// Deleting the plist alone leaves a job launchd already loaded running until
-// the next logout (observed live: uninstall reported success while the daemon
-// process, the launchd registration, and the RPC socket all stayed alive).
-// The ES-owned service is therefore booted out — with the bounded
-// removal-confirmation bootoutService owns — before its definition file is
-// removed.  A service that is not registered is not an error (idempotent
-// uninstall); a bootout that cannot complete fails the command rather than
-// deleting the definition out from under a still-running service.  The
-// launchd bootout and the `removed_launch_agent` field are macOS-only; on
-// Linux the systemd stop and `removed_service_definition` are wired by S03,
-// and S02 removes the definition file without inventing a launchd result.
+// Deleting the definition alone leaves a job the service manager already
+// loaded running until the next logout (observed live: uninstall reported
+// success while the daemon process, the launchd registration, and the RPC
+// socket all stayed alive).  The ES-owned service is therefore booted out —
+// with the bounded removal confirmation bootoutService owns on BOTH backends
+// (launchd bootout on macOS, systemctl --user disable --now plus the inactive
+// confirmation on Linux) — before its definition file is removed.  A service
+// that is not registered is not an error (idempotent uninstall); a stop that
+// cannot complete fails the command rather than deleting the definition out
+// from under a still-running service.  `removed_launch_agent` is macOS-only;
+// Linux reports the same removal as `removed_service_definition`.
 export function uninstall(paths = productPaths(), options = {}) {
   const macos = platform() === 'darwin';
-  const service = macos
-    ? bootoutService(paths, process.getuid(), options)
-    : { already_stopped: true, skipped: true, reason: 'systemd service backend is wired in S03' };
+  const service = bootoutService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl });
   const removed = removeOne(paths.launchAgent);
   return {
     service_stopped: true,

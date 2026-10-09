@@ -381,19 +381,15 @@ export async function main(args) {
   if (command === 'status') {
     const verbose = args.includes('--verbose');
     const local = localInstallStatus(paths, { verbose });
-    // `service` is the read-only launchd view (registered job + process); on
-    // Linux the systemd view is wired by S03, so a transitional skipped view is
-    // reported instead of probing /bin/launchctl — which would crash the whole
-    // command on a host without launchd (the `service_definition` field in
-    // `local` still reports the unit-file presence). `daemon_status` stays the
-    // RPC view, so a loaded-but-unready or ready-but-unregistered install reads
-    // differently instead of blurring.
-    const serviceRaw = platform() === 'darwin'
-      ? serviceRegistrationStatus()
-      : { query: 'skipped', registered: null, skipped: true, reason: 'systemd service view is wired in S03' };
-    // PID is an implementation detail and may be reused by another process;
-    // keep it out of the ordinary status projection.
-    const { pid: _pid, ...service } = serviceRaw;
+    // `service` is the read-only backend view (launchd registered job or the
+    // systemd user unit's real state — `failed` included, never a fake
+    // healthy) selected by the platform dispatch in service-macos.mjs; a Linux
+    // host without a reachable user manager degrades to an explicit
+    // `unavailable` view with the linger hint instead of failing the whole
+    // read-only command. `daemon_status` stays the RPC view, so a
+    // loaded-but-unready or ready-but-unregistered install reads differently
+    // instead of blurring.
+    const { pid: _pid, ...service } = serviceRegistrationStatus();
     try {
       output({ ...local, service, daemon_status: publicDaemonStatus(await callDaemon(process.env.EXTERNAL_SUBAGENT_SOCKET || paths.socket, 'status', {}), { verbose }) });
     } catch (error) {

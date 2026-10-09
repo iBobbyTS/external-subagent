@@ -19,7 +19,16 @@ import { installPlugin } from '../../cli/install/codex.mjs';
 import { registerCodexHome, loadCodexHomes } from '../../cli/install/reconcile.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
-import { productPaths } from '../../cli/paths.mjs';
+import { platform, productPaths } from '../../cli/paths.mjs';
+
+// The installed service definition is the launchd plist on macOS and the
+// systemd user unit on Linux; forwarding assertions below are stated once per
+// backend through this pair of helpers.
+const macos = platform() === 'darwin';
+const assertForwards = (definition, key, value) => {
+  if (macos) assert.match(definition, new RegExp(`<key>${key}</key><string>${value}</string>`, 'u'));
+  else assert.match(definition, new RegExp(`^Environment="${key}=${value}"$`, 'mu'));
+};
 
 function fixtureHome(prefix = 'external-subagent-init-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -122,12 +131,13 @@ test('missing unrelated runtimes never block standalone setup (DSH-only adapter 
     // only failure mode left is the product's own machinery.
     const report = run();
     assert.equal(report.installed, true);
-    const plist = fs.readFileSync(paths.launchAgent, 'utf8');
-    assert.match(plist, /<key>DSH_RUNTIME_PATH<\/key><string>\/opt\/dsh\/acp<\/string>/u);
-    assert.match(plist, /<key>EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>4<\/string>/u, 'the rewritten config advances the revision');
+    const definition = fs.readFileSync(paths.launchAgent, 'utf8');
+    assertForwards(definition, 'DSH_RUNTIME_PATH', '/opt/dsh/acp');
+    assertForwards(definition, 'EXTERNAL_SUBAGENT_CONFIG_REVISION', '4');
+    assert.match(definition, /EXTERNAL_SUBAGENT_CONFIG_REVISION/u, 'the rewritten config advances the revision');
     // The pinned ZCode runtime argument is forwarded exactly when that
     // installation exists — never as an unconditional dependency.
-    assert.equal(plist.includes('--runtime'), fs.existsSync(ZCODE_RUNTIME));
+    assert.equal(definition.includes('--runtime'), fs.existsSync(ZCODE_RUNTIME));
   } finally {
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
@@ -179,8 +189,7 @@ test('init preserves configured agents and advances the service config revision'
     assert.equal(configured.subagents.dsh.spawn_supported, true);
     assert.equal(configured.subagents.dsh.default_model, 'opaque-model');
     assert.equal(configured.subagents.zcode.enabled, true);
-    const plist = fs.readFileSync(paths.launchAgent, 'utf8');
-    assert.match(plist, /EXTERNAL_SUBAGENT_CONFIG_REVISION<\/key><string>8<\/string>/u);
+    assertForwards(fs.readFileSync(paths.launchAgent, 'utf8'), 'EXTERNAL_SUBAGENT_CONFIG_REVISION', '8');
   } finally {
     fs.rmSync(paths.home, { recursive: true, force: true });
   }
