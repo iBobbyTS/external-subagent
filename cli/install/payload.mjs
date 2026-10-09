@@ -9,6 +9,8 @@ import {
 
 const MH_MAGIC_64 = 0xfeedfacf;
 const CPU_TYPE_ARM64 = 0x0100000c;
+// The single executable mode every released payload file must carry.
+const RELEASE_FILE_MODE = 0o755;
 
 // ELF64 header identity, read little-endian:
 //   e_ident[0..3] = 0x7f 'E' 'L' 'F' (0x464c457f as a LE uint32)
@@ -113,4 +115,50 @@ export function verifyPayload(options = {}) {
     return { name: record.name, bytes: bytes.length, mode: '755', sha256: record.sha256, arch };
   });
   return { status: 'verified', platform, version: manifest.version, files };
+}
+
+// npm materializes the packaged payload with the permission recorded in the
+// tarball, masked by the installing process's umask.  A host running under a
+// permissive umask (e.g. 0002) can therefore extract an archived 0755 binary
+// as 0775, and the strict gate in verifyPayload below rejects it as
+// PAYLOAD_PERMISSIONS_INVALID — correct, since a group/world-writable native
+// binary is an installation defect and the gate must never be loosened.  The
+// install paths instead repair the extracted mode before verification: only
+// the permission is restored, the bytes are untouched, and the digest/arch
+// checks still run.  Returns true iff the mode actually changed; a missing or
+// non-regular file (directory, symlink) is never chmodded and returns false so
+// verifyPayload keeps owning that rejection.
+export function normalizePayloadMode(target) {
+  let stat;
+  try { stat = fs.lstatSync(target); } catch { return false; }
+  if (!stat.isFile() || stat.isSymbolicLink()) return false;
+  if ((stat.mode & 0o777) === RELEASE_FILE_MODE) return false;
+  fs.chmodSync(target, RELEASE_FILE_MODE);
+  return true;
+}
+
+// Normalize every payload file the manifest names, exactly the set and order
+// verifyPayload will read.  An absent/invalid manifest or an unreadable file is
+// left for verifyPayload to reject with its own code — this helper never turns
+// a rejection into a pass.  Returns the repaired entries with their prior octal
+// mode so the install step can report what it changed.
+export function normalizePayloadFiles(options = {}) {
+  const platform = options.platform || nativePlatform();
+  if (!NATIVE_PLATFORMS.includes(platform)) return [];
+  let manifest;
+  try { manifest = readPayloadManifest({ platform, root: options.root }); } catch { return []; }
+  const dir = options.root
+    ? path.join(options.root, 'npm', NATIVE_DIR_NAME, platform)
+    : nativePayloadDir(platform);
+  const normalized = [];
+  for (const record of manifest.files) {
+    if (!record || typeof record.name !== 'string' || path.basename(record.name) !== record.name || record.name.includes('..')) continue;
+    const target = path.join(dir, record.name);
+    let stat;
+    try { stat = fs.lstatSync(target); } catch { continue; }
+    if (!stat.isFile() || stat.isSymbolicLink()) continue;
+    const before = stat.mode & 0o777;
+    if (normalizePayloadMode(target)) normalized.push({ name: record.name, from: before.toString(8).padStart(3, '0'), to: '755' });
+  }
+  return normalized;
 }

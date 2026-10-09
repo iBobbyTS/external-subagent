@@ -6,7 +6,7 @@ import { CliError } from '../errors.mjs';
 import { platform } from '../paths.mjs';
 import { parseConfig } from '../config/read.mjs';
 import { writeConfig } from '../config/write.mjs';
-import { verifyPayload } from './payload.mjs';
+import { normalizePayloadFiles, verifyPayload } from './payload.mjs';
 import { pathReport } from './path.mjs';
 import { packageRoot, payloadManifestPath } from './layout.mjs';
 import { updateInstallation } from './update.mjs';
@@ -93,6 +93,14 @@ export function runInit(options = {}) {
   if (options.dryRun) return { dry_run: true, plan };
 
   const skipPayload = Boolean(options.skipPayloadProbe);
+  if (!skipPayload) {
+    // Repair an extraction mode masked by the installer's umask before the
+    // strict verify-payload gate reads the staged files (a 0775 extract from a
+    // 0755 archive is a real npm-install artifact, not a payload defect).
+    for (const entry of normalizePayloadFiles()) {
+      process.stderr.write(`normalized payload mode ${entry.from} -> ${entry.to} (${entry.name})\n`);
+    }
+  }
   const payload = skipPayload ? { status: 'skipped', platform: null, version: null, files: [] } : verifyPayload();
   const pathFindings = pathReport();
 

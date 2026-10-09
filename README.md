@@ -16,15 +16,23 @@ independent axes:
 ## Status
 
 The package is published to the public npm registry as
-`external-subagent@0.1.0` (macOS arm64 only; `os`/`cpu` in `package.json`
-reject installation on other platforms at npm install time). `init` installs
-the standalone daemon service only — no host is bound implicitly; hosts are
-bound through the explicit `install-plugin` (Codex or ZCode) /
-`install-mcp` (Codex-only TOML binding) commands. Installing from a packed
-artifact and explicitly initializing to a launchd-resident service
-(idempotent repeat init/start) is live-verified on a real GUI session;
-active-task upgrade and standalone initialization are implemented and
-reviewed.
+`external-subagent@0.1.0` for macOS arm64 and Linux x86_64. `os`/`cpu` in
+`package.json` are independent npm arrays, so npm admits any darwin/linux +
+arm64/x64 tuple at install time; the CLI then enforces the real support at
+first use — a host outside macOS/Linux is rejected with `UNSUPPORTED_PLATFORM`
+before any HOME write, and `darwin-x64`/`linux-arm64` (no native payload) are
+rejected at `init` with `UNSUPPORTED_PAYLOAD_PLATFORM`.
+`init` installs the standalone daemon service only — no host is bound
+implicitly; hosts are bound through the explicit `install-plugin` (Codex or
+ZCode) / `install-mcp` (Codex-only TOML binding) commands. Installing from a
+packed artifact and explicitly initializing to a service is live-verified on
+macOS arm64 (launchd, real GUI session) and on Linux x86_64 (systemd user
+service, Ubuntu; idempotent repeat init/start); active-task upgrade and
+standalone initialization are implemented and reviewed. On Linux x86_64 the
+`codex` and `zcode` subagents are live-verified (OBSERVED), while `dsh` and
+`agy` remain runtime-gated there: their runtimes are not installed on the
+verification host, so they stay disabled by default with an explicit status,
+exactly as on macOS.
 
 All four subagents are **disabled by default** and are enabled per name with
 `external-subagent agents enable <zcode|dsh|codex|agy>`: a successful local probe
@@ -80,7 +88,7 @@ intentionally diverge; see
 ## Install
 
 ```
-npm install -g external-subagent     # stages package + payload only (macOS arm64)
+npm install -g external-subagent     # stages package + payload only (macOS arm64, Linux x64)
 external-subagent init               # explicit: standalone daemon service only
 external-subagent install-plugin zcode   # optional host binding (or: install-plugin codex / install-mcp)
 ```
@@ -140,9 +148,13 @@ carries a `hint` field with this format summary.
 ## Publishing
 
 Releases publish from CI via npm Trusted Publishing (OIDC): pushing a `vX.Y.Z`
-tag runs [.github/workflows/npm-publish.yml](.github/workflows/npm-publish.yml)
-on an Apple Silicon runner, which rebuilds the payload, runs the pack gates,
-and publishes with no npm token in the environment — the runner's OIDC
+tag runs [.github/workflows/npm-publish.yml](.github/workflows/npm-publish.yml).
+One tarball carries both platform payloads, so the workflow builds them on two
+runners: the `build-linux` job builds the `linux-x64` payload on Ubuntu and
+uploads it as an artifact, and the `publish` job runs on an Apple Silicon
+runner (where `prepack` rebuilds the `darwin-arm64` payload), merges the Linux
+payload into `npm/native/` before the pack gates and release-path test suites
+run, and publishes with no npm token in the environment — the runner's OIDC
 identity is the credential. npm does not support trusted publishing for a
 package's first release, so the initial version was published manually once
 and the trusted publisher was then linked on npmjs.com; the workflow filename
@@ -165,10 +177,16 @@ completed update whose registered Codex homes only partially rebind reports
 `CODEX_SYNC_PARTIAL` per home and keeps the verified activation; the public
 `stop` confirms launchd removal before returning, and `uninstall` boots out
 the ES-owned service before removing its registration while retaining all
-data. Supported platform: macOS arm64 — `os`/`cpu` in `package.json` make npm
-refuse installation elsewhere up front; the CLI additionally keeps
-`help`/`version` working on other platforms and rejects business commands
-without writing HOME.
+data. Supported platforms: macOS arm64 and Linux x86_64. npm's independent
+`os`/`cpu` arrays only bound the tuple to darwin/linux + arm64/x64 (so
+`darwin-x64` and `linux-arm64` install as well); the CLI keeps `help`/`version`
+working everywhere, rejects a host outside macOS/Linux with
+`UNSUPPORTED_PLATFORM`, and rejects `darwin-x64`/`linux-arm64` at `init` with
+`UNSUPPORTED_PAYLOAD_PLATFORM`, never writing HOME on a rejected host. macOS arm64 is live-verified
+(launchd). Linux x86_64 (Ubuntu, systemd user service) is verified for the
+install/init/service/CLI path and the codex and zcode subagents; `dsh` and
+`agy` remain runtime-gated there (their runtimes are not present on the
+verification host).
 
 See [docs/operations.md](docs/operations.md) for service control, PATH
 behavior, the Codex homes registry, backup/removal, and release checks; and

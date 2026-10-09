@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { nativePlatform } from '../../cli/install/layout.mjs';
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', ...options });
@@ -38,7 +39,11 @@ try {
   run('npm', ['install', '--global', `--prefix=${prefix}`, '--no-audit', '--no-fund', tgz], { cwd: work, env });
   const cli = path.join(prefix, 'bin', 'external-subagent');
   const packageRoot = path.join(prefix, 'lib', 'node_modules', 'external-subagent');
-  for (const target of [cli, path.join(prefix, 'bin', 'external-subagent-mcp'), path.join(packageRoot, 'npm', 'native', 'darwin-arm64', 'external-subagentd')]) {
+  // The packed payload directory is the running host's tuple (S01), so the
+  // smoke checks the platform it is actually installing rather than a fixed
+  // darwin-arm64 path.
+  const payloadPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;
+  for (const target of [cli, path.join(prefix, 'bin', 'external-subagent-mcp'), path.join(packageRoot, 'npm', 'native', payloadPlatform, 'external-subagentd')]) {
     fs.accessSync(target, fs.constants.X_OK);
   }
   run(cli, ['version'], { env });

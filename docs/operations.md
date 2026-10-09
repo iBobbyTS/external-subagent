@@ -287,9 +287,32 @@ restored database.
 
 ## Release checks
 
+A release tarball ships one native payload for every supported platform
+(`darwin-arm64` and `linux-x64`); `os`/`cpu` in `package.json` allow
+installation on macOS arm64 and Linux x86_64. The build script stages the
+payload for the running host, so a release check on either platform verifies
+that host's payload:
+
 ```
-node scripts/release/build-native-payload.mjs      # cargo release build + manifest
-npm pack                                           # build the tarball
-node scripts/release/check-native-tarball.mjs      # static pack checks
-node scripts/release/test-installed-tarball.mjs    # controlled-prefix install/init check
+node scripts/release/build-native-payload.mjs      # cargo release build + manifest (running host)
+npm pack                                           # build the tarball (both payloads must be staged)
+node scripts/release/check-native-tarball.mjs      # static pack checks (both platforms: entries, versions, images)
+node scripts/release/test-installed-tarball.mjs    # controlled-prefix install/init check (running host)
 ```
+
+`postpack` runs the tarball checks on every `npm pack` and `prepublishOnly`
+runs the staged checks before a publish; either rejects a tarball that is
+missing a platform payload or whose payload/manifest disagrees with the
+package version. Because no single runner can build both payloads, CI splits
+the work: the ubuntu `build-linux` job builds and uploads `linux-x64`, and the
+Apple Silicon `publish` job rebuilds `darwin-arm64` via `prepack` and merges
+the uploaded Linux payload into `npm/native/` before running the pack gates
+and the release-path test suites (see
+[.github/workflows/npm-publish.yml](../.github/workflows/npm-publish.yml)). A
+local `npm pack` on macOS therefore needs the `linux-x64` payload staged (from
+the Linux build or the CI artifact) as well as the locally built
+`darwin-arm64` payload. The controlled-prefix smoke
+(`test-installed-tarball.mjs`) asserts the macOS launchd service artifacts and
+is therefore a macOS-only check; the equivalent Linux install/init smoke is the
+S06 controlled-prefix `init` verification (systemd seam neutralized), recorded
+separately from this script.

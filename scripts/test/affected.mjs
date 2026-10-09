@@ -28,7 +28,7 @@ const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), 
 
 const SLOW_LANE = ['node:install', 'node:upgrade'];
 const DAEMON_SUBBLOCKS = ['rust:daemon-scheduler', 'rust:daemon-rpc', 'rust:daemon-mcp', 'rust:daemon-adapters'];
-const ALL_NODE_BLOCKS = ['node:cli', 'node:contract', 'node:acceptance', 'node:platform', 'node:provider', 'node:integration', 'node:install', 'node:upgrade'];
+const ALL_NODE_BLOCKS = ['node:cli', 'node:contract', 'node:acceptance', 'node:platform', 'node:release', 'node:provider', 'node:integration', 'node:install', 'node:upgrade'];
 const ALL_RUST_BLOCKS = [
   'rust:store', 'rust:runtime', 'rust:core', 'rust:contract', 'rust:subagents', 'rust:mcp-crate', 'rust:fixture-zcode',
   ...DAEMON_SUBBLOCKS, 'rust:daemon-full', 'rust:workspace-full',
@@ -55,6 +55,7 @@ export const BLOCKS = {
   'node:contract': { kind: 'node', dir: 'contract', cost: 3, desc: 'tests/contract (mock-wire projections)' },
   'node:acceptance': { kind: 'node', dir: 'acceptance', cost: 1, desc: 'tests/acceptance (reads docs/acceptance + plugin manifest)' },
   'node:platform': { kind: 'node', dir: 'platform', cost: 2, desc: 'tests/platform' },
+  'node:release': { kind: 'node', dir: 'release', cost: 5, desc: 'tests/release (release pack gate regression)' },
   'node:provider': { kind: 'node', dir: 'provider-conformance', cost: 10, desc: 'tests/provider-conformance' },
   'node:integration': { kind: 'node', dir: 'integration', cost: 40, prebuild: 'debug-daemon', desc: 'tests/integration' },
   'node:install': { kind: 'node', dir: 'install', cost: 90, slow: true, desc: 'tests/install (payload+pack+install; debug profile builds)' },
@@ -99,7 +100,7 @@ export const IMPACT_RULES = [
   { name: 'reasoning source schema', match: is('schema/public-reasoning-source.json'), blocks: ['node:cli'] },
   { name: 'cli', match: under('cli'), blocks: [...ALL_NODE_BLOCKS] },
   { name: 'bin entries', match: under('bin'), blocks: ['node:cli', 'node:contract', 'node:install', 'node:platform'] },
-  { name: 'packaging/release scripts', match: under('scripts'), blocks: ['node:install', 'node:upgrade', 'node:platform'] },
+  { name: 'packaging/release scripts', match: under('scripts'), blocks: ['node:install', 'node:upgrade', 'node:platform', 'node:release'] },
   { name: 'package inputs', match: (p) => p === 'package.json' || p === 'LICENSE' || under('npm', 'launchd')(p), blocks: ['node:install', 'node:platform'] },
   { name: 'plugins (manifest is acceptance-read)', match: under('plugins'), blocks: ['node:install', 'node:acceptance'] },
   { name: 'acceptance evidence docs', match: under('docs/acceptance'), blocks: ['node:acceptance'] },

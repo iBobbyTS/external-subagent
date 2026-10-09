@@ -9,10 +9,21 @@
 # on npmjs.com (user iBobbyTS, repo external-subagent, workflow
 # npm-publish.yml), and every later tag publishes from here.
 #
-# The runner must be Apple Silicon: the prepack lifecycle builds the
-# darwin-arm64 native payload with cargo, and the pack checks verify the
-# Mach-O arm64 binaries before anything is uploaded.  A tag push publishes;
-# a manual workflow_dispatch run exercises the build and the full test gate
+# The released tarball carries a native payload for every supported platform,
+# and no single runner can build both (darwin-arm64 needs Apple Silicon, the
+# linux-x64 ELF needs Linux).  The build-linux job produces the linux-x64
+# payload on an ubuntu runner and uploads it as an artifact; the publish job
+# runs on an Apple Silicon runner (prepack builds darwin-arm64 with cargo
+# there), merges the linux payload into npm/native/ BEFORE the pack gates and
+# release-path test suites run, then publishes.  The artifact is a tar.gz, not
+# a bare directory: upload-artifact zips its inputs and zip transfer drops the
+# POSIX execute bits, so a directory artifact would land the native binaries
+# non-executable.  Packing them with tar preserves mode 755 across the
+# download, which the explicit "Verify linux-x64 payload merged" step (test -x)
+# checks; the payload digest gate remains the integrity anchor.  The pack
+# checks verify the Mach-O arm64 and ELF x86-64 binaries and require both
+# platform payloads before anything is uploaded.  A tag push publishes; a
+# manual workflow_dispatch run exercises the build and the full test gate
 # without publishing, so the release chain can be verified between releases.
 name: npm publish
 
@@ -27,7 +38,39 @@ permissions:
   id-token: write
 
 jobs:
+  # Build the linux-x64 native payload on a Linux runner.  A single tarball
+  # carries both platform payloads (D-S05), so this artifact is what makes the
+  # macOS publish job's tarball complete; the pack gates reject a tarball that
+  # is missing either platform.
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build linux-x64 native payload
+        run: node scripts/release/build-native-payload.mjs
+
+      # Pack the payload before uploading: upload-artifact zips its inputs and
+      # zip transfer drops the execute bits, so a directory artifact would
+      # arrive non-executable.  tar keeps mode 755 for the download side.
+      - name: Package linux-x64 payload artifact
+        run: tar -czf linux-x64-payload.tgz -C npm/native linux-x64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-x64
+          path: linux-x64-payload.tgz
+          if-no-files-found: error
+
   publish:
+    needs: build-linux
     runs-on: macos-latest
     timeout-minutes: 30
     # The fresh-install tests run npm pack under an ISOLATED HOME, and the
@@ -45,6 +88,26 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+
+      # Merge the linux-x64 payload produced by build-linux into the tree
+      # before any pack gate runs: postpack and prepublishOnly both require
+      # both platform payloads, and the release-path suites below pack the
+      # real tarball from this tree.  The artifact is the tar.gz build-linux
+      # packed (zip transfer would have dropped the execute bits), so extract
+      # it back into the payload directory to restore mode 755.
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-linux-x64
+          path: .
+
+      - name: Extract linux-x64 payload
+        run: tar -xzf linux-x64-payload.tgz -C npm/native
+
+      - name: Verify linux-x64 payload merged
+        run: |
+          test -f npm/native/linux-x64/payload.json
+          test -x npm/native/linux-x64/external-subagentd
+          test -x npm/native/linux-x64/external-subagent-mcp
 
       # A tag must publish exactly the version it names; a mismatch fails
       # before anything is built.
@@ -68,6 +131,7 @@ jobs:
       - name: Run release-path test suites
         run: |
           npm run test:install
+          npm run test:release
           node --test tests/cli/*.test.mjs tests/upgrade/*.test.mjs
 
       # prepack (cargo release build + payload manifest), the npm pack

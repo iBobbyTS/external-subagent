@@ -7,7 +7,7 @@ import { CLI_ENTRY_NAME, DAEMON_BIN_NAME, NATIVE_DIR_NAME } from '../constants.m
 import { reconcileCodexHomes } from './reconcile.mjs';
 import { packageVersion, packageRoot } from './layout.mjs';
 import { loadUpdateState } from './recovery.mjs';
-import { verifyPayload } from './payload.mjs';
+import { normalizePayloadFiles, verifyPayload } from './payload.mjs';
 
 const SCHEMA_VERSION = 2;
 const lockPath = (paths) => path.join(paths.data, 'install.lock');
@@ -112,6 +112,12 @@ export function preflightUpdate(options = {}) {
   const available = options.availableVersions || [packageVersion()];
   if (typeof version !== 'string' || !/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(version) || !available.includes(version)) {
     throw new CliError('PAYLOAD_VERSION_UNAVAILABLE', `requested payload version is unavailable: ${version}`);
+  }
+  // Repair a candidate payload mode masked by the installing umask before the
+  // strict verifier runs; the bytes are untouched, so the digest/arch checks
+  // below still bind the candidate to the release manifest.
+  for (const entry of normalizePayloadFiles({ root: candidateRoot, platform: options.platform })) {
+    process.stderr.write(`normalized payload mode ${entry.from} -> ${entry.to} (${entry.name})\n`);
   }
   const payload = verifyPayload({ root: candidateRoot, platform: options.platform });
   if (version !== payload.version) throw new CliError('PAYLOAD_VERSION_MISMATCH', `requested version ${version} differs from candidate ${payload.version}`);
