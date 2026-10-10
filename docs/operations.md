@@ -214,7 +214,7 @@ compatibility doc). The plugin manifest's `version` is codex's plugin-cache
 identity (`plugin@marketplace@version`): it is deliberately independent
 of the package version (whose single source is `package.json`) and every
 released candidate must carry its own version (`0.1.1` from the
-productization closeout onward, currently `0.1.3`), or a home sharing that
+productization closeout onward, currently `0.1.5`), or a home sharing that
 identity receives another installation's cached bytes — which `install-plugin`
 now rejects by comparing the materialized cache's managed content with the
 staged tree (`CODEX_CACHE_BINDING_MISMATCH`/`CODEX_CACHE_CONTENT_MISMATCH`)

@@ -16,7 +16,7 @@ independent axes:
 ## Status
 
 The package is published to the public npm registry as
-`external-subagent@0.1.0` for macOS arm64 and Linux x86_64. `os`/`cpu` in
+`external-subagent@0.5.0` for macOS arm64 and Linux x86_64. `os`/`cpu` in
 `package.json` are independent npm arrays, so npm admits any darwin/linux +
 arm64/x64 tuple at install time; the CLI then enforces the real support at
 first use — a host outside macOS/Linux is rejected with `UNSUPPORTED_PLATFORM`
@@ -70,12 +70,12 @@ acceptance matrix is recorded in
 
 ## Versioning
 
-The product version has a single source: `package.json` (`0.1.0`). The CLI
+The product version has a single source: `package.json` (`0.5.0`). The CLI
 constant (`cli/constants.mjs`), the daemon crates, and the native payload
 manifest all carry the same version, and `scripts/release/check-native-tarball.mjs`
 enforces payload/package agreement. The managed Codex plugin manifest
 (`plugins/codex/external-subagent/.codex-plugin/plugin.json`, currently
-`0.1.3`) is deliberately **not** tied to the product version: it is codex's
+`0.1.5`) is deliberately **not** tied to the product version: it is codex's
 plugin-cache identity (`plugin@marketplace@version`; under the reserved
 `personal` marketplace name codex resolves the real user root
 machine-globally, ignoring `CODEX_HOME`), which
