@@ -89,7 +89,11 @@ test('normalizePayloadMode repairs a non-755 regular file and is a no-op at 755'
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'payload-mode-unit-'));
   try {
     const umaskExtract = path.join(dir, 'binary');
-    fs.writeFileSync(umaskExtract, 'x', { mode: 0o775 });
+    // Explicit chmod, not writeFileSync's mode option: the option is masked by
+    // the runner umask (0002 keeps 0775, 0022 lands 0755), and the 0775
+    // extraction this test studies must not depend on the host's umask.
+    fs.writeFileSync(umaskExtract, 'x');
+    fs.chmodSync(umaskExtract, 0o775);
     assert.equal(normalizePayloadMode(umaskExtract), true, 'a 0775 extraction is repaired');
     assert.equal(mode(umaskExtract), 0o755, 'the repaired file is exactly 0755');
     assert.equal(normalizePayloadMode(umaskExtract), false, 'a 0755 file is a no-op');
