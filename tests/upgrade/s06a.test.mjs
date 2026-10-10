@@ -294,13 +294,20 @@ test('unverifiable default candidate never overwrites the published active', { s
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-unverifiable-'));
   const p = paths(root);
   fs.mkdirSync(p.data, { recursive: true });
+  // Since the dual-platform tarball (D-S05) the release tree carries a VALID
+  // linux-x64 payload everywhere, CI's publish job included, so forcing a
+  // foreign platform no longer makes the derived candidate unverifiable on its
+  // own — the unverifiable candidate must be an explicit tree whose platform
+  // manifest is absent (verifyPayload's PAYLOAD_MANIFEST_MISSING path).
+  const unverifiable = fs.mkdtempSync(path.join(os.tmpdir(), 'external-no-payload-'));
   try {
     updateInstallation(p, {});
     const before = fs.readFileSync(p.state);
-    assert.throws(() => updateInstallation(p, { platform: 'linux-x64' }), (error) => error.code === 'PAYLOAD_MANIFEST_MISSING');
+    assert.throws(() => updateInstallation(p, { candidateRoot: unverifiable, platform: 'linux-x64' }), (error) => error.code === 'PAYLOAD_MANIFEST_MISSING');
     assert.deepEqual(fs.readFileSync(p.state), before, 'a rejected default candidate must leave the prior active untouched');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(unverifiable, { recursive: true, force: true });
   }
 });
 
@@ -310,11 +317,15 @@ test('service activation is skipped when the default candidate fails verificatio
   fs.mkdirSync(p.data, { recursive: true });
   const activations = [];
   const rpc = async (_socket, command) => command === 'activate-ready' ? { ready_for_activation: true, activation_claim: 'svc-fail-1' } : { ready_for_activation: true };
+  // Same explicit unverifiable candidate as above: updateCommand still derives
+  // the candidate root itself; the wrapper sabotages it into a manifest-less
+  // tree exactly the way it forces the foreign platform.
+  const unverifiable = fs.mkdtempSync(path.join(os.tmpdir(), 'external-no-payload-'));
   try {
     updateInstallation(p, {});
     await assert.rejects(() => updateCommand(p, [], {
       callDaemon: rpc,
-      updateInstallation: (target, options) => updateInstallation(target, { ...options, platform: 'linux-x64' }),
+      updateInstallation: (target, options) => updateInstallation(target, { ...options, candidateRoot: unverifiable, platform: 'linux-x64' }),
       hasInstalledService: () => true,
       activateService: async (...args) => { activations.push(args); return {}; },
     }), (error) => error.code === 'PAYLOAD_MANIFEST_MISSING');
@@ -327,6 +338,7 @@ test('service activation is skipped when the default candidate fails verificatio
     assert.equal(receipt.retryable, true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(unverifiable, { recursive: true, force: true });
   }
 });
 
