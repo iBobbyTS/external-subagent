@@ -1,9 +1,11 @@
 # Operations
 
 Installation, service control, Codex binding, and removal for
-`external-subagent`. The supported baseline is macOS arm64; see
+`external-subagent`. The supported baselines are macOS arm64 (launchd) and
+Linux x86_64 (Ubuntu, systemd user service); see
 [compatibility/codex.md](compatibility/codex.md) for the verified Codex CLI
-interface.
+interface and [acceptance/S07.md](acceptance/S07.md) for the integration
+verification matrix.
 
 ## Host and subagent instances
 
