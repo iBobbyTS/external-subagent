@@ -149,7 +149,8 @@ impl CodexRuntimeOwner {
         requested_effort: Option<&str>,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
-        let params = thread_resume_params(thread_id);
+        let posture = codex_posture(permission_mode);
+        let params = thread_resume_params(thread_id, &posture);
         let response = self
             .driver
             .request("thread/resume", params, remaining_time(deadline)?)?;

@@ -699,8 +699,9 @@ fn start_fails_closed_without_a_confirmed_posture() {
             true,
             "",
         ),
-        // The narrowed workspace-write reconstruction (strictly narrower
-        // than the requested posture) starts the turn as well.
+        // The narrowed workspace-write reconstruction is a silent capability
+        // downgrade, not a confirmed yolo posture: it fails closed on start
+        // exactly as on resume.
         (
             PermissionMode::Yolo,
             Some(
@@ -709,8 +710,8 @@ fn start_fails_closed_without_a_confirmed_posture() {
             ),
             "never",
             None,
-            true,
-            "",
+            false,
+            "start sandbox was not confirmed as the danger-full-access posture",
         ),
     ];
     for mode in [PermissionMode::Build, PermissionMode::Edit] {
@@ -1122,6 +1123,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
         .expect("thread/resume frame");
     assert_eq!(resume["params"]["threadId"], THREAD_ID);
     assert_eq!(resume["params"]["excludeTurns"], true);
+    assert_eq!(resume["params"]["sandbox"], "read-only");
     let turn_starts = deliveries
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -2412,17 +2414,14 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
 }
 
 #[test]
-fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
+fn yolo_resume_redeclares_and_confirms_the_danger_full_access_posture() {
     let _guard = scripted_test_guard();
-    // The live probe on codex-cli 0.154.0 resolved a persisted
-    // danger-full-access rollout as a narrowed workspace-write object;
-    // the faithful dangerFullAccess shape is accepted equally.
-    for (index, sandbox) in [
-        r#""sandbox":{"type":"dangerFullAccess"}"#,
-        r#""sandbox":{"excludeSlashTmp":false,"excludeTmpdirEnvVar":false,"networkAccess":false,"type":"workspaceWrite","writableRoots":[]}"#,
-    ]
-    .iter()
-    .enumerate()
+    // The live probe on codex-cli 0.154.0 showed a sandbox-less resume
+    // resolves a persisted danger-full-access rollout as a narrowed
+    // workspace-write object — a silent capability downgrade, not a
+    // confirmation. The resume request re-declares the admitted sandbox
+    // and only the faithful dangerFullAccess echo is accepted.
+    let sandbox = r#""sandbox":{"type":"dangerFullAccess"}"#;
     {
         let workspace = codex_workspace();
         let directory = workspace.path().to_owned();
@@ -2443,7 +2442,7 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
                 second: yolo_resume_case(
                     &directory,
                     &resume_result,
-                    &format!("codex-resume-yolo-ok-{index}.sh"),
+                    "codex-resume-yolo-ok.sh",
                 ),
             }),
             SchedulerConfig {
@@ -2491,6 +2490,7 @@ fn yolo_resume_accepts_both_confirmed_danger_full_access_postures() {
             .find(|frame| frame["method"] == "thread/resume")
             .expect("thread/resume frame");
         assert_eq!(resume["params"]["threadId"], THREAD_ID);
+        assert_eq!(resume["params"]["sandbox"], "danger-full-access");
         let turn_starts = deliveries
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -2567,9 +2567,11 @@ fn write_modes_resume_with_confirmed_workspace_write() {
             .find(|frame| frame["method"] == "thread/resume")
             .expect("thread/resume frame");
         assert_eq!(resume["params"]["threadId"], THREAD_ID);
-        // Resume confirms the persisted posture from the result; it must not
-        // override it through request parameters.
-        assert!(resume["params"].get("sandbox").is_none());
+        // Resume re-declares the admitted posture: thread/start does not
+        // persist its sandbox into the rollout, so without the request
+        // parameter the provider default (a narrowed reconstruction)
+        // silently replaces the admitted one.
+        assert_eq!(resume["params"]["sandbox"], "workspace-write");
         assert!(resume["params"].get("approvalPolicy").is_none());
         let turn_starts = deliveries
             .lines()
@@ -2578,6 +2580,209 @@ fn write_modes_resume_with_confirmed_workspace_write() {
             .count();
         assert_eq!(turn_starts, 1, "the follow-up turn starts exactly once");
     }
+}
+
+/// A scripted resume phase that answers `thread/resume` with the confirmed
+/// danger-full-access posture and then emits caller-provided
+/// `thread/settings/updated` frames before the follow-up turn: the frames
+/// are printed verbatim after the resume result, and `with_turn` decides
+/// whether the follow-up turn completes.
+fn settings_resume_case(
+    directory: &Path,
+    settings_frames: &str,
+    with_turn: bool,
+    child: &str,
+) -> CodexRuntimeFactory {
+    let sandbox = r#""sandbox":{"type":"dangerFullAccess"}"#;
+    let resume_result = format!(
+        r#"{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{sandbox},"approvalPolicy":"never","cwd":"{}"}}}}"#,
+        directory.to_string_lossy()
+    );
+    let turn_block = if with_turn {
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{"id":3,"result":{"turn":{"id":"codex-turn-2","status":"inProgress"}}}' \
+  '{"method":"turn/started","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"inProgress"}}}' \
+  '{"method":"item/completed","params":{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{"type":"agentMessage","id":"msg_2","text":"RESUMED_OK"}}}' \
+  '{"method":"turn/completed","params":{"threadId":"codex-thread-1","turn":{"id":"codex-turn-2","status":"completed","error":null}}}'
+"#
+    } else {
+        // The follow-up turn/start is answered with an immediate error so
+        // the control path fails fast instead of holding the deadline open
+        // for a runtime the posture violation already terminalized.
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{"id":3,"error":{"message":"terminalized before the turn started"}}'
+"#
+    };
+    let script = format!(
+        r#"
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+IFS= read -r line
+printf '%s\n' "$line" >> deliveries-resume.jsonl
+printf '%s\n' '{resume_result}'
+{settings_frames}
+{turn_block}
+while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; done
+"#
+    );
+    resume_phase_factory(directory, &script, child)
+}
+
+#[test]
+fn posture_violating_settings_notification_fails_the_runtime() {
+    let _guard = scripted_test_guard();
+    // The exact downgrade observed live: the runtime reports a
+    // workspace-write no-network sandbox for an admitted yolo task. The
+    // daemon must fail the runtime instead of running turns with the
+    // silently reduced capability.
+    let settings = r#"printf '%s\n' '{"method":"thread/settings/updated","params":{"threadId":"codex-thread-1","threadSettings":{"sandboxPolicy":{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}}}}'"#;
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-posture-violation",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(harness_factory(
+                &happy_turn(&directory, PermissionMode::Yolo),
+                &directory,
+            ))),
+            second: settings_resume_case(
+                &directory,
+                settings,
+                /*with_turn*/ false,
+                "codex-resume-posture-violation.sh",
+            ),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(60),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for_mode(&directory, "first turn", PermissionMode::Yolo),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "posture-msg", "queue", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    // The posture violation terminalizes the runtime before the follow-up
+    // turn can be answered, so the start itself is allowed to fail; the
+    // task's terminal outcome is what carries the violation.
+    let _ = scheduler.start_ready();
+    let task = await_terminal_task(&scheduler, &agent_id);
+    // Whichever path settles first — the posture terminal (RuntimeLost) or
+    // the follow-up turn command failing against a terminalized runtime
+    // (Failed) — the task must not complete.
+    assert_ne!(task.outcome, Some(TaskOutcome::Completed));
+    assert_ne!(task.outcome, Some(TaskOutcome::Cancelled));
+    // The violation is observable through the terminal record or the task's
+    // own failure message; either carrier is sufficient evidence.
+    let record = scheduler.last_error(&agent_id).expect("failure record");
+    let evidence = format!("{record} {}", task.failure_message.unwrap_or_default());
+    assert!(evidence.contains("PostureViolation"), "evidence: {evidence}");
+    assert!(evidence.contains("workspaceWrite"), "evidence: {evidence}");
+    let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
+        .expect("the resumed process logs its own frames");
+    // The follow-up turn/start request may already be on the wire when the
+    // settings frame lands, but the turn itself never starts: the script
+    // answers no turn result and the task never reaches a completed turn.
+    assert!(
+        !deliveries.contains("\"turn/started\""),
+        "no turn may start on a violated posture"
+    );
+}
+
+#[test]
+fn matching_and_foreign_settings_notifications_leave_the_turn_running() {
+    let _guard = scripted_test_guard();
+    // A foreign-thread downgrade is never this task's observation, and the
+    // admitted posture itself matches: the follow-up turn must run and
+    // complete normally.
+    let settings = r#"printf '%s\n' \
+  '{"method":"thread/settings/updated","params":{"threadId":"another-thread","threadSettings":{"sandboxPolicy":{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false}}}}' \
+  '{"method":"thread/settings/updated","params":{"threadId":"codex-thread-1","threadSettings":{"sandboxPolicy":{"type":"dangerFullAccess"}}}}'"#;
+    let workspace = codex_workspace();
+    let directory = workspace.path().to_owned();
+    let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-resume-posture-ok",
+        store,
+        Arc::new(TwoPhaseFactory {
+            first: Mutex::new(Some(harness_factory(
+                &happy_turn(&directory, PermissionMode::Yolo),
+                &directory,
+            ))),
+            second: settings_resume_case(
+                &directory,
+                settings,
+                /*with_turn*/ true,
+                "codex-resume-posture-ok.sh",
+            ),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: Duration::from_secs(60),
+            control_timeout: Duration::from_secs(30),
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for_mode(&directory, "first turn", PermissionMode::Yolo),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id.clone();
+    scheduler.start_ready().unwrap();
+    let first_result = await_result(&scheduler, &agent_id);
+    assert_eq!(first_result.result.final_text, "CODEX_OK");
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "posture-ok-msg", "queue", "follow-up question")
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    scheduler.start_ready().unwrap();
+    let resumed = await_result(&scheduler, &agent_id);
+    assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+    assert_eq!(resumed.result.final_text, "RESUMED_OK");
 }
 
 /// A scripted resume phase with a controllable `reasoningEffort` echo on
@@ -2879,6 +3084,13 @@ fn yolo_resume_fails_closed_without_a_confirmed_posture() {
         // live probe returns; it stays unconfirmed.
         (
             r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":"danger-full-access","approvalPolicy":"never","cwd":"/elsewhere"}}"#,
+            "danger-full-access",
+        ),
+        // The exact narrowed workspace-write reconstruction a sandbox-less
+        // resume falls back to: a silent capability downgrade (no
+        // unix-socket egress), never a confirmed yolo posture.
+        (
+            r#"{"id":2,"result":{"thread":{"id":"codex-thread-1","ephemeral":false},"model":"gpt-5.6-terra","sandbox":{"type":"workspaceWrite","networkAccess":false,"writableRoots":[],"excludeSlashTmp":false,"excludeTmpdirEnvVar":false},"approvalPolicy":"never","cwd":"/elsewhere"}}"#,
             "danger-full-access",
         ),
         // A network-capable reconstruction diverges from the observed

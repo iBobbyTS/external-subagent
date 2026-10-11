@@ -13,10 +13,11 @@ use std::{
     },
 };
 
+use external_agent_codex::session::{sandbox_confirmed, CodexPermissionMode};
 use external_agent_codex::update;
 use external_runtime::Inbound;
 
-use crate::{Publisher, TurnTracker};
+use crate::{Publisher, RuntimeLoss, RuntimeTerminal, TurnTracker};
 
 pub(super) struct CodexShared {
     pub(super) publisher: Arc<Publisher>,
@@ -24,6 +25,9 @@ pub(super) struct CodexShared {
     pub(super) session_id: Mutex<Option<String>>,
     pub(super) admitted_model: Mutex<Option<String>>,
     pub(super) admitted_effort: Mutex<Option<String>>,
+    /// The admitted permission posture, set before the first wire request so
+    /// every `thread/settings/updated` frame is checked against it.
+    pub(super) admitted_posture: Mutex<Option<CodexPermissionMode>>,
     pub(super) diagnostic_session_id: Mutex<Option<String>>,
     pub(super) current_turn: Mutex<Option<String>>,
     pub(super) retired_turns: Mutex<Vec<String>>,
@@ -331,6 +335,42 @@ impl CodexShared {
                     self.record_mcp_failure(name, error);
                 }
                 true
+            }
+            "thread/settings/updated" => {
+                // A settings frame naming a sandbox that contradicts the
+                // admitted posture is a security invariant break (observed
+                // live as the sandbox-less-resume downgrade to
+                // workspace-write with no network): fail the runtime fast
+                // instead of letting turns run with silently reduced
+                // capability. Frames before the thread identity is known,
+                // foreign-thread frames, or a frame without a sandbox stay
+                // diagnostic observations — the notification is
+                // experimental, and its absence is not evidence of a
+                // downgrade.
+                let (Some(mode), Some(expected)) = (
+                    *self.admitted_posture.lock().unwrap(),
+                    self.session_id.lock().unwrap().clone(),
+                ) else {
+                    return true;
+                };
+                if thread_id != Some(expected.as_str()) {
+                    return true;
+                }
+                let Some(sandbox) = params.pointer("/threadSettings/sandboxPolicy") else {
+                    return true;
+                };
+                if sandbox_confirmed(sandbox, mode) {
+                    return true;
+                }
+                let observed = sandbox
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_owned();
+                self.publisher.publish_terminal(RuntimeTerminal::FailedRuntimeLost(
+                    RuntimeLoss::PostureViolation(observed),
+                ));
+                false
             }
             _ => true,
         }

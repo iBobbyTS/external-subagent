@@ -53,6 +53,7 @@ impl CodexRuntimeOwner {
             session_id: Mutex::new(None),
             admitted_model: Mutex::new(None),
             admitted_effort: Mutex::new(None),
+            admitted_posture: Mutex::new(None),
             diagnostic_session_id: Mutex::new(None),
             current_turn: Mutex::new(None),
             retired_turns: Mutex::new(Vec::new()),
@@ -176,6 +177,9 @@ impl ManagedRuntime for CodexRuntimeOwner {
             .checked_add(timeout)
             .ok_or(RuntimeCommandError::Timeout)?;
         let admitted = Self::admitted_thread(task)?;
+        // Pin the posture before any wire traffic so settings frames the
+        // server sends around the start are already checked against it.
+        *self.shared.admitted_posture.lock().unwrap() = Some(admitted.permission_mode);
         self.initialize_before_threads(deadline)?;
         let thread_id = self.start_thread(
             &admitted.model,
@@ -223,6 +227,9 @@ impl ManagedRuntime for CodexRuntimeOwner {
                 RuntimeCommandError::InvalidSession("task has no persisted session id".into())
             })?;
         let admitted = Self::admitted_thread(task)?;
+        // Same pinning as the start path: settings frames that follow the
+        // resume are checked against the admitted posture.
+        *self.shared.admitted_posture.lock().unwrap() = Some(admitted.permission_mode);
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.initialize_before_threads(deadline)?;
         self.resume_thread(

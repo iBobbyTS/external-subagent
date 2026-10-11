@@ -78,6 +78,12 @@ pub enum RuntimeLoss {
     SessionLost,
     StopFailed(String),
     EventStreamLost,
+    /// The runtime applied a thread setting that contradicts the admitted
+    /// permission posture (for example a Codex sandbox downgrade observed
+    /// through `thread/settings/updated`). The payload names the observed
+    /// setting; it is an allowlisted posture token, never free-form
+    /// provider text.
+    PostureViolation(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

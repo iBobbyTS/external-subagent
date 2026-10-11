@@ -151,6 +151,7 @@ fn runtime_loss_name(loss: &RuntimeLoss) -> &'static str {
         RuntimeLoss::SessionLost => "session_lost",
         RuntimeLoss::StopFailed(_) => "stop_failed",
         RuntimeLoss::EventStreamLost => "event_stream_lost",
+        RuntimeLoss::PostureViolation(_) => "posture_violation",
     }
 }
 

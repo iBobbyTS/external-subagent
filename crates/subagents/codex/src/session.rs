@@ -87,11 +87,16 @@ pub fn thread_start_params(
 }
 
 /// The `thread/resume` request parameters: the persistent thread identity
-/// with the turn history excluded.
-pub fn thread_resume_params(thread_id: &str) -> serde_json::Value {
+/// with the turn history excluded, and the admitted posture re-declared.
+/// `thread/start` does not persist its `sandbox` into the rollout, and a
+/// resume without one falls back to the provider default (observed as
+/// workspace-write with no network on codex-cli 0.154.x), so every resume
+/// names the admitted posture again.
+pub fn thread_resume_params(thread_id: &str, posture: &CodexPosture) -> serde_json::Value {
     serde_json::json!({
         "threadId": thread_id,
         "excludeTurns": true,
+        "sandbox": posture.sandbox,
     })
 }
 
@@ -180,13 +185,13 @@ pub fn start_result_thread_id(
 /// a different capability.
 ///
 /// The live probes resolve the resumed sandbox as an object (plan:
-/// `{"type":"readOnly","networkAccess":false}`; a yolo thread on
-/// codex-cli 0.154.0 resumes as the narrowed workspace-write
-/// reconstruction of its persisted danger-full-access rollout — the
-/// faithful `{"type":"dangerFullAccess"}` shape is accepted too).
-/// Request-time string presets, any posture belonging to another
-/// permission mode, an unknown representation, or a network-capable
-/// sandbox are all unconfirmed and fail closed.
+/// `{"type":"readOnly","networkAccess":false}`; yolo resumes as the
+/// faithful `{"type":"dangerFullAccess"}` once the resume request
+/// re-declares the admitted sandbox). Request-time string presets, any
+/// posture belonging to another permission mode, an unknown
+/// representation, a network-capable sandbox, or the narrowed
+/// workspace-write reconstruction a sandbox-less resume falls back to
+/// are all unconfirmed and fail closed.
 pub fn validate_resume_result(
     result: &serde_json::Value,
     thread_id: &str,
@@ -334,13 +339,12 @@ pub fn confirm_resumed_thread_effort(
 /// for the first launch and every resume alike. Plan threads must resolve
 /// the read-only object. Build/edit must resolve workspaceWrite with no
 /// network or extra writable roots and the default temporary-directory
-/// flags. A yolo thread must resolve the faithful
-/// `{"type":"dangerFullAccess"}` object — the shape a real 0.154.0 start
-/// echoes — or the exact narrowed workspace-write reconstruction codex-cli
-/// 0.154.0 returns when resuming a persisted danger-full-access rollout;
-/// both confirmed yolo shapes are the requested posture or strictly
-/// narrower (no network, no extra writable roots), so any other object
-/// fails closed.
+/// flags. A yolo thread must resolve exactly
+/// `{"type":"dangerFullAccess"}` — the shape a real 0.154.0 start echoes
+/// and a resume re-declaring the admitted sandbox confirms. The narrowed
+/// workspace-write reconstruction a sandbox-less 0.154.0 resume used to
+/// return is a silent capability downgrade (no unix-socket egress, so no
+/// Docker), not a confirmation: it fails closed.
 pub fn sandbox_confirmed(sandbox: &serde_json::Value, mode: CodexPermissionMode) -> bool {
     match mode {
         CodexPermissionMode::Plan => {
@@ -352,14 +356,6 @@ pub fn sandbox_confirmed(sandbox: &serde_json::Value, mode: CodexPermissionMode)
         }
         CodexPermissionMode::Yolo => {
             *sandbox == serde_json::json!({"type": "dangerFullAccess"})
-                || *sandbox
-                    == serde_json::json!({
-                        "type": "workspaceWrite",
-                        "networkAccess": false,
-                        "writableRoots": [],
-                        "excludeSlashTmp": false,
-                        "excludeTmpdirEnvVar": false,
-                    })
         }
         CodexPermissionMode::WorkspaceWrite => {
             *sandbox
@@ -549,10 +545,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_params_exclude_turn_history() {
+    fn resume_params_redeclare_the_admitted_posture() {
         assert_eq!(
-            thread_resume_params("thread-1"),
-            serde_json::json!({"threadId": "thread-1", "excludeTurns": true})
+            thread_resume_params("thread-1", &codex_posture(YOLO)),
+            serde_json::json!({
+                "threadId": "thread-1",
+                "excludeTurns": true,
+                "sandbox": "danger-full-access",
+            })
+        );
+        assert_eq!(
+            thread_resume_params("thread-1", &codex_posture(WRITE)),
+            serde_json::json!({
+                "threadId": "thread-1",
+                "excludeTurns": true,
+                "sandbox": "workspace-write",
+            })
         );
     }
 
@@ -635,12 +643,15 @@ mod tests {
     }
 
     #[test]
-    fn yolo_sandbox_confirms_the_faithful_and_narrowed_shapes() {
+    fn yolo_sandbox_confirms_only_the_faithful_shape() {
         assert!(sandbox_confirmed(
             &serde_json::json!({"type": "dangerFullAccess"}),
             YOLO
         ));
-        assert!(sandbox_confirmed(
+        // The narrowed reconstruction a sandbox-less resume falls back to is
+        // a silent capability downgrade (no unix-socket egress), never a
+        // confirmation of the admitted yolo posture.
+        assert!(!sandbox_confirmed(
             &serde_json::json!({
                 "type": "workspaceWrite",
                 "networkAccess": false,
@@ -787,8 +798,24 @@ mod tests {
             Ok(())
         );
 
+        let mut faithful_yolo = yolo_start_result();
+        faithful_yolo["thread"]["id"] = serde_json::json!("resumed-2");
+        assert_eq!(
+            validate_resume_result(
+                &faithful_yolo,
+                "resumed-2",
+                "gpt-test",
+                WORKSPACE,
+                YOLO,
+                None
+            ),
+            Ok(())
+        );
+
+        // The narrowed workspace-write reconstruction a sandbox-less resume
+        // falls back to is a silent downgrade and must fail closed now.
         let mut narrowed_yolo = yolo_start_result();
-        narrowed_yolo["thread"]["id"] = serde_json::json!("resumed-2");
+        narrowed_yolo["thread"]["id"] = serde_json::json!("resumed-narrowed");
         narrowed_yolo["thread"]["sandbox"] = serde_json::json!({
             "type": "workspaceWrite",
             "networkAccess": false,
@@ -799,13 +826,16 @@ mod tests {
         assert_eq!(
             validate_resume_result(
                 &narrowed_yolo,
-                "resumed-2",
+                "resumed-narrowed",
                 "gpt-test",
                 WORKSPACE,
                 YOLO,
                 None
-            ),
-            Ok(())
+            )
+            .unwrap_err(),
+            CodexError::InvalidSession(
+                "resume sandbox was not confirmed as the danger-full-access posture".into()
+            )
         );
 
         let mut resumed_write = workspace_write_start_result();
