@@ -52,4 +52,25 @@ impl Store {
             })
             .collect()
     }
+
+    /// TERMINAL rows that never recorded a reap. Read by daemon drain to
+    /// converge leftovers that would otherwise hold activation readiness
+    /// false until the next daemon restart.
+    pub fn terminal_unreaped_tasks(&self) -> StoreResult<Vec<TaskRecord>> {
+        let connection = self.connection.lock().unwrap();
+        let mut statement = connection.prepare(
+            "SELECT agent_id FROM tasks
+             WHERE phase='TERMINAL' AND reaped_at IS NULL
+             ORDER BY created_at,rowid",
+        )?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|agent_id| {
+                query_task(&connection, &agent_id)?
+                    .ok_or_else(|| StoreError::InvalidState("terminal task disappeared".into()))
+            })
+            .collect()
+    }
 }

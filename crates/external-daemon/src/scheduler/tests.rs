@@ -5709,3 +5709,273 @@ mod spawn_established_return_tests {
         let _ = handle_a.join().unwrap();
     }
 }
+
+mod drain_straggler_tests {
+    use super::*;
+    use external_core::PermissionMode;
+    use external_store::TaskResult;
+    use std::os::unix::process::CommandExt;
+
+    fn straggler_workspace(prefix: &str) -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(root)
+            .unwrap()
+    }
+
+    fn straggler_scheduler(directory: &std::path::Path) -> Scheduler {
+        let store = Arc::new(Store::open(directory.join("state.sqlite")).unwrap());
+        let factory = Arc::new(CommandRuntimeFactory::new(|_: &TaskRecord| {
+            unreachable!("straggler convergence must never spawn a provider")
+        }));
+        Scheduler::new(
+            "drain-stragglers",
+            store,
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn enqueue_straggler(scheduler: &Scheduler, directory: &std::path::Path) -> (String, u64) {
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: directory.to_path_buf(),
+            permission_mode: Some(PermissionMode::Build),
+            prompt: "never launched".into(),
+            write_manifest: vec![],
+        };
+        let submitted = scheduler.enqueue_general(&manifest).unwrap();
+        let claim = scheduler
+            .store()
+            .claim_next("drain-stragglers", 10, 1)
+            .unwrap()
+            .expect("enqueued straggler must be claimable");
+        assert_eq!(claim.task.agent_id, submitted.agent_id);
+        (submitted.agent_id, claim.owner_epoch)
+    }
+
+    fn terminalize_straggler(scheduler: &Scheduler, agent_id: &str) {
+        scheduler
+            .store()
+            .store_task_result(
+                agent_id,
+                &TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "child exited 3".into(),
+                    partial: true,
+                },
+            )
+            .unwrap();
+        let row = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        assert_eq!(row.phase, TaskPhase::Terminal);
+        assert!(row.reaped_at.is_none());
+    }
+
+    fn await_reaped(scheduler: &Scheduler, agent_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let row = scheduler.store().get_task(agent_id).unwrap().unwrap();
+            if row.reaped_at.is_some() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "straggler was never reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A TERMINAL row that never owned a runtime: claimable, terminal, and
+    /// unreaped, with no runtime identity to probe.
+    fn identityless_straggler(scheduler: &Scheduler, directory: &std::path::Path) -> String {
+        let (agent_id, _) = enqueue_straggler(scheduler, directory);
+        terminalize_straggler(scheduler, &agent_id);
+        agent_id
+    }
+
+    /// A short-lived process group whose leader was waited on, so the group
+    /// id provably has no surviving members.
+    fn dead_group_identity() -> StoredProcessIdentity {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        StoredProcessIdentity {
+            pid,
+            process_group_id: pid as i32,
+            uid: 0,
+            start_token: "dead-group".into(),
+        }
+    }
+
+    /// A process group with a live member the drain must keep waiting for.
+    fn live_group_identity() -> (StoredProcessIdentity, std::process::Child) {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]).process_group(0);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        (
+            StoredProcessIdentity {
+                pid,
+                process_group_id: pid as i32,
+                uid: 0,
+                start_token: "live-group".into(),
+            },
+            child,
+        )
+    }
+
+    fn kill_group_and_wait(pgid: i32, child: &mut std::process::Child) {
+        Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{pgid}"))
+            .status()
+            .unwrap();
+        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observe_process_group(pgid)
+            .map(|members| !members.is_empty())
+            .unwrap_or(true)
+        {
+            assert!(Instant::now() < deadline, "test group refused to die");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn drain_sweeps_an_identityless_terminal_straggler_to_activation_readiness() {
+        let directory = straggler_workspace("drain-straggler-none-");
+        let scheduler = straggler_scheduler(directory.path());
+        let agent_id = identityless_straggler(&scheduler, directory.path());
+
+        assert!(!scheduler.resources_reaped());
+        scheduler.begin_drain();
+        assert!(scheduler.is_draining());
+        assert!(scheduler.resources_reaped());
+        assert!(scheduler.ready_for_activation());
+        await_reaped(&scheduler, &agent_id);
+    }
+
+    #[test]
+    fn drain_sweeps_a_terminal_straggler_whose_process_group_is_gone() {
+        let directory = straggler_workspace("drain-straggler-dead-");
+        let scheduler = straggler_scheduler(directory.path());
+        let identity = dead_group_identity();
+        let (agent_id, epoch) = enqueue_straggler(&scheduler, directory.path());
+        scheduler
+            .store()
+            .mark_session_running(
+                &agent_id,
+                epoch,
+                &format!("{agent_id}:{epoch}"),
+                Some(&identity),
+                None,
+                None,
+            )
+            .unwrap();
+        terminalize_straggler(&scheduler, &agent_id);
+
+        scheduler.begin_drain();
+        assert!(scheduler.resources_reaped());
+        assert!(scheduler.ready_for_activation());
+        await_reaped(&scheduler, &agent_id);
+    }
+
+    #[test]
+    fn drain_keeps_waiting_while_a_straggler_process_group_is_alive() {
+        let directory = straggler_workspace("drain-straggler-live-");
+        let scheduler = straggler_scheduler(directory.path());
+        let (identity, mut child) = live_group_identity();
+        let (agent_id, epoch) = enqueue_straggler(&scheduler, directory.path());
+        scheduler
+            .store()
+            .mark_session_running(
+                &agent_id,
+                epoch,
+                &format!("{agent_id}:{epoch}"),
+                Some(&identity),
+                None,
+                None,
+            )
+            .unwrap();
+        terminalize_straggler(&scheduler, &agent_id);
+
+        scheduler.begin_drain();
+        assert!(scheduler.is_draining());
+        assert!(!scheduler.resources_reaped());
+        assert!(!scheduler.ready_for_activation());
+        let row = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        assert!(row.reaped_at.is_none());
+
+        // The group dies later; a re-issued drain re-runs the sweep with no
+        // side effects and now converges the row.
+        kill_group_and_wait(identity.process_group_id, &mut child);
+        scheduler.abort_drain().unwrap();
+        scheduler.begin_drain();
+        assert!(scheduler.ready_for_activation());
+        await_reaped(&scheduler, &agent_id);
+    }
+
+    #[test]
+    fn an_exited_runtime_terminal_reaps_at_persist_and_leaves_drain_ready() {
+        let directory = straggler_workspace("drain-exited-runtime-");
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        // Bootstrap answers the create/subscribe/send handshake and starts
+        // the turn, then the child exits non-zero while the turn is active:
+        // the pump sees ChildExited, classifies Exited(3) over an empty
+        // process group, and that classification alone must carry the reap.
+        let script = r#"
+read request
+printf '%s\n' '{"id":1,"result":{"session":{"sessionId":"drain-exit-session"}}}'
+read request
+printf '%s\n' '{"id":2,"result":{}}'
+read request
+printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
+exit 3
+"#;
+        let factory = Arc::new(CommandRuntimeFactory::new(move |_: &TaskRecord| {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(script);
+            Ok(command)
+        }));
+        let scheduler = Scheduler::new(
+            "exited-runtime",
+            store,
+            factory,
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let manifest = GeneralTaskManifest {
+            schema: "zcode-general-task/v1".into(),
+            agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(),
+            permission_mode: Some(PermissionMode::Build),
+            prompt: "exit after bootstrap".into(),
+            write_manifest: vec![],
+        };
+        let submitted = scheduler.enqueue_general(&manifest).unwrap();
+        scheduler.start_ready().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(result) = scheduler.store().task_result(&submitted.agent_id).unwrap() {
+                // The turn was still active when the child died, so the exit
+                // settles as RuntimeLost — the same terminal shape as the
+                // production network-failure leftovers this fix converges.
+                assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+                break;
+            }
+            assert!(Instant::now() < deadline, "exited runtime never terminalized");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The Exited classification itself proves the group reaped, so the
+        // reap must follow the persist without any drain.
+        await_reaped(&scheduler, &submitted.agent_id);
+        scheduler.begin_drain();
+        assert!(scheduler.ready_for_activation());
+    }
+}

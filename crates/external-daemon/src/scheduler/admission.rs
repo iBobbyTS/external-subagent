@@ -302,8 +302,14 @@ impl Scheduler {
     }
 
     pub fn begin_drain(&self) {
-        let _admission = self.inner.admission.lock().unwrap();
-        self.inner.draining.store(true, Ordering::Release);
+        {
+            let _admission = self.inner.admission.lock().unwrap();
+            self.inner.draining.store(true, Ordering::Release);
+        }
+        // Outside the admission lock: the straggler sweep probes process
+        // groups and must not hold spawn admission beyond the flag flip that
+        // already closed it.
+        self.reap_terminal_stragglers();
     }
     /// Bounded recovery for an update that drained this daemon but never
     /// activated: reopen admission so the still-running daemon keeps serving

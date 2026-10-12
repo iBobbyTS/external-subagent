@@ -102,7 +102,54 @@ pub(crate) fn terminal_proves_process_group_reaped(terminal: &RuntimeTerminal) -
         RuntimeTerminal::Stopped(_)
             | RuntimeTerminal::Completed(_)
             | RuntimeTerminal::FailedTurn(_)
+            // Every transport's classify_child_exit only returns Exited after
+            // observe_process_group proved the group empty, so the exit
+            // classification itself is the reap proof. FailedRuntimeLost and
+            // Orphaned deliberately stay outside: their process state is
+            // unproven, and later cleanup (or restart recovery) owns the reap.
+            | RuntimeTerminal::Exited(_)
     )
+}
+
+#[cfg(test)]
+mod terminal_reap_proof_tests {
+    use super::*;
+
+    #[test]
+    fn exited_terminals_of_every_child_exit_shape_prove_the_group_reaped() {
+        for exit in [
+            ChildExit::Exited(None),
+            ChildExit::Exited(Some(0)),
+            ChildExit::Exited(Some(3)),
+            ChildExit::Signaled(9),
+            ChildExit::Unknown,
+        ] {
+            assert!(
+                terminal_proves_process_group_reaped(&RuntimeTerminal::Exited(exit.clone())),
+                "Exited({exit:?}) must prove the reap"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_and_unproven_terminals_keep_their_existing_reap_semantics() {
+        for terminal in [
+            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Unknown)),
+            RuntimeTerminal::Completed(StopOutcome::Terminated(ChildExit::Exited(Some(0)))),
+            RuntimeTerminal::FailedTurn(StopOutcome::Terminated(ChildExit::Exited(Some(1)))),
+        ] {
+            assert!(terminal_proves_process_group_reaped(&terminal));
+        }
+        for terminal in [
+            RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::EventStreamLost),
+            RuntimeTerminal::FailedRuntimeLost(RuntimeLoss::PostureViolation(
+                "workspaceWrite".into(),
+            )),
+            RuntimeTerminal::Orphaned(RuntimeLoss::UnknownMembership),
+        ] {
+            assert!(!terminal_proves_process_group_reaped(&terminal));
+        }
+    }
 }
 
 /// Failure code for the S01 transport closure: the runtime rejected an

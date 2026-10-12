@@ -1096,3 +1096,33 @@ fn terminal_resume_persists_both_modes_and_rejects_invalid_mode_without_mutation
         assert_eq!(message.state, MessageState::Queued);
     }
 }
+
+#[test]
+fn terminal_unreaped_tasks_lists_only_unreaped_terminal_rows() {
+    let (_directory, _path, store) = store();
+    store
+        .enqueue_task_authoritative(&task("reaped", "/repo", None))
+        .unwrap();
+    running(&store, "reaped");
+    store
+        .store_task_result("reaped", &result(TaskOutcome::Completed))
+        .unwrap();
+    store.reap_task("reaped").unwrap();
+    store
+        .enqueue_task_authoritative(&task("straggler", "/repo", None))
+        .unwrap();
+    running(&store, "straggler");
+    store
+        .store_task_result("straggler", &result(TaskOutcome::Failed))
+        .unwrap();
+    store
+        .enqueue_task_authoritative(&task("active", "/repo", None))
+        .unwrap();
+    running(&store, "active");
+
+    let unreaped = store.terminal_unreaped_tasks().unwrap();
+    assert_eq!(unreaped.len(), 1);
+    assert_eq!(unreaped[0].agent_id, "straggler");
+    assert_eq!(unreaped[0].phase, TaskPhase::Terminal);
+    assert!(unreaped[0].reaped_at.is_none());
+}

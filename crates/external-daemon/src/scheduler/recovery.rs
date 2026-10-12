@@ -78,31 +78,7 @@ impl Scheduler {
         }
 
         if task.phase == TaskPhase::Terminal {
-            // A TERMINAL row already owns an immutable result. Decoding the
-            // prepared row is no longer required to reap it: old-format rows
-            // that cannot decode are reaped as-is, keeping the stored outcome
-            // and result untouched.
-            let Ok(route) = task_route(task) else {
-                self.inner.store.reap_task(&task.agent_id)?;
-                return Ok(());
-            };
-            validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
-            let TaskRoute::General(prepared) = route;
-            if self.inner.store.task_result(&task.agent_id)?.is_none() {
-                return Err(SchedulerError::RuntimeCommand {
-                    agent_id: task.agent_id.clone(),
-                    message: "terminal startup recovery task has no immutable result".into(),
-                });
-            }
-            let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::RuntimeLost);
-            if !cleanup.cleaned {
-                return Err(SchedulerError::RuntimeCommand {
-                    agent_id: task.agent_id.clone(),
-                    message: "terminal startup worktree recovery did not prove cleanup".into(),
-                });
-            }
-            self.inner.store.reap_task(&task.agent_id)?;
-            return Ok(());
+            return self.reap_terminal_row(task);
         }
 
         // Active row. Old-format preparation no longer decodes; converge it by
@@ -149,6 +125,63 @@ impl Scheduler {
         persist_general_result(&self.inner.store, &task.agent_id, &prepared, &completion)?;
         self.inner.store.reap_task(&task.agent_id)?;
         Ok(())
+    }
+
+    /// Reap a TERMINAL row that never recorded `reaped_at`. The row already
+    /// owns an immutable result; decoding the prepared payload is only needed
+    /// to prove cleanup, so old-format rows that cannot decode are reaped
+    /// as-is, keeping the stored outcome and result untouched.
+    fn reap_terminal_row(&self, task: &TaskRecord) -> Result<(), SchedulerError> {
+        let Ok(route) = task_route(task) else {
+            self.inner.store.reap_task(&task.agent_id)?;
+            return Ok(());
+        };
+        validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
+        let TaskRoute::General(prepared) = route;
+        if self.inner.store.task_result(&task.agent_id)?.is_none() {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: task.agent_id.clone(),
+                message: "terminal task has no immutable result".into(),
+            });
+        }
+        let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::RuntimeLost);
+        if !cleanup.cleaned {
+            return Err(SchedulerError::RuntimeCommand {
+                agent_id: task.agent_id.clone(),
+                message: "terminal worktree recovery did not prove cleanup".into(),
+            });
+        }
+        self.inner.store.reap_task(&task.agent_id)?;
+        Ok(())
+    }
+
+    /// Converge TERMINAL rows that never recorded a reap so a daemon drain is
+    /// not held hostage by leftovers until the next restart. Unlike startup
+    /// recovery this never signals a process: the daemon is still running, so
+    /// a row is only reaped after the row itself proves its process group is
+    /// gone (or never had one). A group with live members, an observation
+    /// that cannot be trusted, or an incomplete identity stays unreaped —
+    /// waiting is correct when a process really is alive, and startup
+    /// recovery remains the fallback for the rest. Best-effort by design: a
+    /// failing row keeps activation readiness false instead of failing the
+    /// drain request.
+    pub(crate) fn reap_terminal_stragglers(&self) {
+        let Ok(tasks) = self.inner.store.terminal_unreaped_tasks() else {
+            return;
+        };
+        for task in tasks {
+            match (&task.runtime_agent_id, &task.process_identity) {
+                (None, None) => {}
+                (Some(_), Some(identity)) => {
+                    match observe_process_group(identity.process_group_id) {
+                        Ok(members) if members.is_empty() => {}
+                        Ok(_) | Err(_) => continue,
+                    }
+                }
+                _ => continue,
+            }
+            let _ = self.reap_terminal_row(&task);
+        }
     }
 
     /// Settle a never-claimed cancellation (`CANCELLING`, epoch 0, no session,

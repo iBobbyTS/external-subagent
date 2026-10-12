@@ -99,6 +99,34 @@ stale or missing binaries) and `postpack` runs the static tarball checks. A
 development checkout packs the same way (`npm pack` after `cargo` is
 available); see [docs/operations.md](docs/operations.md) for release checks.
 
+### Upgrade
+
+An in-place upgrade never kills a running task. `npm install` runs a
+postinstall reconcile that asks the daemon to drain and waits a bounded
+30 seconds for activation readiness; with active tasks it will time out on
+purpose rather than interrupt them.
+
+- **No active tasks**: `npm install -g external-subagent@<version>` is the
+  whole procedure — postinstall drains and activates automatically.
+- **Active tasks you are willing to interrupt**: stop first, then install and
+  reconcile explicitly:
+
+  ```
+  external-subagent stop
+  npm install -g external-subagent@<version>
+  external-subagent update
+  ```
+
+  Restarting the daemon also runs startup recovery, which settles and reaps
+  anything the drain would have waited for.
+- `external-subagent update --cancel-active --yes` asks the daemon to cancel
+  active tasks itself instead of waiting. It only settles tasks that are
+  still running; it is not a leftover-cleanup tool.
+
+Terminal tasks whose process state cannot be proven (runtime lost, orphaned
+group members) keep activation readiness false by design — the upgrade waits
+rather than reaping an unproven process group.
+
 ## Spawn profiles
 
 A spawn profile is a named JSON preset for the spawn inputs, stored as one
