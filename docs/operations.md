@@ -187,7 +187,10 @@ output is an operational summary: install/data presence, payload verification
 state, the registered service's real state (a crashed Linux unit reports
 `failed`, never a fake healthy), daemon component readiness, subagent
 enablement and spawn support, and each probe scope's `state` plus
-`checked_at_ms`. `status --verbose` adds diagnostic-only details such as
+`checked_at_ms`. Answering the RPC status refreshes every configured
+subagent's `local` probe layer automatically (a runtime version check with no
+model call); the `auth`/`hi` layers still require an explicit
+`subagents probe`. `status --verbose` adds diagnostic-only details such as
 payload file hashes, registry recovery data, daemon capabilities, service
 generation, transport and permission metadata, and daemon identity.
 `diagnose` remains the bounded failure/incident report. This keeps routine

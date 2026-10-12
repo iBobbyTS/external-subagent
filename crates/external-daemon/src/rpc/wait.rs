@@ -682,7 +682,19 @@ pub(crate) mod wait_tests {
             .unwrap();
         (
             directory,
-            Arc::new(RpcService::new(scheduler, store).unwrap()),
+            // SystemStatus refreshes every agent's local probe evidence, so
+            // this fixture must inject the hermetic backend: the real one
+            // would discover dsh/codex/agy on PATH and execute their version
+            // commands inside timing-sensitive wait tests.
+            Arc::new(
+                RpcService::new_with_service_generation_and_evidence(
+                    scheduler,
+                    store,
+                    "wait-fixture".into(),
+                    crate::agent_status::AgentEvidenceStore::unprobed(),
+                )
+                .unwrap(),
+            ),
             id,
         )
     }

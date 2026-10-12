@@ -7,7 +7,7 @@ use super::agents::{
     unavailable_agent_statuses, unknown_agent_name_error, validate_agent_models_input,
     validate_agent_probe_input,
 };
-use super::config::read_agent_config_snapshot;
+use super::config::{read_agent_config_snapshot, AgentConfigSnapshot};
 use super::errors::{map_scheduler, map_store, RpcError, RpcErrorCode};
 use super::types::{
     ResponseDecision, RpcMethod, RpcRequest, RpcResponse, RpcSuccess, MAX_LIST_TASKS,
@@ -18,7 +18,10 @@ use super::views::{
     ComponentIdentityView, ComponentStateView, DaemonIdentityView, ModelIdentityView,
     SystemStatusView, TaskObservationView, TaskResultView,
 };
-use crate::{agent_status::AgentEvidenceStore, observation::OBSERVATION_SCHEMA, Scheduler};
+use crate::{
+    agent_status::{AgentEvidenceStore, AgentProbeInput, ProbeLayer},
+    observation::OBSERVATION_SCHEMA, Scheduler,
+};
 use external_core::{canonical_general_repository, PreparedGeneralTask};
 use external_store::{
     Store, StoredTaskResult, TaskOutcome, TaskPageFilter, TaskQueryScope, TaskRecord,
@@ -37,13 +40,11 @@ use uuid::Uuid;
 #[cfg(test)]
 use super::agents::admission_fixtures;
 #[cfg(test)]
-use super::config::AgentConfigSnapshot;
-#[cfg(test)]
 use super::views::{AgentModelSelectionModeView, AgentTransportView};
 #[cfg(test)]
 use crate::agent_status::{
-    AgentModelsInput, AgentModelsOutput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
-    ModelCatalogEvidence, ProbeScope, ScopeEvidence,
+    AgentModelsInput, AgentModelsOutput, AgentProbeEvidence, EvidenceState, ModelCatalogEvidence,
+    ProbeScope, ScopeEvidence,
 };
 #[cfg(test)]
 use external_core::GeneralTaskManifest;
@@ -90,7 +91,7 @@ impl RpcService {
         )
     }
 
-    fn new_with_service_generation_and_evidence(
+    pub(super) fn new_with_service_generation_and_evidence(
         scheduler: Scheduler,
         store: Arc<Store>,
         service_generation: String,
@@ -621,7 +622,10 @@ impl RpcService {
             components,
             capabilities: agent_capabilities(),
             agents: read_agent_config_snapshot()
-                .map(|config| configured_agent_statuses(&config, &self.agent_evidence))
+                .map(|config| {
+                    self.auto_probe_no_llm_layers(&config);
+                    configured_agent_statuses(&config, &self.agent_evidence)
+                })
                 .unwrap_or_else(|_| unavailable_agent_statuses()),
             identity: Some(DaemonIdentityView {
                 daemon: self.daemon_identity.clone(),
@@ -630,6 +634,46 @@ impl RpcService {
                 models: ModelIdentityView { configured: None },
             }),
         }
+    }
+
+    /// Refresh every configured agent's no-LLM probe evidence before status is
+    /// projected. `local` is the only such layer: it runs the runtime's
+    /// version command and never sends a model turn, while `auth`/`hi` either
+    /// require a live session prompt (zcode auth is proven only by hi; every
+    /// hi costs a real model call) or are deliberately left unprobed
+    /// side-effect free (dsh/agy/codex expose no independent credential
+    /// endpoint). The probes run in parallel — one hung runtime bounds the
+    /// status wait at a single LOCAL_PROBE_TIMEOUT — and each probe reuses the
+    /// agent's previously recorded scope so `preserved_or_stale` keeps
+    /// existing auth/hi evidence intact instead of degrading it on a scope
+    /// mismatch. Recorded evidence persists in the store, so later explicit
+    /// probes and status calls observe the same refresh.
+    fn auto_probe_no_llm_layers(&self, config: &AgentConfigSnapshot) {
+        let names: Vec<String> = config.subagents.keys().cloned().collect();
+        if names.is_empty() {
+            return;
+        }
+        std::thread::scope(|scope| {
+            for name in &names {
+                let evidence = self.agent_evidence.clone();
+                let revision = config.revision;
+                let name = name.as_str();
+                scope.spawn(move || {
+                    let recorded = evidence
+                        .latest(name)
+                        .map(|previous| previous.local.scope.clone())
+                        .unwrap_or_default();
+                    evidence.probe(
+                        &AgentProbeInput {
+                            agent: name.to_owned(),
+                            through: ProbeLayer::Local,
+                            scope: recorded,
+                        },
+                        revision,
+                    );
+                });
+            }
+        });
     }
 
     pub(super) fn require_task(&self, agent_id: &str) -> Result<TaskRecord, RpcError> {
@@ -852,17 +896,30 @@ mod agent_probe_tests {
     }
 
     #[test]
-    fn status_is_passive_and_explicit_probe_records_scoped_evidence() {
+    fn status_auto_probes_local_layers_and_preserves_explicit_evidence() {
         let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
+        // Status itself refreshes the no-LLM layer: every configured agent's
+        // local evidence is probed (FixtureProbe answers READY at 123) and
+        // recorded, while auth/hi stay explicit-probe-only.
         let RpcSuccess::SystemStatus { status } =
             service.dispatch(RpcMethod::SystemStatus).unwrap()
         else {
             panic!("expected status")
         };
-        assert_eq!(status.agents[0].local.state, ComponentStateView::Unknown);
+        assert_eq!(status.agents[0].agent, "zcode");
+        assert_eq!(status.agents[0].local.state, ComponentStateView::Ready);
+        assert_eq!(status.agents[0].local.version.as_deref(), Some("3.8.1"));
         assert_eq!(status.agents[0].local.reason, None);
-        assert_eq!(status.agents[0].local.checked_at_ms, None);
+        assert_eq!(status.agents[0].local.checked_at_ms, Some(123));
+        assert_eq!(status.agents[0].auth.checked_at_ms, None);
+        assert_eq!(status.agents[0].hi.checked_at_ms, None);
+        for agent in ["zcode", "dsh", "codex", "agy"] {
+            assert!(
+                service.agent_evidence.latest(agent).is_some(),
+                "{agent} local evidence must be recorded by status"
+            );
+        }
 
         let RpcSuccess::AgentProbed { status, .. } = service
             .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
@@ -899,6 +956,9 @@ mod agent_probe_tests {
         assert_eq!(status.hi.state, ComponentStateView::Ready);
         assert_eq!(status.hi.checked_at_ms, Some(123));
 
+        // A later status runs its automatic local probe again and must not
+        // degrade the recorded scoped hi evidence: the auto probe reuses the
+        // previously recorded scope, so preservation applies.
         let RpcSuccess::SystemStatus { status } =
             service.dispatch(RpcMethod::SystemStatus).unwrap()
         else {
@@ -909,6 +969,8 @@ mod agent_probe_tests {
             .iter()
             .find(|status| status.agent == "zcode")
             .unwrap();
+        assert_eq!(zcode.hi.state, ComponentStateView::Ready);
+        assert_eq!(zcode.hi.checked_at_ms, Some(123));
         assert_eq!(zcode.hi.scope.workspace.as_deref(), Some("/workspace-a"));
         let dsh = status
             .agents

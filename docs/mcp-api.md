@@ -95,7 +95,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 工具 | 用途 | MCP annotations |
 |---|---|---|
-| `external_subagent_status` | 系统就绪、subagent 能力和身份 | 只读、幂等 |
+| `external_subagent_status` | 系统就绪、subagent 能力和身份 | 幂等；非纯只读：自动执行无模型调用的 local 层探测 |
 | `external_subagent_spawn` | 提交任务 | 非只读、非幂等 |
 | `external_subagent_wait` | 有界等待可处理请求或终态结果 | 只读、幂等 |
 | `external_subagent_observe` | 疑似循环时查看观测事实 | 只读、幂等 |
@@ -110,7 +110,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 ## 4. external_subagent_status
 
-输入为 `{}`。MCP 状态只保留路由／能力／就绪信息；部署身份（artifact 路径、配置模型来源）、配置版本、适配器传输细节和逐 scope 探测证据（scope 路径、版本、检查时间、原因）属于操作员诊断，保留在 daemon RPC 视图中，由既有 CLI `diagnose`（以及 `status --verbose`、`subagents status`）读取。读取状态不会代替显式 subagent probe 或真实执行验收。
+输入为 `{}`。MCP 状态只保留路由／能力／就绪信息；部署身份（artifact 路径、配置模型来源）、配置版本、适配器传输细节和逐 scope 探测证据（scope 路径、版本、检查时间、原因）属于操作员诊断，保留在 daemon RPC 视图中，由既有 CLI `diagnose`（以及 `status --verbose`、`subagents status`）读取。读取状态时，daemon 会自动为每个已配置 subagent 执行 local 层探测（仅运行 runtime 的版本命令，不发起任何模型调用）并记录证据；`auth`/`hi` 层仍需显式 probe（hi 探测会真实发送一条最小提示词），状态读取也不代替真实执行验收。
 
 ### 4.1 顶层输出
 

@@ -177,6 +177,15 @@ impl AgentEvidenceStore {
         }
     }
 
+    /// A store whose backend never spawns anything: every layer reports the
+    /// unprobed UNKNOWN sentinel. Fixtures whose suites exercise RPC/wait
+    /// surfaces (where `SystemStatus` runs its automatic local probes) inject
+    /// this so no real runtime is ever discovered or executed.
+    #[cfg(test)]
+    pub(crate) fn unprobed() -> Self {
+        Self::with_backend(Arc::new(UnprobedBackend))
+    }
+
     pub fn probe(&self, input: &AgentProbeInput, config_revision: u64) -> AgentProbeEvidence {
         let mut evidence = self.backend.probe(input);
         evidence.config_revision = config_revision;
@@ -224,6 +233,26 @@ impl AgentEvidenceStore {
         let mut output = self.backend.models(input);
         output.config_revision = config_revision;
         output
+    }
+}
+
+/// A probe backend that reports every layer as the unprobed UNKNOWN sentinel
+/// without spawning anything: the hermetic stand-in for fixtures whose suites
+/// must not discover or execute a real runtime.
+#[cfg(test)]
+struct UnprobedBackend;
+
+#[cfg(test)]
+impl AgentProbeBackend for UnprobedBackend {
+    fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
+        let scope = input.scope.clone();
+        AgentProbeEvidence {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            local: ScopeEvidence::unknown(scope.clone(), 0, "local_not_probed"),
+            auth: ScopeEvidence::unknown(scope.clone(), 0, "auth_not_probed"),
+            hi: ScopeEvidence::unknown(scope, 0, "hi_not_probed"),
+        }
     }
 }
 
