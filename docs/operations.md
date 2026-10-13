@@ -190,7 +190,14 @@ enablement and spawn support, and each probe scope's `state` plus
 `checked_at_ms`. Answering the RPC status refreshes every configured
 subagent's `local` probe layer automatically (a runtime version check with no
 model call); the `auth`/`hi` layers still require an explicit
-`subagents probe`. `status --verbose` adds diagnostic-only details such as
+`subagents probe`. The `components` map aggregates that evidence: `runtime`
+rolls up every enabled subagent's `local` layer, `driver` rolls up the
+spawn channels (enabled plus `spawn_supported`), and `model_auth` rolls up
+the enabled subagents' `auth` evidence — Unknown until an explicit probe
+records some, never a fault claim. `facade` stays Unknown on the daemon RPC
+view (the facade is an on-demand MCP-host child the daemon cannot observe)
+and reads Ready on the MCP tool view, where the response itself is forwarded
+by a live facade. `status --verbose` adds diagnostic-only details such as
 payload file hashes, registry recovery data, daemon capabilities, service
 generation, transport and permission metadata, and daemon identity.
 `diagnose` remains the bounded failure/incident report. This keeps routine

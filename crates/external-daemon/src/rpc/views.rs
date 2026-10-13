@@ -943,6 +943,40 @@ mod result_paging_tests {
     }
 }
 
+/// Roll per-agent scope states up into one `components` entry. A rollup in
+/// which exactly one state appears survives verbatim — all-`Unknown` stays
+/// `Unknown` (absence of evidence is not negative evidence), all-`Ready` is
+/// `Ready`, all-`Unavailable` is `Unavailable` — while an empty rollup and any
+/// mix of more than one state (including `Unknown` members) is `Degraded`.
+pub fn aggregate_component_state(
+    states: impl IntoIterator<Item = ComponentStateView>,
+) -> ComponentStateView {
+    // One slot per state, in enum declaration order.
+    let mut seen = [false; 4];
+    let mut distinct = 0;
+    for state in states {
+        let slot = match state {
+            ComponentStateView::Ready => 0,
+            ComponentStateView::Degraded => 1,
+            ComponentStateView::Unavailable => 2,
+            ComponentStateView::Unknown => 3,
+        };
+        if !seen[slot] {
+            seen[slot] = true;
+            distinct += 1;
+        }
+    }
+    match distinct {
+        0 => ComponentStateView::Unknown,
+        1 if seen[0] => ComponentStateView::Ready,
+        1 if seen[1] => ComponentStateView::Degraded,
+        1 if seen[2] => ComponentStateView::Unavailable,
+        // The only single state left is all-Unknown.
+        1 => ComponentStateView::Unknown,
+        _ => ComponentStateView::Degraded,
+    }
+}
+
 pub fn running_component_identity(component: &str, version: &str) -> ComponentIdentityView {
     running_component_identity_from(component, version, env::current_exe().ok())
 }
@@ -1016,6 +1050,39 @@ fn sanitized_permission_summary(params: &Value) -> String {
         return "Git reference mutation".into();
     }
     "permission request".into()
+}
+
+#[cfg(test)]
+mod component_rollup_tests {
+    use super::aggregate_component_state;
+    use super::ComponentStateView::{Degraded, Ready, Unavailable, Unknown};
+
+    #[test]
+    fn empty_and_all_unknown_rollups_stay_unknown() {
+        assert_eq!(aggregate_component_state([]), Unknown);
+        assert_eq!(aggregate_component_state([Unknown, Unknown]), Unknown);
+    }
+
+    #[test]
+    fn uniform_rollups_survive_verbatim() {
+        assert_eq!(aggregate_component_state([Ready, Ready]), Ready);
+        assert_eq!(aggregate_component_state([Degraded]), Degraded);
+        assert_eq!(aggregate_component_state([Unavailable, Unavailable]), Unavailable);
+    }
+
+    #[test]
+    fn any_mix_is_degraded_including_unknown_members() {
+        assert_eq!(aggregate_component_state([Ready, Unknown]), Degraded);
+        assert_eq!(aggregate_component_state([Ready, Unavailable]), Degraded);
+        assert_eq!(
+            aggregate_component_state([Unavailable, Unknown]),
+            Degraded
+        );
+        assert_eq!(
+            aggregate_component_state([Ready, Degraded, Unavailable, Unknown]),
+            Degraded
+        );
+    }
 }
 
 #[cfg(test)]

@@ -362,7 +362,18 @@ impl SystemStatusOutput {
             components: value
                 .components
                 .into_iter()
-                .map(|(name, state)| (name, state.into()))
+                .map(|(name, state)| {
+                    // The daemon cannot observe the on-demand facade process,
+                    // so its daemon view reports Unknown. This projection runs
+                    // inside the forwarding facade: a status response the host
+                    // can read proves that facade is alive, and this is the
+                    // only place that can honestly claim it.
+                    if name == "facade" {
+                        (name, PublicComponentState::Ready)
+                    } else {
+                        (name, state.into())
+                    }
+                })
                 .collect(),
             capabilities: value.capabilities.into(),
             agents: value.agents.into_iter().map(Into::into).collect(),

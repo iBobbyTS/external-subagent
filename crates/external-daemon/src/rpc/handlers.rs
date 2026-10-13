@@ -14,9 +14,9 @@ use super::types::{
     MAX_REQUEST_FRAME_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESULT_CHUNK_BYTES, MAX_WAIT, MCP_VERSION,
 };
 use super::views::{
-    agent_capabilities, result_page_bounds, running_component_identity, task_view,
-    ComponentIdentityView, ComponentStateView, DaemonIdentityView, ModelIdentityView,
-    SystemStatusView, TaskObservationView, TaskResultView,
+    aggregate_component_state, agent_capabilities, result_page_bounds,
+    running_component_identity, task_view, ComponentIdentityView, ComponentStateView,
+    DaemonIdentityView, ModelIdentityView, SystemStatusView, TaskObservationView, TaskResultView,
 };
 use crate::{
     agent_status::{AgentEvidenceStore, AgentProbeInput, ProbeLayer},
@@ -601,7 +601,17 @@ impl RpcService {
     }
 
     fn system_status(&self) -> SystemStatusView {
+        let agents = read_agent_config_snapshot()
+            .map(|config| {
+                self.auto_probe_no_llm_layers(&config);
+                configured_agent_statuses(&config, &self.agent_evidence)
+            })
+            .unwrap_or_else(|_| unavailable_agent_statuses());
         let mut components = BTreeMap::new();
+        // The facade is an on-demand stdio child each MCP host starts per
+        // connection; the daemon never observes it directly, so its daemon-side
+        // state stays Unknown. The facade-side MCP projection — which runs
+        // inside the forwarding facade — upgrades this to Ready.
         components.insert("facade".into(), ComponentStateView::Unknown);
         components.insert("daemon".into(), ComponentStateView::Ready);
         components.insert(
@@ -613,20 +623,48 @@ impl RpcService {
             },
         );
         components.insert("scheduler".into(), ComponentStateView::Ready);
-        components.insert("driver".into(), ComponentStateView::Unknown);
-        components.insert("runtime".into(), ComponentStateView::Unknown);
-        components.insert("model_auth".into(), ComponentStateView::Unknown);
+        // The driver rollup covers the spawn channels the daemon can actually
+        // drive: enabled agents whose spawn gate is open, judged by their
+        // just-refreshed local runtime evidence. No open channel leaves nothing
+        // to drive, which rolls up to Unknown rather than a fault.
+        components.insert(
+            "driver".into(),
+            aggregate_component_state(
+                agents
+                    .iter()
+                    .filter(|agent| agent.enabled && agent.spawn_supported)
+                    .map(|agent| agent.local.state),
+            ),
+        );
+        // The runtime rollup covers every enabled agent's local layer — the
+        // runtime binaries themselves — whether or not the spawn gate is open.
+        components.insert(
+            "runtime".into(),
+            aggregate_component_state(
+                agents
+                    .iter()
+                    .filter(|agent| agent.enabled)
+                    .map(|agent| agent.local.state),
+            ),
+        );
+        // Model auth rolls up every enabled agent's auth evidence. Only zcode's
+        // hi probe records real auth evidence; until an explicit probe runs,
+        // this honestly stays Unknown (no evidence, not a fault).
+        components.insert(
+            "model_auth".into(),
+            aggregate_component_state(
+                agents
+                    .iter()
+                    .filter(|agent| agent.enabled)
+                    .map(|agent| agent.auth.state),
+            ),
+        );
         SystemStatusView {
             mcp_version: MCP_VERSION.into(),
             service_generation: self.service_generation.clone(),
             components,
             capabilities: agent_capabilities(),
-            agents: read_agent_config_snapshot()
-                .map(|config| {
-                    self.auto_probe_no_llm_layers(&config);
-                    configured_agent_statuses(&config, &self.agent_evidence)
-                })
-                .unwrap_or_else(|_| unavailable_agent_statuses()),
+            agents,
             identity: Some(DaemonIdentityView {
                 daemon: self.daemon_identity.clone(),
                 // Status has no Agent/session scope, and the current runtime
@@ -896,6 +934,47 @@ mod agent_probe_tests {
     }
 
     #[test]
+    fn status_components_roll_up_enabled_agent_evidence() {
+        let _config_guard = admission_fixtures::config_env_guard();
+        let config = admission_fixtures::gated_dsh_config(None);
+        let _config_scope =
+            admission_fixtures::ConfigEnvScope::install(&config.path().join("agents.json"));
+        let (_directory, service) = service();
+        let RpcSuccess::SystemStatus { status } =
+            service.dispatch(RpcMethod::SystemStatus).unwrap()
+        else {
+            panic!("expected status")
+        };
+        // The gated fixture enables zcode and dsh with their spawn gates open;
+        // FixtureProbe answers every local probe Ready, so both rollups are
+        // Ready. Auth evidence exists only after an explicit (LLM-costing)
+        // probe, so model_auth honestly stays Unknown before one runs.
+        assert_eq!(status.components["runtime"], ComponentStateView::Ready);
+        assert_eq!(status.components["driver"], ComponentStateView::Ready);
+        assert_eq!(status.components["model_auth"], ComponentStateView::Unknown);
+
+        service
+            .dispatch(RpcMethod::AgentProbe(AgentProbeInput {
+                agent: "zcode".into(),
+                through: crate::agent_status::ProbeLayer::Hi,
+                scope: ProbeScope::default(),
+            }))
+            .unwrap();
+        // The explicit hi probe records zcode auth evidence (FixtureProbe
+        // answers auth Ready); the rollup now reflects the mixed truth — one
+        // proven, the rest unprobed — instead of claiming a fault.
+        let RpcSuccess::SystemStatus { status } =
+            service.dispatch(RpcMethod::SystemStatus).unwrap()
+        else {
+            panic!("expected status")
+        };
+        assert_eq!(status.components["model_auth"], ComponentStateView::Degraded);
+        // The runtime and driver rollups are unaffected by auth evidence.
+        assert_eq!(status.components["runtime"], ComponentStateView::Ready);
+        assert_eq!(status.components["driver"], ComponentStateView::Ready);
+    }
+
+    #[test]
     fn status_auto_probes_local_layers_and_preserves_explicit_evidence() {
         let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
@@ -920,6 +999,14 @@ mod agent_probe_tests {
                 "{agent} local evidence must be recorded by status"
             );
         }
+        // The default fixture config enables no agent, so every evidence
+        // rollup is an empty rollup: Unknown (nothing to judge), not a fault.
+        // The daemon-side facade observation stays Unknown too — the facade is
+        // an on-demand host child the daemon never sees.
+        assert_eq!(status.components["facade"], ComponentStateView::Unknown);
+        assert_eq!(status.components["runtime"], ComponentStateView::Unknown);
+        assert_eq!(status.components["driver"], ComponentStateView::Unknown);
+        assert_eq!(status.components["model_auth"], ComponentStateView::Unknown);
 
         let RpcSuccess::AgentProbed { status, .. } = service
             .dispatch(RpcMethod::AgentProbe(AgentProbeInput {

@@ -123,6 +123,8 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 `ComponentState = READY | DEGRADED | UNAVAILABLE | UNKNOWN`。
 
+`components` 键语义：`daemon`/`store`/`scheduler` 是 daemon 自身事实；`runtime` 是所有 enabled subagent 的 local 层探测聚合（runtime 二进制是否可执行且版本可读）；`driver` 是 spawn 通道聚合（enabled 且 `spawn_supported` 的 subagent 的 local 层，无任何开放通道时为 UNKNOWN）；`model_auth` 是所有 enabled subagent 的 auth 证据聚合——只有 zcode 的 hi 探测会记录真实 auth 证据，未显式探测时诚实保持 UNKNOWN；`facade` 在 MCP 视图恒为 READY（本响应正由转发中的 facade 投影，响应可读即 facade 存活），而 daemon RPC 视图（CLI 读取）中为 UNKNOWN（facade 是各 MCP host 按需启动的 stdio 子进程，daemon 无法观察）。聚合规则：全部 READY → READY；全部 UNAVAILABLE → UNAVAILABLE；空集或全部 UNKNOWN → UNKNOWN；任何混合 → DEGRADED。
+
 ### 4.2 capabilities
 
 | 字段 | 类型 | 何时使用／存在理由 | 移除影响 |

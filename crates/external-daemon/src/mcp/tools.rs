@@ -1507,7 +1507,12 @@ mod contract_default_tests {
         let status = SystemStatusView {
             mcp_version: "0.1.0".into(),
             service_generation: "legacy-generation".into(),
-            components: BTreeMap::from([("daemon".into(), ComponentStateView::Ready)]),
+            components: BTreeMap::from([
+                ("daemon".into(), ComponentStateView::Ready),
+                // The daemon never observes the on-demand facade process; the
+                // projection under test runs inside that very facade.
+                ("facade".into(), ComponentStateView::Unknown),
+            ]),
             capabilities: AgentCapabilitiesView {
                 max_rpc_request_frame_bytes: 512 * 1024,
                 max_rpc_response_frame_bytes: 2 * 1024 * 1024,
@@ -1529,6 +1534,13 @@ mod contract_default_tests {
         assert_eq!(output.mcp_version, "0.1.0");
         assert!(matches!(
             output.components.get("daemon"),
+            Some(PublicComponentState::Ready)
+        ));
+        // A status response the host can read was forwarded by a live facade,
+        // so the facade-side projection upgrades the daemon's Unknown
+        // observation to Ready.
+        assert!(matches!(
+            output.components.get("facade"),
             Some(PublicComponentState::Ready)
         ));
         let serialized = serde_json::to_value(output).unwrap();
