@@ -197,6 +197,7 @@ dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** 
 | `agent_id` | integer | 保存后用于 wait/send/respond/result/cancel/close/observe | 无法可靠操作刚创建的任务 |
 | `status` | string | 获取会话建立后的单一生命周期状态（通常为 running，亦可为建立后已完成/失败/等待输入等状态，不再返回内部 queued/preparing 瞬态） | 必须额外查询才能知道会话建立后状态；属于便利信息 |
 | `session_id` | string/null | 获取已建立的目标 subagent 会话 ID | 无法直接识别已建立的底层会话标识 |
+| `instruction` | string | 固定的下一步提示（`Use mcp__external_subagent.wait tool to wait for a response`）：任务已建立，下一步用 wait 等待响应 | 客户端需自行知道下一步应等待；纯提示字段，可从契约推导 |
 
 spawn 是有意非幂等的：每次成功提交都是新建任务（agent id 冲突或活动 workspace 冲突返回 `conflict` 错误，而不是复用已有任务），因此不再输出提交 disposition 字段。曾经存在的 `submission_disposition`（`created / existing`）的 `existing` 分支没有生产者，已随死表面一并移除。
 
@@ -227,11 +228,11 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | `result_available` | boolean | 快速判断有无终态结果 | 客户端须从结果等字段推导；属于显式便利信号 |
 | `activity` | PublicActivity | 查看文本尾部、推理尾部、近期工具频度、未决工具调用与遥测可信度 | 难以判断运行中是在工作还是停滞 |
 | `result` | PublicResult/null | 内嵌结果，避免再请求首段 | 必须额外调用 result，长结果仍需分页 |
-| `instruction` | string/null | 给出下一步响应或取分页的提示 | 客户端需自行从结构化字段实现同一判断；不能只解析该自然语言字段 |
+| `instruction` | string/null | 给出下一步响应、取分页或（结果已完整时）close 清理的提示 | 客户端需自行从结构化字段实现同一判断；不能只解析该自然语言字段 |
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
-嵌入结果 `complete=true` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。
+嵌入结果 `complete=true` 时已取得全部结果，不必重复 result，`instruction` 此时固定提示无进一步使用可调用 close 清理（`Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.`）；否则沿 `next_offset` 继续。
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`last_tool_calls` 跑了哪条指令、`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 

@@ -870,7 +870,7 @@ mod result_paging_tests {
                 activity: activity(),
                 result: Some(failed_result()),
                 instruction: Some(
-                    "This is the final result. There is no need to call external_subagent_result again."
+                    "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
                         .into(),
                 ),
                 timed_out: false,

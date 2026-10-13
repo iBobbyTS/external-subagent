@@ -381,6 +381,11 @@ impl SystemStatusOutput {
     }
 }
 
+/// Fixed advisory guidance in every spawn output: the task exists now, so
+/// the caller's next tool is wait.
+pub(crate) const SPAWN_INSTRUCTION: &str =
+    "Use mcp__external_subagent.wait tool to wait for a response";
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentSpawnOutput {
@@ -388,6 +393,7 @@ pub struct AgentSpawnOutput {
     pub agent_id: u64,
     pub status: String,
     pub session_id: Option<String>,
+    pub instruction: String,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]

@@ -14,7 +14,7 @@ use super::types::{internal_task_id, public_task_id, PublicDecision, PublicRespo
 use super::views::{
     AgentListOutput, AgentObserveOutput, AgentRespondOutput, AgentResultOutput, AgentSendOutput,
     AgentSpawnOutput, AgentStateOutput, AgentWaitOutput, PublicMessageDisposition,
-    PublicMessageReceipt, PublicResult, PublicTask, SystemStatusOutput,
+    PublicMessageReceipt, PublicResult, PublicTask, SPAWN_INSTRUCTION, SystemStatusOutput,
 };
 use crate::rpc::{
     GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView,
@@ -415,6 +415,7 @@ impl SubagentMcp {
             agent_id: public_task_id(&task.agent_id).map_err(|e| e.with_operation("spawn"))?,
             status: task.status,
             session_id: task.session_id,
+            instruction: SPAWN_INSTRUCTION.to_owned(),
         })
     }
 
@@ -764,6 +765,7 @@ mod contract_default_tests {
         SystemStatusOutput, PUBLIC_TOOLS,
     };
     use crate::mcp::schemas::PublicPermissionMode;
+    use crate::mcp::views::SPAWN_INSTRUCTION;
     use crate::mcp::views::PublicComponentState;
     use crate::{
         observation::{ObservationSnapshot, OBSERVATION_SCHEMA},
@@ -1672,7 +1674,7 @@ mod contract_default_tests {
             ("external_subagent_status", status),
             (
                 "external_subagent_spawn",
-                serde_json::json!({"agent_id":10000001,"status":"running","session_id":null}),
+                serde_json::json!({"agent_id":10000001,"status":"running","session_id":null,"instruction":SPAWN_INSTRUCTION}),
             ),
             ("external_subagent_wait", wait),
             ("external_subagent_observe", observation),
@@ -1873,6 +1875,7 @@ mod contract_default_tests {
         let output = facade.agent_spawn_inner(input, || false).await.unwrap();
         assert_eq!(output.status, "running");
         assert!(output.session_id.is_some());
+        assert_eq!(output.instruction, SPAWN_INSTRUCTION);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -175,7 +175,7 @@ fn wait_instruction(
 /// last-resort page shortening so it always names the page's real cursor.
 fn terminal_result_instruction(result: &TaskResultView) -> String {
     if result.complete {
-        "This is the final result. There is no need to call external_subagent_result again."
+        "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
             .to_owned()
     } else {
         format!(
@@ -892,7 +892,7 @@ pub(crate) mod wait_tests {
         assert!(result.complete);
         assert_eq!(
             instruction.as_deref(),
-            Some("This is the final result. There is no need to call external_subagent_result again.")
+            Some("Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.")
         );
     }
 
@@ -1549,7 +1549,7 @@ pub(crate) mod wait_tests {
             if fits_page {
                 assert_eq!(
                     instruction,
-                    "This is the final result. There is no need to call external_subagent_result again."
+                    "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
                 );
             } else {
                 assert_eq!(
@@ -2439,14 +2439,14 @@ pub(crate) mod wait_tests {
     #[test]
     fn wait_projection_counts_the_regenerated_instruction_when_a_complete_page_shrinks() {
         // A complete page that must shrink becomes partial, which replaces the
-        // short "no need to call again" instruction with the longer "continue
-        // reading from offset N" one. The frame probing must account for that
+        // "close this subagent" instruction with the longer "continue reading
+        // from offset N" one. The frame probing must account for that
         // growth at every candidate prefix, or the chosen largest prefix looks
         // fine during the search and then overflows on the real envelope
         // (B-01 regression).
         let page = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
         let complete_instruction =
-            "This is the final result. There is no need to call external_subagent_result again.";
+            "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.";
         let mut base = synthesized_wait(
             page.clone(),
             page.len(),
