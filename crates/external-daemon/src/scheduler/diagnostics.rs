@@ -537,12 +537,14 @@ impl RotatingDiagnosticWriter {
         };
         let size = input.metadata()?.len();
         input.seek(SeekFrom::Start(size.saturating_sub(DIAGNOSTIC_FILE_BYTES)))?;
-        let mut output = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(destination)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(destination)?;
         io::copy(&mut input.take(DIAGNOSTIC_FILE_BYTES), &mut output)?;
         Ok(())
     }
@@ -556,11 +558,14 @@ impl Write for RotatingDiagnosticWriter {
                 "diagnostic record exceeds file cap",
             ));
         }
-        let mut output = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(&self.path)?;
+        let mut options = fs::OpenOptions::new();
+        options.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options.open(&self.path)?;
         if output.metadata()?.len().saturating_add(bytes.len() as u64) > DIAGNOSTIC_FILE_BYTES {
             let first = PathBuf::from(format!("{}.1", self.path.display()));
             let second = PathBuf::from(format!("{}.2", self.path.display()));

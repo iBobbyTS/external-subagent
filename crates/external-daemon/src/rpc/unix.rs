@@ -20,20 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Debug, Clone, Copy)]
-pub struct ServerOptions {
-    pub max_connections: usize,
-    pub connection_timeout: Duration,
-}
-
-impl Default for ServerOptions {
-    fn default() -> Self {
-        Self {
-            max_connections: 16,
-            connection_timeout: Duration::from_secs(1),
-        }
-    }
-}
+use super::transport::{
+    handle_connection, read_limited_frame, reap_finished_workers, write_busy, write_response,
+};
+pub use super::transport::ServerOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SocketIdentity {
@@ -82,7 +72,8 @@ impl RpcServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         if active.load(Ordering::Acquire) >= options.max_connections {
-                            write_busy(stream, options.connection_timeout);
+                            let _ = stream.set_write_timeout(Some(options.connection_timeout));
+                            write_busy(stream);
                             continue;
                         }
                         active.fetch_add(1, Ordering::AcqRel);
@@ -90,12 +81,16 @@ impl RpcServer {
                         let worker_active = Arc::clone(&active);
                         let worker_shutdown = Arc::clone(&accept_shutdown);
                         workers.push(thread::spawn(move || {
-                            handle_connection(
-                                stream,
-                                &service,
-                                options.connection_timeout,
-                                &worker_shutdown,
-                            );
+                            if stream.set_nonblocking(false).is_ok() {
+                                let _ = stream.set_read_timeout(Some(options.connection_timeout));
+                                let _ = stream.set_write_timeout(Some(options.connection_timeout));
+                                handle_connection(
+                                    stream,
+                                    &service,
+                                    &worker_shutdown,
+                                    peer_disconnected,
+                                );
+                            }
                             worker_active.fetch_sub(1, Ordering::AcqRel);
                         }));
                     }
@@ -299,18 +294,6 @@ fn prepare_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn reap_finished_workers(workers: &mut Vec<JoinHandle<()>>) {
-    let mut index = 0;
-    while index < workers.len() {
-        if workers[index].is_finished() {
-            let worker = workers.swap_remove(index);
-            let _ = worker.join();
-        } else {
-            index += 1;
-        }
-    }
-}
-
 pub(crate) fn remove_stale_socket(path: &Path) -> io::Result<()> {
     remove_stale_socket_with(path, |path| UnixStream::connect(path).map(drop))
 }
@@ -372,33 +355,6 @@ pub(crate) fn remove_matching_socket(path: &Path, expected: SocketIdentity) -> i
     fs::remove_file(path)
 }
 
-fn handle_connection(
-    mut stream: UnixStream,
-    service: &RpcService,
-    timeout: Duration,
-    shutdown: &AtomicBool,
-) {
-    if stream.set_nonblocking(false).is_err() {
-        return;
-    }
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-    let response = {
-        let mut reader = BufReader::new(&mut stream);
-        match read_limited_frame(&mut reader, MAX_REQUEST_FRAME_BYTES - 1) {
-            Ok(frame) => service.handle_bytes_interruptible(&frame, &|| {
-                shutdown.load(Ordering::Acquire) || peer_disconnected(reader.get_ref())
-            }),
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => RpcResponse::error(
-                None,
-                RpcError::new(RpcErrorCode::Oversized, "request frame exceeds cap"),
-            ),
-            Err(_) => return,
-        }
-    };
-    let _ = write_response(&mut stream, response);
-}
-
 fn peer_disconnected(stream: &UnixStream) -> bool {
     let mut byte = 0u8;
     // Non-consuming and non-blocking: a wait may observe closure without
@@ -417,68 +373,6 @@ fn peer_disconnected(stream: &UnixStream) -> bool {
                 io::Error::last_os_error().kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
             ))
-}
-
-fn write_busy(mut stream: UnixStream, timeout: Duration) {
-    let _ = stream.set_write_timeout(Some(timeout));
-    let response = RpcResponse::error(
-        None,
-        RpcError::new(RpcErrorCode::Conflict, "server connection limit reached"),
-    );
-    let _ = write_response(&mut stream, response);
-}
-
-fn write_response(stream: &mut UnixStream, mut response: RpcResponse) -> io::Result<()> {
-    let mut frame = serde_json::to_vec(&response)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if frame.len() + 1 > MAX_RESPONSE_FRAME_BYTES {
-        response = RpcResponse {
-            request_id: response
-                .request_id
-                .filter(|request_id| !request_id.is_empty() && request_id.len() <= 128),
-            outcome: RpcOutcome::Error {
-                error: RpcError::new(RpcErrorCode::Oversized, "response frame exceeds cap"),
-            },
-        };
-        frame = serde_json::to_vec(&response)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if frame.len() + 1 > MAX_RESPONSE_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized fallback response exceeds cap",
-            ));
-        }
-    }
-    frame.push(b'\n');
-    stream.write_all(&frame)
-}
-
-fn read_limited_frame<R: BufRead>(reader: &mut R, cap: usize) -> io::Result<Vec<u8>> {
-    let mut frame = Vec::new();
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return if frame.is_empty() {
-                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty frame"))
-            } else {
-                Ok(frame)
-            };
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let take = newline.unwrap_or(available.len());
-        if frame.len().saturating_add(take) > cap {
-            reader.consume(take + usize::from(newline.is_some()));
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame exceeds cap",
-            ));
-        }
-        frame.extend_from_slice(&available[..take]);
-        reader.consume(take + usize::from(newline.is_some()));
-        if newline.is_some() {
-            return Ok(frame);
-        }
-    }
 }
 
 #[cfg(test)]

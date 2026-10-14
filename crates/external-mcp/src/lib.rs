@@ -1,13 +1,14 @@
 //! Stateless stdio bridge for the shared daemon MCP listener.
 
 use std::{io, path::Path};
-use tokio::{
-    io::{self as tokio_io, AsyncWriteExt},
-    net::UnixStream,
-};
 
 /// Forward one client stdio session to the daemon MCP stream endpoint.
+#[cfg(unix)]
 pub async fn serve_stdio(socket: impl AsRef<Path>) -> io::Result<()> {
+    use tokio::{
+        io::{self as tokio_io, AsyncWriteExt},
+        net::UnixStream,
+    };
     let socket = socket.as_ref();
     let stream = UnixStream::connect(socket).await.map_err(|error| {
         io::Error::new(
@@ -66,4 +67,15 @@ pub async fn serve_stdio(socket: impl AsRef<Path>) -> io::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Forward one client stdio session to the daemon MCP stream endpoint.
+#[cfg(not(unix))]
+pub async fn serve_stdio(socket: impl AsRef<Path>) -> io::Result<()> {
+    let _ = socket;
+    // TODO(windows-real-machine): implement named pipe client connection for MCP stdio bridge
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "windows: named pipe MCP bridge pending real-machine implementation",
+    ))
 }

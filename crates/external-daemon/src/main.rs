@@ -9,6 +9,7 @@ use external_daemon::{
 };
 use external_runtime::SpawnModel;
 use external_store::Store;
+#[cfg(unix)]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use std::{
     env, fs, io,
@@ -25,7 +26,7 @@ fn configured_subagent<'a>(
 ) -> Option<&'a serde_json::Value> {
     value.pointer(&format!("/subagents/{name}"))
 }
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, unix))]
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
@@ -52,8 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         external_runtime::orphan_spawn_main();
     }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
-    signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
+    #[cfg(unix)]
+    {
+        signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
+        signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // TODO(windows-real-machine: console ctrl handler)
+    }
     let config = parse_config()?;
     if let Some(path) = config.agent_config.as_ref() {
         env::set_var("EXTERNAL_SUBAGENT_CONFIG", path);
@@ -340,7 +348,7 @@ fn production_scheduler_config(runtime_source: Option<PathBuf>) -> SchedulerConf
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, unix))]
 fn wait_for_startup_test_gate(shutdown_requested: &AtomicBool) -> io::Result<()> {
     let Some(path) = env::var_os("EXTERNAL_SUBAGENT_TEST_STARTUP_GATE") else {
         return Ok(());
@@ -362,7 +370,7 @@ fn wait_for_startup_test_gate(shutdown_requested: &AtomicBool) -> io::Result<()>
     Ok(())
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(all(debug_assertions, unix)))]
 fn wait_for_startup_test_gate(_shutdown_requested: &AtomicBool) -> io::Result<()> {
     Ok(())
 }

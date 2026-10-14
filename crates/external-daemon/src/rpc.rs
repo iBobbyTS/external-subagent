@@ -15,12 +15,19 @@ mod types;
 pub(crate) mod views;
 mod wait;
 
+pub(crate) mod transport;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub(crate) use unix::{remove_matching_socket, remove_stale_socket, SocketIdentity};
 #[cfg(unix)]
 pub use unix::{RpcClient, RpcServer, ServerOptions};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{RpcClient, RpcServer, ServerOptions};
 
 pub use config::parse_subagent_config;
 pub use errors::{RpcError, RpcErrorCode};

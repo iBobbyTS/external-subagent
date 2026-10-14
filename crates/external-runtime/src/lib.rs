@@ -1253,7 +1253,7 @@ fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
 pub fn kill_group(pgid: i32) -> io::Result<()> {
     #[cfg(unix)]
     {
-        if pgid <= 0 {
+        if pgid <= 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "process-group id must be positive",
@@ -2891,6 +2891,10 @@ mod tests {
         );
         assert_eq!(
             kill_group(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            kill_group(1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(

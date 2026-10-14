@@ -1,4 +1,5 @@
 use super::*;
+use external_runtime::{kill_group, kill_process};
 use external_store::StoreError;
 
 impl Scheduler {
@@ -183,15 +184,11 @@ impl Scheduler {
                             if let Some(identity) = &handle.identity {
                                 let pgid = identity.process_group_id;
                                 if pgid > 0 {
-                                    unsafe {
-                                        libc::kill(-pgid, libc::SIGKILL);
-                                    }
+                                    let _ = kill_group(pgid);
                                 } else {
                                     let pid = identity.pid;
                                     if pid > 0 {
-                                        unsafe {
-                                            libc::kill(pid as i32, libc::SIGKILL);
-                                        }
+                                        let _ = kill_process(pid);
                                     }
                                 }
                             }
