@@ -67,13 +67,55 @@ function linuxProductPaths(home, env) {
   };
 }
 
+// Windows base directory resolution (S04): %LOCALAPPDATA% is used only when it is a
+// non-empty absolute path; relative or empty values are ignored and the fallback
+// under %USERPROFILE%\AppData\Local applies. APPDATA (Roaming) is deliberately
+// not consulted as the frozen field set has no roaming consumers.
+function localAppDataDirectory(env, home) {
+  const configured = env.LOCALAPPDATA;
+  if (typeof configured === 'string' && configured !== '' && path.isAbsolute(configured)) {
+    return configured;
+  }
+  return path.join(home, 'AppData', 'Local');
+}
+
+// Windows product layout (S04): structurally parallel to darwin/linux.
+// Data, database, config, state, hook provenance, plugin staging, and profiles
+// live under %LOCALAPPDATA%\<product>.
+// Socket uses the Windows named pipe namespace (\\.\pipe\<product>-daemon).
+// launchAgent is null as Windows uses SCM rather than a file-based unit definition.
+function windowsProductPaths(home, env) {
+  const localAppData = localAppDataDirectory(env, home);
+  const data = path.join(localAppData, PRODUCT_NAME);
+  return {
+    home,
+    data,
+    config: path.join(data, 'config.json'),
+    state: path.join(data, 'install-state.json'),
+    hookProvenance: path.join(data, 'zcode-agent-hook-provenance.json'),
+    database: path.join(data, `${PRODUCT_NAME}.sqlite3`),
+    // Named pipe namespace placeholder (pending phase 1 real-machine implementation,
+    // not a filesystem path; prefix matches S03 windows.rs \\.\pipe\ literal).
+    socket: `\\\\.\\pipe\\${PRODUCT_NAME}-daemon`,
+    logs: path.join(localAppData, PRODUCT_NAME, 'logs'),
+    // Windows has no file-based service definition; pending phase 3 SCM integration decision.
+    launchAgent: null,
+    zcodeConfig: path.join(home, '.zcode', 'cli', 'config.json'),
+    zcodePlugin: path.join(data, 'zcode-plugin', PLUGIN_NAME),
+    profiles: path.join(data, 'profiles'),
+  };
+}
+
 // State paths derive from PRODUCT_NAME, so the debug variant gets a fully
 // parallel tree (its own data directory, database, socket, and logs) and
 // never touches the released product's state.  The layout is selected by the
-// process platform: macOS `~/Library`, every other supported host the XDG
-// baseline.  `zcodeConfig` is `~/.zcode/cli/config.json` on both platforms.
+// process platform: macOS `~/Library`, Windows `%LOCALAPPDATA%`, every other
+// supported host the XDG baseline.  `zcodeConfig` is `~/.zcode/cli/config.json`.
 export function productPaths(home = os.homedir(), env = process.env) {
-  return platform(env) === 'darwin' ? darwinProductPaths(home) : linuxProductPaths(home, env);
+  const currentPlatform = platform(env);
+  if (currentPlatform === 'darwin') return darwinProductPaths(home);
+  if (currentPlatform === 'win32') return windowsProductPaths(home, env);
+  return linuxProductPaths(home, env);
 }
 
 // Mirror the daemon's `profiles_directory()` exactly (rpc/profiles.rs):

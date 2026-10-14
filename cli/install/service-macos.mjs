@@ -12,6 +12,10 @@ import {
   SYSTEMD_UNIT_NAME, bootstrapServiceSystemd, bootoutServiceSystemd, installServiceUnit,
   systemdServiceRegistrationStatus,
 } from './service-linux.mjs';
+import {
+  bootstrapServiceWindows, bootoutServiceWindows, installServiceDefinitionWindows,
+  windowsServiceRegistrationStatus,
+} from './service-windows.mjs';
 
 // The macOS service backend for the product daemon, plus the platform
 // dispatch into the systemd user backend (service-linux.mjs).  The plist pins
@@ -176,29 +180,51 @@ export function bootoutLaunchdService(paths, uid = process.getuid(), options = {
 // Linux arms carry the same idempotence/removal-confirmation contract through
 // `systemctl --user` (options.systemctl is the injectable seam, the twin of
 // options.launchctl).
-export function serviceRegistrationStatus(uid = process.getuid(), options = {}) {
-  return platform() === 'darwin'
-    ? launchdServiceRegistrationStatus(uid, options)
-    : systemdServiceRegistrationStatus(options);
+export function serviceRegistrationStatus(uid, options = {}) {
+  const currentPlatform = platform();
+  if (currentPlatform === 'darwin') {
+    return launchdServiceRegistrationStatus(uid ?? process.getuid(), options);
+  }
+  if (currentPlatform === 'win32') {
+    return windowsServiceRegistrationStatus(options);
+  }
+  return systemdServiceRegistrationStatus(options);
 }
 
-export function bootstrapService(paths, uid = process.getuid(), options = {}) {
-  return platform() === 'darwin'
-    ? bootstrapLaunchdService(paths, uid, options)
-    : bootstrapServiceSystemd(paths, uid, options);
+export function bootstrapService(paths, uid, options = {}) {
+  const currentPlatform = platform();
+  if (currentPlatform === 'darwin') {
+    return bootstrapLaunchdService(paths, uid ?? process.getuid(), options);
+  }
+  if (currentPlatform === 'win32') {
+    return bootstrapServiceWindows(paths, options);
+  }
+  return bootstrapServiceSystemd(paths, uid, options);
 }
 
-export function bootoutService(paths, uid = process.getuid(), options = {}) {
-  return platform() === 'darwin'
-    ? bootoutLaunchdService(paths, uid, options)
-    : bootoutServiceSystemd(paths, uid, options);
+export function bootoutService(paths, uid, options = {}) {
+  const currentPlatform = platform();
+  if (currentPlatform === 'darwin') {
+    return bootoutLaunchdService(paths, uid ?? process.getuid(), options);
+  }
+  if (currentPlatform === 'win32') {
+    return bootoutServiceWindows(paths, options);
+  }
+  return bootoutServiceSystemd(paths, uid, options);
 }
 
 // The service-definition installer behind init's install-launch-agent step:
 // the launchd plist on macOS, the systemd user unit (0600, absolute verified
 // payload, Restart=always) on Linux, both at paths.launchAgent.
 export function installServiceDefinition(paths, options = {}) {
-  return platform() === 'darwin' ? installLaunchAgent(paths, options) : installServiceUnit(paths, options);
+  const currentPlatform = platform();
+  if (currentPlatform === 'darwin') {
+    return installLaunchAgent(paths, options);
+  }
+  if (currentPlatform === 'win32') {
+    return installServiceDefinitionWindows(paths, options);
+  }
+  return installServiceUnit(paths, options);
 }
 
 export { SYSTEMD_UNIT_NAME };

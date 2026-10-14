@@ -7,6 +7,7 @@ import { LAUNCH_AGENT_LABEL } from '../constants.mjs';
 import { platform } from '../paths.mjs';
 import { launchAgentPlist, launchctl } from './service-macos.mjs';
 import { SYSTEMD_UNIT_NAME, execStartProgram, replaceExecStartProgram, systemctl, systemdUnit, unitServiceStatus } from './service-linux.mjs';
+import { activateServiceWindows } from './service-windows.mjs';
 
 const xml = (s) => s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const unxml = (s) => s.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
@@ -20,7 +21,14 @@ export function hasInstalledService(paths) {
 // Platform dispatch (S03): the same activation health/rollback contract runs
 // over launchd on macOS (verbatim) and the systemd user manager on Linux.
 export async function activateService(paths, candidate, options = {}) {
-  return platform() === 'darwin' ? activateLaunchdService(paths, candidate, options) : activateSystemdService(paths, candidate, options);
+  const currentPlatform = platform();
+  if (currentPlatform === 'darwin') {
+    return activateLaunchdService(paths, candidate, options);
+  }
+  if (currentPlatform === 'win32') {
+    return activateServiceWindows(paths, candidate, options);
+  }
+  return activateSystemdService(paths, candidate, options);
 }
 
 // The service definition is derived from the CURRENT config: activation
