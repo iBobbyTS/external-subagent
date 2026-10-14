@@ -1,0 +1,37 @@
+# CI workflow for Windows compilation and platform contract verification.
+#
+# Runs on windows-latest to verify that the Rust workspace compiles natively
+# under MSVC (cargo check --workspace, without --all-targets pending Phase 1
+# test harness porting) and that the Node.js CLI platform reject contract
+# (tests/platform/windows.test.mjs) holds on a real win32 host.
+name: Windows check
+
+on:
+  push:
+    branches: ['**']
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  windows-check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Diagnostic - inspect installed rustup targets
+        run: rustup target list --installed
+
+      - name: Cargo check workspace
+        run: cargo check --workspace
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Run Windows platform tests
+        run: node --test tests/platform/windows.test.mjs
