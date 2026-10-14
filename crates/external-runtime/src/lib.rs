@@ -13,6 +13,8 @@ use std::fs;
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::sync::TryLockError;
 use std::{
     collections::HashMap,
     fmt,
@@ -21,7 +23,7 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
-        Arc, Condvar, Mutex, TryLockError,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -32,8 +34,20 @@ use std::{
 pub static SPAWN_GATE: Mutex<()> = Mutex::new(());
 
 pub fn gated_spawn(command: &mut Command) -> io::Result<Child> {
-    let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
-    command.spawn()
+    #[cfg(windows)]
+    {
+        let _ = command;
+        // TODO(windows-real-machine): implement Job Object process supervisor on Windows
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "windows: runtime spawn pending real-machine implementation (Job Object)",
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        command.spawn()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -573,6 +587,21 @@ impl Driver {
         self.write_frame_before(&frame, deadline)
     }
 
+    #[cfg(not(unix))]
+    pub fn respond_before(
+        &self,
+        id: WireId,
+        result: serde_json::Value,
+        deadline: Instant,
+    ) -> Result<(), RequestError> {
+        let encoded = self
+            .encode_frame(&ResponseEnvelope::success(id, result))
+            .map_err(|error| RequestError::WriteFailed(error.to_string()))?;
+        let mut frame = encoded.into_bytes();
+        frame.push(b'\n');
+        self.write_frame_before(&frame, deadline)
+    }
+
     #[cfg(unix)]
     fn write_frame_before(&self, frame: &[u8], deadline: Instant) -> Result<(), RequestError> {
         let mut input = loop {
@@ -601,6 +630,15 @@ impl Driver {
             (Err(error), Ok(())) => Err(error),
             (_, Err(error)) => Err(error),
         }
+    }
+
+    #[cfg(not(unix))]
+    fn write_frame_before(&self, frame: &[u8], deadline: Instant) -> Result<(), RequestError> {
+        let _ = (frame, deadline);
+        // TODO(windows-real-machine): implement timed write on Windows
+        Err(RequestError::WriteFailed(
+            "windows: timed write pending real-machine implementation".into(),
+        ))
     }
 
     pub fn respond_error(&self, id: WireId, error: serde_json::Value) -> io::Result<()> {
@@ -1208,6 +1246,58 @@ fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "process-group signalling is unsupported on this platform",
+        ))
+    }
+}
+
+pub fn kill_group(pgid: i32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if pgid <= 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process-group id must be positive",
+            ));
+        }
+        let killed = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        if killed != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        // TODO(windows-real-machine): implement Job Object process-group termination on Windows
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "windows: process-group termination pending real-machine implementation (Job Object)",
+        ))
+    }
+}
+
+pub fn kill_process(pid: u32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process id must be a positive signal-safe pid",
+            ));
+        }
+        let killed = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if killed != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        // TODO(windows-real-machine): implement process termination on Windows
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "windows: process-group termination pending real-machine implementation (Job Object)",
         ))
     }
 }
@@ -2762,5 +2852,50 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_helpers_terminate_running_process_and_group() {
+        let mut command = Command::new("sleep");
+        command.arg("10");
+        let mut child = gated_spawn(&mut command).unwrap();
+        let pid = child.id();
+        assert!(kill_process(pid).is_ok());
+        let _ = child.wait();
+        // Subsequent kill returns Ok due to ESRCH tolerance
+        assert!(kill_process(pid).is_ok());
+
+        let mut group_command = Command::new("sh");
+        group_command.args(["-c", "sleep 10"]);
+        unsafe {
+            group_command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let mut group_child = gated_spawn(&mut group_command).unwrap();
+        let pgid = group_child.id() as i32;
+        assert!(kill_group(pgid).is_ok());
+        let _ = group_child.wait();
+        // Subsequent kill returns Ok due to ESRCH tolerance
+        assert!(kill_group(pgid).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_helpers_reject_invalid_targets() {
+        assert_eq!(
+            kill_process(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            kill_group(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            kill_group(-1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
