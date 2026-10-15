@@ -2393,7 +2393,7 @@ fn wall_now_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{io::Write, os::unix::fs::PermissionsExt};

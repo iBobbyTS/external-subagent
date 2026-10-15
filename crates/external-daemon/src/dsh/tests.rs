@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Scripted ACP contract tests for the DSH adapter: gates, routing,
 //! bootstrap ordering, permission/input correlation, settlement folding,
 //! cancellation, and drain lifecycle through the shared scheduler.

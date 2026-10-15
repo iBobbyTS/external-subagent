@@ -628,6 +628,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn codex_environment_exports_configured_home_over_inherited() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.json");

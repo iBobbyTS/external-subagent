@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Full-chain model-selection acceptance tests.
 //!
 //! These drive the real daemon scheduler against the fake ZCode runtime

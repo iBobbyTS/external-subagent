@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Scripted app-server contract tests for the Codex adapter: gate, launch
 //! bounds, thread identity, resume posture, turn attribution, and the
 //! shared scheduler lifecycle.

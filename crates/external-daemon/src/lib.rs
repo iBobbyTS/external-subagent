@@ -1679,50 +1679,14 @@ mod daemon;
 pub use daemon::Daemon;
 
 #[cfg(not(unix))]
-pub struct Daemon;
-
+mod daemon_windows;
 #[cfg(not(unix))]
-impl Daemon {
-    pub fn start(
-        socket: impl AsRef<std::path::Path>,
-        scheduler: Scheduler,
-        server_options: rpc::ServerOptions,
-        claim_interval: Duration,
-    ) -> io::Result<Self> {
-        Self::start_with_shutdown(
-            socket,
-            scheduler,
-            server_options,
-            claim_interval,
-            Arc::new(AtomicBool::new(false)),
-        )
-    }
+pub use daemon_windows::Daemon;
 
-    pub fn start_with_shutdown(
-        socket: impl AsRef<std::path::Path>,
-        scheduler: Scheduler,
-        server_options: rpc::ServerOptions,
-        claim_interval: Duration,
-        shutdown_requested: Arc<AtomicBool>,
-    ) -> io::Result<Self> {
-        let _ = (
-            socket,
-            scheduler,
-            server_options,
-            claim_interval,
-            shutdown_requested,
-        );
-        // TODO(windows-real-machine): implement Windows daemon runtime and lifecycle
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "windows: daemon pending real-machine implementation",
-        ))
-    }
+#[cfg(windows)]
+mod win_pipe;
 
-    pub fn shutdown(&self) {}
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod zcode_effort_tests {
     use super::*;
     use external_store::{TaskOutcome, TaskPhase, TaskRecord, TurnState};

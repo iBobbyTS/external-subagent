@@ -478,6 +478,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn materialize_write_guard_tree_is_byte_exact_and_patches_the_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let dsh = directory.path().join("node_modules/@deepseek-ai/dsh");

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Scripted NDJSON contract tests for the `agy` adapter: gate, launch
 //! admission threading, bootstrap on `init`, turn settlement, multi-turn
 //! message delivery, tool activity, cancellation, the idle-signal stream-noise

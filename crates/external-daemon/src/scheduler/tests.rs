@@ -335,6 +335,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     }
 
     #[test]
+    #[cfg(unix)]
     fn non_zcode_adapters_never_inherit_the_zcode_runtime_proof() {
         for (agent, runtime_source) in [
             ("dsh", None),
@@ -446,7 +447,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod failure_log_tests {
     use super::*;
     use external_store::StoreError;
@@ -2353,7 +2354,7 @@ mod legacy_row_recovery_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod transport_failure_tests {
     use super::*;
 
@@ -4427,6 +4428,7 @@ mod spawn_established_return_tests {
     /// `write_entered` after this returns makes "entered && !done at cancel"
     /// prove a write the lock-free kill is required to unblock, rather than a
     /// marker set before the write call was reached.
+    #[cfg(unix)]
     fn prefill_pipe_buffer(writer: &std::process::ChildStdin) -> usize {
         use std::os::unix::io::AsRawFd;
         let fd = writer.as_raw_fd();
@@ -4467,6 +4469,7 @@ mod spawn_established_return_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ac3a_starter_hangs_on_unread_stdin_killed_and_cancelled() {
         use std::process::{Command, Stdio};
         use std::os::unix::process::CommandExt;
@@ -4647,6 +4650,7 @@ mod spawn_established_return_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn ac3b_background_claim_hangs_timeout_and_cancelled() {
         use std::process::{Command, Stdio};
         use std::os::unix::process::CommandExt;
@@ -5710,6 +5714,7 @@ mod spawn_established_return_tests {
     }
 }
 
+#[cfg(unix)]
 mod drain_straggler_tests {
     use super::*;
     use external_core::PermissionMode;

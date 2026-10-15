@@ -315,14 +315,16 @@ impl From<ReasoningEffortSetError> for SessionError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::Command;
 
     /// A scripted ACP child that records every inbound frame to a file and
     /// replies in the pinned order. Reading the file after the run proves the
     /// emitted wire order.
+    #[cfg(unix)]
     fn scripted_child(script: &str) -> (Driver, std::path::PathBuf) {
         let path = std::env::temp_dir().join(format!(
             "dsh-session-{}-{:?}",
@@ -335,6 +337,7 @@ mod tests {
         (driver, path)
     }
 
+    #[cfg(unix)]
     fn wait_for_logged_frames(path: &std::path::Path, expected: usize) -> Vec<serde_json::Value> {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -356,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn bootstrap_orders_initialize_new_model_and_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -410,6 +414,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejected_model_selection_stops_before_any_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -446,6 +451,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_tokens_fail_before_any_wire_traffic() {
         let (driver, path) = scripted_child("sleep 5");
         let mut session = AcpSession::new(Arc::new(driver));
@@ -465,6 +471,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn offered_reasoning_effort_is_set_between_model_and_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -521,6 +528,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn unoffered_reasoning_effort_fails_closed_before_any_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -569,6 +577,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn unadvertised_config_options_forward_the_reasoning_effort_token() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -615,6 +624,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn rejected_reasoning_effort_stops_before_any_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
@@ -666,6 +676,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_effort_tokens_fail_before_any_wire_traffic() {
         let (driver, path) = scripted_child("sleep 5");
         let mut session = AcpSession::new(Arc::new(driver));
@@ -686,6 +697,7 @@ sleep 5
     }
 
     #[test]
+    #[cfg(unix)]
     fn codec_check_rejects_strict_drivers() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 5"]);

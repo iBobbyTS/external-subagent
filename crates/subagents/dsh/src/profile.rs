@@ -1508,6 +1508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn home_override_is_forwarded_only_when_explicit_and_absolute() {
         let absolute = PathBuf::from("/usr/bin/true");
         assert!(absolute.is_file(), "platform true binary is required");
@@ -1537,6 +1538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn build_dump_rejects_user_policy_overrides() {
         let baseline = serde_json::json!([
             {"id":"sandbox-policy", "name":"@deepseek-ai/dsh-sandbox-policy", "config":{
@@ -1636,6 +1638,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn probe_drains_both_large_pipes_without_deadlock() {
         let output = bounded_output(
             Command::new("python3").arg("-c").arg(
@@ -1648,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn probe_caps_each_pipe_and_reaps_the_child() {
         use std::os::unix::process::CommandExt;
         for stream in ["stdout", "stderr"] {
@@ -1670,6 +1674,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn hanging_version_and_open_pipe_probes_time_out_and_reap() {
         use std::os::unix::process::CommandExt;
         for script in [
@@ -1969,6 +1974,7 @@ else:
     }
 
     #[test]
+    #[cfg(unix)]
     fn manifest_build_patch_pins_overrides_and_insert() {
         let manifest = vec![PathBuf::from("src/a.rs"), PathBuf::from("docs/")];
         let guard = PathBuf::from("/tmp/manifest-build/dsh-write-guard/lib/index.js");
@@ -2026,6 +2032,7 @@ else:
     }
 
     #[test]
+    #[cfg(unix)]
     fn manifest_build_patch_round_trips_special_character_paths() {
         let manifest = vec![
             PathBuf::from("src/a.rs"),

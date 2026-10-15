@@ -29,12 +29,12 @@ use external_store::{
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fs::File,
-    io::Read,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+use std::{fs::File, io::Read};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -798,11 +798,27 @@ pub(super) fn failure_message_projection(
     task.failure_message.clone()
 }
 
+#[cfg(unix)]
 fn opaque_generation() -> Result<String, RpcServiceConfigError> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
         .map_err(|_| RpcServiceConfigError::GenerationUnavailable)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Windows entropy source: the CNG `ProcessPrng` primitive (bcryptprimitives.dll)
+/// is the documented replacement for `/dev/urandom`. It is a system-preferred
+/// CSPRNG and cannot fail for the 16-byte request beyond argument validation.
+#[cfg(windows)]
+fn opaque_generation() -> Result<String, RpcServiceConfigError> {
+    let mut bytes = [0u8; 16];
+    let ok = unsafe {
+        windows_sys::Win32::Security::Cryptography::ProcessPrng(bytes.as_mut_ptr(), bytes.len())
+    };
+    if ok == 0 {
+        return Err(RpcServiceConfigError::GenerationUnavailable);
+    }
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
@@ -975,6 +991,7 @@ mod agent_probe_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn status_auto_probes_local_layers_and_preserves_explicit_evidence() {
         let _config_guard = admission_fixtures::config_env_guard();
         let (_directory, service) = service();
