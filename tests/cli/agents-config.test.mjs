@@ -9,12 +9,35 @@ import { subagentsCommand } from '../../cli/commands/agents.mjs';
 import { parseSubagentsArgs } from '../../cli/commands/agents.mjs';
 import { configCommand, parseConfigArgs } from '../../cli/commands/config.mjs';
 import { readConfig } from '../../cli/config/read.mjs';
-import { lockHelperInvocation } from '../../cli/config/write.mjs';
+import { lockHelperInvocation, lockStrategy, restoreLockWithoutDisplacing } from '../../cli/config/write.mjs';
 import { parseSpawnArgs, prepareSpawnInput } from '../../cli/commands/tasks.mjs';
 import { productPaths, platform } from '../../cli/paths.mjs';
+
+// Windows productPaths reads %LOCALAPPDATA% from the environment, so a fixture
+// home alone would not isolate the product data tree. Pin one temp root for
+// this test process (node --test runs each file in its own process) so every
+// productPaths(home) call and spawned CLI child stays inside the fixture.
+if (process.platform === 'win32') {
+  process.env.LOCALAPPDATA = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-localappdata-'));
+}
 import { launchAgentPlist } from '../../cli/install/service-macos.mjs';
 
-function fixture() { const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-')); return { home, paths: productPaths(home) }; }
+function fixturePaths(home) {
+  // Windows product data lives under %LOCALAPPDATA%; pin it inside the
+  // fixture home so fixtures never share the real product tree.
+  const env = process.platform === 'win32'
+    ? { ...process.env, LOCALAPPDATA: path.join(home, 'AppData', 'Local') }
+    : process.env;
+  return productPaths(home, env);
+}
+
+function fixture() { const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-agents-')); return { home, paths: fixturePaths(home) }; }
+
+// launchd plist rendering has no win32 counterpart (SCM is the service
+// definition), and POSIX shebang fixtures cannot execute via CreateProcess.
+const win32PosixBackend = process.platform === 'win32'
+  ? 'win32 uses the SCM backend and PE images; launchd/POSIX-shebang fixtures are POSIX-only'
+  : false;
 
 test('persisted config version matrix is shared with Rust startup and RPC', () => {
   const { paths } = fixture();
@@ -44,7 +67,7 @@ test('persisted config version matrix is shared with Rust startup and RPC', () =
   }
 });
 
-test('legacy read preserves bytes and next locked write persists only canonical config', () => {
+test('legacy read preserves bytes and next locked write persists only canonical config', { skip: win32PosixBackend }, () => {
   const { paths } = fixture();
   fs.mkdirSync(path.dirname(paths.config), { recursive: true });
   const legacy = { schema_version: 1, revision: 7, default_agent: 'dsh', agents: {
@@ -70,7 +93,7 @@ test('legacy read preserves bytes and next locked write persists only canonical 
   assert.equal(fs.existsSync(path.join(paths.data, 'codex-homes.json')), false);
 });
 
-test('config writes regenerate an installed service definition and never create one', () => {
+test('config writes regenerate an installed service definition and never create one', { skip: win32PosixBackend }, () => {
   // The launchd plist is regenerated on macOS only; the Linux systemd unit is
   // owned by the S03 service backend, so a Linux config write must not emit a
   // plist to the unit path.
@@ -130,7 +153,7 @@ test('explicit dsh spawn support survives config validation', () => {
   assert.equal(readConfig(paths.config).subagents.dsh.spawn_supported, true);
 });
 
-test('LaunchAgent captures configured DSH runtime and home for GUI services', () => {
+test('LaunchAgent captures configured DSH runtime and home for GUI services', { skip: win32PosixBackend }, () => {
   const { paths } = fixture();
   configCommand(paths, { operation: 'set', patch: { subagents: { dsh: {
     runtime_path: '/opt/dsh/runtime with spaces', home: '/var/lib/dsh profile', profile: 'acp', version: '0.1.5-rc.1',
@@ -161,7 +184,7 @@ test('codex config persists runtime, home, and default model through every path'
   assert.throws(() => parseConfigArgs(['set', 'subagents.other.enabled', 'true']), (error) => error.code === 'INVALID_ARGUMENT');
 });
 
-test('runtime_process_model round-trips through schema, set, and unset', () => {
+test('runtime_process_model round-trips through schema, set, and unset', { skip: win32PosixBackend }, () => {
   const { paths } = fixture();
   fs.mkdirSync(path.dirname(paths.config), { recursive: true });
   // An absent key reads back the auto default and never lands on disk unknown.
@@ -193,7 +216,7 @@ test('runtime_process_model round-trips through schema, set, and unset', () => {
   assert.equal(readConfig(paths.config).runtime_process_model, 'auto');
 });
 
-test('LaunchAgent forwards the persisted Codex runtime and home exactly', () => {
+test('LaunchAgent forwards the persisted Codex runtime and home exactly', { skip: win32PosixBackend }, () => {
   const { paths } = fixture();
   configCommand(paths, { operation: 'set', patch: { subagents: { codex: {
     runtime_path: '/opt/homebrew/bin/codex with space', home: '/Users/fixture/.codex-multi & 2',
@@ -221,7 +244,7 @@ test('a zcode runtime_path is rejected explicitly instead of silently accepted (
   assert.equal(fs.readFileSync(paths.config, 'utf8'), JSON.stringify({ schema_version: 2, subagents: { zcode: { runtime_path: '/opt/zcode.cjs' } } }), 'the rejected config is never rewritten');
 });
 
-test('the service template stays adapter-neutral per configured adapter (AUD-005/D1)', () => {
+test('the service template stays adapter-neutral per configured adapter (AUD-005/D1)', { skip: win32PosixBackend }, () => {
   // DSH-only: the plist forwards the persisted DSH launch contract and omits
   // every Codex entry; the pinned ZCode runtime argument disappears with the
   // (here absent) ZCode installation instead of becoming a hard dependency.
@@ -349,6 +372,76 @@ test('config writer recovers a stale lock from a dead owner', () => {
   assert.equal(result.default_subagent, 'zcode');
 });
 
+test('two concurrent writers reclaim one stale lock and still serialize', {
+  // The exclusive-create reclaim backend is the win32 one; macOS/Linux keep
+  // the flock/lockf helper and its own coverage.
+  skip: process.platform !== 'win32' ? 'the exclusive-create lock backend is win32-only' : false,
+}, async () => {
+  const { paths } = fixture();
+  fs.mkdirSync(path.dirname(paths.config), { recursive: true });
+  fs.writeFileSync(paths.config, JSON.stringify({
+    schema_version: 2,
+    revision: 4,
+    default_subagent: null,
+    subagents: {
+      zcode: { enabled: true, spawn_supported: true, default_model: null },
+      dsh: { enabled: false, spawn_supported: false, default_model: null },
+    },
+  }));
+  // A pid that has already exited, so the seeded lock is deterministically
+  // reclaimable without relying on a magic number.
+  const deadPid = await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+    child.on('error', reject);
+    child.on('exit', () => resolve(child.pid));
+  });
+  fs.writeFileSync(`${paths.config}.lock`, `${JSON.stringify({ pid: deadPid, token: 'stale', started_at_ms: Date.now() })}\n`);
+
+  const script = `import { configCommand } from './cli/commands/config.mjs'; configCommand(${JSON.stringify(paths)}, JSON.parse(process.argv[1]));`;
+  const run = (patch) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, JSON.stringify({ operation: 'set', patch })], { cwd: path.resolve('.') });
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`writer exited ${code}`)));
+  });
+  await Promise.all([
+    run({ default_subagent: 'zcode', subagents: { zcode: { enabled: true, spawn_supported: true } } }),
+    run({ subagents: { dsh: { enabled: true } } }),
+  ]);
+  const final = readConfig(paths.config);
+  assert.equal(final.revision, 6);
+  assert.equal(final.default_subagent, 'zcode');
+  assert.equal(final.subagents.dsh.enabled, true);
+  assert.equal(fs.existsSync(`${paths.config}.lock`), false, 'the canonical lock is released');
+  assert.deepEqual(
+    fs.readdirSync(path.dirname(paths.config)).filter((name) => name.includes('.lock.stale-') || name.includes('.lock.release-')),
+    [],
+    'verified stale/release tombstones are removed',
+  );
+});
+
+test('lock restore is create-or-fail and never displaces a newer lock', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-lock-restore-'));
+  const saved = path.join(directory, 'saved.lock');
+  const target = path.join(directory, 'config.json.lock');
+  try {
+    fs.writeFileSync(saved, '{"pid":101,"token":"saved"}');
+    fs.writeFileSync(target, '{"pid":202,"token":"fresh"}');
+    // A concurrent writer already owns the canonical path: the restore must
+    // fail closed and leave both files untouched.
+    assert.equal(restoreLockWithoutDisplacing(saved, target), false);
+    assert.equal(fs.readFileSync(target, 'utf8'), '{"pid":202,"token":"fresh"}', 'the newer lock keeps the canonical path');
+    assert.equal(fs.existsSync(saved), true, 'the saved lock is not consumed on failure');
+    // With the path free, the hard-link restore succeeds and removes the
+    // temporary name.
+    fs.unlinkSync(target);
+    assert.equal(restoreLockWithoutDisplacing(saved, target), true);
+    assert.equal(fs.readFileSync(target, 'utf8'), '{"pid":101,"token":"saved"}');
+    assert.equal(fs.existsSync(saved), false, 'the temporary name is removed on success');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('config lock backend derives from the host OS with an equivalent contract', () => {
   // macOS lockf and Linux flock both run a command under an exclusive lock and
   // give up after a 2s wait; only the binary and its timeout flag differ, so
@@ -360,6 +453,15 @@ test('config lock backend derives from the host OS with an equivalent contract',
   assert.equal(linux.command, '/usr/bin/flock');
   assert.deepEqual(linux.args.slice(0, 2), ['-w', '2']);
   assert.deepEqual(darwin.args.slice(3), linux.args.slice(3), 'both run the same ready/held lock command');
+
+  // Windows has no lockf/flock: it locks by exclusive file creation and
+  // reclaims a dead owner's file (the stale-lock test above exercises that),
+  // keeping the same deadline/error contract.
+  assert.equal(lockStrategy('win32'), 'exclusive-create');
+  assert.equal(lockStrategy('linux'), 'helper');
+  const win32 = lockHelperInvocation('/tmp/lock', '/tmp/ready', 'win32');
+  assert.equal(win32.strategy, 'exclusive-create');
+  assert.equal(win32.lock, '/tmp/lock');
 
   // A real write on this host succeeds through that backend.
   const { paths } = fixture();
@@ -555,13 +657,13 @@ test('daemon startup timeout reaps the child, escalating ignored SIGTERM to SIGK
   }
 });
 
-test('fresh init and enable use PATH evidence, live admission, and restarted factories', { timeout: 60000 }, async (t) => {
+test('fresh init and enable use PATH evidence, live admission, and restarted factories', { timeout: 60000, skip: win32PosixBackend }, async (t) => {
   const { runInit } = await import('../../cli/install/init.mjs');
   const { callDaemon } = await import('../../cli/rpc.mjs');
   const { daemonHarness } = await import('../fixtures/restart-daemon.mjs');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'en-'));
   const home = path.join(root, 'h');
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   const bin = path.join(root, 'bin');
   const providerHome = path.join(root, 'provider');
   const workspace = path.join(root, 'repo');

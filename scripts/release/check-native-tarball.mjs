@@ -35,8 +35,10 @@ const dryRun = process.env.npm_config_dry_run === 'true';
 
 // A Windows host packs a CONTROLLED win32-x64 artifact (S03), not the
 // multi-platform release bundle: only the Windows payload is required and
-// checked.  macOS/Linux hosts keep the existing dual-platform release gate.
-const win32Controlled = nativePlatform() === null && process.platform === 'win32' && process.arch === 'x64';
+// checked. Windows npm publishing is intentionally not activated in S04, so
+// macOS/Linux hosts keep the existing dual-platform publish gate; the merged
+// release tarball is assembled there from the platform artifacts.
+const win32Controlled = process.platform === 'win32' && process.arch === 'x64';
 const hostPlatform = nativePlatform() ?? (win32Controlled ? 'win32-x64' : null);
 // Every platform the packed artifact carries, and the image identity each
 // payload must carry.  Keeping both lists here (rather than a fixed

@@ -27,6 +27,12 @@ import { callDaemon } from '../../cli/rpc.mjs';
 
 const LINUX_SEAM = { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'linux' };
 
+// These oracles exercise the Linux service backend and a POSIX-shebang daemon
+// fixture; both are POSIX-only and win32 uses SCM + PE images.
+const win32Posix = process.platform === 'win32'
+  ? 'the systemd backend and POSIX-shebang daemon fixtures are POSIX-only; win32 uses SCM'
+  : false;
+
 function fixtureHome(prefix = 'external-subagent-s05-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -61,7 +67,7 @@ test('zcode runtime discovery: explicit configuration, then the platform convent
   }
 });
 
-test('the systemd unit and the runtime report forward the discovered Linux runtime, or nothing', () => {
+test('the systemd unit and the runtime report forward the discovered Linux runtime, or nothing', { skip: win32Posix }, () => {
   const home = fixtureHome();
   try {
     const paths = productPaths(home, LINUX_SEAM);
@@ -136,7 +142,7 @@ async function bareDaemon(home) {
   };
 }
 
-test('Linux fail-closed: without runtimes no subagent enables and no config is written; spawn before enable refuses', { timeout: 60000 }, async (t) => {
+test('Linux fail-closed: without runtimes no subagent enables and no config is written; spawn before enable refuses', { timeout: 60000, skip: win32Posix }, async (t) => {
   const home = fixtureHome();
   const paths = productPaths(home);
   runInit({ paths, skipPayloadProbe: true, skipServiceStart: true });

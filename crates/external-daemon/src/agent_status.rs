@@ -1546,22 +1546,10 @@ fn discover_runtime(variable: &str, name: &str) -> Option<PathBuf> {
 }
 
 fn discover_on_path(search: Option<&std::ffi::OsStr>, name: &str) -> Option<PathBuf> {
-    env::split_paths(search?).find_map(|directory| {
-        let candidate = directory.join(name);
-        let candidate = std::path::absolute(candidate).ok()?;
-        let metadata = fs::metadata(&candidate).ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 {
-                return None;
-            }
-        }
-        Some(candidate)
-    })
+    // Host executable semantics live in one place: Unix checks the execute
+    // bit, Windows verifies a regular file with a PATHEXT extension and scans
+    // `name` + every extension in directory order.
+    crate::executable::discover_executable(search, name)
 }
 
 fn probe_local(path: Option<&Path>, scope: ProbeScope, checked_at_ms: u64) -> ScopeEvidence {
@@ -1792,7 +1780,7 @@ fn runtime_command(path: &Path, version_only: bool) -> Command {
         command.arg(path);
         command
     } else {
-        Command::new(path)
+        crate::executable::executable_command(path)
     };
     if version_only {
         command.arg("--version");
@@ -1894,9 +1882,39 @@ fn probe_zcode_hi(
 /// the default and the redirected layout. An exported
 /// `EXTERNAL_SUBAGENT_POLICY_VERIFIER` remains the explicit override.
 fn policy_verifier_candidates(home: &str) -> Vec<PathBuf> {
-    policy_verifier_candidates_for(home, env::var_os("XDG_DATA_HOME"))
+    #[cfg(target_os = "windows")]
+    {
+        policy_verifier_candidates_windows(home, env::var_os("LOCALAPPDATA"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        policy_verifier_candidates_for(home, env::var_os("XDG_DATA_HOME"))
+    }
 }
 
+/// Windows mirrors the CLI's `%LOCALAPPDATA%\<product>` data root: the verifier
+/// is staged beside the hook provenance. An exported absolute `LOCALAPPDATA`
+/// wins (it is the same environment rule `cli/paths.mjs` applies); otherwise
+/// the scope-home fallback `%USERPROFILE%\AppData\Local\<product>` applies.
+#[cfg(target_os = "windows")]
+fn policy_verifier_candidates_windows(
+    home: &str,
+    local_app_data: Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(local) = local_app_data.map(PathBuf::from) {
+        if local.is_absolute() {
+            candidates.push(local.join("external-subagent/external-subagent-policy-verifier"));
+        }
+    }
+    candidates.push(
+        Path::new(home)
+            .join("AppData/Local/external-subagent/external-subagent-policy-verifier"),
+    );
+    candidates
+}
+
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn policy_verifier_candidates_for(
     home: &str,
     xdg_data_home: Option<std::ffi::OsString>,
@@ -1924,6 +1942,21 @@ fn policy_verifier_candidates_for(
     }
 }
 
+/// The probe verifier is an extensionless Node script. Windows cannot execute
+/// it directly (no PATHEXT identity, no shebang support in CreateProcess), so
+/// it runs under the same `node` the CLI pins; POSIX keeps the direct exec.
+fn policy_verifier_command(verifier: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        if !crate::executable::pathext_contains(verifier) {
+            let mut command = Command::new("node");
+            command.arg(verifier);
+            return command;
+        }
+    }
+    crate::executable::executable_command(verifier)
+}
+
 fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Duration) -> bool {
     let Some(home) = scope.home.as_deref() else {
         return false;
@@ -1941,7 +1974,7 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Durati
     if !verifier.is_file() {
         return false;
     }
-    let mut command = Command::new(&verifier);
+    let mut command = policy_verifier_command(&verifier);
     command
         .args([
             "--workspace",
@@ -2958,7 +2991,7 @@ process.stdin.on('data', (chunk) => {
                 "/home/a/Library/Application Support/external-subagent/external-subagent-policy-verifier"
             )]
         );
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let fallback = PathBuf::from(
                 "/home/a/.local/share/external-subagent/external-subagent-policy-verifier",
@@ -4097,5 +4130,58 @@ setInterval(() => {}, 1000);
             pid,
             Instant::now() + Duration::from_secs(1)
         ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn batch_probe_commands_are_wrapped_with_cmd_exe() {
+        let command = runtime_command(Path::new(r"C:\tools\agent.cmd"), true);
+        assert_eq!(command.get_program(), "cmd.exe");
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec!["/D", "/C", r"C:\tools\agent.cmd", "--version"]
+        );
+
+        // The extensionless policy verifier is a Node script on Windows and
+        // must run under node rather than through CreateProcess.
+        let command = policy_verifier_command(Path::new(
+            r"C:\Users\a\AppData\Local\external-subagent\external-subagent-policy-verifier",
+        ));
+        assert_eq!(command.get_program(), "node");
+    }
+
+    #[test]
+    fn policy_verifier_candidates_follow_the_localappdata_root() {
+        let fallback = PathBuf::from(
+            "/home/a/AppData/Local/external-subagent/external-subagent-policy-verifier",
+        );
+        assert_eq!(
+            policy_verifier_candidates_windows("/home/a", None),
+            vec![fallback.clone()]
+        );
+        assert_eq!(
+            policy_verifier_candidates_windows("/home/a", Some("relative/data".into())),
+            vec![fallback.clone()]
+        );
+        assert_eq!(
+            policy_verifier_candidates_windows(
+                "/home/a",
+                Some("C:/Users/a/AppData/Local".into())
+            ),
+            vec![
+                PathBuf::from(
+                    "C:/Users/a/AppData/Local/external-subagent/external-subagent-policy-verifier"
+                ),
+                fallback
+            ]
+        );
     }
 }

@@ -6,6 +6,13 @@ import path from 'node:path';
 import test from 'node:test';
 import { diagnose, diagnosticLogs, fileArtifact, publicDaemonStatus } from '../../cli/main.mjs';
 
+// Windows has no filesystem Unix-domain sockets (the daemon uses a named
+// pipe) and /dev/null is a POSIX device path; these fixtures exercise the
+// Unix transport and are skipped on a win32 host.
+const win32Posix = process.platform === 'win32'
+  ? 'win32 has no filesystem Unix-domain socket or /dev/null fixture; the product uses \\\\.\\pipe\\external-subagent-daemon'
+  : false;
+
 function pathsFor(home) {
   return {
     home,
@@ -86,7 +93,7 @@ test('ordinary status projection keeps essential daemon state while verbose keep
   assert.ok(status.identity, 'projection must not mutate the RPC diagnostic view');
 });
 
-test('diagnose preserves daemon self identity and does not promote packaged facade to running', async () => {
+test('diagnose preserves daemon self identity and does not promote packaged facade to running', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-identity-'));
   const paths = pathsFor(home);
   const daemonIdentity = {
@@ -105,7 +112,7 @@ test('diagnose preserves daemon self identity and does not promote packaged faca
   });
 });
 
-test('agent diagnose reads only the public wait projection and exports a bounded report', async () => {
+test('agent diagnose reads only the public wait projection and exports a bounded report', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diagnose-agent-'));
   const paths = pathsFor(home);
   fs.mkdirSync(paths.logs, { recursive: true });
@@ -198,7 +205,7 @@ test('diagnostic marks an unfinished structured failure without publishing a par
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test('diagnostic export write failure is reported without throwing', async () => {
+test('diagnostic export write failure is reported without throwing', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diagnose-output-'));
   const paths = pathsFor(home);
   const report = await diagnose(paths, ['--output', '/dev/null/zcode-diagnose-output']);
@@ -226,7 +233,7 @@ function statusOrTask(request, agentId = '10000001') {
   } };
 }
 
-test('global diagnose queries the configured effective socket without model side effects', async () => {
+test('global diagnose queries the configured effective socket without model side effects', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-socket-'));
   const paths = pathsFor(home);
   const configured = { socket: path.join(home, 'configured.sock') };
@@ -251,7 +258,7 @@ test('global diagnose queries the configured effective socket without model side
   }
 });
 
-test('Agent A diagnostics survive Agent B displacing global tails and finite rotation', async () => {
+test('Agent A diagnostics survive Agent B displacing global tails and finite rotation', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-target-'));
   try {
     const paths = pathsFor(home);
@@ -295,7 +302,7 @@ test('Agent A diagnostics survive Agent B displacing global tails and finite rot
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test('missing agent and unreachable daemon have distinct diagnostic states', async () => {
+test('missing agent and unreachable daemon have distinct diagnostic states', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-missing-'));
   const paths = pathsFor(home);
   await withDaemon(paths, (request) => request.method === 'system_status' ? statusOrTask(request) : { outcome: 'error', error: { code: 'not_found', message: 'task not found' } }, async () => {
@@ -310,7 +317,7 @@ test('missing agent and unreachable daemon have distinct diagnostic states', asy
 });
 
 
-test('diagnostic output caps UTF-8 bytes and distinguishes unfinished target records', async () => {
+test('diagnostic output caps UTF-8 bytes and distinguishes unfinished target records', { skip: win32Posix }, async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-diag-utf8-'));
   const paths = pathsFor(home);
   fs.mkdirSync(paths.logs);

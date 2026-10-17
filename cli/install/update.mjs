@@ -5,7 +5,7 @@ import { atomicWrite, jsonBytes, sha256 } from '../fs-atomic.mjs';
 import { CliError } from '../errors.mjs';
 import { CLI_ENTRY_NAME, DAEMON_BIN_NAME, NATIVE_DIR_NAME } from '../constants.mjs';
 import { reconcileCodexHomes } from './reconcile.mjs';
-import { packageVersion, packageRoot } from './layout.mjs';
+import { nativeExecutableName, packageVersion, packageRoot } from './layout.mjs';
 import { loadUpdateState } from './recovery.mjs';
 import { normalizePayloadFiles, verifyPayload } from './payload.mjs';
 
@@ -55,7 +55,7 @@ function retainPayload(paths, candidateRoot, verified) {
     root,
     entry: path.join(root, CLI_ENTRY_NAME),
     entry_sha256: verified.stable.digest,
-    daemon_entry: path.join(root, DAEMON_BIN_NAME),
+    daemon_entry: path.join(root, nativeExecutableName(DAEMON_BIN_NAME, verified.payload.platform)),
     daemon_entry_sha256: verified.daemon.digest,
   };
   for (const [file, digest] of [[retained.daemon_entry, verified.daemon.digest], [retained.entry, verified.stable.digest]]) {
@@ -72,7 +72,7 @@ function verifyStableEntry(candidateRoot) {
   let stat;
   try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_ENTRY_MISSING', 'candidate stable entry is missing'); }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be a regular file');
-  if ((stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be executable');
+  if (process.platform !== 'win32' && (stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry must be executable');
   const resolved = fs.realpathSync(entry);
   if (resolved !== entry || !resolved.startsWith(`${root}${path.sep}`)) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate stable entry escapes candidate root');
   const digest = crypto.createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
@@ -83,14 +83,15 @@ function verifyStableEntry(candidateRoot) {
 // activation identity is the external-subagentd payload artifact whose digest
 // verifyPayload already checked against the release manifest.
 function verifyDaemonArtifact(candidateRoot, payload) {
-  const record = payload.files.find((file) => file.name === DAEMON_BIN_NAME);
+  const record = payload.files.find((file) => file.name === nativeExecutableName(DAEMON_BIN_NAME, payload.platform));
   if (!record) throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate payload does not carry the daemon artifact');
   const root = fs.realpathSync(candidateRoot);
   const entry = path.join(root, 'npm', NATIVE_DIR_NAME, payload.platform, record.name);
   let stat;
   try { stat = fs.lstatSync(entry); } catch { throw new CliError('PAYLOAD_DAEMON_MISSING', 'candidate daemon artifact is missing'); }
   if (!stat.isFile() || stat.isSymbolicLink()) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be a regular file');
-  if ((stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be executable');
+  // Windows has no POSIX execute bit (the PE loader ignores one).
+  if (process.platform !== 'win32' && (stat.mode & 0o111) === 0) throw new CliError('PAYLOAD_ENTRY_INVALID', 'candidate daemon artifact must be executable');
   const digest = crypto.createHash('sha256').update(fs.readFileSync(entry)).digest('hex');
   if (digest !== record.sha256) throw new CliError('PAYLOAD_DIGEST_MISMATCH', 'candidate daemon artifact does not match the verified payload digest');
   return { entry, digest };

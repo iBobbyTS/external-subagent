@@ -12,10 +12,18 @@ const cli = path.resolve('bin/external-subagent.mjs');
 const legacyShort = ['z', 'a', 's'].join('');
 const legacyCliName = ['zcode', 'as', 'subagent'].join('-');
 
-function run(home, args) {
+function run(home, args, extraEnv = {}) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32' },
+    env: {
+      ...process.env,
+      HOME: home,
+      // Windows product paths read %LOCALAPPDATA% from the environment; keep
+      // every product write inside this fixture home.
+      LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32',
+      ...extraEnv,
+    },
   });
 }
 
@@ -37,15 +45,68 @@ test('help identifies the public CLI as external-subagent', () => {
   assert.deepEqual(fs.readdirSync(home), []);
 });
 
-test('every business command is rejected structurally before filesystem side effects', () => {
-  const commands = ['init', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop', 'uninstall', 'purge', 'create', 'wait', 'list', 'send', 'respond', 'cancel', 'result', 'close'];
-  for (const command of commands) {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), `external-subagent-win-${command}-`));
-    const result = run(home, [command]);
-    assert.equal(result.status, 1, `${command}: ${result.stderr}`);
-    assert.equal(JSON.parse(result.stderr).error.code, 'UNSUPPORTED_PLATFORM');
-    assert.deepEqual(fs.readdirSync(home), []);
-  }
+test('every business command passes the win32 platform gate and reaches its structured failure', () => {
+  // S04 opens the gate: no command may answer UNSUPPORTED_PLATFORM anymore.
+  // Daemon-backed commands answer with a structured connection error; purge
+  // stops at its own confirmation guard. SCM lifecycle commands are covered by
+  // the injectable sc.exe seam in the dispatch test below, never by this test
+  // (that keeps an elevated CI runner from mutating the real SCM database).
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-win-commands-'));
+  const repository = path.join(home, 'repo');
+  fs.mkdirSync(repository, { recursive: true });
+  const agentId = 10_000_000;
+
+  const rejected = (args, code, env = {}) => {
+    const result = run(home, args, env);
+    assert.equal(result.status, 1, `${args.join(' ')}: ${result.stderr}`);
+    const error = JSON.parse(result.stderr).error;
+    assert.notEqual(error.code, 'UNSUPPORTED_PLATFORM', `${args[0]} must pass the platform gate`);
+    assert.equal(error.code, code, `${args.join(' ')}: ${error.message}`);
+  };
+
+  // Side-effect-free commands must run their real win32 path.
+  let result = run(home, ['init', '--dry-run']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).plan[0].id, 'verify-payload');
+
+  result = run(home, ['status']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).daemon_error.code, 'SOCKET_UNAVAILABLE');
+
+  result = run(home, ['diagnose']);
+  assert.equal(result.status, 0, result.stderr);
+
+  result = run(home, ['backup', '--output', path.join(home, 'backup')]);
+  assert.equal(result.status, 0, result.stderr);
+  result = run(home, ['restore', '--input', path.join(home, 'backup')]);
+  assert.equal(result.status, 0, result.stderr);
+
+  // purge passes the platform gate and fails on its own confirmation guard
+  // before any service or data mutation.
+  rejected(['purge'], 'CONFIRMATION_REQUIRED');
+
+  // SCM-backed commands (start/stop/uninstall/purge) are exercised through the
+  // injectable `sc.exe` seam in the dispatch test below and in the S03
+  // service-windows suite: running them here would mutate a real SCM database
+  // on an elevated CI runner. The platform gate itself is shared and covered
+  // by every command above and below.
+
+  // Daemon-backed commands answer with the structured connection error.
+  const daemonCommands = [
+    ['create', '--json', JSON.stringify({ repository, prompt: 'no daemon' })],
+    ['wait', '--json', JSON.stringify({ agent_id: agentId, wait_time: 0 })],
+    ['list', '--json', JSON.stringify({ repository })],
+    ['send', '--json', JSON.stringify({ agent_id: agentId, mode: 'queue', content: 'no daemon' })],
+    ['respond', '--json', JSON.stringify({ agent_id: agentId, request_id: 'req-1', decision: 'allow' })],
+    ['cancel', '--json', JSON.stringify({ agent_id: agentId })],
+    ['result', '--json', JSON.stringify({ agent_id: agentId })],
+    ['close', '--json', JSON.stringify({ agent_id: agentId })],
+  ];
+  for (const args of daemonCommands) rejected(args, 'SOCKET_UNAVAILABLE');
+
+  // The probe command layer reaches the daemon wire method (agent-probe)
+  // instead of being rejected before connecting.
+  rejected(['subagents', 'probe', 'codex', '--hi'], 'SOCKET_UNAVAILABLE');
 });
 
 test('Windows productPaths derives all 12 frozen fields and honors LOCALAPPDATA injection and fallback', async () => {

@@ -64,6 +64,9 @@ export function restoreData(source, paths = productPaths()) {
 }
 
 function removeOne(target) {
+  // Windows has no file-based service definition (paths.launchAgent is null):
+  // the SCM registration is the definition and bootout already removed it.
+  if (typeof target !== 'string' || target === '') return false;
   try {
     const stat = fs.lstatSync(target);
     if (stat.isDirectory() && !stat.isSymbolicLink()) fs.rmSync(target, { recursive: true });
@@ -88,7 +91,10 @@ function removeOne(target) {
 // Linux reports the same removal as `removed_service_definition`.
 export function uninstall(paths = productPaths(), options = {}) {
   const macos = platform() === 'darwin';
-  const service = bootoutService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl });
+  // Windows has no process.getuid(); every backend treats an undefined uid as
+  // "not applicable", so resolve it only where the host defines it.
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+  const service = bootoutService(paths, currentUid, { launchctl: options.launchctl, systemctl: options.systemctl, sc: options.sc });
   const removed = removeOne(paths.launchAgent);
   return {
     service_stopped: true,

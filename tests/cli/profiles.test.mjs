@@ -17,6 +17,12 @@ import {
   scanProfileJson,
 } from '../../cli/commands/tasks.mjs';
 
+// Windows has no filesystem Unix-domain sockets; the profile CLI wire tests
+// bind a *.sock fixture. The product's win32 transport is the named pipe.
+const win32Sockets = process.platform === 'win32'
+  ? 'win32 cannot bind a filesystem *.sock fixture; the product uses \\\\.\\pipe\\external-subagent-daemon'
+  : false;
+
 const CORPUS_DIR = path.resolve(import.meta.dirname, 'profiles-corpus');
 const CLI_BIN = path.resolve(import.meta.dirname, '../../bin/external-subagent.mjs');
 const NO_ENV = Object.freeze({});
@@ -128,7 +134,7 @@ test('AC1: parseSpawnArgs parses --profile and supports --write-manifest', () =>
   assert.equal(Object.hasOwn(parsed, 'effort'), false);
 });
 
-test('AC1: CLI spawn wire forwards top-level profile and omits permission_mode from manifest', async () => {
+test('AC1: CLI spawn wire forwards top-level profile and omits permission_mode from manifest', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `cli-spawn-profile-${process.pid}-${Date.now()}.sock`);
   const seenRequests = [];
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -427,7 +433,7 @@ test('AC3: directory resolution mirrors daemon env priority', () => {
 // AC4: 回归 (Byte-for-byte JSON shape equivalence without --profile)
 // ---------------------------------------------------------------------------
 
-test('AC4: CLI spawn wire without profile is byte-for-byte identical in JSON keys and values', async () => {
+test('AC4: CLI spawn wire without profile is byte-for-byte identical in JSON keys and values', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `cli-spawn-regress-${process.pid}-${Date.now()}.sock`);
   let receivedJson = '';
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -910,7 +916,7 @@ test('fix6: profiles directory follows daemon var_os presence, not truthiness', 
   fs.rmSync(paths.home, { recursive: true, force: true });
 });
 
-test('fix7: real CLI spawn process preserves >512B ASCII and Unicode daemon error lists', async () => {
+test('fix7: real CLI spawn process preserves >512B ASCII and Unicode daemon error lists', { skip: win32Sockets }, async () => {
   const asciiNames = Array.from({ length: 40 }, (_, i) => `standard_ascii_profile_item_${String(i).padStart(3, '0')}`).sort();
   const asciiMessage = `profile 'missing' not found; available profiles: [${asciiNames.join(', ')}]`;
   assert.ok(Buffer.byteLength(asciiMessage, 'utf8') > 512);

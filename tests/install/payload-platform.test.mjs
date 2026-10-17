@@ -120,10 +120,11 @@ function errorCode(fn) {
 }
 
 test('nativePlatform maps the supported tuples and rejects the rest', () => {
-  assert.deepEqual([...NATIVE_PLATFORMS], ['darwin-arm64', 'linux-x64']);
+  assert.deepEqual([...NATIVE_PLATFORMS], ['darwin-arm64', 'linux-x64', 'win32-x64']);
   assert.equal(nativePlatform('darwin', 'arm64'), 'darwin-arm64');
   assert.equal(nativePlatform('linux', 'x64'), 'linux-x64');
-  for (const [platform, arch] of [['darwin', 'x64'], ['linux', 'arm64'], ['win32', 'x64'], ['freebsd', 'x64']]) {
+  assert.equal(nativePlatform('win32', 'x64'), 'win32-x64');
+  for (const [platform, arch] of [['darwin', 'x64'], ['linux', 'arm64'], ['freebsd', 'x64']]) {
     assert.equal(nativePlatform(platform, arch), null, `${platform}-${arch} must have no payload`);
   }
 });
@@ -244,7 +245,7 @@ test('the default unsupported message lists only the release-supported tuples', 
   let error;
   try { verifyPayload(); } catch (caught) { error = caught; }
   assert.equal(error.code, 'UNSUPPORTED_PAYLOAD_PLATFORM');
-  assert.equal(error.message, `no native payload exists for ${process.platform}-${process.arch}; supported platforms: darwin-arm64, linux-x64`);
+  assert.equal(error.message, `no native payload exists for ${process.platform}-${process.arch}; supported platforms: darwin-arm64, linux-x64, win32-x64`);
 });
 
 test('the MCP facade shim resolves the payload directory for each platform', () => {
@@ -264,23 +265,30 @@ test('the MCP facade shim resolves the payload directory for each platform', () 
     mcpFacadePath('darwin-arm64', true).endsWith(path.join('npm', 'native-debug', 'darwin-arm64', 'external-subagent-debug-mcp')),
     'darwin-arm64 debug payload (debug shim re-entry)',
   );
-  const hostPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;
   assert.ok(
-    mcpFacadePath().endsWith(path.join('npm', 'native', hostPlatform, 'external-subagent-mcp')),
+    mcpFacadePath('win32-x64', false).endsWith(path.join('npm', 'native', 'win32-x64', 'external-subagent-mcp.exe')),
+    'win32-x64 release payload carries the PE suffix',
+  );
+  const hostPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;
+  const hostSuffix = hostPlatform.startsWith('win32-') ? '.exe' : '';
+  assert.ok(
+    mcpFacadePath().endsWith(path.join('npm', 'native', hostPlatform, `external-subagent-mcp${hostSuffix}`)),
     `host default resolves ${hostPlatform}`,
   );
 });
 
-test('win32-x64 is verifiable without a POSIX mode while NATIVE_PLATFORMS stays closed', () => {
+test('win32-x64 is a first-class payload verified without a POSIX mode', () => {
   const { root } = makeRoot('win32-x64', { mode: 0o644 });
   try {
     const result = verifyPayload({ root, platform: 'win32-x64' });
     assert.equal(result.status, 'verified');
     assert.equal(result.platform, 'win32-x64');
     assert.deepEqual(result.files.map((file) => file.mode), [null, null]);
-    // The distribution gate remains S04-owned: nativePlatform still has no
-    // win32 tuple, and win32-x64 is reachable only through an explicit option.
-    assert.equal(nativePlatform('win32', 'x64'), null);
+    // The distribution gate is open: win32-x64 is a first-class native tuple
+    // resolved by nativePlatform and NATIVE_PLATFORMS, not an explicit-only
+    // controlled artifact.
+    assert.equal(nativePlatform('win32', 'x64'), 'win32-x64');
+    assert.ok(nativePayloadDir('win32-x64').endsWith(path.join('npm', 'native', 'win32-x64')));
   } finally { cleanup(root); }
 });
 

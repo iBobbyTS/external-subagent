@@ -133,20 +133,9 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
                 .as_deref()
                 .map(Path::new)
                 .is_some_and(|path| {
-                    path.is_absolute()
-                        && fs::metadata(path).is_ok_and(|m| {
-                            m.is_file() && {
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    m.permissions().mode() & 0o111 != 0
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    true
-                                }
-                            }
-                        })
+                    // Host executable semantics: the Unix execute bit, or the
+                    // Windows PATHEXT extension gate over a regular file.
+                    path.is_absolute() && crate::executable::is_executable_file(path)
                 });
     }
     if agent == "codex" {
@@ -160,20 +149,9 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
                 .as_deref()
                 .map(Path::new)
                 .is_some_and(|path| {
-                    path.is_absolute()
-                        && fs::metadata(path).is_ok_and(|m| {
-                            m.is_file() && {
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    m.permissions().mode() & 0o111 != 0
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    true
-                                }
-                            }
-                        })
+                    // Host executable semantics: the Unix execute bit, or the
+                    // Windows PATHEXT extension gate over a regular file.
+                    path.is_absolute() && crate::executable::is_executable_file(path)
                 });
     }
     if agent == "agy" {
@@ -187,20 +165,9 @@ fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
                 .as_deref()
                 .map(Path::new)
                 .is_some_and(|path| {
-                    path.is_absolute()
-                        && fs::metadata(path).is_ok_and(|m| {
-                            m.is_file() && {
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    m.permissions().mode() & 0o111 != 0
-                                }
-                                #[cfg(not(unix))]
-                                {
-                                    true
-                                }
-                            }
-                        })
+                    // Host executable semantics: the Unix execute bit, or the
+                    // Windows PATHEXT extension gate over a regular file.
+                    path.is_absolute() && crate::executable::is_executable_file(path)
                 });
     }
     entry.enabled && entry.spawn_supported
@@ -1089,17 +1056,20 @@ mod admission_tests {
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentUnsupported
         );
-        let runtime = tempfile::NamedTempFile::new().unwrap();
+        // The persisted runtime must carry a PATHEXT extension on Windows.
+        let runtime_dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_dir.path().join("dsh-runtime.exe");
+        std::fs::write(&runtime, b"runtime").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut permissions = runtime.as_file().metadata().unwrap().permissions();
+            let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
             permissions.set_mode(0o755);
-            std::fs::set_permissions(runtime.path(), permissions).unwrap();
+            std::fs::set_permissions(&runtime, permissions).unwrap();
         }
-        env::set_var("DSH_RUNTIME_PATH", runtime.path());
+        env::set_var("DSH_RUNTIME_PATH", &runtime);
         config.subagents.get_mut("dsh").unwrap().runtime_path =
-            Some(runtime.path().to_string_lossy().into_owned());
+            Some(runtime.to_string_lossy().into_owned());
         let identity = resolve_admission(&input, &config).unwrap();
         assert_eq!(identity.agent, "dsh");
         assert_eq!(
@@ -1137,7 +1107,7 @@ mod admission_tests {
     #[test]
     fn dsh_admission_rejects_incomplete_persisted_identity() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = directory.path().join("runtime");
+        let runtime = directory.path().join("runtime.exe");
         std::fs::write(&runtime, b"runtime").unwrap();
         #[cfg(unix)]
         {
@@ -1176,7 +1146,7 @@ mod admission_tests {
     }
 
     fn codex_gate_config(directory: &std::path::Path) -> AgentConfigSnapshot {
-        let runtime = directory.join("codex-runtime");
+        let runtime = directory.join("codex-runtime.exe");
         std::fs::write(&runtime, b"runtime").unwrap();
         #[cfg(unix)]
         {
@@ -1383,7 +1353,7 @@ mod admission_tests {
     }
 
     fn agy_gate_config(directory: &std::path::Path) -> AgentConfigSnapshot {
-        let runtime = directory.join("agy-runtime");
+        let runtime = directory.join("agy-runtime.exe");
         std::fs::write(&runtime, b"runtime").unwrap();
         #[cfg(unix)]
         {
@@ -2129,7 +2099,7 @@ pub(crate) mod admission_fixtures {
     /// profile, version, and an executable absolute runtime).
     pub(crate) fn gated_dsh_config(default_model: Option<&str>) -> tempfile::TempDir {
         let root = admission_root("s04a-admission-config-");
-        let runtime = root.path().join("dsh-runtime");
+        let runtime = root.path().join("dsh-runtime.exe");
         fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {
@@ -2503,7 +2473,7 @@ mod admission_policy_tests {
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         config["subagents"]["codex"] = serde_json::json!({
             "enabled": true, "spawn_supported": true,
-            "runtime_path": root.path().join("dsh-runtime"),
+            "runtime_path": root.path().join("dsh-runtime.exe"),
             "home": root.path().join("codex-home"), "default_model": "gpt-5.6-terra"
         });
         config["default_subagent"] = serde_json::json!("codex");

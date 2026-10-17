@@ -12,6 +12,19 @@ import { runInit } from '../../cli/install/init.mjs';
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths, platform } from '../../cli/paths.mjs';
 
+// Windows product data lives under %LOCALAPPDATA%; pin it inside each fixture
+// home so no test reads or writes the real product tree.
+const win32PosixBackend = process.platform === 'win32'
+  ? 'win32 uses the SCM service backend; launchd/systemd definition fixtures are POSIX-only'
+  : false;
+
+function fixturePaths(home) {
+  const env = process.platform === 'win32'
+    ? { ...process.env, LOCALAPPDATA: path.join(home, 'AppData', 'Local') }
+    : process.env;
+  return productPaths(home, env);
+}
+
 // The service-removal confirmation behaviour is owned per backend: launchd
 // bootout/removal on macOS, systemctl --user disable --now plus the bounded
 // inactive confirmation on Linux (its seam twins live in
@@ -56,7 +69,7 @@ function recordingSystemd({ loaded = false, active = false } = {}) {
 
 test('backup verifies bytes and restore replaces product data', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-data-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.writeFileSync(path.join(paths.data, 'state.bin'), Buffer.from([0, 1, 2, 255]));
   const backup = path.join(home, 'backup');
@@ -68,7 +81,7 @@ test('backup verifies bytes and restore replaces product data', () => {
 
 test('restore detects corrupted backup before replacing data', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-corrupt-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.writeFileSync(path.join(paths.data, 'state'), 'original');
   const backup = path.join(home, 'backup');
@@ -81,7 +94,7 @@ test('restore detects corrupted backup before replacing data', () => {
 
 test('backup rejects a destination inside product data before creating files', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-nested-backup-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.writeFileSync(path.join(paths.data, 'state'), 'original');
   const destination = path.join(paths.data, 'backup');
@@ -91,9 +104,9 @@ test('backup rejects a destination inside product data before creating files', (
   assert.equal(fs.readFileSync(path.join(paths.data, 'state'), 'utf8'), 'original');
 });
 
-test('uninstall retains data, while purge is an explicit separate operation', () => {
+test('uninstall retains data, while purge is an explicit separate operation', { skip: win32PosixBackend }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-retain-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
@@ -112,7 +125,7 @@ test('uninstall retains data, while purge is an explicit separate operation', ()
 
 test('uninstall boots out the loaded ES service before removing its definition', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
@@ -130,7 +143,7 @@ test('uninstall boots out the loaded ES service before removing its definition',
 // The systemd twin of the three launchd uninstall oracles above.
 test('uninstall disables the loaded ES unit before removing its definition', { skip: !linux }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-linux-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, '[Unit]\n');
@@ -147,7 +160,7 @@ test('uninstall disables the loaded ES unit before removing its definition', { s
 
 test('uninstall reports a stop it cannot complete instead of removing the definition', { skip: !linux }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-stuck-linux-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, '[Unit]\n');
   // A unit that stays active after disable --now: the command must fail loudly
@@ -164,7 +177,7 @@ test('uninstall reports a stop it cannot complete instead of removing the defini
 
 test('product uninstall keeps every registry claim when the systemd stop cannot complete', { skip: !linux }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-stuck-linux-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, '[Unit]\n');
@@ -204,7 +217,7 @@ test('product uninstall keeps every registry claim when the systemd stop cannot 
 
 test('uninstall reports a bootout it cannot complete instead of removing the definition', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unload-stuck-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
   // A job that stays registered after bootout: the command must fail loudly
@@ -221,7 +234,7 @@ test('uninstall reports a bootout it cannot complete instead of removing the def
 
 test('product uninstall keeps every registry claim when the bootout cannot complete', { skip: !macos }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-stuck-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
   fs.writeFileSync(paths.launchAgent, 'plist');
@@ -262,9 +275,9 @@ test('product uninstall keeps every registry claim when the bootout cannot compl
   }
 });
 
-test('product uninstall removes the service first, then releases every claim while retaining data', () => {
+test('product uninstall removes the service first, then releases every claim while retaining data', { skip: win32PosixBackend }, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-uninstall-claims-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   fs.mkdirSync(paths.data, { recursive: true });
   fs.writeFileSync(path.join(paths.data, 'install-state.json'), 'state');
   fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
@@ -399,7 +412,7 @@ function recordingBackend({ loaded = false } = {}) {
 
 function initFixture({ failStep = 'publish-active-payload' } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-service-'));
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   // AUD-005/D1: init installs the standalone service only, so the injected
   // post-bootstrap failure lives at the final baseline-publication step (the
   // payload verifies from the repo's staged native tree); no host binding and
@@ -412,7 +425,7 @@ function initFixture({ failStep = 'publish-active-payload' } = {}) {
   return { home, paths, run };
 }
 
-test('a failed init boots back out the service that init itself loaded', () => {
+test('a failed init boots back out the service that init itself loaded', { skip: win32PosixBackend }, () => {
   const { paths, run } = initFixture();
   const backend = recordingBackend();
   try {
@@ -430,7 +443,7 @@ test('a failed init boots back out the service that init itself loaded', () => {
   }
 });
 
-test('a failed init never boots out a service that was already loaded before it', () => {
+test('a failed init never boots out a service that was already loaded before it', { skip: win32PosixBackend }, () => {
   const { paths, run } = initFixture();
   const backend = recordingBackend({ loaded: true });
   try {

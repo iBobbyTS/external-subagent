@@ -16,9 +16,17 @@ export const PLUGIN_NAME = PRODUCT_NAME;
 // payload.mjs all key off the same value.  A tuple outside this table has no
 // payload and is rejected by the installer, never silently downgraded.
 // NATIVE_PLATFORM stays the reference platform (the released macOS identity).
-export const NATIVE_PLATFORMS = Object.freeze(['darwin-arm64', 'linux-x64']);
+export const NATIVE_PLATFORMS = Object.freeze(['darwin-arm64', 'linux-x64', 'win32-x64']);
 export const NATIVE_PLATFORM = NATIVE_PLATFORMS[0];
 export const NATIVE_BINARIES = Object.freeze([DAEMON_BIN_NAME, MCP_BIN_NAME]);
+
+// Payload artifacts are named with their host executable suffix. The staged
+// Windows payload is the same product binaries with `.exe`; every consumer
+// (verification, retention, service definition, MCP facade) resolves names
+// through this one helper so a tuple never mixes stem and extension.
+export function nativeExecutableName(name, platform = nativePlatform()) {
+  return typeof platform === 'string' && platform.startsWith('win32-') ? `${name}.exe` : name;
+}
 
 export function packageRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -37,7 +45,7 @@ export function nativePayloadDir(platform = nativePlatform()) {
 export function nativeBinary(name, platform = nativePlatform()) {
   const dir = nativePayloadDir(platform);
   if (!dir || !NATIVE_BINARIES.includes(name)) return null;
-  return path.join(dir, name);
+  return path.join(dir, nativeExecutableName(name, platform));
 }
 
 export function payloadManifestPath(platform = nativePlatform()) {

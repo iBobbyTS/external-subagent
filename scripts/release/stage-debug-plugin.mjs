@@ -9,6 +9,7 @@
 // build-native-payload.mjs --variant debug.
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const DEBUG_PLUGIN_NAME = 'external-subagent-debug';
 const SOURCE_PLUGIN_NAME = 'external-subagent';
@@ -43,13 +44,18 @@ export function stageDebugPlugin(packageRoot) {
   fs.renameSync(path.join(target, 'skills', SOURCE_PLUGIN_NAME), path.join(target, 'skills', DEBUG_PLUGIN_NAME));
   const skillPath = path.join(target, 'skills', DEBUG_PLUGIN_NAME, 'SKILL.md');
   const skill = fs.readFileSync(skillPath, 'utf8');
-  const rewritten = skill.replace(`name: ${SOURCE_PLUGIN_NAME}\n`, `name: ${DEBUG_PLUGIN_NAME}\n`, 1);
+  // Preserve the source file's line endings: a Windows checkout has CRLF and
+  // the debug rename must not normalize the whole document.
+  const rewritten = skill.replace(
+    new RegExp(`name: ${SOURCE_PLUGIN_NAME}(\\r?\\n)`, 'u'),
+    (_, newline) => `name: ${DEBUG_PLUGIN_NAME}${newline}`,
+  );
   fs.writeFileSync(skillPath, rewritten);
   return target;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const packageRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..');
+  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
   try {
     const target = stageDebugPlugin(packageRoot);
     process.stdout.write(`debug plugin source staged: ${target}\n`);

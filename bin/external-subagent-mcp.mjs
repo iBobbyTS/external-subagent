@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { nativePlatform } from '../cli/install/layout.mjs';
+import { nativeExecutableName, nativePlatform } from '../cli/install/layout.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -18,8 +18,9 @@ export function mcpFacadePath(
   platform = nativePlatform() ?? `${process.platform}-${process.arch}`,
   debug = process.env.EXTERNAL_SUBAGENT_VARIANT === 'debug',
 ) {
+  const name = debug ? 'external-subagent-debug-mcp' : 'external-subagent-mcp';
   return path.join(packageRoot, 'npm', debug ? 'native-debug' : 'native', platform,
-    debug ? 'external-subagent-debug-mcp' : 'external-subagent-mcp');
+    nativeExecutableName(name, platform));
 }
 
 export function runMcpFacade() {

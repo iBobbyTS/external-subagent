@@ -344,6 +344,12 @@ function rustExtension(fileName) {
 // by `profilesDir` (an empty directory yields the bare name).
 function joinChild(dir, name) {
   if (dir === '') return name;
+  if (process.platform === 'win32') {
+    // Rust Path::join uses '\' on Windows and treats both separators as
+    // already-separated components.
+    if (dir.endsWith('/') || dir.endsWith('\\')) return dir + name;
+    return `${dir}\\${name}`;
+  }
   if (dir.endsWith('/')) return dir + name;
   return `${dir}/${name}`;
 }

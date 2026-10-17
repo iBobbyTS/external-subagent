@@ -35,6 +35,11 @@ import { bootstrapService, bootoutService, installServiceDefinition, serviceRegi
 // activation) are additionally gated to a real Linux host.
 const LINUX = { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'linux' };
 const linuxHost = platform() === 'linux';
+
+// The systemd user-service backend is POSIX-only; win32 ships the SCM backend.
+const win32Posix = process.platform === 'win32'
+  ? 'the systemd user-service backend is POSIX-only; win32 uses SCM (S03)'
+  : false;
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const digest = (file) => sha256(fs.readFileSync(file));
 
@@ -86,7 +91,7 @@ function writeAgentConfig(paths, revision = 5) {
   }));
 }
 
-test('the systemd unit mirrors the plist parameterization one-to-one', () => {
+test('the systemd unit mirrors the plist parameterization one-to-one', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     writeAgentConfig(paths, 5);
@@ -121,7 +126,7 @@ test('the systemd unit mirrors the plist parameterization one-to-one', () => {
   }
 });
 
-test('unit generation escapes spaces, quotes, dollars, and percents in paths', () => {
+test('unit generation escapes spaces, quotes, dollars, and percents in paths', { skip: win32Posix }, () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-escape-'));
   try {
     const odd = path.join(base, '安 装目录 $x %h');
@@ -146,7 +151,7 @@ test('unit generation escapes spaces, quotes, dollars, and percents in paths', (
   }
 });
 
-test('environment values keep dollars literal and escape percent-specifiers, quotes, and backslashes', () => {
+test('environment values keep dollars literal and escape percent-specifiers, quotes, and backslashes', { skip: win32Posix }, () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-env-escape-'));
   try {
     // Hostile-but-legal config values exercising every character whose
@@ -198,7 +203,7 @@ test('environment values keep dollars literal and escape percent-specifiers, quo
   }
 });
 
-test('newline-bearing values are refused loudly instead of injecting unit directives', () => {
+test('newline-bearing values are refused loudly instead of injecting unit directives', { skip: win32Posix }, () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-newline-'));
   try {
     const paths = {
@@ -258,7 +263,7 @@ test('newline-bearing values are refused loudly instead of injecting unit direct
   }
 });
 
-test('an absent config forwards the default revision, never a null one', () => {
+test('an absent config forwards the default revision, never a null one', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     // readConfig falls back to the schema default (revision 0), the exact
@@ -271,7 +276,7 @@ test('an absent config forwards the default revision, never a null one', () => {
   }
 });
 
-test('installServiceUnit writes the 0600 unit into the XDG config tree', () => {
+test('installServiceUnit writes the 0600 unit into the XDG config tree', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     writeAgentConfig(paths);
@@ -287,7 +292,7 @@ test('installServiceUnit writes the 0600 unit into the XDG config tree', () => {
   }
 });
 
-test('bootstrap reports already-loaded with the real state and never enables a live unit', () => {
+test('bootstrap reports already-loaded with the real state and never enables a live unit', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     const control = recordingSystemd({ loaded: true, active: true, pid: 4242 });
@@ -304,7 +309,7 @@ test('bootstrap reports already-loaded with the real state and never enables a l
   }
 });
 
-test('bootstrap reloads the manager and enables the unit, and resolves a lost race through the probe', () => {
+test('bootstrap reloads the manager and enables the unit, and resolves a lost race through the probe', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     const control = recordingSystemd();
@@ -342,7 +347,7 @@ test('bootstrap reloads the manager and enables the unit, and resolves a lost ra
   }
 });
 
-test('stop confirms the unit is inactive before returning and stays idempotent', () => {
+test('stop confirms the unit is inactive before returning and stays idempotent', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     const running = recordingSystemd({ loaded: true, active: true });
@@ -362,7 +367,7 @@ test('stop confirms the unit is inactive before returning and stays idempotent',
   }
 });
 
-test('a stop whose unit stays active fails bounded instead of pretending removal', () => {
+test('a stop whose unit stays active fails bounded instead of pretending removal', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     const stuck = (args) => {
@@ -379,7 +384,7 @@ test('a stop whose unit stays active fails bounded instead of pretending removal
   }
 });
 
-test('a stop racing an external removal treats the gone unit as stopped', () => {
+test('a stop racing an external removal treats the gone unit as stopped', { skip: win32Posix }, () => {
   const { home, paths } = servicePaths();
   try {
     let seen = false;
@@ -398,7 +403,7 @@ test('a stop racing an external removal treats the gone unit as stopped', () => 
   }
 });
 
-test('the status view reports a failed unit as failed, never healthy', () => {
+test('the status view reports a failed unit as failed, never healthy', { skip: win32Posix }, () => {
   const failed = (args) => {
     assert.equal(args[0], 'show');
     return { action: 'show', status: 0, stdout: 'LoadState=loaded\nActiveState=failed\nSubState=dead\nMainPID=0\n' };
@@ -409,7 +414,7 @@ test('the status view reports a failed unit as failed, never healthy', () => {
   assert.equal(status.pid, null);
 });
 
-test('the systemd backend stays neutralized under its test seam', () => {
+test('the systemd backend stays neutralized under its test seam', { skip: win32Posix }, () => {
   const previous = process.env.EXTERNAL_SUBAGENT_TEST_NO_SYSTEMCTL;
   process.env.EXTERNAL_SUBAGENT_TEST_NO_SYSTEMCTL = '1';
   try {
@@ -427,7 +432,7 @@ test('the systemd backend stays neutralized under its test seam', () => {
   }
 });
 
-test('a missing user session fails control with the linger hint and degrades the read-only view', () => {
+test('a missing user session fails control with the linger hint and degrades the read-only view', { skip: win32Posix }, () => {
   const saved = { XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS, EXTERNAL_SUBAGENT_TEST_NO_SYSTEMCTL: process.env.EXTERNAL_SUBAGENT_TEST_NO_SYSTEMCTL };
   delete process.env.XDG_RUNTIME_DIR;
   delete process.env.DBUS_SESSION_BUS_ADDRESS;
@@ -456,7 +461,7 @@ test('a missing user session fails control with the linger hint and degrades the
   }
 });
 
-test('the Linux fixed PATH resolves systemctl and stays platform-trueful', () => {
+test('the Linux fixed PATH resolves systemctl and stays platform-trueful', { skip: win32Posix }, () => {
   assert.equal(SYSTEMD_FIXED_PATH.includes('/opt/homebrew'), false);
   // The service PATH is the fixed system set plus the interpreter directory of
   // the node that rendered the unit, so a Node-launcher Codex runtime resolves

@@ -28,11 +28,16 @@ export function localInstallStatus(paths, { verbose = false } = {}) {
     ? payload
     : { status: payload.status, platform: payload.platform, version: payload.version };
   // The service-definition path is the macOS LaunchAgent plist or the Linux
-  // systemd user unit (paths.mjs).  The reported field stays platform-truthful
+  // systemd user unit (paths.mjs).  Windows has no file-based definition (the
+  // SCM registration is the definition), so `launchAgent` is null there and
+  // must not reach fs.existsSync. The reported field stays platform-truthful
   // so a Linux install never reads as a launchd agent.
-  const serviceDefinition = platform() === 'darwin'
+  const currentPlatform = platform();
+  const serviceDefinition = currentPlatform === 'darwin'
     ? { launch_agent: fs.existsSync(paths.launchAgent) }
-    : { service_definition: fs.existsSync(paths.launchAgent) };
+    : currentPlatform === 'win32'
+      ? { service_definition: false }
+      : { service_definition: fs.existsSync(paths.launchAgent) };
   return {
     installed: fs.existsSync(paths.state),
     ...serviceDefinition,

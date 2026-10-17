@@ -1352,7 +1352,7 @@ mod contract_default_tests {
         // codex entry stays disabled for the disabled-agent projection.
         let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
         let config_root = tempfile::tempdir().unwrap();
-        let runtime = config_root.path().join("dsh-runtime");
+        let runtime = config_root.path().join("dsh-runtime.exe");
         std::fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
         {

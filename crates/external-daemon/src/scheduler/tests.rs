@@ -3308,6 +3308,23 @@ mod turn_adjudication_tests {
         }
     }
 
+    /// The terminal result is persisted immediately before `reap_task`, so a
+    /// scheduler thread descheduled between the two lets `await_result_within`
+    /// return while `reaped_at` is still unset. Poll the same row for the reap
+    /// (bounded) so the assertion keeps its semantics but is observed after
+    /// the monitor's post-persist write has landed.
+    fn await_reaped_task(scheduler: &Scheduler, agent_id: &str, within: Duration) -> TaskRecord {
+        let deadline = Instant::now() + within;
+        loop {
+            let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+            if task.reaped_at.is_some() {
+                return task;
+            }
+            assert!(Instant::now() < deadline, "task was never reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn fresh_bootstrap_still_enforces_the_requested_model_gate() {
         let harness = harness(false, "zcode");
@@ -3552,7 +3569,7 @@ mod turn_adjudication_tests {
             Some(TRANSPORT_REASON),
             "the latched transport fault must outrank natural completion"
         );
-        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        let task = await_reaped_task(scheduler, agent_id, Duration::from_secs(10));
         assert_eq!(task.outcome, Some(TaskOutcome::Failed));
         assert!(task.reaped_at.is_some());
         assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 1);
@@ -3690,7 +3707,7 @@ mod turn_adjudication_tests {
             "the confirmed transport latch must survive the read failures"
         );
         assert_eq!(harness.cleanup_calls.load(Ordering::Acquire), 1);
-        let task = scheduler.store().get_task(agent_id).unwrap().unwrap();
+        let task = await_reaped_task(scheduler, agent_id, Duration::from_secs(10));
         assert!(task.reaped_at.is_some());
         let record: serde_json::Value =
             serde_json::from_str(&scheduler.last_error(agent_id).unwrap()).unwrap();

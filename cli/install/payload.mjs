@@ -75,12 +75,9 @@ const IMAGE_CHECKS = Object.freeze({
   'win32-x64': { arch: 'x64', image: 'PE32+ x86-64 image', probe: peArch },
 });
 
-// Payload verification knows how to validate the controlled win32-x64 artifact
-// even though NATIVE_PLATFORMS (the release gate, S04-owned) still excludes
-// Windows: nativePlatform() keeps returning null there, so win32-x64 is only
-// reachable through an explicit `platform` option.  This keeps the packaging
-// matrix exercisable without activating Windows distribution.
-const PAYLOAD_PLATFORMS = Object.freeze([...NATIVE_PLATFORMS, 'win32-x64']);
+// Every released tuple carries a prebuilt payload, including win32-x64; the
+// table is the verification identity set, not a distribution gate.
+const PAYLOAD_PLATFORMS = Object.freeze([...NATIVE_PLATFORMS]);
 
 function payloadDirectory(platform, root) {
   if (root) return path.join(root, 'npm', NATIVE_DIR_NAME, platform);

@@ -21,6 +21,21 @@ function fixtureHome(prefix = 'external-subagent-zcode-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
+// Windows does not enforce POSIX permission bits for the owner/admin, so
+// chmod-based failure injection cannot produce EACCES there.
+const win32Permissions = process.platform === 'win32'
+  ? 'chmod 000/500 failure injection is not enforceable on win32'
+  : false;
+
+// Windows product staging lives under %LOCALAPPDATA%; keep it inside the
+// fixture home so suites never share the real product tree.
+function fixturePaths(home) {
+  const env = process.platform === 'win32'
+    ? { ...process.env, LOCALAPPDATA: path.join(home, 'AppData', 'Local') }
+    : process.env;
+  return productPaths(home, env);
+}
+
 // Realistic foreign config content: the machine-global file this binding
 // merges into carries provider credentials, model picks, and hook state
 // that must survive byte-for-byte in value terms.
@@ -34,7 +49,7 @@ function foreignConfig() {
 
 function fixture({ config } = {}) {
   const home = fixtureHome();
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   if (config !== undefined) {
     fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
     fs.writeFileSync(paths.zcodeConfig, typeof config === 'string' ? config : `${JSON.stringify(config, null, 2)}\n`);
@@ -170,7 +185,7 @@ test('an invalid MCP JSON candidate never reaches the live tree (AUD-002)', () =
   }
 });
 
-test('a copy failure preserves the prior tree and leaves no residue (AUD-002)', () => {
+test('a copy failure preserves the prior tree and leaves no residue (AUD-002)', { skip: win32Permissions }, () => {
   const { home, paths } = fixture({ config: foreignConfig() });
   const source = tempSource((dir) => fs.chmodSync(path.join(dir, 'skills', 'external-subagent', 'SKILL.md'), 0o000));
   try {
@@ -293,7 +308,7 @@ const notRoot = process.getuid?.() !== 0 ? false : 'permission bits are not enfo
 // Both restores are now independent guarded attempts: the staging restore
 // must still run and succeed, the config keeps its exact prior bytes, and
 // the unrestored config is named on the thrown error, not just logged.
-test('a persistently read-only config parent still restores the prior staging tree and reports the unrestored config (AUD-002)', { skip: notRoot }, () => {
+test('a persistently read-only config parent still restores the prior staging tree and reports the unrestored config (AUD-002)', { skip: notRoot || win32Permissions }, () => {
   const { home, paths } = fixture({ config: foreignConfig() });
   const source = tempSource((dir) => fs.appendFileSync(path.join(dir, 'skills', 'external-subagent', 'SKILL.md'), '\ncandidate marker\n'));
   const configParent = path.dirname(paths.zcodeConfig);
@@ -373,7 +388,7 @@ test('a failed staging restore keeps the retained prior tree and is reported on 
   }
 });
 
-test('a failed first install leaves no binding behind (AUD-002)', () => {
+test('a failed first install leaves no binding behind (AUD-002)', { skip: win32Permissions }, () => {
   const { home, paths } = fixture();
   try {
     fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true, mode: 0o700 });
@@ -646,9 +661,9 @@ test('uninstall leaves a foreign-owned tree at the staging path in place and rep
 
 test('reconcile is stateless: absent, refreshed, and failed detection', () => {
   const absentHome = fixtureHome('external-subagent-zcode-absent-');
-  const absentPaths = productPaths(absentHome);
+  const absentPaths = fixturePaths(absentHome);
   const brokenHome = fixtureHome('external-subagent-zcode-broken-');
-  const brokenPaths = productPaths(brokenHome);
+  const brokenPaths = fixturePaths(brokenHome);
   const { home, paths } = fixture({ config: foreignConfig() });
   try {
     // Partial, non-product path shapes must never leak into the real user

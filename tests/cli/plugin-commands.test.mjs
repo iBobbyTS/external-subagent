@@ -16,6 +16,19 @@ import { loadCodexHomes, codexHomesRegistryPath } from '../../cli/install/reconc
 import { CliError } from '../../cli/errors.mjs';
 import { productPaths } from '../../cli/paths.mjs';
 
+// Windows product data lives under %LOCALAPPDATA%; pin it inside each fixture
+// home so plugin staging never collides with the real product tree.
+const win32Shebang = process.platform === 'win32'
+  ? 'the fake codex CLI is a POSIX shebang fixture; win32 resolves `codex` through PATHEXT to the real codex.exe'
+  : false;
+
+function fixturePaths(home) {
+  const env = process.platform === 'win32'
+    ? { ...process.env, LOCALAPPDATA: path.join(home, 'AppData', 'Local') }
+    : process.env;
+  return productPaths(home, env);
+}
+
 function fixtureHome(prefix = 'external-subagent-cli-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -89,7 +102,7 @@ test('install-mcp --codex-home writes only the targeted codex home, never the de
   const productHome = fixtureHome('external-subagent-mcp-cli-');
   const codexA = fixtureHome('external-subagent-mcp-home-a-');
   const codexB = fixtureHome('external-subagent-mcp-home-b-');
-  const paths = productPaths(productHome);
+  const paths = fixturePaths(productHome);
   const priorEnvHome = process.env.CODEX_HOME;
   delete process.env.CODEX_HOME;
   try {
@@ -121,10 +134,10 @@ test('install-mcp --codex-home writes only the targeted codex home, never the de
   }
 });
 
-test('install-plugin --codex-home claims the registry with the real plugin tree digest', () => {
+test('install-plugin --codex-home claims the registry with the real plugin tree digest', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-claim-');
   const fake = fakeCodexCli(home);
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   const codexHome = path.join(home, 'codex-target');
   const priorPath = process.env.PATH;
   process.env.PATH = `${fake.dir}${path.delimiter}${priorPath}`;
@@ -150,10 +163,10 @@ test('install-plugin --codex-home claims the registry with the real plugin tree 
 // P1 counterexample through the public command surface: when codex reports
 // success but never materializes a plugin cache, install-plugin fails closed
 // and the D08 registry keeps no success record for that home.
-test('install-plugin records no registry claim when the cache cannot be verified', () => {
+test('install-plugin records no registry claim when the cache cannot be verified', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-noclaim-');
   const fake = fakeCodexCli(home, { materialize: false });
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   const codexHome = path.join(home, 'codex-target');
   const priorPath = process.env.PATH;
   process.env.PATH = `${fake.dir}${path.delimiter}${priorPath}`;
@@ -178,7 +191,7 @@ test('install-plugin records no registry claim when the cache cannot be verified
 // unknown hosts are rejected at the argument parser.
 test('install-plugin zcode installs and removes the inline binding without touching codex', () => {
   const home = fixtureHome('external-subagent-zcode-cli-');
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   try {
     const dry = pluginCommand(paths, ['zcode', '--dry-run']);
     assert.equal(dry.dry_run, true);
@@ -204,7 +217,7 @@ test('install-plugin zcode installs and removes the inline binding without touch
 
 test('install-plugin rejects codex-only flags on the zcode host and unknown hosts', () => {
   const home = fixtureHome('external-subagent-zcode-args-');
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   try {
     assert.throws(() => pluginCommand(paths, ['zcode', '--codex-home', path.join(home, 'codex')]), (error) => {
       assert.equal(error.code, 'INVALID_ARGUMENT');
@@ -236,7 +249,7 @@ test('install-plugin rejects codex-only flags on the zcode host and unknown host
 // a managed section and unrelated settings, and neither may move a byte.
 test('install-mcp rejects non-codex hosts before any codex or registry mutation', () => {
   const home = fixtureHome('external-subagent-mcp-host-');
-  const paths = productPaths(home);
+  const paths = fixturePaths(home);
   const codexTarget = path.join(home, 'codex-target');
   fs.mkdirSync(codexTarget, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(codexTarget, 'config.toml'), '[mcp_servers.external_subagent]\ncommand = "/kept/managed"\n\n[user]\nname = "unrelated"\n');

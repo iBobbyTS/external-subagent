@@ -25,12 +25,19 @@ test('probe transport timeout covers local, two runtime deadlines, and cleanup',
 import { CliError } from '../../cli/errors.mjs';
 import { DAEMON_HELP } from '../../cli/main.mjs';
 
+// Windows has no filesystem Unix-domain sockets: these fixtures bind *.sock
+// paths, while the product's win32 transport is the named pipe
+// \\.\pipe\external-subagent-daemon (covered by the Rust pipe tests).
+const win32Sockets = process.platform === 'win32'
+  ? 'win32 cannot bind a filesystem *.sock fixture; the product uses \\\\.\\pipe\\external-subagent-daemon'
+  : false;
+
 test('CLI help documents JSON list scope instead of nonexistent flags', () => {
   assert.match(DAEMON_HELP, /list JSON requires repository \(workspace is an alias\)/u);
   assert.doesNotMatch(DAEMON_HELP, /--repository|--workspace/u);
 });
 
-test('CLI sends daemon RPC and preserves success result', async () => {
+test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-${process.pid}-${Date.now()}.sock`);
   let clientEnded = false;
   const server = net.createServer((socket) => {
@@ -73,7 +80,7 @@ test('CLI sends daemon RPC and preserves success result', async () => {
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI preserves daemon error code, message, and active agent id', async () => {
+test('CLI preserves daemon error code, message, and active agent id', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-error-${process.pid}-${Date.now()}.sock`);
   const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002 } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
@@ -81,7 +88,7 @@ test('CLI preserves daemon error code, message, and active agent id', async () =
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI rejects daemon responses for a different request id', async () => {
+test('CLI rejects daemon responses for a different request id', { skip: win32Sockets }, async () => {
   for (const [index, response] of [
     { request_id: 'other-request', outcome: 'success', result: {} },
     { request_id: null, outcome: 'success', result: {} },
@@ -104,7 +111,7 @@ test('CLI rejects the removed wait capability handshake before connecting', () =
   assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: 10000001, supports_answer: true }), /supports_answer/u);
 });
 
-test('CLI forwards wait message_id when declared', async () => {
+test('CLI forwards wait message_id when declared', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-wait-receipt-${process.pid}-${Date.now()}.sock`);
   const server = net.createServer((socket) => { socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);
@@ -129,7 +136,7 @@ test('CLI forwards wait message_id when declared', async () => {
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI omits send message_id for daemon generation and projects the returned id', async () => {
+test('CLI omits send message_id for daemon generation and projects the returned id', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-send-${process.pid}-${Date.now()}.sock`);
   let observedParams;
   const server = net.createServer((socket) => { socket.once('data', (chunk) => {
@@ -149,7 +156,7 @@ test('CLI rejects list without repository or workspace scope before connecting',
   assert.throws(() => callDaemon(path.join(os.tmpdir(), `missing-zcode-list-${process.pid}.sock`), 'list', {}), (error) => error instanceof CliError && error.code === 'INVALID_ARGUMENT');
 });
 
-test('CLI maps workspace list scope to daemon repository scope', async () => {
+test('CLI maps workspace list scope to daemon repository scope', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-list-${process.pid}-${Date.now()}.sock`);
   const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); assert.equal(request.params.repository, '/workspace'); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { tasks: [] } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
@@ -157,7 +164,7 @@ test('CLI maps workspace list scope to daemon repository scope', async () => {
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI passes list agent filter and projects persisted input identity', async () => {
+test('CLI passes list agent filter and projects persisted input identity', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `external-cli-list-identity-${process.pid}-${Date.now()}.sock`);
   const identity = {
     subagent: 'zcode', config_revision: 7, adapter_version: '0.1.0', model: null, model_source: 'native',
@@ -178,7 +185,7 @@ test('CLI passes list agent filter and projects persisted input identity', async
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI spawn wire forwards effort beside the manifest without leaking it inside', async () => {
+test('CLI spawn wire forwards effort beside the manifest without leaking it inside', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `external-cli-spawn-effort-${process.pid}-${Date.now()}.sock`);
   const seen = [];
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -200,7 +207,7 @@ test('CLI spawn wire forwards effort beside the manifest without leaking it insi
   assert.throws(() => callDaemon(path.join(os.tmpdir(), `missing-spawn-effort-${process.pid}.sock`), 'spawn', { repository: '/r', prompt: 'hi', effort: null }), (error) => error instanceof CliError && error.code === 'INVALID_ARGUMENT');
 });
 
-test('CLI applies documented list and result defaults before connecting', async () => {
+test('CLI applies documented list and result defaults before connecting', { skip: win32Sockets }, async () => {
   for (const [command, input, expected] of [
     ['list', { repository: '/workspace' }, { phase: null, outcome: null, cursor: null, limit: 100 }],
     ['result', { agent_id: 10000001 }, { offset: 0, limit: MAX_RESULT_CHUNK_BYTES }],
@@ -220,7 +227,7 @@ test('CLI applies documented list and result defaults before connecting', async 
   }
 });
 
-test('CLI observe uses the shared read-only daemon snapshot without adding fields', async () => {
+test('CLI observe uses the shared read-only daemon snapshot without adding fields', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-observe-${process.pid}-${Date.now()}.sock`);
   const observation = {
     agent_id: 10000001,
@@ -280,7 +287,7 @@ test('CLI reports unavailable daemon socket', async () => {
   await assert.rejects(() => callDaemon(path.join(os.tmpdir(), `missing-zcode-${process.pid}.sock`), 'cancel', { agent_id: 10000001 }), (error) => error.code === 'SOCKET_UNAVAILABLE');
 });
 
-test('CLI accepts a response exactly at the 2MiB frame cap and rejects one byte over', async () => {
+test('CLI accepts a response exactly at the 2MiB frame cap and rejects one byte over', { skip: win32Sockets }, async () => {
   const responseFor = (request, targetBytes) => {
     const response = { request_id: request.request_id, outcome: 'success', result: { tasks: [] }, padding: '' };
     const base = Buffer.byteLength(JSON.stringify(response), 'utf8');
@@ -304,7 +311,7 @@ test('CLI accepts a response exactly at the 2MiB frame cap and rejects one byte 
   }
 });
 
-test('CLI rejects a chunked response that exceeds the cap before newline', async () => {
+test('CLI rejects a chunked response that exceeds the cap before newline', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-chunked-${process.pid}-${Date.now()}.sock`);
   const server = net.createServer((socket) => socket.once('data', () => {
     socket.write(Buffer.alloc(1024 * 1024, 0x78));
@@ -315,7 +322,7 @@ test('CLI rejects a chunked response that exceeds the cap before newline', async
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 
-test('CLI preserves a maximum control and Unicode result page', async () => {
+test('CLI preserves a maximum control and Unicode result page', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-result-${process.pid}-${Date.now()}.sock`);
   const expected = '\u0001'.repeat(100000) + '你好🙂';
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -334,7 +341,7 @@ test('send mode is required and rejects invalid values before connecting', () =>
   }
 });
 
-test('send forwards both modes and preserves each disposition', async () => {
+test('send forwards both modes and preserves each disposition', { skip: win32Sockets }, async () => {
   for (const [mode, disposition] of [['queue', 'delivered'], ['queue', 'queued'], ['steer', 'delivered']]) {
     const socketPath = path.join(os.tmpdir(), `es-send-mode-${process.pid}-${Date.now()}.sock`);
     const server = net.createServer((socket) => socket.once('data', (chunk) => {
@@ -349,7 +356,7 @@ test('send forwards both modes and preserves each disposition', async () => {
   }
 });
 
-test('CLI preserves the steer_unsupported daemon error code', async () => {
+test('CLI preserves the steer_unsupported daemon error code', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `es-send-unsupported-${process.pid}-${Date.now()}.sock`);
   const server = net.createServer((socket) => socket.once('data', (chunk) => {
     const request = JSON.parse(chunk);

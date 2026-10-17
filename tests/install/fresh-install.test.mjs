@@ -25,6 +25,8 @@ import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
 import { nativePlatform } from '../../cli/install/layout.mjs';
+import { runInit } from '../../cli/install/init.mjs';
+import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
@@ -196,15 +198,64 @@ test('install-only stages the package and payload without touching the home', { 
   assert.deepEqual(fs.readdirSync(home), [], 'plain install must not start the daemon, write Codex, probe providers, or write any HOME state');
 });
 
-test('unsupported platforms allow help/version but reject business commands without writes', { skip: !testable }, async () => {
+test('the win32 platform seam passes the gate and installs through the injected sc.exe backend', { skip: !testable }, async () => {
   await ensureInstalled();
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-unsup-'));
-  const env = { ...fixtureEnv(home), EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32' };
-  const init = run(ctx.cli, ['init'], { env });
-  assert.equal(init.status, 1);
-  assert.equal(JSON.parse(init.stderr).error.code, 'UNSUPPORTED_PLATFORM');
-  assert.deepEqual(fs.readdirSync(home), []);
-  assert.equal(run(ctx.cli, ['version'], { env }).status, 0);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-win32-'));
+  const localAppData = path.join(home, 'AppData', 'Local');
+  const env = {
+    ...fixtureEnv(home),
+    USERPROFILE: home,
+    LOCALAPPDATA: localAppData,
+    EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32',
+  };
+  const paths = productPaths(home, { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32', LOCALAPPDATA: localAppData });
+
+  // The public CLI passes the win32 gate: init --dry-run plans the install
+  // instead of answering UNSUPPORTED_PLATFORM, and writes nothing.
+  const dry = run(ctx.cli, ['init', '--dry-run'], { env });
+  assert.equal(dry.status, 0, dry.stderr);
+  const plan = JSON.parse(dry.stdout).plan;
+  assert.equal(plan[0].id, 'verify-payload');
+  assert.equal(plan.some((step) => step.id === 'start-service'), true);
+  assert.equal(fs.existsSync(localAppData), false, 'dry-run must not write the win32 product tree');
+  assert.equal(fs.existsSync(path.join(home, 'Library')), false, 'no macOS launchd tree may be created');
+
+  // A full init on the win32 seam must write only %LOCALAPPDATA% and drive the
+  // SCM backend through the injectable sc seam (never the real sc.exe and
+  // never a launchd/systemd definition).
+  const calls = [];
+  const state = { registered: false, running: false, pid: 0 };
+  const sc = (args) => {
+    calls.push(args);
+    switch (args[0]) {
+      case 'queryex':
+        return state.registered
+          ? { status: 0, stdout: `STATE              : ${state.running ? 4 : 1}  RUNNING\r\n        PID                : ${state.pid}\r\n` }
+          : { status: 1060, stdout: '' };
+      case 'create': state.registered = true; return { status: 0, stdout: '' };
+      case 'start': state.running = true; state.pid += 1; return { status: 0, stdout: '' };
+      case 'stop': state.running = false; return { status: 0, stdout: '' };
+      case 'delete': state.registered = false; return { status: 0, stdout: '' };
+      default: throw new Error(`unexpected sc.exe call: ${args.join(' ')}`);
+    }
+  };
+  const report = runInit({ paths, sc, daemonPath: ctx.daemon });
+  assert.equal(report.installed, true);
+  for (const step of ['verify-payload', 'install-launch-agent', 'start-service', 'publish-active-payload']) {
+    assert.ok(report.completed.includes(step), `init must complete ${step}`);
+  }
+  assert.equal(report.service.created, true);
+  assert.equal(report.service.started, true);
+  assert.ok(calls.some((call) => call[0] === 'create'));
+  assert.ok(calls.some((call) => call[0] === 'start'));
+
+  const data = path.join(localAppData, 'external-subagent');
+  assert.equal(paths.data, data);
+  for (const file of ['config.json', 'install-state.json']) {
+    assert.ok(fs.existsSync(path.join(data, file)), `${file} must live under %LOCALAPPDATA%`);
+  }
+  assert.equal(fs.existsSync(path.join(home, 'Library')), false, 'the win32 install must not create a launchd tree');
+  assert.equal(fs.existsSync(path.join(home, '.zshrc')), false, 'init never edits shell profiles');
 });
 
 test('explicit init installs the standalone service only and binds no host', { skip: !testable }, async () => {

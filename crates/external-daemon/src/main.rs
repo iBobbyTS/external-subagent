@@ -239,18 +239,7 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
             .map(Path::new)
             .is_some_and(|runtime| {
                 runtime.is_absolute()
-                    && runtime.is_file()
-                    && {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            true
-                        }
-                    }
+                    && external_daemon::executable::is_executable_file(runtime)
                     && configured
                         .and_then(|entry| entry.get("profile"))
                         .and_then(serde_json::Value::as_str)
@@ -342,17 +331,7 @@ fn codex_production_enabled(path: Option<&Path>) -> bool {
             .and_then(serde_json::Value::as_str)
             .map(Path::new)
             .is_some_and(|runtime| {
-                runtime.is_absolute() && runtime.is_file() && {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        true
-                    }
-                }
+                runtime.is_absolute() && external_daemon::executable::is_executable_file(runtime)
             })
 }
 
@@ -398,17 +377,7 @@ fn agy_production_enabled(path: Option<&Path>) -> bool {
             .and_then(serde_json::Value::as_str)
             .map(Path::new)
             .is_some_and(|runtime| {
-                runtime.is_absolute() && runtime.is_file() && {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        fs::metadata(runtime).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        true
-                    }
-                }
+                runtime.is_absolute() && external_daemon::executable::is_executable_file(runtime)
             })
 }
 
@@ -496,7 +465,7 @@ fn parse_config() -> io::Result<Config> {
             "EXTERNAL_SUBAGENT_SOCKET or --socket is required",
         )
     })?)?;
-    let runtime = runtime.map(fs::canonicalize).transpose()?;
+    let runtime = runtime.map(canonicalize_runtime).transpose()?;
     if runtime.as_ref().is_some_and(|path| !path.is_file()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -627,6 +596,36 @@ fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
     }
 }
 
+/// Canonicalize the `--runtime` path without a Windows verbatim prefix.
+///
+/// `fs::canonicalize` returns `\\?\C:\...` on Windows. Node's child_process
+/// and several tools do not accept that spelling, and the daemon hands this
+/// path to Node (`node <runtime> app-server`), so the canonical result is
+/// projected back to the normal drive/UNC form. Non-Windows hosts keep the
+/// exact previous behavior; only the representation changes, not the target.
+fn canonicalize_runtime(path: PathBuf) -> io::Result<PathBuf> {
+    Ok(project_verbatim(fs::canonicalize(path)?))
+}
+
+fn project_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+            return PathBuf::from(format!("\\\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix("\\\\?\\") {
+            // Only drive-letter paths are projected. Device paths (`\\.\`) and
+            // other namespaces are deliberately left untouched.
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
+}
+
 fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {
     let runtime = runtime.ok_or_else(|| {
         io::Error::new(
@@ -642,7 +641,7 @@ fn runtime_command(runtime: Option<&Path>) -> io::Result<Command> {
         command.arg(runtime).arg("app-server");
         Ok(command)
     } else {
-        Ok(Command::new(runtime))
+        Ok(external_daemon::executable::executable_command(runtime))
     }
 }
 
@@ -669,7 +668,7 @@ mod tests {
     #[test]
     fn codex_production_gate_requires_enabled_spawn_and_pinned_runtime() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = directory.path().join("codex-runtime");
+        let runtime = directory.path().join("codex-runtime.exe");
         std::fs::File::create(&runtime)
             .unwrap()
             .write_all(b"runtime")
@@ -742,7 +741,7 @@ mod tests {
     #[test]
     fn dsh_production_gate_requires_complete_persisted_identity() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = directory.path().join("dsh-runtime");
+        let runtime = directory.path().join("dsh-runtime.exe");
         std::fs::File::create(&runtime)
             .unwrap()
             .write_all(b"runtime")
@@ -766,6 +765,32 @@ mod tests {
                 .remove(field);
             std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
             assert!(!dsh_production_enabled(Some(&config_path)));
+        }
+    }
+
+    #[test]
+    fn verbatim_canonical_paths_are_projected_for_node() {
+        // Unix keeps the path unchanged; Windows strips only the verbatim
+        // drive/UNC prefixes that Node rejects, never a device namespace.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                project_verbatim(PathBuf::from(r"\\?\C:\Users\admin\zcode.cjs")),
+                PathBuf::from(r"C:\Users\admin\zcode.cjs")
+            );
+            assert_eq!(
+                project_verbatim(PathBuf::from(r"\\?\UNC\server\share\zcode.cjs")),
+                PathBuf::from(r"\\server\share\zcode.cjs")
+            );
+            assert_eq!(
+                project_verbatim(PathBuf::from(r"\\.\pipe\daemon")),
+                PathBuf::from(r"\\.\pipe\daemon")
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let path = PathBuf::from("/opt/zcode.cjs");
+            assert_eq!(project_verbatim(path.clone()), path);
         }
     }
 

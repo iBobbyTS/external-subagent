@@ -2,8 +2,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const pluginRoot = path.resolve(new URL('..', import.meta.url).pathname);
+// `URL#pathname` carries a leading slash before the drive letter on Windows
+// (`/C:/...`), which path.resolve turns into `C:\C:\...`.
+const pluginRoot = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const hookRoot = pluginRoot;
 const configPath = process.argv[process.argv.indexOf('--config') + 1];
 if (!configPath || configPath.startsWith('--')) {

@@ -17,7 +17,9 @@ const LINUX = Object.freeze({ EXTERNAL_SUBAGENT_TEST_PLATFORM: 'linux' });
 function run(home, args, extraEnv = {}) {
   return spawnSync(process.execPath, [cli, ...args], {
     encoding: 'utf8',
-    env: { HOME: home, ...LINUX, ...extraEnv },
+    // USERPROFILE is the win32 os.homedir() source; setting both keeps the
+    // Linux-layout fixture inside the throwaway home on every host.
+    env: { HOME: home, USERPROFILE: home, ...LINUX, ...extraEnv },
   });
 }
 
@@ -121,7 +123,14 @@ test('Linux status reports the real systemd service view without probing launchd
   assert.deepEqual(fs.readdirSync(home), [], 'status must not write HOME state');
 });
 
-test('the darwin platform seam still reports the launchd service view', () => {
+test('the darwin platform seam still reports the launchd service view', {
+  // The launchd backend derives gui/<uid> through process.getuid(), which
+  // does not exist on a win32 host. The darwin backend itself is covered on
+  // macOS; the win32 SCM dispatch is covered by windows.test.mjs.
+  skip: process.platform === 'win32'
+    ? 'process.getuid is unavailable on win32 for the simulated darwin launchd arm'
+    : false,
+}, () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-darwin-status-'));
   const result = run(home, ['status'], { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'darwin', EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL: '1' });
   assert.equal(result.status, 0, result.stderr);

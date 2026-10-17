@@ -98,7 +98,8 @@ test('debug plugin source staging renames identity and keeps managed content', (
     assert.ok(fs.existsSync(path.join(target, 'skills', 'external-subagent-debug', 'SKILL.md')));
     assert.ok(!fs.existsSync(path.join(target, 'skills', 'external-subagent')));
     const skill = fs.readFileSync(path.join(target, 'skills', 'external-subagent-debug', 'SKILL.md'), 'utf8');
-    assert.match(skill.slice(0, 200), /^---\nname: external-subagent-debug\n/u);
+    // A Windows checkout carries CRLF; the rename preserves line endings.
+    assert.match(skill.slice(0, 200), /^---\r?\nname: external-subagent-debug\r?\n/u);
     assert.equal(fs.readFileSync(path.join(target, '.mcp.json'), 'utf8'),
       fs.readFileSync(path.join(repoRoot, 'plugins', 'codex', 'external-subagent', '.mcp.json'), 'utf8'));
     const hooks = fs.readdirSync(path.join(repoRoot, 'plugins', 'codex', 'external-subagent', 'hooks')).sort();

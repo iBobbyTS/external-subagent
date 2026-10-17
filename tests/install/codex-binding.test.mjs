@@ -36,6 +36,14 @@ import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 
+// The recording fake is a POSIX shebang script. On win32 CreateProcess cannot
+// execute it (and PATH resolution would find the real codex.exe instead), so
+// the fake-CLI binding oracles are POSIX-only; the native payload binding is
+// covered by payload/windows suites.
+const win32Shebang = process.platform === 'win32'
+  ? 'the recording codex fake is a POSIX shebang script; win32 resolves codex through PATHEXT'
+  : false;
+
 function fixtureHome(prefix = 'external-subagent-bind-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -158,7 +166,7 @@ function binding(home, extra = {}) {
   return { paths, options: { codexCli: extra.cli, codexHome, ...extra.options } };
 }
 
-test('managed plugin install stages a PATH-independent MCP binding via the official interface', () => {
+test('managed plugin install stages a PATH-independent MCP binding via the official interface', { skip: win32Shebang }, () => {
   const home = fixtureHome();
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -199,7 +207,7 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('marketplace merge preserves unrelated plugins and repeats stay idempotent', () => {
+test('marketplace merge preserves unrelated plugins and repeats stay idempotent', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-merge-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -223,7 +231,7 @@ test('marketplace merge preserves unrelated plugins and repeats stay idempotent'
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('foreign staging and drifted marketplace entries are rejected, not overwritten', () => {
+test('foreign staging and drifted marketplace entries are rejected, not overwritten', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-drift-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -249,7 +257,7 @@ test('foreign staging and drifted marketplace entries are rejected, not overwrit
 // reconcile through the public owner and end up carrying ONLY the current
 // key, in the staged tree and in the codex-materialized cache.  The legacy
 // literal is assembled by the module under test, never spelled here.
-test('an old-key managed staging upgrades through reconcile to the current key only (S03)', () => {
+test('an old-key managed staging upgrades through reconcile to the current key only (S03)', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-legacy-key-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -287,7 +295,7 @@ test('an old-key managed staging upgrades through reconcile to the current key o
 // real user root), so these oracles pin the fail-closed answer to store
 // reuse as deliberate defense against freeze-behavior CLIs and future
 // regressions, not as a model of live 0.154.0 non-reserved adds.
-test('a second binding of the same plugin identity fails closed on store-reused cache bytes', () => {
+test('a second binding of the same plugin identity fails closed on store-reused cache bytes', { skip: win32Shebang }, () => {
   const state = fixtureHome('external-subagent-store-');
   const fake = fakeCodexCli(state, { store: true });
   const homeA = fixtureHome('external-subagent-bind-a-');
@@ -331,7 +339,7 @@ test('a second binding of the same plugin identity fails closed on store-reused 
   }
 });
 
-test('store reuse is answered by a distinct release identity, and a repeat of the same binding verifies', () => {
+test('store reuse is answered by a distinct release identity, and a repeat of the same binding verifies', { skip: win32Shebang }, () => {
   const state = fixtureHome('external-subagent-store-ok-');
   const fake = fakeCodexCli(state, { store: true });
   const homeA = fixtureHome('external-subagent-bind-repeat-');
@@ -381,7 +389,7 @@ test('store reuse is answered by a distinct release identity, and a repeat of th
 // staging carries the new candidate — exactly the shape the metadata/binding
 // comparison alone used to accept as `cache_verified: true`.  Each negative
 // pins exactly ONE difference between the seeded bytes and the candidate.
-test('a same-identity cache with changed managed content fails closed through the store (AUD-010)', () => {
+test('a same-identity cache with changed managed content fails closed through the store (AUD-010)', { skip: win32Shebang }, () => {
   const shippedVersion = JSON.parse(fs.readFileSync(path.join(pluginSourceRoot(), '.codex-plugin', 'plugin.json'), 'utf8')).version;
   const skillAt = (root) => path.join(root, 'skills', 'external-subagent', 'SKILL.md');
   const negatives = [
@@ -462,7 +470,7 @@ test('a same-identity cache with changed managed content fails closed through th
 // The same stale-content failure must not record success anywhere: reconcile
 // reports the home as failed with CODEX_CACHE_CONTENT_MISMATCH, and the prior
 // claim's digest survives untouched.
-test('a stale-content reconcile records failure, never a successful claim (AUD-010)', () => {
+test('a stale-content reconcile records failure, never a successful claim (AUD-010)', { skip: win32Shebang }, () => {
   const state = fixtureHome('external-subagent-aud010-claim-');
   const fake = fakeCodexCli(state, { store: true });
   const home = fixtureHome('external-subagent-aud010-claim-home-');
@@ -490,7 +498,7 @@ test('a stale-content reconcile records failure, never a successful claim (AUD-0
 // The positive counterpart: a plugin version identity no store has ever
 // cached gets its own store entry seeded from THIS run's staged tree, so
 // changed content under a fresh identity with the SAME binding verifies.
-test('a never-used candidate identity with correct materialized content verifies (AUD-010)', () => {
+test('a never-used candidate identity with correct materialized content verifies (AUD-010)', { skip: win32Shebang }, () => {
   const state = fixtureHome('external-subagent-aud010-fresh-');
   const fake = fakeCodexCli(state, { store: true });
   const home = fixtureHome('external-subagent-aud010-fresh-home-');
@@ -528,7 +536,7 @@ test('a never-used candidate identity with correct materialized content verifies
 // one) nor the derived cache location.  installPlugin must fail closed with
 // CODEX_CACHE_UNVERIFIABLE, roll the product-owned state of this run back,
 // and neither the install nor a later reconcile may record success for it.
-test('a plugin-add success with no materialized cache fails closed and records no success', () => {
+test('a plugin-add success with no materialized cache fails closed and records no success', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-nocache-');
   const liedDir = path.join(home, 'fake-lied');
   const silentDir = path.join(home, 'fake-silent');
@@ -578,7 +586,7 @@ test('a plugin-add success with no materialized cache fails closed and records n
 // disappears from the published tree, and a refresh whose verification
 // fails restores the prior coherent staging tree and marketplace bytes
 // instead of leaving an overlaid mix behind.
-test('a codex refresh drops source files deleted since the last install (AUD-002)', () => {
+test('a codex refresh drops source files deleted since the last install (AUD-002)', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-deletion-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -607,7 +615,7 @@ test('a codex refresh drops source files deleted since the last install (AUD-002
   }
 });
 
-test('a failed codex refresh restores the prior staging tree and marketplace bytes (AUD-002)', () => {
+test('a failed codex refresh restores the prior staging tree and marketplace bytes (AUD-002)', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-refresh-rollback-');
   const goodDir = path.join(home, 'fake-good');
   const lyingDir = path.join(home, 'fake-lying');
@@ -651,7 +659,7 @@ const notRoot = process.getuid?.() !== 0 ? false : 'permission bits are not enfo
 // too, but the staging restore is an independent attempt that must still
 // run and succeed, and the unrestored marketplace must be named on the
 // thrown error rather than inferred from logs.
-test('a persistently unwritable marketplace parent still restores the prior staging tree when the marketplace write fails (AUD-002)', { skip: notRoot }, () => {
+test('a persistently unwritable marketplace parent still restores the prior staging tree when the marketplace write fails (AUD-002)', { skip: notRoot || win32Shebang }, () => {
   const home = fixtureHome('external-subagent-market-locked-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -691,7 +699,7 @@ test('a persistently unwritable marketplace parent still restores the prior stag
 // registration / plugin add / cache verification): the primary failure is
 // the unverifiable cache, and the denied marketplace restore must neither
 // skip the staging restore nor replace the original error.
-test('a persistently unwritable marketplace parent still restores the prior staging tree when cache verification fails (AUD-002)', { skip: notRoot }, () => {
+test('a persistently unwritable marketplace parent still restores the prior staging tree when cache verification fails (AUD-002)', { skip: notRoot || win32Shebang }, () => {
   const home = fixtureHome('external-subagent-verify-locked-');
   const goodDir = path.join(home, 'fake-good');
   const lyingDir = path.join(home, 'fake-lying');
@@ -740,7 +748,7 @@ test('a persistently unwritable marketplace parent still restores the prior stag
 // FIXED code replaces the manifest atomically (temp file beside the target
 // plus rename, which needs only parent-dir permission — a read-only file
 // alone would not stop it).
-test('a persistently read-only marketplace file cannot skip the staging restore when verification fails (AUD-002)', { skip: notRoot }, () => {
+test('a persistently read-only marketplace file cannot skip the staging restore when verification fails (AUD-002)', { skip: notRoot || win32Shebang }, () => {
   const home = fixtureHome('external-subagent-market-file-locked-');
   const goodDir = path.join(home, 'fake-good');
   const lyingDir = path.join(home, 'fake-lying');
@@ -787,7 +795,7 @@ test('a persistently read-only marketplace file cannot skip the staging restore 
 // managed marketplace content back to the prior backup bytes — foreign
 // entries intact — alongside the staging restore, with the original error
 // unmasked and no unrestored resources to report.
-test('a marketplace write that succeeded before a later failure rolls back to the prior bytes with foreign entries intact (AUD-002)', () => {
+test('a marketplace write that succeeded before a later failure rolls back to the prior bytes with foreign entries intact (AUD-002)', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-market-rollback-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -830,7 +838,7 @@ test('a marketplace write that succeeded before a later failure rolls back to th
   }
 });
 
-test('uninstall uses the verified name@marketplace removal form', () => {
+test('uninstall uses the verified name@marketplace removal form', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-remove-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -863,7 +871,7 @@ test('direct MCP TOML binding covers all ten tools and removes only its own sect
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('D08 registry claims, dedupes, and unclaims Codex homes', () => {
+test('D08 registry claims, dedupes, and unclaims Codex homes', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-registry-');
   const paths = productPaths(home);
   const codexA = path.join(home, 'codex-a');
@@ -909,7 +917,7 @@ test('D08 registry replaces corrupted JSON atomically and reports a recoverable 
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test('D08 reconcile updates only registered writable homes and never touches strangers', () => {
+test('D08 reconcile updates only registered writable homes and never touches strangers', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-reconcile-');
   const fake = fakeCodexCli(home);
   const { paths } = binding(home, { cli: fake.cli });

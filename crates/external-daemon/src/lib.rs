@@ -43,6 +43,7 @@ pub mod agent_status;
 pub mod agy;
 pub mod codex;
 pub mod dsh;
+pub mod executable;
 mod lifecycle_sink;
 pub mod mcp;
 pub mod observation;

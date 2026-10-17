@@ -21,24 +21,33 @@ const events = config?.hooks?.events;
 if (config?.hooks?.enabled !== true || !events || !Array.isArray(events.PreToolUse)) process.exit(2);
 const pre = events.PreToolUse.find((entry) => entry?.matcher === '^(Read|Grep|Glob|Write|Edit|Delete|Move)$');
 const hook = pre?.hooks?.find((entry) => entry?.type === 'process' && Array.isArray(entry.args));
-const script = hook?.args?.find((candidate) => typeof candidate === 'string' && candidate.endsWith('/hooks/check-agent-files.mjs'));
+const managedWrapperSuffix = path.join('hooks', 'check-agent-files.mjs');
+const script = hook?.args?.find((candidate) => typeof candidate === 'string' && candidate.endsWith(managedWrapperSuffix));
 const guard = events.PreToolUse.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
 const audit = events.PostToolUse?.find((entry) => entry?.matcher === 'Bash')?.hooks?.find((entry) => entry?.type === 'process')?.args?.[0];
 if (!script || !fs.statSync(script).isFile() || hook.command !== process.execPath || !guard || !fs.statSync(guard).isFile() || !audit || !fs.statSync(audit).isFile()) process.exit(2);
 // The provenance is staged by install-agent-hooks.mjs beside this verifier,
 // inside the product data directory of the probe home. The candidates mirror
 // the daemon's policy_verifier_candidates exactly: the frozen macOS
-// `~/Library/Application Support` bytes on darwin; elsewhere an exported
-// absolute $XDG_DATA_HOME is probed first, then the `~/.local/share` XDG
-// fallback for the scope home.
+// `~/Library/Application Support` bytes on darwin; on Windows an exported
+// absolute %LOCALAPPDATA% is probed first, then the scope-home
+// %USERPROFILE%\AppData\Local fallback; elsewhere an exported absolute
+// $XDG_DATA_HOME is probed first, then the `~/.local/share` XDG fallback.
 const provenanceCandidates = process.platform === 'darwin'
   ? [path.join(home, 'Library', 'Application Support', 'external-subagent', 'zcode-agent-hook-provenance.json')]
-  : [
-      ...(typeof process.env.XDG_DATA_HOME === 'string' && path.isAbsolute(process.env.XDG_DATA_HOME)
-        ? [path.join(process.env.XDG_DATA_HOME, 'external-subagent', 'zcode-agent-hook-provenance.json')]
-        : []),
-      path.join(home, '.local', 'share', 'external-subagent', 'zcode-agent-hook-provenance.json'),
-    ];
+  : process.platform === 'win32'
+    ? [
+        ...(typeof process.env.LOCALAPPDATA === 'string' && path.isAbsolute(process.env.LOCALAPPDATA)
+          ? [path.join(process.env.LOCALAPPDATA, 'external-subagent', 'zcode-agent-hook-provenance.json')]
+          : []),
+        path.join(home, 'AppData', 'Local', 'external-subagent', 'zcode-agent-hook-provenance.json'),
+      ]
+    : [
+        ...(typeof process.env.XDG_DATA_HOME === 'string' && path.isAbsolute(process.env.XDG_DATA_HOME)
+          ? [path.join(process.env.XDG_DATA_HOME, 'external-subagent', 'zcode-agent-hook-provenance.json')]
+          : []),
+        path.join(home, '.local', 'share', 'external-subagent', 'zcode-agent-hook-provenance.json'),
+      ];
 const provenancePath = provenanceCandidates.find((candidate) => fs.existsSync(candidate));
 if (!provenancePath) process.exit(2);
 const provenance = JSON.parse(fs.readFileSync(provenancePath, 'utf8'));

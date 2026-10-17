@@ -1504,7 +1504,7 @@ mod observe_gate_tests {
             let codex_home = config_dir.path().join("codex-home");
             fs::create_dir_all(&codex_home).unwrap();
 
-            let dummy_bin = config_dir.path().join("dummy_bin");
+            let dummy_bin = config_dir.path().join("dummy_bin.exe");
             fs::write(&dummy_bin, b"#!/bin/sh\nexit 0\n").unwrap();
             #[cfg(unix)]
             {
@@ -2461,7 +2461,7 @@ mod observe_gate_tests {
             // R3-01(b): Profile subagent="codex" omitting model when config has NO default_model -> NOT wrapped
             // Overwrite agents.json to remove codex default_model
             let codex_home = env._config_dir.path().join("codex-home");
-            let dummy_bin = env._config_dir.path().join("dummy_bin");
+            let dummy_bin = env._config_dir.path().join("dummy_bin.exe");
             let config_no_default_model = serde_json::json!({
                 "schema_version": 2,
                 "revision": 2,
