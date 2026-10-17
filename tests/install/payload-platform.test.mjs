@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { elfArch, machoArch, verifyPayload } from '../../cli/install/payload.mjs';
+import { elfArch, machoArch, peArch, verifyPayload } from '../../cli/install/payload.mjs';
 import {
   NATIVE_PLATFORMS, nativePayloadDir, nativePlatform, payloadManifestPath,
 } from '../../cli/install/layout.mjs';
@@ -36,6 +36,19 @@ function machoHeader({ cputype = 0x0100000c } = {}) {
   return bytes;
 }
 
+// A PE32+ (64-bit) header with the COFF Machine field and the optional-header
+// magic at their documented offsets.
+function peHeader({ machine = 0x8664, magic = 0x20b, signature = 0x00004550 } = {}) {
+  const peOffset = 0x40;
+  const bytes = Buffer.alloc(peOffset + 4 + 20 + 2);
+  bytes.writeUInt16LE(0x5a4d, 0); // "MZ"
+  bytes.writeUInt32LE(peOffset, 0x3c); // e_lfanew
+  bytes.writeUInt32LE(signature, peOffset); // "PE\0\0"
+  bytes.writeUInt16LE(machine, peOffset + 4);
+  bytes.writeUInt16LE(magic, peOffset + 24); // optional header magic
+  return bytes;
+}
+
 const IMAGES = Object.freeze({
   'darwin-arm64': {
     valid: () => machoHeader(),
@@ -51,6 +64,13 @@ const IMAGES = Object.freeze({
     truncated: (bytes) => bytes.subarray(0, 12), // below e_machine
     arch: 'x64',
   },
+  'win32-x64': {
+    valid: () => peHeader(),
+    wrongFormat: () => elfHeader(),
+    wrongMachine: () => peHeader({ machine: 0xaa64 }), // IMAGE_FILE_MACHINE_ARM64
+    truncated: (bytes) => bytes.subarray(0, 0x40 + 24), // below the optional magic
+    arch: 'x64',
+  },
 });
 
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -64,7 +84,8 @@ function makeRoot(platform, options = {}) {
   const packageVersion = options.packageVersion ?? version;
   const dirPlatform = options.dirPlatform ?? platform;
   const mode = options.mode ?? 0o755;
-  const files = options.files ?? ['external-subagentd', 'external-subagent-mcp'].map((name) => ({
+  const suffix = platform === 'win32-x64' ? '.exe' : '';
+  const files = options.files ?? [`external-subagentd${suffix}`, `external-subagent-mcp${suffix}`].map((name) => ({
     name, bytes: IMAGES[platform].valid(),
   }));
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'payload-platform-'));
@@ -117,7 +138,7 @@ test('nativePayloadDir and payloadManifestPath resolve per supported platform', 
   assert.equal(payloadManifestPath('linux-arm64'), null);
 });
 
-test('elfArch accepts only 64-bit little-endian x86-64 and machoArch only arm64', () => {
+test('elfArch/machoArch/peArch accept only their one platform identity', () => {
   assert.equal(elfArch(elfHeader()), 'x64');
   assert.equal(elfArch(elfHeader({ machine: 0xb7 })), null);
   assert.equal(elfArch(elfHeader({ elfClass: 1 })), null); // 32-bit
@@ -127,6 +148,12 @@ test('elfArch accepts only 64-bit little-endian x86-64 and machoArch only arm64'
   assert.equal(machoArch(machoHeader()), 'arm64');
   assert.equal(machoArch(machoHeader({ cputype: 0x01000007 })), null);
   assert.equal(machoArch(machoHeader().subarray(0, 6)), null);
+  assert.equal(peArch(peHeader()), 'x64');
+  assert.equal(peArch(peHeader({ machine: 0xaa64 })), null); // ARM64
+  assert.equal(peArch(peHeader({ magic: 0x10b })), null); // PE32, not PE32+
+  assert.equal(peArch(peHeader({ signature: 0x00004551 })), null); // bad PE signature
+  assert.equal(peArch(elfHeader()), null); // not an MZ image
+  assert.equal(peArch(peHeader().subarray(0, 0x40 + 24)), null); // truncated below the optional magic
 });
 
 for (const platform of Object.keys(IMAGES)) {
@@ -162,7 +189,12 @@ for (const platform of Object.keys(IMAGES)) {
     } finally { cleanup(root); }
   });
 
-  test(`${platform}: a non-755 payload file is rejected`, () => {
+  // Windows has no POSIX execute bit and the gate deliberately does not
+  // enforce one there; the mode rule remains strict for the POSIX payloads on
+  // a POSIX host (and this host cannot materialise mode 755 at all).
+  test(`${platform}: a non-755 payload file is rejected`, {
+    skip: platform === 'win32-x64' || process.platform === 'win32',
+  }, () => {
     const { root } = makeRoot(platform, { mode: 0o644 });
     try {
       assert.equal(errorCode(() => verifyPayload({ root, platform })), 'PAYLOAD_PERMISSIONS_INVALID');
@@ -197,6 +229,22 @@ test('a manifest declaring the wrong platform is rejected', () => {
 
 test('an unsupported platform option has no payload to verify', () => {
   assert.equal(errorCode(() => verifyPayload({ platform: 'linux-arm64' })), 'UNSUPPORTED_PAYLOAD_PLATFORM');
+  let error;
+  try { verifyPayload({ platform: 'linux-arm64' }); } catch (caught) { error = caught; }
+  // An explicit call can reach the controlled tuple, so the explicit message
+  // lists it; the default (no option) message below stays release-only.
+  assert.match(error.message, /win32-x64/u);
+});
+
+test('the default unsupported message lists only the release-supported tuples', {
+  // Only a host whose native payload resolver rejects the running tuple (the
+  // pre-S04 win32 host) can observe the default failure branch.
+  skip: nativePlatform() !== null,
+}, () => {
+  let error;
+  try { verifyPayload(); } catch (caught) { error = caught; }
+  assert.equal(error.code, 'UNSUPPORTED_PAYLOAD_PLATFORM');
+  assert.equal(error.message, `no native payload exists for ${process.platform}-${process.arch}; supported platforms: darwin-arm64, linux-x64`);
 });
 
 test('the MCP facade shim resolves the payload directory for each platform', () => {
@@ -223,9 +271,21 @@ test('the MCP facade shim resolves the payload directory for each platform', () 
   );
 });
 
-test('init reports the derived per-platform manifest path', () => {
+test('win32-x64 is verifiable without a POSIX mode while NATIVE_PLATFORMS stays closed', () => {
+  const { root } = makeRoot('win32-x64', { mode: 0o644 });
+  try {
+    const result = verifyPayload({ root, platform: 'win32-x64' });
+    assert.equal(result.status, 'verified');
+    assert.equal(result.platform, 'win32-x64');
+    assert.deepEqual(result.files.map((file) => file.mode), [null, null]);
+    // The distribution gate remains S04-owned: nativePlatform still has no
+    // win32 tuple, and win32-x64 is reachable only through an explicit option.
+    assert.equal(nativePlatform('win32', 'x64'), null);
+  } finally { cleanup(root); }
+});
+
+test('init reports the derived per-platform manifest path', { skip: nativePlatform() === null }, () => {
   const platform = nativePlatform();
-  assert.ok(platform, 'the test host must be a supported payload platform');
   const plan = installPlan({ data: '/d', logs: '/l', config: '/c', launchAgent: '/a', state: '/s' });
   assert.equal(plan[0].id, 'verify-payload');
   assert.equal(plan[0].path, payloadManifestPath(platform));

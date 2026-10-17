@@ -20,6 +20,11 @@ import {
 const CORPUS_DIR = path.resolve(import.meta.dirname, 'profiles-corpus');
 const CLI_BIN = path.resolve(import.meta.dirname, '../../bin/external-subagent.mjs');
 const NO_ENV = Object.freeze({});
+// The N5 literals below are the Rust Unix grammar fixtures; pin the platform
+// seam so they assert that grammar byte-for-byte on every host (the Windows
+// twin lives in tests/platform/windows-paths.test.mjs).
+const UNIX_SEAM = Object.freeze({ EXTERNAL_SUBAGENT_TEST_PLATFORM: 'linux' });
+const unixProfilesDir = (env) => profilesDir({ ...UNIX_SEAM, ...env });
 
 // The category stored in each corpus expectation maps to a substring that the
 // scanner's diagnostic must contain, so failures point at the right rule.
@@ -38,18 +43,22 @@ const REASON_MARKERS = Object.freeze({
 
 function createTempEnv() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-profiles-'));
-  const paths = productPaths(home);
+  // A real Windows host exports LOCALAPPDATA; the empty env keeps the whole
+  // fixture inside the throwaway home (the layout falls back to
+  // <home>/AppData/Local) instead of the user's product directory.
+  const paths = productPaths(home, process.platform === 'win32' ? {} : process.env);
   const profilesPath = path.join(paths.data, 'profiles');
   fs.mkdirSync(profilesPath, { recursive: true });
   return { home, paths, profilesDir: profilesPath };
 }
 
 // The product data profiles directory for the host layout: macOS
-// `~/Library/Application Support`, else the XDG data root.
+// `~/Library/Application Support`, Windows `%LOCALAPPDATA%`, else the XDG data
+// root.
 function expectedProfilesDir(home) {
-  return platform() === 'darwin'
-    ? path.join(home, 'Library', 'Application Support', 'external-subagent', 'profiles')
-    : path.join(home, '.local', 'share', 'external-subagent', 'profiles');
+  if (platform() === 'darwin') return path.join(home, 'Library', 'Application Support', 'external-subagent', 'profiles');
+  if (platform() === 'win32') return path.join(home, 'AppData', 'Local', 'external-subagent', 'profiles');
+  return path.join(home, '.local', 'share', 'external-subagent', 'profiles');
 }
 
 function listProfiles(paths, env = NO_ENV) {
@@ -249,7 +258,7 @@ test('AC2: invalid profile argument values are rejected', () => {
 
 test('AC3: missing profiles directory returns empty list with path note', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'missing-profiles-dir-'));
-  const paths = productPaths(home);
+  const paths = productPaths(home, process.platform === 'win32' ? {} : process.env);
   // Do NOT create profiles directory
   const res = listProfiles(paths);
   assert.equal(res.operation, 'list');
@@ -616,33 +625,33 @@ test('corpus: scanner output matches the shared JSON differential corpus item-fo
 
 test('N5: profilesDir mirrors Rust Path::parent()+join() without lexical folding', () => {
   // `..` is preserved (Node's path.join would fold it away).
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/../agents.json' }), 'a/../profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/../agents.json' }), 'a/../profiles');
   // A bare relative name (or ".") has the empty path as parent -> "profiles".
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'agents.json' }), 'profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '.' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'agents.json' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: '.' }), 'profiles');
   // "./name" has "." as parent, which is preserved verbatim.
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: './agents.json' }), './profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: './agents.json' }), './profiles');
   // Nested and trailing separators.
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/agents.json' }), 'a/b/profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/' }), 'a/profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/agents.json' }), 'a/b/profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/' }), 'a/profiles');
   // Root has no parent in Rust.
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '/' }), null);
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '//' }), null);
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: '/' }), null);
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: '//' }), null);
   // Empty exported path -> no parent -> null.
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '' }), null);
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: '' }), null);
 });
 
 test('N5: rustPathParent drops non-leading trailing "." components like Rust Path::components', () => {
   // Rust: `Path::new("a/.").parent() == Some("")` -> "profiles".
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/.' }), 'profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/.' }), 'a/profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: '/.' }), null);
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/./.' }), 'profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: './.' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/.' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/b/.' }), 'a/profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: '/.' }), null);
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/./.' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: './.' }), 'profiles');
   // `..` is retained; only a non-leading `.` component is dropped.
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/../.' }), 'a/profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/..' }), 'a/profiles');
-  assert.equal(profilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a//.' }), 'profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/../.' }), 'a/profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a/..' }), 'a/profiles');
+  assert.equal(unixProfilesDir({ EXTERNAL_SUBAGENT_CONFIG: 'a//.' }), 'profiles');
 });
 
 test('N5: candidate paths do not fold symlink/.. (daemon DirEntry::path() equivalence)', { skip: process.platform === 'win32' }, () => {

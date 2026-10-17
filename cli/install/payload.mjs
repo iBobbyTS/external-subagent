@@ -4,7 +4,7 @@ import { CliError } from '../errors.mjs';
 import { sha256 } from '../fs-atomic.mjs';
 import { NATIVE_DIR_NAME, PRODUCT_NAME } from '../constants.mjs';
 import {
-  NATIVE_PLATFORMS, cliVersion, nativePayloadDir, nativePlatform, packageVersion, payloadManifestPath,
+  NATIVE_PLATFORMS, cliVersion, nativePayloadDir, nativePlatform, packageRoot, packageVersion,
 } from './layout.mjs';
 
 const MH_MAGIC_64 = 0xfeedfacf;
@@ -24,10 +24,35 @@ const EM_X86_64 = 0x3e;
 const ELF_E_MACHINE_OFFSET = 18;
 const ELF_HEADER_MIN_BYTES = ELF_E_MACHINE_OFFSET + 2;
 
+// PE/COFF identity for the Windows payload:
+//   DOS header       "MZ"
+//   e_lfanew         uint32 LE at offset 0x3c (offset of the PE signature)
+//   PE signature     "PE\0\0"
+//   Machine          uint16 LE at peOffset + 4 (0x8664 = IMAGE_FILE_MACHINE_AMD64)
+//   Optional magic   uint16 LE at peOffset + 24 (0x20b = PE32+)
+// The image is a supported win32-x64 payload only when all four agree; any
+// truncated header or other machine/format returns null.
+const DOS_MAGIC = 0x5a4d; // "MZ"
+const PE_SIGNATURE = 0x00004550; // "PE\0\0" as a LE uint32
+const IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+const PE32_PLUS_MAGIC = 0x20b;
+const PE_SIGNATURE_OFFSET = 0x3c;
+const PE_HEADER_MIN_BYTES = PE_SIGNATURE_OFFSET + 4 + 20 + 2;
+
 export function machoArch(bytes) {
   if (bytes.length < 8) return null;
   if (bytes.readUInt32LE(0) !== MH_MAGIC_64) return null;
   return bytes.readUInt32LE(4) === CPU_TYPE_ARM64 ? 'arm64' : null;
+}
+
+export function peArch(bytes) {
+  if (bytes.length < PE_HEADER_MIN_BYTES) return null;
+  if (bytes.readUInt16LE(0) !== DOS_MAGIC) return null;
+  const peOffset = bytes.readUInt32LE(PE_SIGNATURE_OFFSET);
+  if (peOffset + 4 + 20 + 2 > bytes.length) return null;
+  if (bytes.readUInt32LE(peOffset) !== PE_SIGNATURE) return null;
+  if (bytes.readUInt16LE(peOffset + 4) !== IMAGE_FILE_MACHINE_AMD64) return null;
+  return bytes.readUInt16LE(peOffset + 24) === PE32_PLUS_MAGIC ? 'x64' : null;
 }
 
 // The Linux image check mirrors machoArch: only a 64-bit little-endian x86-64
@@ -47,12 +72,27 @@ export function elfArch(bytes) {
 const IMAGE_CHECKS = Object.freeze({
   'darwin-arm64': { arch: 'arm64', image: 'Mach-O arm64 image', probe: machoArch },
   'linux-x64': { arch: 'x64', image: 'ELF x86-64 image', probe: elfArch },
+  'win32-x64': { arch: 'x64', image: 'PE32+ x86-64 image', probe: peArch },
 });
+
+// Payload verification knows how to validate the controlled win32-x64 artifact
+// even though NATIVE_PLATFORMS (the release gate, S04-owned) still excludes
+// Windows: nativePlatform() keeps returning null there, so win32-x64 is only
+// reachable through an explicit `platform` option.  This keeps the packaging
+// matrix exercisable without activating Windows distribution.
+const PAYLOAD_PLATFORMS = Object.freeze([...NATIVE_PLATFORMS, 'win32-x64']);
+
+function payloadDirectory(platform, root) {
+  if (root) return path.join(root, 'npm', NATIVE_DIR_NAME, platform);
+  return nativePayloadDir(platform)
+    ?? (PAYLOAD_PLATFORMS.includes(platform) ? path.join(packageRoot(), 'npm', NATIVE_DIR_NAME, platform) : null);
+}
 
 export function readPayloadManifest(options = {}) {
   const platform = options.platform || nativePlatform();
   const root = options.root || undefined;
-  const file = root ? path.join(root, 'npm', NATIVE_DIR_NAME, platform || '', 'payload.json') : payloadManifestPath(platform);
+  const dir = payloadDirectory(platform, root);
+  const file = dir === null ? null : path.join(dir, 'payload.json');
   if (file === null || !fs.existsSync(file)) {
     throw new CliError('PAYLOAD_MANIFEST_MISSING', `the ${platform || 'current'} platform payload manifest is missing from this package`);
   }
@@ -73,9 +113,15 @@ export function readPayloadManifest(options = {}) {
 // little-endian Mach-O arm64 image.  A failed verification is an installation
 // defect, never a silent downgrade path.
 export function verifyPayload(options = {}) {
-  const platform = options.platform || nativePlatform();
-  if (!NATIVE_PLATFORMS.includes(platform)) {
-    throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${platform ?? `${process.platform}-${process.arch}`}; supported platforms: ${NATIVE_PLATFORMS.join(', ')}`);
+  const explicitPlatform = options.platform !== undefined;
+  const platform = explicitPlatform ? options.platform : nativePlatform();
+  if (!PAYLOAD_PLATFORMS.includes(platform)) {
+    // The default resolver (nativePlatform) only produces the release tuples;
+    // win32-x64 is a controlled artifact reachable through an explicit option
+    // until S04 opens NATIVE_PLATFORMS.  The message must not claim the
+    // rejected host tuple is available by default.
+    const supported = explicitPlatform ? PAYLOAD_PLATFORMS : NATIVE_PLATFORMS;
+    throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${platform ?? `${process.platform}-${process.arch}`}; supported platforms: ${supported.join(', ')}`);
   }
   const image = IMAGE_CHECKS[platform];
   const manifest = readPayloadManifest({ platform, root: options.root });
@@ -91,7 +137,8 @@ export function verifyPayload(options = {}) {
   if (versions.package !== versions.cli || versions.payload !== versions.cli) {
     throw new CliError('PAYLOAD_VERSION_MISMATCH', `payload ${versions.payload}, package ${versions.package}, and CLI ${versions.cli} versions disagree`);
   }
-  const dir = options.root ? path.join(options.root, 'npm', NATIVE_DIR_NAME, platform) : nativePayloadDir(platform);
+  const dir = payloadDirectory(platform, options.root);
+  const posixMode = platform !== 'win32-x64' && process.platform !== 'win32';
   const files = manifest.files.map((record) => {
     if (!record || typeof record.name !== 'string' || path.basename(record.name) !== record.name || record.name.includes('..')) {
       throw new CliError('PAYLOAD_MANIFEST_INVALID', 'payload file name must be a direct child');
@@ -101,7 +148,10 @@ export function verifyPayload(options = {}) {
     try { stat = fs.statSync(target); } catch (error) {
       throw new CliError('PAYLOAD_FILE_MISSING', `native payload file is missing: ${record.name} (${error.code})`);
     }
-    if (!stat.isFile() || fs.lstatSync(target).isSymbolicLink() || (stat.mode & 0o777) !== 0o755) {
+    // Windows has no POSIX execute bit: npm extraction cannot produce mode 755
+    // and the PE loader does not consult one, so the mode gate applies only to
+    // the POSIX payload identities (and only on a POSIX host).
+    if (!stat.isFile() || fs.lstatSync(target).isSymbolicLink() || (posixMode && (stat.mode & 0o777) !== 0o755)) {
       throw new CliError('PAYLOAD_PERMISSIONS_INVALID', `native payload file ${record.name} must be a regular file with mode 755`);
     }
     const bytes = fs.readFileSync(target);
@@ -112,7 +162,7 @@ export function verifyPayload(options = {}) {
     if (arch !== image.arch) {
       throw new CliError('PAYLOAD_ARCH_UNSUPPORTED', `native payload file ${record.name} is not a ${image.image}`);
     }
-    return { name: record.name, bytes: bytes.length, mode: '755', sha256: record.sha256, arch };
+    return { name: record.name, bytes: bytes.length, mode: posixMode ? '755' : null, sha256: record.sha256, arch };
   });
   return { status: 'verified', platform, version: manifest.version, files };
 }
@@ -144,12 +194,12 @@ export function normalizePayloadMode(target) {
 // mode so the install step can report what it changed.
 export function normalizePayloadFiles(options = {}) {
   const platform = options.platform || nativePlatform();
-  if (!NATIVE_PLATFORMS.includes(platform)) return [];
+  // Windows has no POSIX mode to repair; the extraction/permission repair is a
+  // POSIX-payload concern only.
+  if (!PAYLOAD_PLATFORMS.includes(platform) || platform === 'win32-x64') return [];
   let manifest;
   try { manifest = readPayloadManifest({ platform, root: options.root }); } catch { return []; }
-  const dir = options.root
-    ? path.join(options.root, 'npm', NATIVE_DIR_NAME, platform)
-    : nativePayloadDir(platform);
+  const dir = payloadDirectory(platform, options.root);
   const normalized = [];
   for (const record of manifest.files) {
     if (!record || typeof record.name !== 'string' || path.basename(record.name) !== record.name || record.name.includes('..')) continue;

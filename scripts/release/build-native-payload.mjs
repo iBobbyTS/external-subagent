@@ -29,11 +29,19 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 // correct tuple everywhere (release: darwin-arm64, linux-x64) and an
 // unsupported host fails before touching the tree.  The debug variant reuses
 // the same tuple under its parallel native-debug directory.
-const platform = nativePlatform();
+//
+// win32-x64 is staged as a controlled test artifact before NATIVE_PLATFORMS
+// is opened for Windows (S04): the tuple is explicit here, never resolved by
+// nativePlatform(), so `npm pack` can build and inspect the Windows payload
+// on a real Windows host without activating distribution.  Windows cargo
+// output carries the `.exe` suffix, and the manifest records the same names.
+const platform = nativePlatform()
+  ?? ((process.platform === 'win32' && process.arch === 'x64') ? 'win32-x64' : null);
 if (platform === null) {
   process.stderr.write(`no native payload for ${process.platform}-${process.arch}\n`);
   process.exit(2);
 }
+const executableSuffix = platform === 'win32-x64' ? '.exe' : '';
 const variantIndex = process.argv.indexOf('--variant');
 const variant = variantIndex === -1 ? '' : (process.argv[variantIndex + 1] ?? '');
 if (variant !== '' && variant !== 'debug') {
@@ -51,9 +59,10 @@ if (cargoProfile !== 'release' && cargoProfile !== 'debug') {
 }
 const nativeDirName = isDebug ? 'native-debug' : 'native';
 const productName = isDebug ? 'external-subagent-debug' : 'external-subagent';
-const binaries = isDebug
+const binaries = (isDebug
   ? [['external-subagentd', 'external-subagent-debugd'], ['external-subagent-mcp', 'external-subagent-debug-mcp']]
-  : [['external-subagentd', 'external-subagentd'], ['external-subagent-mcp', 'external-subagent-mcp']];
+  : [['external-subagentd', 'external-subagentd'], ['external-subagent-mcp', 'external-subagent-mcp']])
+  .map(([source, name]) => [source, `${name}${executableSuffix}`]);
 const platformDir = path.join(packageRoot, 'npm', nativeDirName, platform);
 const manifestPath = path.join(platformDir, 'payload.json');
 const sourceRoots = ['crates', 'profiles'].map((dir) => path.join(packageRoot, dir))
@@ -121,7 +130,7 @@ if (build.status !== 0) {
 fs.mkdirSync(platformDir, { recursive: true });
 const files = [];
 for (const [source, name] of binaries) {
-  const sourcePath = path.join(packageRoot, 'target', cargoProfile, source);
+  const sourcePath = path.join(packageRoot, 'target', cargoProfile, `${source}${executableSuffix}`);
   if (!fs.existsSync(sourcePath)) {
     process.stderr.write(`${cargoProfile} binary missing: ${sourcePath}\n`);
     process.exit(1);
@@ -130,7 +139,15 @@ for (const [source, name] of binaries) {
   fs.copyFileSync(sourcePath, target);
   fs.chmodSync(target, 0o755);
   const bytes = fs.readFileSync(target);
-  files.push({ name, bytes: bytes.length, mode: '755', sha256: sha256(bytes) });
+  // The POSIX mode is part of the darwin/linux manifest contract (and the
+  // install verifier enforces it there).  Windows has no POSIX mode; omit the
+  // field instead of recording a meaningless "755".
+  files.push({
+    name,
+    bytes: bytes.length,
+    ...(executableSuffix === '' ? { mode: '755' } : {}),
+    sha256: sha256(bytes),
+  });
 }
 
 const manifest = { schema_version: 1, product: productName, version, platform };

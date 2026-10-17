@@ -98,7 +98,7 @@ test('Windows productPaths derives all 12 frozen fields and honors LOCALAPPDATA 
   assert.equal(injectedPaths.profiles, path.join(expectedInjectedData, 'profiles'));
 });
 
-test('win32 service dispatch seam fails closed without invoking getuid, launchctl, or systemctl', async () => {
+test('win32 service dispatch routes to the real SCM backend through the injectable sc.exe seam', async () => {
   const {
     bootstrapService,
     bootoutService,
@@ -125,84 +125,75 @@ test('win32 service dispatch seam fails closed without invoking getuid, launchct
     systemctl: () => { systemctlCalled = true; throw new Error('systemctl must not be called'); },
   };
 
+  const daemonPath = process.execPath; // a real, space-bearing Windows executable
+  const state = { registered: false, running: false, pid: 0 };
+  const calls = [];
+  const query = () => (!state.registered
+    ? { status: 1060, stdout: '' }
+    : {
+      status: 0,
+      stdout: [
+        'SERVICE_NAME: external-subagentd',
+        `        STATE              : ${state.running ? 4 : 1}  ${state.running ? 'RUNNING' : 'STOPPED'}`,
+        `        PID                : ${state.pid}`,
+        '',
+      ].join('\r\n'),
+    });
+  const sc = (args) => {
+    calls.push(args);
+    switch (args[0]) {
+      case 'queryex': return query();
+      case 'create': state.registered = true; state.binPath = args[3]; return { status: 0, stdout: '' };
+      case 'start': state.running = true; state.pid += 1; return { status: 0, stdout: '' };
+      case 'stop': state.running = false; return { status: 0, stdout: '' };
+      case 'delete': state.registered = false; state.running = false; return { status: 0, stdout: '' };
+      case 'qc': return state.registered
+        ? { status: 0, stdout: `        BINARY_PATH_NAME   : ${state.binPath}\r\n` }
+        : { status: 1060, stdout: '' };
+      default: throw new Error(`unexpected sc.exe call: ${args.join(' ')}`);
+    }
+  };
+  const options = { sc, daemonPath, ...controlSpies };
   const paths = productPaths('/home/winuser', { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32' });
 
   try {
-    // 1. bootstrapService rejects with UNSUPPORTED_PLATFORM_SERVICE
-    assert.throws(
-      () => bootstrapService(paths, undefined, controlSpies),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
-    );
+    // 1. installServiceDefinition renders the SCM definition without errors.
+    const definition = installServiceDefinition(paths, options);
+    assert.equal(definition.backend, 'scm');
+    assert.equal(definition.service, 'external-subagentd');
+    assert.match(definition.bin_path, /--database "[^"]*" --socket "[^"]*"/u);
+    assert.equal(calls.length, 0, 'rendering the definition does not mutate SCM');
 
-    // Also assert with default parameters (no uid or options passed) to verify lazy uid
-    assert.throws(
-      () => bootstrapService(paths),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
-    );
+    // 2. bootstrapService creates and starts the real SCM definition.
+    const boot = bootstrapService(paths, undefined, options);
+    assert.equal(boot.action, 'bootstrap');
+    assert.equal(boot.created, true);
+    assert.equal(boot.started, true);
+    const create = calls.find((call) => call[0] === 'create');
+    assert.ok(create, 'sc.exe create was issued');
+    assert.deepEqual(create.slice(0, 3), ['create', 'external-subagentd', 'binPath=']);
+    assert.equal(create[4], 'start=');
+    assert.equal(create[5], 'auto');
 
-    // 2. bootoutService rejects with UNSUPPORTED_PLATFORM_SERVICE
-    assert.throws(
-      () => bootoutService(paths, undefined, controlSpies),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
-    );
+    // 3. Read-only status parses the SCM registration.
+    const status = serviceRegistrationStatus(undefined, options);
+    assert.equal(status.query, 'available');
+    assert.equal(status.registered, true);
+    assert.equal(status.state, 'running');
 
-    assert.throws(
-      () => bootoutService(paths),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
-    );
+    // 4. bootoutService stops and deletes it.
+    const stopped = bootoutService(paths, undefined, { ...options, unloadTimeoutMs: 1000 });
+    assert.equal(stopped.removed, true);
 
-    // 3. installServiceDefinition rejects with UNSUPPORTED_PLATFORM_SERVICE
-    assert.throws(
-      () => installServiceDefinition(paths, controlSpies),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
-    );
-
-    // 4. activateService rejects with UNSUPPORTED_PLATFORM_SERVICE
+    // 5. activateService reaches the real SCM activation contract: with no
+    //    registration left it reports SERVICE_NOT_INSTALLED, never
+    //    UNSUPPORTED_PLATFORM_SERVICE.
     await assert.rejects(
-      async () => activateService(paths, { path: 'dummy' }, controlSpies),
-      (error) => {
-        assert.equal(error.code, 'UNSUPPORTED_PLATFORM_SERVICE');
-        assert.match(error.message, /^windows:.*pending real-machine implementation/u);
-        return true;
-      },
+      async () => activateService(paths, { path: 'dummy', sha256: 'dummy' }, options),
+      (error) => error.code === 'SERVICE_NOT_INSTALLED',
     );
 
-    // 5. serviceRegistrationStatus returns the unavailable view isomorphic to service-linux.mjs
-    const status = serviceRegistrationStatus(undefined, controlSpies);
-    assert.deepEqual(status, {
-      query: 'unavailable',
-      registered: null,
-      reason: 'windows: service integration pending real-machine implementation',
-    });
-
-    const statusDefault = serviceRegistrationStatus();
-    assert.deepEqual(statusDefault, {
-      query: 'unavailable',
-      registered: null,
-      reason: 'windows: service integration pending real-machine implementation',
-    });
-
-    // Verification: none of getuid, launchctl, or systemctl was ever called
+    // Verification: none of getuid, launchctl, or systemctl was ever called.
     assert.equal(getuidCalled, false, 'process.getuid was unexpectedly called');
     assert.equal(launchctlCalled, false, 'launchctl was unexpectedly called');
     assert.equal(systemctlCalled, false, 'systemctl was unexpectedly called');

@@ -134,7 +134,7 @@ export function productPaths(home = os.homedir(), env = process.env) {
 // separators and any `.` component that is not the first, so a trailing `.` is
 // not a component of its own: `a/.` has parent `Some("")`, `a/b/.` has parent
 // `Some("a")`, and `/.` is the root with no parent (`None`). `..` is retained.
-function rustPathParent(value) {
+function rustPathParentUnix(value) {
   if (value === '') return null;
   let end = value.length;
   for (;;) {
@@ -163,6 +163,107 @@ function joinProfiles(parent) {
   return `${parent}/profiles`;
 }
 
+// ---------------------------------------------------------------------------
+// Windows twin of the two helpers above.
+//
+// Rust compiles `std::path` against the TARGET platform's grammar, so the
+// daemon running on Windows reads config paths as Win32 paths: both `\` and
+// `/` are separators, a Disk/UNC/Verbatim prefix is part of the path, and
+// `Path::parent()` never returns a parent for a root.  The functions below are
+// derived case-by-case from real `Path::parent()` / `Path::join("profiles")`
+// output on Windows (see tests/platform/windows-paths.test.mjs); they preserve
+// the original bytes (mixed separators included) and never lexically fold
+// `..`, exactly like the Unix implementation above.
+//
+// The Unix helpers stay untouched: `profilesDir` selects the pair by the same
+// process-platform seam that selects the product layout.
+function isWindowsSeparator(char) {
+  return char === '\\' || char === '/';
+}
+
+// Prefix grammar (the subset the product can encounter):
+//   VerbatimDisk   \\?\C:
+//   VerbatimUNC    \\?\UNC\server\share
+//   Verbatim       \\?\...
+//   UNC            \\server\share        (requires both components)
+//   Disk           C:
+// A path with fewer UNC components (`\\server`, `//foo`) is NOT a prefix in
+// Rust: the leading separator is the root instead.
+function windowsPrefixEnd(value) {
+  if (value.startsWith('\\\\?\\') || value.startsWith('//?/')) {
+    let index = 4;
+    if (value.slice(index, index + 3).toUpperCase() === 'UNC'
+      && index + 3 < value.length && isWindowsSeparator(value[index + 3])) {
+      index += 4;
+      // server
+      while (index < value.length && !isWindowsSeparator(value[index])) index += 1;
+      while (index < value.length && isWindowsSeparator(value[index])) index += 1;
+      // share
+      while (index < value.length && !isWindowsSeparator(value[index])) index += 1;
+      return index;
+    }
+    if (index + 1 < value.length && /[A-Za-z]/u.test(value[index]) && value[index + 1] === ':') {
+      return index + 2;
+    }
+    return 4;
+  }
+  if (value.length >= 2 && isWindowsSeparator(value[0]) && isWindowsSeparator(value[1])) {
+    let index = 2;
+    const serverStart = index;
+    while (index < value.length && !isWindowsSeparator(value[index])) index += 1;
+    if (index === serverStart) return 0; // repeated separator: root-relative
+    while (index < value.length && isWindowsSeparator(value[index])) index += 1;
+    const shareStart = index;
+    while (index < value.length && !isWindowsSeparator(value[index])) index += 1;
+    if (index === shareStart) return 0; // no share: not a UNC prefix
+    return index;
+  }
+  if (value.length >= 2 && /[A-Za-z]/u.test(value[0]) && value[1] === ':') return 2;
+  return 0;
+}
+
+function windowsComponents(value, start) {
+  const components = [];
+  let index = start;
+  while (index < value.length) {
+    while (index < value.length && isWindowsSeparator(value[index])) index += 1;
+    if (index >= value.length) break;
+    const componentStart = index;
+    while (index < value.length && !isWindowsSeparator(value[index])) index += 1;
+    // Rust's Path::components drops a non-leading "." (a leading "." with no
+    // prefix/root is CurDir and stays a component).
+    if (value.slice(componentStart, index) === '.' && componentStart !== 0) continue;
+    components.push({ start: componentStart, end: index });
+  }
+  return components;
+}
+
+function rustPathParentWindows(value) {
+  if (value === '') return null;
+  const prefixEnd = windowsPrefixEnd(value);
+  let rootEnd = prefixEnd;
+  if (rootEnd < value.length && isWindowsSeparator(value[rootEnd])) rootEnd += 1;
+  const components = windowsComponents(value, rootEnd);
+  if (components.length === 0) return null; // root, prefix-only, and empty paths
+  if (components.length === 1) return rootEnd === 0 ? '' : value.slice(0, rootEnd);
+  return value.slice(0, components[components.length - 2].end);
+}
+
+// Platform-selected Rust `Path::parent()` (the target platform's grammar, not
+// the host JS module's).  Exported so the path contract is directly testable
+// without going through the product layout.
+export function rustPathParent(value, currentPlatform = process.platform) {
+  return currentPlatform === 'win32' ? rustPathParentWindows(value) : rustPathParentUnix(value);
+}
+
+// Rust `Path::join` on Windows appends with `\`; a trailing separator (roots)
+// and a drive-relative `C:` prefix append directly.
+function joinProfilesWindows(parent) {
+  if (parent === '') return 'profiles';
+  if (/[\\/]$/u.test(parent) || /^[A-Za-z]:$/u.test(parent)) return `${parent}profiles`;
+  return `${parent}\\profiles`;
+}
+
 export function profilesDir(env = {}, home = os.homedir()) {
   const names = ['EXTERNAL_SUBAGENT_CONFIG', 'ZCODE_AGENT_CONFIG'];
   let envPath;
@@ -175,7 +276,8 @@ export function profilesDir(env = {}, home = os.homedir()) {
     }
   }
   if (!exported) return path.join(productPaths(home, env).data, 'profiles');
-  const parent = rustPathParent(envPath);
+  const windows = platform(env) === 'win32';
+  const parent = rustPathParent(envPath, platform(env));
   if (parent === null) return null;
-  return joinProfiles(parent);
+  return windows ? joinProfilesWindows(parent) : joinProfiles(parent);
 }

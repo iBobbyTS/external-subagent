@@ -104,12 +104,15 @@ export function runInit(options = {}) {
   const payload = skipPayload ? { status: 'skipped', platform: null, version: null, files: [] } : verifyPayload();
   const pathFindings = pathReport();
 
+  // Windows has no file-based service definition (paths.launchAgent is null),
+  // so there is nothing to snapshot or roll back there; the SCM registration
+  // is created by the start-service step instead.
   const tracked = {
     zcodeConfig: { file: paths.zcodeConfig, snapshot: snapshotFile(paths.zcodeConfig) },
     hookProvenance: { file: paths.hookProvenance, snapshot: snapshotFile(paths.hookProvenance) },
     state: { file: paths.state, snapshot: snapshotFile(paths.state) },
     config: { file: paths.config, snapshot: snapshotFile(paths.config) },
-    launchAgent: { file: paths.launchAgent, snapshot: snapshotFile(paths.launchAgent) },
+    ...(paths.launchAgent ? { launchAgent: { file: paths.launchAgent, snapshot: snapshotFile(paths.launchAgent) } } : {}),
   };
   const directories = {
     data: { path: paths.data, existed: fs.existsSync(paths.data) },
@@ -130,6 +133,19 @@ export function runInit(options = {}) {
   // A service that was already loaded before this init is never touched.
   let serviceLoadedByThisRun = false;
   let baseline = null;
+  // The service backends are selected by process platform.  Windows has no
+  // process.getuid(), and every backend treats an undefined uid as "not
+  // applicable", so resolve it lazily instead of crashing before dispatch.
+  const currentUid = () => (typeof process.getuid === 'function' ? process.getuid() : undefined);
+  // Forward the injectable control seams (launchctl/systemctl/sc) and the
+  // explicit daemon artifact so a test or a controlled activation can own the
+  // service definition without touching the real service manager.
+  const serviceOptions = () => ({
+    launchctl: options.launchctl,
+    systemctl: options.systemctl,
+    sc: options.sc,
+    daemonPath: options.daemonPath,
+  });
   try {
     if (!completed.has('verify-payload')) mark('verify-payload');
     if (!completed.has('check-path')) mark('check-path');
@@ -158,12 +174,12 @@ export function runInit(options = {}) {
       mark('write-product-config');
     }
     if (!completed.has('install-launch-agent')) {
-      installServiceDefinition(paths);
+      installServiceDefinition(paths, serviceOptions());
       failAt('install-launch-agent');
       mark('install-launch-agent');
     }
     if (!completed.has('start-service') && !options.skipServiceStart) {
-      service = bootstrapService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl });
+      service = bootstrapService(paths, currentUid(), serviceOptions());
       serviceLoadedByThisRun = !service.skipped && !service.already_loaded;
       mark('start-service');
     }
@@ -202,7 +218,7 @@ export function runInit(options = {}) {
       ...removeCreatedDirectories(directories),
     ];
     if (serviceLoadedByThisRun) {
-      try { bootoutService(paths, process.getuid(), { launchctl: options.launchctl, systemctl: options.systemctl }); } catch (bootoutError) {
+      try { bootoutService(paths, currentUid(), serviceOptions()); } catch (bootoutError) {
         rollbackErrors.push(`service rollback (bootout) failed: ${bootoutError.message}`);
       }
     }

@@ -26,23 +26,30 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { elfArch, machoArch } from '../../cli/install/payload.mjs';
+import { elfArch, machoArch, peArch } from '../../cli/install/payload.mjs';
 import { nativePlatform } from '../../cli/install/layout.mjs';
 
 const stagedOnly = process.argv.includes('--staged');
 const explicit = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : null;
 const dryRun = process.env.npm_config_dry_run === 'true';
 
-// Every platform the single release tarball ships, and the image identity each
+// A Windows host packs a CONTROLLED win32-x64 artifact (S03), not the
+// multi-platform release bundle: only the Windows payload is required and
+// checked.  macOS/Linux hosts keep the existing dual-platform release gate.
+const win32Controlled = nativePlatform() === null && process.platform === 'win32' && process.arch === 'x64';
+const hostPlatform = nativePlatform() ?? (win32Controlled ? 'win32-x64' : null);
+// Every platform the packed artifact carries, and the image identity each
 // payload must carry.  Keeping both lists here (rather than a fixed
-// darwin-arm64 path) is what makes the gate dual-platform.
-const RELEASE_PLATFORMS = Object.freeze(['darwin-arm64', 'linux-x64']);
-const BINARIES = Object.freeze(['external-subagentd', 'external-subagent-mcp']);
+// darwin-arm64 path) is what makes the gate multi-platform.
+const RELEASE_PLATFORMS = Object.freeze(win32Controlled ? ['win32-x64'] : ['darwin-arm64', 'linux-x64']);
+const binariesFor = (platform) => (platform === 'win32-x64'
+  ? Object.freeze(['external-subagentd.exe', 'external-subagent-mcp.exe'])
+  : Object.freeze(['external-subagentd', 'external-subagent-mcp']));
 const IMAGE_CHECKS = Object.freeze({
   'darwin-arm64': { describe: 'Mach-O arm64 executable', probe: machoArch, arch: 'arm64' },
   'linux-x64': { describe: 'ELF x86-64 executable', probe: elfArch, arch: 'x64' },
+  'win32-x64': { describe: 'PE32+ x86-64 executable', probe: peArch, arch: 'x64' },
 });
-const hostPlatform = nativePlatform();
 
 function findTarball() {
   if (explicit) return explicit;
@@ -87,10 +94,14 @@ if (!stagedOnly) {
     // rejected here (and by the --staged publish gate) before it can be
     // published.
     for (const platform of RELEASE_PLATFORMS) {
-      for (const name of [...BINARIES, 'payload.json']) required.push(`package/npm/native/${platform}/${name}`);
+      for (const name of [...binariesFor(platform), 'payload.json']) required.push(`package/npm/native/${platform}/${name}`);
     }
 
-    const listing = spawnSync('tar', ['-tzf', tgz], { encoding: 'utf8' });
+    // GNU tar (git-bash on Windows) reads a drive-letter path such as
+    // `C:\...` as a remote host.  A cwd-relative path is unambiguous on every
+    // platform and names the same file the pack just produced.
+    const tarArgument = path.relative(process.cwd(), path.resolve(tgz)) || tgz;
+    const listing = spawnSync('tar', ['-tzf', tarArgument], { encoding: 'utf8' });
     if (listing.status !== 0) {
       process.stderr.write(`cannot list tarball: ${listing.stderr}\n`);
       process.exit(1);
@@ -108,9 +119,9 @@ if (!stagedOnly) {
       if (forbidden.test(entry)) { process.stderr.write(`forbidden release material: ${entry}\n`); failed = true; }
     }
 
-    const packedPackage = JSON.parse(spawnSync('tar', ['-xzf', tgz, '-O', 'package/package.json'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).stdout);
+    const packedPackage = JSON.parse(spawnSync('tar', ['-xzf', tarArgument, '-O', 'package/package.json'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).stdout);
     for (const platform of RELEASE_PLATFORMS) {
-      const manifestText = spawnSync('tar', ['-xzf', tgz, '-O', `package/npm/native/${platform}/payload.json`], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).stdout;
+      const manifestText = spawnSync('tar', ['-xzf', tarArgument, '-O', `package/npm/native/${platform}/payload.json`], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).stdout;
       let manifest;
       try {
         manifest = JSON.parse(manifestText);
@@ -162,7 +173,7 @@ function checkStagedPlatform(platform) {
     failed = true;
   }
   const image = IMAGE_CHECKS[platform];
-  for (const name of BINARIES) {
+  for (const name of binariesFor(platform)) {
     const local = path.join(dir, name);
     let bytes;
     try {
@@ -176,8 +187,12 @@ function checkStagedPlatform(platform) {
       process.stderr.write(`${platform}/${name} is not a ${image.describe}\n`);
       failed = true;
     }
-    const mode = (fs.statSync(local).mode & 0o777).toString(8);
-    if (mode !== '755') { process.stderr.write(`${platform}/${name} has release mode ${mode}, expected 755\n`); failed = true; }
+    // Windows has no POSIX execute bit; the PE image check above is the
+    // executable identity there, exactly as verifyPayload reasons.
+    if (platform !== 'win32-x64') {
+      const mode = (fs.statSync(local).mode & 0o777).toString(8);
+      if (mode !== '755') { process.stderr.write(`${platform}/${name} has release mode ${mode}, expected 755\n`); failed = true; }
+    }
   }
 }
 

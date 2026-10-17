@@ -19,6 +19,12 @@ import {
 } from '../../cli/install/payload.mjs';
 import { preflightUpdate } from '../../cli/install/update.mjs';
 
+// Windows has no POSIX permission bits: fs.chmod cannot materialise 0755 or
+// 0775 there, so the extraction-mode repair/rejection contract is only
+// observable on a POSIX host.  The production path still runs (and is a no-op
+// for win32 payloads, which never enforce a mode).
+const POSIX_MODES = process.platform !== 'win32';
+
 function elfHeader() {
   const bytes = Buffer.alloc(64);
   Buffer.from([0x7f, 0x45, 0x4c, 0x46]).copy(bytes, 0);
@@ -85,7 +91,7 @@ function errorCode(fn) {
   return null;
 }
 
-test('normalizePayloadMode repairs a non-755 regular file and is a no-op at 755', () => {
+test('normalizePayloadMode repairs a non-755 regular file and is a no-op at 755', { skip: !POSIX_MODES }, () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'payload-mode-unit-'));
   try {
     const umaskExtract = path.join(dir, 'binary');
@@ -109,7 +115,7 @@ test('normalizePayloadMode repairs a non-755 regular file and is a no-op at 755'
   }
 });
 
-test('a 0775 linux-x64 payload is repaired before the strict verifier reads it', () => {
+test('a 0775 linux-x64 payload is repaired before the strict verifier reads it', { skip: !POSIX_MODES }, () => {
   const { root, dir } = makeRoot('linux-x64', { mode: 0o775 });
   try {
     assert.equal(errorCode(() => verifyPayload({ root, platform: 'linux-x64' })), 'PAYLOAD_PERMISSIONS_INVALID',
@@ -128,7 +134,7 @@ test('a 0775 linux-x64 payload is repaired before the strict verifier reads it',
   }
 });
 
-test('darwin-arm64 seam: a correctly-permissioned payload normalizes as a no-op', () => {
+test('darwin-arm64 seam: a correctly-permissioned payload normalizes as a no-op', { skip: !POSIX_MODES }, () => {
   const { root, dir } = makeRoot('darwin-arm64', { mode: 0o755 });
   try {
     const before = BINARIES.map((name) => mode(path.join(dir, name)));
@@ -141,7 +147,7 @@ test('darwin-arm64 seam: a correctly-permissioned payload normalizes as a no-op'
   }
 });
 
-test('darwin-arm64 seam: the same repair applies to a masked 0775 extraction', () => {
+test('darwin-arm64 seam: the same repair applies to a masked 0775 extraction', { skip: !POSIX_MODES }, () => {
   const { root, dir } = makeRoot('darwin-arm64', { mode: 0o775 });
   try {
     const normalized = normalizePayloadFiles({ root, platform: 'darwin-arm64' });
@@ -153,7 +159,7 @@ test('darwin-arm64 seam: the same repair applies to a masked 0775 extraction', (
   }
 });
 
-test('a non-payload regular file is repaired too, but a missing manifest is left to the verifier', () => {
+test('a non-payload regular file is repaired too, but a missing manifest is left to the verifier', { skip: !POSIX_MODES }, () => {
   const { root, dir } = makeRoot('linux-x64', { mode: 0o775 });
   try {
     fs.chmodSync(path.join(dir, 'payload.json'), 0o775);
@@ -175,7 +181,7 @@ test('a non-payload regular file is repaired too, but a missing manifest is left
   }
 });
 
-test('update preflight repairs a umask-masked candidate before it is verified', () => {
+test('update preflight repairs a umask-masked candidate before it is verified', { skip: !POSIX_MODES }, () => {
   const { root } = makeRoot('darwin-arm64', { mode: 0o775, version: '2.0.0' });
   try {
     const preflight = preflightUpdate({
