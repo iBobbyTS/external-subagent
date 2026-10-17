@@ -108,7 +108,10 @@ if (!stagedOnly) {
       process.stderr.write(`cannot list tarball: ${listing.stderr}\n`);
       process.exit(1);
     }
-    const entries = listing.stdout.split('\n').filter(Boolean);
+    // Windows' bundled System32 tar (libarchive bsdtar) lists entries with CRLF
+    // line endings while GNU tar writes LF; accept both so entry matching does
+    // not depend on which tar the host resolves.
+    const entries = listing.stdout.split(/\r?\n/).filter(Boolean);
 
     for (const entry of required) {
       if (!entries.includes(entry)) { process.stderr.write(`missing release entry: ${entry}\n`); failed = true; }
