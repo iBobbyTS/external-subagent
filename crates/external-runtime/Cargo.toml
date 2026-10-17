@@ -10,6 +10,18 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 # Integration-test executable only; native payload builds select daemon/mcp bins.
 [[bin]]
 name = "orphan-spawn-test"

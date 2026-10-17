@@ -1378,6 +1378,11 @@ fn cleanup_catalog_process(child: &mut Child, process_group: i32, grace: Duratio
     unsafe {
         let _ = libc::kill(-process_group, libc::SIGKILL);
     }
+    // Windows: drop the group's Job Object handle. With KILL_ON_JOB_CLOSE this
+    // atomically reaps every surviving member and releases the handle, which is
+    // the deterministic recovery the probe child cannot defer.
+    #[cfg(windows)]
+    let _ = external_runtime::release_process_group(process_group);
     let _ = child.wait();
 }
 
@@ -1972,7 +1977,14 @@ fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Durati
     let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                // The child exited on its own, so no kill is needed, but the
+                // Windows job handle registry entry still has to be dropped or
+                // the map grows once per verification in a long-running daemon.
+                #[cfg(windows)]
+                let _ = external_runtime::release_process_group(group);
+                return status.success();
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Ok(None) | Err(_) => {
                 cleanup_catalog_process(&mut child, group, Duration::from_millis(100));

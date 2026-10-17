@@ -3,6 +3,10 @@ mod detached;
 #[cfg(target_os = "macos")]
 pub use detached::{orphan_spawn_main, DetachedTestOptions, TestGate};
 
+/// Win32 Job Object process supervision (Windows only).
+#[cfg(windows)]
+mod win_job;
+
 use external_contract::{
     classify_lifecycle, encode, event_type, parse_line, LifecycleOrder, RequestEnvelope,
     ResponseEnvelope, WireId, WireMessage,
@@ -13,7 +17,7 @@ use std::fs;
 use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::sync::TryLockError;
 use std::{
     collections::HashMap,
@@ -36,18 +40,24 @@ pub static SPAWN_GATE: Mutex<()> = Mutex::new(());
 pub fn gated_spawn(command: &mut Command) -> io::Result<Child> {
     #[cfg(windows)]
     {
-        let _ = command;
-        // TODO(windows-real-machine): implement Job Object process supervisor on Windows
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "windows: runtime spawn pending real-machine implementation (Job Object)",
-        ));
+        // Windows holds the spawn gate through the whole suspended
+        // create/bind/resume sequence inside win_job::spawn_supervised.
+        win_job::spawn_supervised(command)
     }
     #[cfg(not(windows))]
     {
         let _gate = SPAWN_GATE.lock().unwrap_or_else(|e| e.into_inner());
         command.spawn()
     }
+}
+
+/// Kill and reap a child whose startup failed, releasing any Windows job
+/// binding so the registry never leaks a handle for an abandoned child.
+fn discard_started_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+    #[cfg(windows)]
+    let _ = win_job::release(child.id() as i32);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -388,14 +398,12 @@ impl Driver {
         let identity = match observe_process(child.id()) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                discard_started_child(&mut child);
                 return Err(error);
             }
         };
         if let Err(error) = validate_spawn_identity(child.id(), &identity) {
-            let _ = child.kill();
-            let _ = child.wait();
+            discard_started_child(&mut child);
             return Err(error);
         }
         Ok(StartedRuntime {
@@ -502,7 +510,7 @@ impl Driver {
             model,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn send_request(&self, method: &str, params: serde_json::Value) -> std::io::Result<WireId> {
         let id = i64::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
             .map_err(|_| io::Error::other("request id space exhausted"))?;
@@ -632,12 +640,48 @@ impl Driver {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn write_frame_before(&self, frame: &[u8], deadline: Instant) -> Result<(), RequestError> {
+        // Mirror the Unix arm: bound the stdin-mutex acquisition by the
+        // deadline, switch the pipe to nonblocking so a full buffer cannot
+        // block the driver thread, write under the deadline, then restore the
+        // pipe's blocking mode.
+        let input = loop {
+            remaining_before(deadline)?;
+            match self.stdin.try_lock() {
+                Ok(input) => break input,
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(RequestError::WriteFailed(
+                        "runtime stdin lock is poisoned".into(),
+                    ));
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let remaining = remaining_before(deadline)?;
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        };
+        remaining_before(deadline)?;
+        let stdin = match &*input {
+            RuntimeInput::Attached(stdin) => stdin,
+        };
+        let handle = win_job::stdin_handle(stdin);
+        let mut mode = win_job::NonblockingPipe::install(handle).map_err(request_write_error)?;
+        let write_result =
+            win_job::write_all_before(handle, frame, deadline).map_err(request_write_error);
+        let restore_result = mode.restore().map_err(request_write_error);
+        match (write_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn write_frame_before(&self, frame: &[u8], deadline: Instant) -> Result<(), RequestError> {
         let _ = (frame, deadline);
-        // TODO(windows-real-machine): implement timed write on Windows
         Err(RequestError::WriteFailed(
-            "windows: timed write pending real-machine implementation".into(),
+            "timed write is unsupported on this platform".into(),
         ))
     }
 
@@ -930,7 +974,7 @@ impl Driver {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn remaining_before(deadline: Instant) -> Result<Duration, RequestError> {
     deadline
         .checked_duration_since(Instant::now())
@@ -938,7 +982,7 @@ fn remaining_before(deadline: Instant) -> Result<Duration, RequestError> {
         .ok_or(RequestError::Timeout)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn request_write_error(error: io::Error) -> RequestError {
     if error.kind() == io::ErrorKind::TimedOut {
         RequestError::Timeout
@@ -1240,7 +1284,15 @@ fn signal_group(pgid: i32, signal: i32) -> io::Result<()> {
         }
         Err(error)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows has no killable signal numbers; both the TERM and KILL
+        // escalation steps terminate the supervised job. `target` was already
+        // validated above.
+        let _ = (target, signal);
+        win_job::terminate_group(pgid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (target, signal);
         Err(io::Error::new(
@@ -1265,13 +1317,16 @@ pub fn kill_group(pgid: i32) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        win_job::terminate_group(pgid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pgid;
-        // TODO(windows-real-machine): implement Job Object process-group termination on Windows
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "windows: process-group termination pending real-machine implementation (Job Object)",
+            "process-group termination is unsupported on this platform",
         ))
     }
 }
@@ -1291,14 +1346,36 @@ pub fn kill_process(pid: u32) -> io::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        win_job::terminate_process(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
-        // TODO(windows-real-machine): implement process termination on Windows
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "windows: process-group termination pending real-machine implementation (Job Object)",
+            "process termination is unsupported on this platform",
         ))
+    }
+}
+
+/// Release a supervised process group's resources.
+///
+/// On Windows this removes the group's Job Object handle from the registry and
+/// closes it; with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` that atomically reaps
+/// any surviving members, so it is the deterministic cleanup for catalog probe
+/// processes spawned directly through [`gated_spawn`]. Unix process groups need
+/// no such release (their cleanup is signal-based), so this is a no-op there.
+pub fn release_process_group(pgid: i32) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        win_job::release(pgid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pgid;
+        Ok(())
     }
 }
 
@@ -1518,7 +1595,17 @@ fn platform_observe_process_group(pgid: i32) -> io::Result<Vec<ProcessIdentity>>
     Ok(members)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+fn platform_observe_process(pid: u32) -> io::Result<ProcessIdentity> {
+    win_job::observe(pid)
+}
+
+#[cfg(windows)]
+fn platform_observe_process_group(pgid: i32) -> io::Result<Vec<ProcessIdentity>> {
+    win_job::observe_group(pgid)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn platform_observe_process(_pid: u32) -> io::Result<ProcessIdentity> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1526,7 +1613,7 @@ fn platform_observe_process(_pid: u32) -> io::Result<ProcessIdentity> {
     ))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn platform_observe_process_group(_pgid: i32) -> io::Result<Vec<ProcessIdentity>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1552,6 +1639,10 @@ fn drain_stderr(mut stderr: impl Read + Send + 'static, diagnostics: Arc<Mutex<V
 impl Drop for Driver {
     fn drop(&mut self) {
         let _ = self.stop();
+        // Closing the job handle reaps any descendant the graceful stop could
+        // not prove gone, so a dropped Driver never leaks its job binding.
+        #[cfg(windows)]
+        let _ = win_job::release(self.identity.pgid);
     }
 }
 
@@ -1845,6 +1936,7 @@ mod publication_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::sync::Barrier;
 
     #[test]
@@ -1930,6 +2022,7 @@ mod tests {
         assert!(parse_ndjson_line("not json").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ndjson_codec_skips_malformed_lines_and_keeps_reading() {
         let mut command = Command::new("sh");
@@ -1962,6 +2055,7 @@ mod tests {
         driver.stop_and_reap(Duration::from_millis(100)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn ndjson_codec_sends_plain_frames_without_a_jsonrpc_version() {
         let path = capture_path("ndjson-outbound");
@@ -1988,6 +2082,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn jsonrpc_codec_marks_outbound_frames_with_the_version_field() {
         let path = capture_path("jsonrpc-outbound");
@@ -2026,6 +2121,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn jsonrpc_driver_round_trips_through_a_real_child() {
         // A JSON-RPC 2.0 echo child: notifications are rebroadcast as updates
@@ -2097,6 +2193,7 @@ mod tests {
         flags.restore().unwrap();
     }
 
+    #[cfg(unix)]
     fn capture_path(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2108,6 +2205,7 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
     fn wait_for_file(path: &std::path::Path) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2211,6 +2309,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn dispatch_interleaved() {
         let mut c = Command::new("sh");
@@ -2227,6 +2326,7 @@ mod tests {
         d.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_and_child_exit_are_visible() {
         let mut c = Command::new("sh");
@@ -2250,6 +2350,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_is_idempotent_during_turn() {
         let mut c = Command::new("sh");
@@ -2260,6 +2361,7 @@ mod tests {
         d.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_line_is_classified_and_discarded() {
         let mut c = Command::new("sh");
@@ -2275,6 +2377,7 @@ mod tests {
         d.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn unterminated_oversized_line_is_bounded_and_closes_reader() {
         let mut c = Command::new("sh");
@@ -2289,8 +2392,10 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     const LARGE_FRAME_PAYLOAD_BYTES: usize = 2_300_000;
 
+    #[cfg(unix)]
     fn streaming_frame(delta: &str) -> String {
         serde_json::json!({
             "method": "session/event",
@@ -2299,6 +2404,7 @@ mod tests {
         .to_string()
     }
 
+    #[cfg(unix)]
     fn write_frame_file(label: &str, codec: FrameCodec) -> (std::path::PathBuf, Vec<String>) {
         let path = capture_path(label);
         let pad = "z".repeat(LARGE_FRAME_PAYLOAD_BYTES);
@@ -2322,6 +2428,7 @@ mod tests {
         (path, deltas.to_vec())
     }
 
+    #[cfg(unix)]
     fn assert_large_frames_are_delivered_in_order(codec: FrameCodec, label: &str) {
         let (path, deltas) = write_frame_file(label, codec);
         let mut c = Command::new("sh");
@@ -2355,16 +2462,19 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn zcode_strict_two_megabyte_frame_is_delivered_intact_and_in_order() {
         assert_large_frames_are_delivered_in_order(FrameCodec::ZcodeStrict, "strict-large-frame");
     }
 
+    #[cfg(unix)]
     #[test]
     fn jsonrpc_two_megabyte_frame_is_delivered_intact_and_in_order() {
         assert_large_frames_are_delivered_in_order(FrameCodec::JsonRpc2, "jsonrpc-large-frame");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ndjson_two_megabyte_frame_is_delivered_intact_and_in_order() {
         assert_large_frames_are_delivered_in_order(FrameCodec::Ndjson, "ndjson-large-frame");
@@ -2406,6 +2516,7 @@ mod tests {
         assert_eq!(bytes, MAX_NDJSON_LINE_BYTES + 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn oversized_frame_is_broadcast_to_every_subscriber_and_is_not_a_child_exit() {
         let release = capture_path("oversized-broadcast-release");
@@ -2451,6 +2562,7 @@ mod tests {
         std::fs::remove_file(release).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_exit_status_is_published_once() {
         let mut c = Command::new("sh");
@@ -2466,6 +2578,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn wait_race_does_not_lose_child_exit_wakeup() {
         // Exercise the boundary where the monitor publishes just as a caller
@@ -2487,6 +2600,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn out_of_order_lifecycle_keeps_transport_sequence() {
         let mut c = Command::new("sh");
@@ -2508,6 +2622,7 @@ mod tests {
         assert!(matches!(second, Inbound::Message(WireMessage::Event(_))));
     }
 
+    #[cfg(unix)]
     #[test]
     fn noisy_stderr_does_not_block_stdout_response() {
         let mut c = Command::new("sh");
@@ -2523,6 +2638,7 @@ mod tests {
         d.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn diagnostic_tail_is_live_and_retains_latest_bytes() {
         let mut command = Command::new("sh");
@@ -2551,6 +2667,7 @@ mod tests {
         driver.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn diagnostic_tail_is_bounded_to_latest_output_after_fast_exit() {
         let mut command = Command::new("sh");
@@ -2562,6 +2679,7 @@ mod tests {
         assert!(tail.bytes().all(|byte| byte == b'x'));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_utf8_diagnostics_remain_byte_bounded_and_keep_the_end() {
         let mut command = Command::new("sh");
@@ -2578,6 +2696,7 @@ mod tests {
         assert!(tail.ends_with("END"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn concurrent_waiters_are_correlated_while_events_are_broadcast() {
         let mut command = Command::new("sh");
@@ -2625,6 +2744,7 @@ mod tests {
         driver.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn timeout_cancel_duplicate_and_unknown_ids_cannot_complete_another_waiter() {
         let mut command = Command::new("sh");
@@ -2662,6 +2782,7 @@ mod tests {
         driver.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_ids_and_null_outcomes_cannot_complete_a_waiter() {
         let mut command = Command::new("sh");
@@ -2690,6 +2811,7 @@ mod tests {
         driver.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_exit_fails_all_pending_waiters() {
         let mut command = Command::new("sh");
@@ -2707,6 +2829,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn native_identity_is_complete_and_group_isolated() {
         let mut command = Command::new("sh");
@@ -2723,6 +2846,7 @@ mod tests {
         driver.stop().unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn malformed_or_reused_identity_is_rejected_before_signal_and_can_retry() {
         let malformed = ProcessIdentity {
@@ -2749,6 +2873,7 @@ mod tests {
         driver.stop_and_reap(Duration::from_millis(100)).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn persisted_identity_reaper_rejects_reuse_and_reaps_the_owned_group() {
         let mut command = Command::new("sh");
@@ -2767,6 +2892,7 @@ mod tests {
         assert!(observe_process_group(identity.pgid).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn persisted_identity_reaper_recovers_group_after_leader_exit() {
         let path = capture_path("persisted-orphan");
@@ -2789,6 +2915,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn concurrent_stop_callers_share_one_terminal_outcome() {
         let mut command = Command::new("sh");
@@ -2814,6 +2941,7 @@ mod tests {
             .is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn term_resistant_descendant_is_killed_with_owned_group() {
         let path = std::env::temp_dir().join(format!(
@@ -2840,6 +2968,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    #[cfg(unix)]
     fn wait_for_pid_file(path: &std::path::Path) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2901,5 +3030,237 @@ mod tests {
             kill_group(-1).unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    // -- Windows Job Object supervision oracle matrix ------------------------
+    //
+    // These cover spawn x {normal exit, kill_group, handle close, start_token
+    // mismatch} x {observe_process, observe_process_group, release}. Windows
+    // tests use `cmd.exe`/`powershell.exe` only, never a POSIX shell.
+
+    /// `cmd.exe` with a piped stdin blocks reading commands, giving a reliable
+    /// long-lived supervised child without depending on any external tool.
+    #[cfg(windows)]
+    fn windows_live_child() -> Child {
+        let mut command = Command::new("cmd.exe");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        gated_spawn(&mut command).unwrap()
+    }
+
+    /// A `cmd.exe /c powershell ...` tree that ignores stdin and stays alive.
+    #[cfg(windows)]
+    fn windows_deep_tree_command() -> Command {
+        let mut command = Command::new("cmd.exe");
+        command.args([
+            "/c",
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 600",
+        ]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    #[cfg(windows)]
+    fn wait_for_members(pgid: i32, expected: usize) -> Vec<ProcessIdentity> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let members = observe_process_group(pgid).unwrap();
+            if members.len() >= expected {
+                return members;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process group never reached {expected} members"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spawn_binds_a_job_and_observes_group_identity() {
+        let mut child = windows_live_child();
+        let pid = child.id();
+        let identity = observe_process(pid).unwrap();
+        assert!(identity.pid > 1);
+        assert_eq!(identity.pgid, identity.pid as i32);
+        assert_eq!(identity.uid, 0);
+        assert!(identity.start_token.starts_with("windows:creation_time:"));
+        // The identity is stable across observations.
+        assert_eq!(observe_process(pid).unwrap(), identity);
+
+        let members = observe_process_group(identity.pgid).unwrap();
+        assert!(members.iter().any(|member| member == &identity));
+        for member in &members {
+            assert_eq!(member.pgid, identity.pgid);
+            assert_eq!(member.uid, identity.uid);
+            assert!(!member.start_token.is_empty());
+        }
+
+        assert!(kill_group(identity.pgid).is_ok());
+        let _ = child.wait();
+        // TerminateJobObject removed every member from the job.
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+        // A second kill tolerates the already-gone group.
+        assert!(kill_group(identity.pgid).is_ok());
+        release_process_group(identity.pgid).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_observe_reports_a_missing_process_as_not_found() {
+        // A pid the system will not have allocated; observe stays a clean
+        // NotFound so the shared "leader is gone" branches keep working.
+        let error = observe_process(2_000_000_000).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_normal_exit_leaves_no_live_members() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/c", "exit", "0"]);
+        let mut child = gated_spawn(&mut command).unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !observe_process_group(pid).unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "group not empty after normal exit");
+            thread::sleep(Duration::from_millis(20));
+        }
+        release_process_group(pid).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_kill_helpers_terminate_and_tolerate_a_gone_target() {
+        let mut child = windows_live_child();
+        let pid = child.id();
+        assert!(kill_process(pid).is_ok());
+        let _ = child.wait();
+        // Subsequent kill returns Ok due to gone-process tolerance.
+        assert!(kill_process(pid).is_ok());
+        release_process_group(pid as i32).unwrap();
+
+        let mut grouped = windows_live_child();
+        let pgid = grouped.id() as i32;
+        assert!(kill_group(pgid).is_ok());
+        let _ = grouped.wait();
+        assert!(kill_group(pgid).is_ok());
+        release_process_group(pgid).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_kill_helpers_reject_invalid_targets() {
+        for pgid in [0, 1, -1] {
+            assert_eq!(
+                kill_group(pgid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "pgid {pgid} must be rejected"
+            );
+        }
+        assert_eq!(
+            kill_process(0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            observe_process(u32::MAX).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert!(validate_group_target(0).is_err());
+        assert!(validate_group_target(1).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_handle_close_reaps_descendants_like_a_daemon_crash() {
+        // node-free deep tree: cmd.exe (leader) -> powershell.exe (child).
+        let mut child = gated_spawn(&mut windows_deep_tree_command()).unwrap();
+        let pgid = child.id() as i32;
+        let members = wait_for_members(pgid, 2);
+        let descendant = members
+            .iter()
+            .find(|member| member.pid != pgid as u32)
+            .expect("a descendant must be assigned to the job")
+            .pid;
+
+        // Closing the job handle is what happens when the owning daemon dies:
+        // KILL_ON_JOB_CLOSE must reap the whole tree atomically.
+        release_process_group(pgid).unwrap();
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while observe_process(descendant).is_ok() {
+            assert!(Instant::now() < deadline, "descendant survived job close");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(observe_process_group(pgid).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_start_token_mismatch_is_rejected_before_any_signal() {
+        let mut child = windows_live_child();
+        let pid = child.id();
+        let identity = observe_process(pid).unwrap();
+
+        // A stale persisted identity (same pid, different creation time) is a
+        // reused pid: the reaper must refuse to signal, exactly as on Unix.
+        let mut reused = identity.clone();
+        reused.start_token.push_str(":reused");
+        let error =
+            stop_and_reap_persisted_process_group(&reused, Duration::from_millis(50)).unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        // The real process is untouched by the refused reaper.
+        assert_eq!(observe_process(pid).unwrap(), identity);
+
+        // The genuine identity still reaps the owned group.
+        stop_and_reap_persisted_process_group(&identity, Duration::from_millis(200)).unwrap();
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+        let _ = child.wait();
+        release_process_group(identity.pgid).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_driver_spawns_observes_and_reaps_a_supervised_group() {
+        let driver = Driver::spawn(windows_deep_tree_command()).unwrap();
+        let identity = driver.identity();
+        assert_eq!(identity.pgid, identity.pid as i32);
+        assert!(!identity.start_token.is_empty());
+        let members = wait_for_members(identity.pgid, 2);
+        assert!(members.iter().any(|member| member == &identity));
+
+        let outcome = driver.stop_and_reap(Duration::from_millis(500)).unwrap();
+        assert!(matches!(outcome, StopOutcome::Terminated(_)));
+        assert!(observe_process_group(identity.pgid).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_frame_before_bounds_backpressure_by_the_deadline() {
+        let driver = Driver::spawn(windows_deep_tree_command()).unwrap();
+        // A frame far larger than any pipe buffer cannot be consumed by a child
+        // that never reads stdin, so the bounded writer must return at the
+        // deadline instead of blocking the driver thread.
+        let payload = "x".repeat(1024 * 1024);
+        let started = Instant::now();
+        let result = driver.respond_before(
+            WireId::String("windows-backpressure".into()),
+            serde_json::json!({"payload": payload}),
+            Instant::now() + Duration::from_millis(80),
+        );
+        assert_eq!(result.unwrap_err(), RequestError::Timeout);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        driver.stop_and_reap(Duration::from_millis(500)).unwrap();
     }
 }

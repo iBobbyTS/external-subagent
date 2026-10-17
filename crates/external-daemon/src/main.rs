@@ -48,6 +48,79 @@ struct Config {
 const PRODUCTION_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(90);
 const PRODUCTION_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Windows console control handler. It only flips the shared shutdown flag
+/// (a single atomic store); the main loop owns the actual graceful shutdown, so
+/// no lock or allocation runs on the handler thread.
+#[cfg(windows)]
+mod console_control {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
+    };
+    use windows_sys::{
+        core::BOOL,
+        Win32::System::Console::{
+            SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
+            CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        },
+    };
+
+    static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+    pub(super) fn install(flag: Arc<AtomicBool>) {
+        let _ = SHUTDOWN.set(flag);
+        // Registering twice would double-register the same pointer; the daemon
+        // installs this exactly once from `main`.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
+
+    pub(super) unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+        match ctrl_type {
+            CTRL_C_EVENT
+            | CTRL_BREAK_EVENT
+            | CTRL_CLOSE_EVENT
+            | CTRL_LOGOFF_EVENT
+            | CTRL_SHUTDOWN_EVENT => {
+                if let Some(flag) = SHUTDOWN.get() {
+                    flag.store(true, Ordering::Release);
+                }
+                1
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Wiring check for the console control handler. A headless/agent session has
+/// no attachable console, so the real `GenerateConsoleCtrlEvent` delivery is
+/// verified manually; this pins the handler contract the OS invokes: every
+/// console event type flips the shared flag and acknowledges (returns TRUE) so
+/// the main loop, not the default handler, owns termination.
+#[cfg(all(test, windows))]
+mod console_control_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn console_events_flip_the_shutdown_flag_and_are_acknowledged() {
+        let flag = Arc::new(AtomicBool::new(false));
+        console_control::install(Arc::clone(&flag));
+        for event in [
+            windows_sys::Win32::System::Console::CTRL_C_EVENT,
+            windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+            windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT,
+        ] {
+            flag.store(false, Ordering::Release);
+            assert_eq!(unsafe { console_control::handler(event) }, 1);
+            assert!(flag.load(Ordering::Acquire));
+        }
+        // An unknown event is left to the next handler.
+        assert_eq!(unsafe { console_control::handler(0xFFFF_FFFF) }, 0);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__orphan-spawn")) {
         external_runtime::orphan_spawn_main();
@@ -58,9 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         signal_hook::flag::register(SIGINT, Arc::clone(&shutdown_requested))?;
         signal_hook::flag::register(SIGTERM, Arc::clone(&shutdown_requested))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // TODO(windows-real-machine: console ctrl handler)
+        console_control::install(Arc::clone(&shutdown_requested));
     }
     let config = parse_config()?;
     if let Some(path) = config.agent_config.as_ref() {
