@@ -264,3 +264,24 @@ The skipped JS tests are host-coupled POSIX fixtures (filesystem `*.sock`
 binds, systemd/launchd definitions, `chmod`-based failure injection, POSIX
 shebang fake CLIs) with explicit win32 skip reasons; darwin/linux CI keeps
 running them unchanged.
+
+## Main acceptance run (2026-10-17)
+
+The parent re-ran the acceptance independently (daemon started from the
+rebuilt binaries with an isolated acceptance config; probes through the public
+CLI; `--workspace` scope for hi probes; zcode policy environment staged by the
+shipped installer into an isolated temp home):
+
+| Agent | probe --hi | create -> wait -> result |
+|---|---|---|
+| codex 0.162.1 | local READY; auth/hi `not_probed` (by design) | `create` exit 0, session established (`thread/start` accepted the workspace); turn completion blocked by the machine's codex backend being unreachable — the local `codex_rosetta` proxy (`openai_base_url = http://127.0.0.1:57321/v1`) is not running, so codex retries forever (`Reconnecting... waiting for network` reproduced with bare `codex exec`). Not a product defect; rerun when the proxy is up. |
+| zcode 0.16.9 | local+auth+hi READY (isolated home, verifier exit 0) | **COMPLETED**, `final_text: "ACK"` (default model path, `plan` mode) |
+| agy 1.3.5 | local READY, hi READY (`--workspace` scope) | **COMPLETED**, `final_text: "ACK"` (`--model gemini-3.8-flash`) |
+
+A main-directed repair landed during this run and is committed (272af44):
+`canonical_general_repository` now projects the Windows verbatim prefix away
+(same family as the `--runtime` fix), which is what unblocked the codex
+`thread/start` cwd check. gpt-6-luna itself is not present in this machine's
+codex model catalog (the luna model is `gpt-5.6-luna`; the gpt-6 entry is
+`gpt-6-astra`) — the model name for the final codex turn needs the owner's
+confirmation once the proxy is running.
