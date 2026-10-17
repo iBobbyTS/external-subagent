@@ -2444,7 +2444,9 @@ mod admission_policy_tests {
     }
 
     fn scoped_task_count(store: &Store, repository: &Path) -> usize {
-        let repository = repository.canonicalize().unwrap();
+        // Persisted task identity uses the projected (non-verbatim) canonical
+        // workspace, so the query scope must use the same normalization.
+        let repository = external_core::canonical_general_repository(repository).unwrap();
         let repository = repository.to_string_lossy().into_owned();
         store
             .list_task_page(

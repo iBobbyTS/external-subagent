@@ -2250,7 +2250,7 @@ mod legacy_row_recovery_tests {
     fn legacy_active_row_without_intent_converges_to_result_invalid_and_stays_usable() {
         let directory = workspace("legacy-active-");
         let scheduler = open_scheduler(&directory);
-        let (repository, _scratch) = enqueue_legacy(&scheduler, &directory);
+        let (_repository, _scratch) = enqueue_legacy(&scheduler, &directory);
         scheduler
             .store()
             .claim_next("prior-owner", 10, 1)
@@ -2280,7 +2280,12 @@ mod legacy_row_recovery_tests {
             .enqueue_general(&fresh_manifest(&directory))
             .unwrap();
         assert_eq!(fresh.phase, TaskPhase::Queued);
-        assert_eq!(fresh.repository, Path::new(&repository).to_string_lossy());
+        let expected_repository =
+            external_core::canonical_general_repository(directory.path()).unwrap();
+        assert_eq!(
+            fresh.repository,
+            expected_repository.to_string_lossy().into_owned()
+        );
     }
 
     #[test]

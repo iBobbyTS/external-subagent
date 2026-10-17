@@ -327,7 +327,7 @@ pub fn canonical_general_repository(path: &Path) -> PreparationResult<PathBuf> {
             reason: "repository must be absolute".into(),
         });
     }
-    let canonical = fs::canonicalize(path)?;
+    let canonical = project_verbatim(fs::canonicalize(path)?);
     if !canonical.is_dir() {
         return Err(PreparationError::InvalidPath {
             path: canonical,
@@ -335,6 +335,32 @@ pub fn canonical_general_repository(path: &Path) -> PreparationResult<PathBuf> {
         });
     }
     Ok(canonical)
+}
+
+/// Strip the Windows verbatim prefix from a canonicalized path.
+///
+/// `fs::canonicalize` returns `\\?\C:\...` on Windows. The canonical workspace
+/// is handed to external processes (the codex app-server `thread/start` cwd,
+/// the agy `--workspace` argument) and persisted in task records, so it is
+/// projected back to the normal drive/UNC spelling. Non-Windows hosts keep the
+/// exact previous behavior; only the representation changes, not the target.
+fn project_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+            return PathBuf::from(format!("\\\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix("\\\\?\\") {
+            // Only drive-letter paths are projected. Device paths (`\\.\`) and
+            // other namespaces are deliberately left untouched.
+            let bytes = rest.as_bytes();
+            if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path
 }
 
 fn validate_manifest(manifest: &GeneralTaskManifest) -> PreparationResult<()> {
@@ -464,6 +490,26 @@ mod tests {
             PermissionMode::Edit.access_mode(),
             super::AccessMode::WorkspaceWrite
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_general_repository_projects_the_windows_verbatim_prefix() {
+        let repository = tempfile::tempdir().expect("repository");
+        let canonical = super::canonical_general_repository(repository.path())
+            .expect("canonical general repository");
+        let text = canonical.to_string_lossy();
+        assert!(
+            !text.starts_with("\\\\?\\"),
+            "workspace must not be a verbatim path: {text}"
+        );
+        let bytes = text.as_bytes();
+        assert!(
+            bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':',
+            "workspace must retain its drive-letter form: {text}"
+        );
+        assert!(canonical.is_absolute(), "workspace must be absolute: {text}");
+        assert!(canonical.is_dir(), "workspace must be a directory: {text}");
     }
 
     #[test]
