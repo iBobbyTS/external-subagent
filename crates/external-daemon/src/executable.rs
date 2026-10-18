@@ -11,7 +11,6 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
 
 /// The default extension set Windows uses when `PATHEXT` is absent/empty.
