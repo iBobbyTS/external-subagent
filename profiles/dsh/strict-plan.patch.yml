@@ -1,6 +1,6 @@
 # Applied after the user's DSH profile layer. Strict plan keeps observation
-# available but removes every 0.1.5-rc.1 tool entry that can write, execute,
-# spawn nested work, or load executable extensions.
+# available but removes every 0.2.0-rc.2 entry that can write, execute, spawn
+# nested work, load executable extensions, or mutate persistent configuration.
 
 - id: tool-bash
   disabled: true
@@ -24,6 +24,10 @@
   disabled: true
 - id: tool-workflow
   disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: ptc-runtime
+  disabled: true
 - id: tool-goal
   disabled: true
 - id: tool-ralph
@@ -33,7 +37,11 @@
     mode: read-only
 - id: skill-filesystem
   disabled: true
-- id: workflow-worker-thread
+- id: config-editor
+  disabled: true
+- id: plugin-manager
+  disabled: true
+- id: mcp-resources
   disabled: true
 - id: goal-round-driver
   disabled: true

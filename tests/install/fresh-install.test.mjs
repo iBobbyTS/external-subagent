@@ -512,7 +512,7 @@ test('installed daemon admits a dsh write manifest through the guarded manifest-
   const dshFs = path.join(dshPackage, 'node_modules', '@deepseek-ai', 'dsh-fs');
   fs.mkdirSync(path.join(dshPackage, 'bin'), { recursive: true });
   fs.mkdirSync(dshFs, { recursive: true });
-  fs.writeFileSync(path.join(dshPackage, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.1.5-rc.1' }));
+  fs.writeFileSync(path.join(dshPackage, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }));
   fs.writeFileSync(path.join(dshFs, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-fs' }));
   const runtime = path.join(dshPackage, 'bin', 'dsh-hi-probe.mjs');
   fs.copyFileSync(path.join(repoRoot, 'tests/fixtures/dsh-hi-probe.mjs'), runtime);
@@ -527,7 +527,7 @@ test('installed daemon admits a dsh write manifest through the guarded manifest-
     default_subagent: null,
     subagents: {
       zcode: { enabled: false, spawn_supported: false, default_model: null },
-      dsh: { enabled: true, spawn_supported: true, default_model: null, runtime_path: runtime, home: providerHome, profile: 'acp', version: '0.1.5-rc.1' },
+      dsh: { enabled: true, spawn_supported: true, default_model: null, runtime_path: runtime, home: providerHome, profile: 'acp', version: '0.2.0-rc.2' },
       codex: { enabled: false, spawn_supported: false, default_model: null, runtime_path: null, home: null, profile: null, version: null },
     },
   })}\n`);

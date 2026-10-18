@@ -66,10 +66,14 @@ pub const MANIFEST_BUILD_DISABLED_IDS: &[&str] = &[
     "tool-subagent-fork",
     "subagent",
     "tool-workflow",
+    "workflow-ptc",
+    "ptc-runtime",
+    "config-editor",
+    "plugin-manager",
+    "mcp-resources",
     "tool-goal",
     "tool-ralph",
     "skill-filesystem",
-    "workflow-worker-thread",
     "goal-round-driver",
     "subagent-spawn-in-process",
     "subagent-fork-in-process",
@@ -201,7 +205,7 @@ pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, Strin
 
 /// The daemon-tested DSH reference version. This is no longer a launch gate:
 /// the probe only proves the runtime starts and exposes a parseable version.
-pub const PINNED_DSH_VERSION: &str = "0.1.5-rc.1";
+pub const PINNED_DSH_VERSION: &str = "0.2.0-rc.2";
 
 /// Parse the version token from a successful `dsh --version` probe.
 ///
@@ -386,6 +390,26 @@ fn collect_probe(
     result
 }
 
+/// Fail closed when DSH reports a patch-application failure on stderr but still
+/// exits 0. DSH emits `dsh: [<path>] patch: entry "<id>" not found` for a
+/// missing patch row, which otherwise leaves the dump unpatched and silently
+/// widens the composition. A clean (or patch-less) dump writes nothing to
+/// stderr; benign single-line warnings are tolerated because they do not carry
+/// both markers.
+fn reject_patch_application_failure(stderr: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(stderr);
+    if let Some(line) = text
+        .lines()
+        .find(|line| line.contains("patch:") && line.contains("not found"))
+    {
+        return Err(format!(
+            "dsh patch application failed without a non-zero exit: {}",
+            line.trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Verify the actual user-composed build profile with the exact launch cwd,
 /// home and permission environment. Unsupported overrides fail before ACP starts.
 /// Prompt serialization is enforced separately by the daemon runtime owner.
@@ -407,6 +431,7 @@ pub fn preflight_build(launch: &DshLaunch) -> Result<(), String> {
     if !output.status.success() {
         return Err("dsh build dump-config failed".into());
     }
+    reject_patch_application_failure(&output.stderr)?;
     validate_build_dump(
         &validate_dump_config_yaml(&String::from_utf8_lossy(&output.stdout))?,
         &launch.workspace,
@@ -555,6 +580,7 @@ pub fn preflight(launch: &DshLaunch) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
+    reject_patch_application_failure(&out.stderr)?;
     let value = validate_dump_config_yaml(&String::from_utf8_lossy(&out.stdout))?;
     validate_dump_policy(&value)
 }
@@ -573,10 +599,14 @@ const DANGEROUS: &[&str] = &[
     "subagent-spawn-in-process",
     "subagent-fork-in-process",
     "tool-workflow",
+    "workflow-ptc",
+    "ptc-runtime",
     "tool-goal",
     "tool-ralph",
     "skill-filesystem",
-    "workflow-worker-thread",
+    "config-editor",
+    "plugin-manager",
+    "tool-plugin-manager",
     "goal-round-driver",
 ];
 
@@ -598,6 +628,8 @@ const ALLOWED_ENABLED: &[&str] = &[
     "jobs",
     "llm-retry",
     "settings",
+    "authorization",
+    "deepseek-account",
     "credentials",
     "llm-pi-ai",
     "session-persistence-jsonl",
@@ -608,12 +640,14 @@ const ALLOWED_ENABLED: &[&str] = &[
     "storage-json",
     "storage-domain",
     "session-projection-cache",
+    "otel",
     "session-telemetry-otel",
     "permission",
     "shell-env",
     "fs-observation-policy",
     "agent-instructions",
     "skill",
+    "skill-badge",
     "commands",
     "command-feedback",
     "goal",
@@ -627,6 +661,8 @@ const ALLOWED_ENABLED: &[&str] = &[
     "spill-policy",
     "session-checkpoint-policy",
     "tool-result-pruner",
+    "image-offload",
+    "mcp-resources",
     "tool-todo",
     "repeat-tool-reminder",
     "web",
@@ -638,6 +674,7 @@ const ALLOWED_ENABLED: &[&str] = &[
     "agent-loop",
     "fs-sandbox",
     "llm-deepseek",
+    "llm-deepseek-account",
     "acp-app-startup",
     "acp",
     "subprocess",
@@ -1428,6 +1465,7 @@ pub fn preflight_build_manifest(launch: &DshLaunch, manifest: &[PathBuf]) -> Res
     if !output.status.success() {
         return Err("dsh manifest-build dump-config failed".into());
     }
+    reject_patch_application_failure(&output.stderr)?;
     validate_manifest_build_dump(
         &validate_dump_config_yaml(&String::from_utf8_lossy(&output.stdout))?,
         manifest,
@@ -1438,6 +1476,21 @@ pub fn preflight_build_manifest(launch: &DshLaunch, manifest: &[PathBuf]) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Captured from the installed `@deepseek-ai/dsh@0.2.0-rc.2` on
+    // 2026-10-17 with:
+    //   cd <empty workspace> && DSH_PERMISSION_MODE=workspace-write \
+    //     /opt/homebrew/bin/dsh --profile acp --dump-config
+    //   DSH_PERMISSION_MODE=read-only /opt/homebrew/bin/dsh --profile acp \
+    //     --patch profiles/dsh/strict-plan.patch.yml --dump-config
+    //   DSH_PERMISSION_MODE=workspace-write /opt/homebrew/bin/dsh --profile acp \
+    //     --patch <generated manifest-build patch> --dump-config
+    // The strict fixture's patch-header comment is path-normalized; the YAML
+    // data is otherwise byte-for-byte the captured output.
+    const BUILD_DUMP_020: &str = include_str!("../fixtures/dsh-0.2.0-rc.2-build.dump.yml");
+    const STRICT_DUMP_020: &str = include_str!("../fixtures/dsh-0.2.0-rc.2-strict-plan.dump.yml");
+    const MANIFEST_DUMP_020: &str =
+        include_str!("../fixtures/dsh-0.2.0-rc.2-manifest-build.dump.yml");
 
     fn temp_workspace() -> PathBuf {
         std::env::temp_dir()
@@ -1511,29 +1564,53 @@ mod tests {
 
     #[test]
     fn probed_version_is_parsed_without_comparing_the_pin() {
+        // AC4: the daemon-tested reference follows the captured 0.2.0-rc.2
+        // fixtures below.
+        assert_eq!(PINNED_DSH_VERSION, "0.2.0-rc.2");
         assert_eq!(
             parse_dsh_probed_version("dsh 0.2.0-rc.2").unwrap(),
-            "0.2.0-rc.2"
+            PINNED_DSH_VERSION
         );
+        // An older runtime still parses; nothing compares it to the pin.
         assert_eq!(
             parse_dsh_probed_version("0.1.5-rc.1\n").unwrap(),
-            PINNED_DSH_VERSION
+            "0.1.5-rc.1"
         );
         assert!(parse_dsh_probed_version("dsh").is_err());
     }
 
     /// Write a fake runtime script that answers `--version` with `version` and
-    /// `--dump-config` with `dump`, then returns its path.
+    /// `--dump-config` with `dump` (plus an optional stderr line), then returns
+    /// its path.
     #[cfg(unix)]
     fn fake_runtime(name: &str, version: &str, dump: Option<&str>) -> PathBuf {
+        fake_runtime_with_stderr(name, version, dump, None)
+    }
+
+    /// `fake_runtime` with DSH-observable stderr on the dump-config branch. The
+    /// exit status stays 0 so the guard, not the status check, must refuse it.
+    #[cfg(unix)]
+    fn fake_runtime_with_stderr(
+        name: &str,
+        version: &str,
+        dump: Option<&str>,
+        stderr: Option<&str>,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = temp_workspace().join(name);
+        let escape = |text: &str| {
+            text.replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('\'', "'\\''")
+        };
+        let stderr_branch = match stderr {
+            Some(stderr) => format!(" printf '%b\\n' '{}' >&2 ;", escape(stderr)),
+            None => String::new(),
+        };
         let dump_branch = match dump {
             Some(dump) => format!(
-                "  --dump-config) printf '%b\\n' '{}' ; exit 0 ;;\n",
-                dump.replace('\\', "\\\\")
-                    .replace('\n', "\\n")
-                    .replace('\'', "'\\''")
+                "  --dump-config){stderr_branch} printf '%b\\n' '{}' ; exit 0 ;;\n",
+                escape(dump)
             ),
             None => String::new(),
         };
@@ -1572,6 +1649,58 @@ mod tests {
 
         std::fs::remove_file(runtime).unwrap();
         std::fs::remove_file(patch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn patch_application_failure_on_stderr_fails_closed_despite_exit_zero() {
+        let patch = temp_workspace().join("dsh-patch-stderr.patch.yml");
+        std::fs::write(&patch, "- id: sandbox-policy\n").unwrap();
+        let valid_dump = "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask";
+        let mut launch = DshLaunch::new(None, temp_workspace(), None);
+        launch.profile = Some("acp".into());
+        launch.permission_mode = Some("read-only".into());
+        launch.patch = Some(patch.clone());
+
+        // The observed 0.2.0-rc.2 wording: the failing patch row is reported
+        // on stderr while the process still exits 0. The dump itself would
+        // validate, so only the guard can refuse it.
+        let runtime = fake_runtime_with_stderr(
+            "dsh-patch-silent-failure",
+            "0.2.0-rc.2",
+            Some(valid_dump),
+            Some(
+                "dsh: [/tmp/strict-plan.patch.yml] patch: entry \"workflow-worker-thread\" not found",
+            ),
+        );
+        launch.executable = Some(runtime.clone());
+        let error = preflight(&launch).unwrap_err();
+        assert!(error.contains("patch application failed"), "{error}");
+        assert!(error.contains("workflow-worker-thread"), "{error}");
+        std::fs::remove_file(runtime).unwrap();
+
+        // A benign non-patch stderr warning does not trip the guard.
+        let runtime = fake_runtime_with_stderr(
+            "dsh-patch-benign-stderr",
+            "0.2.0-rc.2",
+            Some(valid_dump),
+            Some("dsh: warning: deprecated profile field ignored"),
+        );
+        launch.executable = Some(runtime.clone());
+        preflight(&launch).expect("a benign stderr line must not refuse the launch");
+        std::fs::remove_file(runtime).unwrap();
+        std::fs::remove_file(patch).unwrap();
+    }
+
+    #[test]
+    fn patch_stderr_guard_matches_only_the_pinned_failure_shape() {
+        reject_patch_application_failure(b"").unwrap();
+        reject_patch_application_failure(b"dsh: warning: noisy but harmless\n").unwrap();
+        reject_patch_application_failure(b"dsh: [p] patch: applied\n").unwrap();
+        reject_patch_application_failure(b"dsh: entry not found\n").unwrap();
+        assert!(
+            reject_patch_application_failure(b"dsh: [p] patch: entry \"x\" not found\n").is_err()
+        );
     }
 
     #[test]
@@ -1933,6 +2062,26 @@ else:
             {"id": "approval", "config": {"policy": "ask"}},
         ]);
         validate_dump_policy(&serde_yaml::to_value(&shipped_root).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn captured_020_strict_dump_passes_the_policy_walk() {
+        let value = validate_dump_config_yaml(STRICT_DUMP_020).unwrap();
+        validate_dump_policy(&value).unwrap();
+    }
+
+    #[test]
+    fn captured_020_build_dump_passes_the_managed_controls() {
+        let value = validate_dump_config_yaml(BUILD_DUMP_020).unwrap();
+        validate_build_dump(&value, std::path::Path::new("/workspace")).unwrap();
+    }
+
+    #[test]
+    fn captured_020_manifest_build_dump_passes() {
+        let value = validate_dump_config_yaml(MANIFEST_DUMP_020).unwrap();
+        let manifest = [PathBuf::from("src/a.rs"), PathBuf::from("docs/")];
+        validate_manifest_build_dump(&value, &manifest, std::path::Path::new("/workspace"))
+            .unwrap();
     }
 
     #[test]

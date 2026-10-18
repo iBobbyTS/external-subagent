@@ -150,6 +150,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `configured` | boolean | 判断配置是否存在 | 无法区分未配置与已禁用 |
 | `enabled` | boolean | 判断配置是否允许使用 | 客户端只能通过失败获知禁用 |
 | `spawn_supported` | boolean | 判断此 subagent 配置是否支持启动 | 容易把可 probe 误当作可 spawn |
+| `version_mismatch` | object/null | 仅在 expected（dsh 为 daemon-tested 参考版本，其余为 `agents.<agent>.version`）与 observed 均已知且不等时出现；`instruction` 固定为字节精确的 `version mismatch, it may not work as expected` | 客户端无法在状态面看到版本差异；版本差异不阻止启动，仅作提示 |
 | `permission_modes` | PermissionMode[] | 选择该 subagent 支持的权限模式 | 只能尝试后报错；全局枚举不代表每个 subagent 都支持 |
 | `model_selection` | object | 描述模型选择能力 | 无法按 subagent 选择参数策略 |
 | `model_selection.supported` | boolean | 是否应传 spawn.model | 更容易触发不支持模型选择的错误 |
@@ -232,7 +233,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
-嵌入结果 `complete=true` 时已取得全部结果，不必重复 result，`instruction` 此时固定提示无进一步使用可调用 close 清理（`Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.`）；否则沿 `next_offset` 继续。
+嵌入结果 `complete=true` 时已取得全部结果，不必重复 result，`instruction` 此时固定提示无进一步使用可调用 close 清理（`Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.`）；否则沿 `next_offset` 继续。任务以失败终态结束且该 agent 的 expected/observed 版本不匹配时，`instruction` 同时包含字节精确的 `version mismatch, it may not work as expected`；成功任务或版本未知/一致时不出现该短语。
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`last_tool_calls` 跑了哪条指令、`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 
@@ -372,6 +373,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 |---|---|---|---|
 | `task` | PublicTask | 与读取的文本一起获得任务生命周期 | 单凭 null result 无法判断任务所处阶段 |
 | `result` | PublicResult/null | 终态文本；非终态为 null | 无法取得任务产物正文 |
+| `instruction` | string/null | 失败终态且版本不匹配时携带 `version mismatch, it may not work as expected`；其余情况为 null | 分页读取结果的调用方无法从结果面获知版本不匹配提示 |
 
 ## 13. 复用输出结构
 

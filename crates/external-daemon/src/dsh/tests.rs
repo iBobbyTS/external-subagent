@@ -348,13 +348,21 @@ case "$*" in
   disabled: true
 - id: tool-workflow
   disabled: true
+- id: workflow-ptc
+  disabled: true
+- id: ptc-runtime
+  disabled: true
 - id: tool-goal
   disabled: true
 - id: tool-ralph
   disabled: true
 - id: skill-filesystem
   disabled: true
-- id: workflow-worker-thread
+- id: config-editor
+  disabled: true
+- id: plugin-manager
+  disabled: true
+- id: mcp-resources
   disabled: true
 - id: goal-round-driver
   disabled: true

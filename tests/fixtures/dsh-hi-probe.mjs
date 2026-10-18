@@ -5,7 +5,7 @@ const home = process.env.DSH_HOME;
 const log = home && path.join(home, 'probe.jsonl');
 const record = (value) => fs.appendFileSync(log, JSON.stringify(value) + '\n');
 if (process.argv.includes('--version')) {
-  console.log('0.1.5-rc.1');
+  console.log('0.2.0-rc.2');
   process.exit(0);
 }
 const patchIndex = process.argv.indexOf('--patch');
@@ -96,7 +96,8 @@ if (dumpConfig) {
     const disabled = [
       'tool-bash', 'tool-pwsh', 'tool-jobs', 'tool-skill', 'tool-subagent-control',
       'tool-subagent-list-agents', 'tool-subagent', 'tool-subagent-fork', 'subagent',
-      'tool-workflow', 'tool-goal', 'tool-ralph', 'skill-filesystem', 'workflow-worker-thread',
+      'tool-workflow', 'workflow-ptc', 'ptc-runtime', 'tool-goal', 'tool-ralph',
+      'skill-filesystem', 'config-editor', 'plugin-manager', 'mcp-resources',
       'goal-round-driver', 'subagent-spawn-in-process', 'subagent-fork-in-process',
     ];
     console.log(JSON.stringify([

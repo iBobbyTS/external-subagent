@@ -58,7 +58,7 @@ const VERSION_B = (() => { const [major, minor, patch] = VERSION_A.split('.').ma
 const PLATFORM_DIR = path.join('npm', 'native', 'darwin-arm64');
 const DSH_RUNTIME = process.env.EXTERNAL_SUBAGENT_LIVE_DSH_RUNTIME || '/opt/homebrew/bin/dsh';
 const ZCODE_RUNTIME = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_RUNTIME || '/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs';
-const DSH_VERSION = process.env.EXTERNAL_SUBAGENT_LIVE_DSH_VERSION || '0.1.5-rc.1';
+const DSH_VERSION = process.env.EXTERNAL_SUBAGENT_LIVE_DSH_VERSION || '0.2.0-rc.2';
 const REAL_DSH_HOME = process.env.EXTERNAL_SUBAGENT_LIVE_DSH_BRIDGE || path.join(os.homedir(), '.dsh');
 const REAL_ZCODE_CONFIG = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_CONFIG_BRIDGE || path.join(os.homedir(), '.zcode', 'cli', 'config.json');
 

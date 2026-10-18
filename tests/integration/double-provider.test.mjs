@@ -94,7 +94,7 @@ function writeDualConfig(file) {
         runtime_path: '/opt/homebrew/bin/dsh',
         home: '/tmp/controlled-dsh-home',
         profile: 'acp',
-        version: '0.1.5-rc.1',
+        version: '0.2.0-rc.2',
       },
     },
   }));
@@ -355,7 +355,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
           runtime_path: dshRuntime,
           home: dshHome,
           profile: 'acp',
-          version: '0.1.5-rc.1',
+          version: '0.2.0-rc.2',
         },
       },
     }));
@@ -390,7 +390,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
 
     const dshLocal = jsonOut(cli(['agents', 'probe', 'dsh', '--local'])).evidence;
     assert.equal(dshLocal.local.state, 'READY');
-    assert.equal(dshLocal.local.version, '0.1.5-rc.1');
+    assert.equal(dshLocal.local.version, '0.2.0-rc.2');
 
     // Authenticated DSH hi through the bridged credentials.
     const dshHi = jsonOut(cli(['agents', 'probe', 'dsh', '--hi', '--workspace', wsDsh])).evidence;

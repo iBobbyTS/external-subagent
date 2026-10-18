@@ -815,7 +815,7 @@ pub(crate) mod wait_tests {
     #[test]
     fn failed_terminal_wait_appends_the_version_mismatch_instruction_from_a_probe() {
         use std::sync::atomic::Ordering;
-        let (_directory, service, id, probes) = version_fixture(Some("0.2.0-rc.2"));
+        let (_directory, service, id, probes) = version_fixture(Some("0.1.5-rc.1"));
         service
             .store
             .store_task_result(
@@ -853,7 +853,7 @@ pub(crate) mod wait_tests {
                 .latest("dsh")
                 .and_then(|evidence| evidence.local.version)
                 .as_deref(),
-            Some("0.2.0-rc.2")
+            Some("0.1.5-rc.1")
         );
 
         // The independent result path applies the same semantics.
@@ -881,7 +881,7 @@ pub(crate) mod wait_tests {
     fn successful_or_matched_tasks_never_carry_the_version_mismatch_instruction() {
         use std::sync::atomic::Ordering;
         for (outcome, observed, expected_probes) in [
-            (TaskOutcome::Completed, Some("0.2.0-rc.2"), 0),
+            (TaskOutcome::Completed, Some("0.1.5-rc.1"), 0),
             (TaskOutcome::Failed, Some(external_agent_dsh::profile::PINNED_DSH_VERSION), 1),
             (TaskOutcome::Failed, None, 1),
         ] {

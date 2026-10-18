@@ -597,7 +597,7 @@ test('enable rejects failed or incomplete observations without writing config', 
 });
 
 test('dsh enable records a differing observed version without rejecting it', async () => {
-  for (const required_version of ['0.1.5-rc.1', undefined]) {
+  for (const required_version of ['0.2.0-rc.2', undefined]) {
     const { paths } = fixture();
     const result = await subagentsCommand(paths, { operation: 'enable', subagent: 'dsh' }, {
       socket: '/socket', callDaemon: async () => ({
@@ -687,7 +687,7 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   const status = await callDaemon(daemon.socket, 'status', {});
   assert.ok((status.subagents ?? status.agents).every((entry) => !entry.enabled && !entry.spawn_supported));
   for (const entry of status.subagents ?? status.agents) {
-    assert.equal(entry.required_version, (entry.subagent ?? entry.agent) === 'dsh' ? '0.1.5-rc.1' : undefined);
+    assert.equal(entry.required_version, (entry.subagent ?? entry.agent) === 'dsh' ? '0.2.0-rc.2' : undefined);
   }
   await assert.rejects(() => spawnTask('zcode'), { code: 'agent_disabled' });
   const listed = await callDaemon(daemon.socket, 'list', { repository: workspace });
@@ -695,8 +695,8 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   const initialBytes = fs.readFileSync(paths.config, 'utf8');
   const observed = await subagentsCommand(paths, { operation: 'probe', subagent: 'dsh' }, options);
   assert.equal(observed.evidence.local.runtime_path, path.join(bin, 'dsh'));
-  assert.equal(observed.evidence.local.version, '0.1.5-rc.1');
-  assert.equal(observed.status.required_version, '0.1.5-rc.1');
+  assert.equal(observed.evidence.local.version, '0.2.0-rc.2');
+  assert.equal(observed.status.required_version, '0.2.0-rc.2');
   assert.equal(observed.status.local.runtime_path, path.join(bin, 'dsh'));
   assert.equal(observed.status.spawn_supported, false);
   assert.equal(fs.readFileSync(paths.config, 'utf8'), initialBytes, 'probe must never persist or promote');
@@ -711,7 +711,7 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   assert.match(dsh.message, /重启 daemon 后生效/);
   const saved = readConfig(paths.config).subagents.dsh;
   assert.deepEqual(saved, { enabled: true, spawn_supported: true, default_model: null,
-    runtime_path: path.join(bin, 'dsh'), home: providerHome, profile: 'acp', version: '0.1.5-rc.1' });
+    runtime_path: path.join(bin, 'dsh'), home: providerHome, profile: 'acp', version: '0.2.0-rc.2' });
   const bytes = fs.readFileSync(paths.config, 'utf8');
   await subagentsCommand(paths, parseSubagentsArgs(['enable', 'dsh']), options);
   assert.equal(fs.readFileSync(paths.config, 'utf8'), bytes, 'repeat enable preserves revision and bytes');

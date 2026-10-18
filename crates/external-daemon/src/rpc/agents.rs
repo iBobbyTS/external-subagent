@@ -1217,7 +1217,7 @@ mod admission_tests {
         dsh.profile = Some("acp".into());
 
         for (observed, expect_mismatch) in [
-            (Some("0.2.0-rc.2"), true),
+            (Some("0.1.5-rc.1"), true),
             (
                 Some(external_agent_dsh::profile::PINNED_DSH_VERSION),
                 false,
