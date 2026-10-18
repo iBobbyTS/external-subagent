@@ -11,11 +11,11 @@ use super::views::{
     AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
     AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentPermissionModeView,
     AgentScopeStatusView, AgentStatusView, AgentTransportSupportView, AgentTransportView,
-    ComponentStateView,
+    ComponentStateView, VersionMismatchView,
 };
 use crate::agent_status::{
     AgentEvidenceStore, AgentModelsInput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
-    ProbeScope, ScopeEvidence,
+    ProbeScope, ScopeEvidence, VERSION_MISMATCH_INSTRUCTION,
 };
 use std::{env, fs, path::Path};
 
@@ -45,9 +45,24 @@ pub(super) fn configured_agent_statuses(
         .map(|agent| {
             let entry = &config.subagents[agent];
             let observed = evidence.latest(agent);
+            let observed_version = observed
+                .as_ref()
+                .and_then(|evidence| evidence.local.version.as_deref());
+            let expected =
+                crate::agent_status::expected_version(agent, entry.version.as_deref());
+            let version_mismatch = crate::agent_status::version_mismatch(
+                expected.as_deref(),
+                observed_version,
+            )
+            .map(|mismatch| VersionMismatchView {
+                expected: mismatch.expected,
+                observed: mismatch.observed,
+                instruction: VERSION_MISMATCH_INSTRUCTION.into(),
+            });
             AgentStatusView {
                 agent: agent.into(),
                 required_version: required_version(agent),
+                version_mismatch,
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
@@ -70,6 +85,7 @@ pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
         .map(|agent| AgentStatusView {
             agent: agent.into(),
             required_version: required_version(agent),
+            version_mismatch: None,
             config_revision: 0,
             configured: false,
             enabled: false,
@@ -124,10 +140,12 @@ fn required_version(agent: &str) -> Option<String> {
 
 fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
     if agent == "dsh" {
+        // Version is advisory here: a persisted version difference never
+        // closes the dsh spawn gate. The remaining identity terms stay
+        // fail-closed.
         return entry.enabled
             && entry.spawn_supported
             && entry.profile.as_deref() == Some("acp")
-            && entry.version.as_deref() == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
             && entry
                 .runtime_path
                 .as_deref()
@@ -1105,7 +1123,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn dsh_admission_rejects_incomplete_persisted_identity() {
+    fn dsh_admission_ignores_the_persisted_version_but_keeps_the_identity_gate() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("runtime.exe");
         std::fs::write(&runtime, b"runtime").unwrap();
@@ -1138,11 +1156,110 @@ mod admission_tests {
             },
         };
         assert_eq!(resolve_admission(&input, &config).unwrap().agent, "dsh");
-        config.subagents.get_mut("dsh").unwrap().version = None;
+        // AC2: a version difference (or an absent version) never closes the
+        // spawn gate while the remaining identity terms hold.
+        for version in [None, Some("0.2.0-rc.2"), Some("9.9.9")] {
+            config.subagents.get_mut("dsh").unwrap().version = version.map(str::to_owned);
+            assert_eq!(
+                resolve_admission(&input, &config).unwrap().agent,
+                "dsh",
+                "{version:?}"
+            );
+        }
+        // The profile identity remains fail-closed.
+        config.subagents.get_mut("dsh").unwrap().profile = Some("unsafe".into());
         assert_eq!(
             resolve_admission(&input, &config).unwrap_err().code,
             RpcErrorCode::AgentUnsupported
         );
+    }
+
+    #[test]
+    fn dsh_spawn_support_is_independent_of_the_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime.exe");
+        std::fs::write(&runtime, b"runtime").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = std::fs::metadata(&runtime).unwrap().permissions();
+            mode.set_mode(0o755);
+            std::fs::set_permissions(&runtime, mode).unwrap();
+        }
+        let mut config = AgentConfigSnapshot::default();
+        let dsh = config.subagents.get_mut("dsh").unwrap();
+        dsh.enabled = true;
+        dsh.spawn_supported = true;
+        dsh.runtime_path = Some(runtime.to_string_lossy().into_owned());
+        dsh.profile = Some("acp".into());
+        for version in [None, Some("0.1.5-rc.1"), Some("0.2.0-rc.2")] {
+            dsh.version = version.map(str::to_owned);
+            assert!(effective_spawn_supported("dsh", dsh), "{version:?}");
+        }
+        // This local assertion is only the unknown-observed negative control:
+        // the evidence store has no cached evidence, so no advisory can be
+        // derived. The positive and matched derivation cases are covered by
+        // `dsh_status_derives_version_mismatch_from_evidence`.
+        let evidence = AgentEvidenceStore::new(None);
+        let status = configured_agent_statuses(&config, &evidence)
+            .into_iter()
+            .find(|status| status.agent == "dsh")
+            .unwrap();
+        assert!(status.version_mismatch.is_none());
+    }
+
+    #[test]
+    fn dsh_status_derives_version_mismatch_from_evidence() {
+        let mut config = AgentConfigSnapshot::default();
+        let dsh = config.subagents.get_mut("dsh").unwrap();
+        dsh.enabled = true;
+        dsh.spawn_supported = true;
+        dsh.profile = Some("acp".into());
+
+        for (observed, expect_mismatch) in [
+            (Some("0.2.0-rc.2"), true),
+            (
+                Some(external_agent_dsh::profile::PINNED_DSH_VERSION),
+                false,
+            ),
+            (None, false),
+        ] {
+            let evidence = AgentEvidenceStore::with_backend(std::sync::Arc::new(
+                crate::rpc::wait_tests::FixedLocalVersion {
+                    version: observed.map(str::to_owned),
+                    probes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+            ));
+            // Populate the store through the same probe path status consumes.
+            evidence.probe(
+                &crate::agent_status::AgentProbeInput {
+                    agent: "dsh".into(),
+                    through: crate::agent_status::ProbeLayer::Local,
+                    scope: crate::agent_status::ProbeScope::default(),
+                },
+                config.revision,
+            );
+            let status = configured_agent_statuses(&config, &evidence)
+                .into_iter()
+                .find(|status| status.agent == "dsh")
+                .unwrap();
+            match status.version_mismatch {
+                Some(mismatch) => {
+                    assert!(expect_mismatch, "{observed:?}");
+                    assert_eq!(
+                        mismatch.expected,
+                        external_agent_dsh::profile::PINNED_DSH_VERSION
+                    );
+                    assert_eq!(mismatch.observed, observed.unwrap());
+                    // AC3: the status projection carries the byte-exact phrase.
+                    assert_eq!(
+                        mismatch.instruction,
+                        "version mismatch, it may not work as expected"
+                    );
+                }
+                None => assert!(!expect_mismatch, "{observed:?}"),
+            }
+        }
     }
 
     fn codex_gate_config(directory: &std::path::Path) -> AgentConfigSnapshot {
@@ -2096,7 +2213,8 @@ pub(crate) mod admission_fixtures {
 
     /// Writes an on-disk agent configuration whose DSH entry satisfies the
     /// complete production spawn gate (enabled + spawn_supported + pinned
-    /// profile, version, and an executable absolute runtime).
+    /// profile and an executable absolute runtime). The persisted version is
+    /// recorded as evidence only; it is not a gate term.
     pub(crate) fn gated_dsh_config(default_model: Option<&str>) -> tempfile::TempDir {
         let root = admission_root("s04a-admission-config-");
         let runtime = root.path().join("dsh-runtime.exe");

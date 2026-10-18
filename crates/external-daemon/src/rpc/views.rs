@@ -60,6 +60,10 @@ pub struct AgentStatusView {
     pub agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required_version: Option<String>,
+    /// Present only when both the expected and observed runtime versions are
+    /// known and differ. `instruction` carries the byte-exact advisory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_mismatch: Option<VersionMismatchView>,
     pub config_revision: u64,
     pub configured: bool,
     pub enabled: bool,
@@ -71,6 +75,13 @@ pub struct AgentStatusView {
     pub local: AgentScopeStatusView,
     pub auth: AgentScopeStatusView,
     pub hi: AgentScopeStatusView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionMismatchView {
+    pub expected: String,
+    pub observed: String,
+    pub instruction: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -846,6 +857,7 @@ mod result_paging_tests {
             RpcSuccess::TaskResult {
                 task: task(),
                 result: Some(failed_result()),
+                instruction: None,
             },
         );
         let bytes = serde_json::to_vec(&response).unwrap();

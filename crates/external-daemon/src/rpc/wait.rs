@@ -3,7 +3,7 @@
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::errors::{map_store, RpcError, RpcErrorCode};
-use super::handlers::{failure_message_projection, RpcService};
+use super::handlers::{failure_message_projection, is_failure_outcome, RpcService};
 use super::types::{
     RpcResponse, RpcSuccess, TaskWaitQuery, MAX_PENDING_REQUESTS, MAX_REQUEST_ID_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
@@ -119,8 +119,24 @@ impl RpcService {
                 if let Some(page) = result_page.as_ref() {
                     dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
                 }
-                let instruction =
-                    wait_instruction(terminal, result_page.as_ref(), wake_request.as_ref());
+                // One bounded probe at most per terminal response; the same
+                // result is reused by page regeneration below.
+                let failure = result_page
+                    .as_ref()
+                    .map(|page| is_failure_outcome(page.outcome))
+                    .or_else(|| task.outcome.map(is_failure_outcome))
+                    .unwrap_or(false);
+                let version_mismatch = if terminal && failure {
+                    self.version_mismatch_instruction(&crate::task_agent(&task))
+                } else {
+                    None
+                };
+                let instruction = wait_instruction(
+                    terminal,
+                    result_page.as_ref(),
+                    wake_request.as_ref(),
+                    version_mismatch.as_deref(),
+                );
                 let mut response = RpcSuccess::TaskWait {
                     activity,
                     task: task_header_view(&task),
@@ -131,7 +147,7 @@ impl RpcService {
                     timed_out,
                     message_receipt,
                 };
-                bound_wait_result(&mut response)?;
+                bound_wait_result(&mut response, version_mismatch.as_deref())?;
                 return Ok(response);
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
@@ -145,14 +161,18 @@ fn wait_instruction(
     terminal: bool,
     result_page: Option<&TaskResultView>,
     wake_request: Option<&external_store::StoredPendingRequest>,
+    version_mismatch: Option<&str>,
 ) -> Option<String> {
     if terminal {
         return match result_page {
-            Some(result) => Some(terminal_result_instruction(result)),
-            None => Some(
-                "The task is finished; use external_subagent_result to read the stored result."
-                    .to_owned(),
-            ),
+            Some(result) => Some(terminal_result_instruction(result, version_mismatch)),
+            None => {
+                let body = "The task is finished; use external_subagent_result to read the stored result.";
+                Some(match version_mismatch {
+                    Some(note) => format!("{body} {note}"),
+                    None => body.to_owned(),
+                })
+            }
         };
     }
     match wake_request.map(|request| request.request_type.as_str()) {
@@ -172,9 +192,14 @@ fn wait_instruction(
 }
 
 /// The terminal instruction for the current page state. Regenerated after a
-/// last-resort page shortening so it always names the page's real cursor.
-fn terminal_result_instruction(result: &TaskResultView) -> String {
-    if result.complete {
+/// last-resort page shortening so it always names the page's real cursor. The
+/// version advisory is appended (never replacing the page guidance) so a
+/// failure keeps both its existing meaning and the byte-exact phrase.
+fn terminal_result_instruction(
+    result: &TaskResultView,
+    version_mismatch: Option<&str>,
+) -> String {
+    let body = if result.complete {
         "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
             .to_owned()
     } else {
@@ -182,6 +207,10 @@ fn terminal_result_instruction(result: &TaskResultView) -> String {
             "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
             result.next_offset.unwrap_or(result.offset)
         )
+    };
+    match version_mismatch {
+        Some(note) => format!("{body} {note}"),
+        None => body,
     }
 }
 
@@ -219,7 +248,10 @@ fn wake_pending_request(request: &external_store::StoredPendingRequest) -> bool 
 // so it never falsely reports a shortened page as complete or points at a
 // stale offset. Metadata that still exceeds the cap uses the transport's
 // Oversized response.
-fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
+fn bound_wait_result(
+    response: &mut RpcSuccess,
+    version_mismatch: Option<&str>,
+) -> Result<(), RpcError> {
     if wait_envelope_fits(response)? {
         return Ok(());
     }
@@ -265,7 +297,7 @@ fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
     // 3. Last resort: shorten the result page. The cursor comes from the
     //    original total/offset and the instruction is regenerated for the new
     //    page state.
-    if let Some((end, next_offset, complete)) = shrunk_result_page(&candidate) {
+    if let Some((end, next_offset, complete)) = shrunk_result_page(&candidate, version_mismatch) {
         if let RpcSuccess::TaskWait {
             result: Some(view),
             instruction,
@@ -275,7 +307,7 @@ fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
             view.final_text.truncate(end);
             view.next_offset = next_offset;
             view.complete = complete;
-            *instruction = Some(terminal_result_instruction(view));
+            *instruction = Some(terminal_result_instruction(view, version_mismatch));
         }
     }
     if !wait_envelope_fits(&candidate)? {
@@ -343,7 +375,10 @@ fn message_envelope_fits(base: &RpcSuccess, message: &str) -> bool {
 /// `total_bytes`/`offset` rather than by re-paging the already-paged text.
 /// Returns `None` when there is no page to shorten or even one character does
 /// not fit.
-fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>, bool)> {
+fn shrunk_result_page(
+    base: &RpcSuccess,
+    version_mismatch: Option<&str>,
+) -> Option<(usize, Option<usize>, bool)> {
     let RpcSuccess::TaskWait {
         result: Some(view), ..
     } = base
@@ -382,7 +417,7 @@ fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>, bool)>
             // state, so every probe must carry the instruction the real path
             // would emit for that candidate page (a complete->partial shrink
             // lengthens it, and the remaining slack can be a few bytes).
-            *instruction = Some(terminal_result_instruction(view));
+            *instruction = Some(terminal_result_instruction(view, version_mismatch));
         }
         wait_envelope_fits(&probe).unwrap_or(false)
     };
@@ -644,6 +679,247 @@ pub(crate) mod wait_tests {
             if let Err(error) = service.dispatch(method) {
                 assert!(!error.message.contains("daemon_draining"));
             }
+        }
+    }
+
+    /// A probe backend that reports a fixed local version on every probe. It
+    /// deliberately starts with an empty evidence store: the instruction path
+    /// must invoke the bounded probe itself instead of reading cached input.
+    /// Shared with the status-derivation tests in `rpc::agents`.
+    pub(crate) struct FixedLocalVersion {
+        pub(crate) version: Option<String>,
+        pub(crate) probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::agent_status::AgentProbeBackend for FixedLocalVersion {
+        fn probe(
+            &self,
+            input: &crate::agent_status::AgentProbeInput,
+        ) -> crate::agent_status::AgentProbeEvidence {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let scope = input.scope.clone();
+            let status = |reason: &str| crate::agent_status::ScopeEvidence {
+                runtime_path: None,
+                state: if self.version.is_some() {
+                    crate::agent_status::EvidenceState::Ready
+                } else {
+                    crate::agent_status::EvidenceState::Unavailable
+                },
+                scope: scope.clone(),
+                version: self.version.clone(),
+                checked_at_ms: 0,
+                reason: self.version.is_none().then(|| reason.to_owned()),
+            };
+            crate::agent_status::AgentProbeEvidence {
+                agent: input.agent.clone(),
+                config_revision: 0,
+                local: status("missing"),
+                auth: crate::agent_status::ScopeEvidence {
+                    runtime_path: None,
+                    state: crate::agent_status::EvidenceState::Unknown,
+                    scope: scope.clone(),
+                    version: None,
+                    checked_at_ms: 0,
+                    reason: Some("auth_not_probed".into()),
+                },
+                hi: crate::agent_status::ScopeEvidence {
+                    runtime_path: None,
+                    state: crate::agent_status::EvidenceState::Unknown,
+                    scope,
+                    version: None,
+                    checked_at_ms: 0,
+                    reason: Some("hi_not_probed".into()),
+                },
+            }
+        }
+    }
+
+    /// A fixture whose task carries a dsh admission identity and whose evidence
+    /// store probes a fixed observed version on demand.
+    fn version_fixture(
+        observed: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<RpcService>,
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("version-wait-")
+            .tempdir_in(root)
+            .unwrap();
+        let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+        let factory = CommandRuntimeFactory::new(|_: &TaskRecord| -> std::io::Result<Command> {
+            panic!("version fixture must never start a runtime")
+        });
+        let scheduler = Scheduler::new(
+            "version-wait-test",
+            store.clone(),
+            Arc::new(factory),
+            SchedulerConfig::default(),
+        )
+        .unwrap();
+        let manifest = GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(),
+            agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(),
+            permission_mode: Some(external_core::PermissionMode::Build),
+            prompt: "version wait fixture".into(),
+            write_manifest: vec![],
+        };
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest,
+                Some(external_core::AdmissionIdentity {
+                    agent: "dsh".into(),
+                    config_revision: 0,
+                    adapter_version: "fixture".into(),
+                    model: None,
+                    model_source: "native".into(),
+                    effort: None,
+                    developer_instructions: None,
+                }),
+            )
+            .unwrap();
+        let id = submitted.agent_id;
+        let claim = store.claim_next("version-wait-test", 10, 10).unwrap().unwrap();
+        store
+            .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
+            .unwrap();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let evidence = crate::agent_status::AgentEvidenceStore::with_backend(Arc::new(
+            FixedLocalVersion {
+                version: observed.map(str::to_owned),
+                probes: Arc::clone(&probes),
+            },
+        ));
+        (
+            directory,
+            Arc::new(
+                RpcService::new_with_service_generation_and_evidence(
+                    scheduler,
+                    store,
+                    "version-wait-fixture".into(),
+                    evidence,
+                )
+                .unwrap(),
+            ),
+            id,
+            probes,
+        )
+    }
+
+    #[test]
+    fn failed_terminal_wait_appends_the_version_mismatch_instruction_from_a_probe() {
+        use std::sync::atomic::Ordering;
+        let (_directory, service, id, probes) = version_fixture(Some("0.2.0-rc.2"));
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult {
+                    outcome: TaskOutcome::Failed,
+                    final_text: "boom".into(),
+                    partial: false,
+                },
+            )
+            .unwrap();
+        let RpcSuccess::TaskWait {
+            instruction,
+            result: Some(result),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap()
+        else {
+            panic!("expected terminal wait response")
+        };
+        assert_eq!(result.outcome, TaskOutcome::Failed);
+        let instruction = instruction.expect("terminal instruction");
+        assert!(
+            instruction.contains(crate::agent_status::VERSION_MISMATCH_INSTRUCTION),
+            "{instruction}"
+        );
+        // The existing close guidance is preserved next to the advisory.
+        assert!(instruction.contains("close this subagent"), "{instruction}");
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per response");
+        // The probed evidence is recorded for status reuse.
+        assert_eq!(
+            service
+                .agent_evidence
+                .latest("dsh")
+                .and_then(|evidence| evidence.local.version)
+                .as_deref(),
+            Some("0.2.0-rc.2")
+        );
+
+        // The independent result path applies the same semantics.
+        let RpcSuccess::TaskResult {
+            instruction,
+            result: Some(_),
+            ..
+        } = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: id,
+                offset: 0,
+                limit: MAX_RESULT_CHUNK_BYTES,
+            })
+            .unwrap()
+        else {
+            panic!("expected terminal result response")
+        };
+        assert_eq!(
+            instruction.as_deref(),
+            Some(crate::agent_status::VERSION_MISMATCH_INSTRUCTION)
+        );
+    }
+
+    #[test]
+    fn successful_or_matched_tasks_never_carry_the_version_mismatch_instruction() {
+        use std::sync::atomic::Ordering;
+        for (outcome, observed, expected_probes) in [
+            (TaskOutcome::Completed, Some("0.2.0-rc.2"), 0),
+            (TaskOutcome::Failed, Some(external_agent_dsh::profile::PINNED_DSH_VERSION), 1),
+            (TaskOutcome::Failed, None, 1),
+        ] {
+            let (_directory, service, id, probes) = version_fixture(observed);
+            service
+                .store
+                .store_task_result(
+                    &id,
+                    &TaskResult {
+                        outcome,
+                        final_text: "done".into(),
+                        partial: false,
+                    },
+                )
+                .unwrap();
+            let RpcSuccess::TaskWait { instruction, .. } = service
+                .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+                .unwrap()
+            else {
+                panic!("expected terminal wait response")
+            };
+            let instruction = instruction.expect("terminal instruction");
+            assert!(
+                !instruction.contains(crate::agent_status::VERSION_MISMATCH_INSTRUCTION),
+                "{outcome:?}/{observed:?}: {instruction}"
+            );
+            assert_eq!(probes.load(Ordering::SeqCst), expected_probes);
+            let RpcSuccess::TaskResult { instruction, .. } = service
+                .dispatch(RpcMethod::TaskResult {
+                    agent_id: id,
+                    offset: 0,
+                    limit: MAX_RESULT_CHUNK_BYTES,
+                })
+                .unwrap()
+            else {
+                panic!("expected terminal result response")
+            };
+            assert_eq!(instruction, None);
         }
     }
 
@@ -1934,7 +2210,7 @@ pub(crate) mod wait_tests {
     }
 
     fn terminal_instruction_for(result: &TaskResultView) -> String {
-        super::terminal_result_instruction(result)
+        super::terminal_result_instruction(result, None)
     }
 
     fn realistic_failure_detail() -> String {
@@ -2291,7 +2567,7 @@ pub(crate) mod wait_tests {
             } => view.final_text.clone(),
             _ => unreachable!(),
         };
-        bound_wait_result(&mut base).unwrap();
+        bound_wait_result(&mut base, None).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
@@ -2357,7 +2633,7 @@ pub(crate) mod wait_tests {
         }
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         assert!(envelope_bytes(&floor_probe) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base).unwrap();
+        bound_wait_result(&mut base, None).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
@@ -2400,7 +2676,7 @@ pub(crate) mod wait_tests {
             &original_instruction,
         );
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base).unwrap();
+        bound_wait_result(&mut base, None).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
@@ -2465,7 +2741,7 @@ pub(crate) mod wait_tests {
             } if view.complete && view.next_offset.is_none()
         ));
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base).unwrap();
+        bound_wait_result(&mut base, None).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             instruction,

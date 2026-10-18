@@ -158,14 +158,9 @@ pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
         ));
     }
     command.arg("--profile").arg(profile);
-    if let Some(version) = launch.version.as_deref() {
-        if version != PINNED_DSH_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unsupported DSH version",
-            ));
-        }
-    }
+    // `launch.version` is advisory evidence only: a version difference must
+    // never refuse a launch. The daemon reports it as a status/instruction
+    // advisory instead.
     if let Some(patch) = launch.patch.as_deref() {
         if !patch.is_absolute() || !patch.is_file() {
             return Err(io::Error::new(
@@ -204,19 +199,21 @@ pub fn validate_dump_config_yaml(input: &str) -> Result<serde_yaml::Value, Strin
     Ok(value)
 }
 
+/// The daemon-tested DSH reference version. This is no longer a launch gate:
+/// the probe only proves the runtime starts and exposes a parseable version.
 pub const PINNED_DSH_VERSION: &str = "0.1.5-rc.1";
 
-pub fn validate_dsh_version(output: &str) -> Result<(), String> {
-    let found = output
+/// Parse the version token from a successful `dsh --version` probe.
+///
+/// The preflight keeps probing `--version` to prove the runtime can start, but
+/// the observed version is advisory only: it is returned, never compared
+/// against [`PINNED_DSH_VERSION`].
+pub fn parse_dsh_probed_version(output: &str) -> Result<String, String> {
+    output
         .split_whitespace()
         .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))
-        .ok_or("dsh --version returned no version")?;
-    if found != PINNED_DSH_VERSION {
-        return Err(format!(
-            "unsupported dsh version {found}; expected {PINNED_DSH_VERSION}"
-        ));
-    }
-    Ok(())
+        .map(str::to_owned)
+        .ok_or_else(|| "dsh --version returned no version".to_owned())
 }
 
 /// Collect both pipes concurrently, retaining at most `cap` bytes per pipe.
@@ -403,7 +400,7 @@ pub fn preflight_build(launch: &DshLaunch) -> Result<(), String> {
     if !version.status.success() {
         return Err("dsh version probe failed".into());
     }
-    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let _probed_version = parse_dsh_probed_version(&String::from_utf8_lossy(&version.stdout))?;
     let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
     command.arg("--dump-config");
     let output = bounded_output(&mut command, Duration::from_secs(10), 1024 * 1024)?;
@@ -547,7 +544,7 @@ pub fn preflight(launch: &DshLaunch) -> Result<(), String> {
     if !version.status.success() {
         return Err("dsh version probe failed".into());
     }
-    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let _probed_version = parse_dsh_probed_version(&String::from_utf8_lossy(&version.stdout))?;
     let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
     command.arg("--dump-config");
     let out = bounded_output(&mut command, Duration::from_secs(10), 1024 * 1024)?;
@@ -1424,7 +1421,7 @@ pub fn preflight_build_manifest(launch: &DshLaunch, manifest: &[PathBuf]) -> Res
     if !version.status.success() {
         return Err("dsh version probe failed".into());
     }
-    validate_dsh_version(&String::from_utf8_lossy(&version.stdout))?;
+    let _probed_version = parse_dsh_probed_version(&String::from_utf8_lossy(&version.stdout))?;
     let mut command = resolve_launch(launch).map_err(|e| e.to_string())?;
     command.arg("--dump-config");
     let output = bounded_output(&mut command, Duration::from_secs(10), 1024 * 1024)?;
@@ -1488,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_profile_and_version_are_explicit_and_fail_closed() {
+    fn launch_profile_is_explicit_and_version_is_advisory() {
         let runtime = temp_workspace().join("runtime.mjs");
         std::fs::write(&runtime, "").unwrap();
         let mut launch = DshLaunch::new(Some(runtime), temp_workspace(), None);
@@ -1500,11 +1497,81 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
         assert!(args.windows(2).any(|pair| pair == ["--profile", "acp"]));
-        launch.version = Some("0.0.0".into());
-        assert!(resolve_launch(&launch).is_err());
+        // A version difference never refuses the launch.
+        for version in ["0.0.0", "0.2.0-rc.2", "999.999.999"] {
+            launch.version = Some(version.into());
+            assert!(resolve_launch(&launch).is_ok(), "{version}");
+        }
         launch.version = None;
+        assert!(resolve_launch(&launch).is_ok());
+        // The profile remains fail-closed.
         launch.profile = Some("unsafe".into());
         assert!(resolve_launch(&launch).is_err());
+    }
+
+    #[test]
+    fn probed_version_is_parsed_without_comparing_the_pin() {
+        assert_eq!(
+            parse_dsh_probed_version("dsh 0.2.0-rc.2").unwrap(),
+            "0.2.0-rc.2"
+        );
+        assert_eq!(
+            parse_dsh_probed_version("0.1.5-rc.1\n").unwrap(),
+            PINNED_DSH_VERSION
+        );
+        assert!(parse_dsh_probed_version("dsh").is_err());
+    }
+
+    /// Write a fake runtime script that answers `--version` with `version` and
+    /// `--dump-config` with `dump`, then returns its path.
+    #[cfg(unix)]
+    fn fake_runtime(name: &str, version: &str, dump: Option<&str>) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_workspace().join(name);
+        let dump_branch = match dump {
+            Some(dump) => format!(
+                "  --dump-config) printf '%b\\n' '{}' ; exit 0 ;;\n",
+                dump.replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('\'', "'\\''")
+            ),
+            None => String::new(),
+        };
+        let script = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --version) printf '%s\\n' '{version}'; exit 0 ;;\n{dump_branch}  esac\ndone\nexit 1\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preflight_accepts_a_version_difference_but_still_rejects_a_bad_dump() {
+        let patch = temp_workspace().join("dsh-version-tolerance.patch.yml");
+        std::fs::write(&patch, "- id: sandbox-policy\n").unwrap();
+        let valid_dump = "- id: sandbox-policy\n  config:\n    mode: read-only\n- id: approval\n  config:\n    policy: ask";
+
+        // A differing version passes; the dump is the only remaining gate.
+        let runtime = fake_runtime("dsh-version-tolerance-ok", "0.2.0-rc.2", Some(valid_dump));
+        let mut launch = DshLaunch::new(Some(runtime.clone()), temp_workspace(), None);
+        launch.profile = Some("acp".into());
+        launch.version = Some(PINNED_DSH_VERSION.into());
+        launch.permission_mode = Some("read-only".into());
+        launch.patch = Some(patch.clone());
+        preflight(&launch).expect("a version difference must not refuse the launch");
+        std::fs::remove_file(runtime).unwrap();
+
+        // The same differing version with a malformed dump still fails closed.
+        let runtime = fake_runtime("dsh-version-tolerance-bad", "0.2.0-rc.2", Some("[]"));
+        launch.executable = Some(runtime.clone());
+        let error = preflight(&launch).unwrap_err();
+        assert!(error.contains("sandbox-policy"), "{error}");
+
+        std::fs::remove_file(runtime).unwrap();
+        std::fs::remove_file(patch).unwrap();
     }
 
     #[test]

@@ -596,20 +596,20 @@ test('enable rejects failed or incomplete observations without writing config', 
   }
 });
 
-test('dsh enable rejects incompatible or absent daemon version requirements without writes', async () => {
-  const { paths } = fixture();
+test('dsh enable records a differing observed version without rejecting it', async () => {
   for (const required_version of ['0.1.5-rc.1', undefined]) {
-    await assert.rejects(() => subagentsCommand(paths, { operation: 'enable', subagent: 'dsh' }, {
+    const { paths } = fixture();
+    const result = await subagentsCommand(paths, { operation: 'enable', subagent: 'dsh' }, {
       socket: '/socket', callDaemon: async () => ({
         status: { required_version },
         evidence: { local: { state: 'READY', runtime_path: '/runtime/dsh', version: '9.9.9', scope: { home: '/runtime/home' } } },
       }),
-    }), (error) => {
-      assert.equal(error.code, 'agent_probe_failed');
-      assert.match(error.message, required_version ? /expected version 0\.1\.5-rc\.1, observed 9\.9\.9.*install/u : /required_version.*restart/u);
-      return true;
     });
-    assert.equal(fs.existsSync(paths.config), false);
+    assert.equal(result.subagent, 'dsh');
+    assert.deepEqual(readConfig(paths.config).subagents.dsh, {
+      enabled: true, spawn_supported: true, default_model: null,
+      runtime_path: '/runtime/dsh', home: '/runtime/home', profile: 'acp', version: '9.9.9',
+    });
   }
 });
 

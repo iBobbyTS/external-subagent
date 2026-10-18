@@ -73,6 +73,44 @@ impl Default for ProbeLayer {
     }
 }
 
+/// The byte-exact advisory shared by the status projection and failure
+/// instructions when the expected and observed runtime versions differ.
+pub const VERSION_MISMATCH_INSTRUCTION: &str = "version mismatch, it may not work as expected";
+
+/// The expected runtime version for one agent: the daemon-tested DSH reference
+/// for dsh, otherwise the persisted `agents.<agent>.version`. Absence means no
+/// expected version, so no mismatch can be reported.
+pub fn expected_version(agent: &str, configured: Option<&str>) -> Option<String> {
+    if agent == "dsh" {
+        Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into())
+    } else {
+        configured.map(str::to_owned)
+    }
+}
+
+/// A known expected/observed version pair that differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionMismatch {
+    pub expected: String,
+    pub observed: String,
+}
+
+/// The frozen mismatch semantics: a mismatch exists if and only if both sides
+/// are known and unequal. Any unknown side keeps the historical no-warning
+/// behavior (a failed probe never fabricates an advisory).
+pub fn version_mismatch(
+    expected: Option<&str>,
+    observed: Option<&str>,
+) -> Option<VersionMismatch> {
+    match (expected, observed) {
+        (Some(expected), Some(observed)) if expected != observed => Some(VersionMismatch {
+            expected: expected.to_owned(),
+            observed: observed.to_owned(),
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum EvidenceState {
@@ -227,6 +265,30 @@ impl AgentEvidenceStore {
 
     pub fn latest(&self, agent: &str) -> Option<AgentProbeEvidence> {
         self.latest.lock().unwrap().get(agent).cloned()
+    }
+
+    /// Run the existing bounded local probe once for a failure-path version
+    /// comparison and record the result so status can reuse the same evidence.
+    ///
+    /// This is the on-demand entry for terminal response construction: it does
+    /// not rely on a startup refresh (the automatic no-LLM refresh only runs
+    /// from `system_status`). A failed probe yields `None`, which means
+    /// "observed unknown" and therefore no advisory.
+    pub fn probe_local_version(&self, agent: &str, config_revision: u64) -> Option<String> {
+        let scope = self
+            .latest(agent)
+            .map(|previous| previous.local.scope)
+            .unwrap_or_default();
+        self.probe(
+            &AgentProbeInput {
+                agent: agent.to_owned(),
+                through: ProbeLayer::Local,
+                scope,
+            },
+            config_revision,
+        )
+        .local
+        .version
     }
 
     pub fn models(&self, input: &AgentModelsInput, config_revision: u64) -> AgentModelsOutput {

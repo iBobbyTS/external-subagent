@@ -242,12 +242,23 @@ pub struct PublicAgentStatus {
     pub configured: bool,
     pub enabled: bool,
     pub spawn_supported: bool,
+    /// Present only when the expected and observed versions are both known and
+    /// differ; `instruction` is the byte-exact advisory.
+    pub version_mismatch: Option<PublicVersionMismatch>,
     pub permission_modes: Vec<PublicAgentPermissionMode>,
     pub model_selection: PublicAgentModelSelectionCapability,
     pub effort_selection: PublicEffortSelectionCapability,
     pub local: PublicAgentScopeStatus,
     pub auth: PublicAgentScopeStatus,
     pub hi: PublicAgentScopeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicVersionMismatch {
+    pub expected: String,
+    pub observed: String,
+    pub instruction: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
@@ -339,6 +350,11 @@ impl From<AgentStatusView> for PublicAgentStatus {
             configured: value.configured,
             enabled: value.enabled,
             spawn_supported: value.spawn_supported,
+            version_mismatch: value.version_mismatch.map(|mismatch| PublicVersionMismatch {
+                expected: mismatch.expected,
+                observed: mismatch.observed,
+                instruction: mismatch.instruction,
+            }),
             permission_modes: value.permission_modes.into_iter().map(Into::into).collect(),
             model_selection: PublicAgentModelSelectionCapability {
                 supported: value.model_selection.supported,
@@ -640,6 +656,9 @@ pub struct AgentStateOutput {
 pub struct AgentResultOutput {
     pub task: PublicTask,
     pub result: Option<PublicResult>,
+    /// Present only for a failed terminal result whose runtime version differs
+    /// from the expected version; carries the byte-exact advisory.
+    pub instruction: Option<String>,
 }
 
 #[cfg(test)]
@@ -662,6 +681,7 @@ mod effort_projection_tests {
     fn status(agent: &str, supported: bool) -> AgentStatusView {
         AgentStatusView {
             required_version: None,
+            version_mismatch: None,
             agent: agent.into(),
             config_revision: 1,
             configured: true,
@@ -920,5 +940,97 @@ mod activity_projection_tests {
             invalid["last_tool_calls"] = calls;
             assert!(!validator.is_valid(&invalid));
         }
+    }
+}
+
+#[cfg(test)]
+mod version_mismatch_projection_tests {
+    use super::*;
+    use crate::rpc::{AgentTransportSupportView, AgentTransportView, VersionMismatchView};
+
+    fn status(version_mismatch: Option<VersionMismatchView>) -> AgentStatusView {
+        let scope = crate::rpc::AgentScopeStatusView {
+            runtime_path: None,
+            state: crate::rpc::ComponentStateView::Ready,
+            scope: crate::agent_status::ProbeScope::default(),
+            version: None,
+            checked_at_ms: None,
+            reason: None,
+        };
+        AgentStatusView {
+            agent: "dsh".into(),
+            required_version: Some(
+                external_agent_dsh::profile::PINNED_DSH_VERSION.into(),
+            ),
+            version_mismatch,
+            config_revision: 1,
+            configured: true,
+            enabled: true,
+            spawn_supported: true,
+            transport_support: AgentTransportSupportView {
+                transport: AgentTransportView::DshAcp,
+                probe: true,
+                spawn: true,
+            },
+            permission_modes: Vec::new(),
+            model_selection: crate::rpc::AgentModelSelectionCapabilityView {
+                supported: true,
+                mode: AgentModelSelectionModeView::CatalogToken,
+            },
+            effort_selection: crate::rpc::AgentEffortSelectionCapabilityView {
+                supported: true,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
+            },
+            local: scope.clone(),
+            auth: scope.clone(),
+            hi: scope,
+        }
+    }
+
+    #[test]
+    fn status_json_carries_the_byte_exact_phrase_only_for_a_known_mismatch() {
+        let mismatched = PublicAgentStatus::from(status(Some(VersionMismatchView {
+            expected: "0.1.5-rc.1".into(),
+            observed: "0.2.0-rc.2".into(),
+            instruction: crate::agent_status::VERSION_MISMATCH_INSTRUCTION.into(),
+        })));
+        let encoded = serde_json::to_string(&mismatched).unwrap();
+        assert!(
+            encoded.contains(
+                "\"instruction\":\"version mismatch, it may not work as expected\""
+            ),
+            "{encoded}"
+        );
+        assert!(encoded.contains("\"expected\":\"0.1.5-rc.1\""));
+        assert!(encoded.contains("\"observed\":\"0.2.0-rc.2\""));
+
+        // Matched or unknown comparisons project no advisory at all (the
+        // status computation feeds `None` for both cases; a matched pair never
+        // produces a mismatch view).
+        let public = PublicAgentStatus::from(status(None));
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert!(
+            !encoded.contains(crate::agent_status::VERSION_MISMATCH_INSTRUCTION),
+            "{encoded}"
+        );
+        assert!(!encoded.contains("\"version_mismatch\":{"), "{encoded}");
+    }
+
+    #[test]
+    fn mismatch_comparison_requires_both_sides_and_inequality() {
+        use crate::agent_status::{expected_version, version_mismatch};
+        assert_eq!(
+            expected_version("dsh", None).as_deref(),
+            Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
+        );
+        assert_eq!(
+            expected_version("codex", Some("1.2.3")).as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(expected_version("zcode", None), None);
+        assert!(version_mismatch(None, Some("1.0.0")).is_none());
+        assert!(version_mismatch(Some("1.0.0"), None).is_none());
+        assert!(version_mismatch(Some("1.0.0"), Some("1.0.0")).is_none());
+        assert!(version_mismatch(Some("1.0.0"), Some("1.0.1")).is_some());
     }
 }

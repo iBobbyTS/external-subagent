@@ -558,9 +558,18 @@ impl RpcService {
                         self.task_result_view(stored, offset, limit, reason, failure_message)
                     })
                     .transpose()?;
+                // The independent result path shares wait's mismatch/instruction
+                // semantics: only a failed terminal result may carry the
+                // advisory, and the bounded probe runs at most once per
+                // response.
+                let instruction = result
+                    .as_ref()
+                    .filter(|view| is_failure_outcome(view.outcome))
+                    .and_then(|_| self.version_mismatch_instruction(&crate::task_agent(&task)));
                 Ok(RpcSuccess::TaskResult {
                     task: task_view(task),
                     result,
+                    instruction,
                 })
             }
             RpcMethod::TaskClose { agent_id } => {
@@ -765,6 +774,30 @@ impl RpcService {
             failure_message,
         })
     }
+
+    /// The failure-path version advisory. It runs the existing bounded local
+    /// probe exactly once per terminal response when the expected version is
+    /// known, then records the evidence for status reuse. A failed probe or an
+    /// unknown expected version yields `None` (no advisory).
+    pub(super) fn version_mismatch_instruction(&self, agent: &str) -> Option<String> {
+        let config = read_agent_config_snapshot().ok()?;
+        let entry = config.subagents.get(agent)?;
+        let expected = crate::agent_status::expected_version(agent, entry.version.as_deref())?;
+        let observed = self
+            .agent_evidence
+            .probe_local_version(agent, config.revision)?;
+        crate::agent_status::version_mismatch(Some(expected.as_str()), Some(observed.as_str()))
+            .map(|_| crate::agent_status::VERSION_MISMATCH_INSTRUCTION.to_owned())
+    }
+}
+
+/// Failure outcomes that may carry the version advisory. This mirrors
+/// `failure_message_projection`: cancelled/timed-out tasks are not failures.
+pub(super) fn is_failure_outcome(outcome: TaskOutcome) -> bool {
+    matches!(
+        outcome,
+        TaskOutcome::Failed | TaskOutcome::RuntimeLost | TaskOutcome::ResultInvalid
+    )
 }
 
 fn validate_task_record(task: TaskRecord) -> Result<TaskRecord, RpcError> {

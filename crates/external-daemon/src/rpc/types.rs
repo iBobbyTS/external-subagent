@@ -316,6 +316,10 @@ pub enum RpcSuccess {
     TaskResult {
         task: TaskView,
         result: Option<TaskResultView>,
+        /// Present only for a failed terminal result whose runtime version is a
+        /// known mismatch; carries the byte-exact advisory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instruction: Option<String>,
     },
     Message {
         message_id: String,

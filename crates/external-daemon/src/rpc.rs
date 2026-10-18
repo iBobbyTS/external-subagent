@@ -48,7 +48,7 @@ pub use views::{
     MessageReceiptView, ModelIdentityFactView, ModelIdentityView, ObservationCapabilityView,
     ObservationDefaultsView, PendingRequestView, QuestionView, ResponseDispositionView,
     ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskHeaderView, TaskObservationView,
-    TaskResultView, TaskView, TelemetryStatusView,
+    TaskResultView, TaskView, TelemetryStatusView, VersionMismatchView,
 };
 
 #[cfg(test)]

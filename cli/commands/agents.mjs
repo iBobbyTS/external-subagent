@@ -90,13 +90,8 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
     const result = await options.callDaemon(options.socket, 'agent-probe', { subagent: agent, through: 'local', scope });
     const local = result.evidence?.local;
     if (local?.state !== 'READY') throw new CliError('agent_probe_failed', `Cannot enable ${agent}: ${local?.reason ?? 'local runtime probe did not succeed'}`, 2);
-    const requiredVersion = result.status?.required_version;
-    if (agent === 'dsh' && (typeof requiredVersion !== 'string' || !requiredVersion.trim())) {
-      throw new CliError('agent_probe_failed', 'Cannot enable dsh: daemon did not report required_version; update and restart the daemon, then retry', 2);
-    }
-    if (requiredVersion != null && local.version !== requiredVersion) {
-      throw new CliError('agent_probe_failed', `Cannot enable ${agent}: expected version ${requiredVersion}, observed ${local.version ?? 'unknown'}; install the required runtime version and retry`, 2);
-    }
+    // Version differences are advisory (surfaced by status and failure
+    // instructions); enable records the observed version without rejecting it.
     const patch = { enabled: true, spawn_supported: true };
     if (agent !== 'zcode') {
       if (typeof local.runtime_path !== 'string' || !path.isAbsolute(local.runtime_path) || typeof local.version !== 'string' || !local.version.trim()) {

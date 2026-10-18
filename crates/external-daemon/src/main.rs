@@ -238,16 +238,14 @@ fn dsh_production_enabled(path: Option<&Path>) -> bool {
             .and_then(serde_json::Value::as_str)
             .map(Path::new)
             .is_some_and(|runtime| {
+                // The persisted identity gate decides factory routing only.
+                // `version` is advisory (status/instruction), never a gate.
                 runtime.is_absolute()
                     && external_daemon::executable::is_executable_file(runtime)
                     && configured
                         .and_then(|entry| entry.get("profile"))
                         .and_then(serde_json::Value::as_str)
                         == Some("acp")
-                    && configured
-                        .and_then(|entry| entry.get("version"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(external_agent_dsh::profile::PINNED_DSH_VERSION)
             })
 }
 
@@ -739,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn dsh_production_gate_requires_complete_persisted_identity() {
+    fn dsh_production_gate_ignores_version_but_requires_the_identity() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("dsh-runtime.exe");
         std::fs::File::create(&runtime)
@@ -757,14 +755,29 @@ mod tests {
         let base = serde_json::json!({"agents":{"dsh":{"enabled":true,"spawn_supported":true,"runtime_path":runtime,"profile":"acp","version":"0.1.5-rc.1"}}});
         std::fs::write(&config_path, serde_json::to_vec(&base).unwrap()).unwrap();
         assert!(dsh_production_enabled(Some(&config_path)));
-        for field in ["profile", "version"] {
+        // AC8: an absent or differing persisted version keeps the factory
+        // enabled because the version is advisory only.
+        for entry in [
+            serde_json::json!({"enabled":true,"spawn_supported":true,"runtime_path":runtime,"profile":"acp"}),
+            serde_json::json!({"enabled":true,"spawn_supported":true,"runtime_path":runtime,"profile":"acp","version":"0.2.0-rc.2"}),
+            serde_json::json!({"enabled":true,"spawn_supported":true,"runtime_path":runtime,"profile":"acp","version":"9.9.9"}),
+        ] {
+            let value = serde_json::json!({"agents":{"dsh":entry}});
+            std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
+            assert!(
+                dsh_production_enabled(Some(&config_path)),
+                "version must not gate the dsh factory"
+            );
+        }
+        // The identity terms stay fail-closed.
+        for field in ["profile", "runtime_path"] {
             let mut value = base.clone();
             value["agents"]["dsh"]
                 .as_object_mut()
                 .unwrap()
                 .remove(field);
             std::fs::write(&config_path, serde_json::to_vec(&value).unwrap()).unwrap();
-            assert!(!dsh_production_enabled(Some(&config_path)));
+            assert!(!dsh_production_enabled(Some(&config_path)), "{field}");
         }
     }
 
