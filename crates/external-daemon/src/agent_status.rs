@@ -794,12 +794,13 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
 /// `settings.model.available` catalog without sending a prompt.
 ///
 /// The probe reuses the read-only hi probe's command shape — the daemon policy
-/// environment, the app-server transport, and the provider environment — but
-/// stops after create: `available` is a create-time fact that shrinks to the
-/// selected model after `session/setModel`, so it must never be re-read as the
-/// full directory. Only entries carrying both providerId and modelId project;
-/// the credentials stay in the shared 0600 provider file and never reach the
-/// output, evidence, or logs.
+/// environment and the app-server transport — but stops after create:
+/// `available` is a create-time fact that shrinks to the selected model after
+/// `session/setModel`, so it must never be re-read as the full directory. The
+/// daemon injects no provider environment; the catalog reflects the runtime's
+/// native provider configuration. Only entries carrying both providerId and
+/// modelId project, and no credential material reaches the output, evidence,
+/// or logs.
 fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
     let checked_at_ms = wall_now_millis();
     let mut scope = input.scope.clone();

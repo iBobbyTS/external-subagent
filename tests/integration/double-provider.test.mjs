@@ -379,7 +379,8 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     assert.equal(byAgent.zcode.spawn_supported, true);
     assert.equal(byAgent.dsh.configured, true);
     assert.equal(byAgent.dsh.spawn_supported, true);
-    assert.equal(byAgent.zcode.model_selection.supported, false);
+    assert.equal(byAgent.zcode.model_selection.supported, true);
+    assert.equal(byAgent.zcode.model_selection.mode, 'catalog_token');
     assert.equal(byAgent.dsh.model_selection.supported, true);
 
     const dshLocal = jsonOut(cli(['agents', 'probe', 'dsh', '--local'])).evidence;
@@ -469,7 +470,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     // mirroring the boundary map in the header comment.
     console.log([
       `live-evidence artifact=${version}`,
-      'discovery: dsh+zcode configured & spawn_supported; model_selection: dsh=supported zcode=unsupported(fail-closed)',
+      'discovery: dsh+zcode configured & spawn_supported; model_selection: dsh=supported zcode=explicit-catalog-token',
       `dsh: local=${dshLocal.local.state} authenticated-hi=${dshHi.hi.state} models=${dshModels.models.length}`,
       'dsh tasks: build=COMPLETED/reaped strict-plan=COMPLETED/workspace-unmutated mid-run-cancel=CANCELLED/reaped',
       'zcode tasks: explicit-model=COMPLETED/reaped missing-model=validation',

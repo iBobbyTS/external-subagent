@@ -461,8 +461,16 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.ok(Number.isInteger(pidA) && pidA > 0, 'the vA daemon runs as a real process');
     assert.ok(fs.readFileSync(paths().launchAgent, 'utf8').includes(DSH_RUNTIME), 'the re-rendered plist pins the DSH runtime environment');
 
+    // ZCode requires an explicit provider/model selection; derive it from the
+    // runtime's native catalog (override available for a pinned token).
+    const zcodeModels = cli(['agents', 'models', 'zcode', '--workspace', wsZcode]);
+    assert.equal(zcodeModels.supported, true, `zcode model discovery is not supported: ${JSON.stringify(zcodeModels)}`);
+    assert.ok(zcodeModels.models.length > 0, 'the zcode native catalog must not be empty');
+    const zcodeModel = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_MODEL || zcodeModels.models[0];
+
     // ---- two REAL tasks on the vA daemon
     const taskA = cli(['spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'build',
+      '--model', zcodeModel,
       '--prompt', 'Use the Bash tool to run exactly: sleep 25 && echo DRAIN_LIVE_A_OK > zcode-marker.txt — after it finishes, reply with just: DONE']);
     assert.ok(taskA.agent_id > 0, 'the ZCode task was admitted');
     const taskB = cli(['spawn', '--subagent', 'dsh', '--repository', wsDsh, '--permission-mode', 'build',
@@ -602,6 +610,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
 
     // ---- the NEW daemon serves both upstreams again
     const postZcode = cli(['spawn', '--subagent', 'zcode', '--repository', path.join(workDir, 'ws-post-z'), '--permission-mode', 'yolo',
+      '--model', zcodeModel,
       '--prompt', 'Reply with exactly the single word POST_ZCODE_OK and nothing else. Do not use any tools.']);
     const waitForTerminal = async (agentId, budgetMs = 240_000) => {
       const deadline = Date.now() + budgetMs;
@@ -614,7 +623,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     const postZcodeDone = await waitForTerminal(postZcode.agent_id);
     assert.ok(postZcodeDone, 'the post-upgrade ZCode task never completed');
     assert.equal(postZcodeDone.task.status, 'completed');
-    assert.equal(cli(['result', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.input_identity.model_source, 'native');
+    assert.equal(cli(['result', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.input_identity.model_source, 'spawn_catalog');
     assert.ok(cli(['close', '--json', JSON.stringify({ agent_id: postZcode.agent_id })]).task.status === 'closed');
 
     const postDsh = cli(['spawn', '--subagent', 'dsh', '--repository', path.join(workDir, 'ws-post-d'), '--permission-mode', 'build',
@@ -630,7 +639,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
       'drain: spawn-rejected=daemon_draining zcode=wait/pending/respond-allow/COMPLETED/reaped/result/close dsh=mid-run-CANCELLED/reaped/close',
       `activation: single-update pid=${service.pid} generation-changed=${service.service_generation !== generationA}`,
       'retained: vA bytes preserved through npm replacement',
-      'post-upgrade: zcode=COMPLETED(native-model) dsh=COMPLETED',
+      'post-upgrade: zcode=COMPLETED(explicit-model/spawn_catalog) dsh=COMPLETED',
     ].join('\n'));
   } finally {
     if (updateChild && updateChild.exitCode === null) {

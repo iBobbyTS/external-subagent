@@ -17,7 +17,9 @@ use crate::agent_status::{
     AgentEvidenceStore, AgentModelsInput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
     ProbeScope, ScopeEvidence, VERSION_MISMATCH_INSTRUCTION,
 };
-use std::{env, fs, path::Path};
+use std::{env, path::Path};
+#[cfg(test)]
+use std::fs;
 
 #[cfg(test)]
 use super::views::{flat_identity, task_view};
