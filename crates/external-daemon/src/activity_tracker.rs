@@ -334,15 +334,18 @@ impl PassiveActivityTracker {
     /// replacement holds). The per-turn terminal text and the sticky window
     /// truncation flag are deliberately NOT inherited. Locks are taken in the
     /// fixed order old-read then new-write, never held together.
+    /// 工具观测历史与文本流一样跨 claim 保留：旧 tracker 的 ObservationState
+    /// 作为基底，新 tracker 在替换前已采集的调用按序重放（身份去重）。
     /// terminal text 仍只属于当前 turn。
     pub(crate) fn inherit_wait_text(&self, old: &PassiveActivityTracker) {
-        let (old_tail, old_appended, old_delivered, old_updated) = {
-            let old_state = old.state.lock().unwrap();
+        let (old_tail, old_appended, old_delivered, old_updated, old_observation) = {
+            let mut old_state = old.state.lock().unwrap();
             (
                 old_state.latest_text_tail.clone(),
                 old_state.appended_bytes,
                 old_state.delivered_bytes,
                 old_state.latest_text_updated_at,
+                std::mem::take(&mut old_state.observation),
             )
         };
         let mut state = self.state.lock().unwrap();
@@ -371,6 +374,8 @@ impl PassiveActivityTracker {
             (None, None) => None,
         };
         debug_assert!(state.appended_bytes >= state.latest_text_tail.len() as u64);
+        let newer_observation = std::mem::replace(&mut state.observation, old_observation);
+        state.observation.merge_newer(newer_observation);
     }
 
     pub(crate) fn observation_snapshot(&self) -> observation::ObservationSnapshot {
@@ -531,10 +536,71 @@ mod tests {
                 .tool_calls_started,
             4
         );
-        // Observation is lifetime-scoped: it survives the 60-second window.
+        // Observation is lifetime-scoped: it survives the 60-second window and
+        // tracker replacement across claims.
         let expired = tracker.snapshot_at(now + Duration::from_secs(61));
         assert_eq!(expired.window_60s.tool_calls_started, 0);
         assert_eq!(tracker.observation_snapshot().tools.len(), 3);
+    }
+
+    #[test]
+    fn observation_history_survives_tracker_replacement_with_new_activity() {
+        fn tool_call(event_id: &str, call_id: &str, n: u64) -> RuntimeEvent {
+            session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":event_id, "turnId":"t",
+                "payload":{"kind":"tool_call","toolCallId":call_id,"toolName":"Bash","input":{"n":n}}
+            }))
+        }
+        fn reasoning(event_id: &str, delta: &str) -> RuntimeEvent {
+            session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":event_id, "turnId":"t",
+                "payload":{"kind":"reasoning_delta","delta":delta}
+            }))
+        }
+
+        let old = PassiveActivityTracker::for_adapter("zcode", false);
+        let new = PassiveActivityTracker::for_adapter("zcode", false);
+        let now = Instant::now();
+        old.observe_at(&reasoning("r-old", "old "), now, 0);
+        old.observe_at(&tool_call("e1", "c1", 1), now, 0);
+        old.observe_at(&tool_call("e2", "c2", 2), now, 0);
+        // The incoming tracker already saw c1 before the map swap: the merge
+        // must not count it twice.
+        new.observe_at(&reasoning("r-new", "new"), now, 0);
+        new.observe_at(&tool_call("e1", "c1", 1), now, 0);
+        new.observe_at(&tool_call("e3", "c3", 3), now, 0);
+        new.inherit_wait_text(&old);
+
+        let snapshot = new.observation_snapshot();
+        assert_eq!(snapshot.tools.len(), 1);
+        assert_eq!(snapshot.tools[0].tool_name, "Bash");
+        assert_eq!(snapshot.tools[0].call_count, 3);
+        assert_eq!(
+            snapshot.tools[0]
+                .recent_calls
+                .iter()
+                .map(|call| call.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c3", "c2", "c1"]
+        );
+        assert_eq!(
+            snapshot.tools[0]
+                .recent_calls
+                .iter()
+                .map(|call| call.arguments["n"].clone())
+                .collect::<Vec<_>>(),
+            [serde_json::json!(3), serde_json::json!(2), serde_json::json!(1)]
+        );
+        // Reasoning is concatenated oldest→newest across the replacement.
+        assert_eq!(snapshot.reasoning.text, "old new");
+
+        // Replaying a pre-claim event after inheritance is refused by the
+        // merged source-event set and the call identity.
+        new.observe(&tool_call("e1", "c1", 1));
+        new.observe(&tool_call("e1", "c1", 1));
+        let replayed = new.observation_snapshot();
+        assert_eq!(replayed.tools[0].call_count, 3);
+        assert_eq!(replayed.tools[0].recent_calls.len(), 3);
     }
 
     #[test]
@@ -1082,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn dsh_public_acp_thoughts_reach_observe_and_wait_but_codex_never_collects() {
+    fn dsh_public_acp_thoughts_reach_observe_but_codex_never_collects() {
         use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
         let dsh = PassiveActivityTracker::for_adapter("dsh", true);
         let codex = PassiveActivityTracker::for_adapter("codex", false);

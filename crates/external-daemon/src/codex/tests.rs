@@ -365,7 +365,7 @@ fn codex_owner_bootstrap_omits_developer_instructions_when_empty_or_none() {
 }
 
 #[test]
-fn whitelisted_tool_items_feed_wait_count_without_touching_observe() {
+fn whitelisted_tool_items_feed_wait_count_and_observe_details() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let directory = workspace.path().to_owned();

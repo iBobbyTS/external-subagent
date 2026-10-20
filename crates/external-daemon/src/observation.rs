@@ -267,7 +267,6 @@ impl ObservationState {
             return;
         };
         let turn_id = valid_id(params.get("turnId")).unwrap_or("");
-        let identity = format!("{turn_id}\0{call_id}");
         let (arguments, mut arguments_truncated, redacted_fields) =
             project_arguments(payload.get("input"));
         if self.reasoning_source == ReasoningSource::dsh()
@@ -277,7 +276,7 @@ impl ObservationState {
             arguments_truncated = true;
         }
         self.record_tool_call(
-            identity,
+            turn_id,
             call_id,
             tool_name,
             arguments,
@@ -287,19 +286,27 @@ impl ObservationState {
     }
 
     /// Ingest a detailed descriptor from the same producers that feed the wait
-    /// tool window. The identity is the ZCode-shaped `{turn}\0{call_id}`, so a
-    /// repeat frame or a descriptor arriving after the same logical call's
-    /// `model.streaming` event updates the existing record instead of counting
-    /// it twice.
+    /// tool window. The record path derives the ZCode-shaped
+    /// `{turn}\0{call_id}` identity, so a repeat frame or a descriptor
+    /// arriving after the same logical call's `model.streaming` event updates
+    /// the existing record instead of counting it twice.
     pub(crate) fn observe_descriptor(&mut self, descriptor: &ToolDescriptor) {
         if !valid_text(&descriptor.tool_call_id) || !valid_text(&descriptor.tool_name) {
             self.drop_event(true);
             return;
         }
-        let identity = format!("{}\0{}", descriptor.turn_id, descriptor.tool_call_id);
         let (arguments, arguments_truncated, redacted_fields) =
             match descriptor.input.as_ref() {
-                Some(input) => project_arguments(Some(input)),
+                Some(input) => {
+                    let (arguments, mut truncated, redacted_fields) =
+                        project_arguments(Some(input));
+                    // A non-object input is unknown, not an observed empty
+                    // argument object (the same rule the ACP sibling applies).
+                    if !input.is_object() {
+                        truncated = true;
+                    }
+                    (arguments, truncated, redacted_fields)
+                }
                 None => {
                     // Count-only descriptors carry a free-form detail string;
                     // the public argument shape is an object, so wrap it in a
@@ -312,7 +319,7 @@ impl ObservationState {
                 }
             };
         self.record_tool_call(
-            identity,
+            &descriptor.turn_id,
             &descriptor.tool_call_id,
             &descriptor.tool_name,
             arguments,
@@ -323,13 +330,17 @@ impl ObservationState {
 
     fn record_tool_call(
         &mut self,
-        identity: String,
+        turn_id: &str,
         call_id: &str,
         tool_name: &str,
         arguments: Map<String, Value>,
         arguments_truncated: bool,
         redacted_fields: u64,
     ) {
+        // Single source of the cross-path call identity: every producer and
+        // the replacement merge feed this path, so the same logical call can
+        // never be counted under two shapes.
+        let identity = format!("{turn_id}\0{call_id}");
         if let Some((original_name, seq)) = self.seen_calls.get(&identity).cloned() {
             if let Some(call) = self
                 .tools
@@ -372,6 +383,74 @@ impl ObservationState {
         });
         group.recent_calls.truncate(MAX_RECENT_CALLS);
         self.bump_snapshot();
+    }
+
+    /// Fold a tracker's pre-replacement observation history into this one.
+    /// The receiver keeps its own (older) history as the base; the incoming
+    /// calls are replayed in receipt order through [`Self::record_tool_call`],
+    /// so an identity both trackers saw updates instead of counting twice.
+    /// Coverage stays honest: incomplete wins and dropped counts add up.
+    pub(crate) fn merge_newer(&mut self, newer: ObservationState) {
+        if !newer.reasoning_raw.is_empty() {
+            // The base's raw stream is older than the incoming tracker's
+            // bytes; appending applies the same rolling cap and tail.
+            self.observe_reasoning(&newer.reasoning_raw);
+        }
+        self.reasoning_truncated |= newer.reasoning_truncated;
+        self.reasoning_complete = self.reasoning_complete && newer.reasoning_complete;
+        self.tool_history_complete = self.tool_history_complete && newer.tool_history_complete;
+        self.dropped_events = self.dropped_events.saturating_add(newer.dropped_events);
+
+        let mut calls = newer
+            .seen_calls
+            .iter()
+            .map(|(identity, (tool_name, seq))| (*seq, identity, tool_name))
+            .collect::<Vec<_>>();
+        calls.sort_by_key(|(seq, _, _)| *seq);
+        for (seq, identity, tool_name) in calls {
+            // The identity format has a single NUL separator and both sides
+            // are NUL-free by validation.
+            let (turn_id, call_id) = identity
+                .split_once('\0')
+                .unwrap_or(("", identity.as_str()));
+            let detail = newer
+                .tools
+                .get(tool_name)
+                .and_then(|group| group.recent_calls.iter().find(|call| call.seq == seq));
+            let (arguments, arguments_truncated, redacted_fields) = match detail {
+                Some(call) => (
+                    call.arguments.clone(),
+                    call.arguments_truncated,
+                    call.redacted_fields,
+                ),
+                // A call older than the incoming tracker's bounded recent
+                // window has lost its arguments; keep the count and mark the
+                // detail unknown. It is inserted before the retained recent
+                // calls, so the bounded window still ends with the newest
+                // calls that do carry detail.
+                None => (Map::new(), true, 0),
+            };
+            self.record_tool_call(
+                turn_id,
+                call_id,
+                tool_name,
+                arguments,
+                arguments_truncated,
+                redacted_fields,
+            );
+        }
+
+        // A replayed source event must not be admitted again after a claim.
+        for event_id in newer.seen_source_events {
+            if self.seen_source_events.len() >= MAX_IDENTITIES {
+                self.tool_history_complete = false;
+                self.reasoning_complete = false;
+                self.dropped_events = self.dropped_events.saturating_add(1);
+                break;
+            }
+            self.seen_source_events.insert(event_id);
+        }
+        self.snapshot_seq = self.snapshot_seq.saturating_add(newer.snapshot_seq);
     }
 
     fn drop_event(&mut self, tool: bool) {
@@ -772,6 +851,21 @@ mod tests {
         assert!(encoded.contains("NEVER"));
         assert!(!encoded.contains("encrypted_content"));
         assert_eq!(tool.recent_calls[0].redacted_fields, 1);
+    }
+
+    #[test]
+    fn descriptor_with_non_object_input_reports_unknown_arguments() {
+        let mut state = ObservationState::for_adapter("agy");
+        state.observe_descriptor(&ToolDescriptor {
+            turn_id: "t".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "Bash".into(),
+            input: Some(Value::String("echo hi".into())),
+            detail: None,
+        });
+        let call = &state.snapshot().tools[0].recent_calls[0];
+        assert!(call.arguments.is_empty());
+        assert!(call.arguments_truncated);
     }
 
     #[test]
