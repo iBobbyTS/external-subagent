@@ -1827,8 +1827,15 @@ mod observe_gate_tests {
             });
             let input_case4: GeneralSubmitInput = serde_json::from_value(raw_case4).unwrap();
             assert_eq!(input_case4.manifest.permission_mode, None);
-            let res_case4 = env.service.dispatch(RpcMethod::SubmitGeneral(input_case4));
-            assert!(res_case4.is_ok());
+            // The profile merges successfully, but zcode now requires an
+            // explicit model; the name-only profile supplies none.
+            let err_case4 = env.service.dispatch(RpcMethod::SubmitGeneral(input_case4)).unwrap_err();
+            assert_eq!(err_case4.code, RpcErrorCode::Validation);
+            assert!(
+                err_case4.message.contains("explicit model"),
+                "zcode must require an explicit model: {}",
+                err_case4.message
+            );
 
             // Negative case: non-profile direct RPC with explicit "permission_mode": null -> rejected at wire deserialization
             let raw_non_profile_null = serde_json::json!({
@@ -1880,7 +1887,8 @@ mod observe_gate_tests {
             assert_eq!(admission.model_source, "spawn_catalog");
             assert_eq!(admission.effort.as_deref(), Some("high"));
 
-            // 2. Profile with omitted/empty fields falls back to defaults
+            // 2. A name-only profile leaves zcode without a model, which the
+            // explicit-model admission contract rejects.
             let minimal_json = r#"{ "name": "minimal_profile" }"#;
             fs::write(env.profiles_dir.join("minimal.json"), minimal_json).unwrap();
 
@@ -1891,16 +1899,13 @@ mod observe_gate_tests {
                 profile: Some("minimal_profile".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "minimal test"),
             };
-            let response_min = env.service.dispatch(RpcMethod::SubmitGeneral(input_min)).unwrap();
-            let RpcSuccess::GeneralSubmitted { task: task_min } = response_min else { panic!() };
-
-            let record_min = env.store.get_task(&task_min.agent_id).unwrap().unwrap();
-            let prepared_min: PreparedGeneralTask = serde_json::from_str(&record_min.prepared_launch_json).unwrap();
-            assert_eq!(prepared_min.permission_mode, PermissionMode::Build);
-            let admission_min = prepared_min.admission.unwrap();
-            assert_eq!(admission_min.agent, "zcode"); // defaulted to config.default_subagent
-            assert_eq!(admission_min.model, None);
-            assert_eq!(admission_min.effort, None);
+            let err_min = env.service.dispatch(RpcMethod::SubmitGeneral(input_min)).unwrap_err();
+            assert_eq!(err_min.code, RpcErrorCode::Validation);
+            assert!(
+                err_min.message.contains("explicit model"),
+                "zcode must require an explicit model: {}",
+                err_min.message
+            );
         }
 
         #[test]
@@ -1941,7 +1946,7 @@ mod observe_gate_tests {
             assert_eq!(err.code, RpcErrorCode::Validation);
             assert!(err.message.contains("{provider}:{model}"));
 
-            // 2. zcode: provider/model or bare token accepted
+            // 2. zcode: provider/model accepted; a bare token is refused
             let zcode_slash_json = r#"{
   "name": "zcode_slash",
   "subagent": "zcode",
@@ -1970,7 +1975,13 @@ mod observe_gate_tests {
                 profile: Some("zcode_bare".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "zcode prompt"),
             };
-            assert!(env.service.dispatch(RpcMethod::SubmitGeneral(input_z2)).is_ok());
+            let err_z2 = env.service.dispatch(RpcMethod::SubmitGeneral(input_z2)).unwrap_err();
+            assert_eq!(err_z2.code, RpcErrorCode::Validation);
+            assert!(
+                err_z2.message.contains("{provider}/{model}"),
+                "zcode bare model must be refused: {}",
+                err_z2.message
+            );
 
             // 3. codex: bare slug accepted, slash rejected
             let codex_slug_json = r#"{
@@ -2054,6 +2065,7 @@ mod observe_gate_tests {
             let zcode_json = r#"{
   "name": "zcode_worker",
   "subagent": "zcode",
+  "model": "provider/model",
   "developer_instructions": "Custom instructions for zcode"
 }"#;
             fs::write(env.profiles_dir.join("zcode.json"), zcode_json).unwrap();
@@ -2131,7 +2143,7 @@ mod observe_gate_tests {
             assert_eq!(prepared_agy.admission.unwrap().developer_instructions, None);
 
             // 3. Empty developer_instructions: prompt unchanged on codex and zcode
-            let empty_json = r#"{ "name": "empty_di_worker", "subagent": "zcode", "developer_instructions": "" }"#;
+            let empty_json = r#"{ "name": "empty_di_worker", "subagent": "zcode", "model": "provider/model", "developer_instructions": "" }"#;
             fs::write(env.profiles_dir.join("empty.json"), empty_json).unwrap();
             let input_empty = GeneralSubmitInput {
                 agent: None,
@@ -2188,6 +2200,7 @@ mod observe_gate_tests {
             let good_json = r#"{
   "name": "good",
   "subagent": "zcode",
+  "model": "provider/model",
   "permission_mode": "edit"
 }"#;
             let bad_json = r#"{
@@ -2334,7 +2347,7 @@ mod observe_gate_tests {
             manifest_default.permission_mode = None;
             let input_default = GeneralSubmitInput {
                 agent: Some("zcode".into()),
-                model: None,
+                model: Some("provider/model".into()),
                 effort: None,
                 profile: None,
                 manifest: manifest_default,
@@ -2650,7 +2663,7 @@ mod observe_gate_tests {
             let base_prompt = "x".repeat(MAX_PROMPT_BYTES + 1);
             let input_oversized_prompt = GeneralSubmitInput {
                 agent: Some("zcode".into()),
-                model: None,
+                model: Some("provider/model".into()),
                 effort: None,
                 profile: None,
                 manifest: test_manifest(env.workspace_dir.path(), &base_prompt),

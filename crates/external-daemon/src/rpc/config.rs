@@ -284,13 +284,22 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
             ));
         }
         if let Some(model) = entry.get("default_model") {
-            // S03: zcode now consumes `default_model` as the middle level of
-            // its admission precedence, so it is a normal optional selection.
             if model.as_str().is_some_and(str::is_empty) || (!model.is_null() && !model.is_string())
             {
                 return Err(RpcError::new(
                     RpcErrorCode::Validation,
                     "agent config model selection is invalid",
+                ));
+            }
+            // ZCode has no configured model selection: spawn requires an
+            // explicit provider/model token from the request or a named
+            // profile. Mirror the Node config writer, which rejects the same
+            // non-null value with the public `model_selection_unsupported`
+            // code; null and omission stay valid.
+            if name == "zcode" && !model.is_null() {
+                return Err(RpcError::new(
+                    RpcErrorCode::ModelSelectionUnsupported,
+                    "agent config default_model is unsupported for zcode; spawn must carry an explicit provider/model",
                 ));
             }
         }
@@ -317,22 +326,49 @@ mod config_migration_tests {
     }
 
     #[test]
-    fn zcode_default_model_is_an_optional_selection() {
-        // S03: zcode admits a configured default model (bare or
-        // provider/model); only empty and non-string shapes stay invalid.
-        let config = parse_agent_config_snapshot(
-            br#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true,"default_model":"glm-5.3"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            config.subagents["zcode"].default_model.as_deref(),
-            Some("glm-5.3")
-        );
+    fn zcode_default_model_is_rejected_but_null_stays_valid() {
+        // ZCode spawn requires an explicit provider/model token; a persisted
+        // configured default has no consumer and is refused, mirroring the
+        // Node config writer's `model_selection_unsupported` rejection.
+        for (input, name) in [
+            (
+                br#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true,"default_model":"glm-5.3"}}}"#.as_slice(),
+                "canonical",
+            ),
+            (
+                br#"{"schema_version":1,"default_agent":"zcode","agents":{"zcode":{"enabled":true,"spawn_supported":true,"default_model":"glm-5.3"}}}"#.as_slice(),
+                "legacy",
+            ),
+        ] {
+            let error = parse_agent_config_snapshot(input).unwrap_err();
+            assert_eq!(
+                error.code,
+                RpcErrorCode::ModelSelectionUnsupported,
+                "{name}"
+            );
+            assert!(
+                error.message.contains("unsupported for zcode")
+                    && error.message.contains("explicit provider/model"),
+                "{name}: {}",
+                error.message
+            );
+        }
+        // Null and omission are valid selections for every agent.
+        for input in [
+            br#"{"schema_version":2,"subagents":{"zcode":{"default_model":null}}}"#.as_slice(),
+            br#"{"schema_version":2,"subagents":{"zcode":{}}}"#.as_slice(),
+        ] {
+            let config = parse_agent_config_snapshot(input).unwrap();
+            assert!(config.subagents["zcode"].default_model.is_none());
+        }
+        // Malformed shapes keep the generic config rejection, matching the
+        // Node writer's CONFIG_INVALID family.
         for invalid in [
             br#"{"schema_version":2,"subagents":{"zcode":{"default_model":""}}}"#.as_slice(),
             br#"{"schema_version":2,"subagents":{"zcode":{"default_model":42}}}"#.as_slice(),
         ] {
-            assert!(parse_agent_config_snapshot(invalid).is_err(), "{invalid:?}");
+            let error = parse_agent_config_snapshot(invalid).unwrap_err();
+            assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
         }
     }
 
@@ -407,6 +443,14 @@ mod config_migration_tests {
             zcode_runtime_rejections >= 3,
             "shared matrix lost its zcode runtime_path negatives"
         );
+        let zcode_model_rejections = all
+            .iter()
+            .filter(|case| case["error_code"].as_str() == Some("model_selection_unsupported"))
+            .count();
+        assert!(
+            zcode_model_rejections >= 2,
+            "shared matrix lost its zcode default_model negatives"
+        );
         eprintln!(
             "matrix: {} cases, {} zcode runtime_path rejections",
             all.len(),
@@ -435,6 +479,28 @@ mod config_migration_tests {
                     };
                     assert!(
                         error.message.contains("zcode") && error.message.contains("runtime_path"),
+                        "{} rejection is not diagnosable: {}",
+                        case["name"],
+                        error.message
+                    );
+                }
+            }
+            if !valid && case["error_code"].as_str() == Some("model_selection_unsupported") {
+                // The public code is shared with the Node config writer; both
+                // Rust config entry points must report the same rejection.
+                for error in [startup.as_ref().err(), rpc.as_ref().err()] {
+                    let Some(error) = error else {
+                        panic!("{} escaped rejection", case["name"]);
+                    };
+                    assert_eq!(
+                        error.code,
+                        RpcErrorCode::ModelSelectionUnsupported,
+                        "{} rejection code drifted",
+                        case["name"]
+                    );
+                    assert!(
+                        error.message.contains("zcode")
+                            && error.message.contains("explicit provider/model"),
                         "{} rejection is not diagnosable: {}",
                         case["name"],
                         error.message

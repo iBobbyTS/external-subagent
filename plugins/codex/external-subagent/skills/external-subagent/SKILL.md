@@ -31,7 +31,7 @@ existing wire default; zcode and dsh send no effort field or call at all).
 pass it through to the runtime, because the supported set is only known at
 runtime. A malformed or unsupported token is rejected before dispatch, so no
 task is created. Example: spawn with
-`{"subagent": "zcode", "repository": "/absolute/path", "prompt": "...", "effort": "high"}`.
+`{"subagent": "zcode", "model": "provider/model", "repository": "/absolute/path", "prompt": "...", "effort": "high"}`.
 
 The caller is a `host`. Any unregistered local MCP client can act as `custom` and
 call status or spawn without a host record or Codex home. Built-in `host.codex`
@@ -47,8 +47,10 @@ the configuration only on success (a daemon restart is required for `dsh`/`codex
 Actual per-subagent limitations (from the accepted code):
 
 - `zcode` — disabled until explicitly enabled; all four permission modes
-  (build/edit/plan/yolo); an explicit spawn `model` is rejected
-  (`model_selection_unsupported`).
+  (build/edit/plan/yolo); spawn requires an explicit `{provider}/{model}`
+  token from the spawn request or a named profile. A bare token and an
+  omitted model are rejected at admission, and `agents.zcode.default_model`
+  is rejected with `model_selection_unsupported`.
 - `dsh` — disabled until explicitly enabled and configured
   (`runtime_path`/`home`/`profile`/`version`); admits only `build` and strict
   `plan`.

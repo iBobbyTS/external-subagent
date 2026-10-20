@@ -682,7 +682,10 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   t.after(() => daemon.stop());
   const options = { socket: daemon.socket, callDaemon };
   const spawnTask = (subagent) => callDaemon(daemon.socket, 'spawn', {
-    subagent, ...(subagent === 'codex' ? { model: 'fixture-model' } : {}), repository: workspace, prompt: 'fixture complete', permission_mode: subagent === 'codex' ? 'yolo' : 'build',
+    subagent,
+    ...(subagent === 'codex' ? { model: 'fixture-model' } : {}),
+    ...(subagent === 'zcode' ? { model: 'provider/model' } : {}),
+    repository: workspace, prompt: 'fixture complete', permission_mode: subagent === 'codex' ? 'yolo' : 'build',
   });
   const status = await callDaemon(daemon.socket, 'status', {});
   assert.ok((status.subagents ?? status.agents).every((entry) => !entry.enabled && !entry.spawn_supported));

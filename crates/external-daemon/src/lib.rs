@@ -57,7 +57,6 @@ use lifecycle_sink::{
 pub mod rpc;
 mod runtime_owner;
 mod scheduler;
-pub mod zcode;
 use external_core::{
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,

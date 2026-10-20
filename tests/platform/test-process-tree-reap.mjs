@@ -146,6 +146,7 @@ test('cancelling a task reaps the node->cmd->powershell tree with no orphan PID'
       repository: workspace,
       prompt: 'derive the controlled deep process tree',
       subagent: 'zcode',
+      model: 'provider/model',
     });
     const agentId = created.agent_id;
 

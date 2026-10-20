@@ -4,7 +4,6 @@ use external_daemon::{
     configure_diagnostic_log,
     dsh::{DshRuntimeFactory, RoutingRuntimeFactory},
     rpc::{parse_subagent_config, ServerOptions},
-    zcode::{apply_provider_environment, data_root_from_environment},
     CommandRuntimeFactory, Daemon, RuntimeFactory, Scheduler, SchedulerConfig,
 };
 use external_runtime::SpawnModel;
@@ -143,27 +142,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         configure_agy_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
-    // The daemon is the authority for the derived zcode data root. The
-    // production LaunchAgent passes `--database` as a program argument and never
-    // sets EXTERNAL_SUBAGENT_STORE, so export the resolved absolute path here
-    // (not a possibly-conflicting inherited value) for both provider
-    // injection sites (`data_root_from_environment`).
-    env::set_var("EXTERNAL_SUBAGENT_STORE", &config.database);
     wait_for_startup_test_gate(&shutdown_requested)?;
     if shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
-    let data_root = data_root_from_environment();
     let zcode = CommandRuntimeFactory::new_prepared_with_model(
-        move |_task: &external_store::TaskRecord| {
-            let mut command = runtime_command(runtime.as_deref())?;
-            if let (Some(runtime), Some(data_root)) = (runtime.as_deref(), data_root.as_deref()) {
-                apply_provider_environment(&mut command, runtime, data_root);
-            }
-            Ok(command)
-        },
+        move |_task: &external_store::TaskRecord| runtime_command(runtime.as_deref()),
         config.process_model,
     );
     let dsh_factory = if dsh_production_enabled(config.agent_config.as_deref()) {

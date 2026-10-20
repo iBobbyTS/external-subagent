@@ -150,3 +150,11 @@ test('agy spawn contract pins a bare slug, the closed effort set, build/yolo and
   assert.equal(rule.then.properties.write_manifest.maxItems, 0);
   assert.deepEqual(schema.properties.subagent_status.properties.subagent.enum, ['zcode', 'dsh', 'codex', 'agy']);
 });
+
+test('zcode spawn contract requires an explicit provider/model selection', () => {
+  const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
+  const model = schema.properties.spawn.properties.model.description;
+  assert.match(model, /zcode requires an explicit provider\/model token/u);
+  assert.doesNotMatch(model, /bare token keeps/u);
+  assert.doesNotMatch(model, /default_model for dsh, zcode and agy/u);
+});

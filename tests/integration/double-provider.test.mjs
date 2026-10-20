@@ -4,8 +4,8 @@
 // This file carries two explicitly separated layers:
 //
 //  1. Always-on contract checks (controlled, no live provider): the shared
-//     config/registry surface must keep both upstreams addressable, and the
-//     ZCode model-selection boundary must fail closed at the CLI config
+//     config/registry surface must keep both upstreams addressable, and a
+//     configured ZCode default model must fail closed at the CLI config
 //     layer with `model_selection_unsupported`.
 //
 //  2. An opt-in LIVE acceptance harness (real upstreams, real installed
@@ -37,8 +37,8 @@
 //   probe READY; authenticated dsh hi through the read-only bridge; dsh
 //   model catalog (non-empty); dsh build task spawn→wait→result→close with
 //   resources_reaped; dsh strict-plan task COMPLETED with an unmutated
-//   workspace; zcode task COMPLETED with native model and reaped; zcode
-//   model rejection `model_selection_unsupported`;
+//   workspace; zcode model catalog and task COMPLETED with an explicit
+//   provider/model and reaped; zcode missing-model rejection `validation`;
 //   mid-run dsh cancel → CANCELLED/reaped/closed.
 //
 //   LIVE, recorded in that session only and NOT re-asserted by this file
@@ -111,7 +111,7 @@ test('dual-provider config surface keeps DSH and ZCode addressable', async () =>
   }
 });
 
-test('zcode explicit model selection fails closed at the config boundary', () => {
+test('zcode configured default model fails closed at the config boundary', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'double-provider-'));
   const paths = writeDualConfig(path.join(root, 'config.json'));
   const input = parseConfigArgs(['set', 'subagents.zcode.default_model', 'glm-5.3']);
@@ -393,6 +393,10 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     const dshModels = jsonOut(cli(['agents', 'models', 'dsh', '--workspace', wsDsh]));
     assert.equal(dshModels.supported, true);
     assert.ok(dshModels.models.length > 0);
+    const zcodeModels = jsonOut(cli(['agents', 'models', 'zcode', '--workspace', wsZcode]));
+    assert.equal(zcodeModels.supported, true);
+    assert.ok(zcodeModels.models.length > 0);
+    const zcodeModel = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_MODEL || zcodeModels.models[0];
 
     const lifecycle = (agentId) => {
       const waited = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: agentId, wait_time: 240 })])).result;
@@ -416,29 +420,31 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
     lifecycle(dshPlan.agent_id);
     assert.equal(fs.readdirSync(wsDsh).sort().join(','), beforePlan, 'strict-plan must not mutate the workspace');
 
-    // Real ZCode task with its native model.
+    // Real ZCode task with an explicit provider/model selection.
     const zcodeTask = jsonOut(cli(['spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
+      '--model', zcodeModel,
       '--prompt', 'Reply with exactly the single word LIVE_ZCODE_OK and nothing else. Do not use any tools.'])).result;
     const zcodeWaited = jsonOut(cli(['wait', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id, wait_time: 240 })])).result;
     assert.equal(zcodeWaited.task.status, 'completed');
     // Admission provenance lives in the result/list task views; wait carries
     // only the lifecycle header.
     const zcodeResult = jsonOut(cli(['result', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
-    assert.equal(zcodeResult.task.input_identity.model_source, 'native');
+    assert.equal(zcodeResult.task.input_identity.model, zcodeModel);
+    assert.equal(zcodeResult.task.input_identity.model_source, 'spawn_catalog');
     assert.equal(zcodeWaited.result.final_text.includes('LIVE_ZCODE_OK'), true);
     const zcodeClosed = jsonOut(cli(['close', '--json', JSON.stringify({ agent_id: zcodeTask.agent_id })])).result;
     assert.equal(zcodeClosed.task.status, 'closed');
 
-    // ZCode explicit model rejection (daemon-enforced boundary). The CLI
-    // shim writes its error JSON to stderr and exits 1.
+    // ZCode omitted-model rejection (daemon-enforced admission boundary). The
+    // CLI shim writes its error JSON to stderr and exits 1.
     const rejected = spawnSync(path.join(prefix, 'bin', 'external-subagent'), [
       'spawn', '--subagent', 'zcode', '--repository', wsZcode, '--permission-mode', 'yolo',
-      '--model', 'glm-5.3', '--prompt', 'hi',
+      '--prompt', 'hi',
     ], { encoding: 'utf8', timeout: 30_000, env: { ...cleanDaemonEnv(home), EXTERNAL_SUBAGENT_SOCKET: socket } });
     assert.equal(rejected.status, 1);
     const rejection = JSON.parse(rejected.stderr);
-    assert.equal(rejection.error.code, 'model_selection_unsupported');
-    assert.equal(rejection.error.message, 'model selection is unsupported for zcode');
+    assert.equal(rejection.error.code, 'validation');
+    assert.match(rejection.error.message, /explicit model/u);
 
     // Mid-run cancel with reaping on DSH. The poll loop must actually
     // observe RUNNING: cancelling a task that never left QUEUED would not
@@ -466,7 +472,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
       'discovery: dsh+zcode configured & spawn_supported; model_selection: dsh=supported zcode=unsupported(fail-closed)',
       `dsh: local=${dshLocal.local.state} authenticated-hi=${dshHi.hi.state} models=${dshModels.models.length}`,
       'dsh tasks: build=COMPLETED/reaped strict-plan=COMPLETED/workspace-unmutated mid-run-cancel=CANCELLED/reaped',
-      'zcode tasks: native-model=COMPLETED/reaped model-rejection=model_selection_unsupported',
+      'zcode tasks: explicit-model=COMPLETED/reaped missing-model=validation',
       'NOT asserted here (that-session live evidence only): MCP facade, pending/respond, restart no-replay',
       'NOT asserted here (bounded limitation): zcode authenticated hi (provider credentials live outside the harness)',
     ].join('\n'));

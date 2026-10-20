@@ -8,7 +8,16 @@ const event = (type, payload = {}) => send({ method: 'session/event', params: {
 readline.createInterface({ input: process.stdin }).on('line', (line) => {
   const request = JSON.parse(line);
   let result = {};
-  if (request.method === 'session/create') result = { session: { sessionId: 'fixture-session' } };
+  if (request.method === 'session/create') result = {
+    session: { sessionId: 'fixture-session' },
+    settings: { model: {
+      current: { providerId: 'provider', modelId: 'model' },
+      available: [{ ref: { providerId: 'provider', modelId: 'model' } }],
+    } },
+  };
+  if (request.method === 'session/setModel') result = {
+    settings: { model: { current: { providerId: 'provider', modelId: 'model' } } },
+  };
   if (request.method === 'session/subscribe') result = { subscribed: true };
   if (request.method === 'session/send') result = { turnId: 'fixture-turn' };
   if (request.id !== undefined) send({ id: request.id, result });

@@ -114,19 +114,17 @@ bundled and marketplace plugins: **inline directories** — every path in
 - `plugins.enabled: false` in the config disables all plugin loading;
   `install-plugin zcode` still installs and reports a `warning` instead
   of silently binding into a disabled subsystem.
-- ZCode model selection materializes a provider environment from four
-  undocumented variables (`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`,
-  `ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE`,
-  `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_DATA_BASE_DIR`). The
-  variable names and the `provider_config` schema they point at are
-  internal interfaces, not a public API, and a ZCode update can change
-  them. The group is injected atomically and falls back to today's native
-  behavior when the builtin template is unreadable. After any ZCode
-  upgrade, re-run the model chain: `subagents models zcode` must list the
-  expected catalog tokens, and one small task spawned with an explicit
-  model must complete with that model. The generated personal file holds
-  the API key, so it is written 0600 under the daemon data root and never
-  appears in catalog output, evidence, or logs.
+- ZCode model selection is an explicit caller decision: spawn requires a
+  `{provider}/{model}` token from the spawn request or a named profile.
+  An omitted model and a bare token are refused at admission, and a
+  non-null `agents.zcode.default_model` is rejected by both config
+  boundaries with `model_selection_unsupported`. The daemon does not
+  synthesize or inject a provider environment for ZCode children; the
+  runtime resolves providers from its own inherited environment. After
+  any ZCode upgrade, re-run the model chain: `subagents models zcode`
+  must list the expected native catalog tokens, and one small task spawned
+  with an explicit `{provider}/{model}` model must complete with that
+  model.
 - `session/setModel` is the pinned switch protocol: the request always
   sets `persistAsWorkspaceLastUsed: false`, the create result's
   `settings.model.available` is the only whitelist (it shrinks to the
@@ -217,7 +215,9 @@ the nvm Node v24.17.0 and the bundled v22.16.0.
 credentials copied then deleted): `agents enable zcode` probes
 `local.state=READY`, `version=0.16.9`, and a full
 `spawn → wait → result → close` chain with `permission_mode=plan` completed
-with `final_text="pong"` (`input_identity.model_source="native"`). The
+with `final_text="pong"` (`input_identity.model_source="native"` under the
+then-current admission contract, which allowed an omitted model; the current
+contract requires an explicit `{provider}/{model}`). The
 runtime writes its own logs/state under the spawn environment's `~/.zcode`
 (the isolated home), never the real tree.
 

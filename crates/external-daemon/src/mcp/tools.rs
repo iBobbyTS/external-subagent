@@ -366,7 +366,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, and effort cannot be specified. Specify subagent unless default_subagent is configured. ZCode uses a provider/model token (a bare token keeps the backward-compatible zai/<token> reading); an omitted model falls back to agents.zcode.default_model and then to the native model; dsh spawns when its enabled + spawn_supported + profile=acp + absolute executable runtime_path configuration admits it (the runtime version is advisory only: a difference never blocks a spawn and surfaces in status and failure instructions). A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, and effort cannot be specified. Specify subagent unless default_subagent is configured. ZCode requires an explicit provider/model token from the spawn request or a named profile; a bare token, an omitted model, and agents.zcode.default_model are rejected at admission. dsh spawns when its enabled + spawn_supported + profile=acp + absolute executable runtime_path configuration admits it (the runtime version is advisory only: a difference never blocks a spawn and surfaces in status and failure instructions). A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -1471,7 +1471,7 @@ mod contract_default_tests {
         let input = AgentSpawnInput {
             profile: None,
             agent: Some("zcode".into()),
-            model: None,
+            model: Some("provider/model".into()),
             effort: Some("high".into()),
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "effort passthrough".into(),
@@ -1883,7 +1883,7 @@ mod contract_default_tests {
         let input = AgentSpawnInput {
             profile: None,
             agent: Some("zcode".into()),
-            model: None,
+            model: Some("provider/model".into()),
             effort: None,
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "spawn session test".into(),
@@ -1930,7 +1930,7 @@ mod contract_default_tests {
                 }
                 Ok(crate::SessionReady {
                     session_id: "mcp-blocked-session".into(),
-                    configured_model: None,
+                    configured_model: Some("provider/model".into()),
                     initial_turn_id: None,
                 })
             }
@@ -2023,6 +2023,7 @@ mod contract_default_tests {
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "external_subagent_spawn", "arguments": {
                 "subagent": "zcode",
+                "model": "provider/model",
                 "repository": repository.path().to_string_lossy(),
                 "prompt": "interrupt test",
                 "permission_mode": "plan"
@@ -2088,7 +2089,7 @@ mod contract_default_tests {
         let spawn_input = AgentSpawnInput {
             profile: None,
             agent: Some("zcode".into()),
-            model: None,
+            model: Some("provider/model".into()),
             effort: None,
             repository: repo2.path().to_string_lossy().into_owned(),
             permission_mode: Some(PublicPermissionMode::Plan),

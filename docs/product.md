@@ -63,13 +63,13 @@ external-subagent config set subagents.dsh.profile acp
 external-subagent config set subagents.dsh.version 0.1.5-rc.1
 ```
 
-DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 指定 model 会被明确拒绝。agy 仅接受 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），model 选择顺序同为 spawn 显式裸 slug、配置 `default_model`、native default（启动时按 `agy models` 目录校验，未知 slug 响亮失败）。
+DSH 首发只接受 `build` 和严格 `plan`。DSH model 的选择顺序是 spawn 显式 model、配置的 `default_model`、上游 native default；ZCode 要求 spawn 显式携带 `provider/model`（spawn 请求或具名 profile），裸 token 与省略在准入阶段被拒绝，`agents.zcode.default_model` 以 `model_selection_unsupported` 拒绝。agy 仅接受 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），model 选择顺序同为 spawn 显式裸 slug、配置 `default_model`、native default（启动时按 `agy models` 目录校验，未知 slug 响亮失败）。
 
 spawn 可选 `effort` 参数指定逐任务推理力度：codex 只接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），agy 只接受实测闭集 `low/medium/high/max`，zcode 与 dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token；省略时保持各 subagent 现状默认，非法 token 在派发前被拒绝且不产生任务。
 
 ## 实际能力限制（来自已验收代码）
 
-- `zcode`：默认禁用；显式启用后支持 spawn，四个权限模式（build/edit/plan/yolo）全部可用；spawn 显式传入 `model` 被拒绝（`model_selection_unsupported`）。
+- `zcode`：默认禁用；显式启用后支持 spawn，四个权限模式（build/edit/plan/yolo）全部可用；spawn 必须显式携带 `provider/model`（spawn 请求或具名 profile），裸 token 与省略在准入阶段被拒绝。
 - `dsh`：默认禁用；显式启用并配置 `runtime_path`/`home`/`profile`/`version` 后才可 spawn；仅接受 `build` 和严格 `plan`。build 接受 caller 非空 `write_manifest`（≤256 条、序列化 ≤64 KiB）：daemon 为每任务物化 write-guard 插件与 manifest-build patch，以 workspace-write 沙箱拉起 dsh，唯一启用写工具为 `tool-fs`，清单外写入由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝；显式 `["."]` 与空清单一样走现行 build 组合，plan + 非空清单仍被拒。
 - `codex`（作为 subagent）：默认禁用；支持四模式：`build`/`edit` → sandbox=workspace-write，`plan` → sandbox=read-only，`yolo` → sandbox=danger-full-access；全部钉死 approvalPolicy=never。不支持非空 `write_manifest`，在创建任务前以 `codex_write_manifest_unsupported` 拒绝。
 - `agy`（Google Antigravity，作为 subagent）：默认禁用；显式启用并配置绝对可执行的 `AGY_RUNTIME_PATH`（或 daemon 启动前设置该环境变量）后才可 spawn；仅接受 `build`（`--mode accept-edits`）与 `yolo`（`--dangerously-skip-permissions`），plan/edit 在准入阶段以 `agy_permission_mode_unsupported` 拒绝；model 为裸 slug（`agy models` 目录校验）；effort 为闭集 `low/medium/high/max`；无 write-manifest 守卫，任何非空 `write_manifest`（含显式 `["."]`）在创建任务前以 `agy_write_manifest_unsupported` 拒绝；无 permission request/respond 交互，工具在默认 soft-deny 姿态下被自动拒绝，成功路径的 denied_actions 无公共投影面（documented gap），失败/取消诊断尾部可见。

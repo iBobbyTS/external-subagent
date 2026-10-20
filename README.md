@@ -38,7 +38,8 @@ All four subagents are **disabled by default** and are enabled per name with
 `external-subagent agents enable <zcode|dsh|codex|agy>`: a successful local probe
 writes the configuration (no write on failure), and `dsh`/`codex`/`agy` need a
 daemon restart to take effect. ZCode admits all four permission modes
-(build/edit/plan/yolo) and rejects an explicit spawn `model`; DSH admits
+(build/edit/plan/yolo) and requires an explicit `provider/model` spawn
+selection; DSH admits
 `build` and strict `plan`, with model selection as explicit spawn model,
 configured default, then the native default, and its `build` mode admits a
 non-empty caller `write_manifest` through the guarded manifest-build
@@ -151,7 +152,7 @@ from the available set.
 |---|---|
 | `name` | Required, unique across files; trimmed, non-empty, at most 128 bytes |
 | `subagent` | `zcode`, `dsh`, `codex`, or `agy` |
-| `model` | Model token, named per target: `dsh` wants `provider:model`, `zcode` accepts `provider/model` or a bare token, `codex` and `agy` take a bare slug |
+| `model` | Model token, named per target: `dsh` wants `provider:model`, `zcode` requires `provider/model` (from the spawn request or a named profile; a bare token and omission are rejected), `codex` and `agy` take a bare slug |
 | `effort` | Effort token; some runtime models require one (for example `agy` rejects `gemini-3.8-flash` without `--effort`) and the spawn error surfaces the runtime's message verbatim |
 | `permission_mode` | `build`, `edit`, `plan`, or `yolo`; defaults to `build` when unset |
 | `developer_instructions` | Free-form instructions, delivered as described below |
