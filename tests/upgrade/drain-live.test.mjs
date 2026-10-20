@@ -462,8 +462,12 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
     assert.ok(fs.readFileSync(paths().launchAgent, 'utf8').includes(DSH_RUNTIME), 'the re-rendered plist pins the DSH runtime environment');
 
     // ZCode requires an explicit provider/model selection; derive it from the
-    // runtime's native catalog (override available for a pinned token).
-    const zcodeModels = cli(['agents', 'models', 'zcode', '--workspace', wsZcode]);
+    // runtime's native catalog (override available for a pinned token). The
+    // agents/models CLI envelope carries models/supported at the top level,
+    // unlike the daemon commands whose payload is under `.result`.
+    const zcodeModelsRun = cliRaw(['agents', 'models', 'zcode', '--workspace', wsZcode]);
+    assert.equal(zcodeModelsRun.status, 0, `agents models zcode failed: ${zcodeModelsRun.stderr || zcodeModelsRun.stdout}`);
+    const zcodeModels = JSON.parse(zcodeModelsRun.stdout);
     assert.equal(zcodeModels.supported, true, `zcode model discovery is not supported: ${JSON.stringify(zcodeModels)}`);
     assert.ok(zcodeModels.models.length > 0, 'the zcode native catalog must not be empty');
     const zcodeModel = process.env.EXTERNAL_SUBAGENT_LIVE_ZCODE_MODEL || zcodeModels.models[0];
