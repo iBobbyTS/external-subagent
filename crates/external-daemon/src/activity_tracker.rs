@@ -567,6 +567,18 @@ mod tests {
         old.observe_at(&reasoning("r-old", "old "), now, 0);
         old.observe_at(&tool_call("e1", "c1", 1), now, 0);
         old.observe_at(&tool_call("e2", "c2", 2), now, 0);
+        // The pre-claim tracker ingested a started descriptor and then a
+        // streaming refinement of the same call.
+        let old_started = session_fixture(serde_json::json!({
+            "type":"tool.updated", "eventId":"start-old", "turnId":"t",
+            "payload":{"kind":"started","toolCallId":"d1","toolName":"Read","input":{}}
+        }));
+        let old_refined = session_fixture(serde_json::json!({
+            "type":"model.streaming", "eventId":"refine-old", "turnId":"t",
+            "payload":{"kind":"tool_call","toolCallId":"d1","toolName":"Read","input":{"path":"a.ts"}}
+        }));
+        old.observe_at(&old_started, now, 0);
+        old.observe_at(&old_refined, now, 0);
         // The incoming tracker already saw c1 before the map swap: the merge
         // must not count it twice.
         new.observe_at(&reasoning("r-new", "new"), now, 0);
@@ -579,7 +591,7 @@ mod tests {
         assert_eq!(old.observation_snapshot(), outgoing_before);
 
         let snapshot = new.observation_snapshot();
-        assert_eq!(snapshot.tools.len(), 1);
+        assert_eq!(snapshot.tools.len(), 2);
         assert_eq!(snapshot.tools[0].tool_name, "Bash");
         assert_eq!(snapshot.tools[0].call_count, 3);
         assert_eq!(
@@ -600,6 +612,16 @@ mod tests {
         );
         // Reasoning is concatenated oldest→newest across the replacement.
         assert_eq!(snapshot.reasoning.text, "old new");
+        let read = snapshot
+            .tools
+            .iter()
+            .find(|tool| tool.tool_name == "Read")
+            .unwrap();
+        assert_eq!(read.call_count, 1);
+        assert_eq!(
+            read.recent_calls[0].arguments["path"],
+            serde_json::json!("a.ts")
+        );
 
         // Replaying a pre-claim event after inheritance is refused by the
         // merged source-event set and the call identity.
@@ -608,6 +630,28 @@ mod tests {
         let replayed = new.observation_snapshot();
         assert_eq!(replayed.tools[0].call_count, 3);
         assert_eq!(replayed.tools[0].recent_calls.len(), 3);
+
+        // A pre-claim descriptor re-delivered verbatim is rejected by the
+        // inherited descriptor-frame set: it must not restore the obsolete
+        // empty arguments over the streaming refinement.
+        new.observe(&old_started);
+        assert_eq!(new.observation_snapshot(), replayed);
+
+        // A new post-claim descriptor still lands normally.
+        new.observe(&session_fixture(serde_json::json!({
+            "type":"tool.updated", "eventId":"start-new", "turnId":"t",
+            "payload":{"kind":"started","toolCallId":"d2","toolName":"Read","input":{"path":"b.ts"}}
+        })));
+        let landed = new.observation_snapshot();
+        let read = landed
+            .tools
+            .iter()
+            .find(|tool| tool.tool_name == "Read")
+            .unwrap();
+        assert_eq!(read.call_count, 2);
+        assert!(read.recent_calls.iter().any(|call| {
+            call.tool_call_id == "d2" && call.arguments["path"] == serde_json::json!("b.ts")
+        }));
     }
 
     #[test]
