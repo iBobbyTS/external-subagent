@@ -126,6 +126,12 @@ pub(crate) struct ToolDescriptor {
     pub(crate) turn_id: String,
     pub(crate) tool_call_id: String,
     pub(crate) tool_name: String,
+    /// The parser-level source-frame identity (`tool:{call}:{phase}` for a
+    /// detailed started frame, turn-prefixed `tool:{event}:count` for a
+    /// count event). Replays of the same frame are rejected on this key, not
+    /// on the call identity, so the DSH streaming/started sibling pair can
+    /// still enrich one call.
+    pub(crate) source_identity: String,
     pub(crate) input: Option<Value>,
     pub(crate) detail: Option<String>,
 }
@@ -144,6 +150,7 @@ pub struct ObservationState {
     snapshot_seq: u64,
     next_call_seq: u64,
     seen_source_events: HashSet<String>,
+    seen_descriptor_frames: HashSet<String>,
     seen_calls: HashMap<String, (String, u64)>,
     tools: HashMap<String, ToolGroup>,
     reasoning_raw: String,
@@ -162,6 +169,7 @@ impl Default for ObservationState {
             snapshot_seq: 0,
             next_call_seq: 0,
             seen_source_events: HashSet::new(),
+            seen_descriptor_frames: HashSet::new(),
             seen_calls: HashMap::new(),
             tools: HashMap::new(),
             reasoning_raw: String::new(),
@@ -292,10 +300,28 @@ impl ObservationState {
     /// arriving after the same logical call's `model.streaming` event updates
     /// the existing record instead of counting it twice.
     pub(crate) fn observe_descriptor(&mut self, descriptor: &ToolDescriptor) {
-        if !valid_text(&descriptor.tool_call_id) || !valid_text(&descriptor.tool_name) {
+        if !valid_text(&descriptor.tool_call_id)
+            || !valid_text(&descriptor.tool_name)
+            || descriptor.source_identity.is_empty()
+            || descriptor.source_identity.contains('\0')
+        {
             self.drop_event(true);
             return;
         }
+        if self
+            .seen_descriptor_frames
+            .contains(&descriptor.source_identity)
+        {
+            // A verbatim re-delivery of an already consumed descriptor frame
+            // is not a refinement: it must leave the snapshot untouched.
+            return;
+        }
+        if self.seen_descriptor_frames.len() >= MAX_IDENTITIES {
+            self.drop_event(true);
+            return;
+        }
+        self.seen_descriptor_frames
+            .insert(descriptor.source_identity.clone());
         let (arguments, arguments_truncated, redacted_fields) =
             match descriptor.input.as_ref() {
                 Some(input) => {
@@ -450,6 +476,16 @@ impl ObservationState {
                 break;
             }
             self.seen_source_events.insert(event_id);
+        }
+        // Descriptor frames likewise stay rejected after a claim.
+        for source_identity in newer.seen_descriptor_frames {
+            if self.seen_descriptor_frames.len() >= MAX_IDENTITIES {
+                self.tool_history_complete = false;
+                self.reasoning_complete = false;
+                self.dropped_events = self.dropped_events.saturating_add(1);
+                break;
+            }
+            self.seen_descriptor_frames.insert(source_identity);
         }
         self.snapshot_seq = self.snapshot_seq.saturating_add(newer.snapshot_seq);
     }
@@ -861,6 +897,7 @@ mod tests {
             turn_id: "t".into(),
             tool_call_id: "call-1".into(),
             tool_name: "Bash".into(),
+            source_identity: "tool:call-1:started".into(),
             input: Some(Value::String("echo hi".into())),
             detail: None,
         });

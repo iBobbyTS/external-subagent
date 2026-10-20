@@ -663,6 +663,39 @@ mod tests {
     }
 
     #[test]
+    fn replayed_started_descriptor_keeps_the_newer_streaming_arguments() {
+        let tracker = PassiveActivityTracker::for_adapter("zcode", true);
+        let started = session_fixture(serde_json::json!({
+            "type":"tool.updated", "eventId":"start-1", "turnId":"t",
+            "payload":{"kind":"started","toolCallId":"c","toolName":"Bash","input":{}}
+        }));
+        let refined = session_fixture(serde_json::json!({
+            "type":"model.streaming", "eventId":"refine-2", "turnId":"t",
+            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"sleep 300"}}
+        }));
+        tracker.observe(&started);
+        tracker.observe(&refined);
+        let before = tracker.observation_snapshot();
+        assert_eq!(before.tools[0].call_count, 1);
+        assert_eq!(
+            before.tools[0].recent_calls[0].arguments["command"],
+            serde_json::json!("sleep 300")
+        );
+
+        // The repeated started descriptor is rejected by its source-frame
+        // identity even though the sample admission guard also rejects it;
+        // the newer streaming arguments must survive.
+        tracker.observe(&started);
+        let replayed = tracker.observation_snapshot();
+        assert_eq!(replayed, before);
+        assert_eq!(replayed.tools[0].call_count, 1);
+        assert_eq!(
+            replayed.tools[0].recent_calls[0].arguments["command"],
+            serde_json::json!("sleep 300")
+        );
+    }
+
+    #[test]
     fn descriptors_respect_modes_and_old_events_do_not_invent_calls() {
         let now = Instant::now();
         let old = session_fixture(external_contract::activity::tool_count_event(

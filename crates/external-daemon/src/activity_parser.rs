@@ -484,7 +484,8 @@ fn parse_tool_count_activity(
     let Some(event_id) = event_id else {
         return;
     };
-    parsed.identity = Some(format!("tool:{event_id}:count"));
+    let identity = format!("tool:{event_id}:count");
+    parsed.identity = Some(identity.clone());
     if let Some(tool) = payload.get("tool").and_then(serde_json::Value::as_str) {
         let detail = payload
             .get("detail")
@@ -496,6 +497,9 @@ fn parse_tool_count_activity(
             // id is its stable, non-empty identity.
             tool_call_id: count_call_id(&event_id),
             tool_name: tool.to_owned(),
+            // Turn-prefixed parser identity, matching the ring-era descriptor
+            // dedup key.
+            source_identity: format!("{}:{identity}", turn_id.unwrap_or_default()),
             input: None,
             detail: Some(detail.to_owned()),
         });
@@ -539,11 +543,18 @@ fn parse_detailed_descriptor(
     let Some(input) = payload.get("input") else {
         return;
     };
+    // The sample identity is the frame's parser-level source identity
+    // (`tool:{call}:started`); a replay of the same started frame must not
+    // reach the observation record path.
+    let Some(source_identity) = parsed.identity.clone() else {
+        return;
+    };
     let turn = activity_id(params.get("turnId")).unwrap_or_default();
     parsed.tool_descriptor = Some(observation::ToolDescriptor {
         turn_id: turn,
         tool_call_id: call_id,
         tool_name: tool.to_owned(),
+        source_identity,
         input: Some(input.clone()),
         detail: None,
     });
