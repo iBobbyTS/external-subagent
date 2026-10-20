@@ -23,8 +23,9 @@ const daemonPath = path.resolve('target/debug/external-subagentd');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // A zcode app-server stand-in that answers the strict bootstrap sequence
-// (session/create, session/subscribe, session/send), leaves the turn active,
-// and spawns the deep tree through the same supervised process creation.
+// (session/create, session/setModel, session/subscribe, session/send), leaves
+// the turn active, and spawns the deep tree through the same supervised
+// process creation.
 const RUNTIME_FIXTURE = `'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
@@ -47,10 +48,11 @@ const reply = (value) => process.stdout.write(JSON.stringify(value) + '\\n');
 let reads = 0;
 rl.on('line', () => {
   reads += 1;
-  if (reads === 1) reply({ id: 1, result: { session: { sessionId: 'windows-tree-session' } } });
-  else if (reads === 2) reply({ id: 2, result: {} });
-  else if (reads === 3) {
-    reply({ id: 3, result: { turnId: 't1' } });
+  if (reads === 1) reply({ id: 1, result: { session: { sessionId: 'windows-tree-session' }, settings: { model: { available: [{ ref: { providerId: 'provider', modelId: 'model' } }] } } } });
+  else if (reads === 2) reply({ id: 2, result: { settings: { model: { current: { providerId: 'provider', modelId: 'model' } } } } });
+  else if (reads === 3) reply({ id: 3, result: {} });
+  else if (reads === 4) {
+    reply({ id: 4, result: { turnId: 't1' } });
     reply({ method: 'session/event', params: { type: 'turn.started' } });
   }
   // The turn is never completed: it stays active until the task is cancelled.
