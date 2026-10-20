@@ -135,12 +135,13 @@ impl Scheduler {
         // Public-source policy follows the launched adapter: pinned ZCode,
         // public DSH ACP thoughts, and no Codex reasoning collection.
         let adapter = task_agent(&claim.task);
-        let activity = Arc::new(PassiveActivityTracker::for_adapter(
+        let activity = Arc::new(PassiveActivityTracker::for_launch(
             &adapter,
             observation::adapter_runtime_source_verified(
                 &adapter,
                 self.inner.config.runtime_source.as_deref(),
             ),
+            claim.owner_epoch,
         ));
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),

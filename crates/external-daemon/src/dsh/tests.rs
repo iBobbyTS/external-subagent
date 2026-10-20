@@ -2451,3 +2451,53 @@ while [ ! -f test-release ]; do sleep 0.05; done
         result
     );
 }
+
+#[test]
+fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
+    use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
+    let tracker = crate::PassiveActivityTracker::for_adapter("dsh", true);
+    let update = parse_update(&serde_json::json!({
+        "sessionId": "s1", "update": {
+            "sessionUpdate": "tool_call", "toolCallId": "tool-7", "kind": "edit",
+            "rawInput": {"path": "a.ts", "content": "中"}
+        }
+    }))
+    .unwrap();
+    let input = serde_json::json!({"path":"a.ts","content":"中"});
+    // Mirror the daemon pump: the streaming sibling has no input and the
+    // input-bearing started sibling shares the pair's launch-local event id.
+    let deliver = |event_id: &str| {
+        for mut params in canonical_event_payloads(&update, event_id, "t1") {
+            if params["type"] == "tool.updated" && params["payload"]["kind"] == "started" {
+                params["payload"]["input"] = input.clone();
+            }
+            tracker.observe(&crate::RuntimeEvent::Driver(Inbound::Message(
+                WireMessage::Event(EventEnvelope {
+                    method: "session/event".into(),
+                    params,
+                }),
+            )));
+        }
+    };
+
+    deliver("dsh-event-1");
+    let before = tracker.observation_snapshot();
+    assert_eq!(before.tools[0].call_count, 1);
+    assert_eq!(
+        before.tools[0].recent_calls[0].arguments["path"],
+        serde_json::json!("a.ts")
+    );
+    assert!(!before.tools[0].recent_calls[0].arguments_truncated);
+
+    // A repeated ACP notification is re-normalized with fresh event ids. Its
+    // input-absent streaming sibling must not erase the captured rawInput.
+    deliver("dsh-event-2");
+    let after = tracker.observation_snapshot();
+    assert_eq!(after, before);
+    assert_eq!(after.tools[0].call_count, 1);
+    assert_eq!(
+        after.tools[0].recent_calls[0].arguments["path"],
+        serde_json::json!("a.ts")
+    );
+    assert!(!after.tools[0].recent_calls[0].arguments_truncated);
+}

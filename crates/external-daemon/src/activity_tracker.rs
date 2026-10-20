@@ -54,9 +54,21 @@ impl PassiveActivityTracker {
     }
 
     pub(crate) fn for_adapter(adapter: &str, runtime_source_verified: bool) -> Self {
+        Self::for_launch(adapter, runtime_source_verified, 0)
+    }
+
+    /// Construct a tracker for one fresh runtime launch. `launch_scope` is the
+    /// claim's owner epoch and namespaces the observation replay guards so a
+    /// new launch's adapter-local ids (DSH restarts at zero) never collide
+    /// with inherited ids from a previous claim.
+    pub(crate) fn for_launch(
+        adapter: &str,
+        runtime_source_verified: bool,
+        launch_scope: u64,
+    ) -> Self {
         let mut tracker = Self::new(runtime_source_verified);
         tracker.state.lock().unwrap().observation =
-            observation::ObservationState::for_adapter(adapter);
+            observation::ObservationState::for_launch(adapter, launch_scope);
         tracker.mode = match adapter {
             "codex" => ToolActivityMode::CountOnly,
             "zcode" | "dsh" | "agy" => ToolActivityMode::Detailed,
@@ -561,8 +573,8 @@ mod tests {
             }))
         }
 
-        let old = PassiveActivityTracker::for_adapter("zcode", false);
-        let new = PassiveActivityTracker::for_adapter("zcode", false);
+        let old = PassiveActivityTracker::for_launch("zcode", false, 1);
+        let new = PassiveActivityTracker::for_launch("zcode", false, 2);
         let now = Instant::now();
         old.observe_at(&reasoning("r-old", "old "), now, 0);
         old.observe_at(&tool_call("e1", "c1", 1), now, 0);
@@ -584,6 +596,9 @@ mod tests {
         new.observe_at(&reasoning("r-new", "new"), now, 0);
         new.observe_at(&tool_call("e1", "c1", 1), now, 0);
         new.observe_at(&tool_call("e3", "c3", 3), now, 0);
+        // A stale pre-swap replay of the old started descriptor reaches the
+        // incoming tracker and records the obsolete empty arguments there.
+        new.observe_at(&old_started, now, 0);
         let outgoing_before = old.observation_snapshot();
         new.inherit_wait_text(&old);
         // The outgoing tracker must keep serving its real observation to
@@ -652,6 +667,68 @@ mod tests {
         assert!(read.recent_calls.iter().any(|call| {
             call.tool_call_id == "d2" && call.arguments["path"] == serde_json::json!("b.ts")
         }));
+    }
+
+    #[test]
+    fn launch_scoped_guards_accept_recycled_event_ids_after_reclaim() {
+        let old = PassiveActivityTracker::for_launch("dsh", true, 1);
+        let new = PassiveActivityTracker::for_launch("dsh", true, 2);
+        let now = Instant::now();
+        old.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":"dsh-event-1", "turnId":"old-turn",
+                "payload":{"kind":"reasoning_delta","delta":"old "}
+            })),
+            now,
+            0,
+        );
+        old.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":"dsh-event-2", "turnId":"old-turn",
+                "payload":{"kind":"tool_call","toolCallId":"old-call","toolName":"read","input":{"path":"old.ts"}}
+            })),
+            now,
+            0,
+        );
+        new.inherit_wait_text(&old);
+
+        // The restarted DSH owner starts its launch-local sequence at zero, so
+        // the new claim reuses the same source ids for genuinely new events.
+        new.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":"dsh-event-1", "turnId":"new-turn",
+                "payload":{"kind":"reasoning_delta","delta":"new"}
+            })),
+            now,
+            0,
+        );
+        new.observe_at(
+            &session_fixture(serde_json::json!({
+                "type":"model.streaming", "eventId":"dsh-event-2", "turnId":"new-turn",
+                "payload":{"kind":"tool_call","toolCallId":"new-call","toolName":"edit","input":{"path":"new.ts"}}
+            })),
+            now,
+            0,
+        );
+        let snapshot = new.observation_snapshot();
+        assert_eq!(snapshot.reasoning.text, "old new");
+        assert!(snapshot.coverage.reasoning_complete);
+        assert!(!snapshot.coverage.tool_history_complete);
+        assert_eq!(snapshot.coverage.dropped_events, 0);
+        let tool = |name: &str| {
+            snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.tool_name == name)
+                .unwrap_or_else(|| panic!("{name} must be captured"))
+        };
+        assert_eq!(tool("read").call_count, 1);
+        let edit = tool("edit");
+        assert_eq!(edit.call_count, 1);
+        assert_eq!(
+            edit.recent_calls[0].arguments["path"],
+            serde_json::json!("new.ts")
+        );
     }
 
     #[test]

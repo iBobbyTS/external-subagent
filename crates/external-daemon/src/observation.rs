@@ -145,6 +145,10 @@ struct ToolGroup {
 
 #[derive(Clone)]
 pub struct ObservationState {
+    /// The claim's owner epoch: every fresh runtime launch gets its own
+    /// namespace for replay guards because adapter-local source ids (notably
+    /// DSH's `dsh-event-N`) restart at zero on each launch.
+    launch_scope: u64,
     collect_reasoning: bool,
     reasoning_source: ReasoningSource,
     snapshot_seq: u64,
@@ -164,6 +168,7 @@ pub struct ObservationState {
 impl Default for ObservationState {
     fn default() -> Self {
         Self {
+            launch_scope: 0,
             collect_reasoning: true,
             reasoning_source: ReasoningSource::verified(),
             snapshot_seq: 0,
@@ -184,8 +189,16 @@ impl Default for ObservationState {
 
 impl ObservationState {
     pub fn for_adapter(adapter: &str) -> Self {
+        Self::for_launch(adapter, 0)
+    }
+
+    /// Construct state for one runtime launch. The launch scope namespaces
+    /// every source-id replay guard, so a recycled adapter-local id in a new
+    /// launch can never be mistaken for a replay from a previous claim.
+    pub(crate) fn for_launch(adapter: &str, launch_scope: u64) -> Self {
         let public = matches!(adapter, "zcode" | "dsh");
         Self {
+            launch_scope,
             collect_reasoning: public,
             reasoning_complete: public,
             // Only ZCode exposes the verified per-call history. DSH, agy and
@@ -219,14 +232,15 @@ impl ObservationState {
             self.drop_event(kind == Some("tool_call"));
             return;
         };
-        if self.seen_source_events.contains(event_id) {
+        let key = launch_key(self.launch_scope, event_id);
+        if self.seen_source_events.contains(&key) {
             return;
         }
         if self.seen_source_events.len() >= MAX_IDENTITIES {
             self.drop_event(kind == Some("tool_call"));
             return;
         }
-        self.seen_source_events.insert(event_id.to_owned());
+        self.seen_source_events.insert(key);
         match kind {
             Some("reasoning_delta") => {
                 let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
@@ -308,10 +322,8 @@ impl ObservationState {
             self.drop_event(true);
             return;
         }
-        if self
-            .seen_descriptor_frames
-            .contains(&descriptor.source_identity)
-        {
+        let key = launch_key(self.launch_scope, &descriptor.source_identity);
+        if self.seen_descriptor_frames.contains(&key) {
             // A verbatim re-delivery of an already consumed descriptor frame
             // is not a refinement: it must leave the snapshot untouched.
             return;
@@ -320,8 +332,7 @@ impl ObservationState {
             self.drop_event(true);
             return;
         }
-        self.seen_descriptor_frames
-            .insert(descriptor.source_identity.clone());
+        self.seen_descriptor_frames.insert(key);
         let (arguments, arguments_truncated, redacted_fields) =
             match descriptor.input.as_ref() {
                 Some(input) => {
@@ -374,9 +385,15 @@ impl ObservationState {
                 .get_mut(&original_name)
                 .and_then(|group| group.recent_calls.iter_mut().find(|call| call.seq == seq))
             {
-                if call.arguments != arguments
-                    || call.arguments_truncated != arguments_truncated
-                    || call.redacted_fields != redacted_fields
+                // An input-absent update (unknown arguments) must never erase
+                // known non-empty arguments of the same call. Known→known
+                // refinements and unknown-creates-first-record stay allowed.
+                let unknown_downgrade =
+                    arguments.is_empty() && arguments_truncated && !call.arguments.is_empty();
+                if !unknown_downgrade
+                    && (call.arguments != arguments
+                        || call.arguments_truncated != arguments_truncated
+                        || call.redacted_fields != redacted_fields)
                 {
                     call.arguments = arguments;
                     call.arguments_truncated = arguments_truncated;
@@ -414,10 +431,15 @@ impl ObservationState {
 
     /// Fold a tracker's pre-replacement observation history into this one.
     /// The receiver keeps its own (older) history as the base; the incoming
-    /// calls are replayed in receipt order through [`Self::record_tool_call`],
-    /// so an identity both trackers saw updates instead of counting twice.
+    /// calls are replayed in receipt order through [`Self::record_tool_call`].
+    /// A call identity already present in the base is a replay or a
+    /// pathological id reuse, so the base's captured arguments win and the
+    /// count stays deduplicated. The merged state adopts the incoming launch
+    /// scope: inherited replay keys keep the old launch's namespace, while
+    /// fresh events from the new launch are compared in its own.
     /// Coverage stays honest: incomplete wins and dropped counts add up.
     pub(crate) fn merge_newer(&mut self, newer: ObservationState) {
+        self.launch_scope = newer.launch_scope;
         if !newer.reasoning_raw.is_empty() {
             // The base's raw stream is older than the incoming tracker's
             // bytes; appending applies the same rolling cap and tail.
@@ -435,6 +457,11 @@ impl ObservationState {
             .collect::<Vec<_>>();
         calls.sort_by_key(|(seq, _, _)| *seq);
         for (seq, identity, tool_name) in calls {
+            if self.seen_calls.contains_key(identity) {
+                // Already counted in the base: never replace its arguments
+                // with the incoming (possibly stale/replayed) record.
+                continue;
+            }
             // The identity format has a single NUL separator and both sides
             // are NUL-free by validation.
             let (turn_id, call_id) = identity
@@ -545,6 +572,10 @@ impl ObservationState {
             },
         }
     }
+}
+
+fn launch_key(launch_scope: u64, source_id: &str) -> String {
+    format!("{launch_scope}\0{source_id}")
 }
 
 fn valid_text(value: &str) -> bool {
