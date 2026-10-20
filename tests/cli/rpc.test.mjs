@@ -58,7 +58,7 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
           task: { agent_id: '10000001', status: 'running', session_id: null },
           pending_requests: [{ request_id: 'read-1', kind: 'permission', tool_name: 'Read', operation: 'read', summary: 'target input.txt' }],
           result_available: false,
-          activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+          activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
           result: null,
           instruction: 'A permission request is pending; respond now with external_subagent_respond using decision allow or deny.',
           timed_out: false,
@@ -73,7 +73,7 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
     assert.deepEqual(result.task, { agent_id: 10000001, status: 'running', session_id: null });
     assert.equal(result.result, null);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
-    assert.equal(result.activity.latest_reasoning, '');
+    assert.equal(Object.hasOwn(result.activity, 'latest_reasoning'), false);
     assert.equal(result.timed_out, false);
     assert.equal(result.kind, undefined);
   }
@@ -123,7 +123,7 @@ test('CLI forwards wait message_id when declared', { skip: win32Sockets }, async
         kind: 'task_wait',
         task: { agent_id: '10000001', status: 'running', session_id: null },
         pending_requests: [], result_available: false,
-        activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+        activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
         result: null, instruction: null, timed_out: true,
         message_receipt: { message_id: 'message-1', state: 'queued', failure_code: null },
       },

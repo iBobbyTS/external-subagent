@@ -117,6 +117,19 @@ impl ObservationSnapshot {
     }
 }
 
+/// One detailed tool descriptor collected outside the verified model.streaming
+/// vocabulary: an agy/dsh `tool.updated` started frame (name + input) or a
+/// codex count event's `(tool, detail)` pair. It feeds the same identity,
+/// bound, and redaction rules as [`ObservationState::observe_message`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ToolDescriptor {
+    pub(crate) turn_id: String,
+    pub(crate) tool_call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) input: Option<Value>,
+    pub(crate) detail: Option<String>,
+}
+
 #[derive(Default)]
 struct ToolGroup {
     call_count: u64,
@@ -166,8 +179,9 @@ impl ObservationState {
         Self {
             collect_reasoning: public,
             reasoning_complete: public,
-            // DSH projects calls without their inputs; Codex does not
-            // project canonical tool history at all. Neither is complete.
+            // Only ZCode exposes the verified per-call history. DSH, agy and
+            // codex contribute best-effort descriptors (no results or
+            // lifecycle), so their history stays explicitly incomplete.
             tool_history_complete: adapter == "zcode",
             reasoning_source: if adapter == "dsh" {
                 ReasoningSource::dsh()
@@ -262,7 +276,60 @@ impl ObservationState {
             // An absent ACP input is unknown, not an observed empty object.
             arguments_truncated = true;
         }
+        self.record_tool_call(
+            identity,
+            call_id,
+            tool_name,
+            arguments,
+            arguments_truncated,
+            redacted_fields,
+        );
+    }
 
+    /// Ingest a detailed descriptor from the same producers that feed the wait
+    /// tool window. The identity is the ZCode-shaped `{turn}\0{call_id}`, so a
+    /// repeat frame or a descriptor arriving after the same logical call's
+    /// `model.streaming` event updates the existing record instead of counting
+    /// it twice.
+    pub(crate) fn observe_descriptor(&mut self, descriptor: &ToolDescriptor) {
+        if !valid_text(&descriptor.tool_call_id) || !valid_text(&descriptor.tool_name) {
+            self.drop_event(true);
+            return;
+        }
+        let identity = format!("{}\0{}", descriptor.turn_id, descriptor.tool_call_id);
+        let (arguments, arguments_truncated, redacted_fields) =
+            match descriptor.input.as_ref() {
+                Some(input) => project_arguments(Some(input)),
+                None => {
+                    // Count-only descriptors carry a free-form detail string;
+                    // the public argument shape is an object, so wrap it in a
+                    // single stable key instead of dropping the detail.
+                    let wrapped = Value::Object(Map::from_iter([(
+                        "detail".to_owned(),
+                        Value::String(descriptor.detail.clone().unwrap_or_default()),
+                    )]));
+                    project_arguments(Some(&wrapped))
+                }
+            };
+        self.record_tool_call(
+            identity,
+            &descriptor.tool_call_id,
+            &descriptor.tool_name,
+            arguments,
+            arguments_truncated,
+            redacted_fields,
+        );
+    }
+
+    fn record_tool_call(
+        &mut self,
+        identity: String,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Map<String, Value>,
+        arguments_truncated: bool,
+        redacted_fields: u64,
+    ) {
         if let Some((original_name, seq)) = self.seen_calls.get(&identity).cloned() {
             if let Some(call) = self
                 .tools
@@ -364,10 +431,12 @@ impl ObservationState {
     }
 }
 
+fn valid_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.contains('\0')
+}
+
 fn valid_id(value: Option<&Value>) -> Option<&str> {
-    value
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.contains('\0'))
+    value.and_then(Value::as_str).filter(|value| valid_text(value))
 }
 
 fn reasoning_tail(value: &str) -> String {

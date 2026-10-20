@@ -24,9 +24,6 @@ struct PassiveActivityState {
     sample_order: VecDeque<String>,
     telemetry_degraded: bool,
     observation: observation::ObservationState,
-    // 任务级 ring 独立于 60 秒计数窗和 turn 终态文本；按接收时间升序。
-    last_tool_calls: VecDeque<(Instant, String, [String; 2])>,
-    descriptor_ids: VecDeque<String>,
 }
 
 pub(crate) struct PassiveActivityTracker {
@@ -151,23 +148,10 @@ impl PassiveActivityTracker {
             }
         }
 
-        if admitted {
-            if let Some((identity, call)) = parsed.tool_descriptor {
-                if !state.descriptor_ids.contains(&identity) {
-                    state.descriptor_ids.push_back(identity.clone());
-                    while state.descriptor_ids.len() > MAX_ACTIVITY_IDENTITIES {
-                        state.descriptor_ids.pop_front();
-                    }
-                    state.last_tool_calls.push_back((now, identity, call));
-                    state
-                        .last_tool_calls
-                        .make_contiguous()
-                        .sort_by_key(|entry| entry.0);
-                    while state.last_tool_calls.len() > 3 {
-                        state.last_tool_calls.pop_front();
-                    }
-                }
-            }
+        if let Some(descriptor) = parsed.tool_descriptor.as_ref() {
+            // Descriptor ingestion owns its own identity dedup, so repeated
+            // frames update rather than recount the same logical call.
+            state.observation.observe_descriptor(descriptor);
         }
 
         match parsed.transition {
@@ -286,16 +270,6 @@ impl PassiveActivityTracker {
             latest_text_tail: state.latest_text_tail.clone(),
             latest_text_updated_at: state.latest_text_updated_at,
             latest_text_truncated: state.latest_text_truncated,
-            latest_reasoning: if self.runtime_source_verified() {
-                state.observation.snapshot().reasoning.text
-            } else {
-                String::new()
-            },
-            last_tool_calls: state
-                .last_tool_calls
-                .iter()
-                .map(|entry| entry.2.clone())
-                .collect(),
             active_tools,
             oldest_active_tool_age_ms: state
                 .active_tools
@@ -360,17 +334,15 @@ impl PassiveActivityTracker {
     /// replacement holds). The per-turn terminal text and the sticky window
     /// truncation flag are deliberately NOT inherited. Locks are taken in the
     /// fixed order old-read then new-write, never held together.
-    /// 同时继承任务级工具 ring；terminal text 仍只属于当前 turn。
+    /// terminal text 仍只属于当前 turn。
     pub(crate) fn inherit_wait_text(&self, old: &PassiveActivityTracker) {
-        let (old_tail, old_appended, old_delivered, old_updated, old_calls, old_ids) = {
+        let (old_tail, old_appended, old_delivered, old_updated) = {
             let old_state = old.state.lock().unwrap();
             (
                 old_state.latest_text_tail.clone(),
                 old_state.appended_bytes,
                 old_state.delivered_bytes,
                 old_state.latest_text_updated_at,
-                old_state.last_tool_calls.clone(),
-                old_state.descriptor_ids.clone(),
             )
         };
         let mut state = self.state.lock().unwrap();
@@ -378,20 +350,6 @@ impl PassiveActivityTracker {
             state.delivered_bytes, 0,
             "the incoming tracker cannot have delivered before the map swap"
         );
-        // 同任务 follow-up/resume 替换 tracker 时，旧 ring 与已摄入的新调用合并。
-        let mut calls = old_calls;
-        calls.extend(std::mem::take(&mut state.last_tool_calls));
-        calls.make_contiguous().sort_by_key(|entry| entry.0);
-        while calls.len() > 3 {
-            calls.pop_front();
-        }
-        state.last_tool_calls = calls;
-        let mut ids = old_ids;
-        ids.extend(std::mem::take(&mut state.descriptor_ids));
-        while ids.len() > MAX_ACTIVITY_IDENTITIES {
-            ids.pop_front();
-        }
-        state.descriptor_ids = ids;
         let new_appended = state.appended_bytes;
         let new_updated = state.latest_text_updated_at;
         let mut merged = old_tail;
@@ -531,10 +489,10 @@ mod tests {
     }
 
     #[test]
-    fn last_tool_calls_ring_is_bounded_ordered_and_retained_across_turns() {
+    fn tool_descriptors_feed_observation_without_duplicate_counts_across_turns() {
         let tracker = PassiveActivityTracker::for_adapter("codex", false);
         let now = Instant::now();
-        assert!(tracker.snapshot_at(now).last_tool_calls.is_empty());
+        assert!(tracker.observation_snapshot().tools.is_empty());
         for n in 0..4 {
             let event = session_fixture(external_contract::activity::tool_count_event(
                 &format!("e{n}"),
@@ -546,11 +504,16 @@ mod tests {
             tracker.observe_at(&event, now + Duration::from_millis(n), n);
             tracker.observe_at(&event, now + Duration::from_millis(n + 1), n + 1);
         }
-        let expected = vec![
-            ["tool1".to_owned(), "arg1".to_owned()],
-            ["tool2".to_owned(), "arg2".to_owned()],
-            ["tool3".to_owned(), "arg3".to_owned()],
-        ];
+        // Repeated frames update nothing and never double-count.
+        let observation = tracker.observation_snapshot();
+        assert_eq!(
+            observation
+                .tools
+                .iter()
+                .map(|tool| (tool.tool_name.as_str(), tool.call_count))
+                .collect::<Vec<_>>(),
+            [("tool3", 1), ("tool2", 1), ("tool1", 1)]
+        );
         tracker.observe_at(
             &session_fixture(serde_json::json!({"type":"turn.completed"})),
             now + Duration::from_secs(1),
@@ -564,52 +527,14 @@ mod tests {
         assert_eq!(
             tracker
                 .snapshot_at(now + Duration::from_secs(2))
-                .last_tool_calls,
-            expected
-        );
-        assert_eq!(
-            tracker
-                .snapshot_at(now + Duration::from_secs(2))
                 .window_60s
                 .tool_calls_started,
             4
         );
-        // ring 不受 60 秒计数窗淘汰。
+        // Observation is lifetime-scoped: it survives the 60-second window.
         let expired = tracker.snapshot_at(now + Duration::from_secs(61));
-        assert_eq!(expired.last_tool_calls, expected);
         assert_eq!(expired.window_60s.tool_calls_started, 0);
-        let projected = crate::rpc::views::task_activity_view(
-            external_store::TaskPhase::Running,
-            Some(expired),
-        );
-        assert_eq!(
-            serde_json::to_value(projected).unwrap()["last_tool_calls"],
-            serde_json::json!(expected)
-        );
-    }
-
-    #[test]
-    fn last_tool_calls_survive_tracker_replacement_with_new_activity() {
-        let old = PassiveActivityTracker::for_adapter("zcode", false);
-        let new = PassiveActivityTracker::for_adapter("zcode", false);
-        let now = Instant::now();
-        for (tracker, turn, start) in [(&old, "old", 0), (&new, "new", 2)] {
-            for n in start..start + 2 {
-                tracker.observe_at(&session_fixture(serde_json::json!({
-                    "type":"model.streaming", "turnId":turn,
-                    "payload":{"kind":"tool_call","toolCallId":format!("c{n}"),"toolName":format!("tool{n}"),"input":{"n":n}}
-                })), now + Duration::from_millis(n), n);
-            }
-        }
-        new.inherit_wait_text(&old);
-        assert_eq!(
-            new.snapshot().last_tool_calls,
-            vec![
-                ["tool1".to_owned(), r#"{"n":1}"#.to_owned()],
-                ["tool2".to_owned(), r#"{"n":2}"#.to_owned()],
-                ["tool3".to_owned(), r#"{"n":3}"#.to_owned()],
-            ]
-        );
+        assert_eq!(tracker.observation_snapshot().tools.len(), 3);
     }
 
     #[test]
@@ -626,15 +551,16 @@ mod tests {
         started["payload"]["inputOmitted"] = true.into();
         tracker.observe(&session_fixture(started));
         let snapshot = tracker.snapshot();
-        assert_eq!(
-            snapshot.last_tool_calls,
-            vec![[
-                "Bash".to_owned(),
-                r#"{"command":"echo 中","timeout":10}"#.to_owned()
-            ]]
-        );
         assert_eq!(snapshot.window_60s.tool_calls_started, 1);
-        assert_eq!(tracker.observation_snapshot().tools[0].call_count, 1);
+        let observation = tracker.observation_snapshot();
+        assert_eq!(observation.tools[0].call_count, 1);
+        assert_eq!(
+            observation.tools[0].recent_calls[0].arguments,
+            serde_json::json!({"command":"echo 中","timeout":10})
+                .as_object()
+                .unwrap()
+                .clone()
+        );
     }
 
     #[test]
@@ -655,28 +581,32 @@ mod tests {
         ));
         let codex = PassiveActivityTracker::for_adapter("codex", false);
         codex.observe_at(&old, now, 0);
-        assert!(codex.snapshot().last_tool_calls.is_empty());
+        assert!(codex.observation_snapshot().tools.is_empty());
         assert_eq!(codex.snapshot().window_60s.tool_calls_started, 2);
         codex.observe_at(&detailed, now, 0);
-        assert!(codex.snapshot().last_tool_calls.is_empty());
+        assert!(codex.observation_snapshot().tools.is_empty());
+        codex.observe_at(&count, now, 0);
+        let observed = codex.observation_snapshot();
+        assert_eq!(observed.tools[0].tool_name, "commandExecution");
+        assert_eq!(
+            observed.tools[0].recent_calls[0].arguments,
+            serde_json::json!({"detail":"true"}).as_object().unwrap().clone()
+        );
         let zcode = PassiveActivityTracker::for_adapter("zcode", false);
         zcode.observe_at(&count, now, 0);
-        assert!(zcode.snapshot().last_tool_calls.is_empty());
+        assert!(zcode.observation_snapshot().tools.is_empty());
         assert_eq!(zcode.snapshot().window_60s.tool_calls_started, 0);
     }
 
     #[test]
-    fn last_tool_calls_truncate_unicode_on_character_boundaries() {
-        let tracker = PassiveActivityTracker::for_adapter("codex", false);
+    fn bounded_tool_call_truncates_unicode_on_character_boundaries() {
         let tool = "工🙂".repeat(40);
         let detail = format!("{}🙂tail", "a".repeat(511));
-        tracker.observe(&session_fixture(
-            external_contract::activity::tool_count_event("e", "t", 1, Some(&tool), Some(&detail)),
-        ));
-        let call = tracker.snapshot().last_tool_calls.pop().unwrap();
-        assert_eq!(call[0].chars().count(), 64);
-        assert_eq!(call[0], "工🙂".repeat(32));
-        assert_eq!(call[1], "a".repeat(511));
+        let bounded =
+            crate::activity_parser::bounded_tool_call(&tool, &detail);
+        assert_eq!(bounded[0].chars().count(), 64);
+        assert_eq!(bounded[0], "工🙂".repeat(32));
+        assert_eq!(bounded[1], "a".repeat(511));
         let bounded = crate::activity_parser::bounded_tool_call("Bash", &"🙂".repeat(200));
         assert_eq!(bounded[1].len(), 512);
     }
@@ -867,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_aggregate_is_independent_of_the_last_tool_calls_ring() {
+    fn in_flight_aggregate_is_independent_of_the_observation_call_window() {
         let tracker = PassiveActivityTracker::for_adapter("zcode", false);
         let base = Instant::now();
         for n in 0..5 {
@@ -881,10 +811,12 @@ mod tests {
             );
         }
         let snap = tracker.snapshot_at(base + Duration::from_secs(4));
-        // The aggregate counts every tracked call even though the three-entry
-        // ring has evicted the earlier descriptors.
+        // The aggregate counts every tracked call even though observe only
+        // returns the five most recent calls per tool.
         assert_eq!(snap.active_tools.len(), 5);
-        assert_eq!(snap.last_tool_calls.len(), 3);
+        let observation = tracker.observation_snapshot();
+        assert_eq!(observation.tools[0].call_count, 5);
+        assert_eq!(observation.tools[0].recent_calls.len(), 5);
         assert_eq!(snap.oldest_active_tool_age_ms, Some(4_000));
         assert_eq!(
             crate::rpc::views::task_activity_view(external_store::TaskPhase::Running, Some(snap))
@@ -1143,7 +1075,6 @@ mod tests {
             );
             assert_eq!(snapshot.coverage.dropped_events, u64::from(!valid_empty));
             assert!(snapshot.reasoning.text.is_empty());
-            assert!(dsh.snapshot().latest_reasoning.is_empty());
             let hidden = codex.observation_snapshot();
             assert_eq!(hidden.coverage.dropped_events, 0);
             assert_eq!(hidden.snapshot_seq, 0);
@@ -1201,7 +1132,6 @@ mod tests {
         assert!(snapshot.coverage.reasoning_complete);
         assert!(!snapshot.coverage.tool_history_complete);
         assert_eq!(snapshot.coverage.dropped_events, 0);
-        assert_eq!(dsh.snapshot().latest_reasoning, snapshot.reasoning.text);
         let hidden = codex.observation_snapshot();
         assert!(hidden.reasoning.text.is_empty());
         assert_eq!(
@@ -1210,7 +1140,6 @@ mod tests {
         );
         assert!(!hidden.coverage.reasoning_complete);
         assert!(!hidden.coverage.tool_history_complete);
-        assert!(codex.snapshot().latest_reasoning.is_empty());
     }
 
     #[test]

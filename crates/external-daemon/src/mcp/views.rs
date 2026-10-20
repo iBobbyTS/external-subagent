@@ -558,14 +558,8 @@ pub enum PublicTelemetryStatus {
 pub struct PublicActivity {
     pub latest_text_tail: String,
     pub latest_text_truncated: bool,
-    /// Verified-public reasoning tail (bounded to 200 Unicode
-    /// characters); empty when the runtime source is not verified.
-    pub latest_reasoning: String,
     /// Tool calls started in the last 60 seconds, across all tools.
     pub tool_calls_last_60s: u64,
-    /// 任务级最近三次调用，按时间升序；参数统一为字符串。
-    #[schemars(length(max = 3))]
-    pub last_tool_calls: Vec<[String; 2]>,
     /// Number of tracked in-flight tool calls (scheduled or started without a
     /// matching result/error/permission resolution); 0 when there is no
     /// snapshot or the adapter has no per-call lifecycle tracking.
@@ -583,9 +577,7 @@ impl From<TaskActivityView> for PublicActivity {
         Self {
             latest_text_tail: value.latest_text_tail,
             latest_text_truncated: value.latest_text_truncated,
-            latest_reasoning: value.latest_reasoning,
             tool_calls_last_60s: value.tool_calls_last_60s,
-            last_tool_calls: value.last_tool_calls,
             in_flight_tool_count: value.in_flight_tool_count,
             oldest_in_flight_tool_age_ms: value.oldest_in_flight_tool_age_ms,
             last_activity_age_ms: value.last_activity_age_ms,
@@ -865,15 +857,16 @@ mod activity_projection_tests {
     use super::*;
 
     #[test]
-    fn public_activity_forwards_pairs_age_active_and_empty_defaults() {
+    fn public_activity_forwards_liveness_and_omits_detail_fields() {
         let empty = crate::rpc::views::task_activity_view(external_store::TaskPhase::Queued, None);
         let value = serde_json::to_value(PublicActivity::from(empty)).unwrap();
-        assert_eq!(value["last_tool_calls"], serde_json::json!([]));
         assert!(value["last_activity_age_ms"].is_null());
         assert_eq!(value["model_request_active"], false);
         // No snapshot: the in-flight aggregate is honestly empty.
         assert_eq!(value["in_flight_tool_count"], 0);
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
+        assert!(value.get("last_tool_calls").is_none());
+        assert!(value.get("latest_reasoning").is_none());
         let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
         for n in 0..4 {
             tracker.observe(&crate::RuntimeEvent::Driver(
@@ -903,27 +896,24 @@ mod activity_projection_tests {
             Some(snapshot),
         );
         let value = serde_json::to_value(PublicActivity::from(rpc)).unwrap();
-        assert_eq!(
-            value["last_tool_calls"],
-            serde_json::json!([
-                ["commandExecution", "echo 1"],
-                ["commandExecution", "echo 2"],
-                ["commandExecution", "echo 3"]
-            ])
-        );
+        assert_eq!(value["tool_calls_last_60s"], 4);
         assert_eq!(value["last_activity_age_ms"], serde_json::json!(age));
         assert_eq!(value["model_request_active"], true);
         // Codex is count-only: no per-call lifecycle, so 0 means "no tracking
         // information", never "no command is running".
         assert_eq!(value["in_flight_tool_count"], 0);
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
-        // 公共 schema 拒绝合并字符串、非二元组和第四条调用。
+        // Detail lives in observe now; the wait projection never carries it.
+        assert!(value.get("last_tool_calls").is_none());
+        assert!(value.get("latest_reasoning").is_none());
         let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
         assert_eq!(schema["properties"]["in_flight_tool_count"]["type"], "integer");
         assert_eq!(
             schema["properties"]["oldest_in_flight_tool_age_ms"]["type"],
             serde_json::json!(["integer", "null"])
         );
+        assert!(schema["properties"].get("last_tool_calls").is_none());
+        assert!(schema["properties"].get("latest_reasoning").is_none());
         let required = schema["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::json!("in_flight_tool_count")));
         // The age is an Option field: schemars renders it nullable and leaves
@@ -931,13 +921,10 @@ mod activity_projection_tests {
         assert!(!required.contains(&serde_json::json!("oldest_in_flight_tool_age_ms")));
         let validator = jsonschema::validator_for(&schema).unwrap();
         assert!(validator.is_valid(&value));
-        for calls in [
-            serde_json::json!(["commandExecution echo 1"]),
-            serde_json::json!([["tool"]]),
-            serde_json::json!([["a", "1"], ["b", "2"], ["c", "3"], ["d", "4"]]),
-        ] {
+        // The removed keys are rejected by the closed public schema.
+        for removed in ["last_tool_calls", "latest_reasoning"] {
             let mut invalid = value.clone();
-            invalid["last_tool_calls"] = calls;
+            invalid[removed] = serde_json::json!([]);
             assert!(!validator.is_valid(&invalid));
         }
     }

@@ -166,7 +166,7 @@ pub(crate) struct ParsedActivity {
     pub(crate) assistant_message_id: Option<String>,
     pub(crate) message_finished: bool,
     pub(crate) terminal_response: Option<String>,
-    pub(crate) tool_descriptor: Option<(String, [String; 2])>,
+    pub(crate) tool_descriptor: Option<observation::ToolDescriptor>,
 }
 
 impl ParsedActivity {
@@ -288,10 +288,7 @@ fn parse_activity_message(
                     // A Detailed adapter never emits the count vocabulary:
                     // ignore it rather than accepting a foreign sample.
                     if mode != ToolActivityMode::Detailed {
-                        parse_tool_count_activity(&mut parsed, payload, event_id);
-                        if let Some((identity, _)) = parsed.tool_descriptor.as_mut() {
-                            *identity = format!("{}:{identity}", turn_id.as_deref().unwrap_or(""));
-                        }
+                        parse_tool_count_activity(&mut parsed, payload, event_id, turn_id.as_deref());
                     }
                 } else if mode != ToolActivityMode::CountOnly {
                     parse_tool_activity(&mut parsed, payload, source);
@@ -479,6 +476,7 @@ fn parse_tool_count_activity(
     parsed: &mut ParsedActivity,
     payload: &serde_json::Value,
     event_id: Option<String>,
+    turn_id: Option<&str>,
 ) {
     let Some(count) = payload.get("count").and_then(serde_json::Value::as_u64) else {
         return;
@@ -495,10 +493,15 @@ fn parse_tool_count_activity(
             .get("detail")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        parsed.tool_descriptor = Some((
-            parsed.identity.clone().unwrap(),
-            bounded_tool_call(tool, detail),
-        ));
+        parsed.tool_descriptor = Some(observation::ToolDescriptor {
+            turn_id: turn_id.unwrap_or_default().to_owned(),
+            // The count vocabulary has no per-call id; the params-level event
+            // id is its stable, non-empty identity.
+            tool_call_id: count_call_id(&event_id),
+            tool_name: tool.to_owned(),
+            input: None,
+            detail: Some(detail.to_owned()),
+        });
     }
     parsed.sample = Some(ActivitySampleKind::ToolStarted {
         kind: PassiveToolKind::Other,
@@ -506,7 +509,16 @@ fn parse_tool_count_activity(
     });
 }
 
-// ring 统一保留二元组：工具名按字符截断，参数按 UTF-8 字节截断。
+fn count_call_id(event_id: &str) -> String {
+    let id = format!("count:{event_id}");
+    if id.len() <= MAX_ACTIVITY_ID_BYTES {
+        id
+    } else {
+        event_id.to_owned()
+    }
+}
+
+// codex count-event 描述符统一保留二元组：工具名按字符截断，参数按 UTF-8 字节截断。
 pub(crate) fn bounded_tool_call(tool: &str, arg: &str) -> [String; 2] {
     let mut end = arg.len().min(512);
     while !arg.is_char_boundary(end) {
@@ -530,12 +542,14 @@ fn parse_detailed_descriptor(
     let Some(input) = payload.get("input") else {
         return;
     };
-    let arg = serde_json::to_string(input).expect("JSON value serialization");
     let turn = activity_id(params.get("turnId")).unwrap_or_default();
-    parsed.tool_descriptor = Some((
-        format!("call:{turn}:{call_id}"),
-        bounded_tool_call(tool, &arg),
-    ));
+    parsed.tool_descriptor = Some(observation::ToolDescriptor {
+        turn_id: turn,
+        tool_call_id: call_id,
+        tool_name: tool.to_owned(),
+        input: Some(input.clone()),
+        detail: None,
+    });
 }
 
 fn stream_key(

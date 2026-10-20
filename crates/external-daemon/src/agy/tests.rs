@@ -385,7 +385,7 @@ fn yolo_permission_maps_to_the_skip_permissions_flag() {
 }
 
 #[test]
-fn tool_step_pair_feeds_the_wait_window_and_observe_stays_exempt() {
+fn tool_step_pair_feeds_the_wait_window_and_observe_capture() {
     let _guard = scripted_test_guard();
     let workspace = agy_workspace();
     let directory = workspace.path().to_owned();
@@ -406,20 +406,25 @@ fn tool_step_pair_feeds_the_wait_window_and_observe_stays_exempt() {
     assert_eq!(activity.window_60s.tool_calls_started, 1);
     assert_eq!(activity.window_60s.tool_calls_completed, 1);
     assert_eq!(activity.window_60s.other_tool_calls, 1);
-    assert_eq!(
-        activity.last_tool_calls,
-        vec![[
-            "run_command".to_owned(),
-            r#"{"CommandLine":"echo X"}"#.to_owned()
-        ]]
-    );
 
-    // observe is exempt for agy like codex: available with no tool history and
-    // empty reasoning (the runtime source is not verified).
+    // The started frame's tool name and parameters are captured by observe;
+    // wait no longer carries per-call details. Reasoning stays uncollected.
     let (observation, verified) = scheduler.observation_snapshot(&agent_id);
     assert!(!verified);
-    let expected = crate::observation::ObservationState::for_adapter("agy").snapshot();
-    assert_eq!(observation, expected);
+    assert_eq!(observation.tools.len(), 1);
+    assert_eq!(observation.tools[0].tool_name, "run_command");
+    assert_eq!(observation.tools[0].call_count, 1);
+    assert_eq!(
+        observation.tools[0].recent_calls[0].arguments,
+        serde_json::json!({"CommandLine":"echo X"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
+    assert!(observation.reasoning.text.is_empty());
+    assert!(!observation.coverage.tool_history_complete);
+    assert!(!observation.coverage.reasoning_complete);
 }
 
 #[test]

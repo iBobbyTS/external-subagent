@@ -130,7 +130,7 @@ test('agent diagnose reads only the public wait projection and exports a bounded
     socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
       kind: 'task_wait', task: { agent_id: 10000001, status: 'running', session_id: null },
       pending_requests: [], result_available: false,
-      activity: { latest_text_tail: '', latest_text_truncated: false, latest_reasoning: '', tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+      activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
       result: null, instruction: 'Not finished yet, call wait again', timed_out: false,
     } }) + '\n');
   }));

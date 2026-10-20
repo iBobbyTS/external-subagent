@@ -52,6 +52,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.match(schema.properties.wait.description, /embedded question/u);
   assert.match(schema.properties.wait.description, /in_flight_tool_count/u);
   assert.match(schema.properties.wait.description, /oldest_in_flight_tool_age_ms/u);
+  assert.equal(schema.properties.wait.description.includes('last_tool_calls'), false);
+  assert.equal(schema.properties.wait.description.includes('reasoning tail'), false);
   assert.equal(schema.properties.result.properties.offset.default, 0);
   assert.equal(schema.properties.result.properties.limit.default, 262144);
   assert.deepEqual(schema.properties.observe.required, ['agent_id']);

@@ -429,35 +429,95 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         "call-1 (deduped start+complete), call-2 (started), call-3 (completion backfill) only"
     );
     assert_eq!(activity.window_60s.other_tool_calls, 3);
-    assert_eq!(
-        activity.last_tool_calls,
-        vec![
-            [
-                "commandExecution".to_owned(),
-                "/bin/zsh -lc 'echo 中'".to_owned()
-            ],
-            ["fileChange".to_owned(), "a.ts, b.ts".to_owned()],
-            ["mcpToolCall".to_owned(), "call-3".to_owned()],
-        ]
-    );
-
     // The wait public projection is a straight-through single line: whatever
     // the tracker counted is exactly what wait exposes on the public field.
     let projection =
         crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
     assert_eq!(projection.tool_calls_last_60s, 3);
-    assert_eq!(
-        serde_json::to_value(projection).unwrap()["last_tool_calls"],
-        serde_json::json!(activity.last_tool_calls)
+    assert!(
+        serde_json::to_value(projection)
+            .unwrap()
+            .get("last_tool_calls")
+            .is_none()
     );
 
-    // observe stays exactly as before this feature: the count-only events are
-    // not tool calls and codex still projects no tool history or reasoning. The
-    // full snapshot equality locks every field, not just the empty collections.
+    // The count-only tool descriptors now feed observe: each distinct call is
+    // visible once with its detail wrapped in the argument object.
     let (observation, verified) = scheduler.observation_snapshot(&agent_id);
     assert!(!verified);
-    let expected = crate::observation::ObservationState::for_adapter("codex").snapshot();
-    assert_eq!(observation, expected);
+    assert_eq!(
+        observation
+            .tools
+            .iter()
+            .map(|tool| (tool.tool_name.as_str(), tool.call_count))
+            .collect::<Vec<_>>(),
+        [("mcpToolCall", 1), ("fileChange", 1), ("commandExecution", 1)]
+    );
+    let details = observation
+        .tools
+        .iter()
+        .map(|tool| {
+            (
+                tool.tool_name.as_str(),
+                tool.recent_calls[0].arguments["detail"].clone(),
+                tool.recent_calls[0].arguments_truncated,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        details,
+        [
+            (
+                "mcpToolCall",
+                serde_json::json!("call-3"),
+                false
+            ),
+            ("fileChange", serde_json::json!("a.ts, b.ts"), false),
+            (
+                "commandExecution",
+                serde_json::json!("/bin/zsh -lc 'echo 中'"),
+                false
+            ),
+        ]
+    );
+    // Codex still exposes no reasoning and its history is explicitly partial.
+    assert!(observation.reasoning.text.is_empty());
+    assert!(!observation.coverage.tool_history_complete);
+    assert!(!observation.coverage.reasoning_complete);
+    assert_eq!(observation.coverage.dropped_events, 0);
+}
+
+#[test]
+fn count_descriptor_feeds_observe_once_per_event_with_wrapped_detail() {
+    let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
+    let event = crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+        external_contract::WireMessage::Event(external_contract::EventEnvelope {
+            method: "session/event".into(),
+            params: external_contract::activity::tool_count_event(
+                "codex-event-1",
+                "turn-1",
+                1,
+                Some("commandExecution"),
+                Some("echo 中"),
+            ),
+        }),
+    ));
+    // A re-delivered descriptor is the same logical call: weight and history
+    // both stay single.
+    tracker.observe(&event);
+    tracker.observe(&event);
+    let snapshot = tracker.observation_snapshot();
+    assert_eq!(snapshot.tools.len(), 1);
+    let tool = &snapshot.tools[0];
+    assert_eq!(tool.tool_name, "commandExecution");
+    assert_eq!(tool.call_count, 1);
+    assert_eq!(tool.recent_calls.len(), 1);
+    let call = &tool.recent_calls[0];
+    assert!(!call.tool_call_id.is_empty());
+    assert_eq!(call.arguments, serde_json::json!({"detail":"echo 中"}).as_object().unwrap().clone());
+    assert!(!call.arguments_truncated);
+    assert!(!snapshot.coverage.tool_history_complete);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 1);
 }
 
 #[test]
@@ -533,14 +593,16 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         activity.window_60s.tool_calls_started, 2,
         "the same item id counts once per turn after the boundary clears the dedupe set"
     );
-    // 计数去重按 turn 重置，工具历史仍保留两轮（缺 command 的描述符为空串）。
-    assert_eq!(
-        activity.last_tool_calls,
-        vec![
-            ["commandExecution".to_owned(), String::new()],
-            ["commandExecution".to_owned(), String::new()],
-        ]
-    );
+    // 计数去重按 turn 重置，observe 的调用身份同样按 turn 区分。
+    let (observation, _) = scheduler.observation_snapshot(&agent_id);
+    assert_eq!(observation.tools.len(), 1);
+    assert_eq!(observation.tools[0].tool_name, "commandExecution");
+    assert_eq!(observation.tools[0].call_count, 2);
+    assert_eq!(observation.tools[0].recent_calls.len(), 2);
+    assert!(observation.tools[0]
+        .recent_calls
+        .iter()
+        .all(|call| call.arguments["detail"] == serde_json::json!("")));
 }
 
 #[test]

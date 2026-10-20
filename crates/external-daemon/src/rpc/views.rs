@@ -279,13 +279,8 @@ pub enum TelemetryStatusView {
 pub struct TaskActivityView {
     pub latest_text_tail: String,
     pub latest_text_truncated: bool,
-    /// Verified-public reasoning tail (bounded to 200 Unicode characters);
-    /// empty when the runtime source is not verified.
-    pub latest_reasoning: String,
     /// Tool calls started in the last 60 seconds, across all tools.
     pub tool_calls_last_60s: u64,
-    /// 任务级最近三次调用，按时间升序；参数统一为字符串。
-    pub last_tool_calls: Vec<[String; 2]>,
     /// Number of tracked in-flight tool calls (scheduled or started without a
     /// matching result/error/permission resolution). 0 when there is no
     /// snapshot or the adapter has no per-call lifecycle tracking.
@@ -584,9 +579,7 @@ pub(crate) fn task_activity_view(
         return TaskActivityView {
             latest_text_tail: String::new(),
             latest_text_truncated: false,
-            latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
-            last_tool_calls: Vec::new(),
             in_flight_tool_count: 0,
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
@@ -597,9 +590,7 @@ pub(crate) fn task_activity_view(
     TaskActivityView {
         latest_text_tail: snapshot.latest_text_tail,
         latest_text_truncated: snapshot.latest_text_truncated,
-        latest_reasoning: snapshot.latest_reasoning,
         tool_calls_last_60s: snapshot.window_60s.tool_calls_started,
-        last_tool_calls: snapshot.last_tool_calls,
         in_flight_tool_count: snapshot.active_tools.len() as u64,
         oldest_in_flight_tool_age_ms: snapshot.oldest_active_tool_age_ms,
         last_activity_age_ms: snapshot.last_activity_age_ms,
@@ -631,8 +622,6 @@ mod activity_projection_tests {
             latest_text_tail: "preserved tail".into(),
             latest_text_updated_at: Some(950),
             latest_text_truncated: true,
-            latest_reasoning: "recent reasoning".into(),
-            last_tool_calls: vec![["Bash".into(), "{}".into()]],
             active_tools: vec![PassiveActiveTool {
                 tool_call_id: "call-1".into(),
                 kind: PassiveToolKind::Bash,
@@ -651,13 +640,8 @@ mod activity_projection_tests {
         let activity = task_activity_view(TaskPhase::Running, Some(snapshot()));
         assert_eq!(activity.latest_text_tail, "preserved tail");
         assert!(activity.latest_text_truncated);
-        assert_eq!(activity.latest_reasoning, "recent reasoning");
         assert_eq!(activity.tool_calls_last_60s, 4);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Degraded);
-        assert_eq!(
-            activity.last_tool_calls,
-            vec![["Bash".to_owned(), "{}".to_owned()]]
-        );
         assert_eq!(activity.last_activity_age_ms, Some(250));
         assert!(activity.model_request_active);
         // The in-flight aggregate is now a public contract: a count plus the
@@ -667,15 +651,16 @@ mod activity_projection_tests {
         // The projection intentionally exposes the liveness surface; the
         // remaining internal signals stay private.
         let encoded = serde_json::to_value(&activity).unwrap();
-        assert_eq!(
-            encoded["last_tool_calls"],
-            serde_json::json!([["Bash", "{}"]])
-        );
+        assert_eq!(encoded["latest_text_tail"], "preserved tail");
+        assert_eq!(encoded["latest_text_truncated"], true);
+        assert_eq!(encoded["tool_calls_last_60s"], 4);
         assert_eq!(encoded["last_activity_age_ms"], 250);
         assert_eq!(encoded["model_request_active"], true);
         assert_eq!(encoded["in_flight_tool_count"], 1);
         assert_eq!(encoded["oldest_in_flight_tool_age_ms"], 5_000);
         for gone in [
+            "last_tool_calls",
+            "latest_reasoning",
             "state",
             "model_request_age_ms",
             "active_tools",
@@ -691,9 +676,7 @@ mod activity_projection_tests {
         let activity = task_activity_view(TaskPhase::Queued, None);
         assert_eq!(activity.latest_text_tail, "");
         assert!(!activity.latest_text_truncated);
-        assert_eq!(activity.latest_reasoning, "");
         assert_eq!(activity.tool_calls_last_60s, 0);
-        assert!(activity.last_tool_calls.is_empty());
         assert_eq!(activity.in_flight_tool_count, 0);
         assert_eq!(activity.oldest_in_flight_tool_age_ms, None);
         assert_eq!(activity.last_activity_age_ms, None);
@@ -805,9 +788,7 @@ mod result_paging_tests {
         TaskActivityView {
             latest_text_tail: "\u{0}".repeat(8 * 1024),
             latest_text_truncated: true,
-            latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
-            last_tool_calls: Vec::new(),
             in_flight_tool_count: 0,
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,

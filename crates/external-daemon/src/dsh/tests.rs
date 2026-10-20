@@ -553,13 +553,21 @@ printf '%s\\n' \
     assert_eq!(payload["toolName"], "edit");
     assert_eq!(payload["toolCallId"], "tool-7");
     let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+    assert_eq!(activity.window_60s.tool_calls_started, 1);
+    // The daemon attaches the ACP rawInput to the started frame, so observe
+    // sees the real arguments instead of the empty-input fallback.
+    let (observation, _) = scheduler.observation_snapshot(&agent_id);
+    assert_eq!(observation.tools[0].tool_name, "edit");
+    assert_eq!(observation.tools[0].call_count, 1);
     assert_eq!(
-        activity.last_tool_calls,
-        vec![[
-            "edit".to_owned(),
-            r#"{"content":"中","path":"a.ts"}"#.to_owned()
-        ]]
+        observation.tools[0].recent_calls[0].arguments,
+        serde_json::json!({"content":"中","path":"a.ts"})
+            .as_object()
+            .unwrap()
+            .clone()
     );
+    assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
+    assert!(!observation.coverage.tool_history_complete);
 
     let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
     let error = service

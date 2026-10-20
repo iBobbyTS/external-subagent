@@ -2149,9 +2149,7 @@ pub(crate) mod wait_tests {
         TaskActivityView {
             latest_text_tail: String::new(),
             latest_text_truncated: false,
-            latest_reasoning: String::new(),
             tool_calls_last_60s: 0,
-            last_tool_calls: Vec::new(),
             in_flight_tool_count: 0,
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
