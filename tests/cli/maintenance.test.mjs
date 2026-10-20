@@ -479,6 +479,101 @@ test('a failed config write retains provenance and the staged verifier for retry
   }
 });
 
+// The legacy fallback is bound to the events and the single script position
+// the retired installer wrote. A same-named script under the wrong event, or
+// a script-looking path that is only a data argument, is foreign state.
+test('legacy hook recognition is event-bound and uses the script position only', { skip: win32PosixBackend }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-shape-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const pluginRoot = path.join(home, 'node_modules', 'external-subagent', 'plugins', 'codex', 'external-subagent');
+  const guard = path.join(pluginRoot, 'hooks', 'guard-bash.mjs');
+  const check = path.join(pluginRoot, 'hooks', 'check-agent-files.mjs');
+  const audit = path.join(pluginRoot, 'hooks', 'audit-bash-result.mjs');
+  const hook = (matcher, args) => ({ matcher, hooks: [{ type: 'process', command: process.execPath, args, timeoutMs: 5000 }] });
+  const dataArgument = { matcher: 'Bash', hooks: [{ type: 'process', command: '/usr/bin/printf', args: ['%s', guard], timeoutMs: 5000 }] };
+  const wrongEvent = hook('Bash', [guard]);
+  const config = {
+    hooks: {
+      events: {
+        PreToolUse: [hook('Bash', [guard]), dataArgument, hook('^(Read|Grep|Glob|Write|Edit|Delete|Move)$', [check])],
+        PostToolUse: [wrongEvent, hook('Bash', [audit])],
+        PostToolUseFailure: [hook('Bash', [audit])],
+      },
+    },
+  };
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify(config));
+  try {
+    const result = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(result.zcode_hooks.entries_removed, 4, 'canonical entries under their own events are removed');
+    const after = JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
+    assert.deepEqual(after.hooks.events.PreToolUse, [dataArgument],
+      'a script-looking path after the script position is data, not a managed hook');
+    assert.deepEqual(after.hooks.events.PostToolUse, [wrongEvent],
+      'guard-bash.mjs is never managed under PostToolUse');
+    assert.deepEqual(after.hooks.events.PostToolUseFailure, []);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// A real provenance read error is not an absent record: exact-path evidence
+// is the only way to recognize an entry whose matcher differs from the legacy
+// fallback, so the record and verifier must survive until a retry can read it.
+test('a provenance read failure retains the record and staged verifier for retry', { skip: win32PosixBackend }, (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-provenance-retry-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const exact = path.join(home, 'custom-plugin-root', 'guard-bash.mjs');
+  const entry = {
+    matcher: '^Bash$',
+    hooks: [{ type: 'process', command: process.execPath, args: [exact], timeoutMs: 5000 }],
+  };
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify({ hooks: { events: { PreToolUse: [entry] } } }));
+  fs.writeFileSync(paths.hookProvenance, JSON.stringify({ effective_guard_wrapper_path: exact }));
+  const verifier = path.join(path.dirname(paths.hookProvenance), 'external-subagent-policy-verifier');
+  fs.writeFileSync(verifier, '#!/usr/bin/env node\n');
+
+  try {
+    fs.chmodSync(paths.hookProvenance, 0o000);
+    try {
+      fs.readFileSync(paths.hookProvenance);
+      t.skip('provenance file remains readable (running as root)');
+      return;
+    } catch (error) {
+      if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error;
+    }
+
+    const failed = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.notEqual(failed.zcode_hooks.error, undefined, 'the provenance read failure is reported');
+    assert.equal(failed.zcode_hooks.entries_removed, 0);
+    assert.equal(failed.zcode_hooks.provenance_removed, false, 'the unreadable provenance is retained');
+    assert.equal(failed.zcode_hooks.verifier_removed, false, 'the staged verifier is retained');
+    assert.equal(fs.existsSync(paths.hookProvenance), true);
+    assert.equal(fs.existsSync(verifier), true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')).hooks.events.PreToolUse, [entry]);
+
+    fs.chmodSync(paths.hookProvenance, 0o600);
+    const retried = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(retried.zcode_hooks.entries_removed, 1);
+    assert.equal(retried.zcode_hooks.config_updated, true);
+    assert.equal(retried.zcode_hooks.provenance_removed, true);
+    assert.equal(retried.zcode_hooks.verifier_removed, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')).hooks.events.PreToolUse, []);
+    assert.equal(fs.existsSync(paths.hookProvenance), false);
+    assert.equal(fs.existsSync(verifier), false);
+  } finally {
+    try { fs.chmodSync(paths.hookProvenance, 0o600); } catch {}
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // launchd answers a bootstrap over an already-loaded label with
 // "Bootstrap failed: 5: Input/output error" (observed live in the user GUI
 // domain); a repeat start/init must stay idempotent instead of failing.

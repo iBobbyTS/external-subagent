@@ -15,26 +15,23 @@ import { atomicWrite, jsonBytes, readOptional } from '../fs-atomic.mjs';
 // released the same way: the product-owned staging tree and its single
 // plugins.dirs entry go away together.
 
-const MANAGED_HOOK_EVENTS = ['PreToolUse', 'PostToolUse', 'PostToolUseFailure'];
-const MANAGED_HOOK_MATCHERS = new Map([
-  ['guard-bash.mjs', 'Bash'],
-  ['audit-bash-result.mjs', 'Bash'],
-  ['check-agent-files.mjs', '^(Read|Grep|Glob|Write|Edit|Delete|Move)$'],
-]);
+// Event-bound legacy shapes. The retired installer wrote each script under
+// exactly these events and always placed the script as the single process
+// argument.
+const MANAGED_HOOK_EVENTS = {
+  PreToolUse: new Map([
+    ['guard-bash.mjs', 'Bash'],
+    ['check-agent-files.mjs', '^(Read|Grep|Glob|Write|Edit|Delete|Move)$'],
+  ]),
+  PostToolUse: new Map([['audit-bash-result.mjs', 'Bash']]),
+  PostToolUseFailure: new Map([['audit-bash-result.mjs', 'Bash']]),
+};
 const PROVENANCE_WRAPPER_KEYS = [
   'effective_guard_wrapper_path',
   'effective_audit_wrapper_path',
   'effective_file_wrapper_path',
 ];
 const POLICY_VERIFIER_NAME = 'external-subagent-policy-verifier';
-
-function processHookArgs(entry) {
-  if (!entry || !Array.isArray(entry.hooks)) return [];
-  return entry.hooks
-    .filter((hook) => hook?.type === 'process' && Array.isArray(hook.args))
-    .flatMap((hook) => hook.args)
-    .filter((arg) => typeof arg === 'string');
-}
 
 function exactWrapperPaths(provenance) {
   const paths = new Set();
@@ -47,18 +44,26 @@ function exactWrapperPaths(provenance) {
 }
 
 // A managed entry is either one the provenance recorded byte-for-byte, or a
-// legacy shape written by the retired installer: a process hook whose args
-// point at `<any plugin root>/hooks/<managed script>`.  The matcher must
-// match the script's event role so a foreign entry that reuses a name is
-// left alone.
-function managedHookEntry(entry, exactPaths) {
-  if (!entry || typeof entry !== 'object' || typeof entry.matcher !== 'string') return false;
-  for (const arg of processHookArgs(entry)) {
-    if (exactPaths.has(path.resolve(arg))) return true;
-    const script = path.basename(arg);
-    const expectedMatcher = MANAGED_HOOK_MATCHERS.get(script);
+// legacy shape written by the retired installer: under its own event, a
+// process hook whose script position (`args[0]`) points at
+// `<any plugin root>/hooks/<managed script>` and whose matcher matches that
+// script's event role. Arguments after the script position are data, never
+// executable positions.
+function managedHookEntry(entry, exactPaths, managedScripts) {
+  if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) return false;
+  const hooks = entry.hooks.filter((hook) => hook?.type === 'process' && Array.isArray(hook.args));
+  for (const hook of hooks) {
+    for (const arg of hook.args) {
+      if (typeof arg === 'string' && exactPaths.has(path.resolve(arg))) return true;
+    }
+  }
+  if (typeof entry.matcher !== 'string') return false;
+  for (const hook of hooks) {
+    const script = hook.args[0];
+    if (typeof script !== 'string') continue;
+    const expectedMatcher = managedScripts.get(path.basename(script));
     if (expectedMatcher !== undefined
-      && path.basename(path.dirname(arg)) === 'hooks'
+      && path.basename(path.dirname(script)) === 'hooks'
       && entry.matcher === expectedMatcher) {
       return true;
     }
@@ -66,11 +71,15 @@ function managedHookEntry(entry, exactPaths) {
   return false;
 }
 
+// Only a genuinely absent record routes to the empty path. A real I/O read
+// failure propagates so the caller treats the config phase as failed and
+// retains the exact-path evidence a retry needs. An unparseable record cannot
+// contribute exact paths, so it is treated as absent.
 function readProvenance(file) {
   if (typeof file !== 'string') return {};
+  const bytes = readOptional(file);
+  if (bytes === null) return {};
   try {
-    const bytes = readOptional(file);
-    if (bytes === null) return {};
     const doc = JSON.parse(bytes.toString('utf8'));
     return doc && typeof doc === 'object' && !Array.isArray(doc) ? doc : {};
   } catch {
@@ -116,10 +125,10 @@ function removeManagedHooks(paths) {
         : undefined;
       if (events && typeof events === 'object' && !Array.isArray(events)) {
         let removed = 0;
-        for (const event of MANAGED_HOOK_EVENTS) {
+        for (const [event, managedScripts] of Object.entries(MANAGED_HOOK_EVENTS)) {
           const entries = events[event];
           if (!Array.isArray(entries)) continue;
-          const kept = entries.filter((entry) => !managedHookEntry(entry, exactPaths));
+          const kept = entries.filter((entry) => !managedHookEntry(entry, exactPaths, managedScripts));
           removed += entries.length - kept.length;
           if (kept.length !== entries.length) events[event] = kept;
         }
