@@ -574,6 +574,41 @@ test('a provenance read failure retains the record and staged verifier for retry
   }
 });
 
+// The provenance exact-path rule is the installer's written shape: the
+// recorded wrapper must be the process script position (`args[0]`), not a
+// data argument that merely contains the recorded path.
+test('provenance exact-path recognition uses the script position only', { skip: win32PosixBackend }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-exact-shape-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const exact = path.join(home, 'staged-plugin', 'hooks', 'guard-bash.mjs');
+  const canonical = {
+    matcher: 'Bash',
+    hooks: [{ type: 'process', command: process.execPath, args: [exact], timeoutMs: 5000 }],
+  };
+  const dataArgument = {
+    matcher: 'Bash',
+    hooks: [{ type: 'process', command: '/usr/bin/printf', args: ['%s', exact], timeoutMs: 5000 }],
+  };
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify({ hooks: { events: { PreToolUse: [canonical, dataArgument] } } }));
+  fs.writeFileSync(paths.hookProvenance, JSON.stringify({ effective_guard_wrapper_path: exact }));
+  const verifier = path.join(path.dirname(paths.hookProvenance), 'external-subagent-policy-verifier');
+  fs.writeFileSync(verifier, '#!/usr/bin/env node\n');
+  try {
+    const result = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(result.zcode_hooks.entries_removed, 1, 'only the args[0] exact-path entry is managed');
+    assert.equal(result.zcode_hooks.provenance_removed, true);
+    assert.equal(result.zcode_hooks.verifier_removed, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')).hooks.events.PreToolUse, [dataArgument],
+      'the recorded path passed as data is preserved');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // launchd answers a bootstrap over an already-loaded label with
 // "Bootstrap failed: 5: Input/output error" (observed live in the user GUI
 // domain); a repeat start/init must stay idempotent instead of failing.

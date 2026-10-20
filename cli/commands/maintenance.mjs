@@ -43,19 +43,17 @@ function exactWrapperPaths(provenance) {
   return paths;
 }
 
-// A managed entry is either one the provenance recorded byte-for-byte, or a
-// legacy shape written by the retired installer: under its own event, a
-// process hook whose script position (`args[0]`) points at
-// `<any plugin root>/hooks/<managed script>` and whose matcher matches that
-// script's event role. Arguments after the script position are data, never
-// executable positions.
+// A managed entry is exactly the installer's written shape: a process hook
+// whose script position (`args[0]`) is either a provenance-recorded exact
+// wrapper path or an event-bound legacy `<plugin root>/hooks/<managed
+// script>` with the matching matcher. Arguments after the script position
+// are data, never executable positions.
 function managedHookEntry(entry, exactPaths, managedScripts) {
   if (!entry || typeof entry !== 'object' || !Array.isArray(entry.hooks)) return false;
   const hooks = entry.hooks.filter((hook) => hook?.type === 'process' && Array.isArray(hook.args));
   for (const hook of hooks) {
-    for (const arg of hook.args) {
-      if (typeof arg === 'string' && exactPaths.has(path.resolve(arg))) return true;
-    }
+    const script = hook.args[0];
+    if (typeof script === 'string' && exactPaths.has(path.resolve(script))) return true;
   }
   if (typeof entry.matcher !== 'string') return false;
   for (const hook of hooks) {
