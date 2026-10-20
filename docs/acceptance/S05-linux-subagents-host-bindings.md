@@ -33,21 +33,7 @@ nvm bin (S04 behavior).
 
 ## 1. Production path fixes (code)
 
-1. **Scope policy verifier default path**
-   (`crates/external-daemon/src/agent_status.rs`, was :1849-1860): the default
-   is now derived per platform by `policy_verifier_candidates` — the frozen
-   macOS `~/Library/Application Support/<product>` bytes on darwin; on Linux an
-   exported absolute `$XDG_DATA_HOME/<product>/external-subagent-policy-verifier`
-   is probed first (the same environment rule `cli/paths.mjs` and
-   `rpc/profiles.rs` apply), then the `<scope home>/.local/share/<product>`
-   fallback. `EXTERNAL_SUBAGENT_POLICY_VERIFIER` remains the explicit override.
-   The three `#[cfg(test)]` fixtures (formerly :2779/:2888/:3387) install the
-   scope-home fallback candidate through the same function; a new shape test
-   pins both arms (pure form, no process-env mutation, so the parallel suite
-   stays deterministic). `cargo test -p external-daemon --lib` green; the new
-   lines appear nowhere in `cargo fmt --check` (195 pre-existing drifts
-   elsewhere, unchanged count).
-2. **zcode runtime constant** (`cli/constants.mjs`, was line 17): the macOS
+1. **zcode runtime constant** (`cli/constants.mjs`, was line 17): the macOS
    app-bundle constant is kept as `ZCODE_RUNTIME`; the runtime the service
    generators and the observations report use is `zcodeRuntimePath(home, env)`
    — explicit `ZCODE_RUNTIME_PATH` first, then the platform convention
@@ -96,13 +82,13 @@ Daemon B (`--runtime ~/.zcode/server/agents/glm/zcode.cjs`):
 Daemon C (debug binary with the S05 verifier fix, XDG env exported):
 `subagents models zcode` first isolated two gaps (§5), both fixed in the same
 section after the coordinator ruling — the post-fix re-verification (daemon D,
-same controlled tree, fixed verifier restaged by `hooks install`, throwaway
+same controlled tree, fixed verifier restaged by the then-current hook
 credentials re-copied) reads:
 
 | layer | before the fix | after the fix (OBSERVED) |
 |---|---|---|
-| `subagents models zcode` | `policy_unverified` → `create_failed` | **`supported: true`, catalog `["deepseek/deepseek-flash"]`, reason none** (the catalog reflects the throwaway provider config copied into the isolated home, not a product claim about the host's catalog) |
-| `subagents probe zcode --hi` | `policy_unverified` | **local/auth/hi all `READY`** (0.16.9) |
+| `subagents models zcode` | the unavailable gate → `create_failed` | **`supported: true`, catalog `["deepseek/deepseek-flash"]`, reason none** (the catalog reflects the throwaway provider config copied into the isolated home, not a product claim about the host's catalog) |
+| `subagents probe zcode --hi` | the unavailable gate | **local/auth/hi all `READY`** (0.16.9) |
 
 **Spawn smoke** (plan mode, prompt "reply with the single word
 pong"; pre-fix on daemon C and post-fix on daemon D — identical outcomes):
@@ -139,14 +125,14 @@ ruling and fixed:
 1. **Staged verifier script macOS path**
    (`plugins/codex/external-subagent/scripts/policy-verifier.mjs`): joined
    its provenance as `<home>/Library/Application Support/external-subagent/…`
-   unconditionally → exit 2 on Linux → `policy_unverified` on every
+   unconditionally → exit 2 on Linux → the unavailable gate on every
    `--hi`/`models` probe. Diagnosis: manual run exit 2 as staged, exit 0
    with a provenance copy at the macOS-style path. Fix: the provenance
    candidates are derived with the same semantics as the daemon's
    `policy_verifier_candidates` (macOS frozen bytes; Linux absolute
    `$XDG_DATA_HOME/external-subagent/` first, then
-   `<home>/.local/share/external-subagent/`). Re-verified: `hooks install`
-   restages the fixed script, and with the daemon's XDG env it exits 0
+   `<home>/.local/share/external-subagent/`). Re-verified: the then-current
+   hook installation restages the fixed script, and with the daemon's XDG env it exits 0
    against the isolated tree.
 2. **Unknown server request aborted the probe loop**
    (`agent_status.rs`): the 0.16.9 runtime issues
@@ -181,7 +167,7 @@ plan policy still held for the completed plan-mode turn).
 | `install-plugin codex --uninstall` | official remove, cache gone, `claim_released=true`, registry `homes: []` |
 | `install-mcp --codex-home …` | TOML `[mcp_servers.external_subagent]` written (10 tools, linux-x64 facade, isolated socket); `codex mcp list` → one row, `Status: enabled`; `codex mcp list --json` shape captured |
 | `install-mcp --uninstall` | exactly the managed section removed; unrelated `[marketplaces.personal]` preserved; claim released |
-| `install-plugin zcode` | staging under `<XDG data>/external-subagent/zcode-plugin/external-subagent`, `plugins.dirs` entry in the isolated `~/.zcode/cli/config.json` (hooks from `hooks install` preserved byte-for-byte in value), bridge binding = installing node + `scripts/mcp-stdio-bridge.mjs` + `timeoutMs=300000` + isolated socket, `config_verified=true` |
+| `install-plugin zcode` | staging under `<XDG data>/external-subagent/zcode-plugin/external-subagent`, `plugins.dirs` entry in the isolated `~/.zcode/cli/config.json` (foreign hook state preserved byte-for-byte in value), bridge binding = installing node + `scripts/mcp-stdio-bridge.mjs` + `timeoutMs=300000` + isolated socket, `config_verified=true` |
 | repeat install | idempotent, identical digest, still exactly one `dirs` entry |
 | `install-plugin zcode --uninstall` | `staging_removed=true`, `plugins` key gone, hooks intact |
 

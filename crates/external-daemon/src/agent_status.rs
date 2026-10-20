@@ -202,10 +202,7 @@ pub struct AgentEvidenceStore {
 
 impl AgentEvidenceStore {
     pub fn new(runtime_source: Option<PathBuf>) -> Self {
-        Self::with_backend(Arc::new(ProcessProbeBackend {
-            runtime_source,
-            verifier_deadline: None,
-        }))
+        Self::with_backend(Arc::new(ProcessProbeBackend { runtime_source }))
     }
 
     pub(crate) fn with_backend(backend: Arc<dyn AgentProbeBackend>) -> Self {
@@ -349,13 +346,6 @@ fn preserved_or_stale(
 
 struct ProcessProbeBackend {
     runtime_source: Option<PathBuf>,
-    /// Budget the hi probe waits for the scope policy verifier before
-    /// declaring the policy unverified. `None` keeps the production
-    /// `LOCAL_PROBE_TIMEOUT`; tests that share the machine with a full
-    /// parallel suite widen it so a starved-but-healthy verifier is not
-    /// misjudged (the verifier is a trivial shell script, only ever slow
-    /// because the machine is busy, not because it is unhealthy).
-    verifier_deadline: Option<Duration>,
 }
 
 impl AgentProbeBackend for ProcessProbeBackend {
@@ -454,7 +444,6 @@ impl AgentProbeBackend for ProcessProbeBackend {
                     &scope,
                     local.version.clone(),
                     checked_at_ms,
-                    self.verifier_deadline,
                 );
                 auth = auth_result;
                 hi = hi_result;
@@ -474,11 +463,7 @@ impl AgentProbeBackend for ProcessProbeBackend {
 
     fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
         if input.agent == "zcode" {
-            return probe_zcode_models(
-                self.runtime_source.as_deref(),
-                self.verifier_deadline,
-                input,
-            );
+            return probe_zcode_models(self.runtime_source.as_deref(), input);
         }
         if input.agent == "codex" {
             // The Codex catalog was observed only through the controlled live
@@ -808,19 +793,14 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
 /// Read the ZCode model directory from the session/create
 /// `settings.model.available` catalog without sending a prompt.
 ///
-/// The probe reuses the read-only hi probe's command shape — the scope policy
-/// verifier, the daemon policy environment, the app-server transport, and the
-/// S01 provider environment — but stops after create: `available` is a
-/// create-time fact that shrinks to the selected model after
-/// `session/setModel`, so it must never be re-read as the full directory. Only
-/// entries carrying both providerId and modelId project; the credentials stay
-/// in the shared 0600 provider file and never reach the output, evidence, or
-/// logs.
-fn probe_zcode_models(
-    executable: Option<&Path>,
-    verifier_deadline: Option<Duration>,
-    input: &AgentModelsInput,
-) -> AgentModelsOutput {
+/// The probe reuses the read-only hi probe's command shape — the daemon policy
+/// environment, the app-server transport, and the provider environment — but
+/// stops after create: `available` is a create-time fact that shrinks to the
+/// selected model after `session/setModel`, so it must never be re-read as the
+/// full directory. Only entries carrying both providerId and modelId project;
+/// the credentials stay in the shared 0600 provider file and never reach the
+/// output, evidence, or logs.
+fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
     let checked_at_ms = wall_now_millis();
     let mut scope = input.scope.clone();
     if scope.home.is_none() {
@@ -863,16 +843,6 @@ fn probe_zcode_models(
     };
     if !Path::new(workspace).is_absolute() || !Path::new(workspace).is_dir() {
         return zcode_models_degraded(input, evidence, "workspace_missing");
-    }
-    // The models probe holds the same read-only policy pre-flight as the hi
-    // probe: a scope the hi probe would refuse must not get a session created
-    // on the models path either. The verifier runs before any app-server spawn.
-    if !verified_read_only_policy(
-        &scope,
-        workspace,
-        verifier_deadline.unwrap_or(LOCAL_PROBE_TIMEOUT),
-    ) {
-        return zcode_models_degraded(input, evidence, "policy_unverified");
     }
     let executable = executable.expect("ready local evidence has a runtime path");
     let mut command = runtime_command(executable, false);
@@ -1857,7 +1827,6 @@ fn probe_zcode_hi(
     scope: &ProbeScope,
     version: Option<String>,
     checked_at_ms: u64,
-    verifier_deadline: Option<Duration>,
 ) -> (ScopeEvidence, ScopeEvidence) {
     let Some(workspace) = scope.workspace.as_deref() else {
         let evidence = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "workspace_required");
@@ -1872,14 +1841,6 @@ fn probe_zcode_hi(
             checked_at_ms,
             reason: Some("workspace_missing".into()),
         };
-        return (evidence.clone(), evidence);
-    }
-    if !verified_read_only_policy(
-        scope,
-        workspace,
-        verifier_deadline.unwrap_or(LOCAL_PROBE_TIMEOUT),
-    ) {
-        let evidence = unavailable(scope, version, checked_at_ms, "policy_unverified");
         return (evidence.clone(), evidence);
     }
     let mut command = runtime_command(executable, false);
@@ -1930,163 +1891,6 @@ fn probe_zcode_hi(
     };
     let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
     (auth, hi)
-}
-
-/// Default scope policy verifier candidates under the probe scope home. The
-/// CLI stages the verifier beside the hook provenance inside the product data
-/// directory (`plugins/codex/external-subagent/scripts/install-agent-hooks.mjs`),
-/// which is `~/Library/Application Support/<product>` on macOS and the XDG
-/// `$XDG_DATA_HOME/<product>` / `~/.local/share/<product>` convention
-/// elsewhere (D-S02, matching `cli/paths.mjs` and `rpc/profiles.rs`). On XDG
-/// hosts an exported absolute `XDG_DATA_HOME` is the first candidate — the
-/// same environment rule the CLI's own layout resolution applies — followed by
-/// the scope-home fallback, so the probe finds the tree the CLI wrote in both
-/// the default and the redirected layout. An exported
-/// `EXTERNAL_SUBAGENT_POLICY_VERIFIER` remains the explicit override.
-fn policy_verifier_candidates(home: &str) -> Vec<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        policy_verifier_candidates_windows(home, env::var_os("LOCALAPPDATA"))
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        policy_verifier_candidates_for(home, env::var_os("XDG_DATA_HOME"))
-    }
-}
-
-/// Windows mirrors the CLI's `%LOCALAPPDATA%\<product>` data root: the verifier
-/// is staged beside the hook provenance. An exported absolute `LOCALAPPDATA`
-/// wins (it is the same environment rule `cli/paths.mjs` applies); otherwise
-/// the scope-home fallback `%USERPROFILE%\AppData\Local\<product>` applies.
-#[cfg(target_os = "windows")]
-fn policy_verifier_candidates_windows(
-    home: &str,
-    local_app_data: Option<std::ffi::OsString>,
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(local) = local_app_data.map(PathBuf::from) {
-        if local.is_absolute() {
-            candidates.push(local.join("external-subagent/external-subagent-policy-verifier"));
-        }
-    }
-    candidates.push(
-        Path::new(home)
-            .join("AppData/Local/external-subagent/external-subagent-policy-verifier"),
-    );
-    candidates
-}
-
-#[cfg_attr(target_os = "windows", allow(dead_code))]
-fn policy_verifier_candidates_for(
-    home: &str,
-    xdg_data_home: Option<std::ffi::OsString>,
-) -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = xdg_data_home;
-        vec![Path::new(home).join(
-            "Library/Application Support/external-subagent/external-subagent-policy-verifier",
-        )]
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut candidates = Vec::new();
-        if let Some(xdg) = xdg_data_home.map(PathBuf::from) {
-            if xdg.is_absolute() {
-                candidates.push(xdg.join("external-subagent/external-subagent-policy-verifier"));
-            }
-        }
-        candidates.push(
-            Path::new(home)
-                .join(".local/share/external-subagent/external-subagent-policy-verifier"),
-        );
-        candidates
-    }
-}
-
-/// The probe verifier is an extensionless Node script. Windows cannot execute
-/// it directly (no PATHEXT identity, no shebang support in CreateProcess), so
-/// it runs under the same `node` the CLI pins; POSIX keeps the direct exec.
-fn policy_verifier_command(verifier: &Path) -> Command {
-    #[cfg(windows)]
-    {
-        if !crate::executable::pathext_contains(verifier) {
-            let mut command = Command::new("node");
-            command.arg(verifier);
-            return command;
-        }
-    }
-    crate::executable::executable_command(verifier)
-}
-
-fn verified_read_only_policy(scope: &ProbeScope, workspace: &str, budget: Duration) -> bool {
-    let Some(home) = scope.home.as_deref() else {
-        return false;
-    };
-    let verifier = env::var_os("EXTERNAL_SUBAGENT_POLICY_VERIFIER")
-        .map(PathBuf::from)
-        .or_else(|| {
-            policy_verifier_candidates(home)
-                .into_iter()
-                .find(|candidate| candidate.is_file())
-        });
-    let Some(verifier) = verifier else {
-        return false;
-    };
-    if !verifier.is_file() {
-        return false;
-    }
-    let mut command = policy_verifier_command(&verifier);
-    command
-        .args([
-            "--workspace",
-            workspace,
-            "--home",
-            home,
-            "--permission-mode",
-            "plan",
-            "--write-manifest",
-            "[]",
-        ])
-        .env("ZCODE_HOME", home)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let Ok(mut child) = gated_spawn(&mut command) else {
-        return false;
-    };
-    let group = child.id() as i32;
-    // The verifier is a trivial script; the budget only has to outlast a
-    // busy machine (a loaded host can starve even a millisecond script
-    // past a tight deadline), so it matches the local probe timeout
-    // instead of the historic 2s that produced load-correlated
-    // `policy_unverified` false negatives.
-    let deadline = Instant::now() + budget;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // The child exited on its own, so no kill is needed, but the
-                // Windows job handle registry entry still has to be dropped or
-                // the map grows once per verification in a long-running daemon.
-                #[cfg(windows)]
-                let _ = external_runtime::release_process_group(group);
-                return status.success();
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) | Err(_) => {
-                cleanup_catalog_process(&mut child, group, Duration::from_millis(100));
-                return false;
-            }
-        }
-    }
 }
 
 fn run_read_only_hi(driver: Arc<Driver>, workspace: &str) -> Result<String, String> {
@@ -2782,7 +2586,6 @@ mod tests {
         }
         let backend = ProcessProbeBackend {
             runtime_source: None,
-            verifier_deadline: None,
         };
         let result = backend.probe(&AgentProbeInput {
             agent: "dsh".into(),
@@ -2960,19 +2763,6 @@ process.stdin.on('data', (chunk) => {
         after_terminal: &str,
     ) -> (AgentProbeEvidence, Vec<Value>) {
         let directory = tempfile::tempdir().unwrap();
-        let verifier = policy_verifier_candidates(&directory.path().to_string_lossy())
-            .pop()
-            .expect("at least one policy verifier candidate");
-        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
-        fs::write(
-            &verifier,
-            b"#!/bin/sh\n[ \"$1\" = \"--workspace\" ] && [ -d \"$2\" ] && [ \"$3\" = \"--home\" ] && [ -d \"$4\" ] && [ \"$5\" = \"--permission-mode\" ] && [ \"$6\" = \"plan\" ] && [ \"$7\" = \"--write-manifest\" ] && [ \"$8\" = \"[]\" ]\n",
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
-        }
         let (runtime, log) = fake_hi_runtime(
             directory.path(),
             terminal,
@@ -2983,7 +2773,6 @@ process.stdin.on('data', (chunk) => {
         );
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let evidence = backend.probe(&AgentProbeInput {
             agent: "zcode".into(),
@@ -3003,7 +2792,7 @@ process.stdin.on('data', (chunk) => {
                     .unwrap_or_else(|| "none".into());
                 panic!(
                     "fixture log unavailable: {error}; hi probe proximate cause: {proximate} \
-                     (a policy_unverified hi layer aborts before the fixture ever launches); \
+                     (the hi layer aborted before the fixture ever launched); \
                      evidence={evidence:?}"
                 )
             })
@@ -3035,119 +2824,6 @@ process.stdin.on('data', (chunk) => {
             let method = record["value"]["method"].as_str().unwrap_or_default();
             !method.contains("tool") && !method.contains("permission")
         }));
-    }
-
-    #[test]
-    fn policy_verifier_candidates_follow_the_platform_data_directory() {
-        // The scope policy verifier is looked up where the CLI stages it (the
-        // product data directory): the frozen macOS `~/Library/Application
-        // Support` bytes on darwin, the XDG `~/.local/share` convention
-        // everywhere else (D-S02), so the probe and `install-agent-hooks.mjs`
-        // agree on one location per platform. The last candidate is always the
-        // scope-home fallback the fixtures install; the pure form keeps the
-        // oracle free of process-environment mutation.
-        #[cfg(target_os = "macos")]
-        assert_eq!(
-            policy_verifier_candidates_for("/home/a", Some("/xdg-redirect".into())),
-            vec![PathBuf::from(
-                "/home/a/Library/Application Support/external-subagent/external-subagent-policy-verifier"
-            )]
-        );
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-        {
-            let fallback = PathBuf::from(
-                "/home/a/.local/share/external-subagent/external-subagent-policy-verifier",
-            );
-            // Without an exported absolute XDG_DATA_HOME the scope-home
-            // fallback is the only candidate; a relative or empty export is
-            // ignored per the XDG rule.
-            assert_eq!(
-                policy_verifier_candidates_for("/home/a", None),
-                vec![fallback.clone()]
-            );
-            assert_eq!(
-                policy_verifier_candidates_for("/home/a", Some("relative/data".into())),
-                vec![fallback.clone()]
-            );
-            // An exported absolute override is probed first; the scope-home
-            // fallback stays last, so a redirected product tree and a plain
-            // scope home are both covered.
-            assert_eq!(
-                policy_verifier_candidates_for("/home/a", Some("/xdg-redirect".into())),
-                vec![
-                    PathBuf::from(
-                        "/xdg-redirect/external-subagent/external-subagent-policy-verifier"
-                    ),
-                    fallback
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn hi_probe_refuses_prompt_without_scope_policy_verifier() {
-        let directory = tempfile::tempdir().unwrap();
-        let (runtime, log) = fake_hi_runtime(
-            directory.path(),
-            "turn.completed",
-            serde_json::json!({}),
-            false,
-            false,
-            "success",
-        );
-        let evidence = ProcessProbeBackend {
-            runtime_source: Some(runtime),
-            verifier_deadline: None,
-        }
-        .probe(&AgentProbeInput {
-            agent: "zcode".into(),
-            through: ProbeLayer::Hi,
-            scope: ProbeScope::default(),
-        });
-        assert_eq!(evidence.hi.reason.as_deref(), Some("policy_unverified"));
-        assert!(!log.exists());
-    }
-
-    #[test]
-    fn policy_verifier_deadline_override_short_circuits_the_hi_probe() {
-        // A verifier that would succeed but outlives the configured budget
-        // must fail closed before the runtime is ever spawned, proving the
-        // deadline seam reaches the gate (production keeps
-        // LOCAL_PROBE_TIMEOUT; fixture probes widen it to survive a
-        // parallel suite without weakening the fail-closed semantics).
-        let directory = tempfile::tempdir().unwrap();
-        let verifier = policy_verifier_candidates(&directory.path().to_string_lossy())
-            .pop()
-            .expect("at least one policy verifier candidate");
-        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
-        fs::write(&verifier, "#!/bin/sh\nsleep 1\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-        let (runtime, log) = fake_hi_runtime(
-            directory.path(),
-            "turn.completed",
-            serde_json::json!({}),
-            false,
-            false,
-            "success",
-        );
-        let evidence = ProcessProbeBackend {
-            runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_millis(200)),
-        }
-        .probe(&AgentProbeInput {
-            agent: "zcode".into(),
-            through: ProbeLayer::Hi,
-            scope: ProbeScope {
-                home: Some(directory.path().to_string_lossy().into_owned()),
-                ..ProbeScope::default()
-            },
-        });
-        assert_eq!(evidence.hi.state, EvidenceState::Unavailable);
-        assert_eq!(evidence.hi.reason.as_deref(), Some("policy_unverified"));
-        assert!(!log.exists());
     }
 
     #[test]
@@ -3628,20 +3304,6 @@ process.stdin.on('data', (chunk) => {
         fs::write(executable, source).unwrap();
     }
 
-    /// Install the scope policy verifier the read-only probes require under the
-    /// scope home, so the models probe can reach `session/create`.
-    fn install_policy_verifier(directory: &Path) {
-        let verifier = policy_verifier_candidates(&directory.to_string_lossy())
-            .pop()
-            .expect("at least one policy verifier candidate");
-        fs::create_dir_all(verifier.parent().unwrap()).unwrap();
-        fs::write(&verifier, b"#!/bin/sh\nexit 0\n").unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&verifier, fs::Permissions::from_mode(0o700)).unwrap();
-        }
-    }
-
     #[test]
     fn zcode_catalog_projects_create_settings_available_without_a_prompt() {
         let directory = tempfile::tempdir().unwrap();
@@ -3658,7 +3320,6 @@ process.stdin.on('data', (chunk) => {
             {"ref": {"providerId": "zai"}}
         ]);
         fake_models_runtime(&runtime, &log, &catalog, false, false);
-        install_policy_verifier(directory.path());
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
@@ -3667,7 +3328,6 @@ process.stdin.on('data', (chunk) => {
         };
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -3720,7 +3380,6 @@ process.stdin.on('data', (chunk) => {
             {"ref": {"providerId": "zai", "modelId": "GLM-5.3"}},
         ]);
         fake_models_runtime(&runtime, &log, &catalog, false, true);
-        install_policy_verifier(directory.path());
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
@@ -3729,7 +3388,6 @@ process.stdin.on('data', (chunk) => {
         };
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -3768,10 +3426,8 @@ process.stdin.on('data', (chunk) => {
         let runtime = directory.path().join("zcode-models.mjs");
         let log = directory.path().join("models.jsonl");
         fake_models_runtime(&runtime, &log, &serde_json::json!([]), true, false);
-        install_policy_verifier(directory.path());
         let backend = ProcessProbeBackend {
             runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_secs(30)),
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -3789,42 +3445,10 @@ process.stdin.on('data', (chunk) => {
     }
 
     #[test]
-    fn zcode_catalog_refuses_session_creation_without_scope_policy_verifier() {
-        let directory = tempfile::tempdir().unwrap();
-        let runtime = directory.path().join("zcode-models.mjs");
-        let log = directory.path().join("models.jsonl");
-        fake_models_runtime(&runtime, &log, &serde_json::json!([]), false, false);
-        // No verifier under the scope home: the models probe must hold the hi
-        // probe's read-only policy gate and degrade before spawning anything.
-        let backend = ProcessProbeBackend {
-            runtime_source: Some(runtime),
-            verifier_deadline: Some(Duration::from_secs(30)),
-        };
-        let output = backend.models(&AgentModelsInput {
-            agent: "zcode".into(),
-            scope: ProbeScope {
-                workspace: Some(directory.path().to_string_lossy().into_owned()),
-                home: Some(directory.path().to_string_lossy().into_owned()),
-                profile: None,
-                version: None,
-            },
-        });
-        assert!(!output.supported);
-        assert!(output.models.is_empty());
-        assert_eq!(output.reason.as_deref(), Some("policy_unverified"));
-        assert_eq!(output.evidence.source, "zcode_session_create_settings");
-        assert!(
-            !log.exists(),
-            "the app-server must not be spawned when the policy is unverified"
-        );
-    }
-
-    #[test]
     fn zcode_catalog_reports_a_missing_runtime_without_spawning() {
         let workspace = tempfile::tempdir().unwrap();
         let backend = ProcessProbeBackend {
             runtime_source: Some(PathBuf::from("/must-not-run")),
-            verifier_deadline: None,
         };
         let output = backend.models(&AgentModelsInput {
             agent: "zcode".into(),
@@ -4079,7 +3703,6 @@ setInterval(() => {}, 1000);
         }
         let backend = ProcessProbeBackend {
             runtime_source: None,
-            verifier_deadline: None,
         };
         let evidence = backend.probe(&AgentProbeInput {
             agent: "agy".into(),
@@ -4210,40 +3833,6 @@ mod windows_tests {
         assert_eq!(
             arguments,
             vec!["/D", "/C", r"C:\tools\agent.cmd", "--version"]
-        );
-
-        // The extensionless policy verifier is a Node script on Windows and
-        // must run under node rather than through CreateProcess.
-        let command = policy_verifier_command(Path::new(
-            r"C:\Users\a\AppData\Local\external-subagent\external-subagent-policy-verifier",
-        ));
-        assert_eq!(command.get_program(), "node");
-    }
-
-    #[test]
-    fn policy_verifier_candidates_follow_the_localappdata_root() {
-        let fallback = PathBuf::from(
-            "/home/a/AppData/Local/external-subagent/external-subagent-policy-verifier",
-        );
-        assert_eq!(
-            policy_verifier_candidates_windows("/home/a", None),
-            vec![fallback.clone()]
-        );
-        assert_eq!(
-            policy_verifier_candidates_windows("/home/a", Some("relative/data".into())),
-            vec![fallback.clone()]
-        );
-        assert_eq!(
-            policy_verifier_candidates_windows(
-                "/home/a",
-                Some("C:/Users/a/AppData/Local".into())
-            ),
-            vec![
-                PathBuf::from(
-                    "C:/Users/a/AppData/Local/external-subagent/external-subagent-policy-verifier"
-                ),
-                fallback
-            ]
         );
     }
 }

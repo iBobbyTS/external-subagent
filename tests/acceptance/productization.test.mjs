@@ -77,7 +77,7 @@ test('acceptance doc attributes the zcode probe home to the real user home, not 
   // Native-review correction: the launchd-run daemon had no HOME from the
   // bootstrapping shell (the plist sets none), so the zcode probe's recorded
   // scope.home was the real /Users/ibobby. The doc must attribute the
-  // policy_unverified boundary to that evidence gap — never to an isolated
+  // unavailable-gate boundary to that evidence gap — never to an isolated
   // scratch HOME — while the ZCode spawn cells stay the capability proof.
   assert.match(doc, /scope\.home/u, 'the probe scope attribution must stay explicit');
   assert.match(doc, /\/Users\/ibobby/u);

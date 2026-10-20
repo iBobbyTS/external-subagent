@@ -53,17 +53,11 @@
 //   live evidence.
 //
 // Known bounded limitations (do not silently re-classify): an authenticated
-// AND policy-verified ZCode hi probe requires the product hooks to be
-// installed into the same user config.json that carries the provider
-// credentials. With a read-only symlink bridge the probe reports
-// `policy_unverified`; with a hooks-only config the probe passes the policy
-// verifier but the zcode child exits with `model_config_missing`. Resolving
-// both in one home requires an authorized hook installation into the real
-// user config (product `init --install-hooks`), which the live harness must
-// never perform. This harness therefore asserts no zcode hi state at all.
-// Symmetrically, a DSH home whose credentials were NOT bridged (blank home)
-// must fail the authenticated hi probe; such a failure is never recorded
-// or reported as success here.
+// ZCode hi probe requires provider credentials in the same user config the
+// runtime reads. The live harness must never write the real user's config,
+// so it asserts no zcode hi state at all. Symmetrically, a DSH home whose
+// credentials were NOT bridged (blank home) must fail the authenticated hi
+// probe; such a failure is never recorded or reported as success here.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -474,7 +468,7 @@ test('live dual-provider acceptance through one installed artifact', { skip: liv
       'dsh tasks: build=COMPLETED/reaped strict-plan=COMPLETED/workspace-unmutated mid-run-cancel=CANCELLED/reaped',
       'zcode tasks: native-model=COMPLETED/reaped model-rejection=model_selection_unsupported',
       'NOT asserted here (that-session live evidence only): MCP facade, pending/respond, restart no-replay',
-      'NOT asserted here (bounded limitation): zcode authenticated hi (policy_unverified/model_config_missing split)',
+      'NOT asserted here (bounded limitation): zcode authenticated hi (provider credentials live outside the harness)',
     ].join('\n'));
     settled = true;
   } finally {

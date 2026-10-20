@@ -35,8 +35,7 @@ facade. `install-plugin zcode` pins the **installing node
 `scripts/mcp-stdio-bridge.mjs`** — a node reimplementation of the native
 facade's stdio↔`.mcp`-socket byte pipe (`crates/external-mcp`), with the
 same `EXTERNAL_SUBAGENT_SOCKET` → sibling `.mcp` endpoint resolution and
-either-side-EOF exit semantics. This mirrors how the product's own hook
-installation already pins `process.execPath`. The pinned path follows the
+either-side-EOF exit semantics. The pinned path follows the
 installing interpreter (e.g. a Homebrew Cellar path); `update`/`reconcile`
 re-stage the binding with the current interpreter, and a prior binding
 pinned to a since-replaced interpreter path refreshes in place — the
@@ -92,10 +91,8 @@ bundled and marketplace plugins: **inline directories** — every path in
   rejected as `plugin_component_path_invalid`.
 - Plugin-provided MCP servers are trusted and auto-connected at session
   start together with every other scope (user, workspace, environment).
-- The manifest declares only `skills` and `mcpServers`; plugin `hooks`
-  components are a separate manifest field, so installing this plugin as
-  a host binding does not activate the bundled subagent policy hooks
-  (those remain the explicit `hooks install` flow).
+- The manifest declares only `skills` and `mcpServers`; installing this
+  plugin as a host binding activates no policy hooks.
 
 ## Risk envelope
 
@@ -224,21 +221,10 @@ with `final_text="pong"` (`input_identity.model_source="native"`). The
 runtime writes its own logs/state under the spawn environment's `~/.zcode`
 (the isolated home), never the real tree.
 
-**Read-only probe layers on this runtime line — two gaps found and fixed
-(2026-10-09, both re-verified live end-to-end after the fix):**
+**Read-only probe layers on this runtime line — one gap found and fixed
+(2026-10-09, re-verified live end-to-end after the fix):**
 
-1. The staged scope policy verifier
-   (`plugins/codex/external-subagent/scripts/policy-verifier.mjs`) joined
-   its provenance as the macOS `<home>/Library/Application Support/…` path
-   unconditionally, so on Linux it exited 2 and every `--hi`/`models` probe
-   reported `policy_unverified` (the daemon-side lookup was already
-   platform-aware). The script now derives the provenance candidates with
-   the same semantics as the daemon's `policy_verifier_candidates`: the
-   frozen macOS bytes on darwin; elsewhere an exported absolute
-   `$XDG_DATA_HOME/<product>/` first, then the `<home>/.local/share/<product>`
-   XDG fallback. An existing installation picks the fixed script up on the
-   next `hooks install`, which restages the verifier beside the provenance.
-2. `session/create` on this runtime issues a new server request
+1. `session/create` on this runtime issues a new server request
    `interaction/requestOfficialMcpAuthHeaders` (official-MCP auth, e.g. for
    the `image-search` plugin) and proceeds with an anonymous fallback no
    matter how the client answers. The daemon's read-only probe loops
@@ -250,7 +236,7 @@ runtime writes its own logs/state under the spawn environment's `~/.zcode`
    its own error response or the probe deadline
    (`respond_unsupported_probe_request`, pinned by the
    `zcode_catalog_survives_an_unsupported_server_request_during_create`
-   unit test). After both fixes, the live chain on the real runtime reads:
+   unit test). After the fix, the live chain on the real runtime reads:
    `subagents models zcode` → `supported: true` with the projected catalog,
    and `subagents probe zcode --hi` → local/auth/hi all `READY`.
 

@@ -315,6 +315,82 @@ test('product uninstall removes the service first, then releases every claim whi
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+// Retained installations may still carry managed hooks written by the retired
+// installer. The inverse cleanup is bounded: provenance-recorded exact paths
+// and the legacy `<any plugin root>/hooks/<managed script>` shapes disappear,
+// while every foreign entry, unknown hooks key, and unrelated top-level key
+// survives. The provenance record and the verifier staged beside it are
+// deleted afterwards.
+test('product uninstall removes only recognized managed hooks and deletes the staged verifier', { skip: win32PosixBackend }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-cleanup-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+
+  const packageRoot = path.join(home, 'node_modules', 'external-subagent', 'plugins', 'codex', 'external-subagent');
+  const stagedRoot = path.join(home, 'staged');
+  const guardExact = path.join(stagedRoot, 'hooks', 'guard-bash.mjs');
+  const auditExact = path.join(stagedRoot, 'hooks', 'audit-bash-result.mjs');
+  const fileExact = path.join(stagedRoot, 'hooks', 'check-agent-files.mjs');
+  const managed = (matcher, script) => ({ matcher, hooks: [{ type: 'process', command: process.execPath, args: [script], timeoutMs: 5000 }] });
+  const foreign = { matcher: 'Bash', hooks: [{ type: 'process', command: 'existing', args: ['/usr/local/bin/foreign-hook'] }], id: 'foreign-entry' };
+  const config = {
+    theme: 'dark',
+    hooks: {
+      enabled: true,
+      custom: { keep: true },
+      events: {
+        PreToolUse: [
+          foreign,
+          managed('Bash', guardExact),
+          managed('^(Read|Grep|Glob|Write|Edit|Delete|Move)$', path.join(packageRoot, 'hooks', 'check-agent-files.mjs')),
+        ],
+        PostToolUse: [managed('Bash', path.join(packageRoot, 'hooks', 'audit-bash-result.mjs')), foreign],
+        PostToolUseFailure: [managed('Bash', auditExact)],
+        OtherEvent: [foreign],
+      },
+    },
+  };
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify(config));
+  fs.writeFileSync(paths.hookProvenance, JSON.stringify({
+    effective_guard_wrapper_path: guardExact,
+    effective_audit_wrapper_path: auditExact,
+    effective_file_wrapper_path: fileExact,
+  }));
+  const verifier = path.join(path.dirname(paths.hookProvenance), 'external-subagent-policy-verifier');
+  fs.writeFileSync(verifier, '#!/usr/bin/env node\n');
+
+  try {
+    const result = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(result.zcode_hooks.entries_removed, 4, 'exact and package-root recognized entries are removed');
+    assert.equal(result.zcode_hooks.config_updated, true);
+    assert.equal(result.zcode_hooks.provenance_removed, true);
+    assert.equal(result.zcode_hooks.verifier_removed, true);
+    assert.equal(result.zcode_hooks.error, undefined);
+
+    const after = JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8'));
+    assert.deepEqual(after.hooks.events.PreToolUse, [foreign], 'foreign entries survive with every key');
+    assert.deepEqual(after.hooks.events.PostToolUse, [foreign]);
+    assert.deepEqual(after.hooks.events.PostToolUseFailure, []);
+    assert.deepEqual(after.hooks.events.OtherEvent, [foreign], 'unmanaged events are untouched');
+    assert.equal(after.theme, 'dark', 'unknown top-level keys survive');
+    assert.deepEqual(after.hooks.custom, { keep: true }, 'unknown hooks keys survive');
+    assert.equal(after.hooks.enabled, true, 'the enabled flag is not a managed-hook entry');
+    assert.equal(fs.existsSync(paths.hookProvenance), false);
+    assert.equal(fs.existsSync(verifier), false);
+
+    // The cleanup is idempotent: a retry finds nothing recognized and writes
+    // nothing.
+    const again = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(again.zcode_hooks.entries_removed, 0);
+    assert.equal(again.zcode_hooks.config_updated, false);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // launchd answers a bootstrap over an already-loaded label with
 // "Bootstrap failed: 5: Input/output error" (observed live in the user GUI
 // domain); a repeat start/init must stay idempotent instead of failing.

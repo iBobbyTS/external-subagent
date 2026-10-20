@@ -365,7 +365,6 @@ function fullPaths(root) {
     state: path.join(root, 'data', 'install-state.json'), config: path.join(root, 'config', 'product.json'),
     launchAgent: path.join(root, 'LaunchAgents', 'com.external-subagent.daemon.plist'),
     socket: path.join(root, 'data', 'daemon.sock'), database: path.join(root, 'data', 'daemon.db'),
-    zcodeConfig: path.join(root, 'zcode', 'config.toml'), hookProvenance: path.join(root, 'zcode', 'hooks.json'),
   };
 }
 

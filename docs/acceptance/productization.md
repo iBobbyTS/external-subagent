@@ -77,7 +77,7 @@ none), so daemon-side operations that fall back to `HOME` resolved the real
 | Probe | Result |
 |---|---|
 | `agents probe dsh --hi` | local `READY` (`0.1.5-rc.1`, bridged home), auth `UNKNOWN/auth_not_probed` (by design), **hi `READY`** — real upstream round-trip |
-| `agents probe zcode --hi` | local `READY` (zcode `0.16.5`), auth/hi `UNAVAILABLE/policy_unverified`. Correction (native review): the probe's recorded `scope.home` was the real `/Users/ibobby`, not the scratch `HOME` — launchd set no `HOME` on the daemon job (the plist sets none), and the daemon's home fallback resolved the real user home. This run therefore establishes neither which ZCode config source the probe consulted nor how the policy gate evaluated against that real home; `policy_unverified` is recorded as that evidence gap, not as a property of an isolated HOME and not as a statement about a normal user's configuration. Real ZCode capability is unaffected and proven by the spawn cells below |
+| `agents probe zcode --hi` | local `READY` (zcode `0.16.5`), auth/hi `UNAVAILABLE` (the read-only policy gate could not be verified). Correction (native review): the probe's recorded `scope.home` was the real `/Users/ibobby`, not the scratch `HOME` — launchd set no `HOME` on the daemon job (the plist sets none), and the daemon's home fallback resolved the real user home. This run therefore establishes neither which ZCode config source the probe consulted nor how the policy gate evaluated against that real home; the unavailable gate is recorded as that evidence gap, not as a property of an isolated HOME and not as a statement about a normal user's configuration. Real ZCode capability is unaffected and proven by the spawn cells below |
 | DSH build mode | proven by cell 1 (live) |
 | DSH strict-plan refusal | task `10000002`: `COMPLETED`, the model reported no write tool available, workspace stayed empty |
 | ZCode explicit model | `model_selection_unsupported` before any prompt (re-asserted live by the 20:0x double-provider session run below; the closeout re-check did not reach this step) |
@@ -274,7 +274,7 @@ files.
 - **ZCode hi probe policy gate**: the probe ran with `scope.home`
   `/Users/ibobby` (launchd set no `HOME`; the product plist sets none), so
   the config source behind the probe and the policy-gate evaluation that
-  produced `policy_unverified` are unproven for this run — an authenticated
+  produced the unavailable result are unproven for this run — an authenticated
   plus policy-verified ZCode hi on a launchd-resident daemon remains open
   evidence. This gap does not negate the ZCode task cells: cells 2 and 4
   prove real ZCode capability through the public CLI and the managed plugin.

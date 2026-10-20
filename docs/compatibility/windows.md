@@ -106,12 +106,7 @@ gpt-6-luna` + `wait` evidence is owned by the final main acceptance step.**
 The `hi` probe runs the same app-server protocol as production with an explicit
 `plan` session, an empty write manifest, and the daemon policy environment.
 `auth` becomes READY only after the hi session succeeds (ZCode exposes no
-independent credential endpoint). The probe required the staged policy
-verifier: on Windows `install-agent-hooks.mjs` writes it to
-`%LOCALAPPDATA%\external-subagent\external-subagent-policy-verifier`, and both
-the CLI staging and the daemon lookup use the `%LOCALAPPDATA%` root (falling
-back to `%USERPROFILE%\AppData\Local`). The verifier itself runs under `node`
-on Windows because it is an extensionless Node script.
+independent credential endpoint).
 
 ### Antigravity (`agy`)
 
@@ -160,21 +155,13 @@ deduplication, case-insensitive membership, extension requirement, PATH
 discovery with `.exe`/`.cmd` and rejection of `.txt`/missing names, custom
 `PATHEXT` driving gate membership, and batch wrapping in `cmd.exe`.
 
-## Permission interception matrix
-
-The ZCode probe and production hook surface use the same policy:
+## Probe permission posture
 
 | Surface | Rule | Failure mode |
 |---|---|---|
-| `PreToolUse` matcher `^(Read\|Grep\|Glob\|Write\|Edit\|Delete\|Move)$` | staged file-policy wrapper + provenance hashes | probe: `policy_violation`; production: hook denies |
-| `PreToolUse` matcher `Bash` | guard wrapper (read-only probe session) | any permission request fails the probe |
-| `PostToolUse` / `PostToolUseFailure` matcher `Bash` | audit wrapper records outcome | audit only; never grants |
-| ZCode `hi` probe policy | explicit `plan` session, empty write manifest, no tool calls requested | `policy_unverified` before spawn; `policy_violation` on any tool/permission event |
+| ZCode `hi` probe policy | explicit `plan` session, empty write manifest, no tool calls requested | `policy_violation` on any tool/permission event |
 | agy `hi` probe | bare stream-json, no permission flags | any tool `step_update` (even soft-denied) fails the probe |
 | Codex | no in-band hi layer | local executable/version only |
-
-On Windows the staged wrappers are invoked with `process.execPath` and the
-verifier path is resolved through the same `%LOCALAPPDATA%` rules as the daemon.
 
 ## Session reconnect
 

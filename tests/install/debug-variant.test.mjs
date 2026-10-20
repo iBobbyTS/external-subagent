@@ -102,8 +102,6 @@ test('debug plugin source staging renames identity and keeps managed content', (
     assert.match(skill.slice(0, 200), /^---\r?\nname: external-subagent-debug\r?\n/u);
     assert.equal(fs.readFileSync(path.join(target, '.mcp.json'), 'utf8'),
       fs.readFileSync(path.join(repoRoot, 'plugins', 'codex', 'external-subagent', '.mcp.json'), 'utf8'));
-    const hooks = fs.readdirSync(path.join(repoRoot, 'plugins', 'codex', 'external-subagent', 'hooks')).sort();
-    assert.deepEqual(fs.readdirSync(path.join(target, 'hooks')).sort(), hooks);
   } finally {
     fs.rmSync(target, { recursive: true, force: true });
   }

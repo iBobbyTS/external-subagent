@@ -51,7 +51,7 @@ export function zcodeRuntimePath(home = os.homedir(), env = process.env) {
 }
 
 export const BUSINESS_COMMANDS = new Set([
-  'init', 'hooks', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop',
+  'init', 'status', 'diagnose', 'backup', 'restore', 'start', 'stop',
   'uninstall', 'purge', 'install-plugin', 'install-mcp', 'create', 'spawn', 'wait', 'list', 'send',
   'respond', 'cancel', 'result', 'close', 'config', 'agents', 'subagents',
   'observe', 'update', 'reconcile',

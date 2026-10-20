@@ -3,7 +3,7 @@
 // from the release source at plugins/codex/external-subagent: a byte-level copy
 // with the plugin identity renamed (plugin.json name/displayName, the skill
 // directory and its frontmatter name).  The .mcp.json placeholder and the
-// hooks/scripts/lib payloads stay identical — the host bindings rewrite the
+// scripts payload stay identical — the host bindings rewrite the
 // placeholder at staging time, and tool names are the daemon's, not the
 // plugin's.  The generated tree is a build artifact (gitignored) owned by
 // build-native-payload.mjs --variant debug.

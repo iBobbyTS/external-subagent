@@ -1,6 +1,5 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { LAUNCH_AGENT_LABEL, NATIVE_DIR_NAME } from '../constants.mjs';
 import { CliError } from '../errors.mjs';
 import { platform } from '../paths.mjs';
@@ -47,12 +46,6 @@ import { SYSTEMD_UNIT_NAME, bootstrapService, bootoutService, installServiceDefi
 // lets `init --resume` continue after environmental failures.  Journals from
 // pre-D1 inits may still list the retired codex steps; unknown completed ids
 // are simply never consulted again.
-const HOOK_INSTALLER = ['plugins', 'codex', 'external-subagent', 'scripts', 'install-agent-hooks.mjs'];
-
-function hookInstallerPath() {
-  return path.join(packageRoot(), ...HOOK_INSTALLER);
-}
-
 export function installPlan(paths, options = {}) {
   // The plan reports the payload the verifier will read.  When the running
   // tuple has a supported payload this is the resolved manifest path; on an
@@ -70,20 +63,7 @@ export function installPlan(paths, options = {}) {
     { id: 'start-service', action: darwin ? 'bootstrap the daemon service' : 'enable and start the daemon service', path: paths.launchAgent, ...(darwin ? { label: LAUNCH_AGENT_LABEL } : { unit: SYSTEMD_UNIT_NAME }) },
     { id: 'publish-active-payload', action: 'publish the verified active payload and retained-byte baseline', path: paths.state },
   ];
-  if (options.installHooks) plan.splice(plan.findIndex((step) => step.id === 'publish-active-payload'), 0, { id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance });
   return plan;
-}
-
-export function installHooks(paths, options = {}) {
-  if (options.dryRun) return { dry_run: true, plan: [{ id: 'install-hooks', action: 'install ZCode policy hooks', path: paths.zcodeConfig, provenance: paths.hookProvenance }] };
-  const result = spawnSync(process.execPath, [hookInstallerPath(), '--config', paths.zcodeConfig, '--provenance', paths.hookProvenance], { encoding: 'utf8' });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    let failure;
-    try { failure = JSON.parse((result.stderr || '').trim()); } catch { /* plain-text failure */ }
-    throw new CliError(failure?.code || 'HOOK_INSTALL_FAILED', failure?.error || (result.stderr || 'hook installation failed').trim());
-  }
-  try { return JSON.parse(result.stdout); } catch { throw new CliError('HOOK_INSTALL_FAILED', 'hook installer returned invalid JSON'); }
 }
 
 export function runInit(options = {}) {
@@ -108,8 +88,6 @@ export function runInit(options = {}) {
   // so there is nothing to snapshot or roll back there; the SCM registration
   // is created by the start-service step instead.
   const tracked = {
-    zcodeConfig: { file: paths.zcodeConfig, snapshot: snapshotFile(paths.zcodeConfig) },
-    hookProvenance: { file: paths.hookProvenance, snapshot: snapshotFile(paths.hookProvenance) },
     state: { file: paths.state, snapshot: snapshotFile(paths.state) },
     config: { file: paths.config, snapshot: snapshotFile(paths.config) },
     ...(paths.launchAgent ? { launchAgent: { file: paths.launchAgent, snapshot: snapshotFile(paths.launchAgent) } } : {}),
@@ -182,10 +160,6 @@ export function runInit(options = {}) {
       service = bootstrapService(paths, currentUid(), serviceOptions());
       serviceLoadedByThisRun = !service.skipped && !service.already_loaded;
       mark('start-service');
-    }
-    if (options.installHooks && !completed.has('install-hooks')) {
-      installHooks(paths);
-      mark('install-hooks');
     }
     // The baseline publication runs LAST and only for an init that verified
     // the payload it installed (a skipped probe — test harnesses only —

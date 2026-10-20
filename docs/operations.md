@@ -63,8 +63,7 @@ A plain npm install only stages the package and its native payload:
 Every state-changing action belongs to an explicit `init`:
 
 ```
-external-subagent init [--dry-run] [--resume] [--install-hooks]
-    [--skip-service-start]
+external-subagent init [--dry-run] [--resume] [--skip-service-start]
 ```
 
 `init` installs the standalone daemon service only. Its steps, in order:

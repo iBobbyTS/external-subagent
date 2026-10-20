@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { BUSINESS_COMMANDS, PRODUCT_NAME, VERSION, zcodeRuntimePath } from './constants.mjs';
 import { CliError } from './errors.mjs';
-import { installHooks, installPlan, runInit } from './install/init.mjs';
+import { installPlan, runInit } from './install/init.mjs';
 import { nativeBinary } from './install/layout.mjs';
 import { purge, restoreData, backupData, uninstall } from './commands/maintenance.mjs';
 import { updateCommand } from './commands/update.mjs';
@@ -23,7 +23,7 @@ import { parseProfileArgs, parseSpawnArgs, prepareSpawnInput, profileCommand } f
 // resolved or written.
 const SUPPORTED_PLATFORMS = new Set(['darwin', 'linux', 'win32']);
 
-const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--install-hooks] [--skip-service-start]\n                             Install the standalone daemon service only; bind a\n                             host afterwards with install-plugin or install-mcp\n  hooks install [--dry-run]  Install ZCode policy hooks explicitly\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon service\n  profile list | profile show <name>\n                             Inspect global spawn profiles (profiles/*.json);\n                             invalid files are reported as path-based warnings,\n                             and warned or duplicate files are excluded from the\n                             available name set\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n`;
+const HELP = `external-subagent ${VERSION}\n\nUsage: external-subagent <command> [options]\n\nCommands:\n  help, version               Show basic product information\n  init [--dry-run] [--resume] [--skip-service-start]\n                             Install the standalone daemon service only; bind a\n                             host afterwards with install-plugin or install-mcp\n  install-plugin [codex|zcode] [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the managed host plugin (MCP + skill);\n                             the host defaults to codex, --codex-home is codex-only\n  install-mcp [--dry-run|--uninstall] [--codex-home <path>]\n                             Install or remove the direct Codex MCP TOML binding\n  status, diagnose            Inspect local service and runtime state\n  start, stop                 Bootstrap or boot out the daemon service\n  profile list | profile show <name>\n                             Inspect global spawn profiles (profiles/*.json);\n                             invalid files are reported as path-based warnings,\n                             and warned or duplicate files are excluded from the\n                             available name set\n  backup --output <dir>       Back up retained product data\n  restore --input <dir>       Verify and restore product data\n  uninstall                   Release Codex/ZCode bindings; remove service registration; retain data\n  purge --yes                 Explicitly delete new product data\n`;
 const DAEMON_HELP = `  config get [key] | config set <key> <value>\n  subagents list | subagents status [subagent] | subagents probe/models [subagent]\n  create/spawn [--profile <name>], wait, list, send, respond, cancel, result, close, observe\n                             Daemon calls accept --json '<object>' or JSON stdin\n                             list JSON requires repository (workspace is an alias)\n                             observe JSON requires only agent_id\n`;
 
 function structuredInput(args, parser) {
@@ -355,7 +355,7 @@ export async function main(args) {
     // no Codex host, and a host home is chosen by the explicit install
     // commands instead.
     const flags = args.slice(1);
-    const known = ['--dry-run', '--resume', '--install-hooks', '--skip-service-start'];
+    const known = ['--dry-run', '--resume', '--skip-service-start'];
     for (let index = 0; index < flags.length; index += 1) {
       if (!known.includes(flags[index])) {
         if (flags[index] === '--skip-runtime-probe' || flags[index] === '--skip-codex-plugin' || flags[index] === '--codex-home') {
@@ -368,14 +368,9 @@ export async function main(args) {
       paths,
       dryRun: flags.includes('--dry-run'),
       resume: flags.includes('--resume'),
-      installHooks: flags.includes('--install-hooks'),
       skipServiceStart: flags.includes('--skip-service-start'),
     }));
     return;
-  }
-  if (command === 'hooks') {
-    if (args[1] !== 'install') throw new CliError('INVALID_ARGUMENT', 'usage: hooks install [--dry-run]', 2);
-    output(installHooks(paths, { dryRun: args.includes('--dry-run') })); return;
   }
   if (command === 'install-plugin') {
     output(pluginCommand(paths, args.slice(1))); return;
