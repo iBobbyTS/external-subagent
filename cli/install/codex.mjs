@@ -176,7 +176,7 @@ function verifyCodexCache(add, { codexHome, staging, marketplaceName }) {
     // plugin tree with no host-generated additions inside it (see
     // docs/compatibility/codex.md), so the staged file set IS the managed
     // set; any difference fails closed through the existing error chain
-    // (S01 keeps staging/marketplace recoverable) instead of reporting
+    // (staging/marketplace stay recoverable) instead of reporting
     // cache_verified for stale bytes.
     const stagedMcp = readCacheJson(path.join(staging, '.mcp.json'), staging, identity);
     const cacheMcp = readCacheJson(path.join(cache, '.mcp.json'), cache, identity);

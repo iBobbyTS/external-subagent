@@ -162,7 +162,7 @@ const PERSISTABLE_MESSAGE_BYTES: usize = 512;
 const PERSISTABLE_EVIDENCE_BYTES: usize = 192;
 
 /// Per-field string budgets for one serialized persistable record. The default
-/// set is the S01 production contract; [`shrink_persistable_record`] scales it
+/// set is the production contract; [`shrink_persistable_record`] scales it
 /// down to fit a smaller consumer envelope.
 #[derive(Clone, Copy)]
 struct PersistableBudgets {
@@ -344,7 +344,7 @@ pub(crate) fn shrink_persistable_record(record: &str, max_bytes: usize) -> Optio
 
     // The encoded length is monotone in the suffix size, so the smallest
     // feasible cut is the maximal feasible suffix. A cut also marks the tail
-    // truncated, like the S01 path.
+    // truncated, like the production path.
     let mut boundaries: Vec<usize> = original_tail.char_indices().map(|(index, _)| index).collect();
     boundaries.push(original_tail.len());
     let feasible = |index: usize| {

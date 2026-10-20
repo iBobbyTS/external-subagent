@@ -2,7 +2,7 @@
 //!
 //! Frames are carried by the shared runtime driver in JSON-RPC 2.0 codec
 //! mode; this module owns the DSH method names, request params, and strict
-//! response projections with the same bounds the S03 catalog probe pinned
+//! response projections with the same bounds the catalog probe pinned
 //! (session ids and model tokens are opaque, non-empty, NUL-free, and at most
 //! 512 bytes).
 
@@ -20,7 +20,7 @@ pub const SESSION_REQUEST_PERMISSION: &str = "session/request_permission";
 pub const SESSION_REQUEST_INPUT: &str = "session/request_input";
 pub const MODELS_LIST: &str = "models/list";
 
-/// DSH ACP advertises exactly one protocol version (S01-pinned).
+/// DSH ACP advertises exactly one protocol version (pinned).
 pub const ACP_PROTOCOL_VERSION: i64 = 1;
 pub const ACP_CLIENT_NAME: &str = "external-subagent-dsh";
 
@@ -154,7 +154,7 @@ pub fn parse_initialize_result(result: &Value) -> Result<InitializeResult, Shape
 }
 
 /// The build composition requires respondable permissions and cancellation.
-/// A server that does not advertise them cannot host S04.A build tasks.
+/// A server that does not advertise them cannot host build tasks.
 pub fn require_build_capabilities(capabilities: &AcpCapabilities) -> Result<(), ShapeError> {
     if !capabilities.permission {
         return Err(ShapeError(

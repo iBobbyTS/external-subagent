@@ -173,7 +173,7 @@ export function bootoutLaunchdService(paths, uid = process.getuid(), options = {
   }
 }
 
-// Platform dispatch (S03): the service backend is selected by the process
+// Platform dispatch: the service backend is selected by the process
 // platform — launchd on macOS, the systemd user manager on Linux — behind the
 // same call surface every caller (init, start/stop, uninstall, status) already
 // uses.  The macOS arms below are the verbatim launchd implementations; the

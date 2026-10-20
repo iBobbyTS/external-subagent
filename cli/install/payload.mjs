@@ -115,7 +115,7 @@ export function verifyPayload(options = {}) {
   if (!PAYLOAD_PLATFORMS.includes(platform)) {
     // The default resolver (nativePlatform) only produces the release tuples;
     // win32-x64 is a controlled artifact reachable through an explicit option
-    // until S04 opens NATIVE_PLATFORMS.  The message must not claim the
+    // until the NATIVE_PLATFORMS gate opens.  The message must not claim the
     // rejected host tuple is available by default.
     const supported = explicitPlatform ? PAYLOAD_PLATFORMS : NATIVE_PLATFORMS;
     throw new CliError('UNSUPPORTED_PAYLOAD_PLATFORM', `no native payload exists for ${platform ?? `${process.platform}-${process.arch}`}; supported platforms: ${supported.join(', ')}`);

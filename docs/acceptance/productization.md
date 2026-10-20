@@ -1,6 +1,6 @@
 # Productization acceptance — dual-upstream CLI + real Codex CLI→MCP matrix
 
-Feature `external-subagent-productization-closeout-20260913`, section S04
+Feature `external-subagent-productization-closeout-20260913`, section productization closeout
 (2026-09-13). Two candidate generations are recorded, each proven by its own
 consumer run through the public install/init surface with real upstream model
 tasks: **C1 (plugin cache identity `0.1.1`)** — the matrix below is kept as
@@ -14,7 +14,7 @@ output.
 
 ## Candidate identity
 
-- Base commit: `9017aa011ce67d5f77c22380975c4d37aaa88f48` (S03 integrated).
+- Base commit: `9017aa011ce67d5f77c22380975c4d37aaa88f48` (service-backend stage integrated).
 - C0 tarball (pre-fix, HEAD `9017aa0`): `external-subagent-0.1.0.tgz`,
   sha256 `54d35381f754860cb5d8e18a0fe41ccdefe2bcf058ebb08037863d193f5d7ac6`
   (54 files, static checks passed).
@@ -90,10 +90,10 @@ artifact.
 
 | # | Route | Task ID | Terminal outcome | Final marker | resources_reaped | closed | Exit codes |
 |---|---|---|---|---|---|---|---|
-| 1 | DSH, public ES CLI (`spawn/wait/result/close`) | `10000000` | `COMPLETED` | `S04_CLI_DSH_OK` | true | true | 0 / 0 / 0 / 0 |
-| 2 | ZCode, public ES CLI | `10000001` | `COMPLETED` | `S04_CLI_ZCODE_OK` | true | true | 0 / 0 / 0 / 0 |
-| 3 | DSH, real Codex CLI → managed plugin → MCP | `10000003` | `COMPLETED` | `S04_MCP_DSH_OK` | true | true | codex exec 0 |
-| 4 | ZCode, real Codex CLI → managed plugin → MCP | `10000004` | `COMPLETED` | `S04_MCP_ZCODE_OK` | true | true | codex exec 0 |
+| 1 | DSH, public ES CLI (`spawn/wait/result/close`) | `10000000` | `COMPLETED` | `CLI_DSH_OK` | true | true | 0 / 0 / 0 / 0 |
+| 2 | ZCode, public ES CLI | `10000001` | `COMPLETED` | `CLI_ZCODE_OK` | true | true | 0 / 0 / 0 / 0 |
+| 3 | DSH, real Codex CLI → managed plugin → MCP | `10000003` | `COMPLETED` | `MCP_DSH_OK` | true | true | codex exec 0 |
+| 4 | ZCode, real Codex CLI → managed plugin → MCP | `10000004` | `COMPLETED` | `MCP_ZCODE_OK` | true | true | codex exec 0 |
 
 Cells 3–4 were separate fresh `codex exec --ephemeral --json` processes whose
 recorded JSONL shows real `mcp_tool_call` items against server
@@ -106,19 +106,18 @@ pick up the managed plugin (`0.1.1`, enabled).
 
 Evidence provenance: the per-cell artifacts backing this matrix (spawn/wait/
 result/close JSON, Codex `--json` JSONL, probe/plugin/stop/uninstall
-records, C1 tarball) currently reside in the S04 run root
-`/tmp/es-s04-candidate/` (raw, identity-level redaction only; `/tmp` is
+records, C1 tarball) currently reside in the productization run root (raw, identity-level redaction only; `/tmp` is
 ephemeral — this document is the durable sanitized record). Terminal
 outcomes, final markers, reaped, and closed flags above are read directly
 from those saved artifacts; the numeric exit-code column (`0 / 0 / 0 / 0`,
-`codex exec 0`) is the S04 session runner's report — the per-cell numeric
+`codex exec 0`) is the productization session runner's report — the per-cell numeric
 codes were not separately persisted, and the saved terminal proof for cells
 3–4 is the `turn.completed` JSONL records with real token usage and no error
 events.
 
 Same-candidate consumer re-check, two records:
 
-- **S04 session (2026-09-13 ~20:0x, session prefix since removed)**:
+- **Productization session (2026-09-13 ~20:0x, session prefix since removed)**:
   `EXTERNAL_SUBAGENT_LIVE_PREFIX=<prefix> node --test
   tests/integration/double-provider.test.mjs` → 3/3 pass as reported by the
   session (dsh hi READY, models=3, build COMPLETED/reaped, strict-plan
@@ -148,7 +147,7 @@ Same-candidate consumer re-check, two records:
 plugin identity `0.1.2`). Run type: fresh consumer verification through the
 public install/init surface only — no tracked file, `.agent-work/`, legacy
 ZAS, or real `~/.codex` was modified. The run root was `/tmp/es-c2/`
-(ephemeral); `outputs/s04-c2-evidence/` is the durable sanitized copy, and
+(ephemeral); the durable sanitized C2 evidence copy is retained, and
 every fact below is read from those artifacts. The C1 matrix above stays
 C1's evidence — rewriting its rows to `0.1.2` would be evidence
 falsification; C2 was proven by this run of its own.
@@ -191,10 +190,10 @@ falsification; C2 was proven by this run of its own.
 
 | # | Route | Task ID | Terminal outcome | Final marker | resources_reaped | closed | Exit codes |
 |---|---|---|---|---|---|---|---|
-| 1 | DSH, public ES CLI (`spawn/wait/result/close`) | `10000000` | `COMPLETED` | `S04_C2_CLI_DSH_OK` | true | true | 0 / 0 / 0 / 0 |
-| 2 | ZCode, public ES CLI | `10000001` | `COMPLETED` | `S04_C2_CLI_ZCODE_OK` | true | true | 0 / 0 / 0 / 0 |
-| 3 | DSH, real Codex CLI → managed plugin → MCP | `10000003` | `COMPLETED` | `S04_C2_MCP_DSH_OK` | true | true | codex exec 0 |
-| 4 | ZCode, real Codex CLI → managed plugin → MCP | `10000004` | `COMPLETED` | `S04_C2_MCP_ZCODE_OK` | true | true | codex exec 0 |
+| 1 | DSH, public ES CLI (`spawn/wait/result/close`) | `10000000` | `COMPLETED` | `C2_CLI_DSH_OK` | true | true | 0 / 0 / 0 / 0 |
+| 2 | ZCode, public ES CLI | `10000001` | `COMPLETED` | `C2_CLI_ZCODE_OK` | true | true | 0 / 0 / 0 / 0 |
+| 3 | DSH, real Codex CLI → managed plugin → MCP | `10000003` | `COMPLETED` | `C2_MCP_DSH_OK` | true | true | codex exec 0 |
+| 4 | ZCode, real Codex CLI → managed plugin → MCP | `10000004` | `COMPLETED` | `C2_MCP_ZCODE_OK` | true | true | codex exec 0 |
 
 - Cells 1–2 artifacts: `cell1-dsh-{spawn,wait,result,close}.json`,
   `cell2-zcode-{spawn,wait,result,close}.json` (public CLI JSON; markers read
@@ -246,7 +245,7 @@ files.
   from a machine-global store keyed by `plugin@marketplace@version`. With the
   real `~/.codex` already caching `external-subagent@personal@0.1.0`, an
   isolated home binding the *same* identity receives the real installation's
-  bytes (observed live in S03 testing). The managed plugin therefore carries
+  bytes (observed live in service-backend testing). The managed plugin therefore carries
   a distinct release identity per candidate (`0.1.1` for C1; `0.1.2` for C2,
   because the C1 runs themselves put `0.1.1` bytes into the machine-global
   store — and the C2 runs have now burned `0.1.2` the same way, so any later

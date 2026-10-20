@@ -935,7 +935,7 @@ mod agent_probe_tests {
         }
 
         fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
-            // S03 catalog fixture: the RPC result must carry the projected
+            // Catalog fixture: the RPC result must carry the projected
             // token list and the create-settings provenance unchanged.
             let supported = input.agent == "zcode";
             AgentModelsOutput {
@@ -1414,7 +1414,7 @@ mod observe_gate_tests {
         std::fs::create_dir_all(&root).unwrap();
         for adapter in ["zcode", "dsh", "codex"] {
             let directory = tempfile::Builder::new()
-                .prefix("s07-active-")
+                .prefix("active-")
                 .tempdir_in(&root)
                 .unwrap();
             let (service, task) = service_with_pinned_source(directory.path(), adapter);
@@ -1473,7 +1473,7 @@ mod observe_gate_tests {
         std::fs::create_dir_all(&root).unwrap();
         for adapter in ["zcode", "dsh", "codex"] {
             let directory = tempfile::Builder::new()
-                .prefix("s07-observe-")
+                .prefix("observe-")
                 .tempdir_in(&root)
                 .unwrap();
             let (service, task) = service_with_pinned_source(directory.path(), adapter);
@@ -1502,7 +1502,7 @@ mod observe_gate_tests {
     }
 
     #[cfg(test)]
-    mod s01_profile_acceptance_tests {
+    mod profile_acceptance_tests {
         use super::*;
         use crate::rpc::agents::admission_fixtures::{admission_root, config_env_guard, ConfigEnvScope};
         use crate::rpc::profiles::{load_profile, load_profiles_from_dir, parse_profile_json};
@@ -1531,7 +1531,7 @@ mod observe_gate_tests {
 
         fn setup_environment() -> TestEnvironment {
             let guard = config_env_guard();
-            let config_dir = admission_root("s01-test-config-");
+            let config_dir = admission_root("test-config-");
             let profiles_dir = config_dir.path().join("profiles");
             fs::create_dir_all(&profiles_dir).unwrap();
             let codex_home = config_dir.path().join("codex-home");
@@ -1589,11 +1589,11 @@ mod observe_gate_tests {
             fs::write(&config_path, serde_json::to_vec(&config_json).unwrap()).unwrap();
             let scope = ConfigEnvScope::install(&config_path);
 
-            let workspace_dir = admission_root("s01-test-workspace-");
+            let workspace_dir = admission_root("test-workspace-");
             let store = Arc::new(Store::open(workspace_dir.path().join("state.sqlite")).unwrap());
             let factory = Arc::new(crate::rpc::wait::wait_tests::FakeRunnableFactory);
             let scheduler = Scheduler::new(
-                "s01-test",
+                "profile-acceptance-test",
                 Arc::clone(&store),
                 factory,
                 SchedulerConfig::default(),
@@ -1613,7 +1613,7 @@ mod observe_gate_tests {
         }
 
         fn test_manifest(_workspace: &Path, prompt: &str) -> GeneralTaskManifest {
-            let ws = admission_root("s01-ws-");
+            let ws = admission_root("ws-");
             let path = ws.path().canonicalize().unwrap();
             std::mem::forget(ws);
             GeneralTaskManifest {

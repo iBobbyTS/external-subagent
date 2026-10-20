@@ -12,7 +12,7 @@ const patchIndex = process.argv.indexOf('--patch');
 const patch = patchIndex < 0 ? undefined : process.argv[patchIndex + 1];
 const patchText = typeof patch === 'string' && fs.existsSync(patch) ? fs.readFileSync(patch, 'utf8') : null;
 const mode = process.env.DSH_PERMISSION_MODE;
-const fixture = process.env.S05_DSH_SPAWN_FIXTURE === '1';
+const fixture = process.env.DSH_SPAWN_FIXTURE === '1';
 const dumpConfig = process.argv.includes('--dump-config');
 // Legacy build spawn: the fixture-managed spawn with no patch.
 const ordinarySpawn = fixture && mode === 'workspace-write' && typeof patch !== 'string';
@@ -87,7 +87,7 @@ if (dumpConfig) {
     process.exit(0);
   }
   if (manifestSpawn) {
-    // Full manifest-build dump, aligned with S02 `validate_manifest_build_dump`:
+    // Full manifest-build dump, aligned with `validate_manifest_build_dump`:
     // the guard insert (its name normalized to a `file://` URL) carries the
     // caller manifest verbatim, tool-fs stays enabled, every other strict-plan
     // tool stays disabled, and the sandbox/approval/permission controls match

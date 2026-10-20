@@ -17,7 +17,7 @@ use crate::{task_route, LifecycleSink, ManagedRuntime, RuntimeFactory};
 /// Whether the DSH factory may spawn adapter processes at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DshSpawnGate {
-    /// S04.A production state: the adapter exists but spawn is refused.
+    /// Production state: the adapter exists but spawn is refused.
     Closed,
     /// Production launch after the managed strict-plan preflight succeeds.
     Enabled,
@@ -79,7 +79,7 @@ fn is_workspace_root_manifest(manifest: &[PathBuf]) -> bool {
 }
 
 /// Derive the installed `@deepseek-ai/dsh-fs` package directory from the dsh
-/// runtime path (S03 pinned algorithm). The runtime path is canonicalized,
+/// runtime path (pinned algorithm). The runtime path is canonicalized,
 /// then its containing directory and every ancestor is checked for a
 /// `package.json` whose `name` is exactly `@deepseek-ai/dsh`; the nested
 /// `node_modules/@deepseek-ai/dsh-fs` package is joined and its own
@@ -140,7 +140,7 @@ struct WriteGuardTree {
 }
 
 /// Materialize the byte-exact `dsh-write-guard` package (plus its nested
-/// `@deepseek-ai/dsh-fs` symlink) and the S02 patch inside a fresh
+/// `@deepseek-ai/dsh-fs` symlink) and the managed patch inside a fresh
 /// `external-dsh-manifest-` TempDir. Pure filesystem work, so the derivation
 /// and byte-equality tests can exercise it without a runtime that answers
 /// `--dump-config`.
@@ -216,7 +216,7 @@ struct ManifestBuild {
     command: std::process::Command,
 }
 
-/// Materialize one manifest-build composition, run the S02 preflight against
+/// Materialize one manifest-build composition, run the manifest-build preflight against
 /// the generated patch, and resolve the ACP command. Shared by the production
 /// `Enabled` gate and the test-only `TestHarness` gate so the derivation,
 /// byte-exact plugin files, symlink and patch cannot drift between them.
@@ -318,7 +318,7 @@ impl RuntimeFactory for DshRuntimeFactory {
                     )?))
                 } else if is_workspace_root_manifest(&prepared.write_manifest) {
                     // Legacy build: no patch, `preflight_build`, byte-identical
-                    // to the pre-S03 composition.
+                    // to the legacy composition.
                     let mut launch = external_agent_dsh::profile::DshLaunch::new(
                         Some(executable),
                         prepared.workspace.path.clone(),

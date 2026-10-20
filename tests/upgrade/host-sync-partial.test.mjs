@@ -97,7 +97,7 @@ function lockedHome(root) {
 // ZCODE_SYNC_PARTIAL, and the verified activation — payload AND service —
 // preserved rather than rolled back.
 test('zcode config failure after healthy activation keeps the payload active and reports partial (AUD-003)', { skip: !darwinArm64 }, async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-zcode-config-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-config-'));
   const paths = productPaths(home);
   const candidate = makeCandidate('2.0.0');
   const activations = [];
@@ -106,7 +106,7 @@ test('zcode config failure after healthy activation keeps the payload active and
     breakZcodeConfig(paths);
     await assert.rejects(
       updateCommand(paths, ['--version=2.0.0'], {
-        callDaemon: rpc('s03-config-1'),
+        callDaemon: rpc('config-1'),
         hasInstalledService: () => true,
         activateService: async (_target, serviceCandidate) => { activations.push(serviceCandidate); return { pid: 4242, service_generation: 3 }; },
         ...realUpdaterFor(candidate, '2.0.0'),
@@ -118,7 +118,7 @@ test('zcode config failure after healthy activation keeps the payload active and
     const receipt = receiptOf(paths);
     assert.equal(receipt.status, 'partial');
     assert.equal(receipt.retryable, true);
-    assert.equal(receipt.claim, 's03-config-1');
+    assert.equal(receipt.claim, 'config-1');
     assert.equal(receipt.version, '2.0.0');
     assert.equal(receipt.zcode.status, 'failed');
     assert.equal(receipt.zcode.error.code, 'ZCODE_CONFIG_INVALID');
@@ -141,7 +141,7 @@ test('zcode config failure after healthy activation keeps the payload active and
 // itself fails (a foreign-owned staged MCP binding conflicts).  Runs on every
 // platform: the host outcome is real, the updater is the repo's stub idiom.
 test('zcode refresh failure after healthy activation is partial, never success (AUD-003)', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-zcode-refresh-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-refresh-'));
   const paths = productPaths(home);
   try {
     installZcodePlugin(paths);
@@ -153,7 +153,7 @@ test('zcode refresh failure after healthy activation is partial, never success (
     const activations = [];
     await assert.rejects(
       updateCommand(paths, ['--version=0.1.0'], {
-        callDaemon: rpc('s03-refresh-1'),
+        callDaemon: rpc('refresh-1'),
         hasInstalledService: () => true,
         activateService: async () => { activations.push(1); return { pid: 7, service_generation: 1 }; },
         ...stubUpdater(home),
@@ -175,7 +175,7 @@ test('zcode refresh failure after healthy activation is partial, never success (
 // Scenario 3: both hosts implicated — a skipped Codex home plus a failed
 // ZCode config.  One reducer, one receipt, one caller error, both details.
 test('mixed host failures reduce to one partial receipt naming every host (AUD-003)', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-mixed-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'mixed-'));
   const paths = productPaths(home);
   const locked = lockedHome(home);
   try {
@@ -185,7 +185,7 @@ test('mixed host failures reduce to one partial receipt naming every host (AUD-0
     const activations = [];
     await assert.rejects(
       updateCommand(paths, ['--version=0.1.0'], {
-        callDaemon: rpc('s03-mixed-1'),
+        callDaemon: rpc('mixed-1'),
         hasInstalledService: () => true,
         activateService: async () => { activations.push(1); return { pid: 9, service_generation: 1 }; },
         ...stubUpdater(home),
@@ -212,11 +212,11 @@ test('mixed host failures reduce to one partial receipt naming every host (AUD-0
 // Scenario 4: no binding at all.  An unbound host is never touched and never
 // fails: the caller resolves and the receipt keeps the exact success shape.
 test('no host binding stays a clean success with the unchanged receipt shape', async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-absent-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'absent-'));
   const paths = productPaths(home);
   try {
     const result = await updateCommand(paths, ['--version=0.1.0'], {
-      callDaemon: rpc('s03-absent-1'),
+      callDaemon: rpc('absent-1'),
       hasInstalledService: () => true,
       activateService: async () => ({ pid: 11, service_generation: 1 }),
       ...stubUpdater(home),
@@ -237,7 +237,7 @@ test('no host binding stays a clean success with the unchanged receipt shape', a
 // on.  The payload activates for real; the zcode failure must not bury the
 // run as success, and the freshly published active must survive.
 test('a service-less update reports the failed zcode binding as partial and keeps the new active (AUD-003)', { skip: !darwinArm64 }, async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-no-service-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'no-service-'));
   const paths = productPaths(home);
   const candidate = makeCandidate('2.0.0');
   try {
@@ -245,7 +245,7 @@ test('a service-less update reports the failed zcode binding as partial and keep
     breakZcodeConfig(paths);
     await assert.rejects(
       updateCommand(paths, ['--version=2.0.0'], {
-        callDaemon: rpc('s03-nosvc-1'),
+        callDaemon: rpc('nosvc-1'),
         hasInstalledService: () => false,
         ...realUpdaterFor(candidate, '2.0.0'),
       }),
@@ -269,7 +269,7 @@ test('a service-less update reports the failed zcode binding as partial and keep
 // version drift).  This path never ran the old partial-homes reducer at all,
 // so a failed host integration used to persist a success receipt.
 test('pure reconcile reduces host failures truthfully instead of writing success (AUD-003)', { skip: !darwinArm64 }, async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-pure-rec-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pure-rec-'));
   const paths = productPaths(home);
   const candidate = makeCandidate(packageVersion());
   try {
@@ -277,13 +277,13 @@ test('pure reconcile reduces host failures truthfully instead of writing success
     installZcodePlugin(paths);
     breakZcodeConfig(paths);
     await assert.rejects(
-      updateCommand(paths, ['reconcile'], { callDaemon: rpc('s03-rec-1') }),
+      updateCommand(paths, ['reconcile'], { callDaemon: rpc('rec-1') }),
       (error) => error.code === 'ZCODE_SYNC_PARTIAL' && /ZCODE_CONFIG_INVALID/.test(error.message),
     );
     const receipt = receiptOf(paths);
     assert.equal(receipt.status, 'partial');
     assert.equal(receipt.retryable, true);
-    assert.equal(receipt.claim, 's03-rec-1');
+    assert.equal(receipt.claim, 'rec-1');
     assert.equal(receipt.zcode.status, 'failed');
     assert.equal(stateOf(paths).active.version, packageVersion(), 'the published active is untouched');
   } finally {
@@ -296,7 +296,7 @@ test('pure reconcile reduces host failures truthfully instead of writing success
 // here) zcode binding — the codex-only half of the same latent pure-reconcile
 // gap, keeping the existing CODEX_SYNC_PARTIAL signal.
 test('pure reconcile reports a skipped codex home as partial, not success (AUD-003)', { skip: !darwinArm64 }, async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-pure-homes-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pure-homes-'));
   const paths = productPaths(home);
   const candidate = makeCandidate(packageVersion());
   const locked = lockedHome(home);
@@ -304,7 +304,7 @@ test('pure reconcile reports a skipped codex home as partial, not success (AUD-0
     updateInstallation(paths, upgradeOptions(candidate, packageVersion()));
     registerCodexHome(paths, locked);
     await assert.rejects(
-      updateCommand(paths, ['reconcile'], { callDaemon: rpc('s03-rec-2') }),
+      updateCommand(paths, ['reconcile'], { callDaemon: rpc('rec-2') }),
       (error) => error.code === 'CODEX_SYNC_PARTIAL'
         && error.message.includes(fs.realpathSync(locked)) && error.message.includes('skipped_not_writable'),
     );
@@ -325,7 +325,7 @@ test('pure reconcile reports a skipped codex home as partial, not success (AUD-0
 // once the host is repaired, the SAME public command succeeds, overwrites the
 // partial receipt with a success one, and resolves for the caller.
 test('a healthy retry after a partial failure clears the retryable receipt (AUD-003)', { skip: !darwinArm64 }, async () => {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 's03-retry-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'retry-'));
   const paths = productPaths(home);
   const candidate = makeCandidate(packageVersion());
   try {
@@ -333,20 +333,20 @@ test('a healthy retry after a partial failure clears the retryable receipt (AUD-
     installZcodePlugin(paths);
     breakZcodeConfig(paths);
     await assert.rejects(
-      updateCommand(paths, ['reconcile'], { callDaemon: rpc('s03-retry-1') }),
+      updateCommand(paths, ['reconcile'], { callDaemon: rpc('retry-1') }),
       (error) => error.code === 'ZCODE_SYNC_PARTIAL',
     );
     assert.equal(receiptOf(paths).status, 'partial');
 
     // Repair the host: a valid config pointing at the staged binding again.
     fs.writeFileSync(paths.zcodeConfig, `${JSON.stringify({ plugins: { dirs: [path.resolve(paths.zcodePlugin)] } }, null, 2)}\n`);
-    const result = await updateCommand(paths, ['reconcile'], { callDaemon: rpc('s03-retry-2') });
+    const result = await updateCommand(paths, ['reconcile'], { callDaemon: rpc('retry-2') });
     assert.equal(result.phase, 'active');
     assert.equal(result.zcode.bound, true);
     assert.equal(result.zcode.status, 'updated');
     const receipt = receiptOf(paths);
     assert.equal(receipt.status, 'success', 'the successful retry overwrites the partial receipt');
-    assert.equal(receipt.claim, 's03-retry-2');
+    assert.equal(receipt.claim, 'retry-2');
     assert.deepEqual(Object.keys(receipt).sort(), ['claim', 'result', 'status', 'version']);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });

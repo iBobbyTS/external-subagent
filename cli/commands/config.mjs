@@ -96,7 +96,7 @@ export function parseConfigArgs(args) {
 // regenerates the service definition from the new config.  Only the file is
 // rewritten — launchd picks the environment up at its next load, so a running
 // daemon is never restarted or disturbed here.  The launchd plist is macOS
-// only; the Linux systemd unit is re-rendered by the S03 service backend, so a
+// only; the Linux systemd unit is re-rendered by the service backend, so a
 // Linux config write refreshes nothing yet instead of writing a plist to the
 // unit path.
 function refreshServiceDefinition(paths) {

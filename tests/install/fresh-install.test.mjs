@@ -1,4 +1,4 @@
-// S05 fresh npm install acceptance: the packed artifact installs into a
+// Fresh npm install acceptance: the packed artifact installs into a
 // throwaway npm prefix, a plain install only stages the package and payload
 // (no daemon, no Codex writes, no provider probes), and an explicit `init`
 // installs the STANDALONE SERVICE ONLY (AUD-005 decision D1): no ZCode
@@ -30,10 +30,10 @@ import { productPaths } from '../../cli/paths.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 const testable = process.platform === 'darwin' && process.arch === 'arm64';
-// The staged payload directory is the host tuple (S01); the acceptance fixture
+// The staged payload directory is the host tuple; the acceptance fixture
 // is macOS-arm64-gated today, so this resolves to `darwin-arm64` on the gate
 // and stays correct if the gate ever widens to Linux (the service assertions
-// below remain macOS-specific until the S03 systemd backend lands).
+// below remain macOS-specific until the systemd backend lands).
 const PAYLOAD_PLATFORM = nativePlatform() ?? `${process.platform}-${process.arch}`;
 const PAYLOAD_DIR = ['npm', 'native', PAYLOAD_PLATFORM];
 
@@ -473,7 +473,7 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     const reader = readline.createInterface({ input: facade.stdout });
     reader.on('line', (line) => replies.push(JSON.parse(line)));
     const send = (frame) => facade.stdin.write(`${JSON.stringify(frame)}\n`);
-    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 's05-install-check', version: '1' } } });
+    send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'install-check', version: '1' } } });
     await waitFor(() => replies.some((reply) => reply.id === 1), 'MCP initialize');
     send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     send({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
@@ -546,7 +546,7 @@ test('installed daemon admits a dsh write manifest through the guarded manifest-
     env: fixtureEnv(home, { env: {
       DSH_RUNTIME_PATH: runtime,
       DSH_HOME: providerHome,
-      S05_DSH_SPAWN_FIXTURE: '1',
+      DSH_SPAWN_FIXTURE: '1',
       EXTERNAL_SUBAGENT_CONFIG: configPath,
     } }),
     stdio: ['ignore', 'pipe', 'pipe'],

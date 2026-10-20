@@ -1,4 +1,4 @@
-// S05 managed Codex binding and the D08 global Codex-homes registry.
+// Managed Codex binding and the D08 global Codex-homes registry.
 //
 // The binding oracles pin the verified codex-cli interface (JSON shapes
 // verified on 0.153.4; add/marketplace paths re-verified on 0.154.0 —
@@ -252,12 +252,12 @@ test('foreign staging and drifted marketplace entries are rejected, not overwrit
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-// S03 upgrade regression: a codex home whose managed staging was written
+// Upgrade regression: a codex home whose managed staging was written
 // before the socket env rename (socket pinned under the retired key) must
 // reconcile through the public owner and end up carrying ONLY the current
 // key, in the staged tree and in the codex-materialized cache.  The legacy
 // literal is assembled by the module under test, never spelled here.
-test('an old-key managed staging upgrades through reconcile to the current key only (S03)', { skip: win32Shebang }, () => {
+test('an old-key managed staging upgrades through reconcile to the current key only', { skip: win32Shebang }, () => {
   const home = fixtureHome('external-subagent-legacy-key-');
   const fake = fakeCodexCli(home);
   const { paths, options } = binding(home, { cli: fake.cli });
@@ -456,7 +456,7 @@ test('a same-identity cache with changed managed content fails closed through th
       assert.ok(failure.message.includes(first.cache), 'the error shows the cache that was rejected');
 
       // The failed refresh restores the prior coherent staging/marketplace
-      // bytes (S01), and the codex-owned cache is left exactly as codex wrote
+      // bytes, and the codex-owned cache is left exactly as codex wrote
       // it — still carrying the stale content this product rejected.
       assert.deepEqual(snapshotTree(staging), treeBefore, `${negative.name}: the prior staging tree is restored`);
       assert.deepEqual(fs.readFileSync(marketplace), marketBefore, `${negative.name}: the marketplace keeps its exact prior bytes`);

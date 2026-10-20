@@ -4,7 +4,7 @@ Installation, service control, Codex binding, and removal for
 `external-subagent`. The supported baselines are macOS arm64 (launchd) and
 Linux x86_64 (Ubuntu, systemd user service); see
 [compatibility/codex.md](compatibility/codex.md) for the verified Codex CLI
-interface and [acceptance/S07.md](acceptance/S07.md) for the integration
+interface and [integration delivery acceptance](acceptance/integration-delivery-acceptance.md) for the integration
 verification matrix.
 
 ## Host and subagent instances
@@ -325,5 +325,5 @@ the Linux build or the CI artifact) as well as the locally built
 `darwin-arm64` payload. The controlled-prefix smoke
 (`test-installed-tarball.mjs`) asserts the macOS launchd service artifacts and
 is therefore a macOS-only check; the equivalent Linux install/init smoke is the
-S06 controlled-prefix `init` verification (systemd seam neutralized), recorded
+controlled-prefix `init` verification (systemd seam neutralized), recorded
 separately from this script.

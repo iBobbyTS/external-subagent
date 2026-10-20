@@ -643,7 +643,7 @@ mod tests {
     fn unique_pipe() -> PathBuf {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         PathBuf::from(format!(
-            r"\\.\pipe\external-subagent-s01-{}-{}",
+            r"\\.\pipe\external-subagent-transport-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ))
@@ -656,7 +656,7 @@ mod tests {
             panic!("transport fixture must never start a runtime")
         });
         let scheduler = Scheduler::new(
-            "s01-transport",
+            "transport",
             store.clone(),
             Arc::new(factory),
             SchedulerConfig::default(),
@@ -666,7 +666,7 @@ mod tests {
             RpcService::new_with_service_generation_and_evidence(
                 scheduler,
                 store,
-                "s01-transport".into(),
+                "transport".into(),
                 AgentEvidenceStore::unprobed(),
             )
             .unwrap(),
@@ -804,7 +804,7 @@ mod daemon_tests {
             panic!("daemon fixture must never start a runtime")
         });
         let scheduler = Scheduler::new(
-            "s01-daemon",
+            "daemon",
             store,
             Arc::new(factory),
             SchedulerConfig::default(),
@@ -812,7 +812,7 @@ mod daemon_tests {
         .unwrap();
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = PathBuf::from(format!(
-            r"\\.\pipe\external-subagent-s01-daemon-{}-{}",
+            r"\\.\pipe\external-subagent-daemon-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -844,7 +844,7 @@ mod daemon_tests {
         let directory = tempfile::tempdir().unwrap();
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let rpc_path = PathBuf::from(format!(
-            r"\\.\pipe\external-subagent-s01-mcp-squat-{}-{}",
+            r"\\.\pipe\external-subagent-mcp-squat-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -869,7 +869,7 @@ mod daemon_tests {
             panic!("mcp squat fixture must never start a runtime")
         });
         let scheduler = Scheduler::new(
-            "s01-mcp-squat",
+            "mcp-squat",
             store,
             Arc::new(factory),
             SchedulerConfig::default(),

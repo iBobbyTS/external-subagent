@@ -1976,7 +1976,7 @@ mod contract_default_tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("s01-mcp-blocking-")
+            .prefix("mcp-blocking-")
             .tempdir_in(root)
             .unwrap();
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());

@@ -1,6 +1,6 @@
 # Windows compatibility
 
-Live-verification evidence for the Windows host. The S04 gate removal makes
+Live-verification evidence for the Windows host. The win32 path gate removal makes
 Windows a first-class native platform (`win32-x64`) alongside macOS arm64 and
 Linux x86-64: the CLI platform gate, the native payload tuple, and the npm
 `os` field all include it. This document records what was actually observed on
@@ -43,7 +43,7 @@ configuration:
 ```text
 target/debug/external-subagentd.exe \
   --database <temp>\state.sqlite3 \
-  --socket \\.\pipe\external-subagent-s04-probe-<n> \
+  --socket \\.\pipe\external-subagent-win32-probe-<n> \
   --runtime C:\Users\iBobb\AppData\Local\Programs\ZCode\resources\glm\zcode.cjs \
   --agent-config <temp>\config.json
 ```
@@ -171,7 +171,7 @@ Measured on the real Named Pipe transport:
    `payload = verified (win32-x64)`, enabled agents `zcode/codex/agy`.
 2. The daemon was terminated; the same pipe name was re-bound by a second
    daemon (PID 14396).
-3. `status` over the same `\\.\pipe\external-subagent-s04-probe-<n>` succeeded
+3. `status` over the same `\\.\pipe\external-subagent-win32-probe-<n>` succeeded
    again: `ok: true`, `components.daemon = READY`, payload `win32-x64`, agents
    `zcode:true, dsh:false, codex:true, agy:true`.
 
@@ -191,9 +191,7 @@ did not re-run a live resume of an interrupted task.
   verifies that the handler only flips the shared shutdown flag and
   acknowledges the event, leaving the graceful shutdown to the main loop.
 - Deep process-tree termination (Job Object, `KILL_ON_JOB_CLOSE`, PID-reuse
-  `start_token`) is the S02 owner; see
-  `.agent-work/handoffs/windows-real-machine-completion/S02-HANDOFF.md`.
-  This section did not re-run the S02 tree-kill matrix.
+  `start_token`) is owned by the fail-closed runtime skeleton; see the corresponding handoff under `.agent-work/`. This section did not re-run that tree-kill matrix.
 
 ## CLI command surface on win32
 
@@ -209,7 +207,7 @@ did not re-run a live resume of an interrupted task.
 - Service commands (`start/stop/uninstall/purge`) dispatch to the SCM backend;
   lifecycle is exercised through the injectable `sc.exe` seam because this
   shell is not elevated. Elevated SCM lifecycle and Event Viewer evidence from
-  S03 remain the authoritative service evidence.
+  the RPC decoupling stage remains the authoritative service evidence.
 
 ## Known gaps
 
@@ -220,17 +218,17 @@ did not re-run a live resume of an interrupted task.
    win32 payload and fails closed at `verify-payload`. This is the deliberate
    "win32 npm 发布激活" exclusion; the local/CI packaging path is ready.
 2. **SCM startup does not forward runtime environment variables.** The
-   service binPath carries `--database` and `--socket` only (S03 decision).
+   service binPath carries `--database` and `--socket` only (RPC decoupling stage decision).
    Starting the daemon through SCM therefore does not pass `--runtime`, so a
    ZCode task served by an SCM-started daemon has no pinned runtime. Direct
    daemon startup and the final acceptance run pass `--runtime` explicitly.
    Forwarding `ZCODE_RUNTIME_PATH`/agent homes through the service registry
-   environment is an S03-owned follow-up.
+   environment is a service-layer follow-up.
 3. **DSH deferred** (version pin mismatch; see above).
 4. **CI not triggered.** The `windows-check` workflow exists and was validated
    locally (YAML parse + command-level runs); no GitHub Actions run was started
    in this worktree.
-5. **Elevated SCM / Event Viewer** was not re-run in this section; S03's
+5. **Elevated SCM / Event Viewer** was not re-run in this section; the service-backend stage's
    non-elevated evidence (structured `SERVICE_ACCESS_DENIED`, read-only
    `registered: false`) stands.
 6. **Full live codex create/wait** is owned by the final main acceptance step;

@@ -30,7 +30,7 @@ function darwinProductPaths(home) {
   };
 }
 
-// XDG Base Directory resolution (D-S02).  A variable selects its directory only
+// XDG Base Directory resolution.  A variable selects its directory only
 // when it is a non-empty absolute path; relative or empty values are ignored and
 // the spec fallback under $HOME applies.  Only the three XDG variables the
 // product owns are read — no other user XDG directory is probed.
@@ -46,7 +46,7 @@ function xdgDirectory(env, variable, home, fallback) {
 // state, database, socket, hook provenance, plugin staging, profiles all live
 // inside the product data directory) so the two platforms stay structurally
 // parallel.  Data and logs follow XDG; the systemd user unit directory is
-// provided for the S03 service backend.
+// provided for the service backend.
 function linuxProductPaths(home, env) {
   const data = path.join(xdgDirectory(env, 'XDG_DATA_HOME', home, ['.local', 'share']), PRODUCT_NAME);
   const logs = path.join(xdgDirectory(env, 'XDG_STATE_HOME', home, ['.local', 'state']), PRODUCT_NAME);
@@ -67,7 +67,7 @@ function linuxProductPaths(home, env) {
   };
 }
 
-// Windows base directory resolution (S04): %LOCALAPPDATA% is used only when it is a
+// Windows base directory resolution: %LOCALAPPDATA% is used only when it is a
 // non-empty absolute path; relative or empty values are ignored and the fallback
 // under %USERPROFILE%\AppData\Local applies. APPDATA (Roaming) is deliberately
 // not consulted as the frozen field set has no roaming consumers.
@@ -79,7 +79,7 @@ function localAppDataDirectory(env, home) {
   return path.join(home, 'AppData', 'Local');
 }
 
-// Windows product layout (S04): structurally parallel to darwin/linux.
+// Windows product layout: structurally parallel to darwin/linux.
 // Data, database, config, state, hook provenance, plugin staging, and profiles
 // live under %LOCALAPPDATA%\<product>.
 // Socket uses the Windows named pipe namespace (\\.\pipe\<product>-daemon).
@@ -95,7 +95,7 @@ function windowsProductPaths(home, env) {
     hookProvenance: path.join(data, 'zcode-agent-hook-provenance.json'),
     database: path.join(data, `${PRODUCT_NAME}.sqlite3`),
     // Named pipe namespace placeholder (pending phase 1 real-machine implementation,
-    // not a filesystem path; prefix matches S03 windows.rs \\.\pipe\ literal).
+    // not a filesystem path; prefix matches the windows.rs \\.\pipe\ literal).
     socket: `\\\\.\\pipe\\${PRODUCT_NAME}-daemon`,
     logs: path.join(localAppData, PRODUCT_NAME, 'logs'),
     // Windows has no file-based service definition; pending phase 3 SCM integration decision.

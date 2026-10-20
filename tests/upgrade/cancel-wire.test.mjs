@@ -85,7 +85,7 @@ test('a failed update aborts the drain through the real CLI RPC encoder', async 
 // R2 compatibility oracle: a NEW CLI upgrading against an OLD daemon whose
 // method table predates daemon_abort_drain. The error frame below is the
 // daemon's real wire behavior, not an invented one: every released daemon
-// since the s02a migration gates method names through RpcMethod::is_known,
+// since the migration gates method names through RpcMethod::is_known,
 // and RpcErrorCode serializes snake_case — so the unknown abort method
 // answers { code: 'unknown_method', message: 'unknown RPC method' } (see
 // crates/external-daemon/src/rpc.rs). This is a controlled old-protocol wire

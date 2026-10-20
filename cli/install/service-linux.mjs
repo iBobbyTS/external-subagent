@@ -23,7 +23,7 @@ import { readConfig } from '../config/read.mjs';
 export const SYSTEMD_UNIT_NAME = `${PRODUCT_NAME}.service`;
 export const SYSTEMCTL_PATH = '/usr/bin/systemctl';
 
-// D-S04: a host without a reachable user manager gets an actionable
+// A host without a reachable user manager gets an actionable
 // explanation, never an automatic `loginctl enable-linger` and never a detour
 // through the system manager.
 const NO_SESSION_HINT = 'log in through a real session (which provides $XDG_RUNTIME_DIR), or run \'loginctl enable-linger <user>\' so the user manager stays available without one; this product never enables linger, never modifies unrelated units, and never contacts the system (PID 1) manager';

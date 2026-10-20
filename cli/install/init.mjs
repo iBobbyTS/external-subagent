@@ -12,7 +12,7 @@ import { updateInstallation } from './update.mjs';
 import { loadInstallState, markInstallStep, removeCreatedDirectories, rollbackFiles, snapshotFile } from './recovery.mjs';
 import { SYSTEMD_UNIT_NAME, bootstrapService, bootoutService, installServiceDefinition, runtimeObservations } from './service-macos.mjs';
 
-// Standalone-install coordination (S05, AUD-005 decision D1).  A plain npm
+// Standalone-install coordination (AUD-005 decision D1).  A plain npm
 // install only stages the package and payload; an explicit `init` installs
 // the STANDALONE SERVICE ONLY — every state-changing step below is
 // host-neutral:
@@ -136,8 +136,8 @@ export function runInit(options = {}) {
       // The daemon takes its database/socket/runtime from service arguments,
       // never from this file; drop the retired top-level path fields so an
       // install over an older local config republishes the current schema.
-      // S05-F01: `subagents.zcode.runtime_path` was a first-class config key
-      // before D1 rejected it, so a pre-S05 install can carry it in either
+      // The runtime_path remediation: `subagents.zcode.runtime_path` was a first-class config key
+      // before D1 rejected it, so an install predating that rejection can carry it in either
       // the schema-2 or the legacy schema-1 shape.  Retire it here — before
       // parseConfig migrates/validates — so `npm new -> init` self-heals such
       // configs instead of failing closed at the read gate (which stays

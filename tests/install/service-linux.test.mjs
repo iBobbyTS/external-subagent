@@ -1,4 +1,4 @@
-// S03 systemd user-service oracles (seam-based; the real-user-manager smoke
+// Systemd user-service oracles (seam-based; the real-user-manager smoke
 // is recorded separately in the section evidence).  The backend under test is
 // the REAL cli/install/service-linux.mjs plus the platform dispatch in
 // service-macos.mjs; only `systemctl` is a double (the structural twin of the
@@ -38,7 +38,7 @@ const linuxHost = platform() === 'linux';
 
 // The systemd user-service backend is POSIX-only; win32 ships the SCM backend.
 const win32Posix = process.platform === 'win32'
-  ? 'the systemd user-service backend is POSIX-only; win32 uses SCM (S03)'
+  ? 'the systemd user-service backend is POSIX-only; win32 uses SCM'
   : false;
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const digest = (file) => sha256(fs.readFileSync(file));
@@ -465,7 +465,7 @@ test('the Linux fixed PATH resolves systemctl and stays platform-trueful', { ski
   assert.equal(SYSTEMD_FIXED_PATH.includes('/opt/homebrew'), false);
   // The service PATH is the fixed system set plus the interpreter directory of
   // the node that rendered the unit, so a Node-launcher Codex runtime resolves
-  // `node` from the unit environment (the bounded S04 fix).
+  // `node` from the unit environment (the bounded PATH fix).
   assert.equal(systemdServicePath(), `${SYSTEMD_FIXED_PATH}:${path.dirname(process.execPath)}`);
   assert.equal(systemdServicePath().startsWith(`${SYSTEMD_FIXED_PATH}:`), true);
   // The fixed set must actually find systemctl, the tool the service itself

@@ -46,7 +46,7 @@ test('help identifies the public CLI as external-subagent', () => {
 });
 
 test('every business command passes the win32 platform gate and reaches its structured failure', () => {
-  // S04 opens the gate: no command may answer UNSUPPORTED_PLATFORM anymore.
+  // The win32 path stage opens the gate: no command may answer UNSUPPORTED_PLATFORM anymore.
   // Daemon-backed commands answer with a structured connection error; purge
   // stops at its own confirmation guard. SCM lifecycle commands are covered by
   // the injectable sc.exe seam in the dispatch test below, never by this test
@@ -86,7 +86,7 @@ test('every business command passes the win32 platform gate and reaches its stru
   rejected(['purge'], 'CONFIRMATION_REQUIRED');
 
   // SCM-backed commands (start/stop/uninstall/purge) are exercised through the
-  // injectable `sc.exe` seam in the dispatch test below and in the S03
+  // injectable `sc.exe` seam in the dispatch test below and in the RPC decoupling stage
   // service-windows suite: running them here would mutate a real SCM database
   // on an elevated CI runner. The platform gate itself is shared and covered
   // by every command above and below.

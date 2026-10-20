@@ -12,8 +12,8 @@
 - Required second independent ZAS PLAN reviewer: NOT_RUN；actual route/id/result UNKNOWN。
 - Global PLAN barrier: CLOSED。
 - Code full-review slots consumed: 0；next provider native @code_reviewer。
-- S01/S02.A/S02.B/S03/S04.A/S04.B/S05/S06: PENDING。
-- S02/S04 parent integration: NOT_RUN。
+- DSH probe/ZCode walking path/ZCode lifecycle parity/agent status/DSH build/DSH strict plan/npm install/upgrade coordination: PENDING。
+- ZCode lifecycle/DSH production parent integration: NOT_RUN。
 - Runtime/CLI/MCP/Codex/npm/launchd live checks: NOT_RUN。
 - Plan structural/document checks: 见 VALIDATION.md；不代表独立review。
 

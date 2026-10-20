@@ -1,4 +1,4 @@
-// Release pack gate regression (S06): drives the real
+// Release pack gate regression: drives the real
 // scripts/release/check-native-tarball.mjs --staged in throwaway fixture trees
 // that look exactly like the merged publish tree (package.json + both platform
 // payload directories).  The gate must accept the dual-platform staging and

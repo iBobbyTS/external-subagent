@@ -89,7 +89,7 @@ external-subagent/
 └── .agent-work/                        # 仅当前新 feature 的计划与记录
 ```
 
-`plugins/dsh-policy/` **不是默认存在的目录**；只有 S01 证明缺口并经窄 scope delta 批准，才加入。届时它是 TypeScript 策略插件，仍不能拥有进程、task store 或 scheduler。
+`plugins/dsh-policy/` **不是默认存在的目录**；只有 DSH probe 证明缺口并经窄 scope delta 批准，才加入。届时它是 TypeScript 策略插件，仍不能拥有进程、task store 或 scheduler。
 
 ## 3. 依赖与唯一 owner
 
@@ -126,7 +126,7 @@ CLI / MCP → daemon service → core → store + contract + runtime trait
 
 ## 5. AgentAdapter 的最小语义面
 
-不是预先承诺具体 Rust 签名；S02 基于现有 `ManagedRuntime` / `RuntimeFactory` 最小演进：
+不是预先承诺具体 Rust 签名；ZCode lifecycle 基于现有 `ManagedRuntime` / `RuntimeFactory` 最小演进：
 
 - `capabilities`：可选模型、权限模式、响应种类、telemetry 来源、原生 resume 与产品续聊支持分别列出。
 - `discover / probe`：安装与认证证据，纯本地与真实请求分层。

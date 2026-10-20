@@ -1,4 +1,4 @@
-// S04.A DSH build-loop wire contract (X05–X07). Drives the shared ACP fixture
+// DSH build-loop wire contract (X05–X07). Drives the shared ACP fixture
 // directly as a JSON-RPC 2.0 peer and pins the exact shapes the Rust adapter
 // parses: bootstrap order (initialize → session/new → model config verified
 // before the prompt), single-shot permission responses that only echo offered

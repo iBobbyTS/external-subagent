@@ -1,4 +1,4 @@
-// Productization acceptance invariants (S04 consumer surface). These are
+// Productization acceptance invariants (consumer surface). These are
 // controlled, always-on checks for the seams the productization closeout
 // touched: the managed plugin's cache identity (codex materializes plugin
 // caches keyed by plugin@marketplace@version, so the manifest version is a
@@ -48,7 +48,7 @@ test('staged plugin MCP binding keeps exactly the managed placeholders', () => {
 
 test('acceptance matrix deliverable records the four live consumer cells', () => {
   const doc = fs.readFileSync(path.join(root, 'docs', 'acceptance', 'productization.md'), 'utf8');
-  for (const marker of ['S04_CLI_DSH_OK', 'S04_CLI_ZCODE_OK', 'S04_MCP_DSH_OK', 'S04_MCP_ZCODE_OK']) {
+  for (const marker of ['CLI_DSH_OK', 'CLI_ZCODE_OK', 'MCP_DSH_OK', 'MCP_ZCODE_OK']) {
     assert.ok(doc.includes(marker), `acceptance matrix must record the ${marker} cell`);
   }
   assert.ok(doc.includes('REGISTRY_PUBLICATION_PENDING'), 'publication status must stay explicit until authorized');
@@ -63,7 +63,7 @@ test('acceptance doc records the C2 fresh consumer verification as passed', () =
   // labelled as the historical evidence for the C1 artifact.
   assert.ok(doc.includes('C2_FRESH_CONSUMER_VERIFICATION_PASS'), 'the passed C2 fresh-consumer verification must stay explicit');
   assert.ok(!doc.includes('C2_FRESH_CONSUMER_VERIFICATION_PENDING'), 'the withdrawn pending status must not return');
-  for (const marker of ['S04_C2_CLI_DSH_OK', 'S04_C2_CLI_ZCODE_OK', 'S04_C2_MCP_DSH_OK', 'S04_C2_MCP_ZCODE_OK']) {
+  for (const marker of ['C2_CLI_DSH_OK', 'C2_CLI_ZCODE_OK', 'C2_MCP_DSH_OK', 'C2_MCP_ZCODE_OK']) {
     assert.ok(doc.includes(marker), `the C2 acceptance matrix must record the ${marker} cell`);
   }
   assert.ok(doc.includes('7444f59b508d5aae31b6f17e6c8744c6abde494b86701d821fce43d436d04399'), 'the C2 tarball sha256 must be recorded');

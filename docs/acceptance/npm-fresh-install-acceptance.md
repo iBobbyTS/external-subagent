@@ -1,4 +1,4 @@
-# S05 acceptance — npm fresh install enables Codex to invoke both agents
+# npm fresh install acceptance — Codex can invoke both agents
 
 Section outcome (U06/P09/P10/P13, D08): a plain npm install only stages the
 package and its versioned payload; an explicit `init` makes the CLI usable on
@@ -15,7 +15,7 @@ and claims the Codex home in the global registry.
   binding over the verified official CLI), `service-macos` (the one
   LaunchAgent template + bootstrap/bootout with a documented test seam),
   `reconcile` (D08 homes registry single owner), `recovery` (snapshots,
-  journal, rollback), `init` (explicit-init coordination). The S02-era
+  journal, rollback), `init` (explicit-init coordination). The legacy
   `cli/installer.mjs` and `cli/service.mjs` were superseded by these owners.
 - `cli/commands/`: `plugin`, `daemon`, `maintenance` (uninstall now releases
   D08 claims; data-layer operations remain in `cli/maintenance.mjs`).
@@ -36,7 +36,7 @@ and claims the Codex home in the global registry.
     the codex home (D08), never edits shell profiles, and is idempotent;
     unicode/spaces homes work; the installed daemon serves CLI status with
     zcode enabled and a fail-closed DSH entry when no DSH configuration is
-    supplied; configured DSH live evidence is recorded in S04. The installed facade speaks
+    supplied; configured DSH live evidence is recorded in the DSH compatibility record. The installed facade speaks
     the MCP handshake and exposes **exactly ten** `external_subagent_*`
     tools.
   - `codex-binding`: official arg shapes (marketplace add / add
@@ -45,7 +45,7 @@ and claims the Codex home in the global registry.
     ten-tool TOML section with unrelated sections preserved, and the D08
     oracles (claim/dedupe/unclaim, atomic corruption recovery with preserved
     bytes, only-registered-writable-homes reconcile, strangers untouched).
-  - `identity` (S02 heritage, imports updated) and the **real codex CLI**
+  - `identity` (legacy heritage, imports updated) and the **real codex CLI**
     bounded test (throwaway `CODEX_HOME` only): real `plugin add` installs
     under `$CODEX_HOME/plugins/cache/personal/external-subagent/0.1.0` with
     the absolute facade entry intact; official remove clears the cache.
@@ -60,7 +60,7 @@ and claims the Codex home in the global registry.
 - Ten-tool discovery inside a running Codex host and live two-agent (zcode
   hi + DSH) tasks from a real Codex conversation remain **NOT_RUN**. The
   installed-artifact and isolated real-Codex checks cover plugin/MCP discovery;
-  the configured DSH build/strict-plan gate is exercised by the S04 evidence.
+  the configured DSH build/strict-plan gate is exercised by the DSH compatibility evidence.
 - Registry publication (`npm publish`).
 - Full cargo workspace verification for this section: run and recorded in
   the section commit message (clean build + fmt + workspace tests + payload
@@ -79,6 +79,6 @@ and claims the Codex home in the global registry.
 - The launchctl seam (`EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL=1`) neutralizes
   service bootstrap in fixtures; real bootstrap is exercised only by an
   authorized real-home init.
-- Update/reconcile-on-upgrade is shared by the S05/S06 install owner; the
+- Update/reconcile-on-upgrade is shared by the install and upgrade owner; the
   active-task drain and vA→vB hot-swap claims remain bound to their explicit
-  S06 evidence.
+  upgrade evidence.

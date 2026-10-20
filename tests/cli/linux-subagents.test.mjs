@@ -1,4 +1,4 @@
-// S05 Linux-first oracles for the remaining subagents (zcode/dsh/agy) and the
+// Linux-first oracles for the remaining subagents (zcode/dsh/agy) and the
 // zcode runtime discovery (cli/constants.mjs).  The fail-closed negatives come
 // FIRST: without a runtime, or before enable, every Linux admission must
 // refuse exactly the way the macOS contract does, and no configuration may be
@@ -33,7 +33,7 @@ const win32Posix = process.platform === 'win32'
   ? 'the systemd backend and POSIX-shebang daemon fixtures are POSIX-only; win32 uses SCM'
   : false;
 
-function fixtureHome(prefix = 'external-subagent-s05-') {
+function fixtureHome(prefix = 'external-subagent-linux-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
@@ -107,7 +107,7 @@ test('the systemd unit and the runtime report forward the discovered Linux runti
 // environment, and a PATH that holds none of the executables — the Linux
 // fail-closed baseline every enable/spawn refusal below is measured against.
 async function bareDaemon(home) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-s05-daemon-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-linux-daemon-'));
   const socket = path.join(root, 'daemon.sock');
   const env = { ...process.env, HOME: home, PATH: '/usr/bin:/bin' };
   for (const key of ['EXTERNAL_SUBAGENT_CONFIG', 'EXTERNAL_SUBAGENT_CONFIG_REVISION', 'DSH_RUNTIME_PATH', 'DSH_HOME', 'DSH_PROFILE', 'DSH_VERSION', 'CODEX_RUNTIME_PATH', 'CODEX_HOME', 'AGY_RUNTIME_PATH', 'ZCODE_RUNTIME_PATH']) delete env[key];

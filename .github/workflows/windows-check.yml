@@ -1,11 +1,11 @@
 # CI workflow for Windows compilation, platform contract verification, and the
-# controlled win32-x64 payload/pack matrix (S03).
+# controlled win32-x64 payload/pack matrix.
 #
 # windows-check (x64): cargo check on the MSVC host, the Node platform suites,
 # a release build of the win32-x64 native payload, and `npm pack` (which runs
 # the prepack builder and postpack payload/tarball gates).  The resulting
 # tarball is uploaded as an artifact; it is a controlled test product and is
-# NOT published (the three distribution gates stay closed until S04).
+# NOT published (the three distribution gates stay closed until explicitly opened).
 #
 # windows-arm64-check: cargo check only, as required for the arm64 target while
 # the x64 payload is the only controlled artifact.

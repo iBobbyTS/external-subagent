@@ -20,7 +20,7 @@ let counter = 0;
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function uniquePipe() {
-  return `\\\\.\\pipe\\external-subagent-s01-fixture-${process.pid}-${counter++}`;
+  return `\\\\.\\pipe\\external-subagent-fixture-${process.pid}-${counter++}`;
 }
 
 function spawnDaemon({ database, pipe }) {
@@ -58,7 +58,7 @@ async function waitForExit(exited, timeoutMs) {
 }
 
 test('named pipe daemon round-trips status and concurrent calls', { skip: !isWindows }, async () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 's01-pipe-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-'));
   const pipe = uniquePipe();
   const daemon = spawnDaemon({ database: path.join(directory, 'external-subagent.sqlite3'), pipe });
   try {
@@ -76,7 +76,7 @@ test('named pipe daemon round-trips status and concurrent calls', { skip: !isWin
 });
 
 test('a squatted endpoint rejects the daemon bind (anti-hijack)', { skip: !isWindows }, async () => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 's01-pipe-hijack-'));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'pipe-hijack-'));
   const pipe = uniquePipe();
   const squatter = net.createServer();
   await new Promise((resolve, reject) => {

@@ -46,7 +46,7 @@ test('persisted config version matrix is shared with Rust startup and RPC', () =
   for (const entry of cases) {
     fs.writeFileSync(paths.config, JSON.stringify(entry.input));
     if (!entry.valid) {
-      // Per-case error contract (S02/AUD-005): a zcode runtime_path keeps its
+      // Per-case error contract (AUD-005): a zcode runtime_path keeps its
       // dedicated `runtime_path_unsupported` code; every other rejection keeps
       // its existing CONFIG_INVALID family code.  schema.mjs codes are frozen.
       const code = entry.error_code ?? 'CONFIG_INVALID';
@@ -95,7 +95,7 @@ test('legacy read preserves bytes and next locked write persists only canonical 
 
 test('config writes regenerate an installed service definition and never create one', { skip: win32PosixBackend }, () => {
   // The launchd plist is regenerated on macOS only; the Linux systemd unit is
-  // owned by the S03 service backend, so a Linux config write must not emit a
+  // owned by the service backend, so a Linux config write must not emit a
   // plist to the unit path.
   const macos = platform() === 'darwin';
   const stale = fixture();
@@ -677,7 +677,7 @@ test('fresh init and enable use PATH evidence, live admission, and restarted fac
   assert.deepEqual(Object.keys(init.runtimes), ['zcode', 'dsh', 'codex', 'agy']);
   assert.ok(Object.values(readConfig(paths.config).subagents).every((entry) => !entry.enabled && !entry.spawn_supported));
   const daemon = await daemonHarness({ root, home, runtime: path.resolve('tests/fixtures/zcode-general.mjs'), env: {
-    PATH: bin, DSH_HOME: providerHome, CODEX_HOME: providerHome, S05_DSH_SPAWN_FIXTURE: '1',
+    PATH: bin, DSH_HOME: providerHome, CODEX_HOME: providerHome, DSH_SPAWN_FIXTURE: '1',
   } });
   t.after(() => daemon.stop());
   const options = { socket: daemon.socket, callDaemon };

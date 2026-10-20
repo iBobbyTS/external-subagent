@@ -13,7 +13,7 @@ import { nativePlatform, pluginSourceRoot } from '../../cli/install/layout.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '../..');
 
-// The staged payload directory follows the host tuple (S01), independent of the
+// The staged payload directory follows the host tuple, independent of the
 // layout seam; the released payload and its debug twin live under the same
 // platform directory name.
 const hostPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;

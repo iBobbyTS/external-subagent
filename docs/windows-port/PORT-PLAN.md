@@ -53,7 +53,7 @@ flowchart TD
 - `crates/external-daemon/src/rpc.rs:18-24`（RPC 三分：抽取 `transport.rs`，增加 `windows.rs` 骨架桩）
 - `crates/external-daemon/src/lib.rs:23, 1675-1678`（PermissionsExt 门控与 `Daemon` windows 骨架桩）
 - `crates/external-daemon/src/scheduler/diagnostics.rs:540-545, 559-563`（`.mode(0o600)` 改为局部 unix 门控链）
-- `crates/external-daemon/src/scheduler/admission.rs:184-196`（未门控 `libc::kill` 迁移至 S02 `kill_group`/`kill_process`）
+- `crates/external-daemon/src/scheduler/admission.rs:184-196`（未门控 `libc::kill` 迁移至共享 `kill_group`/`kill_process`）
 - `crates/external-daemon/src/main.rs:12, 55-56, 343-365`（signal_hook 注册与 debug gate cfg 拆分）
 - `crates/external-mcp/src/lib.rs:6, 12`（`UnixStream::connect` cfg 拆分）
 - `cli/paths.mjs:75-77`（`windowsProductPaths` 12 字段平行结构与三分支分发）
@@ -67,8 +67,8 @@ flowchart TD
 2. 宿主测试全绿：host `cargo test --workspace` 全绿；`cargo build --workspace --bins` 后 `node --test tests/platform/*.test.mjs tests/cli/*.test.mjs tests/install/*.test.mjs` 全绿。
 3. 骨架语义验证：
    - 源断言确认 `gated_spawn` 的 windows 拒绝位于 `command.spawn()` 之前；
-   - S04 测试 4 验证 `windowsProductPaths` 的 LOCALAPPDATA 注入/回退、socket 管道命名、launchAgent 为 null；
-   - S04 测试 5 验证 win32 平台下服务操作直接抛出结构化 `CliError('UNSUPPORTED_PLATFORM_SERVICE', ...)`。
+   - win32 路径阶段测试 4 验证 `windowsProductPaths` 的 LOCALAPPDATA 注入/回退、socket 管道命名、launchAgent 为 null；
+   - win32 路径阶段测试 5 验证 win32 平台下服务操作直接抛出结构化 `CliError('UNSUPPORTED_PLATFORM_SERVICE', ...)`。
 4. CI 语法有效：`.github/workflows/windows-check.yml` 通过本机 YAML 解析校验。
 5. 两个文档健全：`docs/windows-port/PLATFORM-MATRIX.md` 覆盖 10/10 构造族且四列完整；`docs/windows-port/PORT-PLAN.md` 覆盖五阶段且四要素齐备。
 

@@ -5,7 +5,7 @@
 //! Durable grants like `allow_always` are never constructed. Two observed
 //! option dialects are accepted: the upstream standard shape
 //! (`options: [{optionId, name, kind}]` with `toolCall: {toolCallId}`) and
-//! the S01-pinned fixture shape (`options: [{kind}]` with a flat
+//! the pinned fixture shape (`options: [{kind}]` with a flat
 //! `toolCallId`); the response echoes an identifier the server itself
 //! offered, so no value is invented.
 
@@ -200,7 +200,7 @@ mod tests {
         })
     }
 
-    fn s01_fixture_offer() -> Value {
+    fn fixture_offer() -> Value {
         json!({
             "requestId": "permission-1",
             "toolCallId": "tool-1",
@@ -213,7 +213,7 @@ mod tests {
         let upstream = parse_offer(&upstream_offer()).unwrap();
         assert_eq!(upstream.tool_call_id.as_deref(), Some("call-7"));
         assert_eq!(upstream.options.len(), 2);
-        let fixture = parse_offer(&s01_fixture_offer()).unwrap();
+        let fixture = parse_offer(&fixture_offer()).unwrap();
         assert_eq!(fixture.request_id.as_deref(), Some("permission-1"));
         assert_eq!(fixture.tool_call_id.as_deref(), Some("tool-1"));
         assert!(parse_offer(&json!({"options": []})).is_none());
@@ -231,12 +231,12 @@ mod tests {
             upstream.select("deny").unwrap()["outcome"]["optionId"],
             "reject-once"
         );
-        let fixture = parse_offer(&s01_fixture_offer()).unwrap();
+        let fixture = parse_offer(&fixture_offer()).unwrap();
         assert_eq!(
             fixture.select("allow").unwrap()["outcome"]["optionId"],
             "allow_once"
         );
-        assert!(parse_offer(&s01_fixture_offer())
+        assert!(parse_offer(&fixture_offer())
             .unwrap()
             .select("answer")
             .is_none());
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(normalized["toolName"], "Edit");
         assert_eq!(normalized["toolCallId"], "call-7");
         assert_eq!(normalized["origin"], "dsh_acp");
-        let uncorrelated = parse_offer(&s01_fixture_offer()).unwrap();
+        let uncorrelated = parse_offer(&fixture_offer()).unwrap();
         let normalized = normalize_permission_request(&uncorrelated, None);
         assert_eq!(normalized["toolName"], "unknown");
     }
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn offer_cache_is_bounded_and_take_is_once() {
         let mut cache = OfferCache::default();
-        let offer = parse_offer(&s01_fixture_offer()).unwrap();
+        let offer = parse_offer(&fixture_offer()).unwrap();
         let key = correlation_key(&WireId::String("srv-1".into()));
         cache.observe(key.clone(), offer);
         assert!(cache.take(&key).is_some());
@@ -273,7 +273,7 @@ mod tests {
         for index in 0i64..(MAX_OFFERED_REQUESTS as i64 + 8) {
             cache.observe(
                 correlation_key(&WireId::Integer(index)),
-                parse_offer(&s01_fixture_offer()).unwrap(),
+                parse_offer(&fixture_offer()).unwrap(),
             );
         }
         assert!(cache

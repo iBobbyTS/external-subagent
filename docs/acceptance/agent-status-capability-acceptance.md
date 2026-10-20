@@ -1,4 +1,4 @@
-# S03 acceptance evidence
+# Agent status capability acceptance evidence
 
 Agent status has one daemon-owned representation across RPC, MCP, CLI pass-through, and the packaged public schema. Each provider reports configuration identity, enabled and spawn gates, transport support, currently admitted permission modes, model-selection semantics, and scoped local/auth/hi evidence.
 
@@ -9,6 +9,6 @@ Current capability matrix:
 | Agent | Transport | Probe | Spawn | Permission modes | Model selection |
 | --- | --- | --- | --- | --- | --- |
 | ZCode | `zcode_app_server` | yes | configured gate | `build`, `edit`, `plan`, `yolo` when spawn is supported | native only; explicit model rejected |
-| DSH | `dsh_acp` | yes | no | none until the S04 production adapter is accepted | catalog-token mode identified, currently unsupported |
+| DSH | `dsh_acp` | yes | no | none until the DSH production adapter is accepted | catalog-token mode identified, currently unsupported |
 
 The deterministic Rust and Node contract suites cover capability projection, revision invalidation, schema shape, and CLI preservation. Live ZCode and DSH provider probes are not evidence for this repair unless separately recorded by the parent section handoff.

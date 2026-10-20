@@ -2565,13 +2565,13 @@ mod tests {
     #[test]
     fn dsh_probe_never_promotes_production_spawn_support() {
         // Isolate PATH in a subprocess; never mutate global PATH under parallel tests.
-        if env::var_os("S05_EMPTY_PATH_PROBE").is_none() {
+        if env::var_os("EMPTY_PATH_PROBE").is_none() {
             let status = Command::new(env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "agent_status::tests::dsh_probe_never_promotes_production_spawn_support",
                 ])
-                .env("S05_EMPTY_PATH_PROBE", "1")
+                .env("EMPTY_PATH_PROBE", "1")
                 .env("PATH", "")
                 .env_remove("DSH_RUNTIME_PATH")
                 .status()
@@ -3678,7 +3678,7 @@ setInterval(() => {}, 1000);
     /// subprocess (never mutate process-global env under a parallel suite).
     #[test]
     fn agy_probe_resolves_agy_runtime_path_and_never_promotes() {
-        if env::var_os("S03_AGY_PROBE").is_none() {
+        if env::var_os("AGY_PROBE").is_none() {
             let directory = tempfile::tempdir().unwrap();
             let executable = directory.path().join("agy-runtime");
             fs::write(&executable, "#!/bin/sh\nprintf '1.2.12\\n'\n").unwrap();
@@ -3688,7 +3688,7 @@ setInterval(() => {}, 1000);
                     "--exact",
                     "agent_status::tests::agy_probe_resolves_agy_runtime_path_and_never_promotes",
                 ])
-                .env("S03_AGY_PROBE", "1")
+                .env("AGY_PROBE", "1")
                 .env("PATH", "")
                 .env("AGY_RUNTIME_PATH", &executable)
                 .status()

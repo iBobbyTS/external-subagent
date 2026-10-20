@@ -176,7 +176,7 @@ fn dsh_scheduler(workspace: &std::path::Path, dsh: DshRuntimeFactory) -> Schedul
 
 fn dsh_workspace() -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix("s04a-dsh-")
+        .prefix("dsh-")
         .tempdir_in(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/live-agent/workspace"),
@@ -250,7 +250,7 @@ fn enqueue_dsh_with_manifest(
 /// `@deepseek-ai/dsh` package (name pinned) holding a non-`.js` scripted
 /// runtime, plus the **nested** `@deepseek-ai/dsh-fs` package the write-guard
 /// `node_modules` symlink targets. The runtime answers `--version` and
-/// `--dump-config` for the S02 manifest-build preflight and then speaks the
+/// `--dump-config` for the manifest-build preflight and then speaks the
 /// scripted ACP bootstrap; the shared harness records its argv and patch.
 fn manifest_fake_dsh(workspace: &std::path::Path) -> (tempfile::TempDir, std::path::PathBuf) {
     let root = dsh_workspace();
@@ -276,7 +276,7 @@ fn manifest_fake_dsh(workspace: &std::path::Path) -> (tempfile::TempDir, std::pa
 
 /// The fake runtime body: preflight probes plus a one-turn ACP bootstrap. The
 /// `--dump-config` branch builds the write-guard `file://` name from the
-/// `--patch` TempDir so the S02 dump validation sees the guard the daemon just
+/// `--patch` TempDir so the dump validation sees the guard the daemon just
 /// materialized, and pins `config.manifest` to the caller manifest the test
 /// enqueues (`["src/a.rs", "docs"]`).
 const MANIFEST_FAKE_SCRIPT: &str = r#"
@@ -2338,7 +2338,7 @@ fn manifest_build_spawn_materializes_a_patch_and_observes_the_caller_manifest() 
         "{patch}"
     );
 
-    // The patch content is the S02 constructor output: a guard insert line
+    // The patch content is the manifest-build constructor output: a guard insert line
     // carrying the caller manifest verbatim, with tool-fs kept enabled and
     // bash disabled. It is the daemon TempDir materialization, never a
     // source-tree file.
@@ -2367,7 +2367,7 @@ fn dsh_event_count(workspace: &std::path::Path, agent_id: &str, event_type: &str
         .unwrap()
 }
 
-/// S01 AC3: a DSH provider that emits an oversized ACP frame and keeps
+/// The oversized-frame contract: a DSH provider that emits an oversized ACP frame and keeps
 /// running fails explicitly instead of hanging RUNNING.
 #[test]
 fn dsh_oversized_frame_fails_explicitly_and_reaps_the_provider() {

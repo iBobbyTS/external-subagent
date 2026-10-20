@@ -1,4 +1,4 @@
-// Windows deep process-tree cascade-reap fixture (stage 2 / S02).
+// Windows deep process-tree cascade-reap fixture (stage 2).
 //
 // The real daemon is started with a controlled zcode runtime whose only job is
 // to derive a deep process tree (node.exe -> cmd.exe -> powershell.exe) through
@@ -115,8 +115,8 @@ function spawnDaemon({ database, pipe, config, runtime, env }) {
 }
 
 test('cancelling a task reaps the node->cmd->powershell tree with no orphan PID', { skip: !isWindows }, async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 's02-tree-'));
-  const pipe = `\\\\.\\pipe\\external-subagent-s02-tree-${process.pid}`;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tree-'));
+  const pipe = `\\\\.\\pipe\\external-subagent-tree-${process.pid}`;
   const pidFile = path.join(root, 'tree-pids.json');
   const runtime = path.join(root, 'runtime.cmd');
   const config = path.join(root, 'config.json');

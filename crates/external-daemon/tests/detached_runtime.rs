@@ -3,7 +3,7 @@
 //! The real `external-subagentd` binary is used as the hidden `__orphan-spawn`
 //! helper, so this exercises the production helper entry (the same
 //! `current_exe()` the daemon passes in production) rather than the
-//! external-runtime test fixture. S01's `spawn_for_test` supplies only the
+//! external-runtime test fixture. The `spawn_for_test` helper supplies only the
 //! helper path; the spawn protocol itself is the production one.
 #![cfg(all(target_os = "macos", debug_assertions))]
 

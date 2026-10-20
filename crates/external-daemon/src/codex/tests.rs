@@ -59,7 +59,7 @@ fn codex_workspace() -> tempfile::TempDir {
         .canonicalize()
         .unwrap();
     tempfile::Builder::new()
-        .prefix("s01-codex-")
+        .prefix("codex-")
         .tempdir_in(root)
         .unwrap()
 }
@@ -3264,7 +3264,7 @@ sleep 1
     }
 }
 
-/// S01: the runtime line cap is 16 MiB, so a terminal frame that replays the
+/// The runtime line cap is 16 MiB, so a terminal frame that replays the
 /// whole turn must reach the codex projection intact instead of being dropped
 /// as oversized and hanging the task.
 #[test]
@@ -3371,7 +3371,7 @@ head -c {bytes} /dev/zero
 
 const CODEX_TRANSPORT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
 
-/// S01 AC3: a codex provider that emits an oversized frame and keeps running
+/// The oversized-frame contract: a codex provider that emits an oversized frame and keeps running
 /// fails explicitly instead of hanging RUNNING.
 #[test]
 fn codex_oversized_frame_fails_explicitly_and_reaps_the_provider() {

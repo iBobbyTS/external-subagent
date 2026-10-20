@@ -22,7 +22,7 @@
 
 先看DECISIONS与报告结论，随后确认REQUIREMENTS，再由本机主控使用PLAN-FULL。文件架构和source evidence用于代码handoff，不需每个implementer重复阅读全部报告。
 
-本计划遵循附件SFD4.5.1的结构与路由；**未执行native和ZAS独立PLANreview**。机械validator通过不等于SFD批准，也不等于产品验收。DSH源码版本是master manifest所见，不是npm latest或本机版本；S01负责真实固定版本与wire验证。
+本计划遵循附件SFD4.5.1的结构与路由；**未执行native和ZAS独立PLANreview**。机械validator通过不等于SFD批准，也不等于产品验收。DSH源码版本是master manifest所见，不是npm latest或本机版本；DSH probe 负责真实固定版本与wire验证。
 
 ## 在新仓库中的放置方式
 

@@ -114,7 +114,7 @@ function trimRust(value) {
 //      outside a string is therefore rejected iff `Number(token)` is not finite.
 //      This uses correctly-rounded IEEE rounding; serde_json's default
 //      accumulator can round to infinity within one ulp of `f64::MAX` (a
-//      recorded residual, see S02-HANDOFF).
+//      recorded residual).
 //   3. `JSON.parse` has no container-depth limit (it is iterative), while
 //      serde_json starts with `remaining_depth = 128` (de.rs:63) and
 //      `check_recursion` decrements before descending and errors when it reaches

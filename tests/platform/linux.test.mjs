@@ -8,7 +8,7 @@ import { ZCODE_RUNTIME } from '../../cli/constants.mjs';
 import { productPaths, profilesDir } from '../../cli/paths.mjs';
 
 // Linux mirrors the macOS platform suite: the same dry-run oracle, the XDG
-// layout contract (D-S02), and the zero-write failure path of an
+// layout contract, and the zero-write failure path of an
 // uninitialized install.  EXTERNAL_SUBAGENT_TEST_PLATFORM stays the process
 // platform override seam, so every assertion here is host-independent.
 const cli = path.resolve('bin/external-subagent.mjs');
@@ -59,7 +59,7 @@ test('Linux XDG layout follows the specification and keeps the macOS tree apart'
   assert.equal(layout.profiles, path.join(data, 'profiles'));
   assert.equal(layout.zcodePlugin, path.join(data, 'zcode-plugin', 'external-subagent'));
   assert.equal(layout.logs, path.join(home, '.local', 'state', 'external-subagent'));
-  // The systemd user unit directory is provided for the S03 service backend.
+  // The systemd user unit directory is provided for the service backend.
   assert.equal(layout.launchAgent, path.join(home, '.config', 'systemd', 'user', 'external-subagent.service'));
 
   // Absolute XDG variables win; empty and relative values fall back per spec.
@@ -102,7 +102,7 @@ test('Linux profile list reports the XDG directory without writing HOME', () => 
 test('Linux status reports the real systemd service view without probing launchd', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-linux-status-'));
   // No launchd test seam: the real Linux path must not invoke /bin/launchctl.
-  // The systemd view is the REAL `systemctl --user show` probe (S03): an
+  // The systemd view is the REAL `systemctl --user show` probe: an
   // uninitialized install reports the unit as absent, and a host without a
   // reachable user manager degrades to an explicit unavailable view with the
   // linger hint instead of failing the read-only command.

@@ -927,7 +927,7 @@ pub(crate) mod wait_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("s01-wait-")
+            .prefix("wait-")
             .tempdir_in(root)
             .unwrap();
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
@@ -1029,7 +1029,7 @@ pub(crate) mod wait_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("s01-runnable-")
+            .prefix("runnable-")
             .tempdir_in(root)
             .unwrap();
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());

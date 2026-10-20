@@ -18,8 +18,8 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     fn identity(&self) -> Option<ProcessIdentity>;
     fn stop(&self, grace: Duration) -> RuntimeTerminal;
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal>;
-    /// Real cleanup shared by the scheduler transport fault closure (S01
-    /// latched transport failure).
+    /// Real cleanup shared by the scheduler transport fault closure (latched
+    /// transport failure).
     ///
     /// `stop` is short-circuited by the owner's publisher once any terminal
     /// was published, including a late child-exit classification that never
@@ -274,7 +274,7 @@ impl<F> CommandRuntimeFactory<F> {
     }
 
     /// Thread the persisted `runtime_process_model` decision into every
-    /// spawned ZCode runtime. See the S01 driver contract: detached supports
+    /// spawned ZCode runtime. See the driver contract: detached supports
     /// the Command program/args/cwd/env-set/env-remove subset only; env_clear,
     /// uid/gid, arg0 and caller pre_exec stay attached-only (production uses
     /// none of them).

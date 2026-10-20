@@ -1,6 +1,6 @@
 //! Managed launch profile for the DSH ACP adapter.
 //!
-//! The single launch rule set is shared by the S03 discovery/catalog probe and
+//! The single launch rule set is shared by the discovery/catalog probe and
 //! the adapter spawn: an explicit executable (resolved by the caller, normally
 //! `DSH_RUNTIME_PATH`), the Node wrapper for JavaScript entrypoints, the task
 //! workspace as cwd, and an explicit home override only when the caller
@@ -28,9 +28,9 @@ pub const STRICT_PLAN_PROFILE_JSON: &str =
 pub const MANIFEST_BUILD_PROFILE_JSON: &str =
     include_str!("../../../../profiles/dsh/manifest-build.json");
 
-/// Embedded `dsh-write-guard` package artifact. S01 checked in the plugin as
+/// Embedded `dsh-write-guard` package artifact. The plugin was checked in as
 /// the artifact (no build step); embedding the exact bytes here keeps the
-/// daemon materialization in S03 independent of the source tree at runtime.
+/// daemon materialization independent of the source tree at runtime.
 pub const WRITE_GUARD_PACKAGE_JSON: &str =
     include_str!("../../../../plugins/dsh-write-guard/package.json");
 pub const WRITE_GUARD_INDEX_JS: &str =
@@ -38,13 +38,13 @@ pub const WRITE_GUARD_INDEX_JS: &str =
 
 /// Materialization manifest for the write-guard package: relative path inside
 /// the plugin package directory paired with its byte-exact embedded content.
-/// S03 writes `<TempDir>/dsh-write-guard/<relative path>` for each pair.
+/// Materialization writes `<TempDir>/dsh-write-guard/<relative path>` for each pair.
 pub const WRITE_GUARD_FILES: &[(&str, &str)] = &[
     ("package.json", WRITE_GUARD_PACKAGE_JSON),
     ("lib/index.js", WRITE_GUARD_INDEX_JS),
 ];
 
-// The embedded plugin artifact is the S03 materialization source; an empty
+// The embedded plugin artifact is the materialization source; an empty
 // snapshot would silently produce an unloadable plugin tree, so the non-empty
 // invariant is enforced at compile time as well as at runtime by a unit test.
 const _: () = assert!(!WRITE_GUARD_PACKAGE_JSON.is_empty());
@@ -116,7 +116,7 @@ impl DshLaunch {
 
 /// Resolve the managed launch composition into a process command.
 ///
-/// Mirrors the S03 catalog probe launch exactly (Node wrapper for `.js`,
+/// Mirrors the catalog probe launch exactly (Node wrapper for `.js`,
 /// `.cjs`, `.mjs` entrypoints) so probe evidence cannot diverge from the
 /// adapter path.
 pub fn resolve_launch(launch: &DshLaunch) -> io::Result<Command> {
@@ -825,7 +825,7 @@ fn validate_dump_policy(value: &serde_yaml::Value) -> Result<(), String> {
 
 /// Parse and validate the managed build composition. Unknown fields or a
 /// non-`workspace-write` sandbox are rejected: the build composition is the
-/// only DSH permission surface S04.A is allowed to drive.
+/// only DSH permission surface the production adapter is allowed to drive.
 pub fn build_profile() -> Result<Value, String> {
     let profile: Value = serde_json::from_str(BUILD_PROFILE_JSON)
         .map_err(|error| format!("managed dsh build profile is invalid: {error}"))?;

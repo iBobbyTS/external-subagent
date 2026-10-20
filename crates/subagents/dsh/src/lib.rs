@@ -6,7 +6,7 @@
 //! folding). Task lifecycle, queueing, persistence, and process reaping stay
 //! with the daemon scheduler and the shared runtime driver.
 //!
-//! Production DSH spawn stays behind the S04 feature gate; nothing in this
+//! Production DSH spawn stays behind the DSH production feature gate; nothing in this
 //! crate installs a provider, writes user credentials, or mutates global
 //! provider configuration.
 

@@ -10,7 +10,7 @@ owned by the ZCode client is ever written by this product.
 
 Linux evidence (2026-10-09, Ubuntu 26.04 x86_64) is recorded in
 "Linux runtime distribution and discovery (observed 2026-10-09)" below and in
-[docs/acceptance/S05-linux-subagents-host-bindings.md](../acceptance/S05-linux-subagents-host-bindings.md).
+[docs/acceptance/linux-subagents-host-bindings-acceptance.md](../acceptance/linux-subagents-host-bindings-acceptance.md).
 
 ## Restricted spawn environments kill native binaries (verified live)
 
@@ -208,7 +208,7 @@ service generation must stay independent of the interactive shell
 environment (the same design the fixed unit PATH follows), and the product
 home already owns `~/.zcode`. The daemon runs the script with the `node` on
 its PATH (the systemd unit PATH carries the unit-rendering Node's bin
-directory since S04); `zcode.cjs --version` prints the same `0.16.9` under
+directory since the win32 path stage); `zcode.cjs --version` prints the same `0.16.9` under
 the nvm Node v24.17.0 and the bundled v22.16.0.
 
 **Live verification** (isolated product HOME/XDG, real runtime, throwaway

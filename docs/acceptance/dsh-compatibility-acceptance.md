@@ -1,6 +1,6 @@
-# S04 acceptance — DSH compatibility and strict-plan evidence
+# DSH compatibility and strict-plan acceptance
 
-S04 records the live DSH compatibility evidence and the boundary around
+This record captures the live DSH compatibility evidence and the boundary around
 production enablement. The reference executable was DSH `0.1.5-rc.1`, run in a
 disposable workspace.
 

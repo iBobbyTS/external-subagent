@@ -107,7 +107,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 
 ## 10. 接入状态
 
-> 本节由外围合同节（S03）追加；live smoke 证据待「集成与完成」阶段回填，当前仅登记实现面与已知缺口。
+> 本节由外围合同节（agent status）追加；live smoke 证据待「集成与完成」阶段回填，当前仅登记实现面与已知缺口。
 
 **注册与门控**：`agy` 已作为第 4 个 subagent 注册（`zcode`/`dsh`/`codex`/`agy`），传输为 `agy_stream_json`。生产 spawn 与顶层 `spawn_supported` 默认关闭，需要 `enabled + spawn_supported` 加绝对可执行的 `AGY_RUNTIME_PATH`；未满足时 status 如实报告 closed。
 

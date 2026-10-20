@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// S01-pinned DSH ACP wire fixture shared by the S01 probe, the S03 catalog
-// probe, and the S04.A build-loop contract tests. It speaks exactly one
+// DSH ACP wire fixture shared by the discovery probe, the catalog
+// probe, and the build-loop contract tests. It speaks exactly one
 // dialect: JSON-RPC 2.0 newline frames with protocolVersion 1, a `model`
 // config option, single-shot permission options on a real server request id,
 // and prompt settlements that fold a committed agent message.

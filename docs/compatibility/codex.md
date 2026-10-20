@@ -15,7 +15,7 @@ nvm launcher `/home/ibobby/.nvm/versions/node/v24.17.0/bin/codex`, a Node shim)
 — was verified live on 2026-10-09 through the external-subagent CLI; the
 app-server deltas from 0.154.0 and the live full-chain evidence are recorded in
 "Linux x86_64, codex-cli 0.162.0 (observed 2026-10-09)" below and in
-[docs/acceptance/S04-linux-codex-smoke.md](../acceptance/S04-linux-codex-smoke.md).
+[docs/acceptance/linux-codex-smoke-acceptance.md](../acceptance/linux-codex-smoke-acceptance.md).
 
 ## Implementation layout
 
@@ -285,11 +285,11 @@ Upstream Codex app-server supports native `developer_instructions` on `thread/st
 
 ## Linux x86_64, codex-cli 0.162.0 (observed 2026-10-09)
 
-Evidence gathered with `CODEX_HOME=/tmp/es-s04-codex-home` (throwaway) and a
+Evidence gathered with `CODEX_HOME=/tmp/es-codex-smoke-codex-home` (throwaway) and a
 probe under `tools/probes/codex-app-server/probe.mjs`; the real user Codex home
 was only read. The daemon drove three live turns (build/plan/yolo) that all
 settled `COMPLETED` with `final_text = "pong"` for `gpt-6-luna`
-([acceptance record](../acceptance/S04-linux-codex-smoke.md)).
+([acceptance record](../acceptance/linux-codex-smoke-acceptance.md)).
 
 Deltas from the 0.154.0 baseline, all additive — nothing the daemon reads moved:
 
@@ -321,7 +321,7 @@ Deltas from the 0.154.0 baseline, all additive — nothing the daemon reads move
   folded to `pong` exactly as on 0.154.0.
 - Linux runtime resolution (fixed 2026-10-09, not a protocol drift): the nvm
   `codex` is a Node launcher (`#! /usr/bin/env node`), so a daemon whose `PATH`
-  lacked that interpreter failed closed — the S03 systemd unit's fixed `PATH`
+  lacked that interpreter failed closed — the earlier systemd unit's fixed `PATH`
   had no Node, and `spawn` returned `SESSION_START_FAILED`/
   `stderr_tail: env: 'node': No such file or directory`. The Linux service PATH
   now appends `path.dirname(process.execPath)` (the directory of the Node that
@@ -331,13 +331,13 @@ Deltas from the 0.154.0 baseline, all additive — nothing the daemon reads move
   `systemd-run` unit with the generated unit PATH): the daemon spawned
   `node …/bin/codex app-server --listen stdio://` → the vendored native codex
   binary in the unit cgroup, and live build/plan chains completed
-  ([acceptance record](../acceptance/S04-linux-codex-smoke.md)).
+  ([acceptance record](../acceptance/linux-codex-smoke-acceptance.md)).
 
 ### Plugin/MCP host-binding surface on Linux 0.162.0 (observed 2026-10-09)
 
 The full managed binding surface was exercised live on Linux through the
 product CLI with a throwaway `CODEX_HOME` and an isolated product HOME/XDG
-tree ([S05 acceptance](../acceptance/S05-linux-subagents-host-bindings.md)):
+tree ([host-bindings acceptance](../acceptance/linux-subagents-host-bindings-acceptance.md)):
 `install-plugin codex` (staging → official `marketplace add` + `plugin add`,
 cache verified, D08 claim), a repeat install (idempotent, claim deduplicated),
 `install-plugin codex --uninstall` (official `plugin remove`, cache cleared,

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-// DSH remains discovery-only until the S04 gate is explicitly opened.
+// DSH remains discovery-only until the DSH production gate is explicitly opened.
 test('dsh policy is fail-closed for unsupported spawn modes', async () => {
   const { subagentsCommand } = await import('../../cli/commands/agents.mjs');
   const config = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-policy-'));

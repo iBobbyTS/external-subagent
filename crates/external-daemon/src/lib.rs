@@ -153,7 +153,7 @@ mod terminal_reap_proof_tests {
     }
 }
 
-/// Failure code for the S01 transport closure: the runtime rejected an
+/// Failure code for the transport closure: the runtime rejected an
 /// oversized NDJSON frame, so the provider can no longer deliver a truthful
 /// terminal and the task is failed explicitly instead of hanging RUNNING.
 pub(crate) const TRANSPORT_FRAME_LIMIT_REASON: &str = "RUNTIME_TRANSPORT_FRAME_LIMIT";
@@ -1837,7 +1837,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn admitted_effort_reaches_the_create_frame_and_an_equal_echo_proceeds() {
-        let workspace = workspace("s03-effort-equal-");
+        let workspace = workspace("effort-equal-");
         let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("high")));
         let submitted = scheduler
             .enqueue_general_with_admission(
@@ -1872,7 +1872,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn a_diverging_thought_echo_fails_closed_before_any_turn() {
-        let workspace = workspace("s03-effort-mismatch-");
+        let workspace = workspace("effort-mismatch-");
         let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("low")));
         let submitted = scheduler
             .enqueue_general_with_admission(
@@ -1922,7 +1922,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn a_missing_thought_echo_is_diagnostic_only_and_proceeds() {
-        let workspace = workspace("s03-effort-missing-");
+        let workspace = workspace("effort-missing-");
         let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(None));
         let submitted = scheduler
             .enqueue_general_with_admission(
@@ -1954,7 +1954,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn a_task_without_an_admitted_effort_keeps_the_byte_identical_create_frame() {
-        let workspace = workspace("s03-effort-none-");
+        let workspace = workspace("effort-none-");
         let scheduler = effort_scheduler(workspace.path(), &effort_bootstrap_script(Some("high")));
         let submitted = scheduler
             .enqueue_general_with_admission(
@@ -2026,10 +2026,10 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn resume_carries_the_admitted_effort_and_confirms_the_same_echo_helper() {
-        let workspace = workspace("s03-effort-resume-");
+        let workspace = workspace("effort-resume-");
         let task = effort_task(
             workspace.path(),
-            "s03-resume-equal",
+            "resume-equal",
             Some("high"),
             Some("effort-session"),
         );
@@ -2053,10 +2053,10 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     #[test]
     fn a_diverging_resume_echo_fails_closed_and_a_missing_one_proceeds() {
-        let diverge = workspace("s03-effort-resume-diverge-");
+        let diverge = workspace("effort-resume-diverge-");
         let task = effort_task(
             diverge.path(),
-            "s03-resume-diverge",
+            "resume-diverge",
             Some("high"),
             Some("effort-session"),
         );
@@ -2068,10 +2068,10 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
             other => panic!("diverging resume echo must fail closed: {other:?}"),
         }
 
-        let missing = workspace("s03-effort-resume-missing-");
+        let missing = workspace("effort-resume-missing-");
         let task = effort_task(
             missing.path(),
-            "s03-resume-missing",
+            "resume-missing",
             Some("high"),
             Some("effort-session"),
         );
@@ -2120,7 +2120,7 @@ mod task_route_tests {
         let repository = tempfile::tempdir().unwrap();
         let manifest = external_core::GeneralTaskManifest {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
-            agent_id: "s01-legacy-row".into(),
+            agent_id: "legacy-row".into(),
             repository: repository.path().to_path_buf(),
             permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "legacy row".into(),
@@ -2164,7 +2164,7 @@ mod task_route_tests {
         let repository = tempfile::tempdir().unwrap();
         let manifest = external_core::GeneralTaskManifest {
             schema: external_core::GENERAL_TASK_SCHEMA.into(),
-            agent_id: "s02-admission-model".into(),
+            agent_id: "admission-model".into(),
             repository: repository.path().to_path_buf(),
             permission_mode: Some(external_core::PermissionMode::Plan),
             prompt: "model".into(),
@@ -2210,7 +2210,7 @@ mod task_route_tests {
         // fail closed at the task-route decode instead of silently routing.
         let legacy_json = serde_json::json!({
             "schema": external_core::GENERAL_TASK_SCHEMA,
-            "agent_id": "s01-legacy-row",
+            "agent_id": "legacy-row",
             "repository": "/repo",
             "workspace": {"path": "/repo", "scratch_root": "/tmp/legacy"},
             "permission_mode": "plan",
@@ -2222,7 +2222,7 @@ mod task_route_tests {
         })
         .to_string();
         let record = TaskRecord {
-            agent_id: "s01-legacy-row".into(),
+            agent_id: "legacy-row".into(),
             repository: "/repo".into(),
             phase: TaskPhase::Queued,
             outcome: None,

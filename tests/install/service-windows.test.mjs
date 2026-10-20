@@ -1,4 +1,4 @@
-// S03 Windows SCM backend oracles.  The real cli/install/service-windows.mjs
+// Windows SCM backend oracles.  The real cli/install/service-windows.mjs
 // is exercised through its injectable `options.sc` seam (the twin of the
 // launchd/systemd doubles): query parsing, create/start/stop/delete argument
 // construction (including binPath quoting), idempotence, bounded stop

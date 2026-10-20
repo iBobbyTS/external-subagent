@@ -37,11 +37,11 @@
 
 | 交付单元 | Commit Hash | 提交信息与核心产物 | 验证证据指针 (HANDOFF) | 核心审查与验证结论 |
 |---|---|---|---|---|
-| **S01** | `47c4e47` | `docs(windows-port): 平台差异矩阵与分阶段移植计划`<br>• `docs/windows-port/PLATFORM-MATRIX.md`<br>• `docs/windows-port/PORT-PLAN.md` | `.agent-work/handoffs/windows-port-prep/S01-HANDOFF.md` | 矩阵覆盖 10/10 平台构造族且四列齐备；演进计划分五阶段且四要素齐备；全部 40+ 源码行号与具名符号经只读命令核验证实。 |
-| **S02** | `aec2069` | `feat(runtime): Windows fail-closed 平台骨架`<br>• `crates/external-runtime/src/bin/orphan-spawn-test.rs`<br>• `crates/external-runtime/src/lib.rs` | `.agent-work/handoffs/windows-port-prep/S02-HANDOFF.md` | MinGW Windows 交叉编译 check 0 error / 0 warning；宿主 40 单元测试 + 28 detached 测试全绿；`gated_spawn` 前置拒绝断言通过。 |
-| **S03** | `d72f65d` | `feat(daemon,mcp): RPC 传输解耦与 Windows 交叉编译清零`<br>• `crates/external-daemon/src/rpc/transport.rs`<br>• `crates/external-daemon/src/rpc/windows.rs`<br>• `crates/external-daemon/src/rpc/unix.rs`<br>• `crates/external-daemon/src/rpc.rs`<br>• `crates/external-daemon/src/lib.rs`<br>• `crates/external-daemon/src/scheduler/diagnostics.rs`<br>• `crates/external-daemon/src/scheduler/admission.rs`<br>• `crates/external-daemon/src/main.rs`<br>• `crates/external-mcp/src/lib.rs`<br>• `crates/external-runtime/src/lib.rs` | `.agent-work/handoffs/windows-port-prep/S03-HANDOFF.md` | 全 Workspace 交叉编译清零（`cargo check --workspace --target x86_64-pc-windows-gnu` 报 0 error）；宿主 daemon 478 项测试全绿，mcp 5 项全绿；Rust `tests/` 目录零改动。 |
-| **S04** | `b6a9fce` | `feat(cli): win32 路径分支与服务 fail-closed 骨架`<br>• `cli/paths.mjs`<br>• `cli/install/service-windows.mjs`<br>• `cli/install/service-macos.mjs`<br>• `cli/install/service-activation.mjs`<br>• `tests/platform/windows.test.mjs` | `.agent-work/handoffs/windows-port-prep/S04-HANDOFF.md` | JS 语法 `node --check` 0 error；平台测试 14/14 全绿（含新增测试 4 校验 12 字段与测试 5 校验 win32 服务 seam 拒绝且未调用 getuid/launchctl/systemctl）；工作树仅 5 授权文件。 |
-| **S05** | `da1b4a8` | `ci(windows): 新增 windows-latest check workflow`<br>• `.github/workflows/windows-check.yml` | `.agent-work/handoffs/windows-port-prep/S05-HANDOFF.md` | YAML 解析与 schema 校验通过（Ruby（S05 HANDOFF）与 Python/PyYAML（S05 CODE A）均有解析证据）；`npm-publish.yml` 保持零改动；windows-latest runner 原生 MSVC check 门禁搭建完毕。 |
+| **Platform matrix** | `47c4e47` | `docs(windows-port): 平台差异矩阵与分阶段移植计划`<br>• `docs/windows-port/PLATFORM-MATRIX.md`<br>• `docs/windows-port/PORT-PLAN.md` | `.agent-work/handoffs/windows-port-prep/` | 矩阵覆盖 10/10 平台构造族且四列齐备；演进计划分五阶段且四要素齐备；全部 40+ 源码行号与具名符号经只读命令核验证实。 |
+| **Fail-closed skeleton** | `aec2069` | `feat(runtime): Windows fail-closed 平台骨架`<br>• `crates/external-runtime/src/bin/orphan-spawn-test.rs`<br>• `crates/external-runtime/src/lib.rs` | `.agent-work/handoffs/windows-port-prep/` | MinGW Windows 交叉编译 check 0 error / 0 warning；宿主 40 单元测试 + 28 detached 测试全绿；`gated_spawn` 前置拒绝断言通过。 |
+| **RPC decoupling** | `d72f65d` | `feat(daemon,mcp): RPC 传输解耦与 Windows 交叉编译清零`<br>• `crates/external-daemon/src/rpc/transport.rs`<br>• `crates/external-daemon/src/rpc/windows.rs`<br>• `crates/external-daemon/src/rpc/unix.rs`<br>• `crates/external-daemon/src/rpc.rs`<br>• `crates/external-daemon/src/lib.rs`<br>• `crates/external-daemon/src/scheduler/diagnostics.rs`<br>• `crates/external-daemon/src/scheduler/admission.rs`<br>• `crates/external-daemon/src/main.rs`<br>• `crates/external-mcp/src/lib.rs`<br>• `crates/external-runtime/src/lib.rs` | `.agent-work/handoffs/windows-port-prep/` | 全 Workspace 交叉编译清零（`cargo check --workspace --target x86_64-pc-windows-gnu` 报 0 error）；宿主 daemon 478 项测试全绿，mcp 5 项全绿；Rust `tests/` 目录零改动。 |
+| **CLI and win32 paths** | `b6a9fce` | `feat(cli): win32 路径分支与服务 fail-closed 骨架`<br>• `cli/paths.mjs`<br>• `cli/install/service-windows.mjs`<br>• `cli/install/service-macos.mjs`<br>• `cli/install/service-activation.mjs`<br>• `tests/platform/windows.test.mjs` | `.agent-work/handoffs/windows-port-prep/` | JS 语法 `node --check` 0 error；平台测试 14/14 全绿（含新增测试 4 校验 12 字段与测试 5 校验 win32 服务 seam 拒绝且未调用 getuid/launchctl/systemctl）；工作树仅 5 授权文件。 |
+| **Windows CI** | `da1b4a8` | `ci(windows): 新增 windows-latest check workflow`<br>• `.github/workflows/windows-check.yml` | `.agent-work/handoffs/windows-port-prep/` | YAML 解析与 schema 校验通过（Ruby（Windows CI HANDOFF）与 Python/PyYAML（Windows CI CODE A）均有解析证据）；`npm-publish.yml` 保持零改动；windows-latest runner 原生 MSVC check 门禁搭建完毕。 |
 
 ### 2. 已知环境缺口与 Stash 对照证据 (Host Pre-existing Gaps)
 在宿主开发机（macOS darwin arm64）上运行完整 Node 测试套件时，可观察到 4 项由于宿主开发环境污染或未提供打包产物引起的假失败。这些失败与 Windows 移植改动完全无关：
@@ -50,9 +50,9 @@
 3. `tests/install/fresh-install.test.mjs`：测试临时重设的 `HOME` 隔离目录未透传 `RUSTUP_HOME`，且本地源码树未自带 CI 交叉构建生成的预编译 `linux-x64` 发布 tarball 产物。
 
 **Stash 对照判定证据（引自 `.agent-work/FEATURE-STATE.md:54`）**：
-在 S04 交付后，系统负责人（main）使用 `git stash` 针对基线状态（base `ff726bd`）与当前候选分支进行了同环境对照复跑：
+在 CLI/win32 路径阶段交付后，系统负责人（main）使用 `git stash` 针对基线状态（base `ff726bd`）与当前候选分支进行了同环境对照复跑：
 - 在同一宿主环境下，base 与候选的失败用例集**逐项完全一致**；
-- 结论证明 **S04 diff 零新增失败**，上述 4 项失败确认为宿主环境固有特征，代码改动未引入任何功能退化。
+- 结论证明 **该阶段 diff 零新增失败**，上述 4 项失败确认为宿主环境固有特征，代码改动未引入任何功能退化。
 
 ---
 
@@ -75,7 +75,7 @@
 - **真机开发要求**：真机 Agent 在真实 Windows 设备上开发时，应使用原生 MSVC 工具链（`cargo check --workspace --all-targets`），无需使用 MinGW 前置工具链。
 
 ### 3. cargo-clean 合规记录与 Target 目录契约
-- **合规记录**：依据 PLAN 冻结决策 B4，在阶段 0 执行 S02 前执行了一次性 `cargo clean`（彻底清理约 2.1 GiB 缓存），遵循合规审计要求，确保后续构建的二进制完全来自最新源码。
+- **合规记录**：依据 PLAN 冻结决策 B4，在阶段 0 执行 fail-closed 骨架前执行了一次性 `cargo clean`（彻底清理约 2.1 GiB 缓存），遵循合规审计要求，确保后续构建的二进制完全来自最新源码。
 - **Target 目录铁律**：此后所有构建与测试**必须统一使用仓库根目录默认的 `target/` 目录**。严禁通过环境变量 `CARGO_TARGET_DIR` 隔离编译产物，因为 Node CLI 的测试套件存在硬编码契约（如 `tests/fixtures/restart-daemon.mjs:30-36`、`tests/cli/linux-subagents.test.mjs:103-113` 固定 spawn `target/debug/external-subagentd`），隔离 target 会导致测试运行找不到二进制或运行到旧二进制假绿。
 
 ### 4. CI 触发方式与未验证状态
@@ -99,20 +99,20 @@
 - **业务目标**：在 Windows 真机上实现基于 Win32 命名管道（Named Pipe）的服务端与客户端通信协议；使 Node CLI 能够通过命名管道连接 daemon 进程；使 `external-mcp` 的 stdio bridge 对接命名管道；消除 Rust 集成测试目录 `tests/` 中的 Unix 假设并全部编译通过。
 
 #### 1. 入口 file:line
-- `crates/external-daemon/src/rpc/windows.rs`（计划新增，已在 S03 落地为骨架桩，行号待阶段 1 产物生成后核证；核验命令：`grep -n "RpcServer" crates/external-daemon/src/rpc/windows.rs`）：
+- `crates/external-daemon/src/rpc/windows.rs`（计划新增，已在 RPC 解耦阶段落地为骨架桩，行号待阶段 1 产物生成后核证；核验命令：`grep -n "RpcServer" crates/external-daemon/src/rpc/windows.rs`）：
   - 管道路径命名空间必须使用 `\\.\pipe\` 前缀（9 字符，双反斜杠开头，已由 `cli/paths.mjs:99` 固化为 `\\\\.\\pipe\\${PRODUCT_NAME}-daemon`；核验命令：`sed -n '97,100p' cli/paths.mjs`）；
   - 调用 `CreateNamedPipeW` 配置 `PIPE_ACCESS_DUPLEX`、`PIPE_TYPE_BYTE`、`PIPE_READMODE_BYTE`、`PIPE_WAIT`，并指定并发实例上限 `nMaxInstances`（对齐 `ServerOptions::max_connections`，核验命令：`sed -n '18,30p' crates/external-daemon/src/rpc/transport.rs`）；
   - **防劫持保护**：首实例创建管道时**必须**传入标志位 `FILE_FLAG_FIRST_PIPE_INSTANCE`，确保只有服务端能创建主监听端点，防止恶意进程抢占管道端点；
   - **安全描述符**：配置严格的 `SECURITY_ATTRIBUTES`（DACL），限制仅当前用户 SID 拥有读写访问权限；
   - **互斥与 Stale 判定**：Windows 命名管道不具备 POSIX 文件系统的 `dev`/`ino` 节点标识。使用 Win32 具名互斥体（`CreateMutexW`）或文件锁（`LockFileEx`）保证单例，或在 bind 前探测管道连接状态判定是否残留。
-- `crates/external-daemon/src/rpc/transport.rs`（计划新增，已在 S03 落地为共享层，行号待阶段 1 产物生成后核证；核验命令：`grep -n "handle_connection" crates/external-daemon/src/rpc/transport.rs`）：
+- `crates/external-daemon/src/rpc/transport.rs`（计划新增，已在 RPC 解耦阶段落地为共享层，行号待阶段 1 产物生成后核证；核验命令：`grep -n "handle_connection" crates/external-daemon/src/rpc/transport.rs`）：
   - 对接 Windows Named Pipe Stream 读写抽象，复用通用的泛型连接处理函数 `handle_connection<S: Read + Write, D: Fn(&S) -> bool>`（核验命令：`sed -n '105,113p' crates/external-daemon/src/rpc/transport.rs`）。
-- `crates/external-daemon/src/lib.rs:1676-1723`（Windows `Daemon` 生命周期桩替换，核验命令：`sed -n '1676,1723p' crates/external-daemon/src/lib.rs`；证据来源：S01 矩阵 `PLATFORM-MATRIX.md:64` 与 S03 `S03-HANDOFF.md:19`）：
+- `crates/external-daemon/src/lib.rs:1676-1723`（Windows `Daemon` 生命周期桩替换，核验命令：`sed -n '1676,1723p' crates/external-daemon/src/lib.rs`；证据来源：平台矩阵 `PLATFORM-MATRIX.md:64` 与 RPC 解耦阶段的 handoff）：
   - 当前 `#[cfg(not(unix))]` 的 `Daemon` 桩在 `start_with_shutdown` 中无条件返回 `Unsupported("windows: daemon pending real-machine implementation")`，`crates/external-daemon/src/main.rs:123-137` 调用该方法并直接向上传播错误；若不替换该桩为真实生命周期实现，文档中的 daemon 直启验证命令无法运行；
   - **模块边界注意**：Unix 真实实现在整文件受 `#[cfg(unix)]` 门控的 `crates/external-daemon/src/daemon.rs`（核验命令：`sed -n '1,12p' crates/external-daemon/src/daemon.rs`），不能只改该文件便宣称 Windows daemon 已接通；Windows 必须在 `lib.rs:1681-1723` 处提供生产级生命周期实现（或新增 Windows 专属模块并在 `lib.rs` 按平台引入），打通启动、`claim_thread` 调度循环、RPC 监听与优雅停机（`shutdown`）。
-- `crates/external-daemon/src/rpc/handlers.rs:75-77, 801-806`（RPC 随机源 Windows 适配，核验命令：`sed -n '75,77p; 801,806p' crates/external-daemon/src/rpc/handlers.rs`；证据来源：S01 矩阵 `PLATFORM-MATRIX.md:85` 与 S03 `S03-HANDOFF.md:22`）：
+- `crates/external-daemon/src/rpc/handlers.rs:75-77, 801-806`（RPC 随机源 Windows 适配，核验命令：`sed -n '75,77p; 801,806p' crates/external-daemon/src/rpc/handlers.rs`；证据来源：平台矩阵 `PLATFORM-MATRIX.md:85` 与 RPC 解耦阶段的 handoff）：
   - `RpcService::new` 构造服务时调用 `opaque_generation()` 生成 `service_generation`；当前实现硬读 `/dev/urandom`（`:801-806`），在缺少该设备的 Windows 上返回 `RpcServiceConfigError::GenerationUnavailable`，会直接阻断正常的 daemon 启动与 RPC 服务组合；
-  - Windows 真机实现须切换为 Windows CNG 接口（`ProcessPrng` 或 `BCryptGenRandom`，S01 矩阵 :85 已记录为真机阶段项），确保在 Windows 原生环境下成功生成 16 字节随机十六进制代际字符串，消除启动阻断。
+  - Windows 真机实现须切换为 Windows CNG 接口（`ProcessPrng` 或 `BCryptGenRandom`，平台矩阵 :85 已记录为真机阶段项），确保在 Windows 原生环境下成功生成 16 字节随机十六进制代际字符串，消除启动阻断。
 - `crates/external-mcp/src/lib.rs:72-81`（`serve_stdio` Windows 桩，核验命令：`sed -n '72,81p' crates/external-mcp/src/lib.rs`）：
   - 在 Windows 平台上使用 `tokio::net::windows::named_pipe::ClientOptions` 连接守护进程具名管道端点，替换当前的 fail-closed Unsupported 错误桩。
 - `crates/external-daemon/src/daemon.rs:15, 23, 202`（`McpServer` 结构体定义、实现与 bind，核验命令：`sed -n '15p; 23p; 202p' crates/external-daemon/src/daemon.rs`）：

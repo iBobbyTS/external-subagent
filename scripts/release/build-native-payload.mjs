@@ -31,7 +31,7 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 // the same tuple under its parallel native-debug directory.
 //
 // win32-x64 is staged as a controlled test artifact before NATIVE_PLATFORMS
-// is opened for Windows (S04): the tuple is explicit here, never resolved by
+// is opened for Windows distribution: the tuple is explicit here, never resolved by
 // nativePlatform(), so `npm pack` can build and inspect the Windows payload
 // on a real Windows host without activating distribution.  Windows cargo
 // output carries the `.exe` suffix, and the manifest records the same names.

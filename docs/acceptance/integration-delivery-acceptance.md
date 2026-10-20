@@ -1,7 +1,7 @@
-# S07 acceptance — integration, dual-platform equivalence and delivery
+# Integration, dual-platform equivalence and delivery acceptance
 
-Section S07 of `external-subagent-linux-full-20261009`. S07 adds no product
-implementation; it assembles the verification matrix over the accepted S01–S06
+Acceptance section of `external-subagent-linux-full-20261009`. This section adds no product
+implementation; it assembles the verification matrix over the accepted probe through upgrade coordination
 sections, runs the standard baseline on Linux for the first time, exercises one
 real end-to-end install from the packed `daaaa95` tarball under the real systemd
 user manager, and records the macOS zero-regression row and the known
@@ -46,13 +46,13 @@ the live upgrade oracle `tests/upgrade/drain-live.test.mjs` (skip reason
 | 组合 | 结论 | 证据指针 | 标注 |
 |---|---|---|---|
 | Linux 全新安装（tarball→init→systemd→CLI 全命令面→stop→uninstall） | **PASS** | §4 below | OBSERVED |
-| codex × CLI（enable/probe/gpt-6-luna spawn→wait/result/close、四模式、fail-closed） | **PASS** | [S04-linux-codex-smoke.md](S04-linux-codex-smoke.md) (S04 FINAL) | 引用 S04 |
-| zcode × CLI（enable/models/probe/spawn） | **PASS** (split across two hosts/homes) | [S05-linux-subagents-host-bindings.md](S05-linux-subagents-host-bindings.md) §3 | 引用 S05 |
-| dsh × CLI | **BLOCKER (runtime absent)** — fail-closed `agent_probe_failed`/`UNAVAILABLE reason=missing`, no spawn claimed | S05 doc §2/§4; §4 below re-observed | 引用 S05 + OBSERVED |
-| agy × CLI | **BLOCKER (runtime absent)** — same fail-closed refusal | S05 doc §2/§4; §4 below re-observed | 引用 S05 + OBSERVED |
-| host 绑定（install-plugin codex\|zcode，install-mcp） | **PASS** | S05 doc §6 | 引用 S05 |
-| 升级协调（排空/激活/服务重启） | **PARTIAL** — Linux suite green on the seam-parametrized subset; live vA→vB drain oracle is macOS-only | §1 skips; `tests/upgrade/drain-live.test.mjs` gate; S03 FINAL systemd restart evidence | OBSERVED (suite) + boundary |
-| macOS 零退化 | **PARTIAL** — local seams + frozen darwin bytes verified locally; full mac-runner suite/pack gate still owed | §3; `launchd/` diff base→HEAD empty; S01/S03 FINALs | OBSERVED(local) + 引用 + external gate |
+| codex × CLI（enable/probe/gpt-6-luna spawn→wait/result/close、四模式、fail-closed） | **PASS** | [linux-codex-smoke-acceptance.md](linux-codex-smoke-acceptance.md) (Codex smoke FINAL) | 引用 Codex smoke record |
+| zcode × CLI（enable/models/probe/spawn） | **PASS** (split across two hosts/homes) | [linux-subagents-host-bindings-acceptance.md](linux-subagents-host-bindings-acceptance.md) §3 | 引用 host-bindings record |
+| dsh × CLI | **BLOCKER (runtime absent)** — fail-closed `agent_probe_failed`/`UNAVAILABLE reason=missing`, no spawn claimed | host-bindings record §2/§4; §4 below re-observed | 引用 host-bindings record + OBSERVED |
+| agy × CLI | **BLOCKER (runtime absent)** — same fail-closed refusal | host-bindings record §2/§4; §4 below re-observed | 引用 host-bindings record + OBSERVED |
+| host 绑定（install-plugin codex\|zcode，install-mcp） | **PASS** | host-bindings record §6 | 引用 host-bindings record |
+| 升级协调（排空/激活/服务重启） | **PARTIAL** — Linux suite green on the seam-parametrized subset; live vA→vB drain oracle is macOS-only | §1 skips; `tests/upgrade/drain-live.test.mjs` gate; service-backend FINAL systemd restart evidence | OBSERVED (suite) + boundary |
+| macOS 零退化 | **PARTIAL** — local seams + frozen darwin bytes verified locally; full mac-runner suite/pack gate still owed | §3; `launchd/` diff base→HEAD empty; probe/service-backend FINALs | OBSERVED(local) + 引用 + external gate |
 | 平台测试 `tests/platform/{macos,linux,windows}.test.mjs` | **PASS** — 12 pass, 0 fail, 0 skip | `node --test tests/platform/*.test.mjs` | OBSERVED |
 
 ## 3. macOS zero-regression row (local portion, OBSERVED; full gate pending)
@@ -67,10 +67,10 @@ Locally verifiable and verified:
   `EXTERNAL_SUBAGENT_TEST_PLATFORM=darwin` seam and asserts the launchd service
   view plus PATH-independent, side-effect-free darwin dry-run.
 - `git diff 2756545..daaaa95 -- launchd/` is **empty**: the launchd plist
-  template is byte-frozen. (S03 FINAL additionally verified the darwin plist
+  template is byte-frozen. (the service-backend FINAL additionally verified the darwin plist
   output bytes are preserved through the platform-dispatch refactor of
   `cli/install/service-macos.mjs`.)
-- The darwin payload bytes were proven unchanged by the S01 FINAL review, and
+- The darwin payload bytes were proven unchanged by the probe FINAL review, and
   the dual-platform pack gate (`tests/release/check-native-tarball.test.mjs`)
   passes with the Mach-O arm64 image probe and `darwin-arm64` manifest
   consistency.
@@ -83,12 +83,12 @@ runner before any release; the Linux side is verified here.
 Tarball: `npm pack` from `daaaa95` (prepack rebuilt the `linux-x64` release
 payload; postpack dual-platform gate passed) → `external-subagent-0.4.1.tgz`
 containing both `npm/native/darwin-arm64/` and `npm/native/linux-x64/`.
-Controlled `HOME=/tmp/s07-e2e/home`, `XDG_DATA_HOME`/`XDG_STATE_HOME` under
-`/tmp/s07-e2e`, controlled npm prefix/cache, `umask 022`. `XDG_CONFIG_HOME` was
+Controlled `HOME=/tmp/integration-e2e/home`, `XDG_DATA_HOME`/`XDG_STATE_HOME` under
+`/tmp/integration-e2e`, controlled npm prefix/cache, `umask 022`. `XDG_CONFIG_HOME` was
 left at the **real** `/home/ibobby/.config` because the real systemd user
 manager's unit search path is fixed to the manager's own HOME (an isolated
 `XDG_CONFIG_HOME` unit is `LoadState=not-found` to the running manager — the
-same boundary S04 recorded); the resulting unit was removed and the real
+same boundary the Codex smoke record established); the resulting unit was removed and the real
 `~/.config/systemd/user/` left holding only its pre-existing
 `codex-app-server.service`.
 
@@ -98,7 +98,7 @@ same boundary S04 recorded); the resulting unit was removed and the real
 | `external-subagent init` | EXIT 0; `completed=[verify-payload, check-path, create-data, write-product-config, install-launch-agent, start-service, publish-active-payload]`; payload `linux-x64 0.4.1` verified (sha256 `d6752c05…` for `external-subagentd`); unit written to `/home/ibobby/.config/systemd/user/external-subagent.service` (mode 0600). |
 | `status` | EXIT 0; `service={registered:true, state:"active", sub_state:"running"}`; real `systemctl --user show` → `LoadState=loaded ActiveState=active UnitFileState=enabled MainPID=212810`. |
 | CLI whole-command-surface smoke (read-only) | `version`=0.4.1, `diagnose`, `config get`, `subagents list`, `agents list` (alias), `profile list`, `subagents status`, `subagents probe codex|dsh|agy|zcode`, `subagents models codex` — all EXIT 0. `probe codex` → `READY` 0.162.0 (PATH discovery); `models codex` → `supported:false, reason:codex_models_probed_live_only`; `probe dsh`/`agy`/`zcode` → `UNAVAILABLE reason=missing` (under the controlled home none of these runtimes is present). |
-| codex `gpt-6-luna` spawn | **Not re-run** (quota minimisation per the S07 contract); referenced from S04, which ran the full `spawn→wait→result→close` chain for build/plan/yolo attached **and** under a real systemd-hosted daemon. |
+| codex `gpt-6-luna` spawn | **Not re-run** (quota minimisation per this section's contract); referenced from the Codex smoke record, which ran the full `spawn→wait→result→close` chain for build/plan/yolo attached **and** under a real systemd-hosted daemon. |
 | `stop` | EXIT 0; `removed:true, socket_removed:true`; `systemctl` → `ActiveState=inactive MainPID=0`. Repeat `stop` → `already_stopped` (idempotent). |
 | `uninstall` | EXIT 0; `removed_service_definition:true, data_retained:true`; unit file gone; `systemctl --user show` → `LoadState=not-found`. |
 | Cleanup | Real `~/.config/systemd/user/` recovered to exactly `codex-app-server.service` + `default.target.wants/`; controlled tree and tarball removed; `git status` clean; no `external-subagentd` process left. |
@@ -141,11 +141,11 @@ No other pre-existing flake surfaced in the parallel rerun.
 
 ## 6. Known boundaries (honest, carried)
 
-- **detached process model (D-S06)** — not ported to Linux: `auto` degrades to
+- **detached process model** — not ported to Linux: `auto` degrades to
   `attached` with one diagnostic, an explicit `detached` on the incapable host
   fails startup loudly. `crates/external-daemon/src/main.rs`
   `resolve_runtime_process_model`.
-- **linux-arm64 excluded** (D-S03) — only `darwin-arm64` + `linux-x64` payloads.
+- **linux-arm64 excluded** — only `darwin-arm64` + `linux-x64` payloads.
 - **dsh / agy runtime absent on the verification host** — probes fail closed;
   no spawn smoke claimed (upstream runtime install is out of scope).
 - **zcode runtime form is a single OBSERVED shape** — `<home>/.zcode/server/
@@ -165,7 +165,7 @@ No other pre-existing flake surfaced in the parallel rerun.
   extraction alike) before the strict read, and the strict verifier itself is
   not relaxed. The repair covers only the manifest-named binaries (not the
   manifest or directories), is skipped for symlinks/absent files, and an
-  unrepairable file (e.g. an unwritable target) still fails closed. S06's live
+  unrepairable file (e.g. an unwritable target) still fails closed. The upgrade live
   evidence exercised `0002` and `0775`; the `0077` case is covered by the same
   code path but was not separately live-run.
 - **`tools/probes` has no `affected` mapping** — `scripts/test/affected.mjs`
@@ -173,15 +173,15 @@ No other pre-existing flake surfaced in the parallel rerun.
   `tools/probes/codex-app-server/probe.mjs`), so probe changes are not
   auto-selected by `npm run test:affected`.
 - **real-home boundaries** — no `~/.codex` / real `~/.zcode/cli/config.json`
-  writes; host bindings were verified against controlled homes (S05).
+  writes; host bindings were verified against controlled homes (host bindings).
 
-## 7. S07 completion-condition cross-check (PLAN-FULL S07)
+## 7. Completion-condition cross-check (PLAN-FULL integration section)
 
 | Condition | Status |
 |---|---|
-| All sections accepted (incl. TWO-section A/B fresh native review) | **MET** — S01–S06 ACCEPTED (S03/S05/S06 TWO; S01/S02/S04 ONE) |
-| Support matrix records platform × subagent × host with versions (codex 0.162.0/Linux) | **MET** — §2 + S04/S05 docs |
-| Deliverable: dual-platform tarball, source, updated README/operations/compatibility, `docs/acceptance/` records | **MET** — this file, S04/S05 docs, operations.md updated; tarball reproducible via `npm pack` |
+| All sections accepted (incl. TWO-section A/B fresh native review) | **MET** — probe through upgrade coordination ACCEPTED (service-backend/host-bindings/upgrade TWO; probe/ZCode-lifecycle/DSH-production ONE) |
+| Support matrix records platform × subagent × host with versions (codex 0.162.0/Linux) | **MET** — §2 + Codex-smoke/host-bindings records |
+| Deliverable: dual-platform tarball, source, updated README/operations/compatibility, `docs/acceptance/` records | **MET** — this file, Codex-smoke/host-bindings records, operations.md updated; tarball reproducible via `npm pack` |
 | No DONE where live not run / review missing / decision unapproved | **HONORED** — macOS row and CI dry-run marked open; dsh/agy recorded as blockers |
 | macOS zero-degradation on a mac runner | **OPEN (external)** — mac runner unavailable |
 | CI dry-run | **OPEN (external)** — no GitHub Actions execution here |

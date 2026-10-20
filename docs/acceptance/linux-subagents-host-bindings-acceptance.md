@@ -1,6 +1,6 @@
-# S05 acceptance — remaining subagents and host bindings on Linux (2026-10-09)
+# Remaining subagents and host bindings on Linux acceptance (2026-10-09)
 
-Section S05 of `external-subagent-linux-full-20261009`: the zcode/dsh/agy
+Acceptance section of `external-subagent-linux-full-20261009`: the zcode/dsh/agy
 subagents and both host bindings verified on Linux x86_64, plus the two
 production path fixes the section owned (the scope policy verifier default
 path and the zcode runtime constant) and three later fixes expanded into the
@@ -11,7 +11,7 @@ host in the environment table unless marked otherwise; all product state
 lived in an isolated HOME/XDG tree, all Codex interaction used a throwaway
 `CODEX_HOME`, and the zcode credentials used for the probe/spawn rounds were
 copied into the isolated home and deleted afterwards. Raw command outputs:
-`/tmp/es-s05-evidence/`.
+`/tmp/es-host-bindings-evidence/`.
 
 ## Environment (OBSERVED, 2026-10-09, times UTC)
 
@@ -22,14 +22,14 @@ copied into the isolated home and deleted afterwards. Raw command outputs:
 | Codex CLI | `codex-cli 0.162.0` (nvm bin, Node shim) |
 | ZCode Linux runtime | `~/.zcode/server/agents/glm/zcode.cjs`, `--version` → `0.16.9`; bundled `~/.zcode/server/node` v22.16.0; `agents/glm/.version` `0.13.3`; desktop `ZCODE_APP_VERSION=3.14.5`, attached-remote deployment (`ZCODE_SERVER_RUNTIME_ROOT` exported by the desktop, `zcode-agent` launcher defaults to `$HOME/.zcode/server`) |
 | dsh / agy | **not installed** — not on PATH, no `DSH_RUNTIME_PATH`/`AGY_RUNTIME_PATH` |
-| product HOME / XDG | `/tmp/es-s05-iso/home`, `XDG_{DATA,STATE,CONFIG}_HOME=/tmp/es-s05-iso/xdg-{data,state,config}` |
-| CODEX_HOME (throwaway) | `/tmp/es-s05-codex-home` |
-| daemon | release payload `npm/native/linux-x64/external-subagentd` (fail-closed round) and `target/debug/external-subagentd` (rebuilt with the S05 verifier fix, enable/models rounds) |
+| product HOME / XDG | `/tmp/es-host-bindings-iso/home`, `XDG_{DATA,STATE,CONFIG}_HOME=/tmp/es-host-bindings-iso/xdg-{data,state,config}` |
+| CODEX_HOME (throwaway) | `/tmp/es-host-bindings-codex-home` |
+| daemon | release payload `npm/native/linux-x64/external-subagentd` (fail-closed round) and `target/debug/external-subagentd` (rebuilt with the verifier fix, enable/models rounds) |
 
 `init --skip-service-start` verified the linux-x64 payload 0.4.1 and wrote the
 systemd unit **without** `--runtime` (the conventional Linux runtime location
 does not exist under the isolated HOME), with the fixed PATH carrying the
-nvm bin (S04 behavior).
+nvm bin (the Codex smoke behavior).
 
 ## 1. Production path fixes (code)
 
@@ -79,7 +79,7 @@ Daemon B (`--runtime ~/.zcode/server/agents/glm/zcode.cjs`):
 `restart_required=false`, config revision 2 (`enabled=true`,
 `spawn_supported=true`, no runtime_path persisted — the D1 rule holds).
 
-Daemon C (debug binary with the S05 verifier fix, XDG env exported):
+Daemon C (debug binary with the verifier fix, XDG env exported):
 `subagents models zcode` first isolated two gaps (§5), both fixed in the same
 section after the coordinator ruling — the post-fix re-verification (daemon D,
 same controlled tree, fixed verifier restaged by the then-current hook
@@ -110,7 +110,7 @@ the smoke.
 
 Neither runtime exists on this host (not on PATH, no env override), so
 enable/probe stop exactly at the fail-closed refusal (§2) and no spawn smoke
-is claimed. Upstream runtime installation is explicitly out of S05 scope
+is claimed. Upstream runtime installation is explicitly out of this section's scope
 (exclusions). This is a host-environment blocker, not a product defect: the
 same probes against the fixture runtimes remain covered by
 `tests/cli/agents-config.test.mjs` (dsh/codex enable paths) and the Rust
@@ -119,7 +119,7 @@ probe suites.
 ## 5. zcode read-only probe layers — two gaps found, fixed, re-verified
 
 Both were pinpointed with controlled experiments first (no product file
-modified during the diagnosis), then expanded into S05 by the coordinator
+modified during the diagnosis), then expanded into this section by the coordinator
 ruling and fixed:
 
 1. **Staged verifier script macOS path**
@@ -162,7 +162,7 @@ plan policy still held for the completed plan-mode turn).
 
 | flow | result |
 |---|---|
-| `install-plugin codex --codex-home /tmp/es-s05-codex-home` | `installed=true`, `cache_verified=true`, plugin `0.1.4` at `plugins/cache/personal/external-subagent/0.1.4`, D08 claim `{registered:true, homes:1}` |
+| `install-plugin codex --codex-home /tmp/es-host-bindings-codex-home` | `installed=true`, `cache_verified=true`, plugin `0.1.4` at `plugins/cache/personal/external-subagent/0.1.4`, D08 claim `{registered:true, homes:1}` |
 | repeat install | idempotent, `cache_verified=true`, claim `{deduplicated:true}` |
 | `install-plugin codex --uninstall` | official remove, cache gone, `claim_released=true`, registry `homes: []` |
 | `install-mcp --codex-home …` | TOML `[mcp_servers.external_subagent]` written (10 tools, linux-x64 facade, isolated socket); `codex mcp list` → one row, `Status: enabled`; `codex mcp list --json` shape captured |

@@ -533,11 +533,11 @@ test('an interpreter-path drift between installs refreshes in place instead of c
   }
 });
 
-// S03 upgrade regression: a managed staging tree written before the socket
+// Upgrade regression: a managed staging tree written before the socket
 // env rename (its `.mcp.json` pins the socket under the retired key) must
 // reconcile in place and end up carrying ONLY the current key.  The legacy
 // literal is assembled by the module under test, never spelled here.
-test('a managed staging bound under the retired socket key upgrades through reconcile to the current key only (S03)', () => {
+test('a managed staging bound under the retired socket key upgrades through reconcile to the current key only', () => {
   const { home, paths } = fixture({ config: foreignConfig() });
   try {
     installZcodePlugin(paths);
@@ -560,10 +560,10 @@ test('a managed staging bound under the retired socket key upgrades through reco
   }
 });
 
-// S03 boundary: the generalized ownership rule only accepts a socket that
+// Boundary: the generalized ownership rule only accepts a socket that
 // points at the product endpoint.  The same managed command pinned to a
 // stranger socket stays foreign under either env key.
-test('a staging bound to a foreign socket is still refused under either env key (S03)', () => {
+test('a staging bound to a foreign socket is still refused under either env key', () => {
   const { home, paths } = fixture();
   const source = pluginSourceRoot();
   const staging = paths.zcodePlugin;

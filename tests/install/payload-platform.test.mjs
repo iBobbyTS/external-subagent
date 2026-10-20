@@ -239,7 +239,7 @@ test('an unsupported platform option has no payload to verify', () => {
 
 test('the default unsupported message lists only the release-supported tuples', {
   // Only a host whose native payload resolver rejects the running tuple (the
-  // pre-S04 win32 host) can observe the default failure branch.
+  // legacy win32 host) can observe the default failure branch.
   skip: nativePlatform() !== null,
 }, () => {
   let error;

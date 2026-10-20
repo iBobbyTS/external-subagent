@@ -39,7 +39,7 @@ permissions:
 
 jobs:
   # Build the linux-x64 native payload on a Linux runner.  A single tarball
-  # carries both platform payloads (D-S05), so this artifact is what makes the
+  # carries both platform payloads, so this artifact is what makes the
   # macOS publish job's tarball complete; the pack gates reject a tarball that
   # is missing either platform.
   build-linux:

@@ -158,15 +158,15 @@ P17. 实际接受证据覆盖 fake transport、生产序列化边界、真正两
 
 | 要求／反例 | 责任 section | 可判错检查 |
 |---|---|---|
-| U01/U02，新项目不丢 ZCode 生命周期 | S02 | 老测试复原＋新命名空间真实 MCP/CLI lifecycle；第三 adapter 接缝由 S04 联合验证 |
-| U03/U05，安装／认证／hi 分层 | S01/S03 | 缺 executable、坏版本、缺 key、握手成功但401、限流、合法 hi、daemon env 差异 |
-| U04，没有默认 agent；ZCode 禁 model | S03/S04 | flags/JSON/MCP 同形 fixture，非法输入未发 prompt、配置修改不影响已有 task |
-| B02/B03，非 Bash 可响应请求；100上限 | S02/S04 | Read/other PENDING 提前醒；SENDING/非响应不醒；第101条边界明确 |
-| B04，Unicode／编码膨胀／完整 wait | S02/S04 | 262144 字节分页、2MiB frame、控制字符转义、完整内联与分页回退 |
-| B05/B06/B07，取消／队列／请求关联 | S02/S04 | 双 agent 同 workspace 互斥、发送重放冲突、迟到 respond、不确定投递不重放 |
-| B08/P04/P05，observe与严格plan | S01/S04 | 公开thought字段、200字符；所有已启用写入／执行入口拒绝与越权回复测试 |
-| U06/P09—P14，完整npm升级 | S05/S06 | 全新prefix、GUI PATH、多home、忙任务排空、启动失败／plugin冲突／ignore-scripts |
-| U02/P15，文件结构 | S02—S06 | owner依赖、文件规模清单、入口薄化、独立测试；不复制巨大旧lib |
+| U01/U02，新项目不丢 ZCode 生命周期 | ZCode lifecycle | 老测试复原＋新命名空间真实 MCP/CLI lifecycle；第三 adapter 接缝由 DSH production 联合验证 |
+| U03/U05，安装／认证／hi 分层 | DSH probe / agent status | 缺 executable、坏版本、缺 key、握手成功但401、限流、合法 hi、daemon env 差异 |
+| U04，没有默认 agent；ZCode 禁 model | agent status / DSH production | flags/JSON/MCP 同形 fixture，非法输入未发 prompt、配置修改不影响已有 task |
+| B02/B03，非 Bash 可响应请求；100上限 | ZCode lifecycle / DSH production | Read/other PENDING 提前醒；SENDING/非响应不醒；第101条边界明确 |
+| B04，Unicode／编码膨胀／完整 wait | ZCode lifecycle / DSH production | 262144 字节分页、2MiB frame、控制字符转义、完整内联与分页回退 |
+| B05/B06/B07，取消／队列／请求关联 | ZCode lifecycle / DSH production | 双 agent 同 workspace 互斥、发送重放冲突、迟到 respond、不确定投递不重放 |
+| B08/P04/P05，observe与严格plan | DSH probe / DSH production | 公开thought字段、200字符；所有已启用写入／执行入口拒绝与越权回复测试 |
+| U06/P09—P14，完整npm升级 | npm install / upgrade coordination | 全新prefix、GUI PATH、多home、忙任务排空、启动失败／plugin冲突／ignore-scripts |
+| U02/P15，文件结构 | ZCode lifecycle through upgrade coordination | owner依赖、文件规模清单、入口薄化、独立测试；不复制巨大旧lib |
 
 ## 9. 已确认的人类决策
 

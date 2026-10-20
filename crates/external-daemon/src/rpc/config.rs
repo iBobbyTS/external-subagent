@@ -249,7 +249,7 @@ fn normalize_agent_config_value(value: &mut Value) -> Result<(), RpcError> {
                 }
             }
         }
-        // AUD-005/D1 (S02): a zcode runtime_path has no consumer — startup
+        // AUD-005/D1: a zcode runtime_path has no consumer — startup
         // resolves the pinned packaged ZCode runtime from service arguments,
         // never from this field (see main.rs) — so accepting it here would let
         // a hand-written config pass startup/RPC admission while being
@@ -435,7 +435,7 @@ mod config_migration_tests {
             .iter()
             .filter(|case| case["error_code"].as_str() == Some("runtime_path_unsupported"))
             .count();
-        // AUD-005/S02: the shared fixture must keep exercising the zcode
+        // AUD-005: the shared fixture must keep exercising the zcode
         // runtime_path gate in both schema shapes plus the disabled-entry
         // variant; a matrix edit that drops them would otherwise let this
         // filtered test pass vacuously.

@@ -8,7 +8,7 @@
 
 需要自行维护的是 provider adapter、受管启动 profile 和本产品的生命周期投影。只有已批准的权限保证无法用官方组合可靠表达时，才增加小型 DSH 策略插件；不再造 session store、request queue 或第二个 daemon。
 
-当前研究所读源码的 CLI manifest 声明 `@deepseek-ai/dsh` **0.1.5-rc.2**；根 manifest 声明 Node `^22.19.0 || >=24.0.0`。这是 **master 源码状态，不是已核实的 npm latest，也不是用户本机版本**。实际 S01 必须固定可安装版本／来源与真实命令输出再验证，不能把 moving master 的新能力假定为任何旧 DSH 都具备。[R04][R05]
+当前研究所读源码的 CLI manifest 声明 `@deepseek-ai/dsh` **0.1.5-rc.2**；根 manifest 声明 Node `^22.19.0 || >=24.0.0`。这是 **master 源码状态，不是已核实的 npm latest，也不是用户本机版本**。实际 DSH probe 必须固定可安装版本／来源与真实命令输出再验证，不能把 moving master 的新能力假定为任何旧 DSH 都具备。[R04][R05]
 
 ## 2. 官方 app-server／CLI 能力比较
 
@@ -74,7 +74,7 @@ DSH sandbox 的 read-only/workspace-write 是**文件效果策略**，不是“�
 | 验证受管组合的实际能力，拒绝未覆盖执行入口 | 另起管理 daemon／再建立 task queue |
 | 与特定实测 DSH 版本绑定并做 conformance fixture | 直接依赖大量 Web 内部数据实现完整 GUI parity |
 
-S01 要给出“官方组合足够”或“具体入口存在可复现缺口”的证据。后一种再做窄范围 PLAN delta；不因为“万物皆插件”就预先写一个大 plugin。
+DSH probe 要给出“官方组合足够”或“具体入口存在可复现缺口”的证据。后一种再做窄范围 PLAN delta；不因为“万物皆插件”就预先写一个大 plugin。
 
 ## 4. 第三方插件调查与取舍
 
@@ -135,9 +135,9 @@ npm ignore-scripts 会阻止 package scripts；Codex 的 npm plugin source 也�
 
 ## 8. 先验证的最小问题与判定标准
 
-S01 在受控 fixture 与授权环境记录：实际 executable/version、ACP版本与capabilities、native model catalog、model选择先于prompt、错误凭据与正常hi、tool/permission关联、cancel与close退出、messageId/text/thought语义、严格plan对所有启用入口的实际拒绝、stderr不混stdout、未知/超大帧与stdin阻塞。
+DSH probe 在受控 fixture 与授权环境记录：实际 executable/version、ACP版本与capabilities、native model catalog、model选择先于prompt、错误凭据与正常hi、tool/permission关联、cancel与close退出、messageId/text/thought语义、严格plan对所有启用入口的实际拒绝、stderr不混stdout、未知/超大帧与stdin阻塞。
 
-只有成功才进入正式DSH产品化；S01遇到环境缺失先作一次有界诊断，不能因没有装DSH就声称必须fork。找不到公开能力时保持UNKNOWN或明确unsupported，按决定表处理。性能与多进程资源成本没有本次实测，不在报告里编造吞吐／延迟。
+只有成功才进入正式DSH产品化；DSH probe 遇到环境缺失先作一次有界诊断，不能因没有装DSH就声称必须fork。找不到公开能力时保持UNKNOWN或明确unsupported，按决定表处理。性能与多进程资源成本没有本次实测，不在报告里编造吞吐／延迟。
 
 ## 9. 一手来源索引
 

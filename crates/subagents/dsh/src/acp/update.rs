@@ -5,7 +5,7 @@
 //! message (P06): thought chunks and uncommitted message chunks only ever
 //! project as progress/reasoning; only a committed agent message with a real
 //! `messageId` is eligible as final text. Two observed discriminator
-//! dialects are accepted: the S01-pinned fixture shape (`update.type`) and
+//! dialects are accepted: the pinned fixture shape (`update.type`) and
 //! the upstream standard shape (`update.sessionUpdate`).
 
 use external_contract::activity::{tool_result_event, tool_started_event};
@@ -20,7 +20,7 @@ pub struct SessionUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateKind {
-    /// Assistant message text. `committed` is true only for the S01-pinned
+    /// Assistant message text. `committed` is true only for the pinned
     /// `agent_message` shape that carries a verified `messageId`.
     AgentMessage {
         message_id: Option<String>,
@@ -226,14 +226,14 @@ pub fn canonical_event_payloads(
 mod tests {
     use super::*;
 
-    fn s01_tool() -> Value {
+    fn fixture_tool() -> Value {
         json!({
             "sessionId": "fixture-session",
             "update": {"type": "tool_call", "toolCallId": "tool-1", "title": "read-only probe"}
         })
     }
 
-    fn s01_message() -> Value {
+    fn fixture_message() -> Value {
         json!({
             "sessionId": "fixture-session",
             "update": {
@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn both_dialects_parse_and_keep_message_identity() {
-        let tool = parse_update(&s01_tool()).unwrap();
+        let tool = parse_update(&fixture_tool()).unwrap();
         assert_eq!(
             tool.kind,
             UpdateKind::ToolCall {
@@ -269,7 +269,7 @@ mod tests {
                 tool_kind: None,
             }
         );
-        let message = parse_update(&s01_message()).unwrap();
+        let message = parse_update(&fixture_message()).unwrap();
         assert_eq!(
             message.kind,
             UpdateKind::AgentMessage {
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn canonical_payloads_separate_text_thought_and_tool() {
-        let message = parse_update(&s01_message()).unwrap();
+        let message = parse_update(&fixture_message()).unwrap();
         let payloads = canonical_event_payloads(&message, "evt-1", "turn-1");
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0]["type"], "model.streaming");
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0]["payload"]["kind"], "reasoning_delta");
 
-        let tool = parse_update(&s01_tool()).unwrap();
+        let tool = parse_update(&fixture_tool()).unwrap();
         let payloads = canonical_event_payloads(&tool, "evt-3", "turn-1");
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0]["payload"]["kind"], "tool_call");
@@ -404,7 +404,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(tool_name(&kind.kind).as_deref(), Some("edit"));
-        let title_only = parse_update(&s01_tool()).unwrap();
+        let title_only = parse_update(&fixture_tool()).unwrap();
         assert_eq!(
             tool_name(&title_only.kind).as_deref(),
             Some("read-only probe")

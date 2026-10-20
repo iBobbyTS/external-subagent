@@ -343,7 +343,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             ("codex", Some(PINNED_ZCODE_SOURCE)),
             ("unsupported-adapter-fixture", Some(PINNED_ZCODE_SOURCE)),
         ] {
-            let directory = workspace("s04-observation-");
+            let directory = workspace("observation-");
             let scheduler = observation_scheduler(
                 directory.path(),
                 OBSERVATION_PROTOCOL,
@@ -413,7 +413,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 
     #[test]
     fn missing_activity_never_borrows_the_global_runtime_proof() {
-        let directory = workspace("s04-observation-missing-");
+        let directory = workspace("observation-missing-");
         // A task that was never launched has no launch-scoped activity; the
         // scheduler-global pinned ZCode path must not stand in for it.
         let scheduler = observation_scheduler(
@@ -460,7 +460,7 @@ mod failure_log_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         fs::create_dir_all(&root).unwrap();
         let workspace = tempfile::Builder::new()
-            .prefix("s02-fault-")
+            .prefix("fault-")
             .tempdir_in(root)
             .unwrap();
         let store = Arc::new(Store::open(workspace.path().join("state.sqlite")).unwrap());
@@ -521,7 +521,7 @@ mod failure_log_tests {
             Ok(command)
         });
         let scheduler = Scheduler::new(
-            "s02-preparation-failure",
+            "preparation-failure",
             Arc::clone(&store),
             Arc::new(factory),
             SchedulerConfig::default(),
@@ -2477,7 +2477,7 @@ mod transport_failure_tests {
             .unwrap()
     }
 
-    /// The zcode bootstrap prefix used by the S01 transport fixtures: three
+    /// The zcode bootstrap prefix used by the transport fixtures: three
     /// request/response pairs plus a turn.started boundary, leaving the task
     /// RUNNING with its monitor attached.
     const ZCODE_RUNNING_PREFIX: &str = r#"
@@ -2588,7 +2588,7 @@ printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.stre
     #[test]
     fn zcode_oversized_frame_fails_explicitly_reaps_and_releases_the_queue() {
         let _guard = transport_child_guard();
-        let directory = transport_workspace("s01-transport-zcode-");
+        let directory = transport_workspace("transport-zcode-");
         let failing = format!("{ZCODE_RUNNING_PREFIX}{}\nsleep 30\n", oversized_output());
         let normal = normal_completion_script();
         let scheduler = transport_scheduler(directory.path(), move |prompt| {
@@ -2658,7 +2658,7 @@ printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.stre
     #[test]
     fn zcode_oversized_frame_with_a_pending_input_still_fails_the_task() {
         let _guard = transport_child_guard();
-        let directory = transport_workspace("s01-transport-zcode-pending-");
+        let directory = transport_workspace("transport-zcode-pending-");
         let script = format!(
             "{ZCODE_RUNNING_PREFIX}\
 while [ ! -f release-request ]; do sleep 0.01; done\n\
@@ -2721,7 +2721,7 @@ while [ ! -f release-oversize ]; do sleep 0.01; done\n\
     #[test]
     fn zcode_committed_cancellation_outranks_the_transport_failure() {
         let _guard = transport_child_guard();
-        let directory = transport_workspace("s01-transport-zcode-cancel-");
+        let directory = transport_workspace("transport-zcode-cancel-");
         let script = format!(
             "{ZCODE_RUNNING_PREFIX}\
 while [ ! -f release-oversize ]; do sleep 0.01; done\n\
@@ -2747,7 +2747,7 @@ while [ ! -f release-oversize ]; do sleep 0.01; done\n\
     #[test]
     fn latched_transport_failure_cleans_up_after_a_late_orphaned_terminal() {
         let _guard = transport_child_guard();
-        let directory = transport_workspace("s01-transport-b2-01-");
+        let directory = transport_workspace("transport-b2-01-");
         // The leader publishes an oversized frame, forks a descendant that
         // keeps the process group alive, then exits so the pump publishes an
         // Orphaned terminal before the monitor reaches its cleanup.
@@ -2942,7 +2942,7 @@ exit 0\n",
 
     #[test]
     fn injected_cleanup_failure_keeps_unreaped_evidence() {
-        let directory = transport_workspace("s01-transport-cleanup-failure-");
+        let directory = transport_workspace("transport-cleanup-failure-");
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
         let calls = Arc::new(AtomicU64::new(0));
         let scheduler = Scheduler::new(
@@ -2990,11 +2990,11 @@ exit 0\n",
         assert_eq!(scheduler.active_count(), 0);
     }
 
-    /// S01 AC4: a normal terminal published by the pump after the oversized
+    /// The late-terminal contract: a normal terminal published by the pump after the oversized
     /// frame (here a Completed boundary) must not turn the task COMPLETED.
     #[test]
     fn published_completed_terminal_does_not_override_the_latched_failure() {
-        let directory = transport_workspace("s01-transport-late-completed-");
+        let directory = transport_workspace("transport-late-completed-");
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
         let calls = Arc::new(AtomicU64::new(0));
         let scheduler = Scheduler::new(
@@ -3923,7 +3923,7 @@ mod wait_tail_inheritance_tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         fs::create_dir_all(&root).unwrap();
         let directory = tempfile::Builder::new()
-            .prefix("s01-wait-inherit-")
+            .prefix("wait-inherit-")
             .tempdir_in(root)
             .unwrap();
         let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());

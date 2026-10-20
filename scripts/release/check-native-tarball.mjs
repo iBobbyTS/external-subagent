@@ -33,9 +33,9 @@ const stagedOnly = process.argv.includes('--staged');
 const explicit = process.argv[2] && !process.argv[2].startsWith('--') ? process.argv[2] : null;
 const dryRun = process.env.npm_config_dry_run === 'true';
 
-// A Windows host packs a CONTROLLED win32-x64 artifact (S03), not the
+// A Windows host packs a CONTROLLED win32-x64 artifact, not the
 // multi-platform release bundle: only the Windows payload is required and
-// checked. Windows npm publishing is intentionally not activated in S04, so
+// checked. Windows npm publishing is intentionally not activated yet, so
 // macOS/Linux hosts keep the existing dual-platform publish gate; the merged
 // release tarball is assembled there from the platform artifacts.
 const win32Controlled = process.platform === 'win32' && process.arch === 'x64';

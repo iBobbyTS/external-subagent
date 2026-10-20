@@ -835,8 +835,8 @@ impl Scheduler {
                     } else {
                         format!("{terminal:?}")
                     };
-                    // The generic closure logs `runtime_terminal`; the S01
-                    // transport closure carries its own stage so the final
+                    // The generic closure logs `runtime_terminal`; the transport
+                    // closure carries its own stage so the final
                     // record (and latest failure) keeps that context.
                     let stage = if reason == TRANSPORT_FRAME_LIMIT_REASON {
                         TRANSPORT_DIAGNOSTIC_STAGE

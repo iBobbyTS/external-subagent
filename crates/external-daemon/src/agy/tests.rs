@@ -37,7 +37,7 @@ const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
 
 fn agy_workspace() -> tempfile::TempDir {
     tempfile::Builder::new()
-        .prefix("s02-agy-")
+        .prefix("agy-")
         .tempdir_in(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace"),
         )
@@ -561,7 +561,7 @@ fn closed_gate_refuses_spawn_without_a_process() {
 }
 
 /// An unsupported permission mode never reaches a child: the factory refuses
-/// at resolution time (S03 admission is expected to reject it upstream).
+/// at resolution time (daemon admission is expected to reject it upstream).
 #[test]
 fn plan_permission_is_refused_by_the_factory() {
     let _guard = scripted_test_guard();

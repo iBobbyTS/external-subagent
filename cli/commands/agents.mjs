@@ -153,11 +153,11 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
 }
 
 // Source compatibility for internal callers while the public CLI name is
-// `subagents`; wire-level agent fields remain S02's responsibility.
+// `subagents`; wire-level agent fields remain the daemon wire contract's responsibility.
 export const agentsCommand = subagentsCommand;
 export const parseAgentsArgs = parseSubagentsArgs;
 
-// The daemon wire contract is migrated by S02; the CLI already exposes the
+// The daemon wire contract is owned by the daemon; the CLI already exposes the
 // canonical execution-target name at its own boundary.
 function subagentView(value) {
   if (!value) return value;

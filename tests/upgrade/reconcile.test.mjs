@@ -372,7 +372,7 @@ const ensureR2 = () => (setupPromise ??= doSetup());
 
 async function doSetup() {
   // A short base keeps the product socket path below macOS SUN_LEN, exactly
-  // like the short-HOME fixture the S05 live test uses.
+  // like the short-HOME fixture the live install test uses.
   ctx.workDir = fs.mkdtempSync('/tmp/esr2-');
   ctx.home = path.join(ctx.workDir, 'home');
   fs.mkdirSync(ctx.home, { recursive: true });
@@ -562,7 +562,7 @@ test('a partial Codex-home sync keeps the verified activation and reports per-ho
 
   // A second registered home the sync cannot write: reconcile must skip it
   // per home, and the public update must surface that partial outcome without
-  // rolling the completed service activation back (S02's diagnostic limit).
+  // rolling the completed service activation back (the diagnostic limit).
   const lockedHome = path.join(ctx.workDir, 'codex-locked');
   fs.mkdirSync(lockedHome, { recursive: true });
   fs.chmodSync(lockedHome, 0o500);

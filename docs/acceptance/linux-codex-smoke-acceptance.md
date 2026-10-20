@@ -1,6 +1,6 @@
-# S04 acceptance — Codex subagent Linux smoke (gpt-6-luna)
+# Codex subagent Linux smoke acceptance (gpt-6-luna)
 
-Section S04 of `external-subagent-linux-full-20261009`: the first real Codex
+Acceptance section of `external-subagent-linux-full-20261009`: the first real Codex
 `spawn → wait → result → close` chain driven by the external-subagent CLI on
 Linux, plus the Linux/codex-cli 0.162.0 wire observations. Every fact below is
 **OBSERVED** on the host recorded in the environment table; all Codex
@@ -14,14 +14,14 @@ No credential value was read, printed, or committed.
 | OS | Ubuntu 26.04 LTS, x86_64, kernel 7.0.0-29-generic |
 | Node | v24.17.0 — `/home/ibobby/.nvm/versions/node/v24.17.0/bin/node` |
 | Codex CLI | `codex-cli 0.162.0`, `/home/ibobby/.nvm/versions/node/v24.17.0/bin/codex` → `../lib/node_modules/@openai/codex/bin/codex.js` (Node launcher) |
-| product HOME | `/tmp/es-s04-iso/home` |
-| product XDG | `XDG_DATA_HOME=/tmp/es-s04-iso/xdg-data`, `XDG_STATE_HOME=/tmp/es-s04-iso/xdg-state`, `XDG_CONFIG_HOME=/tmp/es-s04-iso/xdg-config` |
-| CODEX_HOME (throwaway) | `/tmp/es-s04-codex-home` |
+| product HOME | `/tmp/es-codex-smoke-iso/home` |
+| product XDG | `XDG_DATA_HOME=/tmp/es-codex-smoke-iso/xdg-data`, `XDG_STATE_HOME=/tmp/es-codex-smoke-iso/xdg-state`, `XDG_CONFIG_HOME=/tmp/es-codex-smoke-iso/xdg-config` |
+| CODEX_HOME (throwaway) | `/tmp/es-codex-smoke-codex-home` |
 | daemon binary | `/home/ibobby/external-subagent/npm/native/linux-x64/external-subagentd`, sha256 `bfcf7862…e64b`, payload version `0.4.1` (linux-x64) |
 
 `init --skip-service-start` verified the linux-x64 payload, created the XDG data
 and log directories, wrote `config.json`, and wrote the systemd unit at
-`/tmp/es-s04-iso/xdg-config/systemd/user/external-subagent.service`. Service
+`/tmp/es-codex-smoke-iso/xdg-config/systemd/user/external-subagent.service`. Service
 start was skipped so the daemon ran attached under fully controlled env. The
 real user `~/.codex` was only read (to copy `auth.json`/`config.toml` into the
 throwaway home with mode 0600) and was never modified by the product.
@@ -33,14 +33,14 @@ Config: `subagents.codex.runtime_path` = the absolute nvm Codex path,
 isolated HOME/XDG, `PATH` including the nvm bin, **no `CODEX_HOME`**.
 
 ```
-$ external-subagent spawn --json '{"subagent":"codex","repository":"/tmp/es-s04-iso/ws","prompt":"reply with the single word pong","permission_mode":"build","model":"gpt-6-luna"}'
+$ external-subagent spawn --json '{"subagent":"codex","repository":"/tmp/es-codex-smoke-iso/ws","prompt":"reply with the single word pong","permission_mode":"build","model":"gpt-6-luna"}'
 {"ok":false,"error":{"code":"agent_unsupported","message":"codex home is unconfigured"}}
 ```
 
 The refusal is synchronous at admission **before any task row is created**:
 
 ```
-$ external-subagent list --json '{"repository":"/tmp/es-s04-iso/ws"}'
+$ external-subagent list --json '{"repository":"/tmp/es-codex-smoke-iso/ws"}'
 {"tasks":[],"next_cursor":null}
 ```
 
@@ -51,14 +51,14 @@ with isolated HOME and an isolated store, and refused before spawning any child)
 
 ## 2. PATH discovery and absolute-path persistence (`agents enable codex`)
 
-Daemon B environment: `CODEX_HOME=/tmp/es-s04-codex-home`, `PATH` including the
+Daemon B environment: `CODEX_HOME=/tmp/es-codex-smoke-codex-home`, `PATH` including the
 nvm bin. `agents enable codex` ran the real local probe through the daemon:
 
 - `local.state = READY`, `local.version = 0.162.0`,
   `local.runtime_path = /home/ibobby/.nvm/versions/node/v24.17.0/bin/codex`
-  (absolute, discovered on PATH), `local.scope.home = /tmp/es-s04-codex-home`.
+  (absolute, discovered on PATH), `local.scope.home = /tmp/es-codex-smoke-codex-home`.
 - Persisted config (revision 5): codex `enabled=true`, `spawn_supported=true`,
-  absolute `runtime_path`, `home=/tmp/es-s04-codex-home`, `version=0.162.0`;
+  absolute `runtime_path`, `home=/tmp/es-codex-smoke-codex-home`, `version=0.162.0`;
   `restart_required=true`.
 
 After restarting the daemon (C1) with **no `CODEX_HOME`/`CODEX_RUNTIME_PATH` in
@@ -68,7 +68,7 @@ version 0.162.0 with the same home — the persisted-config launch contract work
 
 ## 3. Live full chain (spawn → wait → result → close)
 
-Model `gpt-6-luna`, workspace `/tmp/es-s04-iso/ws`, prompt
+Model `gpt-6-luna`, workspace `/tmp/es-codex-smoke-iso/ws`, prompt
 `reply with the single word pong`.
 
 | permission_mode | agent_id | thread/session_id | outcome | final_text | close |
@@ -79,7 +79,7 @@ Model `gpt-6-luna`, workspace `/tmp/es-s04-iso/ws`, prompt
 
 `result.input_identity` for each: `subagent=codex`, `adapter_version=0.4.1`,
 `model=gpt-6-luna`, `model_source=spawn_catalog`, `effort=null`,
-`workspace_path=/tmp/es-s04-iso/ws`, `permission_mode=<mode>`.
+`workspace_path=/tmp/es-codex-smoke-iso/ws`, `permission_mode=<mode>`.
 
 `observe` (build and plan) reported `"reasoning": null` per the README contract,
 `count_scope=agent_lifetime`, empty tool history, `dropped_events=0`.
@@ -127,9 +127,9 @@ several new notifications (`thread/status/changed`, `thread/tokenUsage/updated`,
 `account/updated`, `account/rateLimits/updated`, `remoteControl/status/changed`,
 `mcpServer/startupStatus/updated`) are emitted and safely ignored by the daemon.
 
-## 7. FINDING (resolved in S04) — systemd fixed PATH could not execute an nvm-installed Codex shim
+## 7. FINDING (resolved in this section) — systemd fixed PATH could not execute an nvm-installed Codex shim
 
-**Pre-fix observation.** The S03 systemd unit pinned
+**Pre-fix observation.** The earlier systemd unit pinned
 `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` (no Node).
 The nvm `codex` is a Node launcher (`codex.js`, shebang `#!/usr/bin/env node`).
 Running the unit's environment verbatim:
@@ -152,7 +152,7 @@ $ external-subagent spawn --json '{...codex...}'
 
 This was a runtime-resolution/environment gap, not an adapter protocol drift.
 
-**Fix (bounded, S04 owner).** `cli/install/path.mjs` gains
+**Fix (bounded, this section's owner).** `cli/install/path.mjs` gains
 `systemdServicePath()` = `SYSTEMD_FIXED_PATH` + `:` + `path.dirname(process.execPath)`
 (the interpreter directory of the Node that rendered the unit); both
 `cli/install/service-linux.mjs` (unit `Environment="PATH=…"`) and
@@ -163,8 +163,8 @@ This mirrors the macOS fixed PATH carrying the Homebrew bin that holds its own
 
 ## 8. Systemd-hosted re-verification (post-fix, OBSERVED)
 
-Fresh isolated install (`HOME=/tmp/es-s04-sysd/home`, XDG under
-`/tmp/es-s04-sysd`, throwaway `CODEX_HOME=/tmp/es-s04-codex-home2`). `init
+Fresh isolated install (`HOME=/tmp/es-codex-smoke-sysd/home`, XDG under
+`/tmp/es-codex-smoke-sysd`, throwaway `CODEX_HOME=/tmp/es-codex-smoke-codex-home2`). `init
 --skip-service-start` wrote the unit with the fixed PATH; its exact byte line:
 
 ```
@@ -175,16 +175,16 @@ Boundary note: the real user manager's unit search path is the real
 `~/.config/systemd/user` (manager HOME `/home/ibobby`, no `XDG_CONFIG_HOME`), so
 an isolated `XDG_CONFIG_HOME` unit is invisible to it and writing the real HOME
 is out of boundary. The daemon was therefore hosted as a genuine systemd user
-service via `systemd-run --user` (transient unit `es-s04-codex-systemd.service`)
+service via `systemd-run --user` (transient unit `es-codex-smoke-codex-systemd.service`)
 with this exact unit `PATH` and the isolated HOME/XDG/CODEX_HOME — a real
 `systemctl --user` service, not an attached process:
 
 ```
-$ systemctl --user show es-s04-codex-systemd -p ActiveState -p MainPID
+$ systemctl --user show es-codex-smoke-codex-systemd -p ActiveState -p MainPID
 ActiveState=active
 MainPID=117990
-$ systemctl --user status es-s04-codex-systemd   # CGroup during a turn:
-  /user.slice/user-1000.slice/user@1000.service/app.slice/es-s04-codex-systemd.service
+$ systemctl --user status es-codex-smoke-codex-systemd   # CGroup during a turn:
+  /user.slice/user-1000.slice/user@1000.service/app.slice/es-codex-smoke-codex-systemd.service
    ├─117990 external-subagentd --database … --socket … --diagnostic-log …
    ├─118403 node /home/ibobby/.nvm/versions/node/v24.17.0/bin/codex app-server --listen stdio://
    └─118415 …/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex app-server --listen stdio://
@@ -210,20 +210,20 @@ start. The copied credential was deleted from the throwaway home.
 ## Reproduction
 
 ```
-/tmp/es-s04/cli.sh init --skip-service-start
-/tmp/es-s04/cli.sh config set subagents.codex.runtime_path <abs codex>
-/tmp/es-s04/cli.sh config set subagents.codex.enabled true
-/tmp/es-s04/cli.sh config set subagents.codex.spawn_supported true
+/tmp/es-codex-smoke/cli.sh init --skip-service-start
+/tmp/es-codex-smoke/cli.sh config set subagents.codex.runtime_path <abs codex>
+/tmp/es-codex-smoke/cli.sh config set subagents.codex.enabled true
+/tmp/es-codex-smoke/cli.sh config set subagents.codex.spawn_supported true
 # daemon A (no CODEX_HOME): spawn → agent_unsupported
-# daemon B (CODEX_HOME=/tmp/es-s04-codex-home): agents enable codex → READY + persist
+# daemon B (CODEX_HOME=/tmp/es-codex-smoke-codex-home): agents enable codex → READY + persist
 # daemon C1 (config-supplied CODEX_HOME/RUNTIME_PATH): spawn/wait/result/close build|plan|yolo
-# systemd-hosted (unit PATH): systemd-run --user --unit=es-s04-codex-systemd \
+# systemd-hosted (unit PATH): systemd-run --user --unit=es-codex-smoke-codex-systemd \
 #   --setenv=PATH=<unit PATH> --setenv=HOME=<iso> --setenv=CODEX_HOME=<throwaway> <daemon> --database… --socket…
 node tools/probes/codex-app-server/probe.mjs --executable <codex> --codex-home <throwaway> \
   --workspace <ws> --model gpt-6-luna --scenario posture|turn
 ```
 
-Evidence artifacts (raw command outputs, redacted wire): `/tmp/es-s04-evidence/`
+Evidence artifacts (raw command outputs, redacted wire): `/tmp/es-codex-smoke-evidence/`
 (`init.json`, `failclosed-spawn.json`, `enable-codex.json`, `spawn-build.json`,
 `wait-build.json`, `result-build.json`, `observe-build.json`,
 `spawn-plan.json`, `probe-posture.json`, `probe-turn.json`,

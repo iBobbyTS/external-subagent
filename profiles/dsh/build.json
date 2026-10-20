@@ -6,7 +6,7 @@
     "prompt_scope": "one-in-flight"
   },
   "notes": [
-    "Managed DSH build composition pinned by S04.A; strict plan and full cancellation hardening land in S04.B.",
+    "Managed DSH build composition; strict plan and full cancellation hardening are implemented by the strict-plan composition.",
     "Production DSH spawn still requires the daemon configuration gate and runtime preflight; this file never widens provider configuration."
   ]
 }

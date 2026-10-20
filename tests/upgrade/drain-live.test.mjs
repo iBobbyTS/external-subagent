@@ -439,7 +439,7 @@ test('live vA→vB upgrade drains a real active task and activates vB automatica
       },
     });
 
-    // init binds no host (S05/D1): claim the Codex home explicitly through
+    // init binds no host (D1): claim the Codex home explicitly through
     // the fake codex CLI so the update below performs a real home rebind.
     // install-plugin prints its result flat in the CLI envelope (no
     // `.result` wrapper), unlike the daemon commands the cli() helper reads.

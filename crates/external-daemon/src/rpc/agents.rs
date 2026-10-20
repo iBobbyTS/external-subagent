@@ -2174,7 +2174,7 @@ pub(crate) mod admission_fixtures {
     /// profile and an executable absolute runtime). The persisted version is
     /// recorded as evidence only; it is not a gate term.
     pub(crate) fn gated_dsh_config(default_model: Option<&str>) -> tempfile::TempDir {
-        let root = admission_root("s04a-admission-config-");
+        let root = admission_root("admission-config-");
         let runtime = root.path().join("dsh-runtime.exe");
         fs::write(&runtime, b"#!/bin/sh\nexit 0\n").unwrap();
         #[cfg(unix)]
@@ -2559,7 +2559,7 @@ mod admission_policy_tests {
         let _config_env = ConfigEnvScope::install(&config_path);
         let (_directory, service, _id) = wait_tests::fixture();
         let store = service.store_for_wait_test();
-        let workspace = admission_root("s06-codex-manifest-");
+        let workspace = admission_root("codex-manifest-");
         for mode in ["build", "edit", "plan", "yolo"] {
             for explicit in [true, false] {
                 let mut frame: serde_json::Value = serde_json::from_slice(&cli_submit_frame(
@@ -2592,7 +2592,7 @@ mod admission_policy_tests {
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (_directory, service, _id) = wait_tests::fixture();
         let store = service.store_for_wait_test();
-        let workspace = admission_root("s04a-cli-dsh-reject-");
+        let workspace = admission_root("cli-dsh-reject-");
 
         // Unproven permission modes are still refused by the daemon gate.
         for (mode, request_id) in [("edit", "dsh-edit"), ("yolo", "dsh-yolo")] {
@@ -2657,7 +2657,7 @@ mod admission_policy_tests {
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (directory, service, _id) = wait_tests::runnable_fixture();
         let store = service.store_for_wait_test();
-        let spawn_root = admission_root("s04a-cli-dsh-admit-");
+        let spawn_root = admission_root("cli-dsh-admit-");
 
         let explicit_workspace = spawn_root.path().join("explicit");
         fs::create_dir(&explicit_workspace).unwrap();
@@ -2807,7 +2807,7 @@ mod admission_policy_tests {
         let config_root = gated_dsh_config(None);
         let _config_env = ConfigEnvScope::install(&config_root.path().join("agents.json"));
         let (directory, service, _id) = wait_tests::runnable_fixture();
-        let zcode_root = admission_root("s04a-cli-zcode-");
+        let zcode_root = admission_root("cli-zcode-");
         for (request_id, mode, manifest) in [
             ("zcode-edit-exact", "edit", vec!["src/zone.rs"]),
             ("zcode-yolo", "yolo", Vec::new()),

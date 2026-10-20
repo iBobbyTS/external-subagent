@@ -1,6 +1,6 @@
 # DeepSeek Harness ACP compatibility
 
-This document records the bounded S01 probe contract. It is not a claim that DSH is supported by the product.
+This document records the bounded discovery probe contract. It is not a claim that DSH is supported by the product.
 
 The probe is `tools/probes/dsh-acp/probe.mjs`. It accepts an explicit executable path and argv, speaks JSON-RPC over stdio, and never installs a provider or writes credentials. `--help` lists the only scenarios. The caller must supply the exact executable and arguments obtained from its installed DSH version; the probe does not invent `dsh app-server`, login, or profile commands.
 
@@ -12,7 +12,7 @@ Catalog discovery isolates the provider in a process group and cleans the group 
 
 The shared executable-version check applies the same process-group and incremental-reader bounds, including cleanup when a leader exits while a descendant still owns stdout/stderr.
 
-S04 live status (2026-09-12): **PARTIALLY VERIFIED** against DSH `0.1.5-rc.1` in a disposable workspace. Real ACP `initialize`, `session/new`, and `session/prompt` completed; the default-model prompt returned `LIVE_OK` with `end_turn`. Under the strict patch profile, shell/write probing exposed only the expected `glob`/`grep` operations and created no target file.
+DSH live status (2026-09-12): **PARTIALLY VERIFIED** against DSH `0.1.5-rc.1` in a disposable workspace. Real ACP `initialize`, `session/new`, and `session/prompt` completed; the default-model prompt returned `LIVE_OK` with `end_turn`. Under the strict patch profile, shell/write probing exposed only the expected `glob`/`grep` operations and created no target file.
 
 These observations validate the ACP wire path and the bounded strict-plan probe. Production daemon routing is implemented behind the explicit `enabled + spawn_supported + DSH_RUNTIME_PATH` gate; Persisted `agents.dsh.runtime_path`, `home`, and `profile` are carried into the LaunchAgent environment and consumed by the DSH launch profile; an unsupported profile fails closed. `agents.dsh.version` is advisory evidence only: a difference from the daemon-tested reference never refuses a launch and is surfaced as `version mismatch, it may not work as expected` (byte-exact) in status and in failed-terminal wait/result instructions. An isolated daemon smoke completed `spawn → wait → result → close` with `DAEMON_LIVE_OK`, `COMPLETED`, and `resources_reaped=true`. Explicit provider auth/hi probes were executed, but a successful authenticated hi remains **UNVERIFIED** (results below). Codex/ZCode host integration remains **NOT_RUN**. Daemon cancellation is live-verified with reaping and terminal-state preservation across wait/result/close; restart recovery is live-verified as `RUNTIME_LOST` with no replay. The default configuration remains closed; this document does not claim that an unconfigured deployment is enabled.
 
@@ -66,7 +66,7 @@ reject any stderr line containing both `patch:` and `not found`; a clean dump
 (and a benign non-patch warning line) still passes. This keeps an old runtime
 with the strict/manifest patch on the existing fail-closed path: the patch row
 is missing, the dump is refused, and the advisory version mismatch is reported.
-A legacy no-patch build is not refused for its version (S01): it spawns when
+A legacy no-patch build is not refused for its version: it spawns when
 the existing dump controls validate.
 
 Build composition posture (accepted upstream drift): 0.2.0's default build dump
@@ -99,7 +99,7 @@ the admitted permission mode and write manifest:
 - **build with a non-empty caller manifest**: per task the daemon materializes
   the embedded `dsh-write-guard` package plus a nested
   `node_modules/@deepseek-ai/dsh-fs` symlink into a fresh
-  `external-dsh-manifest-` TempDir, writes the S02 patch (`sandbox-policy`
+  `external-dsh-manifest-` TempDir, writes the managed patch (`sandbox-policy`
   `workspace-write`; every strict-plan tool except `tool-fs` disabled; one
   `insert` row mounting the guard by absolute path with the caller manifest),
   and requires `preflight_build_manifest` before ACP starts. The guard's

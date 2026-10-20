@@ -1,4 +1,4 @@
-// S05 init rollback and standalone-boundary oracles at the unit level (the
+// Init rollback and standalone-boundary oracles at the unit level (the
 // full packed CLI acceptance lives in fresh-install.test.mjs).  AUD-005/D1:
 // init installs the STANDALONE SERVICE ONLY — no fixed-ZCode runtime probe,
 // no managed Codex plugin install, no D08 claim — so a successful init leaves
@@ -269,9 +269,9 @@ test('a failed init never touches codex-owned paths', () => {
   }
 });
 
-test('init republishes away a pre-S05 zcode runtime_path instead of failing closed (S05-F01)', () => {
+test('init republishes away a legacy zcode runtime_path instead of failing closed', () => {
   // `subagents.zcode.runtime_path` was a first-class `config set` key before
-  // D1 rejected it, so a real pre-S05 install can carry it in either the
+  // D1 rejected it, so a real install predating that rejection can carry it in either the
   // schema-2 or the legacy schema-1 shape.  The republish step retires the
   // field before validation, so `npm new -> init` self-heals both shapes and
   // the strict read gate never bricks an upgrade.
@@ -285,7 +285,7 @@ test('init republishes away a pre-S05 zcode runtime_path instead of failing clos
       default_subagent: null,
       subagents: { zcode: { enabled: true, spawn_supported: true, runtime_path: '/opt/legacy-zcode.cjs' } },
     }));
-    assert.equal(schema2.run().installed, true, 'init self-heals a schema-2 config written by the pre-S05 CLI');
+    assert.equal(schema2.run().installed, true, 'init self-heals a schema-2 config written by the legacy CLI');
     let configured = JSON.parse(fs.readFileSync(schema2.paths.config, 'utf8'));
     assert.equal(configured.subagents.zcode.runtime_path, undefined, 'the retired field is gone from the republished schema-2 config');
     assert.equal(configured.subagents.zcode.enabled, true, 'unrelated zcode settings survive the republish');
@@ -306,7 +306,7 @@ test('init republishes away a pre-S05 zcode runtime_path instead of failing clos
       default_agent: 'zcode',
       agents: { zcode: { enabled: true, spawn_supported: true, runtime_path: '/opt/legacy-zcode.cjs' } },
     }));
-    assert.equal(schema1.run().installed, true, 'init self-heals a legacy schema-1 config written by the pre-S05 CLI');
+    assert.equal(schema1.run().installed, true, 'init self-heals a legacy schema-1 config written by the legacy CLI');
     configured = JSON.parse(fs.readFileSync(schema1.paths.config, 'utf8'));
     assert.equal(configured.schema_version, 2, 'the schema-1 prior is migrated by the republish');
     assert.equal(configured.subagents.zcode.runtime_path, undefined, 'the retired field is gone from the migrated config');

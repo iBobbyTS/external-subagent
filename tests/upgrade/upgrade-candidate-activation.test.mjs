@@ -294,7 +294,7 @@ test('unverifiable default candidate never overwrites the published active', { s
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-unverifiable-'));
   const p = paths(root);
   fs.mkdirSync(p.data, { recursive: true });
-  // Since the dual-platform tarball (D-S05) the release tree carries a VALID
+  // Since the dual-platform tarball the release tree carries a VALID
   // linux-x64 payload everywhere, CI's publish job included, so forcing a
   // foreign platform no longer makes the derived candidate unverifiable on its
   // own — the unverifiable candidate must be an explicit tree whose platform

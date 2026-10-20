@@ -39,7 +39,7 @@ try {
   run('npm', ['install', '--global', `--prefix=${prefix}`, '--no-audit', '--no-fund', tgz], { cwd: work, env });
   const cli = path.join(prefix, 'bin', 'external-subagent');
   const packageRoot = path.join(prefix, 'lib', 'node_modules', 'external-subagent');
-  // The packed payload directory is the running host's tuple (S01), so the
+  // The packed payload directory is the running host's tuple, so the
   // smoke checks the platform it is actually installing rather than a fixed
   // darwin-arm64 path.
   const payloadPlatform = nativePlatform() ?? `${process.platform}-${process.arch}`;

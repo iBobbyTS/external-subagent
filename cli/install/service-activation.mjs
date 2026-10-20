@@ -18,7 +18,7 @@ export function hasInstalledService(paths) {
   return Boolean(paths.launchAgent && fs.existsSync(paths.launchAgent));
 }
 
-// Platform dispatch (S03): the same activation health/rollback contract runs
+// Platform dispatch: the same activation health/rollback contract runs
 // over launchd on macOS (verbatim) and the systemd user manager on Linux.
 export async function activateService(paths, candidate, options = {}) {
   const currentPlatform = platform();

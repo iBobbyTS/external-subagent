@@ -158,7 +158,7 @@ fn set_model_params(case: &Case) -> Value {
 /// carries the provider-qualified model plus persistAsWorkspaceLastUsed=false.
 #[test]
 fn ac1_admitted_effort_reaches_set_model_with_a_resolved_level() {
-    let case = run_case("s02-ac1-effort-", &[], Some("zai/GLM-5.3"), Some("high"));
+    let case = run_case("ac1-effort-", &[], Some("zai/GLM-5.3"), Some("high"));
     assert_eq!(case.start.as_ref().unwrap(), &vec![case.agent_id.clone()]);
     assert_eq!(case.outcome(), TaskOutcome::Completed);
     assert_eq!(
@@ -178,7 +178,7 @@ fn ac1_admitted_effort_reaches_set_model_with_a_resolved_level() {
 /// AC①: with no admitted effort the catalog entry's defaultLevel is applied.
 #[test]
 fn ac1_default_level_is_used_when_no_effort_is_admitted() {
-    let case = run_case("s02-ac1-default-", &[], Some("zai/GLM-5.3"), None);
+    let case = run_case("ac1-default-", &[], Some("zai/GLM-5.3"), None);
     assert_eq!(case.start.as_ref().unwrap(), &vec![case.agent_id.clone()]);
     assert_eq!(case.outcome(), TaskOutcome::Completed);
     assert_eq!(
@@ -192,7 +192,7 @@ fn ac1_default_level_is_used_when_no_effort_is_admitted() {
 fn ac1_options_are_omitted_when_no_level_resolves() {
     let catalog = r#"[{"ref":{"providerId":"zai","modelId":"GLM-5.3"},"reasoning":{"levels":[{"value":"low","label":"low"}]}}]"#;
     let case = run_case(
-        "s02-ac1-nolevel-",
+        "ac1-nolevel-",
         &[("ZCODE_FAKE_MODEL_CATALOG", catalog)],
         Some("zai/GLM-5.3"),
         None,
@@ -211,7 +211,7 @@ fn ac1_options_are_omitted_when_no_level_resolves() {
 #[test]
 fn ac1b_non_zai_provider_round_trips_provider_qualified() {
     let case = run_case(
-        "s02-ac1b-deepseek-",
+        "ac1b-deepseek-",
         &[],
         Some("deepseek/deepseek-flash"),
         Some("low"),
@@ -233,7 +233,7 @@ fn ac1b_non_zai_provider_round_trips_provider_qualified() {
 /// an InvalidSession bootstrap failure as SESSION_START_FAILED.
 #[test]
 fn ac2_unoffered_model_fails_closed_before_set_model() {
-    let case = run_case("s02-ac2-unoffered-", &[], Some("zai/NOT-A-MODEL"), None);
+    let case = run_case("ac2-unoffered-", &[], Some("zai/NOT-A-MODEL"), None);
     assert!(
         case.start.is_err(),
         "unoffered model must fail the bootstrap"
@@ -255,7 +255,7 @@ fn ac2_unoffered_model_fails_closed_before_set_model() {
 fn ac3_remote_model_rejection_maps_to_model_rejected() {
     for code in ["model_not_found", "invalid_model_request"] {
         let case = run_case(
-            "s02-ac3-remote-",
+            "ac3-remote-",
             &[("ZCODE_FAKE_SETMODEL_ERROR_CODE", code)],
             Some("zai/GLM-5.3"),
             Some("high"),
@@ -275,7 +275,7 @@ fn ac3_remote_model_rejection_maps_to_model_rejected() {
     }
 }
 
-/// Repair (S02 closing review): an unrecognized remote failure during the
+/// Repair (closing review): an unrecognized remote failure during the
 /// switch — an unknown `error.data.code` or a missing one — must NOT claim
 /// MODEL_REJECTED. It stays the InvalidSession variant and classifies as
 /// SESSION_START_FAILED, the honest bucket for an unrecognized bootstrap
@@ -283,7 +283,7 @@ fn ac3_remote_model_rejection_maps_to_model_rejected() {
 #[test]
 fn unrecognized_remote_set_model_failure_stays_invalid_session() {
     let unknown_code = run_case(
-        "s02-ac3-unknown-code-",
+        "ac3-unknown-code-",
         &[("ZCODE_FAKE_SETMODEL_ERROR_CODE", "session_busy")],
         Some("zai/GLM-5.3"),
         Some("high"),
@@ -303,7 +303,7 @@ fn unrecognized_remote_set_model_failure_stays_invalid_session() {
     );
 
     let missing_code = run_case(
-        "s02-ac3-no-code-",
+        "ac3-no-code-",
         &[
             ("ZCODE_FAKE_SETMODEL_ERROR_CODE", "ignored"),
             ("ZCODE_FAKE_SETMODEL_ERROR_WITHOUT_CODE", "1"),
@@ -331,7 +331,7 @@ fn unrecognized_remote_set_model_failure_stays_invalid_session() {
 #[test]
 fn ac4_diverging_readback_fails_closed() {
     let case = run_case(
-        "s02-ac4-mismatch-",
+        "ac4-mismatch-",
         &[(
             "ZCODE_FAKE_SETMODEL_CURRENT",
             r#"{"providerId":"zai","modelId":"GLM-5.3-Flash"}"#,
@@ -354,7 +354,7 @@ fn ac4_diverging_readback_fails_closed() {
 #[test]
 fn ac5_requested_none_keeps_the_legacy_bootstrap() {
     let case = run_case(
-        "s02-ac5-none-",
+        "ac5-none-",
         &[("ZCODE_FAKE_EFFORT_ECHO", "high")],
         None,
         Some("high"),
@@ -374,7 +374,7 @@ fn ac5_requested_none_keeps_the_legacy_bootstrap() {
 /// must not disturb the pump or the following turn.
 #[test]
 fn ac6_state_updated_notification_does_not_disturb_the_pump() {
-    let case = run_case("s02-ac6-notify-", &[], Some("zai/GLM-5.3"), Some("high"));
+    let case = run_case("ac6-notify-", &[], Some("zai/GLM-5.3"), Some("high"));
     assert_eq!(case.start.as_ref().unwrap(), &vec![case.agent_id.clone()]);
     assert_eq!(
         case.outcome(),
@@ -394,7 +394,7 @@ fn ac6_state_updated_notification_does_not_disturb_the_pump() {
 /// before any setModel frame, with the levels as evidence.
 #[test]
 fn ac7_effort_outside_catalog_levels_is_rejected_before_set_model() {
-    let case = run_case("s02-ac7-effort-", &[], Some("zai/GLM-5.3"), Some("medium"));
+    let case = run_case("ac7-effort-", &[], Some("zai/GLM-5.3"), Some("medium"));
     assert!(case.start.is_err(), "unavailable effort must fail early");
     assert_eq!(case.outcome(), TaskOutcome::Failed);
     assert_eq!(case.reason_code().as_deref(), Some("SESSION_START_FAILED"));

@@ -14,6 +14,6 @@ node scripts/release/build-native-payload.mjs --if-stale
 
 Supported platforms install without compiling Rust; the installer verifies
 the payload manifest, digest, permissions (755), and Mach-O arm64 image
-before any `init` step runs.  There is no payload for other platforms in
-S05; unsupported platforms keep `help`/`version` working and reject business
+before any `init` step runs.  There is no payload for other platforms yet;
+unsupported platforms keep `help`/`version` working and reject business
 commands without writing HOME.

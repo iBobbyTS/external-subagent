@@ -146,7 +146,7 @@ impl Scheduler {
         check.cancel();
         drop(guard);
         // The cleanup entry never trusts a terminal a late exit boundary may
-        // have published (S01 handoff) and reports the real stop/reap.
+        // have published (the prior terminal contract) and reports the real stop/reap.
         let terminal = runtime.cleanup_for_forced_failure(self.inner.config.stop_grace);
         let message = detail(&terminal);
         let _guard = operation.lock().unwrap();
@@ -226,7 +226,7 @@ impl Scheduler {
                             // priority: a transient decision read failure must
                             // retry from the loop top, never fall through into
                             // the normal terminal closure (that would drop the
-                            // S01 reason, stage and forced cleanup).
+                            // fault reason, stage and forced cleanup).
                             FaultDisposition::Suppressed => {
                                 thread::sleep(Duration::from_millis(10));
                                 continue;

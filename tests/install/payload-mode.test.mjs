@@ -1,4 +1,4 @@
-// Payload extraction-mode normalization (S06 repair).  `npm install -g` lays
+// Payload extraction-mode normalization (repair).  `npm install -g` lays
 // the packaged native binaries down with the tarball's recorded mode masked by
 // the installer's umask, so a host with umask 0002 extracts an archived 0755
 // binary as 0775.  verifyPayload must keep rejecting that (a group/world

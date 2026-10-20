@@ -1,4 +1,4 @@
-// S05 CLI regression: the --codex-home option must actually reach the target
+// CLI regression: the --codex-home option must actually reach the target
 // Codex home.  install-mcp resolves its config.toml (for install and removal
 // alike) inside the requested home and never writes the default home;
 // install-plugin claims the home in the D08 registry with the real staged
