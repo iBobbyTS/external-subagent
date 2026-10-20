@@ -245,13 +245,10 @@ fn parse_activity_message(
         let payload_type = payload.get("type").and_then(serde_json::Value::as_str);
         let event_id = activity_id(params.get("eventId"));
         let turn_id = activity_id(params.get("turnId"));
-        // zcode 的参数仅在 tool_call 帧，独立读取，不增加计数样本。
-        if mode != ToolActivityMode::CountOnly
-            && kind == Some("model.streaming")
-            && payload_kind == Some("tool_call")
-        {
-            parse_detailed_descriptor(&mut parsed, params, payload);
-        }
+        // `model.streaming` tool calls are owned end-to-end by
+        // ObservationState::observe_message (arguments, source validation and
+        // event-id replay rejection); extracting a descriptor here would feed
+        // the same frame twice and bypass that replay guard.
         match (kind, payload_kind, payload_type) {
             (Some("model.streaming"), Some("reasoning_delta"), _) => {
                 parsed.stream_key = stream_key(params, payload, "reasoning");

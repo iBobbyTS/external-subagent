@@ -637,6 +637,32 @@ mod tests {
     }
 
     #[test]
+    fn replayed_streaming_tool_frame_keeps_the_newer_arguments() {
+        let tracker = PassiveActivityTracker::for_adapter("zcode", true);
+        let empty = session_fixture(serde_json::json!({
+            "type":"model.streaming", "eventId":"e1", "turnId":"t",
+            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{}}
+        }));
+        let refined = session_fixture(serde_json::json!({
+            "type":"model.streaming", "eventId":"e2", "turnId":"t",
+            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"sleep 300"}}
+        }));
+        tracker.observe(&empty);
+        tracker.observe(&refined);
+        let before = tracker.observation_snapshot();
+        assert_eq!(before.tools[0].call_count, 1);
+        assert_eq!(
+            before.tools[0].recent_calls[0].arguments["command"],
+            serde_json::json!("sleep 300")
+        );
+
+        // A re-delivered older frame is rejected by the canonical source-event
+        // guard; it must not restore the obsolete empty arguments.
+        tracker.observe(&empty);
+        assert_eq!(tracker.observation_snapshot(), before);
+    }
+
+    #[test]
     fn descriptors_respect_modes_and_old_events_do_not_invent_calls() {
         let now = Instant::now();
         let old = session_fixture(external_contract::activity::tool_count_event(
