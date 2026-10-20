@@ -55,7 +55,7 @@ function managedHookEntry(entry, exactPaths) {
   if (!entry || typeof entry !== 'object' || typeof entry.matcher !== 'string') return false;
   for (const arg of processHookArgs(entry)) {
     if (exactPaths.has(path.resolve(arg))) return true;
-    const script = path.basename(arg).toLowerCase();
+    const script = path.basename(arg);
     const expectedMatcher = MANAGED_HOOK_MATCHERS.get(script);
     if (expectedMatcher !== undefined
       && path.basename(path.dirname(arg)) === 'hooks'
@@ -92,7 +92,9 @@ function removeFile(file) {
 // actually wrote: recognized managed entries are removed from the three
 // event lists, while every foreign entry, unknown hooks key, and unrelated
 // top-level key stays untouched.  The write is atomic.  Afterwards the
-// provenance record and the verifier staged beside it are deleted.
+// provenance record and the verifier staged beside it are deleted — but only
+// when the config phase completed, so a failed read/parse/write retains the
+// exact-path evidence a retry needs.
 function removeManagedHooks(paths) {
   const configPath = paths.zcodeConfig;
   const provenancePath = paths.hookProvenance;
@@ -103,6 +105,7 @@ function removeManagedHooks(paths) {
     provenance_removed: false,
     verifier_removed: false,
   };
+  let configPhaseFailed = false;
   try {
     const exactPaths = exactWrapperPaths(readProvenance(provenancePath));
     const bytes = typeof configPath === 'string' ? readOptional(configPath) : null;
@@ -112,33 +115,38 @@ function removeManagedHooks(paths) {
         ? config.hooks.events
         : undefined;
       if (events && typeof events === 'object' && !Array.isArray(events)) {
+        let removed = 0;
         for (const event of MANAGED_HOOK_EVENTS) {
           const entries = events[event];
           if (!Array.isArray(entries)) continue;
           const kept = entries.filter((entry) => !managedHookEntry(entry, exactPaths));
-          result.entries_removed += entries.length - kept.length;
+          removed += entries.length - kept.length;
           if (kept.length !== entries.length) events[event] = kept;
         }
-        if (result.entries_removed > 0) {
+        if (removed > 0) {
           atomicWrite(configPath, jsonBytes(config));
+          result.entries_removed = removed;
           result.config_updated = true;
         }
       }
     }
   } catch (error) {
+    configPhaseFailed = true;
     result.error = { code: error?.code || 'ZCODE_HOOKS_CLEANUP_FAILED', message: error.message };
   }
-  try {
-    if (typeof provenancePath === 'string') result.provenance_removed = removeFile(provenancePath);
-  } catch (error) {
-    result.error ??= { code: error?.code || 'ZCODE_HOOKS_CLEANUP_FAILED', message: error.message };
-  }
-  try {
-    if (typeof provenancePath === 'string') {
-      result.verifier_removed = removeFile(path.join(path.dirname(provenancePath), POLICY_VERIFIER_NAME));
+  if (!configPhaseFailed) {
+    try {
+      if (typeof provenancePath === 'string') result.provenance_removed = removeFile(provenancePath);
+    } catch (error) {
+      result.error ??= { code: error?.code || 'ZCODE_HOOKS_CLEANUP_FAILED', message: error.message };
     }
-  } catch (error) {
-    result.error ??= { code: error?.code || 'ZCODE_HOOKS_CLEANUP_FAILED', message: error.message };
+    try {
+      if (typeof provenancePath === 'string') {
+        result.verifier_removed = removeFile(path.join(path.dirname(provenancePath), POLICY_VERIFIER_NAME));
+      }
+    } catch (error) {
+      result.error ??= { code: error?.code || 'ZCODE_HOOKS_CLEANUP_FAILED', message: error.message };
+    }
   }
   return result;
 }

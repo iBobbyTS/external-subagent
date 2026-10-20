@@ -391,6 +391,94 @@ test('product uninstall removes only recognized managed hooks and deletes the st
   }
 });
 
+// The retired installer wrote the exact lowercase script names and compared
+// resolved paths exactly. Recognition must not case-fold, or a foreign
+// `hooks/GUARD-BASH.mjs` on a case-sensitive filesystem would be removed.
+test('managed hook recognition is case-sensitive and preserves foreign case variants', { skip: win32PosixBackend }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-case-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const pluginRoot = path.join(home, 'node_modules', 'external-subagent', 'plugins', 'codex', 'external-subagent');
+  const foreign = {
+    matcher: 'Bash',
+    hooks: [{ type: 'process', command: process.execPath, args: [path.join(pluginRoot, 'hooks', 'GUARD-BASH.mjs')], timeoutMs: 5000 }],
+    id: 'foreign-case-variant',
+  };
+  const config = { hooks: { events: { PreToolUse: [foreign] } } };
+  fs.mkdirSync(path.dirname(paths.zcodeConfig), { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify(config));
+  // No provenance record: only the legacy shape could classify this entry.
+  try {
+    const result = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(result.zcode_hooks.entries_removed, 0, 'case-variant names are not managed');
+    assert.equal(result.zcode_hooks.config_updated, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')).hooks.events.PreToolUse, [foreign]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Every reference a retry needs must survive a config-phase failure.
+// The entry below is recognized only through its provenance exact path (its
+// matcher deliberately fails the legacy fallback), so deleting the provenance
+// after a failed write would make it permanently unremovable.
+test('a failed config write retains provenance and the staged verifier for retry', { skip: win32PosixBackend }, (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-hook-retry-'));
+  const paths = fixturePaths(home);
+  fs.mkdirSync(paths.data, { recursive: true });
+  fs.mkdirSync(path.dirname(paths.launchAgent), { recursive: true });
+  fs.writeFileSync(paths.launchAgent, 'plist');
+  const exact = path.join(home, 'custom-plugin-root', 'guard-bash.mjs');
+  const entry = {
+    matcher: '^Bash$',
+    hooks: [{ type: 'process', command: process.execPath, args: [exact], timeoutMs: 5000 }],
+  };
+  const configDir = path.dirname(paths.zcodeConfig);
+  fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(paths.zcodeConfig, JSON.stringify({ hooks: { events: { PreToolUse: [entry] } } }));
+  fs.writeFileSync(paths.hookProvenance, JSON.stringify({ effective_guard_wrapper_path: exact }));
+  const verifier = path.join(path.dirname(paths.hookProvenance), 'external-subagent-policy-verifier');
+  fs.writeFileSync(verifier, '#!/usr/bin/env node\n');
+
+  try {
+    fs.chmodSync(configDir, 0o500);
+    try {
+      const probe = path.join(configDir, '.writable-probe');
+      fs.writeFileSync(probe, 'probe');
+      fs.unlinkSync(probe);
+      t.skip('config directory remains writable (running as root)');
+      return;
+    } catch (error) {
+      if (error?.code !== 'EACCES' && error?.code !== 'EPERM') throw error;
+    }
+
+    const failed = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.notEqual(failed.zcode_hooks.error, undefined, 'the failed write is reported');
+    assert.equal(failed.zcode_hooks.entries_removed, 0);
+    assert.equal(failed.zcode_hooks.provenance_removed, false, 'provenance survives a failed config phase');
+    assert.equal(failed.zcode_hooks.verifier_removed, false, 'staged verifier survives a failed config phase');
+    assert.equal(fs.existsSync(paths.hookProvenance), true);
+    assert.equal(fs.existsSync(verifier), true);
+
+    // Allow the write and retry: the retained exact path still classifies the
+    // entry even though the legacy matcher fallback would not.
+    fs.chmodSync(configDir, 0o700);
+    const retried = uninstallProduct(paths, bothSeams(recordingLaunchctl().control, recordingSystemd().control));
+    assert.equal(retried.zcode_hooks.entries_removed, 1);
+    assert.equal(retried.zcode_hooks.config_updated, true);
+    assert.equal(retried.zcode_hooks.provenance_removed, true);
+    assert.equal(retried.zcode_hooks.verifier_removed, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(paths.zcodeConfig, 'utf8')).hooks.events.PreToolUse, []);
+    assert.equal(fs.existsSync(paths.hookProvenance), false);
+    assert.equal(fs.existsSync(verifier), false);
+  } finally {
+    try { fs.chmodSync(configDir, 0o700); } catch {}
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 // launchd answers a bootstrap over an already-loaded label with
 // "Bootstrap failed: 5: Input/output error" (observed live in the user GUI
 // domain); a repeat start/init must stay idempotent instead of failing.
