@@ -130,13 +130,14 @@ pub(crate) struct ToolDescriptor {
     pub(crate) detail: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ToolGroup {
     call_count: u64,
     latest_seq: u64,
     recent_calls: VecDeque<ObservedCall>,
 }
 
+#[derive(Clone)]
 pub struct ObservationState {
     collect_reasoning: bool,
     reasoning_source: ReasoningSource,

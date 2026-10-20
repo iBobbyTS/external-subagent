@@ -339,13 +339,16 @@ impl PassiveActivityTracker {
     /// terminal text 仍只属于当前 turn。
     pub(crate) fn inherit_wait_text(&self, old: &PassiveActivityTracker) {
         let (old_tail, old_appended, old_delivered, old_updated, old_observation) = {
-            let mut old_state = old.state.lock().unwrap();
+            let old_state = old.state.lock().unwrap();
             (
                 old_state.latest_text_tail.clone(),
                 old_state.appended_bytes,
                 old_state.delivered_bytes,
                 old_state.latest_text_updated_at,
-                std::mem::take(&mut old_state.observation),
+                // Clone instead of take: an in-flight reader may still hold
+                // this outgoing tracker's Arc until the map swap, and must
+                // keep seeing its real observation state.
+                old_state.observation.clone(),
             )
         };
         let mut state = self.state.lock().unwrap();
@@ -569,7 +572,11 @@ mod tests {
         new.observe_at(&reasoning("r-new", "new"), now, 0);
         new.observe_at(&tool_call("e1", "c1", 1), now, 0);
         new.observe_at(&tool_call("e3", "c3", 3), now, 0);
+        let outgoing_before = old.observation_snapshot();
         new.inherit_wait_text(&old);
+        // The outgoing tracker must keep serving its real observation to
+        // readers racing the map swap, not an emptied default state.
+        assert_eq!(old.observation_snapshot(), outgoing_before);
 
         let snapshot = new.observation_snapshot();
         assert_eq!(snapshot.tools.len(), 1);
