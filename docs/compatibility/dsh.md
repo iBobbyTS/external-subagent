@@ -83,6 +83,44 @@ is not a new execution surface, and the risk is recorded here for a future
 narrowing decision. Manifest-build is unaffected because its generated patch
 disables the new entries and keeps the fail-closed allowlist walk.
 
+## Host 绑定（install-plugin dsh）
+
+DSH 除作为 subagent 外也可作为 host 调用本产品。内置绑定命令是
+`external-subagent install-plugin dsh --profile <name>`（`--uninstall` 对称移除，
+`--dsh-home <path>` 覆盖目标 home，默认 `$DSH_HOME` 环境变量或 `~/.dsh`）：
+
+- **MCP 绑定**：向 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 追加一个带
+  哨兵注释的受管块，内容是一条 `@deepseek-ai/dsh-mcp-client` stdio 条目
+  （`serverName: external_subagent`，command 为 native MCP facade 绝对路径，
+  `EXTERNAL_SUBAGENT_SOCKET` 钉死 daemon socket，`toolCallTimeoutMs: 300000`
+  覆盖 dsh 默认 60s —— `external_subagent_wait` 上限 299s，与 zcode 绑定的
+  timeoutMs 同理）。追加是**文本级事务**：不 parse/rewrite 用户的 YAML，
+  用户注释与条目逐字节保留；全新模板末尾的 `[]` 空根行先摘除再追加
+  （OBSERVED 0.2.0-rc.2 模板形态）。重装时哨兵块整体替换（socket/facade
+  路径漂移自愈），字节等价则报 `idempotent`。
+- **dump 验证**：写入后执行 `dsh --profile <name> --dump-config`
+  （`DSH_PERMISSION_MODE=read-only`，30s 有界），stderr 出现
+  `patch:` + `not found` 即 fail-closed（0.2.0-rc.2 对缺失 patch 行也 exit 0，
+  与 daemon preflight 同一守卫），dump 尾部必须出现本条目；失败时 patch 字节
+  与已 staged skill 全部回滚。
+- **Skill 装载**：`SKILL.md` 复制到 `$DSH_HOME/skills/external-subagent/`
+  （dsh-skill-filesystem 默认扫描的 rank-400 user root，无需改 profile）；
+  该位置已有非产品内容时以 `DSH_SKILL_CONFLICT` 拒绝，绝不覆盖。
+- **profile 校验**：`--profile` 必填且目录必须已存在（fail-closed 并提示
+  `--from-default-profile` 创建）；`desktop` 被明确拒绝（npm dsh CLI 拒绝其
+  dump 与 plugin 管理，属 Electron 保留名）；名字含路径分隔符拒绝。
+- **裸包名解析**：受管条目用裸包名 `@deepseek-ai/dsh-mcp-client`，由 dsh
+  loader 从 CLI 自带安装树解析（实测全新 DSH_HOME 无 profile node_modules
+  也能干净组合）。安装时探测 CLI 安装树中该包的存在性，缺失时回执附
+  warning 并给出 `dsh plugin --profile <name> add ...` 补装指引，不静默。
+- **无注册表**：绑定状态从 patch 哨兵无状态推导（zcode 模式）。reconcile
+  扫描 `$DSH_HOME/profiles/*/cordis.patch.yml` 的哨兵并逐 profile 重绑；
+  `uninstall` 释放所有哨兵 profile 并移除共享 skill（仅当内容仍是产品字节）。
+  部分失败按 profile 逐项上报（`DSH_SYNC_PARTIAL`），可重跑 reconcile 补齐。
+- **边界**：dump 验证只证明组合合法；真实工具注入需用户 boot 该 profile 后
+  自行确认。用户手工破坏哨兵块时，卸载走 `serverName: external_subagent`
+  兜底搜索并 warning，绝不改动用户条目。
+
 ## Launch compositions (implemented)
 
 DSH spawn has three explicit compositions, selected by the daemon factory from

@@ -6,8 +6,9 @@ tools) and subagents (the execution targets that run the tasks) are two
 independent axes:
 
 - **Hosts** — Codex (`install-plugin codex` or `install-mcp`), ZCode
-  (`install-plugin zcode`), and any custom local MCP client that connects
-  directly to the facade without registration.
+  (`install-plugin zcode`), DSH (`install-plugin dsh --profile <name>`), and
+  any custom local MCP client that connects directly to the facade without
+  registration.
 - **Subagents** — ZCode, DeepSeek Harness (DSH), Codex, and Google
   Antigravity (`agy`), each routed through an internal adapter and subject to
   the per-subagent limitations listed in [docs/product.md](docs/product.md)
@@ -91,7 +92,8 @@ intentionally diverge; see
 ```
 npm install -g external-subagent     # stages package + payload only (macOS arm64, Linux x64)
 external-subagent init               # explicit: standalone daemon service only
-external-subagent install-plugin zcode   # optional host binding (or: install-plugin codex / install-mcp)
+external-subagent install-plugin zcode   # optional host binding (or: install-plugin codex /
+                                        # install-plugin dsh --profile web / install-mcp)
 ```
 
 Packing and publishing are gated by npm lifecycle scripts: `prepack` always

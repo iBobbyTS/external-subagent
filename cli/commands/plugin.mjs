@@ -1,6 +1,7 @@
 import { CliError } from '../errors.mjs';
 import { installMcp, installPlugin, uninstallPlugin } from '../install/codex.mjs';
 import { installZcodePlugin, uninstallZcodePlugin } from '../install/zcode.mjs';
+import { installDshPlugin, uninstallDshPlugin } from '../install/dsh.mjs';
 import { registerCodexHome, unregisterCodexHome } from '../install/reconcile.mjs';
 import { verifyPayload } from '../install/payload.mjs';
 
@@ -9,10 +10,12 @@ import { verifyPayload } from '../install/payload.mjs';
 // stages the plugin and goes through the official codex CLI, claiming the
 // Codex home in the D08 registry; zcode stages the same plugin into a
 // product-owned tree and registers it through the ZCode config's inline
-// plugin dirs.  The MCP TOML binding stays an explicit codex-only
-// alternative for hosts without plugin support.
+// plugin dirs; dsh appends one managed mcp-client entry to the profile's
+// cordis.patch.yml and stages the skill into the DSH user skill root.  The
+// MCP TOML binding stays an explicit codex-only alternative for hosts
+// without plugin support.
 
-const PLUGIN_HOSTS = ['codex', 'zcode'];
+const PLUGIN_HOSTS = ['codex', 'zcode', 'dsh'];
 
 function parseCommon(args, flags) {
   const options = {};
@@ -28,6 +31,16 @@ function parseCommon(args, flags) {
       const value = args[index + 1];
       if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', '--codex-home requires a value', 2);
       options.codexHome = value;
+      index += 1;
+    } else if (arg === '--dsh-home') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', '--dsh-home requires a value', 2);
+      options.dshHome = value;
+      index += 1;
+    } else if (arg === '--profile') {
+      const value = args[index + 1];
+      if (!value || value.startsWith('--')) throw new CliError('INVALID_ARGUMENT', '--profile requires a value', 2);
+      options.profile = value;
       index += 1;
     } else {
       throw new CliError('INVALID_ARGUMENT', `unsupported plugin option: ${arg}`, 2);
@@ -45,8 +58,20 @@ export function pluginCommand(paths, args) {
   const installerOptions = withInstallerFlags(options);
   if (options.host === 'zcode') {
     if (options.codexHome) throw new CliError('INVALID_ARGUMENT', '--codex-home applies to the codex host only', 2);
+    if (options.dshHome) throw new CliError('INVALID_ARGUMENT', '--dsh-home applies to the dsh host only', 2);
+    if (options.profile) throw new CliError('INVALID_ARGUMENT', '--profile applies to the dsh host only', 2);
     return options.uninstall ? uninstallZcodePlugin(paths, installerOptions) : installZcodePlugin(paths, installerOptions);
   }
+  if (options.host === 'dsh') {
+    if (options.codexHome) throw new CliError('INVALID_ARGUMENT', '--codex-home applies to the codex host only', 2);
+    // installDshPlugin re-requires --profile, but failing here keeps the
+    // error at the CLI parsing boundary with the other flag-combination
+    // errors instead of deep inside the installer.
+    if (!options.profile) throw new CliError('INVALID_ARGUMENT', 'the dsh host requires --profile <name>', 2);
+    return options.uninstall ? uninstallDshPlugin(paths, installerOptions) : installDshPlugin(paths, installerOptions);
+  }
+  if (options.profile) throw new CliError('INVALID_ARGUMENT', '--profile applies to the dsh host only', 2);
+  if (options.dshHome) throw new CliError('INVALID_ARGUMENT', '--dsh-home applies to the dsh host only', 2);
   if (options.uninstall) {
     const result = uninstallPlugin(paths, installerOptions);
     if (!options.dry_run && result.uninstalled) {

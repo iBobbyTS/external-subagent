@@ -1,6 +1,7 @@
 import { backupData, purge, restoreData, uninstall as removeService } from '../maintenance.mjs';
 import { unregisterAllCodexHomes } from '../install/reconcile.mjs';
 import { uninstallZcodePlugin } from '../install/zcode.mjs';
+import { uninstallAllDshBindings } from '../install/dsh.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWrite, jsonBytes, readOptional } from '../fs-atomic.mjs';
@@ -167,11 +168,17 @@ export function uninstall(paths, options = {}) {
   try { zcode = uninstallZcodePlugin(paths); } catch (error) {
     zcode = { uninstalled: false, error: { code: error.code || 'ZCODE_BINDING_FAILED', message: error.message } };
   }
+  // DSH bindings are released by scanning every profile's patch sentinel;
+  // the same per-item reporting posture as the codex homes release.
+  let dsh;
+  try { dsh = uninstallAllDshBindings(paths); } catch (error) {
+    dsh = { released: 0, error: { code: error.code || 'DSH_BINDING_RELEASE_FAILED', message: error.message } };
+  }
   // Retained installations may still carry managed hooks pointing at the
   // removed scripts.  Cleanup is bounded to recognized entries and reports
   // its own failure without failing the rest of the uninstall.
   const zcode_hooks = removeManagedHooks(paths);
-  return { ...removed, codex_homes_unregistered: released.unregistered, zcode_binding: zcode, zcode_hooks };
+  return { ...removed, codex_homes_unregistered: released.unregistered, zcode_binding: zcode, dsh_bindings: dsh, zcode_hooks };
 }
 
 export { backupData, purge, restoreData };

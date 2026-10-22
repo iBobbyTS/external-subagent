@@ -1,5 +1,6 @@
 import { npmUpdateCoordination, reconcileCodexHomes } from '../install/reconcile.mjs';
 import { reconcileZcodeBinding } from '../install/zcode.mjs';
+import { reconcileDshBindings } from '../install/dsh.mjs';
 import { preflightUpdate, reconcileInstallation, updateInstallation } from '../install/update.mjs';
 import { callDaemon, canonicalDaemonCode } from '../rpc.mjs';
 import { CliError } from '../errors.mjs';
@@ -28,7 +29,16 @@ function partialHostSync(result) {
     const { error } = result.zcode;
     failures.push(`zcode: ${error ? `${error.code}: ${error.message}` : 'binding refresh failed'}`);
   }
-  return failures.length > 0 ? { zcodeFailed, failures } : null;
+  // DSH reconciles per profile; a bound-but-failed profile is a partial
+  // sync (retryable through reconcile), an absent binding is not.
+  const dshFailed = Array.isArray(result?.dsh?.profiles) && result.dsh.profiles.some((entry) => entry.status === 'failed');
+  if (dshFailed) {
+    for (const entry of result.dsh.profiles.filter((item) => item.status === 'failed')) {
+      const { error } = entry;
+      failures.push(`dsh ${entry.profile}: ${error ? `${error.code}: ${error.message}` : 'binding refresh failed'}`);
+    }
+  }
+  return failures.length > 0 ? { zcodeFailed, dshFailed, failures } : null;
 }
 
 export async function updateCommand(paths, args = [], daemon = {}) {
@@ -115,13 +125,14 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
     const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
     result = (reconciling && !coordinate)
-      ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths), zcode: reconcileZcodeBinding(paths) }
+      ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths), zcode: reconcileZcodeBinding(paths), dsh: reconcileDshBindings(paths) }
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceDue });
-    // The zcode binding has neither a registry nor a service dependency, so
-    // it refreshes on every activation attempt — including service-less
-    // installs, where the codex homes sync runs inside updateInstallation
-    // instead of the service activation block below.
+    // The zcode and dsh bindings have neither a registry nor a service
+    // dependency, so they refresh on every activation attempt — including
+    // service-less installs, where the codex homes sync runs inside
+    // updateInstallation instead of the service activation block below.
     if (!result.zcode) result.zcode = reconcileZcodeBinding(paths);
+    if (!result.dsh) result.dsh = reconcileDshBindings(paths);
     if (!result || typeof result !== 'object' || result.phase !== 'active') {
       throw new Error(`installation update did not activate payload (phase=${result?.phase ?? 'none'})`);
     }
@@ -214,6 +225,6 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   // error, the receipt, and the per-host registries the reconcile owners
   // already persisted — and the public reconcile command finishes the
   // remaining hosts idempotently.  The activation itself stays published.
-  throw new CliError(partialHosts.zcodeFailed ? 'ZCODE_SYNC_PARTIAL' : 'CODEX_SYNC_PARTIAL',
+  throw new CliError(partialHosts.zcodeFailed ? 'ZCODE_SYNC_PARTIAL' : (partialHosts.dshFailed ? 'DSH_SYNC_PARTIAL' : 'CODEX_SYNC_PARTIAL'),
     `activation completed at ${result?.active?.version || requestedVersion}, but host binding reconciliation is partial — ${partialHosts.failures.join('; ')}; run 'external-subagent reconcile' after fixing the listed hosts`);
 }

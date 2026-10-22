@@ -333,3 +333,79 @@ test('treeDigest follows symlink targets outside the traversed root and stays sa
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// DSH host: the command layer routes --profile/--dsh-home to the dsh
+// installer, rejects flag misuse at the parsing boundary, and never
+// touches codex or zcode state.  The dsh-home stays inside the fixture;
+// the dump verification is the installer's injected seam via process.env
+// is NOT used here — these tests cover the command surface only (the
+// installer contract has its own suite).
+test('install-plugin dsh routes to the dsh installer with --profile and --dsh-home', () => {
+  const home = fixtureHome('external-subagent-dsh-cli-');
+  const paths = fixturePaths(home);
+  const dshHome = path.join(home, '.dsh');
+  const profileDir = path.join(dshHome, 'profiles', 'web');
+  fs.mkdirSync(profileDir, { recursive: true });
+  fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), '[]\n');
+  try {
+    const dry = pluginCommand(paths, ['dsh', '--profile', 'web', '--dsh-home', dshHome, '--dry-run']);
+    assert.equal(dry.dry_run, true);
+    assert.equal(dry.host, 'dsh');
+    assert.equal(dry.profile, 'web');
+    assert.equal(fs.readFileSync(path.join(profileDir, 'cordis.patch.yml'), 'utf8'), '[]\n', 'dry-run writes nothing');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('install-plugin dsh without --profile fails at the command boundary', () => {
+  const home = fixtureHome('external-subagent-dsh-args-');
+  const paths = fixturePaths(home);
+  try {
+    assert.throws(() => pluginCommand(paths, ['dsh']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /requires --profile/u);
+      return true;
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('install-plugin rejects dsh-only flags on the other hosts and foreign flags on dsh', () => {
+  const home = fixtureHome('external-subagent-dsh-args2-');
+  const paths = fixturePaths(home);
+  try {
+    assert.throws(() => pluginCommand(paths, ['--profile', 'web']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /--profile applies to the dsh host only/u);
+      return true;
+    });
+    assert.throws(() => pluginCommand(paths, ['--dsh-home', '/tmp/x']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /--dsh-home applies to the dsh host only/u);
+      return true;
+    });
+    assert.throws(() => pluginCommand(paths, ['dsh', '--profile', 'web', '--codex-home', '/tmp/c']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /--codex-home applies to the codex host only/u);
+      return true;
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('install-mcp rejects the dsh host before any mutation', () => {
+  const home = fixtureHome('external-subagent-dsh-mcp-');
+  const paths = fixturePaths(home);
+  try {
+    assert.throws(() => mcpCommand(paths, ['dsh', '--profile', 'web']), (error) => {
+      assert.equal(error.code, 'INVALID_ARGUMENT');
+      assert.match(error.message, /install-mcp binds the codex host only/u);
+      return true;
+    });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
