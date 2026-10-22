@@ -112,13 +112,27 @@ process.exit(1);
 }
 
 function fixtureEnv(home, extra = {}) {
-  return {
+  const env = {
     ...process.env,
     HOME: home,
     CODEX_HOME: extra.codexHome || path.join(home, '.codex'),
     EXTERNAL_SUBAGENT_TEST_NO_LAUNCHCTL: '1',
     ...extra.env,
   };
+  // A developer machine running the suite from inside a DSH-managed session
+  // (desktop/web) leaks DSH_PROFILE/DSH_HOME/DSH_PROFILE_DIR into every
+  // spawned daemon and CLI: the daemon's probe scope falls back to
+  // env DSH_PROFILE, a non-acp value then refuses every dsh launch
+  // (strict_preflight_failed), and a leaked DSH_HOME redirects fixture
+  // writes into the real profile tree. CI runners are clean; strip the
+  // ambient variables so the suite is host-environment independent. Tests
+  // that need a DSH variable pass it explicitly through extra.env.
+  for (const leaked of ['DSH_PROFILE', 'DSH_HOME', 'DSH_PROFILE_DIR', 'DSH_SHELL', 'DSH_WEB_URL', 'DSH_SESSION_ID']) {
+    if (!(leaked in env)) continue;
+    if (extra.env && leaked in extra.env) continue;
+    delete env[leaked];
+  }
+  return env;
 }
 
 // npm pack/install setup is shared by every test through a memoized promise;
@@ -208,6 +222,13 @@ test('the win32 platform seam passes the gate and installs through the injected 
     LOCALAPPDATA: localAppData,
     EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32',
   };
+  // The seam must reach IN-PROCESS calls too: runInit → installServiceDefinition
+  // → platform() reads process.env of THIS test process, not the child env
+  // above. Without it a macOS runner dispatches into installLaunchAgent with
+  // the win32 null paths.launchAgent and crashes inside path.dirname(null).
+  const previousPlatformSeam = process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM;
+  process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM = 'win32';
+  try {
   const paths = productPaths(home, { EXTERNAL_SUBAGENT_TEST_PLATFORM: 'win32', LOCALAPPDATA: localAppData });
 
   // The public CLI passes the win32 gate: init --dry-run plans the install
@@ -256,6 +277,12 @@ test('the win32 platform seam passes the gate and installs through the injected 
   }
   assert.equal(fs.existsSync(path.join(home, 'Library')), false, 'the win32 install must not create a launchd tree');
   assert.equal(fs.existsSync(path.join(home, '.zshrc')), false, 'init never edits shell profiles');
+  } finally {
+    // Restore the process seam: later tests in this file run the real
+    // host platform again.
+    if (previousPlatformSeam === undefined) delete process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM;
+    else process.env.EXTERNAL_SUBAGENT_TEST_PLATFORM = previousPlatformSeam;
+  }
 });
 
 test('explicit init installs the standalone service only and binds no host', { skip: !testable }, async () => {
@@ -441,7 +468,17 @@ test('installed daemon payload serves status, agent states, and ten MCP tools', 
     assert.equal(byAgent.zcode.spawn_supported, false);
     assert.equal(byAgent.dsh.enabled, false, 'DSH stays explicitly missing without any auto-install');
     assert.equal(byAgent.dsh.spawn_supported, false);
-    assert.equal(byAgent.dsh.local.state, 'UNKNOWN', 'missing DSH must surface as unknown, never as valid');
+    // The daemon is spawned with DSH_RUNTIME_PATH pointing at the probe
+    // fixture (the explicit hi probe below consumes it), and status
+    // auto-probes every CONFIGURED agent's local layer through that env —
+    // so local is READY here precisely because the fixture runtime answers
+    // --version. What must NEVER happen is enabled/spawn_supported flipping
+    // on from a probe: those stay false above. On a daemon without the env
+    // (a default install), the same projection reports UNKNOWN.
+    assert.ok(['READY', 'UNKNOWN'].includes(byAgent.dsh.local.state), `dsh local must be probe-derived, got ${byAgent.dsh.local.state}`);
+    if (byAgent.dsh.local.state === 'READY') {
+      assert.ok(fs.realpathSync(byAgent.dsh.local.runtime_path || runtime) === fs.realpathSync(runtime), 'a READY local layer must be the fixture runtime, never a system dsh');
+    }
 
 
     // Exercise the installed native binary with no source/resources in its
