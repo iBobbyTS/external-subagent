@@ -232,7 +232,7 @@ fn materialize_manifest_build(
         workspace.to_path_buf(),
         home,
     );
-    launch.profile = std::env::var("DSH_PROFILE").ok();
+    launch.profile = std::env::var("DSH_PROFILE").ok().filter(|v| v == "acp");
     launch.version = std::env::var("DSH_VERSION").ok();
     launch.permission_mode = Some("workspace-write".into());
     launch.patch = Some(tree.patch_path.clone());
@@ -375,7 +375,12 @@ impl RuntimeFactory for DshRuntimeFactory {
                         prepared.workspace.path.clone(),
                         home,
                     );
-                    launch.profile = std::env::var("DSH_PROFILE").ok();
+                    // The scripted children speak the ACP protocol, so the
+                    // harness pins the profile: a DSH_PROFILE leaked from
+                    // the host session running the suite (desktop/web) must
+                    // not refuse the launch as `unsupported DSH profile`
+                    // (the same leak f377c77 stripped from the mjs fixtures).
+                    launch.profile = Some("acp".into());
                     launch.version = std::env::var("DSH_VERSION").ok();
                     let command = external_agent_dsh::profile::resolve_launch(&launch)?;
                     let owner = DshRuntimeOwner::spawn(command, _sink)?;

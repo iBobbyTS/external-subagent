@@ -2304,6 +2304,18 @@ mod tests {
     use super::*;
     use std::{io::Write, os::unix::fs::PermissionsExt};
 
+    /// A scope pinned to the `acp` profile for tests that actually launch a
+    /// scripted ACP child: a `DSH_PROFILE` leaked from the host session
+    /// running the suite (desktop/web) would otherwise flow through the
+    /// `or_else(env::var)` fallbacks and refuse the launch (the same leak
+    /// f377c77 stripped from the mjs fixtures).
+    fn acp_scope() -> ProbeScope {
+        ProbeScope {
+            profile: Some("acp".into()),
+            ..ProbeScope::default()
+        }
+    }
+
     #[derive(Clone)]
     struct FixtureBackend {
         evidence: AgentProbeEvidence,
@@ -2346,7 +2358,7 @@ mod tests {
         let scope = ProbeScope {
             workspace: Some("/workspace-a".into()),
             home: Some("/home-a".into()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         let store = AgentEvidenceStore::with_backend(Arc::new(FixtureBackend {
@@ -2951,7 +2963,7 @@ process.stdin.on('data', (chunk) => {
             let scope = ProbeScope {
                 workspace: Some(workspace.to_string_lossy().into_owned()),
                 home: Some(home.to_string_lossy().into_owned()),
-                profile: None,
+                profile: Some("acp".into()),
                 version: None,
             };
             let (auth, hi) = probe_dsh_hi(Some(&runtime), &scope, None, 0);
@@ -3083,7 +3095,7 @@ process.stdin.on('data', (chunk) => {
             Some(&runtime),
             &AgentModelsInput {
                 agent: "dsh".into(),
-                scope: ProbeScope::default(),
+                scope: acp_scope(),
             },
         );
         assert!(output.supported);
@@ -3134,7 +3146,7 @@ process.stdin.on('data', (chunk) => {
             Some(&runtime),
             &AgentModelsInput {
                 agent: "dsh".into(),
-                scope: ProbeScope::default(),
+                scope: acp_scope(),
             },
         );
         assert!(output.supported);
@@ -3196,7 +3208,7 @@ process.stdin.on('data', (chunk) => {
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         // Counterexample: models/list succeeds with zero tokens and session/new
@@ -3318,7 +3330,7 @@ process.stdin.on('data', (chunk) => {
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         let backend = ProcessProbeBackend {
@@ -3378,7 +3390,7 @@ process.stdin.on('data', (chunk) => {
         let scope = ProbeScope {
             workspace: Some(directory.path().to_string_lossy().into_owned()),
             home: Some(directory.path().to_string_lossy().into_owned()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         let backend = ProcessProbeBackend {
@@ -3429,7 +3441,7 @@ process.stdin.on('data', (chunk) => {
             scope: ProbeScope {
                 workspace: Some(directory.path().to_string_lossy().into_owned()),
                 home: Some(directory.path().to_string_lossy().into_owned()),
-                profile: None,
+                profile: Some("acp".into()),
                 version: None,
             },
         });
@@ -3450,7 +3462,7 @@ process.stdin.on('data', (chunk) => {
             scope: ProbeScope {
                 workspace: Some(workspace.path().to_string_lossy().into_owned()),
                 home: Some("/home-a".into()),
-                profile: None,
+                profile: Some("acp".into()),
                 version: None,
             },
         });
@@ -3506,7 +3518,7 @@ process.stdin.on('data', (chunk) => {
         let scope = ProbeScope {
             workspace: Some(workspace.to_string_lossy().into_owned()),
             home: Some(home.to_string_lossy().into_owned()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         let (auth, hi) = probe_agy_hi(Some(&runtime), &scope, Some("1.2.12".into()), 7);
@@ -3530,7 +3542,7 @@ process.stdin.on('data', (chunk) => {
         let scope = ProbeScope {
             workspace: Some(workspace.to_string_lossy().into_owned()),
             home: Some(home.to_string_lossy().into_owned()),
-            profile: None,
+            profile: Some("acp".into()),
             version: None,
         };
         let (auth, hi) = probe_agy_hi(Some(&runtime), &scope, None, 7);
@@ -3761,7 +3773,7 @@ process.stdin.on('data', (chunk) => {
             Some(&runtime),
             &AgentModelsInput {
                 agent: "dsh".into(),
-                scope: ProbeScope::default(),
+                scope: acp_scope(),
             },
         );
         assert!(output.supported);
@@ -3796,7 +3808,7 @@ setInterval(() => {}, 1000);
             Some(&runtime),
             &AgentModelsInput {
                 agent: "dsh".into(),
-                scope: ProbeScope::default(),
+                scope: acp_scope(),
             },
         );
         assert!(!output.supported);
