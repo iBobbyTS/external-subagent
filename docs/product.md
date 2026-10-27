@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `host.codex` | 支持多个 instance | `hosts.codex.installations[].home` | 每个 `home` 代表一个独立 Codex 安装绑定；同步、状态和解绑按 home 分别报告 |
 | `host.zcode` | 单 instance（单用户配置，无 home 概念） | `~/.zcode/cli/config.json` 的 `plugins.dirs` | 由 `install-plugin zcode` 注册一个受管 inline plugin 目录；绑定状态从 config 无状态推导，不设注册表 |
-| `host.dsh` | 每 profile 一条绑定（`$DSH_HOME/profiles/<name>/cordis.patch.yml` 的哨兵块） | `install-plugin dsh --profile <name>` | 受管块为一条 `dsh-mcp-client` stdio 条目 + 共享 user skill（`$DSH_HOME/skills`）；绑定状态从哨兵无状态推导；`desktop` profile 被拒绝（npm CLI 保留名） |
+| `host.dsh` | 每 profile 一条绑定（`$DSH_HOME/profiles/<name>/cordis.patch.yml` 的哨兵块） | `install-plugin dsh --profile <name>` | 受管块为一条钉死 `id: mcp-external-subagent` 的 `dsh-mcp-client` stdio 条目 + 共享 user skill（`$DSH_HOME/skills`）；绑定状态从哨兵无状态推导；`desktop` 走 Electron CLI 镜像 dump 验证（Linux 拒绝） |
 | `host.custom` | 支持任意未注册本机 MCP client；不要求持久化 instance | 无需配置 | 连接按 MCP session 识别；不提供安装或自动升级绑定，也不要求预先登记 |
 | `subagents.zcode`、`subagents.dsh`、`subagents.codex`、`subagents.agy` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
 

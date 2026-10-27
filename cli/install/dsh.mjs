@@ -27,10 +27,29 @@ import { guardedRestores } from './plugin-stage.mjs';
 // name cleanly).  The physical presence check below is a fail-closed guard
 // against a future dsh build that stops shipping it.
 const MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
-// The npm dsh CLI rejects dump and plugin-management requests for the
-// desktop profile (reserved for the Electron-owned installation), so it
-// cannot be verified from here at all.
-export const DSH_FORBIDDEN_PROFILES = ['desktop'];
+// The npm dsh CLI rejects dump requests for the desktop profile (reserved
+// for the Electron-owned installation), so desktop cannot be verified by
+// naming it directly.  The refusal is name-only: the same composition is
+// dumpable under a mirror profile name, and the Electron app ships its own
+// CLI whose plugin subcommand manages desktop.  Desktop is therefore
+// installed like any other profile and verified through a mirror dump
+// driven by the Electron-bundled CLI (verifyWithMirrorDump below).
+export const DSH_FORBIDDEN_PROFILES = [];
+// Stable loader entry id for the managed mcp-client row.  dsh's patch
+// grammar makes `id` optional on insert rows, but a row without one is
+// unmanageable: the loader assigns a random 8-hex id at each boot and never
+// persists it, so dsh's own plugin manager marks the row read-only
+// (`unaddressable`) and no later patch row can target it.  Every managed
+// block therefore pins this id, and uninstall also strips disable overrides
+// carrying it.
+export const MCP_ENTRY_ID = 'mcp-external-subagent';
+// The Electron-bundled dsh CLI, usable for desktop verification where the
+// npm CLI refuses the profile name.  Windows ships dsh.cmd at the parallel
+// resources path.
+export const ELECTRON_DSH_CLI = {
+  darwin: '/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh',
+  win32: `${process.env.LOCALAPPDATA || '~/AppData/Local/Programs'}\\DeepSeek Harness\\resources\\runtime\\cli\\bin\\dsh.cmd`,
+};
 // `external_subagent_wait` defaults to 290s with a 299s ceiling; dsh's
 // mcp-client caps tool calls at 60s unless overridden, which would cut
 // every long wait.  300000ms covers the ceiling with margin (the same
@@ -54,6 +73,9 @@ export function dshProfileDir(options = {}, paths) {
   }
   if (DSH_FORBIDDEN_PROFILES.includes(name)) {
     throw new CliError('INVALID_ARGUMENT', `the dsh CLI refuses the "${name}" profile for external management; bind web, headless, acp, or a custom profile instead`, 2);
+  }
+  if (name === 'desktop' && process.platform !== 'darwin' && process.platform !== 'win32') {
+    throw new CliError('INVALID_ARGUMENT', 'the desktop profile is Electron-owned and only manageable on macOS and Windows installations', 2);
   }
   if (/[\\/]/u.test(name)) throw new CliError('INVALID_ARGUMENT', 'dsh profile name must not contain path separators', 2);
   return path.join(dshHomeFor(options, paths), 'profiles', name);
@@ -117,6 +139,7 @@ function managedBlock(binding, socket) {
   return [
     SENTINEL,
     '- insert:',
+    `    - id: ${MCP_ENTRY_ID}`,
     `    - name: ${yamlScalar(MCP_CLIENT_PACKAGE)}`,
     '      config:',
     `        serverName: ${yamlScalar('external_subagent')}`,
@@ -192,6 +215,38 @@ function managedRange(text) {
   return { start: sentinelIndex, end: Math.min(end, text.length) };
 }
 
+// Remove top-level disable overrides for the managed entry id.  A matching
+// row is `- id: <MCP_ENTRY_ID>` (single- or double-quoted or bare, matching
+// dsh's own writer which emits `{id, disabled}`) followed only by `disabled`
+// and comment lines; a row carrying any other key (`name`, `config`,
+// `insert`) belongs to the user and survives even if it reuses the id.
+function stripDisableOverrides(text) {
+  const lines = text.split('\n');
+  const kept = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    const match = /^- id:\s*('?|"?)mcp-external-subagent\1\s*$/u.exec(line);
+    if (match) {
+      let end = index + 1;
+      while (end < lines.length) {
+        const next = lines[end];
+        if (/^  disabled:\s*\S+/u.test(next) || next.trim() === '' || next.startsWith('#')) end += 1;
+        else break;
+      }
+      const body = lines.slice(index + 1, end).filter((l) => l.trim() !== '' && !l.startsWith('#'));
+      const onlyDisabled = body.length > 0 && body.every((l) => /^  disabled:\s*\S+/u.test(l));
+      if (onlyDisabled) {
+        index = end;
+        continue;
+      }
+    }
+    kept.push(line);
+    index += 1;
+  }
+  return kept.join('\n');
+}
+
 function skillPaths(dshHome) {
   const dir = path.join(dshHome, 'skills', 'external-subagent');
   return { dir, file: path.join(dir, 'SKILL.md') };
@@ -237,14 +292,78 @@ function unstageSkill(dshHome, source) {
 // failures.  Returns the observed dsh version token (advisory evidence).
 // `options.verify` is the test seam: an injected verifier replaces the
 // spawn without touching any other install logic.
+// Compose a throwaway mirror of the desktop profile under a non-reserved
+// name inside the SAME dsh home and dump it with the Electron-bundled CLI.
+// The npm CLI (and even the Electron CLI) refuse `--dump-config` for the
+// literal name "desktop" — the refusal is name-only (OBSERVED 0.2.1-rc.3),
+// so an identical composition under another name verifies the same patch
+// bytes.  The mirror copies the profile's composition inputs (cordis.yml,
+// cordis.patch.yml, package.json, pnpm-*.yaml) but never node_modules: a
+// symlinked node_modules would let dsh's link-projection cleanup write into
+// the real profile through the mirror, and bundle resolution falling back
+// to the CLI's own installation is exactly what we want to observe anyway.
+// Returns { status, stderr, stdout } or throws CliError on spawn failure.
+function dumpMirrorProfile(dshHome, sourceProfileDir, exe) {
+  const profilesRoot = path.join(dshHome, 'profiles');
+  const mirrorName = `esa-verify-${process.pid}`;
+  const mirrorDir = path.join(profilesRoot, mirrorName);
+  const mirrorHome = fs.mkdtempSync(path.join(os.tmpdir(), 'external-subagent-mirror-'));
+  const mirrorProfiles = path.join(mirrorHome, 'profiles', mirrorName);
+  fs.mkdirSync(mirrorProfiles, { recursive: true });
+  let dump;
+  try {
+    for (const file of ['cordis.yml', 'cordis.patch.yml', 'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml']) {
+      const from = path.join(sourceProfileDir, file);
+      if (fs.existsSync(from)) fs.copyFileSync(from, path.join(mirrorProfiles, file));
+    }
+    // DSH_HOME points at the scratch home: bundle resolution walks the
+    // CLI's own installation first, so shared bundles resolve there, and a
+    // profile-local bundle that cannot resolve is reported by the dump
+    // itself (an unrelated-user-layer diagnostic, not a crash).
+    dump = spawnSync(exe, ['--profile', mirrorName, '--dump-config'], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, DSH_HOME: mirrorHome, DSH_PERMISSION_MODE: 'read-only' },
+    });
+  } finally {
+    fs.rmSync(mirrorHome, { recursive: true, force: true });
+  }
+  if (dump.error) {
+    throw new CliError('DSH_BINDING_UNVERIFIABLE', `desktop mirror dump could not run: ${dump.error.message}`);
+  }
+  return dump;
+}
+
+// Resolve the Electron-bundled dsh CLI for desktop verification.  Returns
+// null when the expected install is absent (non-Electron machines); the
+// caller degrades to an unverified install with an explicit warning.
+function electronDshCli() {
+  const candidate = process.platform === 'win32'
+    ? ELECTRON_DSH_CLI.win32
+    : ELECTRON_DSH_CLI.darwin;
+  try {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  } catch { /* probe is advisory */ }
+  return null;
+}
+
 function verifyWithDump(dshHome, profileName, options = {}) {
   if (typeof options.verify === 'function') return options.verify({ dshHome, profile: profileName });
-  const { exe } = dshExecutable();
-  const dump = spawnSync(exe, ['--profile', profileName, '--dump-config'], {
-    encoding: 'utf8',
-    timeout: 30000,
-    env: { ...process.env, DSH_HOME: dshHome, DSH_PERMISSION_MODE: 'read-only' },
-  });
+  let dump;
+  let unrelatedDiagnostics = [];
+  if (profileName === 'desktop') {
+    const exe = electronDshCli();
+    if (exe === null) return { dsh_version: null, config_verified: false, warning: 'the Electron-bundled dsh CLI was not found; the desktop patch was written but its composition was not dump-verified (confirm in the DeepSeek Harness plugin page after restart)' };
+    const profileDir = path.join(dshHome, 'profiles', profileName);
+    dump = dumpMirrorProfile(dshHome, profileDir, exe);
+  } else {
+    const { exe } = dshExecutable();
+    dump = spawnSync(exe, ['--profile', profileName, '--dump-config'], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, DSH_HOME: dshHome, DSH_PERMISSION_MODE: 'read-only' },
+    });
+  }
   if (dump.error) {
     throw new CliError('DSH_BINDING_UNVERIFIABLE', `dsh --dump-config could not run: ${dump.error.message}`);
   }
@@ -256,11 +375,18 @@ function verifyWithDump(dshHome, profileName, options = {}) {
   // on stderr (OBSERVED classes: `patch: entry "<id>" not found` for a
   // missing target, `patch: id is required for non-insert patches` for a
   // malformed row).  Fail-open by design upstream — so stderr is a
-  // first-class signal here, not a footnote: ANY `patch:` diagnostic line
-  // about our patch file rejects the install.
+  // first-class signal here, not a footnote: a `patch:` diagnostic naming
+  // OUR entry id rejects the install, because it means the managed row was
+  // dropped or malformed.  Diagnostics about other rows (an unrelated user
+  // override targeting a missing entry, pre-existing profile drift) are
+  // reported as a warning instead: the mirror composition of a
+  // long-lived desktop profile routinely carries such pre-existing
+  // diagnostics that this install neither caused nor can fix.
   const patchDiagnostics = stderr.split('\n').filter((line) => line.includes('patch:'));
-  if (patchDiagnostics.length > 0) {
-    throw new CliError('DSH_BINDING_UNVERIFIABLE', `dsh reported failed patch rows: ${patchDiagnostics.join(' | ')}`);
+  const ours = patchDiagnostics.filter((line) => line.includes(MCP_ENTRY_ID) || line.includes('serverName: external_subagent'));
+  unrelatedDiagnostics = patchDiagnostics.filter((line) => !ours.includes(line));
+  if (ours.length > 0) {
+    throw new CliError('DSH_BINDING_UNVERIFIABLE', `dsh reported failed patch rows: ${ours.join(' | ')}`);
   }
   const out = dump.stdout || '';
   // Presence must be established by a STRUCTURAL match, not a loose
@@ -269,8 +395,10 @@ function verifyWithDump(dshHome, profileName, options = {}) {
   // copied fixture) could otherwise satisfy a substring check and mask a
   // silently-dropped managed row.  The composed dump re-serializes the
   // entry, so anchor on the plugin name line and require the serverName
-  // within the following mapping block.
-  const anchor = out.indexOf(`name: ${MCP_CLIENT_PACKAGE}`);
+  // within the following mapping block.  The dump may render the package
+  // name quoted (`'@deepseek-ai/dsh-mcp-client'`) or bare depending on the
+  // dsh version, so anchor on both spellings.
+  const anchor = Math.max(out.indexOf(`name: ${MCP_CLIENT_PACKAGE}\n`), out.indexOf(`name: '${MCP_CLIENT_PACKAGE}'`));
   if (anchor === -1) {
     throw new CliError('DSH_BINDING_UNVERIFIABLE', 'the managed mcp-client entry is absent from the composed profile dump');
   }
@@ -278,9 +406,13 @@ function verifyWithDump(dshHome, profileName, options = {}) {
   if (!window.includes('serverName: external_subagent')) {
     throw new CliError('DSH_BINDING_UNVERIFIABLE', 'the managed mcp-client entry is present but its serverName is missing from the composed dump');
   }
-  return (dump.stdout.match(/dsh[^\n]*?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/u) || [])[1]
+  const version = (dump.stdout.match(/dsh[^\n]*?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/u) || [])[1]
     || stderr.match(/version[^\n]*?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/ui)?.[1]
     || null;
+  if (unrelatedDiagnostics.length > 0) {
+    return { dsh_version: version, warning: `the profile composition carries pre-existing patch diagnostics unrelated to this binding: ${unrelatedDiagnostics.join(' | ')}` };
+  }
+  return version;
 }
 
 export function installDshPlugin(paths, options = {}) {
@@ -318,16 +450,25 @@ export function installDshPlugin(paths, options = {}) {
   try {
     atomicWrite(patchFile, Buffer.from(nextText, 'utf8'));
     const skill = stageSkill(dshHome, source);
-    const version = verifyWithDump(dshHome, profileName, options);
+    const verification = verifyWithDump(dshHome, profileName, options);
+    // verifyWithDump returns a plain version token on a clean dump, or an
+    // object {dsh_version, warning} when the composition verified but
+    // carries a caveat the user should see (no Electron CLI for a desktop
+    // dump, or pre-existing unrelated patch diagnostics).
+    const isObject = typeof verification === 'object' && verification !== null;
+    const version = isObject ? verification.dsh_version : verification;
+    const verifyWarning = isObject ? verification.warning : null;
     const result = {
       installed: true, host: 'dsh', dsh_home: dshHome, profile: profileName, patch_file: patchFile,
-      config_verified: true,
+      config_verified: !isObject || verification.config_verified !== false,
       binding: { command: binding.command, socket: paths.socket },
       skill: { dir: skill.dir, written: skill.written },
-      dsh_version: version,
+      dsh_version: version ?? packageProbe.version,
     };
+    if (verifyWarning) result.warning = verifyWarning;
     if (!packageProbe.present) {
-      result.warning = `the ${MCP_CLIENT_PACKAGE} plugin was not found beside the dsh CLI; if the profile fails to load the entry, run: dsh plugin --profile ${profileName} add ${MCP_CLIENT_PACKAGE}`;
+      const probeWarning = `the ${MCP_CLIENT_PACKAGE} plugin was not found beside the dsh CLI; if the profile fails to load the entry, run: dsh plugin --profile ${profileName} add ${MCP_CLIENT_PACKAGE}`;
+      result.warning = result.warning ? `${result.warning}; ${probeWarning}` : probeWarning;
     }
     return result;
   } catch (error) {
@@ -349,12 +490,25 @@ export function uninstallDshPlugin(paths, options = {}) {
   }
   const priorPatch = readOptional(patchFile);
   let patchRemoved = false;
+  let overrideRemoved = false;
   let fallback = null;
   if (priorPatch !== null) {
     const text = priorPatch.toString('utf8');
     const range = managedRange(text);
     if (range !== null) {
-      const next = text.slice(0, range.start) + text.slice(range.end);
+      let next = text.slice(0, range.start) + text.slice(range.end);
+      // A user (or dsh's own plugin manager) may have toggled the managed
+      // entry, leaving a top-level disable override carrying our id outside
+      // the sentinel block.  With the insert row gone the override targets
+      // nothing: dsh prints `patch: entry "<id>" not found` on every boot,
+      // and this product's own dump verification treats any patch:
+      // diagnostic naming our id as a failure — so a leftover override
+      // would break the NEXT install.  Strip matching top-level override
+      // rows: `- id: <ours>` plus an optional `disabled`/comment-only body,
+      // never a row that also carries `name` or `config` (that would be a
+      // user-authored entry that merely reuses the id).
+      next = stripDisableOverrides(next);
+      overrideRemoved = next !== text.slice(0, range.start) + text.slice(range.end);
       const trimmed = next.replace(/\s+$/u, '');
       const remainderHasEntries = trimmed.split('\n').some((line) => /^- /u.test(line));
       if (!remainderHasEntries) {
@@ -380,6 +534,7 @@ export function uninstallDshPlugin(paths, options = {}) {
     skill_removed: skill.removed,
     ...(skill.note ? { skill_note: skill.note } : {}),
     ...(fallback ? { warning: fallback } : {}),
+    ...(overrideRemoved ? { override_removed: true } : {}),
     ...(!existed && !patchRemoved ? { note: 'no dsh binding present' } : {}),
   };
 }

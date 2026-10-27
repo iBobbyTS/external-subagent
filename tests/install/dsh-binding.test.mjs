@@ -12,7 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { CliError } from '../../cli/errors.mjs';
 import {
-  composePatchText, dshMcpBinding, installDshPlugin, reconcileDshBindings,
+  composePatchText, dshMcpBinding, installDshPlugin, MCP_ENTRY_ID, reconcileDshBindings,
   uninstallAllDshBindings, uninstallDshPlugin,
 } from '../../cli/install/dsh.mjs';
 import { pluginSourceRoot } from '../../cli/install/layout.mjs';
@@ -247,12 +247,68 @@ test('a missing profile directory fails closed with a creation hint', () => {
   }
 });
 
-test('the desktop profile is refused explicitly', () => {
+test('the managed block pins a stable entry id so dsh plugin management can address the row', () => {
+  const { home, paths, dshHome, patchFile } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    const text = readPatch(patchFile);
+    assert.ok(text.includes(`    - id: ${MCP_ENTRY_ID}`), 'the insert row carries the pinned id');
+    if (yaml) {
+      const parsed = yaml.load(text);
+      const entry = parsed.find((item) => item?.insert?.[0]?.id === MCP_ENTRY_ID);
+      assert.ok(entry, 'the id survives YAML parsing inside the insert row');
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('the desktop profile is installed like any other (verification via the injected seam)', () => {
   const home = fixtureHome();
   try {
     const paths = fixturePaths(home);
-    assert.throws(() => installDshPlugin(paths, { dshHome: path.join(home, '.dsh'), profile: 'desktop', verify: okVerify }),
-      /refuses the "desktop" profile/);
+    const dshHome = path.join(home, '.dsh');
+    const profileDir = path.join(dshHome, 'profiles', 'desktop');
+    fs.mkdirSync(profileDir, { recursive: true });
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), SHIPPED_TEMPLATE);
+    const result = installDshPlugin(paths, { dshHome, profile: 'desktop', verify: okVerify });
+    assert.equal(result.installed, true);
+    assert.equal(result.config_verified, true);
+    assert.ok(readPatch(path.join(profileDir, 'cordis.patch.yml')).includes(`    - id: ${MCP_ENTRY_ID}`));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('uninstall strips the disable override carrying the managed id but keeps foreign rows', () => {
+  const { home, paths, dshHome, patchFile } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    fs.appendFileSync(patchFile, `- id: ${MCP_ENTRY_ID}\n  disabled: true\n- id: timer\n  disabled: true\n`);
+    const result = uninstallDshPlugin(paths, { dshHome, profile: 'web' });
+    assert.equal(result.patch_removed, true);
+    assert.equal(result.override_removed, true, 'the managed disable override is reported');
+    const text = readPatch(patchFile);
+    assert.ok(!text.includes(`- id: ${MCP_ENTRY_ID}`), 'the managed override is gone');
+    assert.ok(text.includes('- id: timer'), 'the foreign override survives');
+    if (yaml) {
+      const parsed = yaml.load(text);
+      assert.ok(parsed.some((item) => item?.id === 'timer' && item?.disabled === true));
+      assert.ok(!parsed.some((item) => item?.id === MCP_ENTRY_ID));
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('uninstall keeps a user row that reuses the managed id but carries other keys', () => {
+  const { home, paths, dshHome, patchFile } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    fs.appendFileSync(patchFile, `- id: ${MCP_ENTRY_ID}\n  name: user-owned-plugin\n  disabled: true\n`);
+    uninstallDshPlugin(paths, { dshHome, profile: 'web' });
+    const text = readPatch(patchFile);
+    assert.ok(text.includes('name: user-owned-plugin'), 'a row with name/config is user-owned and survives');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
   }

@@ -91,31 +91,53 @@ DSH 除作为 subagent 外也可作为 host 调用本产品。内置绑定命令
 
 - **MCP 绑定**：向 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 追加一个带
   哨兵注释的受管块，内容是一条 `@deepseek-ai/dsh-mcp-client` stdio 条目
-  （`serverName: external_subagent`，command 为 native MCP facade 绝对路径，
-  `EXTERNAL_SUBAGENT_SOCKET` 钉死 daemon socket，`toolCallTimeoutMs: 300000`
-  覆盖 dsh 默认 60s —— `external_subagent_wait` 上限 299s，与 zcode 绑定的
-  timeoutMs 同理）。追加是**文本级事务**：不 parse/rewrite 用户的 YAML，
+  （固定 `id: mcp-external-subagent`、`serverName: external_subagent`，command
+  为 native MCP facade 绝对路径，`EXTERNAL_SUBAGENT_SOCKET` 钉死 daemon
+  socket，`toolCallTimeoutMs: 300000` 覆盖 dsh 默认 60s ——
+  `external_subagent_wait` 上限 299s，与 zcode 绑定的 timeoutMs 同理）。
+  id 是 dsh 插件管理的前提：insert 行的 `id` 在 dsh 语法里可省，但省略时
+  loader 每次启动生成随机 8 位 hex 且不落盘，dsh 自己的 plugin manager 会把
+  该行标为 `unaddressable`（只读、无法开关）；钉死 id 后 GUI 插件页与本产品
+  都能稳定寻址。追加是**文本级事务**：不 parse/rewrite 用户的 YAML，
   用户注释与条目逐字节保留；全新模板末尾的 `[]` 空根行先摘除再追加
   （OBSERVED 0.2.0-rc.2 模板形态）。重装时哨兵块整体替换（socket/facade
-  路径漂移自愈），字节等价则报 `idempotent`。
+  路径漂移自愈，旧版无 id 块同样被替换补上 id），字节等价则报
+  `idempotent`。
 - **dump 验证**：写入后执行 `dsh --profile <name> --dump-config`
-  （`DSH_PERMISSION_MODE=read-only`，30s 有界），stderr 出现
-  `patch:` + `not found` 即 fail-closed（0.2.0-rc.2 对缺失 patch 行也 exit 0，
-  与 daemon preflight 同一守卫），dump 尾部必须出现本条目；失败时 patch 字节
-  与已 staged skill 全部回滚。
+  （`DSH_PERMISSION_MODE=read-only`，30s 有界），stderr 出现针对**本条目 id**
+  的 `patch:` 诊断即 fail-closed（0.2.0-rc.2 对缺失 patch 行也 exit 0，
+  与 daemon preflight 同一守卫），dump 必须包含本条目；与本次绑定无关的
+  存量诊断（用户自己的 override 指向缺失条目等）降级为回执 warning，不
+  阻断——长期使用的 profile 组合里这类噪音常见，且镜像验证下 bundle 缺失
+  也会产生同源噪音。失败时 patch 字节与已 staged skill 全部回滚。
+  `desktop` profile 的验证走**镜像 dump**：npm dsh CLI 与 Electron 自带 CLI
+  都按名字拒绝 desktop 的 `--dump-config`（OBSERVED 0.2.1-rc.3，拒绝仅看
+  名字），安装器把 profile 的组合输入（cordis.yml、cordis.patch.yml、
+  package.json、pnpm-*.yaml，**不含 node_modules**——symlink 会让 dsh 的
+  link-projection 清理穿透写真实 profile）复制进一次性 DSH_HOME 的镜像
+  名下，用 Electron 自带 CLI（macOS
+  `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`，
+  Windows `%LOCALAPPDATA%\\DeepSeek Harness\\resources\\runtime\\cli\\bin\\dsh.cmd`）
+  dump；Electron CLI 缺失时降级为 `config_verified: false` + warning，把
+  最终确认留给 GUI 插件页。
 - **Skill 装载**：`SKILL.md` 复制到 `$DSH_HOME/skills/external-subagent/`
   （dsh-skill-filesystem 默认扫描的 rank-400 user root，无需改 profile）；
   该位置已有非产品内容时以 `DSH_SKILL_CONFLICT` 拒绝，绝不覆盖。
 - **profile 校验**：`--profile` 必填且目录必须已存在（fail-closed 并提示
-  `--from-default-profile` 创建）；`desktop` 被明确拒绝（npm dsh CLI 拒绝其
-  dump 与 plugin 管理，属 Electron 保留名）；名字含路径分隔符拒绝。
+  `--from-default-profile` 创建）；名字含路径分隔符拒绝。`desktop` 不再被
+  拒绝：写入路径与 dump 无关，验证走上面的镜像 dump（Linux 上没有
+  Electron 安装，desktop 仍被拒绝）。
 - **裸包名解析**：受管条目用裸包名 `@deepseek-ai/dsh-mcp-client`，由 dsh
   loader 从 CLI 自带安装树解析（实测全新 DSH_HOME 无 profile node_modules
   也能干净组合）。安装时探测 CLI 安装树中该包的存在性，缺失时回执附
   warning 并给出 `dsh plugin --profile <name> add ...` 补装指引，不静默。
 - **无注册表**：绑定状态从 patch 哨兵无状态推导（zcode 模式）。reconcile
-  扫描 `$DSH_HOME/profiles/*/cordis.patch.yml` 的哨兵并逐 profile 重绑；
-  `uninstall` 释放所有哨兵 profile 并移除共享 skill（仅当内容仍是产品字节）。
+  扫描 `$DSH_HOME/profiles/*/cordis.patch.yml` 的哨兵并逐 profile 重绑（含
+  desktop）；`uninstall` 释放所有哨兵 profile 并移除共享 skill（仅当内容仍是
+  产品字节），同时剥离携带本条目 id 的顶层 `disabled` 覆盖行（dsh 的
+  plugin manager 开关后留下的 `{id, disabled}` 行——块删掉后它指向空目标，
+  dsh 每次启动报 `patch: entry not found`，且会被本产品下次安装的 dump
+  验证误判为失败；携带 `name`/`config` 的同 id 用户行不属此列，保留）。
   部分失败按 profile 逐项上报（`DSH_SYNC_PARTIAL`），可重跑 reconcile 补齐。
 - **边界**：dump 验证只证明组合合法；真实工具注入需用户 boot 该 profile 后
   自行确认。用户手工破坏哨兵块时，卸载走 `serverName: external_subagent`
