@@ -429,3 +429,66 @@ test('a failed baseline publication rolls the whole init back', { skip: !darwinA
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a JS-only release skips drain and service restart when the running daemon already executes the candidate bytes', { skip: !darwinArm64 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-js-only-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  const events = [];
+  // The real updater runs from this tree so the JS activation is genuine;
+  // the candidate's daemon digest is forced to equal the LIVE daemon's
+  // self-reported artifact digest — exactly a release whose native payload
+  // is byte-identical to the one already running.
+  const liveDigest = 'aa' + 'b'.repeat(62);
+  const rpc = async (_socket, command) => {
+    events.push(`rpc:${command}`);
+    if (command === 'status') return { identity: { daemon: { artifact: { path: '/live/external-subagentd', sha256: liveDigest }, version: '0.5.3' } }, service_generation: 'gen-1' };
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'js-only-1' };
+    return { ready_for_activation: true };
+  };
+  try {
+    const result = await updateCommand(p, [], {
+      callDaemon: rpc,
+      preflightUpdate: () => ({ candidateRoot: packageRoot(), version: packageVersion(), payload: { version: packageVersion() }, stable: { digest: 's' }, daemon: { digest: liveDigest } }),
+      updateInstallation: (target, options) => { events.push('update'); assert.equal(options.deferCodexSync, false, 'the JS activation still defers codex sync like a service run'); return { phase: 'active', active: { version: packageVersion(), entry: 'e', entry_sha256: 'es', daemon_entry: 'd', daemon_entry_sha256: liveDigest } }; },
+      hasInstalledService: () => true,
+      activateService: async () => { events.push('activate'); throw new Error('service activation must not run for a JS-only release'); },
+    });
+    assert.equal(result.phase, 'active');
+    assert.equal(result.js_only_restart_skipped, true);
+    assert.ok(!events.includes('rpc:drain'), 'the live daemon is never drained');
+    assert.ok(!events.includes('rpc:drain-status'), 'no drain polling happens');
+    assert.ok(!events.includes('activate'), 'no service restart is attempted');
+    const receipt = JSON.parse(fs.readFileSync(`${p.state}.activation.json`, 'utf8'));
+    assert.equal(receipt.status, 'success');
+    assert.equal(receipt.js_only_restart_skipped, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a binary-changing release still drains and restarts the service', { skip: !darwinArm64 }, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'external-binary-change-'));
+  const p = paths(root);
+  fs.mkdirSync(p.data, { recursive: true });
+  const events = [];
+  const rpc = async (_socket, command) => {
+    events.push(`rpc:${command}`);
+    if (command === 'status') return { identity: { daemon: { artifact: { path: '/live/external-subagentd', sha256: 'old' + '0'.repeat(61), version: '0.5.3' } }, service_generation: 'gen-1' } };
+    if (command === 'activate-ready') return { ready_for_activation: true, activation_claim: 'binary-change-1' };
+    return { ready_for_activation: true };
+  };
+  try {
+    await updateCommand(p, [], {
+      callDaemon: rpc,
+      preflightUpdate: () => ({ candidateRoot: packageRoot(), version: packageVersion(), payload: { version: packageVersion() }, stable: { digest: 's' }, daemon: { digest: 'ff' + 'e'.repeat(62) } }),
+      updateInstallation: () => ({ phase: 'active', active: { version: packageVersion(), entry: 'e', entry_sha256: 'es', daemon_entry: 'd', daemon_entry_sha256: 'ff' + 'e'.repeat(62) } }),
+      hasInstalledService: () => true,
+      activateService: async () => { events.push('activate'); return { pid: 99, service_generation: 8 }; },
+    });
+    assert.ok(events.includes('rpc:drain'), 'a real binary change still drains the daemon');
+    assert.ok(events.includes('activate'), 'a real binary change still restarts the service');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

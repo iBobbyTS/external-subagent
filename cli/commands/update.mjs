@@ -69,9 +69,36 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   // returns with the daemon still serving spawns. A pure reaffirmal that
   // activates nothing drains only for its claim and needs no candidate.
   const preflight = daemon.preflightUpdate || preflightUpdate;
-  if (!(reconciling && !coordinate)) preflight({ version: requestedVersion });
+  let candidate = null;
+  if (!(reconciling && !coordinate)) {
+    candidate = preflight({ version: requestedVersion });
+  }
+  // A JavaScript-only release ships a native payload byte-identical to the
+  // one the running daemon already executes. Draining and restarting the
+  // service for it would bounce every live subagent task for nothing, and
+  // the health gate would then refuse the "new" payload anyway: the daemon
+  // self-reports the version baked into the (unchanged) binary, which can
+  // never equal the requested JS-only version. So when the running daemon's
+  // self-reported artifact digest matches the candidate's verified daemon
+  // digest, this run skips the drain/service-restart entirely: the JS state
+  // still activates, host bindings still reconcile, and the service keeps
+  // executing the very bytes it already runs. The restart path stays
+  // untouched for any real binary change (digest mismatch) and for offline
+  // daemons (nothing to compare against; the activation boots the service).
+  let jsOnlyRestartSkip = false;
+  if (candidate !== null && candidate.daemon?.digest) {
+    try {
+      const live = await rpc(socket, 'status', {});
+      const liveArtifact = live?.identity?.daemon?.artifact;
+      if (liveArtifact?.sha256 === candidate.daemon.digest) jsOnlyRestartSkip = true;
+    } catch { /* offline or unanswerable daemon: take the normal restart path */ }
+  }
   let status = null;
   let online = true;
+  if (jsOnlyRestartSkip) {
+    online = false;
+    status = { ready_for_activation: true, activation_claim: null, js_only_restart_skipped: true };
+  } else {
   try {
     status = await rpc(socket, 'drain', cancelActive ? { cancel_active: true } : {});
   } catch (error) {
@@ -99,6 +126,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     }
     status = await rpc(socket, 'activate-ready', {});
   }
+  }
   const claim = online ? status.activation_claim : `offline-${process.pid}-${Date.now()}-activation`;
   if (!claim) return { ...status, activation_claim: null, update: 'not_activated' };
   if (prior?.status === 'success' && prior.claim === claim
@@ -123,7 +151,11 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   let partialHosts = null;
   try {
     const serviceInstalled = typeof daemon.hasInstalledService === 'function' ? daemon.hasInstalledService(paths) : hasInstalledService(paths);
-    const serviceDue = serviceInstalled && !daemon.skipServiceActivation;
+    // A JS-only release skips the service restart (see jsOnlyRestartSkip):
+    // the running daemon already executes the candidate's exact daemon bytes,
+    // so a bootout/bootstrap would only bounce live tasks and then fail the
+    // version-bearing health gate against the unchanged binary.
+    const serviceDue = serviceInstalled && !daemon.skipServiceActivation && !jsOnlyRestartSkip;
     result = (reconciling && !coordinate)
       ? { ...reconcileInstallation(paths, { cancelActive, yes }), homes: reconcileCodexHomes(paths), zcode: reconcileZcodeBinding(paths), dsh: reconcileDshBindings(paths) }
       : await (daemon.updateInstallation || updateInstallation)(paths, { version: requestedVersion, deferCodexSync: serviceDue });
@@ -163,8 +195,8 @@ export async function updateCommand(paths, args = [], daemon = {}) {
     partialHosts = partialHostSync(result);
     atomicWrite(receiptPath(paths), jsonBytes(partialHosts
       ? { claim, version: receiptVersion, status: 'partial', retryable: true, homes: result.homes, zcode: result.zcode, result }
-      : { claim, version: receiptVersion, status: 'success', result }));
-    if (partialHosts === null) return result;
+      : { claim, version: receiptVersion, status: 'success', ...(jsOnlyRestartSkip ? { js_only_restart_skipped: true } : {}), result }));
+    if (partialHosts === null) return jsOnlyRestartSkip ? { ...result, js_only_restart_skipped: true } : result;
   } catch (error) {
     // Snapshot what the updater recorded before rollback replaces it, so the
     // receipt keeps the candidate and active evidence the retry will need.
