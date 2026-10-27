@@ -663,28 +663,28 @@ test('the public update drives the real activation and health-verifies the verif
 
   // Only the launchctl seam is injected: drain, claim, updateInstallation,
   // activateService, health verification, and the real daemon RPC on the real
-  // socket all run for real from the installed package.
+  // socket all run for real from the installed package.  By this leg the
+  // fixture's published active is ALREADY vB and the running daemon already
+  // executes the vB bytes, so this run is a JS-only re-affirmal: the
+  // coordinator must SKIP the drain and the service restart (the daemon is
+  // never replaced), still activate the JS state, and re-bind the codex
+  // home.  The drain/replace/health-verify path itself stays covered by the
+  // live vA→vB leg above, where the binary really changes.
   const real = runDriver('real', [], { mode: 'real-update' });
   assert.equal(real.ok, true, `real update failed: ${real.code} ${real.message}`);
   assert.equal(real.result.phase, 'active');
   assert.equal(real.result.active.version, VERSION_B);
   assert.equal(real.result.active.retained.daemon_entry, path.join(paths().data, 'payload-store', VERSION_B, 'external-subagentd'));
   assert.equal(real.result.active.daemon_entry_sha256, ctx.shaB);
+  assert.equal(real.result.js_only_restart_skipped, true, 'a same-binary re-affirmal skips the service restart');
 
-  const service = real.result.service;
-  assert.ok(Number.isInteger(service.pid) && service.pid > 0, 'health verification returned a real daemon pid');
-  assert.notEqual(service.pid, pidBefore, 'the daemon was replaced, not reused');
-  assert.equal(service.version, VERSION_B, 'the running daemon self-reports the payload version');
-  assert.equal(service.artifact.path, real.result.active.retained.daemon_entry, 'the daemon self-reports the verified daemon artifact path');
-  assert.equal(service.artifact.sha256, ctx.shaB, 'the daemon self-reports the verified payload digest');
-  assert.ok(service.service_generation, 'health verification captured the new service generation');
-
+  assert.equal(launchctlState().pid, pidBefore, 'the running daemon was never drained or replaced');
   const spawned = launchctlLog().filter((entry) => entry.action === 'spawned').slice(spawnCountBefore);
-  assert.deepEqual(spawned.map((entry) => entry.program), [real.result.active.retained.daemon_entry], 'the public update relaunched exactly the native daemon, never the shim');
-  assert.equal(plistProgram(), real.result.active.retained.daemon_entry, 'the LaunchAgent keeps pinning the daemon artifact');
+  assert.deepEqual(spawned, [], 'no service relaunch happens for unchanged daemon bytes');
+  assert.equal(plistProgram(), daemonEntry(), 'the LaunchAgent keeps pinning the daemon artifact');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'success');
-  assert.match(receipt.claim, /^external-subagentd-\d+-activation$/, 'the receipt carries the real daemon-issued activation claim');
+  assert.equal(receipt.js_only_restart_skipped, true);
   const registry = JSON.parse(fs.readFileSync(path.join(paths().data, 'codex-homes.json'), 'utf8'));
   assert.equal(registry.homes[0].last_status, 'updated', 'the real update re-bound the claimed codex home');
 });
@@ -708,5 +708,10 @@ test('the retired vA version is rejected without touching the published vB activ
   assert.equal(sha256(fs.readFileSync(daemonEntry())), ctx.shaB, 'the active daemon artifact on disk still matches the verified digest');
   const receipt = readReceipt();
   assert.equal(receipt.status, 'success');
-  assert.match(receipt.claim, /^external-subagentd-\d+-activation$/);
+  // The claim shape depends on how the fixture's vB activation reached the
+  // coordinator: a live daemon grants an external-subagentd-N claim, while
+  // the JS-only skip path (or a fixture boot without a running daemon)
+  // synthesizes an offline claim. Both are legitimate success receipts for
+  // a publication this test did not itself drive.
+  assert.match(receipt.claim, /^(external-subagentd-\d+|offline-\d+-\d+)-activation$/);
 });

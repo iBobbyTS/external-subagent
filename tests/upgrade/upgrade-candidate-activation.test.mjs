@@ -126,8 +126,12 @@ test('cancel-active with yes is forwarded to drain and waits for reap readiness'
     if (command === 'drain-status') { statuses += 1; return { ready_for_activation: statuses >= 2, tasks_reaped: statuses >= 2 }; }
     return { ready_for_activation: true, activation_claim: null };
   };
-  await updateCommand(p, ['--cancel-active', '--yes'], { callDaemon: rpc });
-  assert.deepEqual(calls.slice(0, 3), [['drain', { cancel_active: true }], ['drain-status', {}], ['drain-status', {}]]);
+  // Injected verified candidate (this rpc fixture reports no daemon
+  // identity, so the JS-only probe declines) keeps the call sequence
+  // identical on dev machines and CI.
+  const candidate = () => ({ candidateRoot: '/tmp', version: '9.9.9', payload: { version: '9.9.9' }, stable: { digest: 's' }, daemon: { digest: 'd'.repeat(64) } });
+  await updateCommand(p, ['--cancel-active', '--yes'], { callDaemon: rpc, preflightUpdate: candidate, updateInstallation: () => ({ phase: 'active', active: { version: '9.9.9' } }), hasInstalledService: () => false });
+  assert.deepEqual(calls.slice(0, 4), [['status', {}], ['drain', { cancel_active: true }], ['drain-status', {}], ['drain-status', {}]]);
 });
 
 test('missing activation claim does not run updater', async () => {
