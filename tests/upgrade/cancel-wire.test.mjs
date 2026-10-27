@@ -32,14 +32,25 @@ test('update cancel-active survives the real CLI RPC encoder', async (t) => {
   });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
   t.after(() => new Promise((resolve) => server.close(resolve)));
-  await updateCommand({ state: path.join(root, 'state'), socket: socketPath }, ['--cancel-active', '--yes']);
-  assert.equal(frames[0].method, 'daemon_begin_drain');
-  assert.deepEqual(frames[0].params, { cancel_active: true });
-  assert.equal(frames[1].method, 'daemon_drain_status');
+  // A verified candidate whose daemon digest differs from anything this fake
+  // daemon could report: the JS-only probe always declines and the full
+  // drain sequence runs, on this machine and on CI alike (the real
+  // preflight cannot serve that role on a dev checkout whose staged payload
+  // version drifts from the package version).
+  const candidate = () => ({ candidateRoot: '/tmp', version: '9.9.9', payload: { version: '9.9.9' }, stable: { digest: 's' }, daemon: { digest: 'd'.repeat(64) } });
+  await updateCommand({ state: path.join(root, 'state'), socket: socketPath }, ['--cancel-active', '--yes'], { preflightUpdate: candidate, updateInstallation: () => ({ phase: 'active', active: { version: '9.9.9' } }), hasInstalledService: () => false });
+  assert.equal(frames[0].method, 'system_status', 'the JS-only probe leads the wire sequence');
+  assert.equal(frames[1].method, 'daemon_begin_drain');
+  assert.deepEqual(frames[1].params, { cancel_active: true });
+  assert.equal(frames[2].method, 'daemon_drain_status');
   assert.equal(frames.at(-1).method, 'daemon_activate_ready');
   frames.length = 0;
-  await updateCommand({ state: path.join(root, 'state'), socket: socketPath }, []);
-  assert.equal(Object.hasOwn(frames[0], 'params'), false);
+  await updateCommand({ state: path.join(root, 'state'), socket: socketPath }, [], { preflightUpdate: candidate, updateInstallation: () => ({ phase: 'active', active: { version: '9.9.9' } }), hasInstalledService: () => false });
+  // The repeat run still probes, drains, and re-affirms the same claim; the
+  // drain itself stays parameterless.
+  assert.equal(frames[0].method, 'system_status');
+  assert.equal(frames[1].method, 'daemon_begin_drain');
+  assert.equal(Object.hasOwn(frames[1], 'params'), false);
 });
 
 test('a failed update aborts the drain through the real CLI RPC encoder', async (t) => {
@@ -169,11 +180,15 @@ test('legacy daemon accepts default drain and rejects explicit cancellation with
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const paths = { state: path.join(root, 'state'), socket: socketPath };
-  await updateCommand(paths, []);
-  assert.deepEqual(frames.map((request) => request.method), ['daemon_begin_drain', 'daemon_activate_ready']);
-  assert.equal(Object.hasOwn(frames[0], 'params'), false);
+  // Same injected verified candidate as the first test: the probe always
+  // declines here, keeping the wire sequence identical everywhere.
+  const candidate = () => ({ candidateRoot: '/tmp', version: '9.9.9', payload: { version: '9.9.9' }, stable: { digest: 's' }, daemon: { digest: 'd'.repeat(64) } });
+  const seams = { preflightUpdate: candidate, updateInstallation: () => ({ phase: 'active', active: { version: '9.9.9' } }), hasInstalledService: () => false };
+  await updateCommand(paths, [], seams);
+  assert.deepEqual(frames.map((request) => request.method), ['system_status', 'daemon_begin_drain', 'daemon_activate_ready']);
+  assert.equal(Object.hasOwn(frames[1], 'params'), false);
   frames.length = 0;
-  await assert.rejects(updateCommand(paths, ['--cancel-active', '--yes']), { code: 'CANCEL_ACTIVE_UNSUPPORTED' });
-  assert.equal(frames.length, 1, 'must not retry without cancellation or activate');
-  assert.deepEqual(frames[0].params, { cancel_active: true });
+  await assert.rejects(updateCommand(paths, ['--cancel-active', '--yes'], seams), { code: 'CANCEL_ACTIVE_UNSUPPORTED' });
+  assert.equal(frames.length, 2, 'probe plus one cancelled drain; no retry, no activate');
+  assert.deepEqual(frames[1].params, { cancel_active: true });
 });
