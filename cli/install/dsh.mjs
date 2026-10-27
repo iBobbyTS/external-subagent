@@ -140,7 +140,7 @@ function managedBlock(binding, socket) {
     SENTINEL,
     '- insert:',
     `    - id: ${MCP_ENTRY_ID}`,
-    `    - name: ${yamlScalar(MCP_CLIENT_PACKAGE)}`,
+    `      name: ${yamlScalar(MCP_CLIENT_PACKAGE)}`,
     '      config:',
     `        serverName: ${yamlScalar('external_subagent')}`,
     `        transport: ${yamlScalar('stdio')}`,
@@ -394,15 +394,22 @@ function verifyWithDump(dshHome, profileName, options = {}) {
   // composition (an older manual row, another profile's leftovers in a
   // copied fixture) could otherwise satisfy a substring check and mask a
   // silently-dropped managed row.  The composed dump re-serializes the
-  // entry, so anchor on the plugin name line and require the serverName
-  // within the following mapping block.  The dump may render the package
-  // name quoted (`'@deepseek-ai/dsh-mcp-client'`) or bare depending on the
-  // dsh version, so anchor on both spellings.
-  const anchor = Math.max(out.indexOf(`name: ${MCP_CLIENT_PACKAGE}\n`), out.indexOf(`name: '${MCP_CLIENT_PACKAGE}'`));
+  // entry with its id first (dsh emits `id`, `name`, `config` in key
+  // order), so anchor on OUR entry id and require both the plugin name and
+  // the serverName in the same mapping block.  Anchoring on the id is what
+  // makes this structural: a sibling `- id:`/`- name:` regression (two list
+  // items instead of one) drops the id from the composed entry, and this
+  // check then fails even though a bare `name:` line still exists for some
+  // other mcp-client row in the dump.  The dump may render the package name
+  // quoted or bare depending on the dsh version, so accept both spellings.
+  const anchor = out.indexOf(`- id: ${MCP_ENTRY_ID}\n`);
   if (anchor === -1) {
-    throw new CliError('DSH_BINDING_UNVERIFIABLE', 'the managed mcp-client entry is absent from the composed profile dump');
+    throw new CliError('DSH_BINDING_UNVERIFIABLE', `the managed entry id ${MCP_ENTRY_ID} is absent from the composed profile dump`);
   }
   const window = out.slice(anchor, anchor + 1200);
+  if (!window.includes(`name: ${MCP_CLIENT_PACKAGE}`) && !window.includes(`name: '${MCP_CLIENT_PACKAGE}'`)) {
+    throw new CliError('DSH_BINDING_UNVERIFIABLE', 'the managed entry is present but does not carry the mcp-client plugin name');
+  }
   if (!window.includes('serverName: external_subagent')) {
     throw new CliError('DSH_BINDING_UNVERIFIABLE', 'the managed mcp-client entry is present but its serverName is missing from the composed dump');
   }

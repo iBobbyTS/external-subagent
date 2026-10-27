@@ -255,8 +255,16 @@ test('the managed block pins a stable entry id so dsh plugin management can addr
     assert.ok(text.includes(`    - id: ${MCP_ENTRY_ID}`), 'the insert row carries the pinned id');
     if (yaml) {
       const parsed = yaml.load(text);
-      const entry = parsed.find((item) => item?.insert?.[0]?.id === MCP_ENTRY_ID);
+      // The id must live INSIDE the one insert item: a `- id:` line followed
+      // by a sibling `- name:` line parses as two list items — an id-only
+      // orphan plus a name-only row that dsh marks unaddressable — which is
+      // exactly the regression this guards against.
+      const rows = parsed.flatMap((item) => item?.insert ?? []);
+      const entry = rows.find((item) => item?.id === MCP_ENTRY_ID);
       assert.ok(entry, 'the id survives YAML parsing inside the insert row');
+      assert.equal(entry.name, '@deepseek-ai/dsh-mcp-client', 'id and name are the SAME insert item');
+      assert.equal(entry.config?.serverName, 'external_subagent', 'the config rides the same item');
+      assert.equal(rows.length, 1, 'the managed block inserts exactly one row');
     }
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
