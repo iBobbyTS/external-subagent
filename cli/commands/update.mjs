@@ -86,7 +86,7 @@ export async function updateCommand(paths, args = [], daemon = {}) {
   // untouched for any real binary change (digest mismatch) and for offline
   // daemons (nothing to compare against; the activation boots the service).
   let jsOnlyRestartSkip = false;
-  if (candidate !== null && candidate.daemon?.digest) {
+  if (candidate?.daemon?.digest) {
     try {
       const live = await rpc(socket, 'status', {});
       const liveArtifact = live?.identity?.daemon?.artifact;
