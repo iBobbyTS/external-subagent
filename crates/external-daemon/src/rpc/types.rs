@@ -306,10 +306,8 @@ pub enum RpcSuccess {
     TaskWait {
         task: TaskHeaderView,
         pending_requests: Vec<PendingRequestView>,
-        result_available: bool,
         activity: TaskActivityView,
         result: Option<TaskResultView>,
-        instruction: Option<String>,
         timed_out: bool,
         message_receipt: Option<MessageReceiptView>,
     },

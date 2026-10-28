@@ -308,7 +308,7 @@ async function diagnose(paths, args) {
         query_request_id: snapshot.__request_id ?? null,
         identifiers_complete: Boolean(snapshot.task?.turn_id || (Array.isArray(snapshot.pending_requests) && snapshot.pending_requests.some((request) => request.request_id))),
         pending_request_count: Array.isArray(snapshot.pending_requests) ? snapshot.pending_requests.length : null,
-        result_available: snapshot.result_available ?? false,
+        result_available: snapshot.result_available ?? (snapshot.result != null),
         observed_at_ms: Date.now(),
       };
     } catch (error) {

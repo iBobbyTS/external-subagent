@@ -423,15 +423,15 @@ pub struct PublicTask {
 }
 
 /// The wait output's task projection: lifecycle only. Admission provenance is
-/// immutable after spawn, so wait never repeats it; list/result/close return
-/// the full [`PublicTask`].
+/// immutable after spawn and the session id is already returned by spawn, so
+/// wait never repeats either; list/result/close return the full
+/// [`PublicTask`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicTaskHeader {
     #[schemars(range(min = 10000000, max = 99999999))]
     pub agent_id: u64,
     pub status: String,
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -453,7 +453,6 @@ impl TryFrom<TaskHeaderView> for PublicTaskHeader {
         Ok(Self {
             agent_id: public_task_id(&value.agent_id)?,
             status: value.status,
-            session_id: value.session_id,
         })
     }
 }
@@ -512,11 +511,12 @@ pub struct PublicResult {
     pub partial: bool,
     pub offset: usize,
     pub total_bytes: usize,
+    /// `None` marks the last page: the caller has the whole final text.
     pub next_offset: Option<usize>,
-    pub complete: bool,
     pub reason_code: Option<String>,
     /// Bounded structured failure detail. `None` serializes as `null`, the
     /// same serialized behavior as the `reason_code` precedent.
+    #[serde(default)]
     pub failure_message: Option<String>,
 }
 
@@ -531,7 +531,6 @@ impl TryFrom<TaskResultView> for PublicResult {
             offset: value.offset,
             total_bytes: value.total_bytes,
             next_offset: value.next_offset,
-            complete: value.complete,
             reason_code: value.reason_code,
             failure_message: value.failure_message,
         })
@@ -596,10 +595,8 @@ impl From<TaskActivityView> for PublicActivity {
 pub struct AgentWaitOutput {
     pub task: PublicTaskHeader,
     pub pending_requests: Vec<PublicPendingRequest>,
-    pub result_available: bool,
     pub activity: PublicActivity,
     pub result: Option<PublicResult>,
-    pub instruction: Option<String>,
     pub timed_out: bool,
     pub message_receipt: Option<PublicMessageReceipt>,
 }
@@ -755,7 +752,6 @@ mod public_result_reason_tests {
             offset: 0,
             total_bytes: 51,
             next_offset: None,
-            complete: true,
             reason_code: reason.map(str::to_owned),
             failure_message: None,
         }

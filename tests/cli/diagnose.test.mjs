@@ -128,10 +128,10 @@ test('agent diagnose reads only the public wait projection and exports a bounded
     }
     assert.equal(request.method, 'task_wait');
     socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: {
-      kind: 'task_wait', task: { agent_id: 10000001, status: 'running', session_id: null },
-      pending_requests: [], result_available: false,
+      kind: 'task_wait', task: { agent_id: 10000001, status: 'running' },
+      pending_requests: [],
       activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
-      result: null, instruction: 'Not finished yet, call wait again', timed_out: false,
+      result: null, timed_out: false,
     } }) + '\n');
   }));
   await new Promise((resolve) => server.listen(paths.socket, resolve));
@@ -228,8 +228,8 @@ function statusOrTask(request, agentId = '10000001') {
   assert.equal(request.method, 'task_wait');
   assert.equal(request.params.agent_id, agentId);
   return { outcome: 'success', result: {
-    task: { agent_id: agentId, status: 'failed', session_id: null },
-    activity: {}, pending_requests: [], result_available: true,
+    task: { agent_id: agentId, status: 'failed' },
+    activity: {}, pending_requests: [],
   } };
 }
 

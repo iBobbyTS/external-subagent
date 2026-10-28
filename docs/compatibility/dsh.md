@@ -14,7 +14,7 @@ The shared executable-version check applies the same process-group and increment
 
 DSH live status (2026-09-12): **PARTIALLY VERIFIED** against DSH `0.1.5-rc.1` in a disposable workspace. Real ACP `initialize`, `session/new`, and `session/prompt` completed; the default-model prompt returned `LIVE_OK` with `end_turn`. Under the strict patch profile, shell/write probing exposed only the expected `glob`/`grep` operations and created no target file.
 
-These observations validate the ACP wire path and the bounded strict-plan probe. Production daemon routing is implemented behind the explicit `enabled + spawn_supported + DSH_RUNTIME_PATH` gate; Persisted `agents.dsh.runtime_path`, `home`, and `profile` are carried into the LaunchAgent environment and consumed by the DSH launch profile; an unsupported profile fails closed. `agents.dsh.version` is advisory evidence only: a difference from the daemon-tested reference never refuses a launch and is surfaced as `version mismatch, it may not work as expected` (byte-exact) in status and in failed-terminal wait/result instructions. An isolated daemon smoke completed `spawn → wait → result → close` with `DAEMON_LIVE_OK`, `COMPLETED`, and `resources_reaped=true`. Explicit provider auth/hi probes were executed, but a successful authenticated hi remains **UNVERIFIED** (results below). Codex/ZCode host integration remains **NOT_RUN**. Daemon cancellation is live-verified with reaping and terminal-state preservation across wait/result/close; restart recovery is live-verified as `RUNTIME_LOST` with no replay. The default configuration remains closed; this document does not claim that an unconfigured deployment is enabled.
+These observations validate the ACP wire path and the bounded strict-plan probe. Production daemon routing is implemented behind the explicit `enabled + spawn_supported + DSH_RUNTIME_PATH` gate; Persisted `agents.dsh.runtime_path`, `home`, and `profile` are carried into the LaunchAgent environment and consumed by the DSH launch profile; an unsupported profile fails closed. `agents.dsh.version` is advisory evidence only: a difference from the daemon-tested reference never refuses a launch and is surfaced as `version mismatch, it may not work as expected` (byte-exact) in status and in failed-terminal result instructions. An isolated daemon smoke completed `spawn → wait → result → close` with `DAEMON_LIVE_OK`, `COMPLETED`, and `resources_reaped=true`. Explicit provider auth/hi probes were executed, but a successful authenticated hi remains **UNVERIFIED** (results below). Codex/ZCode host integration remains **NOT_RUN**. Daemon cancellation is live-verified with reaping and terminal-state preservation across wait/result/close; restart recovery is live-verified as `RUNTIME_LOST` with no replay. The default configuration remains closed; this document does not claim that an unconfigured deployment is enabled.
 
 An isolated strict-plan daemon submission completed through ACP. A prompt that
 requested shell/write activity received no shell or write tool and the model
@@ -28,8 +28,8 @@ now `0.2.0-rc.2`. Version equality is no longer a gate anywhere: the preflight
 still probes `--version` to prove the runtime starts and parses a version token,
 but never compares it. A difference produces only the advisory string
 `version mismatch, it may not work as expected` in MCP status and in
-failed-terminal wait/result instructions (expected is the dsh reference;
-observed is the bounded local probe).
+failed-terminal result instructions (expected is the dsh reference;
+observed is the bounded local probe); wait no longer carries the advisory.
 
 Captured evidence and fixtures (tests include them verbatim):
 `crates/subagents/dsh/fixtures/dsh-0.2.0-rc.2-{build,strict-plan,manifest-build}.dump.yml`.

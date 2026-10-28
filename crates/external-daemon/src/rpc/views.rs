@@ -226,14 +226,13 @@ pub struct TaskView {
 }
 
 /// The wait response's task projection. Admission provenance is immutable
-/// after spawn, so every wait would repeat the same `input_identity` block;
-/// wait carries only this header and list/result/close keep the full
-/// [`TaskView`].
+/// after spawn and the session id is already returned by spawn, so every wait
+/// would repeat the same bytes; wait carries only this header and
+/// list/result/close keep the full [`TaskView`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskHeaderView {
     pub agent_id: String,
     pub status: String,
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,8 +299,8 @@ pub struct TaskResultView {
     pub partial: bool,
     pub offset: usize,
     pub total_bytes: usize,
+    /// `None` marks the last page: the caller has the whole final text.
     pub next_offset: Option<usize>,
-    pub complete: bool,
     #[serde(default)]
     pub reason_code: Option<String>,
     /// Bounded structured failure detail, exposed only when the stored result
@@ -386,17 +385,20 @@ pub struct PendingRequestView {
     pub kind: String,
     pub tool_name: Option<String>,
     pub operation: String,
-    pub summary: String,
+    /// Human-readable one-liner for permission requests; `None` for
+    /// user_input requests, whose only retrieval surface — the embedded
+    /// `question` — already carries the same text in fuller form.
+    pub summary: Option<String>,
     /// Full embedded question for user_input requests (the only retrieval
     /// surface); truncated marks questions beyond the embed cap.
     pub question: Option<QuestionView>,
 }
 
 /// Bounded question exposure for answerable user-input requests. The summary
-/// prefix keeps even a worst-case 100-request wait projection inside the
-/// response frame cap, while the embedded question carries a generous page —
-/// wait is its only retrieval surface, so a cut is marked truncated instead
-/// of silently shortened.
+/// bound is the degradation target: under frame pressure the embedded question
+/// itself is shortened to this prefix and marked truncated instead of
+/// silently dropped, keeping even a worst-case 100-request wait projection
+/// inside the response frame cap.
 pub(super) const MAX_QUESTION_SUMMARY_BYTES: usize = 2048;
 pub(super) const MAX_QUESTION_EMBED_BYTES: usize = 16 * 1024;
 
@@ -409,21 +411,6 @@ fn user_input_question(payload_json: &str) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
-}
-
-fn sanitized_user_input_summary(payload_json: &str) -> String {
-    user_input_question(payload_json)
-        .map(|question| {
-            let total = question.chars().count();
-            let prefix = truncate_at_char_boundary(&question, MAX_QUESTION_SUMMARY_BYTES);
-            let shown = prefix.chars().count();
-            if shown < total {
-                format!("question {prefix} [+{} more chars]", total - shown)
-            } else {
-                format!("question {question}")
-            }
-        })
-        .unwrap_or_else(|| "user input request".into())
 }
 
 fn user_input_question_page(payload_json: &str) -> Option<QuestionView> {
@@ -529,7 +516,6 @@ pub(super) fn task_header_view(task: &TaskRecord) -> TaskHeaderView {
     TaskHeaderView {
         agent_id: task.agent_id.clone(),
         status: task_status(task),
-        session_id: task.session_id.clone(),
     }
 }
 
@@ -704,7 +690,6 @@ impl From<StoredTaskResult> for TaskResultView {
             offset: 0,
             total_bytes,
             next_offset: None,
-            complete: true,
             reason_code: None,
             failure_message: None,
         }
@@ -718,7 +703,7 @@ pub(super) fn pending_request_view(request: StoredPendingRequest) -> PendingRequ
             kind: "user_input".into(),
             tool_name: None,
             operation: "user_input".into(),
-            summary: sanitized_user_input_summary(&request.payload_json),
+            summary: None,
             question: user_input_question_page(&request.payload_json),
         };
     }
@@ -742,7 +727,7 @@ pub(super) fn pending_request_view(request: StoredPendingRequest) -> PendingRequ
         kind: "permission".into(),
         tool_name,
         operation,
-        summary,
+        summary: Some(summary),
         question: None,
     }
 }
@@ -780,7 +765,6 @@ mod result_paging_tests {
         TaskHeaderView {
             agent_id: "a".repeat(256),
             status: "completed".into(),
-            session_id: None,
         }
     }
 
@@ -811,7 +795,6 @@ mod result_paging_tests {
             offset: 0,
             total_bytes: MAX_RESULT_CHUNK_BYTES,
             next_offset: None,
-            complete: true,
             reason_code: Some("RUNTIME_TERMINAL".into()),
             failure_message: Some(worst_case_failure_detail()),
         }
@@ -859,13 +842,8 @@ mod result_paging_tests {
             RpcSuccess::TaskWait {
                 task: task_header(),
                 pending_requests: Vec::new(),
-                result_available: true,
                 activity: activity(),
                 result: Some(failed_result()),
-                instruction: Some(
-                    "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
-                        .into(),
-                ),
                 timed_out: false,
                 message_receipt: None,
             },
@@ -888,13 +866,11 @@ mod result_paging_tests {
             RpcSuccess::TaskWait {
                 task: task_header(),
                 pending_requests: Vec::new(),
-                result_available: true,
                 activity: activity(),
                 result: Some(TaskResultView {
                     failure_message: None,
                     ..failed_result()
                 }),
-                instruction: None,
                 timed_out: false,
                 message_receipt: None,
             },
@@ -927,7 +903,6 @@ mod result_paging_tests {
             offset: 0,
             total_bytes: 7,
             next_offset: None,
-            complete: true,
             reason_code: None,
             failure_message: None,
         };

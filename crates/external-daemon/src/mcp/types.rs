@@ -34,7 +34,9 @@ pub struct PublicPendingRequest {
     pub kind: PublicPendingKind,
     pub tool_name: Option<String>,
     pub operation: PublicOperation,
-    pub summary: String,
+    /// Human-readable one-liner for permission requests; null for user_input
+    /// requests, whose full embedded question already carries the same text.
+    pub summary: Option<String>,
     /// Full embedded question for user_input requests; truncated marks
     /// questions beyond the embed cap.
     pub question: Option<PublicQuestion>,
@@ -127,7 +129,7 @@ mod tests {
             kind: "permission".into(),
             tool_name: Some("Read".into()),
             operation: "read".into(),
-            summary: "target input.txt".into(),
+            summary: Some("target input.txt".into()),
             question: None,
         };
         let projected: PublicPendingRequest = view.into();

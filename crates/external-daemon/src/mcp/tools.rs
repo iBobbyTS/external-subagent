@@ -428,7 +428,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_wait",
     output_schema = tool_output_schema::<AgentWaitOutput>(),
-    description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
+    description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -462,19 +462,15 @@ impl SubagentMcp {
             RpcSuccess::TaskWait {
                 task,
                 pending_requests,
-                result_available,
                 activity,
                 result,
-                instruction,
                 timed_out,
                 message_receipt,
             } => Ok(Json(AgentWaitOutput {
                 task: task.try_into()?,
                 pending_requests: pending_requests.into_iter().map(Into::into).collect(),
-                result_available,
                 activity: activity.into(),
                 result: result.map(TryInto::try_into).transpose()?,
-                instruction,
                 timed_out,
                 message_receipt: message_receipt.map(|r| PublicMessageReceipt {
                     message_id: r.message_id,
@@ -887,7 +883,10 @@ mod contract_default_tests {
             response.unwrap(),
             RpcSuccess::TaskWait {
                 timed_out: false,
-                result: Some(TaskResultView { complete: true, .. }),
+                result: Some(TaskResultView {
+                    next_offset: None,
+                    ..
+                }),
                 ..
             }
         ));
@@ -1002,10 +1001,9 @@ mod contract_default_tests {
             wait["pending_requests"][0]["respondable"],
             serde_json::Value::Null
         );
-        assert!(wait["instruction"]
-            .as_str()
-            .expect("respond instruction")
-            .contains("external_subagent_respond"));
+        // The advisory instruction is gone from the wait projection: the
+        // pending record itself names the respond path.
+        assert_eq!(wait["instruction"], serde_json::Value::Null);
         serving.abort();
         let _ = serving.await;
     }
@@ -1661,7 +1659,7 @@ mod contract_default_tests {
         // The wait output carries the lifecycle header only; its schema must
         // reject the full task shape that list/cancel/result still accept.
         let wait_task = serde_json::json!({
-            "agent_id":10000001, "status":"running", "session_id":null
+            "agent_id":10000001, "status":"running"
         });
         let activity = serde_json::json!({
             "latest_text_tail":"", "latest_text_truncated":false,
@@ -1684,8 +1682,8 @@ mod contract_default_tests {
         });
         let wait = serde_json::json!({
             "task":wait_task,"pending_requests":[],
-            "result_available":false,"activity":activity,
-            "result":null,"instruction":null,"timed_out":false,
+            "activity":activity,
+            "result":null,"timed_out":false,
             "message_receipt":{"message_id":"message-1","state":"queued","failure_code":null}
         });
         let successes = BTreeMap::from([
@@ -1821,7 +1819,8 @@ mod contract_default_tests {
             assert!(found, "{name} output schema must expose failure_message");
         }
 
-        // The schema accepts both the extended and the legacy result shapes.
+        // The schema accepts the result shape both with and without an
+        // explicit failure_message value.
         let tool = tools
             .iter()
             .find(|tool| tool.name == "external_subagent_result")
@@ -1838,7 +1837,7 @@ mod contract_default_tests {
         });
         let base_result = serde_json::json!({
             "outcome":"FAILED","final_text":"RUNTIME_TERMINAL","partial":true,
-            "offset":0,"total_bytes":16,"next_offset":null,"complete":true,
+            "offset":0,"total_bytes":16,"next_offset":null,
             "reason_code":"RUNTIME_TERMINAL"
         });
         for failure in [

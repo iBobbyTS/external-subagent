@@ -189,12 +189,12 @@ function publicTask(task) {
 }
 
 // The wait response carries only the task lifecycle header: admission
-// provenance never changes after spawn, so wait does not repeat it.
+// provenance and the session id never change after spawn, so wait does not
+// repeat them.
 function publicTaskHeader(task) {
   return {
     agent_id: publicTaskId(task.agent_id),
     status: task.status,
-    session_id: task.session_id ?? null,
   };
 }
 
@@ -207,8 +207,8 @@ function publicResult(result) {
     offset: result.offset,
     total_bytes: result.total_bytes,
     next_offset: result.next_offset ?? null,
-    complete: result.complete,
     reason_code: result.reason_code ?? null,
+    failure_message: result.failure_message ?? null,
   };
 }
 

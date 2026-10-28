@@ -224,16 +224,14 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
-| `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
+| `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance 与 session_id（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
-| `result_available` | boolean | 快速判断有无终态结果 | 客户端须从结果等字段推导；属于显式便利信号 |
 | `activity` | PublicActivity | 查看文本尾部、近期工具频度、未决工具调用与遥测可信度 | 难以判断运行中是在工作还是停滞 |
-| `result` | PublicResult/null | 内嵌结果，避免再请求首段 | 必须额外调用 result，长结果仍需分页 |
-| `instruction` | string/null | 给出下一步响应、取分页或（结果已完整时）close 清理的提示 | 客户端需自行从结构化字段实现同一判断；不能只解析该自然语言字段 |
+| `result` | PublicResult/null | 内嵌结果，避免再请求首段；`next_offset` 为 null 即已取完全文，否则按其继续分页 | 必须额外调用 result，长结果仍需分页 |
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
-嵌入结果 `complete=true` 时已取得全部结果，不必重复 result，`instruction` 此时固定提示无进一步使用可调用 close 清理（`Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.`）；否则沿 `next_offset` 继续。任务以失败终态结束且该 agent 的 expected/observed 版本不匹配时，`instruction` 同时包含字节精确的 `version mismatch, it may not work as expected`；成功任务或版本未知/一致时不出现该短语。
+嵌入结果 `next_offset=null` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。终态后的清理（close）与响应（respond）由调用方根据 `result`、`pending_requests` 与工具描述决定；wait 不再携带 advisory instruction 文本。任务失败且该 agent 的 expected/observed 版本不匹配时，版本提示由 spawn 输出的 `version_mismatch` 对象与 result 工具的 `instruction` 承载，wait 不重复。
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel；需要查看最近跑的是哪条指令或调用参数时，调用 observe。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 
@@ -390,7 +388,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 
 `status` 是折叠后的单一状态：`queued / preparing / running / waiting_input / cancelling`（非终态）与 `completed / failed / cancelled / timed_out / runtime_lost / result_invalid`（终态）及 `closed`（close 之后，含回收）。失败原因细码不再出现在公共视图；深入诊断使用 diagnose（日志中的 failure 记录保留完整信息）。status 在输出类型中是 string，而非强制枚举。
 
-**PublicTaskHeader**（wait 专用）：`{ agent_id, status, session_id }`，即 PublicTask 去掉 `input_identity` 的收窄形式。准入 provenance（subagent、model、effort、config_revision、adapter_version、workspace、permission_mode）在 spawn 后不可变，每次 wait 重复返回同一块没有新信息；需要 provenance 时读 list/result/cancel/close 的完整 PublicTask。
+**PublicTaskHeader**（wait 专用）：`{ agent_id, status }`，即 PublicTask 去掉 `input_identity` 与 `session_id` 的收窄形式。准入 provenance（subagent、model、effort、config_revision、adapter_version、workspace、permission_mode）在 spawn 后不可变，session_id 也由 spawn 返回且不再变化，每次 wait 重复返回同一块没有新信息；需要 provenance 或 session_id 时读 spawn 的返回或 list/result/cancel/close 的完整 PublicTask。
 
 ### 13.2 InputIdentity
 
@@ -418,11 +416,11 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | Question.`truncated` | boolean | 标识问题是否超出内嵌上限 | 易把截断问题当完整题目 |
 | Result 的 `offset` | integer | 识别本页字节起点，避免拼接错位 | 难以检测重复／错页 |
 | Result 的 `total_bytes` | integer | 知道全文长度、检查累计读取量 | 失去长度校验和进度信息；仍可用 next_offset 翻页 |
-| Result 的 `next_offset` | integer/null | 获取下一页的合法字节起点 | 无法可靠按服务端分页继续，尤其涉及 UTF-8 边界 |
-| Result 的 `complete` | boolean | 直接标识全文分页结束 | 可由 next_offset 为 null 推导；是便利字段，不表示任务成功 |
+| Result 的 `next_offset` | integer/null | 获取下一页的合法字节起点；为 null 即表示已取完全文 | 无法可靠按服务端分页继续，尤其涉及 UTF-8 边界 |
 | Result 的 `reason_code` | string/null | 任务终态的机器可读原因（如 dsh 模型选择被拒为 `MODEL_REJECTED`）；`null` 表示没有特定原因（成功的 completed 任务、旧的无终态行结果，或仅有历史占位原因的记录） | 调用方只能依赖人类可读的 final_text 判断失败类别 |
+| Result 的 `failure_message` | string/null | 失败终态的有界结构化诊断（通常为单行 JSON；早期 fail_claim 行可能为纯文本，按不透明有界字符串防御性解析）；非失败或无持久化细节时为 null | 调用方需回退到 daemon 日志或 sqlite 才能定位失败 |
 
-`partial` 与 `complete` 含义不同：可能 `partial=true` 且 `complete=true`，表示已取完一个不完整任务产物的全部文本。PublicQuestion 只出现在 wait 的 pending_requests 里且无分页契约——wait 是问题正文的唯一获取面。当整个 wait 响应逼近 2MiB 帧上限时，服务端会把内嵌问题降级为更短的有界前缀并保持 `truncated=true`（request_id 始终可达）；`truncated` 因此表示“文本不完整”，不承诺 16KiB 全长。
+`partial` 与分页完成是两个维度：可能 `partial=true` 且 `next_offset=null`，表示已取完一个不完整任务产物的全部文本。PublicQuestion 只出现在 wait 的 pending_requests 里且无分页契约——wait 是问题正文的唯一获取面。当整个 wait 响应逼近 2MiB 帧上限时，服务端会把内嵌问题降级为更短的有界前缀并保持 `truncated=true`（request_id 始终可达）；`truncated` 因此表示“文本不完整”，不承诺 16KiB 全长。
 
 ### 13.4 PublicPendingRequest
 
@@ -434,7 +432,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `kind` | `permission / user_input` | 选择审批（allow/deny）或回答（answer+content） | 容易把用户问题当权限决定 |
 | `tool_name` | string/null | 权限审批时识别触发工具 | 缺少具体动作来源 |
 | `operation` | `read / write / command / network / git_ref_mutation / user_input / unknown` | 从语义上理解请求操作 | 必须猜工具名或解析摘要 |
-| `summary` | string | 快速展示请求概要 | 可读性下降；摘要不能替代完整问题 |
+| `summary` | string/null | 权限请求的单行概要；user_input 请求恒为 null——问题正文已由 `question` 完整内嵌，不再重复其前缀 | 权限请求可读性下降 |
 | `question` | PublicQuestion/null | 用户问题的完整内嵌正文 | 需额外请求才能了解题目 |
 
 ### 13.5 PublicActivity
@@ -542,7 +540,7 @@ dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单�
 | 路由／任务必需 | agent_id、repository、prompt、交互 request_id | 必须有等价方式确定目标、范围和任务内容 |
 | 有界传输必需 | offset、next_offset、cursor、正文页 | 必须仍能恢复全部长文本和长列表 |
 | 权限／正确性解释 | permission_mode、write_manifest、effective_decision、coverage | 必须避免扩大授权或对缺失证据作错误判断 |
-| 可推导／便利 | complete、result_available、requested_decision、instruction | 可精简，但需迁移消费者并明确替代计算／调用 |
+| 可推导／便利 | requested_decision；已精简的先例有 wait/result 页的 `complete`（由 `next_offset=null` 表达）、wait 的 `result_available`（由 `result` 是否为 null 表达）与 wait 的 `instruction`（由结构化字段与工具描述承载） | 可精简，但需迁移消费者并明确替代计算／调用 |
 | 诊断 | identity、config_revision、活动时间、各类计数 | 不一定阻止执行，但会降低排障和可追溯性 |
 
 本文只说明现有接口及其设计代价，不修改协议。后续修改参数时，应同步 Rust 输入／输出及 handler、静态契约、相关回归测试和本文；以实际行为为准处理 schema 与运行时校验差异。

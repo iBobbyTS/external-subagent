@@ -769,7 +769,6 @@ impl RpcService {
             offset,
             total_bytes,
             next_offset,
-            complete: next_offset.is_none(),
             reason_code,
             failure_message,
         })

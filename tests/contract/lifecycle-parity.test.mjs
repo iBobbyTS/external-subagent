@@ -21,7 +21,7 @@ function task(status = 'running') {
 
 // The wait wire shape carries only the task lifecycle header.
 function taskHeader(status = 'running') {
-  return { agent_id: agentId, status, session_id: 'session-123' };
+  return { agent_id: agentId, status };
 }
 
 function rpcResult(requestId, result) {
@@ -68,10 +68,8 @@ async function lifecycleServer(socketPath) {
         result = {
           task: taskHeader(status),
           pending_requests: projected.map(({ state, ...view }) => view),
-          result_available: false,
           activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
           result: null,
-          instruction: timedOut ? 'Not finished yet, call wait again' : null,
           timed_out: timedOut,
           message_receipt: request.params.message_id
             ? { message_id: request.params.message_id, state: 'queued', failure_code: null }

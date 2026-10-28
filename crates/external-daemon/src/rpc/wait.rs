@@ -1,16 +1,16 @@
-//! The bounded task_wait loop: wake decisions, instructions, and projection.
+//! The bounded task_wait loop: wake decisions and projection.
 //!
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
 use super::errors::{map_store, RpcError, RpcErrorCode};
-use super::handlers::{failure_message_projection, is_failure_outcome, RpcService};
+use super::handlers::{failure_message_projection, RpcService};
 use super::types::{
     RpcResponse, RpcSuccess, TaskWaitQuery, MAX_PENDING_REQUESTS, MAX_REQUEST_ID_BYTES,
     MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
 };
 use super::views::{
     pending_request_view, task_activity_view, task_header_view, truncate_at_char_boundary,
-    MessageReceiptView, TaskResultView, MAX_QUESTION_SUMMARY_BYTES,
+    MessageReceiptView, MAX_QUESTION_SUMMARY_BYTES,
 };
 use crate::scheduler::shrink_persistable_record;
 use external_store::{PendingRequestState, TaskPhase};
@@ -22,7 +22,9 @@ use std::{
 #[cfg(test)]
 use super::types::{MessageInput, RpcMethod, RpcOutcome, RpcRequest};
 #[cfg(test)]
-use super::views::{agent_capabilities, MessageDispositionView, MAX_QUESTION_EMBED_BYTES};
+use super::views::{
+    agent_capabilities, MessageDispositionView, TaskResultView, MAX_QUESTION_EMBED_BYTES,
+};
 #[cfg(all(test, unix))]
 use super::{RpcClient, RpcServer, ServerOptions};
 #[cfg(test)]
@@ -88,7 +90,6 @@ impl RpcService {
                 .map(pending_request_view)
                 .collect::<Vec<_>>();
             let wake_respondable = wake_request.is_some();
-            let result_available = stored_result.is_some();
             let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
             let terminal = task.phase == TaskPhase::Terminal;
             let now = Instant::now();
@@ -119,98 +120,19 @@ impl RpcService {
                 if let Some(page) = result_page.as_ref() {
                     dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
                 }
-                // One bounded probe at most per terminal response; the same
-                // result is reused by page regeneration below.
-                let failure = result_page
-                    .as_ref()
-                    .map(|page| is_failure_outcome(page.outcome))
-                    .or_else(|| task.outcome.map(is_failure_outcome))
-                    .unwrap_or(false);
-                let version_mismatch = if terminal && failure {
-                    self.version_mismatch_instruction(&crate::task_agent(&task))
-                } else {
-                    None
-                };
-                let instruction = wait_instruction(
-                    terminal,
-                    result_page.as_ref(),
-                    wake_request.as_ref(),
-                    version_mismatch.as_deref(),
-                );
                 let mut response = RpcSuccess::TaskWait {
                     activity,
                     task: task_header_view(&task),
                     pending_requests,
-                    result_available,
                     result: result_page,
-                    instruction,
                     timed_out,
                     message_receipt,
                 };
-                bound_wait_result(&mut response, version_mismatch.as_deref())?;
+                bound_wait_result(&mut response)?;
                 return Ok(response);
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
-    }
-}
-
-/// Instructions are advisory text for models that forget skill guidance
-/// during long runs; they name the action the current state allows.
-fn wait_instruction(
-    terminal: bool,
-    result_page: Option<&TaskResultView>,
-    wake_request: Option<&external_store::StoredPendingRequest>,
-    version_mismatch: Option<&str>,
-) -> Option<String> {
-    if terminal {
-        return match result_page {
-            Some(result) => Some(terminal_result_instruction(result, version_mismatch)),
-            None => {
-                let body = "The task is finished; use external_subagent_result to read the stored result.";
-                Some(match version_mismatch {
-                    Some(note) => format!("{body} {note}"),
-                    None => body.to_owned(),
-                })
-            }
-        };
-    }
-    match wake_request.map(|request| request.request_type.as_str()) {
-        Some("user_input") => Some(
-            "The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content."
-                .to_owned(),
-        ),
-        Some(_) => Some(
-            "A permission request is pending; respond now with external_subagent_respond using decision allow or deny."
-                .to_owned(),
-        ),
-        None => Some(
-            "Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop"
-                .to_owned(),
-        ),
-    }
-}
-
-/// The terminal instruction for the current page state. Regenerated after a
-/// last-resort page shortening so it always names the page's real cursor. The
-/// version advisory is appended (never replacing the page guidance) so a
-/// failure keeps both its existing meaning and the byte-exact phrase.
-fn terminal_result_instruction(
-    result: &TaskResultView,
-    version_mismatch: Option<&str>,
-) -> String {
-    let body = if result.complete {
-        "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
-            .to_owned()
-    } else {
-        format!(
-            "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
-            result.next_offset.unwrap_or(result.offset)
-        )
-    };
-    match version_mismatch {
-        Some(note) => format!("{body} {note}"),
-        None => body,
     }
 }
 
@@ -244,20 +166,16 @@ fn wake_pending_request(request: &external_store::StoredPendingRequest) -> bool 
 // it stays parseable with a latest-suffix tail), then embedded questions fall
 // back to a bounded prefix so actionable request_ids stay reachable, and only
 // as a last resort is the result page itself shortened. The last step derives
-// the cursor from the original total/offset and regenerates the instruction,
-// so it never falsely reports a shortened page as complete or points at a
-// stale offset. Metadata that still exceeds the cap uses the transport's
-// Oversized response.
-fn bound_wait_result(
-    response: &mut RpcSuccess,
-    version_mismatch: Option<&str>,
-) -> Result<(), RpcError> {
+// the cursor from the original total/offset, so it never falsely reports a
+// shortened page as the end of the text or points at a stale offset. Metadata
+// that still exceeds the cap uses the transport's Oversized response.
+fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
     if wait_envelope_fits(response)? {
         return Ok(());
     }
     let mut candidate = response.clone();
-    // 1. Failure detail only: the result page, its cursor, the questions, and
-    //    the instruction stay byte-identical.
+    // 1. Failure detail only: the result page, its cursor, and the questions
+    //    stay byte-identical.
     let original_detail = match &candidate {
         RpcSuccess::TaskWait {
             result: Some(view), ..
@@ -295,19 +213,14 @@ fn bound_wait_result(
         return Ok(());
     }
     // 3. Last resort: shorten the result page. The cursor comes from the
-    //    original total/offset and the instruction is regenerated for the new
-    //    page state.
-    if let Some((end, next_offset, complete)) = shrunk_result_page(&candidate, version_mismatch) {
+    //    original total/offset.
+    if let Some((end, next_offset)) = shrunk_result_page(&candidate) {
         if let RpcSuccess::TaskWait {
-            result: Some(view),
-            instruction,
-            ..
+            result: Some(view), ..
         } = &mut candidate
         {
             view.final_text.truncate(end);
             view.next_offset = next_offset;
-            view.complete = complete;
-            *instruction = Some(terminal_result_instruction(view, version_mismatch));
         }
     }
     if !wait_envelope_fits(&candidate)? {
@@ -371,14 +284,12 @@ fn message_envelope_fits(base: &RpcSuccess, message: &str) -> bool {
 }
 
 /// The largest prefix of the embedded result page that keeps the envelope in
-/// bounds, with `next_offset`/`complete` derived from the ORIGINAL
-/// `total_bytes`/`offset` rather than by re-paging the already-paged text.
-/// Returns `None` when there is no page to shorten or even one character does
-/// not fit.
-fn shrunk_result_page(
-    base: &RpcSuccess,
-    version_mismatch: Option<&str>,
-) -> Option<(usize, Option<usize>, bool)> {
+/// bounds, with `next_offset` derived from the ORIGINAL `total_bytes`/`offset`
+/// rather than by re-paging the already-paged text. A `None` next offset
+/// therefore still means "this page reaches the end of the text". Returns
+/// `None` when there is no page to shorten or even one character does not
+/// fit.
+fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>)> {
     let RpcSuccess::TaskWait {
         result: Some(view), ..
     } = base
@@ -404,20 +315,12 @@ fn shrunk_result_page(
     let fits_end = |end: usize| {
         let mut probe = base.clone();
         if let RpcSuccess::TaskWait {
-            result: Some(view),
-            instruction,
-            ..
+            result: Some(view), ..
         } = &mut probe
         {
             let next = offset + end;
             view.final_text.truncate(end);
             view.next_offset = (next < total).then_some(next);
-            view.complete = view.next_offset.is_none();
-            // The instruction is part of the frame and depends on the page
-            // state, so every probe must carry the instruction the real path
-            // would emit for that candidate page (a complete->partial shrink
-            // lengthens it, and the remaining slack can be a few bytes).
-            *instruction = Some(terminal_result_instruction(view, version_mismatch));
         }
         wait_envelope_fits(&probe).unwrap_or(false)
     };
@@ -437,7 +340,7 @@ fn shrunk_result_page(
     let end = ends[lo];
     let next = offset + end;
     let next_offset = (next < total).then_some(next);
-    Some((end, next_offset, next_offset.is_none()))
+    Some((end, next_offset))
 }
 
 #[cfg(test)]
@@ -683,9 +586,10 @@ pub(crate) mod wait_tests {
     }
 
     /// A probe backend that reports a fixed local version on every probe. It
-    /// deliberately starts with an empty evidence store: the instruction path
-    /// must invoke the bounded probe itself instead of reading cached input.
-    /// Shared with the status-derivation tests in `rpc::agents`.
+    /// deliberately starts with an empty evidence store: the result path's
+    /// version advisory must invoke the bounded probe itself instead of
+    /// reading cached input. Shared with the status-derivation tests in
+    /// `rpc::agents`.
     pub(crate) struct FixedLocalVersion {
         pub(crate) version: Option<String>,
         pub(crate) probes: Arc<std::sync::atomic::AtomicUsize>,
@@ -813,7 +717,7 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn failed_terminal_wait_appends_the_version_mismatch_instruction_from_a_probe() {
+    fn failed_terminal_wait_returns_the_result_without_a_version_probe() {
         use std::sync::atomic::Ordering;
         let (_directory, service, id, probes) = version_fixture(Some("0.1.5-rc.1"));
         service
@@ -828,7 +732,6 @@ pub(crate) mod wait_tests {
             )
             .unwrap();
         let RpcSuccess::TaskWait {
-            instruction,
             result: Some(result),
             ..
         } = service
@@ -838,25 +741,17 @@ pub(crate) mod wait_tests {
             panic!("expected terminal wait response")
         };
         assert_eq!(result.outcome, TaskOutcome::Failed);
-        let instruction = instruction.expect("terminal instruction");
+        // Wait carries no advisory, so it never runs the version probe.
+        assert_eq!(probes.load(Ordering::SeqCst), 0, "wait must not probe");
         assert!(
-            instruction.contains(crate::agent_status::VERSION_MISMATCH_INSTRUCTION),
-            "{instruction}"
-        );
-        // The existing close guidance is preserved next to the advisory.
-        assert!(instruction.contains("close this subagent"), "{instruction}");
-        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per response");
-        // The probed evidence is recorded for status reuse.
-        assert_eq!(
             service
                 .agent_evidence
                 .latest("dsh")
                 .and_then(|evidence| evidence.local.version)
-                .as_deref(),
-            Some("0.1.5-rc.1")
+                .is_none()
         );
 
-        // The independent result path applies the same semantics.
+        // The independent result path keeps the advisory semantics.
         let RpcSuccess::TaskResult {
             instruction,
             result: Some(_),
@@ -875,10 +770,19 @@ pub(crate) mod wait_tests {
             instruction.as_deref(),
             Some(crate::agent_status::VERSION_MISMATCH_INSTRUCTION)
         );
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe per response");
+        assert_eq!(
+            service
+                .agent_evidence
+                .latest("dsh")
+                .and_then(|evidence| evidence.local.version)
+                .as_deref(),
+            Some("0.1.5-rc.1")
+        );
     }
 
     #[test]
-    fn successful_or_matched_tasks_never_carry_the_version_mismatch_instruction() {
+    fn successful_or_matched_results_never_carry_the_version_mismatch_instruction() {
         use std::sync::atomic::Ordering;
         for (outcome, observed, expected_probes) in [
             (TaskOutcome::Completed, Some("0.1.5-rc.1"), 0),
@@ -897,18 +801,14 @@ pub(crate) mod wait_tests {
                     },
                 )
                 .unwrap();
-            let RpcSuccess::TaskWait { instruction, .. } = service
+            // Wait never probes for a version advisory.
+            let RpcSuccess::TaskWait { .. } = service
                 .dispatch(RpcMethod::TaskWait(query(&id, 0)))
                 .unwrap()
             else {
                 panic!("expected terminal wait response")
             };
-            let instruction = instruction.expect("terminal instruction");
-            assert!(
-                !instruction.contains(crate::agent_status::VERSION_MISMATCH_INSTRUCTION),
-                "{outcome:?}/{observed:?}: {instruction}"
-            );
-            assert_eq!(probes.load(Ordering::SeqCst), expected_probes);
+            assert_eq!(probes.load(Ordering::SeqCst), 0);
             let RpcSuccess::TaskResult { instruction, .. } = service
                 .dispatch(RpcMethod::TaskResult {
                     agent_id: id,
@@ -920,6 +820,7 @@ pub(crate) mod wait_tests {
                 panic!("expected terminal result response")
             };
             assert_eq!(instruction, None);
+            assert_eq!(probes.load(Ordering::SeqCst), expected_probes);
         }
     }
 
@@ -1071,7 +972,7 @@ pub(crate) mod wait_tests {
             .keys()
             .collect::<Vec<_>>();
         keys.sort_unstable();
-        assert_eq!(keys, ["agent_id", "session_id", "status"]);
+        assert_eq!(keys, ["agent_id", "status"]);
         assert_eq!(encoded["agent_id"], id);
     }
 
@@ -1124,20 +1025,12 @@ pub(crate) mod wait_tests {
         assert!(!RpcMethod::is_known("task_poll"));
         let before = service.store.get_task(&id).unwrap();
         let start = Instant::now();
-        let RpcSuccess::TaskWait {
-            timed_out: true,
-            instruction,
-            ..
-        } = service
+        let RpcSuccess::TaskWait { timed_out: true, .. } = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
             panic!("expected unfinished wait response")
         };
-        assert_eq!(
-            instruction.as_deref(),
-            Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
-        );
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(before, service.store.get_task(&id).unwrap());
         // A terminal task accepts the maximum without actually sleeping.
@@ -1154,8 +1047,6 @@ pub(crate) mod wait_tests {
             .unwrap();
         let RpcSuccess::TaskWait {
             timed_out: false,
-            instruction,
-            result_available,
             result: Some(result),
             ..
         } = service
@@ -1164,12 +1055,7 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected terminal wait response")
         };
-        assert!(result_available);
-        assert!(result.complete);
-        assert_eq!(
-            instruction.as_deref(),
-            Some("Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.")
-        );
+        assert_eq!(result.next_offset, None);
     }
 
     #[test]
@@ -1207,7 +1093,6 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             timed_out: true,
             activity,
-            instruction,
             message_receipt: Some(_),
             ..
         } = response
@@ -1216,10 +1101,6 @@ pub(crate) mod wait_tests {
         };
         assert_eq!(activity.latest_text_tail, "ordinary text");
         assert_eq!(activity.tool_calls_last_60s, 1);
-        assert_eq!(
-            instruction.as_deref(),
-            Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
-        );
         assert_eq!(before, service.store.get_task(&id).unwrap());
     }
 
@@ -1284,7 +1165,7 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected terminal wait response")
         };
-        assert!(result.complete);
+        assert_eq!(result.next_offset, None);
         assert_eq!(activity.latest_text_tail, "我会按只读方式检查。");
         assert!(!activity.latest_text_truncated);
     }
@@ -1340,7 +1221,6 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
-            instruction,
             ..
         } = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
@@ -1351,10 +1231,7 @@ pub(crate) mod wait_tests {
         assert!(!timed_out);
         assert_eq!(pending_requests.len(), 1);
         assert_eq!(pending_requests[0].tool_name.as_deref(), Some("Read"));
-        assert_eq!(
-            instruction.as_deref(),
-            Some("A permission request is pending; respond now with external_subagent_respond using decision allow or deny.")
-        );
+        assert_eq!(pending_requests[0].summary.as_deref(), Some("permission request"));
     }
 
     #[test]
@@ -1375,7 +1252,6 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
-            instruction,
             ..
         } = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
@@ -1386,14 +1262,11 @@ pub(crate) mod wait_tests {
         assert!(!timed_out);
         assert_eq!(pending_requests.len(), 1);
         assert_eq!(pending_requests[0].kind, "user_input");
-        assert_eq!(pending_requests[0].summary, "question which branch?");
+        // The question is the single text surface: no summary duplicate.
+        assert_eq!(pending_requests[0].summary, None);
         let question = pending_requests[0].question.as_ref().expect("question");
         assert_eq!(question.text, "which branch?");
         assert!(!question.truncated);
-        assert_eq!(
-            instruction.as_deref(),
-            Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
-        );
     }
 
     #[test]
@@ -1415,7 +1288,6 @@ pub(crate) mod wait_tests {
         let RpcSuccess::TaskWait {
             pending_requests,
             timed_out,
-            instruction,
             ..
         } = service
             .task_wait(query(&id, 0), start + Duration::from_millis(30), &|| false)
@@ -1425,14 +1297,10 @@ pub(crate) mod wait_tests {
         };
         assert!(timed_out);
         assert!(pending_requests.is_empty());
-        assert_eq!(
-            instruction.as_deref(),
-            Some("Not finished yet, call wait again; use observe only if latest_text_tail may indicate subagent runs into a meaningless loop")
-        );
     }
 
     #[test]
-    fn long_answer_questions_expose_bounded_content_with_an_observable_cut() {
+    fn user_input_questions_below_the_embed_cap_ship_in_full_without_a_summary() {
         let (_, service, id) = fixture();
         let question = "q".repeat(5000);
         service
@@ -1453,18 +1321,13 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected wait response")
         };
-        let summary = &pending_requests[0].summary;
-        // The exposed prefix is bounded by bytes, the cut states exactly how
-        // many question chars were omitted, and the full marker resolves.
-        assert_eq!(
-            summary,
-            &format!(
-                "question {} [+{} more chars]",
-                "q".repeat(2048),
-                5000 - 2048
-            )
-        );
-        // A multibyte question cuts on a character boundary inside the cap.
+        // The embedded question is the only text surface: the summary never
+        // duplicates its head, and anything below the embed cap ships whole.
+        assert_eq!(pending_requests[0].summary, None);
+        let page = pending_requests[0].question.as_ref().expect("question");
+        assert_eq!(page.text.len(), 5000);
+        assert!(!page.truncated);
+        // A multibyte question below the cap ships whole as well.
         let wide = "語".repeat(1024);
         service
             .store
@@ -1484,17 +1347,14 @@ pub(crate) mod wait_tests {
         else {
             panic!("expected wait response")
         };
-        let wide_summary = &pending_requests
+        let wide_view = pending_requests
             .iter()
             .find(|request| request.request_id == "wide")
-            .expect("wide request in projection")
-            .summary;
-        // 2048 bytes holds 682 three-byte chars (2 bytes remain, below the
-        // next boundary), so 342 chars are omitted.
-        assert_eq!(
-            wide_summary.as_str(),
-            format!("question {} [+{} more chars]", "語".repeat(682), 342)
-        );
+            .expect("wide request in projection");
+        assert_eq!(wide_view.summary, None);
+        let wide_page = wide_view.question.as_ref().expect("question");
+        assert_eq!(wide_page.text, "語".repeat(1024));
+        assert!(!wide_page.truncated);
     }
 
     #[test]
@@ -1805,7 +1665,6 @@ pub(crate) mod wait_tests {
             let RpcSuccess::TaskWait {
                 result: Some(result),
                 timed_out: false,
-                instruction,
                 ..
             } = &response
             else {
@@ -1815,27 +1674,11 @@ pub(crate) mod wait_tests {
             assert_eq!(result.total_bytes, text.len());
             // Wait inlines the same bounded first page as external_subagent_result.
             assert_eq!(result.offset, 0);
-            assert_eq!(result.complete, fits_page);
             assert_eq!(
                 result.next_offset,
                 (!fits_page).then_some(MAX_RESULT_CHUNK_BYTES)
             );
             assert_eq!(result.final_text, text[..result.final_text.len()]);
-            let instruction = instruction.as_deref().expect("terminal instruction");
-            if fits_page {
-                assert_eq!(
-                    instruction,
-                    "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required."
-                );
-            } else {
-                assert_eq!(
-                    instruction,
-                    &format!(
-                        "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {}.",
-                        MAX_RESULT_CHUNK_BYTES
-                    )
-                );
-            }
             assert!(
                 serde_json::to_vec(&RpcResponse::success("q".repeat(128), response.clone()))
                     .unwrap()
@@ -2141,7 +1984,6 @@ pub(crate) mod wait_tests {
         TaskHeaderView {
             agent_id: "10000001".into(),
             status: "failed".into(),
-            session_id: None,
         }
     }
 
@@ -2164,7 +2006,7 @@ pub(crate) mod wait_tests {
             kind: "user_input".into(),
             tool_name: None,
             operation: "user_input".into(),
-            summary: "question".into(),
+            summary: None,
             question: Some(QuestionView {
                 truncated: false,
                 text,
@@ -2178,12 +2020,10 @@ pub(crate) mod wait_tests {
         next_offset: Option<usize>,
         failure_message: Option<String>,
         pending_requests: Vec<PendingRequestView>,
-        instruction: &str,
     ) -> RpcSuccess {
         RpcSuccess::TaskWait {
             task: perspective_task(),
             pending_requests,
-            result_available: true,
             activity: empty_activity(),
             result: Some(TaskResultView {
                 outcome: TaskOutcome::Failed,
@@ -2191,12 +2031,10 @@ pub(crate) mod wait_tests {
                 partial: true,
                 offset: 0,
                 total_bytes,
-                complete: next_offset.is_none(),
                 next_offset,
                 reason_code: Some("RUNTIME_TERMINAL".into()),
                 failure_message,
             }),
-            instruction: Some(instruction.to_owned()),
             timed_out: false,
             message_receipt: None,
         }
@@ -2205,10 +2043,6 @@ pub(crate) mod wait_tests {
     fn envelope_bytes(response: &RpcSuccess) -> usize {
         let envelope = RpcResponse::success("\u{1}".repeat(MAX_REQUEST_ID_BYTES), response.clone());
         serde_json::to_vec(&envelope).unwrap().len() + 1
-    }
-
-    fn terminal_instruction_for(result: &TaskResultView) -> String {
-        super::terminal_result_instruction(result, None)
     }
 
     fn realistic_failure_detail() -> String {
@@ -2534,7 +2368,6 @@ pub(crate) mod wait_tests {
     #[test]
     fn wait_projection_shrinks_only_the_failure_detail_when_that_is_enough() {
         let detail = realistic_failure_detail();
-        let instruction = "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.";
         let build = |message: Option<String>, question: String| {
             synthesized_wait(
                 "RUNTIME_TERMINAL".into(),
@@ -2542,7 +2375,6 @@ pub(crate) mod wait_tests {
                 Some("RUNTIME_TERMINAL".len()),
                 message,
                 vec![user_question("q", question)],
-                instruction,
             )
         };
         let with_detail = build(Some(detail.clone()), String::new());
@@ -2565,11 +2397,10 @@ pub(crate) mod wait_tests {
             } => view.final_text.clone(),
             _ => unreachable!(),
         };
-        bound_wait_result(&mut base, None).unwrap();
+        bound_wait_result(&mut base).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
-            instruction,
             ..
         } = &base
         else {
@@ -2581,27 +2412,21 @@ pub(crate) mod wait_tests {
         assert_ne!(shrunk, detail);
         assert!(shrunk.len() <= detail.len());
         serde_json::from_str::<serde_json::Value>(shrunk).unwrap();
-        // The result page, its cursor, the question, and the instruction are
-        // byte-identical: this branch never touches them.
+        // The result page, its cursor, and the question are byte-identical:
+        // this branch never touches them.
         assert_eq!(view.final_text, original_final);
         assert_eq!(view.next_offset, Some("RUNTIME_TERMINAL".len()));
-        assert!(!view.complete);
         assert_eq!(pending_requests.len(), 1);
         assert_eq!(
             pending_requests[0].question.as_ref().unwrap().text,
             question
         );
         assert!(!pending_requests[0].question.as_ref().unwrap().truncated);
-        assert_eq!(
-            instruction.as_deref(),
-            Some("The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.")
-        );
     }
 
     #[test]
     fn wait_projection_shrinks_questions_before_touching_a_paged_result() {
         let detail = realistic_failure_detail();
-        let instruction = "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0.";
         let build = |message: Option<String>, question: String| {
             synthesized_wait(
                 "RUNTIME_TERMINAL".into(),
@@ -2609,7 +2434,6 @@ pub(crate) mod wait_tests {
                 Some("RUNTIME_TERMINAL".len()),
                 message,
                 vec![user_question("q", question)],
-                instruction,
             )
         };
         // Size the question so that even the smallest structured detail cannot
@@ -2631,11 +2455,10 @@ pub(crate) mod wait_tests {
         }
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         assert!(envelope_bytes(&floor_probe) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base, None).unwrap();
+        bound_wait_result(&mut base).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
-            instruction,
             ..
         } = &base
         else {
@@ -2648,21 +2471,16 @@ pub(crate) mod wait_tests {
             "questions stage must bound the embed"
         );
         assert!(question.truncated);
-        // The paged result keeps its original cursor and instruction.
+        // The paged result keeps its original cursor.
         assert_eq!(view.final_text, "RUNTIME_TERMINAL");
         assert_eq!(view.next_offset, Some("RUNTIME_TERMINAL".len()));
-        assert!(!view.complete);
         assert_eq!(view.total_bytes, "RUNTIME_TERMINAL".len() + 100);
-        assert_eq!(instruction.as_deref(), Some("The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset 0."));
     }
 
     #[test]
-    fn wait_projection_shortens_a_result_page_with_a_consistent_cursor_and_instruction() {
+    fn wait_projection_shortens_a_result_page_with_a_consistent_cursor() {
         let page = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
         let total = MAX_RESULT_CHUNK_BYTES + 4096;
-        let original_instruction = format!(
-            "The final result is available but this bounded page is partial; continue reading it with external_subagent_result from offset {MAX_RESULT_CHUNK_BYTES}."
-        );
         let mut base = synthesized_wait(
             page.clone(),
             total,
@@ -2671,14 +2489,12 @@ pub(crate) mod wait_tests {
             (0..MAX_PENDING_REQUESTS)
                 .map(|index| user_question(&format!("q{index}"), "\u{0}".repeat(16 * 1024)))
                 .collect(),
-            &original_instruction,
         );
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base, None).unwrap();
+        bound_wait_result(&mut base).unwrap();
         let RpcSuccess::TaskWait {
             result: Some(view),
             pending_requests,
-            instruction,
             ..
         } = &base
         else {
@@ -2689,19 +2505,10 @@ pub(crate) mod wait_tests {
         assert!(view.final_text.len() < page.len());
         assert!(!view.final_text.is_empty());
         // The cursor advances from the ORIGINAL total, not by re-paging the
-        // shortened page (which would falsely report complete).
+        // shortened page (which would falsely report the end of the text).
         let end = view.final_text.len();
         assert_eq!(view.total_bytes, total);
         assert_eq!(view.next_offset, Some(end));
-        assert!(!view.complete);
-        // The instruction names the updated page state.
-        let regenerated = terminal_instruction_for(view);
-        assert_eq!(
-            instruction.as_deref(),
-            Some(regenerated.as_str())
-        );
-        assert!(instruction.as_deref().unwrap().contains(&format!("offset {end}")));
-        assert_ne!(instruction.as_deref(), Some(original_instruction.as_str()));
         // Pagination still advances and the questions were bounded too.
         assert!(view.next_offset.unwrap() > view.offset);
         assert!(pending_requests
@@ -2711,16 +2518,11 @@ pub(crate) mod wait_tests {
     }
 
     #[test]
-    fn wait_projection_counts_the_regenerated_instruction_when_a_complete_page_shrinks() {
-        // A complete page that must shrink becomes partial, which replaces the
-        // "close this subagent" instruction with the longer "continue reading
-        // from offset N" one. The frame probing must account for that
-        // growth at every candidate prefix, or the chosen largest prefix looks
-        // fine during the search and then overflows on the real envelope
-        // (B-01 regression).
+    fn wait_projection_shortens_a_complete_page_to_a_consistent_partial_cursor() {
+        // A complete page that must shrink becomes partial: the cursor comes
+        // from the original total, never from re-paging the shortened text.
+        // The chosen prefix is maximal: one more byte cannot fit.
         let page = "\u{0}".repeat(MAX_RESULT_CHUNK_BYTES);
-        let complete_instruction =
-            "Use mcp__external_subagent.close to close this subagent if no further usage of this subagent required.";
         let mut base = synthesized_wait(
             page.clone(),
             page.len(),
@@ -2729,21 +2531,18 @@ pub(crate) mod wait_tests {
             (0..MAX_PENDING_REQUESTS)
                 .map(|index| user_question(&format!("q{index}"), "\u{0}".repeat(16 * 1024)))
                 .collect(),
-            complete_instruction,
         );
         assert!(matches!(
             &base,
             RpcSuccess::TaskWait {
                 result: Some(view),
                 ..
-            } if view.complete && view.next_offset.is_none()
+            } if view.next_offset.is_none()
         ));
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
-        bound_wait_result(&mut base, None).unwrap();
+        bound_wait_result(&mut base).unwrap();
         let RpcSuccess::TaskWait {
-            result: Some(view),
-            instruction,
-            ..
+            result: Some(view), ..
         } = &base
         else {
             panic!("expected wait response")
@@ -2753,18 +2552,8 @@ pub(crate) mod wait_tests {
         let end = view.final_text.len();
         assert_eq!(view.total_bytes, page.len());
         assert_eq!(view.next_offset, Some(end));
-        assert!(!view.complete);
-        // The instruction matches the shortened page, not the stale complete
-        // one, and the real envelope stays inside the cap.
-        let regenerated = terminal_instruction_for(view);
-        assert_eq!(instruction.as_deref(), Some(regenerated.as_str()));
-        assert!(instruction
-            .as_deref()
-            .unwrap()
-            .contains(&format!("offset {end}")));
-        assert_ne!(instruction.as_deref(), Some(complete_instruction));
-        // The chosen prefix is maximal for the real (instruction-inclusive)
-        // envelope: one more byte cannot fit.
+        // The chosen prefix is maximal for the real envelope: one more byte
+        // cannot fit.
         if end + 1 <= page.len() {
             let mut probe = base.clone();
             if let RpcSuccess::TaskWait {
@@ -2773,7 +2562,6 @@ pub(crate) mod wait_tests {
             {
                 view.final_text = page[..end + 1].to_owned();
                 view.next_offset = Some(end + 1);
-                view.complete = false;
             }
             assert!(envelope_bytes(&probe) > MAX_RESPONSE_FRAME_BYTES);
         }

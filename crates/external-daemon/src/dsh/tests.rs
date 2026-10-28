@@ -798,7 +798,6 @@ while IFS= read -r line; do :; done
     let RpcSuccess::TaskWait {
         pending_requests,
         timed_out,
-        instruction,
         ..
     } = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
@@ -813,14 +812,10 @@ while IFS= read -r line; do :; done
     assert!(!timed_out);
     assert_eq!(pending_requests.len(), 1);
     assert_eq!(pending_requests[0].kind, "user_input");
-    assert_eq!(pending_requests[0].summary, "question pick a scope");
+    assert_eq!(pending_requests[0].summary, None);
     assert_eq!(
         pending_requests[0].question.as_ref().unwrap().text,
         "pick a scope"
-    );
-    assert_eq!(
-        instruction.as_deref(),
-        Some("The subagent requested input; answer it now with external_subagent_respond using decision answer and non-empty content.")
     );
     // The caller answers through the request id exactly as the wait
     // response returned it, with no second lookup.
@@ -1021,7 +1016,7 @@ while IFS= read -r line; do :; done
     let wake = &pending_requests[0];
     assert!(!wake.request_id.starts_with("filler-"));
     assert_eq!(wake.kind, "user_input");
-    assert_eq!(wake.summary, "question pick a scope");
+    assert_eq!(wake.summary, None);
     assert_eq!(wake.question.as_ref().unwrap().text, "pick a scope");
     // Answering through the returned id settles the parked ACP request.
     assert_eq!(

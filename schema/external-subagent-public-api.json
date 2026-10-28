@@ -104,7 +104,7 @@
     },
     "wait": {
       "type": "object",
-      "description": "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the final result is embedded with complete=true no further result call is needed; a partial page directs you to external_subagent_result with next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
+      "description": "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
       "required": ["agent_id"],
       "properties": {
         "agent_id": { "type": "integer", "minimum": 10000000, "maximum": 99999999 },
@@ -135,7 +135,7 @@
     },
     "result_projection": {
       "type": "object",
-      "required": ["outcome", "final_text", "partial", "offset", "total_bytes", "next_offset", "complete", "reason_code"],
+      "required": ["outcome", "final_text", "partial", "offset", "total_bytes", "next_offset", "reason_code", "failure_message"],
       "properties": {
         "outcome": { "enum": ["COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "RUNTIME_LOST", "RESULT_INVALID"] },
         "final_text": { "type": "string" },
@@ -143,8 +143,8 @@
         "offset": { "type": "integer", "minimum": 0 },
         "total_bytes": { "type": "integer", "minimum": 0 },
         "next_offset": { "type": ["integer", "null"], "minimum": 0 },
-        "complete": { "type": "boolean" },
-        "reason_code": { "type": ["string", "null"] }
+        "reason_code": { "type": ["string", "null"] },
+        "failure_message": { "type": ["string", "null"] }
       },
       "additionalProperties": false
     },
@@ -185,7 +185,7 @@
       "properties": {
         "external_subagent_status": { "input": [], "output": ["mcp_version", "components", "capabilities", "subagents"] },
         "external_subagent_spawn": { "input": ["profile", "subagent", "repository", "permission_mode", "prompt", "model", "effort", "write_manifest"], "output": ["agent_id", "status", "session_id", "instruction"], "idempotent": false },
-        "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "result_available", "activity", "result", "instruction", "timed_out", "message_receipt"] },
+        "external_subagent_wait": { "input": ["agent_id", "wait_time", "message_id"], "output": ["task", "pending_requests", "activity", "result", "timed_out", "message_receipt"] },
         "external_subagent_observe": { "input": ["agent_id"], "output": ["tools", "reasoning", "coverage"], "idempotent": true },
         "external_subagent_list": { "input": ["subagent", "repository", "phase", "outcome", "cursor", "limit"], "output": ["tasks", "next_cursor"] },
         "external_subagent_send": { "input": ["agent_id", "message_id", "mode", "content"], "required": ["agent_id", "mode", "content"], "mode": ["queue", "steer"], "output": ["message_id", "disposition"] },

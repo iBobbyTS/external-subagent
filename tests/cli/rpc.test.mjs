@@ -55,12 +55,10 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
         outcome: 'success',
         result: {
           kind: 'task_wait',
-          task: { agent_id: '10000001', status: 'running', session_id: null },
+          task: { agent_id: '10000001', status: 'running' },
           pending_requests: [{ request_id: 'read-1', kind: 'permission', tool_name: 'Read', operation: 'read', summary: 'target input.txt' }],
-          result_available: false,
           activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
           result: null,
-          instruction: 'A permission request is pending; respond now with external_subagent_respond using decision allow or deny.',
           timed_out: false,
         },
       }) + '\n');
@@ -70,7 +68,7 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
   try {
     const result = await callDaemon(socketPath, 'wait', { agent_id: 10000001, wait_time: 0 });
     assert.equal(clientEnded, false, 'sending a request must not half-close the RPC socket');
-    assert.deepEqual(result.task, { agent_id: 10000001, status: 'running', session_id: null });
+    assert.deepEqual(result.task, { agent_id: 10000001, status: 'running' });
     assert.equal(result.result, null);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
     assert.equal(Object.hasOwn(result.activity, 'latest_reasoning'), false);
@@ -121,10 +119,10 @@ test('CLI forwards wait message_id when declared', { skip: win32Sockets }, async
       outcome: 'success',
       result: {
         kind: 'task_wait',
-        task: { agent_id: '10000001', status: 'running', session_id: null },
-        pending_requests: [], result_available: false,
+        task: { agent_id: '10000001', status: 'running' },
+        pending_requests: [],
         activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
-        result: null, instruction: null, timed_out: true,
+        result: null, timed_out: true,
         message_receipt: { message_id: 'message-1', state: 'queued', failure_code: null },
       },
     }) + '\n');
@@ -256,9 +254,11 @@ test('CLI public projection removes private RPC fields and result digest', () =>
   });
   assert.deepEqual(Object.keys(projected).sort(), ['result', 'task']);
   assert.deepEqual(projected.task, { agent_id: 10000001, status: 'completed', session_id: null, input_identity: null });
-  // A legacy daemon frame may still carry the retired digest; the projection
-  // must not forward it even if one appears.
+  // A legacy daemon frame may still carry the retired digest or the retired
+  // completeness flag; the projection must not forward either.
   assert.equal(projected.result.result_sha256, undefined);
+  assert.equal(projected.result.complete, undefined);
+  assert.equal(projected.result.failure_message, null);
 });
 
 test('CLI public projection carries the terminal reason code and defaults to null', () => {

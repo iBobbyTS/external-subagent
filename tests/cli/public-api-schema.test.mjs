@@ -69,8 +69,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'agent_id', 'wait_time', 'message_id',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.output, [
-    'task', 'pending_requests', 'result_available', 'activity',
-    'result', 'instruction', 'timed_out', 'message_receipt',
+    'task', 'pending_requests', 'activity', 'result', 'timed_out', 'message_receipt',
   ]);
   assert.deepEqual(schema.properties.error_projection.required, ['error']);
   assert.deepEqual(schema.properties.error_projection.properties.error.required, ['code', 'message']);
@@ -93,7 +92,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [
-    'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'complete', 'reason_code',
+    'outcome', 'final_text', 'partial', 'offset', 'total_bytes', 'next_offset', 'reason_code',
+    'failure_message',
   ]);
   assert.deepEqual(Object.keys(schema.properties.contracts.properties).sort(), schema.properties.tools.const.slice().sort());
   for (const contract of Object.values(schema.properties.contracts.properties)) {
