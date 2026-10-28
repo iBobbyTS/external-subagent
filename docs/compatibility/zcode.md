@@ -118,13 +118,14 @@ bundled and marketplace plugins: **inline directories** — every path in
   `{provider}/{model}` token from the spawn request or a named profile.
   An omitted model and a bare token are refused at admission, and a
   non-null `agents.zcode.default_model` is rejected by both config
-  boundaries with `model_selection_unsupported`. The daemon does not
-  synthesize or inject a provider environment for ZCode children; the
-  runtime resolves providers from its own inherited environment. After
-  any ZCode upgrade, re-run the model chain: `subagents models zcode`
-  must list the expected native catalog tokens, and one small task spawned
-  with an explicit `{provider}/{model}` model must complete with that
-  model.
+  boundaries with `model_selection_unsupported`. Provider materialization
+  for ZCode children is daemon-owned (see the section below): the child
+  gets the builtin/personal/data-root environment group, and subscription
+  or manual providers resolve from the generated registry rather than the
+  GUI's runtime-preferences channel. After any ZCode upgrade, re-run the
+  model chain: `subagents models zcode` must list the expected native
+  catalog tokens, and one small task spawned with an explicit
+  `{provider}/{model}` model must complete with that model.
 - `session/setModel` is the pinned switch protocol: the request always
   sets `persistAsWorkspaceLastUsed: false`, the create result's
   `settings.model.available` is the only whitelist (it shrinks to the
@@ -247,6 +248,58 @@ change): no `initialize` method (`-32601 Method not found`);
 `session.mode`/`settings.mode.current` as `build` for a `plan` request
 (the env-level `ZCODE_AGENT_PERMISSION_MODE=plan` policy still held for the
 completed plan-mode turn).
+
+## Provider environment chain (restored 2026-10-28 after the 3.16.3 layout drift)
+
+Two independent ZCode-side facts, both verified against the 3.16.3 app /
+CLI 0.17.0 bundle, make daemon-owned provider materialization mandatory
+for standalone (non-GUI) sessions:
+
+1. **Bundled-template relocation.** The builtin provider template moved to
+   `Contents/Resources/config/provider/zcode-builtin.json`. The CLI's own
+   resolution (`resolveBundledZCodeBuiltinProviderConfig`) probes only
+   `<entry-dir>/provider/` and `resolve(entry-dir, "../../../../../config/
+   provider/")` — a dev-tree depth that lands on `/config/provider/...`
+   for the app-bundle entry `Resources/glm/zcode.cjs`. Without an explicit
+   `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`, every standalone session dies at
+   session start with `无法定位 CLI ZCode Built-in Provider Config`
+   before any provider or model is consulted (`prepareCliProviderRuntimeEnv`
+   env short-circuit skips that search when the variable is preset).
+2. **Account providers do not materialize standalone.** The GUI's
+   subscription entries (`account:zai-start-plan` in
+   `~/.zcode/v2/provider_config.json`) carry no credential and only
+   materialize through the GUI answering
+   `session/requestRuntimePreferences` (scope `runtime-materialization`).
+   A daemon child answered with default preferences therefore loses every
+   subscription model: the catalog shrinks to the manually-configured
+   personal providers.
+
+The daemon's `zcode` module (deleted in the explicit-model refactor,
+restored 2026-10-28) addresses both: for every zcode child (spawn via the
+runtime factory closure, probes via the hi/catalog command builders) it
+resolves the builtin template from the runtime path's ancestors, composes
+a daemon-owned personal registry under `<data root>/zcode-runtime/`
+(v2 personal rules verbatim + a synthesized `zai` rule from the
+`~/.zcode/cli/config.json` coding-plan key intersected with the builtin
+`zai-api` template models; 0600, atomic, idempotent), and injects the
+four-variable group `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` /
+`ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE` /
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` / `ZCODE_DATA_BASE_DIR` as one
+atomic unit — any generation failure leaves the command with no new
+`ZCODE_` variable. A user-defined `zai` rule is authoritative and never
+overwritten. `ZCODE_AGENT_BOOTSTRAP_ROOTS` is no longer read by the
+0.17.0 bundle (verified by bundle string search) and is left set only for
+older CLI compatibility.
+
+Live verification on the restored chain (2026-10-28, real ZCode.app
+3.16.3 runtime, scratch daemon): `subagents models zcode` projects all
+six catalog tokens (`zai/GLM-5.3`, `zai/GLM-5.3-Flash`,
+`new-provider-3/glm-5.3`, `new-provider-3/glm-5.3-flash`,
+`new-provider-2/z-ai/glm-5.3-flash`, `deepseek/deepseek-flash`), and
+plan-mode `pong` tasks completed with the recorded model for
+`zai/GLM-5.3` (subscription), `new-provider-3/glm-5.3` (manual) and
+`deepseek/deepseek-flash` (manual) — including both glm-5.3-bearing
+providers selected independently.
 
 ## Oracles
 

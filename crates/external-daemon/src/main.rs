@@ -142,14 +142,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         configure_agy_environment(Some(path));
     }
     configure_diagnostic_log(config.diagnostic_log.clone());
+    // daemon 是派生 zcode data root 的权威：生产 LaunchAgent 以程序参数传
+    // `--database`、从不设置 EXTERNAL_SUBAGENT_STORE，这里导出解析后的绝对路径
+    // （而非可能冲突的继承值）供两个 provider 注入点（`data_root_from_environment`）。
+    env::set_var("EXTERNAL_SUBAGENT_STORE", &config.database);
     wait_for_startup_test_gate(&shutdown_requested)?;
     if shutdown_requested.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
     let store = Arc::new(Store::open(&config.database)?);
     let runtime = config.runtime.clone();
+    let data_root = external_daemon::zcode::data_root_from_environment();
     let zcode = CommandRuntimeFactory::new_prepared_with_model(
-        move |_task: &external_store::TaskRecord| runtime_command(runtime.as_deref()),
+        move |_task: &external_store::TaskRecord| {
+            let mut command = runtime_command(runtime.as_deref())?;
+            if let (Some(runtime), Some(data_root)) = (runtime.as_deref(), data_root.as_deref()) {
+                external_daemon::zcode::apply_provider_environment(&mut command, runtime, data_root);
+            }
+            Ok(command)
+        },
         config.process_model,
     );
     let dsh_factory = if dsh_production_enabled(config.agent_config.as_deref()) {
