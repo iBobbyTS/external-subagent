@@ -33,6 +33,7 @@ const DSH_MAX_MODELS: usize = 256;
 const DSH_MAX_MODEL_TOKEN_BYTES: usize = 512;
 const AGY_CATALOG_TIMEOUT: Duration = Duration::from_secs(5);
 const AGY_MAX_CATALOG_BYTES: usize = 1024 * 1024;
+const CODEX_CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_STREAM_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,7 @@ pub trait AgentProbeBackend: Send + Sync + 'static {
 pub struct AgentEvidenceStore {
     backend: Arc<dyn AgentProbeBackend>,
     latest: Arc<Mutex<BTreeMap<String, AgentProbeEvidence>>>,
+    models_latest: Arc<Mutex<BTreeMap<String, AgentModelsOutput>>>,
 }
 
 impl AgentEvidenceStore {
@@ -209,6 +211,7 @@ impl AgentEvidenceStore {
         Self {
             backend,
             latest: Arc::new(Mutex::new(BTreeMap::new())),
+            models_latest: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -291,7 +294,18 @@ impl AgentEvidenceStore {
     pub fn models(&self, input: &AgentModelsInput, config_revision: u64) -> AgentModelsOutput {
         let mut output = self.backend.models(input);
         output.config_revision = config_revision;
+        self.models_latest
+            .lock()
+            .unwrap()
+            .insert(input.agent.clone(), output.clone());
         output
+    }
+
+    /// The most recently recorded model-catalog discovery for an agent, if
+    /// any explicit `agent_models` call ever ran. Reading never discovers:
+    /// projection of "no data" is the caller's absence decision.
+    pub fn latest_models(&self, agent: &str) -> Option<AgentModelsOutput> {
+        self.models_latest.lock().unwrap().get(agent).cloned()
     }
 }
 
@@ -466,9 +480,10 @@ impl AgentProbeBackend for ProcessProbeBackend {
             return probe_zcode_models(self.runtime_source.as_deref(), input);
         }
         if input.agent == "codex" {
-            // The Codex catalog was observed only through the controlled live
-            // probe; no in-band catalog claim is made here.
-            return unsupported_models(input, "codex_models_probed_live_only");
+            return probe_codex_models(
+                discover_runtime("CODEX_RUNTIME_PATH", "codex").as_deref(),
+                input,
+            );
         }
         if input.agent == "agy" {
             return probe_agy_models(
@@ -908,6 +923,222 @@ fn zcode_models_degraded(
         models: Vec::new(),
         evidence,
         reason: Some(reason.into()),
+    }
+}
+
+/// Discover the Codex model catalog through the app-server `model/list`
+/// request (SOURCE_INSPECTED: upstream `app-server-protocol` v2 `model/list`
+/// with `data[].id/hidden` and `nextCursor` pagination; OBSERVED live on
+/// codex-cli 0.163.0 with a throwaway home and no sign-in).
+///
+/// The bounded sequence is `initialize` → `initialized` → `model/list {}`
+/// (→ continuation pages while `nextCursor` is present). No thread is
+/// started and no prompt is sent, so the probe never costs a model call.
+/// The home precedence mirrors the spawn gate's rule — explicit
+/// `scope.home`, then the daemon-exported `CODEX_HOME` (from persisted
+/// configuration), then a mode-0700 disposable home — and never falls back
+/// to `~/.codex`. Provider credentials inherited from the daemon
+/// environment are removed exactly as `CodexLaunch::command` does, so
+/// authentication follows only the resolved home.
+fn probe_codex_models(path: Option<&Path>, input: &AgentModelsInput) -> AgentModelsOutput {
+    let checked_at_ms = wall_now_millis();
+    let mut scope = input.scope.clone();
+    let disposable_home = if scope.home.is_none() {
+        match env::var_os("CODEX_HOME") {
+            Some(home) => {
+                scope.home = Some(home.to_string_lossy().into_owned());
+                None
+            }
+            None => tempfile::Builder::new()
+                .prefix("external-subagent-codex-catalog-")
+                .tempdir()
+                .ok(),
+        }
+    } else {
+        None
+    };
+    if let Some(home) = disposable_home.as_ref() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700));
+        }
+        scope.home = Some(home.path().to_string_lossy().into_owned());
+    }
+    let local = probe_local(path, scope.clone(), checked_at_ms);
+    let evidence = ModelCatalogEvidence {
+        source: "codex_app_server_model_list".into(),
+        version: local.version.clone(),
+        scope: scope.clone(),
+        checked_at_ms,
+    };
+    if local.state != EvidenceState::Ready {
+        return codex_models_degraded(
+            input,
+            evidence,
+            local.reason.as_deref().unwrap_or("missing"),
+        );
+    }
+    let Some(home) = scope.home.as_deref() else {
+        return codex_models_degraded(input, evidence, "home_required");
+    };
+    if !Path::new(home).is_absolute() {
+        return codex_models_degraded(input, evidence, "home_invalid");
+    }
+    let runtime = path.expect("ready local evidence has a runtime path");
+    let result = run_codex_model_list(runtime, home, Path::new(home));
+    match result {
+        Ok(models) if !models.is_empty() => AgentModelsOutput {
+            agent: input.agent.clone(),
+            config_revision: 0,
+            supported: true,
+            models,
+            evidence,
+            reason: None,
+        },
+        Ok(_) => codex_models_degraded(input, evidence, "model_catalog_empty"),
+        Err(reason) => codex_models_degraded(input, evidence, &reason),
+    }
+}
+
+fn codex_models_degraded(
+    input: &AgentModelsInput,
+    evidence: ModelCatalogEvidence,
+    reason: &str,
+) -> AgentModelsOutput {
+    AgentModelsOutput {
+        agent: input.agent.clone(),
+        config_revision: 0,
+        supported: false,
+        models: Vec::new(),
+        evidence,
+        reason: Some(reason.into()),
+    }
+}
+
+/// Drive the bounded app-server catalog exchange and project the picker
+/// tokens. Non-`hidden` entries project their `id` verbatim — the same token
+/// `thread/start` accepts — sorted, deduplicated, and capped at
+/// `CODEX_MAX_MODELS` raw entries.
+fn run_codex_model_list(
+    runtime: &Path,
+    home: &str,
+    cwd: &Path,
+) -> Result<Vec<String>, String> {
+    let mut command = runtime_command(runtime, false);
+    command
+        .args(["app-server", "--listen", "stdio://"])
+        .env("CODEX_HOME", home)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .current_dir(cwd);
+    let mut driver = Driver::spawn(command).map_err(|_| "transport".to_owned())?;
+    let outcome = codex_catalog_exchange(&driver);
+    let _ = driver.stop_and_reap(RUNTIME_STOP_GRACE);
+    outcome
+}
+
+fn codex_catalog_exchange(driver: &Driver) -> Result<Vec<String>, String> {
+    let deadline = Instant::now() + CODEX_CATALOG_TIMEOUT;
+    let remaining = |deadline: Instant| -> Result<Duration, String> {
+        deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "timeout".to_owned())
+    };
+    let initialize = driver
+        .request(
+            "initialize",
+            serde_json::json!({
+                "clientInfo": {
+                    "name": "external-subagent",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {},
+            }),
+            remaining(deadline)?,
+        )
+        .map_err(|_| "transport".to_owned())?;
+    let codex_home_ok = initialize
+        .result
+        .as_ref()
+        .and_then(|result| result.get("codexHome"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|home| !home.is_empty() && home.len() <= 4096);
+    if !codex_home_ok {
+        return Err("handshake_failed".into());
+    }
+    driver
+        .send(&serde_json::json!({"method": "initialized"}))
+        .map_err(|_| "transport".to_owned())?;
+    let mut models = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let params = match cursor.as_deref() {
+            Some(cursor) => serde_json::json!({ "cursor": cursor }),
+            None => serde_json::json!({}),
+        };
+        let page = driver
+            .request("model/list", params, remaining(deadline)?)
+            .map_err(|error| match error {
+                RequestError::Timeout => "timeout".to_owned(),
+                // A JSON-RPC error body arrives as Remote: classify the
+                // gateway sign-in refusal, collapsing anything else.
+                RequestError::Remote(value) => classify_codex_model_list_error(&value),
+                _ => "transport".to_owned(),
+            })?;
+        let Some(result) = page.result.as_ref() else {
+            return Err("transport".into());
+        };
+        let Some(data) = result.get("data").and_then(serde_json::Value::as_array) else {
+            return Err("transport".into());
+        };
+        for entry in data {
+            // A failed individual entry must not abort the catalog; skip
+            // anything that is not an object or not visible in the picker.
+            let Some(entry) = entry.as_object() else {
+                continue;
+            };
+            if entry.get("hidden").and_then(serde_json::Value::as_bool) == Some(true) {
+                continue;
+            }
+            if let Some(id) = entry.get("id").and_then(serde_json::Value::as_str) {
+                if !id.is_empty()
+                    && id.len() <= DSH_MAX_MODEL_TOKEN_BYTES
+                    && !id.contains('\0')
+                {
+                    models.push(id.to_owned());
+                }
+            }
+        }
+        if models.len() > DSH_MAX_MODELS {
+            return Err("oversized".into());
+        }
+        cursor = result
+            .get("nextCursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+/// Map a `model/list` JSON-RPC error onto a bounded reason. The gateway
+/// sign-in shape (SOURCE_INSPECTED: catalog_processor's "Gateway sign-in
+/// required or unavailable") is `auth_required`; everything else collapses
+/// to `catalog_refused` — a bounded, non-credential-bearing label.
+fn classify_codex_model_list_error(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if message.contains("sign-in") || message.contains("sign in") {
+        "auth_required".into()
+    } else {
+        "catalog_refused".into()
     }
 }
 
@@ -3590,6 +3821,191 @@ process.exit(1);
         fs::write(&executable, source).unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         executable
+    }
+
+    /// Minimal codex app-server fixture speaking the daemon's pinned envelope
+    /// (`initialize` → `initialized` → `model/list`). The scripted variants
+    /// cover the live-observed shapes: paginated `nextCursor`, `hidden`
+    /// entries, a duplicate id, a gateway sign-in error, an empty catalog,
+    /// and a missing `codexHome` in the initialize result.
+    fn fake_codex_models_runtime(
+        directory: &Path,
+        log: &Path,
+        variant: &str,
+    ) -> PathBuf {
+        let executable = directory.join("codex-models.mjs");
+        let source = r#"
+import fs from 'node:fs';
+if (process.argv.includes('--version')) { process.stdout.write('codex-cli 0.163.0\n'); process.exit(0); }
+const log = __LOG__;
+const variant = __VARIANT__;
+let buffer = '';
+function write(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+const page = (models, nextCursor) => ({ data: models, ...(nextCursor ? { nextCursor } : {}) });
+const model = (id, extra = {}) => ({ id, model: id, displayName: id, hidden: false, ...extra });
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  for (;;) {
+    const newline = buffer.indexOf('\n'); if (newline < 0) break;
+    const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1);
+    if (!line) continue;
+    const value = JSON.parse(line);
+    fs.appendFileSync(log, JSON.stringify({ value, codexHome: process.env.CODEX_HOME, cwd: process.cwd() }) + '\n');
+    if (value.method === 'initialize') {
+      if (variant === 'no_home') { write({ id: value.id, result: { userAgent: 'fixture' } }); continue; }
+      write({ id: value.id, result: { codexHome: process.env.CODEX_HOME, userAgent: 'fixture' } });
+    } else if (value.method === 'initialized') {
+      // notification: no response expected
+    } else if (value.method === 'model/list') {
+      if (variant === 'gateway') { write({ id: value.id, error: { code: -32000, message: 'Gateway sign-in required or unavailable. Complete gateway sign-in and retry fetching the model list' } }); continue; }
+      if (variant === 'refused') { write({ id: value.id, error: { code: -32000, message: 'internal provider failure' } }); continue; }
+      if (variant === 'empty') { write({ id: value.id, result: page([]) }); continue; }
+      if (variant === 'paged' && !value.params?.cursor) {
+        write({ id: value.id, result: page([model('gpt-6-luna'), model('gpt-5.5')], '1') });
+      } else if (variant === 'paged') {
+        write({ id: value.id, result: page([model('gpt-6-astra'), model('hidden-one', { hidden: true }), model('gpt-6-luna')]) });
+      } else {
+        write({ id: value.id, result: page([model('gpt-6-luna'), model('gpt-5.6-terra'), model('gpt-6-luna')]) });
+      }
+    } else {
+      write({ id: value.id, error: { code: -32601, message: 'unsupported' } });
+    }
+  }
+});
+"#
+        .replace("__LOG__", &serde_json::to_string(log).unwrap())
+        .replace("__VARIANT__", &serde_json::to_string(variant).unwrap());
+        fs::write(&executable, source).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    fn codex_models_input() -> AgentModelsInput {
+        AgentModelsInput {
+            agent: "codex".into(),
+            scope: ProbeScope::default(),
+        }
+    }
+
+    #[test]
+    fn codex_catalog_projects_model_list_ids_without_a_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("codex-models.jsonl");
+        let runtime = fake_codex_models_runtime(directory.path(), &log, "plain");
+        let output = probe_codex_models(Some(&runtime), &codex_models_input());
+        assert!(output.supported, "{output:?}");
+        assert_eq!(
+            output.models,
+            vec!["gpt-5.6-terra".to_owned(), "gpt-6-luna".to_owned()]
+        );
+        assert_eq!(output.evidence.source, "codex_app_server_model_list");
+        assert_eq!(output.evidence.version.as_deref(), Some("0.163.0"));
+        assert_eq!(output.reason, None);
+
+        let frames = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let methods = frames
+            .iter()
+            .filter_map(|frame| frame["value"]["method"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            ["initialize", "initialized", "model/list"],
+            "{frames:?}"
+        );
+        // The throwaway home the probe created is the one the child saw, and
+        // it is recorded as the evidence scope home.
+        let home = output.evidence.scope.home.as_deref().unwrap();
+        assert!(home.contains("external-subagent-codex-catalog-"), "{home}");
+        assert!(Path::new(home).is_absolute());
+        assert_eq!(frames[0]["codexHome"].as_str().unwrap(), home);
+    }
+
+    #[test]
+    fn codex_catalog_follows_pagination_and_skips_hidden_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("codex-models.jsonl");
+        let runtime = fake_codex_models_runtime(directory.path(), &log, "paged");
+        let output = probe_codex_models(Some(&runtime), &codex_models_input());
+        assert!(output.supported, "{output:?}");
+        // The hidden entry never projects; the cross-page duplicate dedups.
+        assert_eq!(
+            output.models,
+            vec!["gpt-5.5".to_owned(), "gpt-6-astra".to_owned(), "gpt-6-luna".to_owned()]
+        );
+        let second = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["value"]["method"] == "model/list" && frame["value"]["params"].get("cursor").is_some())
+            .expect("a cursor continuation request");
+        assert_eq!(second["value"]["params"]["cursor"].as_str().unwrap(), "1");
+    }
+
+    #[test]
+    fn codex_catalog_classifies_gateway_and_provider_refusals() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("codex-models.jsonl");
+        let runtime = fake_codex_models_runtime(directory.path(), &log, "gateway");
+        let output = probe_codex_models(Some(&runtime), &codex_models_input());
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("auth_required"));
+        assert!(output.models.is_empty());
+
+        let log2 = directory.path().join("codex-models-2.jsonl");
+        let runtime2 = fake_codex_models_runtime(directory.path(), &log2, "refused");
+        let output = probe_codex_models(Some(&runtime2), &codex_models_input());
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("catalog_refused"));
+    }
+
+    #[test]
+    fn codex_catalog_fails_closed_on_missing_runtime_empty_catalog_and_bad_handshake() {
+        let output = probe_codex_models(None, &codex_models_input());
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("missing"));
+        assert_eq!(output.evidence.source, "codex_app_server_model_list");
+
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("codex-models.jsonl");
+        let empty = fake_codex_models_runtime(directory.path(), &log, "empty");
+        let output = probe_codex_models(Some(&empty), &codex_models_input());
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("model_catalog_empty"));
+
+        let log2 = directory.path().join("codex-models-2.jsonl");
+        let no_home = fake_codex_models_runtime(directory.path(), &log2, "no_home");
+        let output = probe_codex_models(Some(&no_home), &codex_models_input());
+        assert!(!output.supported);
+        assert_eq!(output.reason.as_deref(), Some("handshake_failed"));
+    }
+
+    #[test]
+    fn codex_catalog_prefers_an_explicit_scope_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("explicit-home");
+        fs::create_dir_all(&home).unwrap();
+        let log = directory.path().join("codex-models.jsonl");
+        let runtime = fake_codex_models_runtime(directory.path(), &log, "plain");
+        let output = probe_codex_models(
+            Some(&runtime),
+            &AgentModelsInput {
+                agent: "codex".into(),
+                scope: ProbeScope {
+                    home: Some(home.to_string_lossy().into_owned()),
+                    ..ProbeScope::default()
+                },
+            },
+        );
+        assert!(output.supported, "{output:?}");
+        assert_eq!(
+            output.evidence.scope.home.as_deref(),
+            Some(home.to_string_lossy().into_owned().as_str())
+        );
     }
 
     #[test]

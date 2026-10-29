@@ -53,6 +53,13 @@ pub struct RpcRequest {
 #[allow(clippy::large_enum_variant)]
 pub enum RpcMethod {
     SystemStatus,
+    /// `system_status` with an explicit refresh request. A distinct variant —
+    /// not a field on `SystemStatus` — keeps the historical unit-variant wire
+    /// shape (no `params` key) byte-compatible for older CLI frames.
+    SystemStatusRefresh {
+        #[serde(default)]
+        probe: bool,
+    },
     DaemonBeginDrain {
         #[serde(default)]
         cancel_active: bool,
@@ -90,6 +97,7 @@ impl RpcMethod {
         matches!(
             name,
             "system_status"
+                | "system_status_refresh"
                 | "daemon_begin_drain"
                 | "daemon_drain_status"
                 | "daemon_abort_drain"

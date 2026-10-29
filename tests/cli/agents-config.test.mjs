@@ -522,6 +522,11 @@ test('agents human operations are strict and unsupported actions are explicit', 
   assert.throws(() => parseSubagentsArgs(['probe', 'zcode', '--auth', '--hi']), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => parseSubagentsArgs(['probe', 'zcode', '--workspace']), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => parseSubagentsArgs(['probe', 'zcode', '--unknown']), (error) => error.code === 'INVALID_ARGUMENT');
+  // status --probe parses and routes to the refresh RPC with probe=true.
+  assert.deepEqual(parseSubagentsArgs(['status', 'codex', '--probe']), { operation: 'status', subagent: 'codex', probe: true });
+  assert.deepEqual(parseSubagentsArgs(['status', '--probe']), { operation: 'status', probe: true });
+  assert.deepEqual(parseSubagentsArgs(['status']), { operation: 'status' });
+  assert.throws(() => parseSubagentsArgs(['status', 'codex', '--probe', '--probe']), (error) => error.code === 'INVALID_ARGUMENT');
 });
 
 test('agents status projects daemon evidence and rejects absent identities', async () => {
@@ -545,6 +550,15 @@ test('agents status projects daemon evidence and rejects absent identities', asy
   assert.deepEqual(await subagentsCommand(paths, { operation: 'status', subagent: 'zcode' }, options), { service_generation: 'generation-1', subagents: status.subagents });
   await assert.rejects(() => subagentsCommand(paths, { operation: 'status', subagent: 'dsh' }, options), (error) => error.code === 'subagent_unknown'
     && error.message === 'daemon did not report subagent: dsh, available subagents are ["zcode"]');
+  // --probe routes to status-refresh with {probe:true} and passes the
+  // per-agent models block through unchanged.
+  const refreshed = structuredClone(status);
+  refreshed.subagents[0].models = { supported: true, tokens: ['zai/GLM-5.3'], source: 'zcode_session_create_settings', version: '3.8.1', checked_at_ms: 99 };
+  const refreshOptions = { socket: '/socket', callDaemon: async (socket, command, input) => {
+    assert.equal(command, 'status-refresh'); assert.deepEqual(input, { probe: true }); return refreshed;
+  } };
+  const probedStatus = await subagentsCommand(paths, { operation: 'status', subagent: 'zcode', probe: true }, refreshOptions);
+  assert.deepEqual(probedStatus.subagents[0].models, refreshed.subagents[0].models);
 });
 
 test('explicit null spawn selection is rejected while omitted route fields stay omitted', () => {

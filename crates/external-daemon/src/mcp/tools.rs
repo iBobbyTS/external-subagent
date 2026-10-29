@@ -8,7 +8,7 @@ use super::errors::{
 use super::schemas::{
     tool_output_schema, validate_text, AgentInput, AgentListInput, AgentRespondInput,
     AgentIdOrList, AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, EmptyInput,
-    PublicPermissionMode, MAX_MESSAGE_BYTES,
+    PublicPermissionMode, StatusInput, MAX_MESSAGE_BYTES,
 };
 use super::types::{internal_task_id, public_task_id, PublicDecision, PublicResponseDisposition};
 use super::views::{
@@ -277,7 +277,7 @@ fn wait_context_id(target: &crate::rpc::WaitTarget) -> Option<String> {
 }
 
 fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {    match method {
-        RpcMethod::SystemStatus => ("status", None),
+        RpcMethod::SystemStatus | RpcMethod::SystemStatusRefresh { .. } => ("status", None),
         RpcMethod::DaemonBeginDrain { .. } => ("drain", None),
         RpcMethod::DaemonDrainStatus => ("drain_status", None),
         RpcMethod::DaemonAbortDrain => ("drain_abort", None),
@@ -359,7 +359,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_status",
     output_schema = tool_output_schema::<SystemStatusOutput>(),
-    description = "Read daemon/runtime readiness, the diagnostic-only mcp_version, component states, and capability limits. Read-only.",
+    description = "Read daemon/runtime readiness, the diagnostic-only mcp_version, component states, and capability limits. Pass {\"probe\": true} to first refresh every configured subagent's model catalog through bounded, prompt-free discovery (no threads, no prompts, no model calls) and then return the same status shape with each subagent's optional models block projected from that fresh evidence; the default (probe omitted or false) stays a passive projection of previously recorded evidence. Not purely read-only in either mode: status always runs the no-model-call local layer probes.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -369,9 +369,14 @@ impl SubagentMcp {
 )]
     async fn system_status(
         &self,
-        Parameters(_): Parameters<EmptyInput>,
+        Parameters(input): Parameters<StatusInput>,
     ) -> Result<Json<SystemStatusOutput>, ToolError> {
-        match self.rpc(RpcMethod::SystemStatus)? {
+        let method = if input.probe {
+            RpcMethod::SystemStatusRefresh { probe: true }
+        } else {
+            RpcMethod::SystemStatus
+        };
+        match self.rpc(method)? {
             RpcSuccess::SystemStatus { status } => Ok(Json(SystemStatusOutput::from_view(status))),
             _ => Err(protocol_error().with_operation("status")),
         }
@@ -1839,6 +1844,81 @@ mod contract_default_tests {
             wait_validator.is_valid(&many_wait),
             "wait schema rejected list-mode success: {:?}",
             wait_validator.iter_errors(&many_wait).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn status_tool_schema_accepts_models_block_and_input_declares_probe() {
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/schema.sock"), Duration::from_secs(1));
+        let status_tool = facade
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "external_subagent_status")
+            .unwrap();
+        let schema = serde_json::to_value(status_tool.output_schema.as_ref().unwrap()).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+
+        // A subagent that never ran discovery omits `models` entirely.
+        let passive = serde_json::json!({
+            "mcp_version":"0.1.0",
+            "components":{},
+            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
+                "maturity":{},"observation":{"public_reasoning_default":true,
+                    "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
+            "subagents":[{
+                "subagent":"codex","configured":true,"enabled":true,"spawn_supported":true,
+                "permission_modes":["build","edit","plan","yolo"],
+                "model_selection":{"supported":true,"mode":"catalog_token"},
+                "effort_selection":{"supported":true,"mode":"closed_set"},
+                "local":{"state":"UNKNOWN"},"auth":{"state":"UNKNOWN"},"hi":{"state":"UNKNOWN"}
+            }]
+        });
+        assert!(
+            validator.is_valid(&passive),
+            "passive status rejected: {:?}",
+            validator.iter_errors(&passive).collect::<Vec<_>>()
+        );
+
+        // A discovered subagent carries the models block; a degraded one
+        // keeps the block with a bounded reason.
+        let with_models = serde_json::json!({
+            "mcp_version":"0.1.0",
+            "components":{},
+            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
+                "maturity":{},"observation":{"public_reasoning_default":true,
+                    "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
+            "subagents":[
+                {
+                    "subagent":"codex","configured":true,"enabled":true,"spawn_supported":true,
+                    "permission_modes":["build","edit","plan","yolo"],
+                    "model_selection":{"supported":true,"mode":"catalog_token"},
+                    "effort_selection":{"supported":true,"mode":"closed_set"},
+                    "models":{"supported":true,"tokens":["gpt-6-luna"],"source":"codex_app_server_model_list","version":"0.163.0","checked_at_ms":42},
+                    "local":{"state":"UNKNOWN"},"auth":{"state":"UNKNOWN"},"hi":{"state":"UNKNOWN"}
+                },
+                {
+                    "subagent":"dsh","configured":true,"enabled":true,"spawn_supported":true,
+                    "permission_modes":["build","edit","plan","yolo"],
+                    "model_selection":{"supported":true,"mode":"catalog_token"},
+                    "effort_selection":{"supported":true,"mode":"passthrough_token"},
+                    "models":{"supported":false,"tokens":[],"source":"dsh_acp_models_list","checked_at_ms":43,"reason":"stale_config_revision"},
+                    "local":{"state":"UNKNOWN"},"auth":{"state":"UNKNOWN"},"hi":{"state":"UNKNOWN"}
+                }
+            ]
+        });
+        assert!(
+            validator.is_valid(&with_models),
+            "models block rejected: {:?}",
+            validator.iter_errors(&with_models).collect::<Vec<_>>()
+        );
+
+        // The tool's declared input now names the probe flag.
+        let input_schema = serde_json::to_value(&status_tool.input_schema).unwrap();
+        let properties = input_schema["properties"].as_object().cloned().unwrap_or_default();
+        assert!(
+            properties.contains_key("probe"),
+            "status input schema must declare probe: {input_schema}"
         );
     }
 

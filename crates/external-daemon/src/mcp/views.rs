@@ -3,6 +3,7 @@
 //! Extracted mechanically from the former private `mcp::server` module; the
 //! facade at `crate::mcp` keeps every historical path importable.
 use super::errors::{protocol_error, ToolError};
+use super::schemas::StatusInput;
 use super::types::{
     public_task_id, PublicDecision, PublicPendingRequest, PublicResponseDisposition,
 };
@@ -248,9 +249,31 @@ pub struct PublicAgentStatus {
     pub permission_modes: Vec<PublicAgentPermissionMode>,
     pub model_selection: PublicAgentModelSelectionCapability,
     pub effort_selection: PublicEffortSelectionCapability,
+    /// Present only when model-catalog discovery has ever recorded evidence
+    /// for this subagent (`status(probe=true)` or an explicit models call).
+    /// Never discovered → absent, never an empty placeholder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<PublicAgentModelsStatus>,
     pub local: PublicAgentScopeStatus,
     pub auth: PublicAgentScopeStatus,
     pub hi: PublicAgentScopeStatus,
+}
+
+/// The public projection of recorded model-catalog evidence: picker tokens
+/// usable in spawn `model`, the evidence source label, and a bounded reason
+/// when discovery degraded (for example `stale_config_revision`,
+/// `auth_required`, or `model_catalog_empty`).
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicAgentModelsStatus {
+    pub supported: bool,
+    pub tokens: Vec<String>,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub checked_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -364,6 +387,14 @@ impl From<AgentStatusView> for PublicAgentStatus {
                 supported: value.effort_selection.supported,
                 mode: value.effort_selection.mode.into(),
             },
+            models: value.models.map(|models| PublicAgentModelsStatus {
+                supported: models.supported,
+                tokens: models.tokens,
+                source: models.source,
+                version: models.version,
+                checked_at_ms: models.checked_at_ms,
+                reason: models.reason,
+            }),
             local: value.local.into(),
             auth: value.auth.into(),
             hi: value.hi.into(),
@@ -752,6 +783,7 @@ mod effort_projection_tests {
                 supported,
                 mode: crate::rpc::AgentEffortSelectionModeView::PassthroughToken,
             },
+            models: None,
             local: scope_status(),
             auth: scope_status(),
             hi: scope_status(),
@@ -1026,6 +1058,7 @@ mod version_mismatch_projection_tests {
                 supported: true,
                 mode: AgentEffortSelectionModeView::PassthroughToken,
             },
+            models: None,
             local: scope.clone(),
             auth: scope.clone(),
             hi: scope,
@@ -1165,5 +1198,131 @@ mod wait_many_schema_settings_probe {
             !required.iter().any(|v| v == "error"),
             "draft2020-12 generator must not require error: {required:?} — full: {root}"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_models_schema_tests {
+    use super::*;
+
+    fn status(agent: &str) -> AgentStatusView {
+        AgentStatusView {
+            required_version: None,
+            version_mismatch: None,
+            agent: agent.into(),
+            config_revision: 1,
+            configured: true,
+            enabled: true,
+            spawn_supported: true,
+            transport_support: crate::rpc::AgentTransportSupportView {
+                transport: crate::rpc::AgentTransportView::CodexAppServer,
+                probe: true,
+                spawn: true,
+            },
+            permission_modes: Vec::new(),
+            model_selection: crate::rpc::AgentModelSelectionCapabilityView {
+                supported: true,
+                mode: crate::rpc::AgentModelSelectionModeView::CatalogToken,
+            },
+            effort_selection: crate::rpc::AgentEffortSelectionCapabilityView {
+                supported: true,
+                mode: crate::rpc::AgentEffortSelectionModeView::ClosedSet,
+            },
+            models: None,
+            local: crate::rpc::AgentScopeStatusView {
+                runtime_path: None,
+                state: crate::rpc::ComponentStateView::Unknown,
+                scope: crate::agent_status::ProbeScope::default(),
+                version: None,
+                checked_at_ms: None,
+                reason: None,
+            },
+            auth: crate::rpc::AgentScopeStatusView {
+                runtime_path: None,
+                state: crate::rpc::ComponentStateView::Unknown,
+                scope: crate::agent_status::ProbeScope::default(),
+                version: None,
+                checked_at_ms: None,
+                reason: None,
+            },
+            hi: crate::rpc::AgentScopeStatusView {
+                runtime_path: None,
+                state: crate::rpc::ComponentStateView::Unknown,
+                scope: crate::agent_status::ProbeScope::default(),
+                version: None,
+                checked_at_ms: None,
+                reason: None,
+            },
+        }
+    }
+
+    #[test]
+    fn agent_status_schema_does_not_require_the_models_key() {
+        // The same schemars lesson as the wait `error` key: an Option field
+        // stays out of `required`, so hosts validating structured output
+        // accept a status response for a never-discovered subagent.
+        let schema = schemars::schema_for!(PublicAgentStatus);
+        let root = serde_json::to_value(&schema).unwrap();
+        let required = root["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|v| v == "models"),
+            "models must not be schema-required: {required:?}"
+        );
+    }
+
+    #[test]
+    fn models_block_wire_is_absent_until_discovered_and_present_after() {
+        let undecorated = PublicAgentStatus::from(status("codex"));
+        let encoded = serde_json::to_value(&undecorated).unwrap();
+        assert!(
+            encoded.get("models").is_none(),
+            "undiscovered agent must omit models entirely: {encoded}"
+        );
+
+        let mut discovered = status("codex");
+        discovered.models = Some(crate::rpc::AgentModelsStatusView {
+            supported: true,
+            tokens: vec!["gpt-6-luna".into()],
+            source: "codex_app_server_model_list".into(),
+            version: Some("0.163.0".into()),
+            checked_at_ms: 42,
+            reason: None,
+        });
+        let projected = PublicAgentStatus::from(discovered);
+        let encoded = serde_json::to_value(&projected).unwrap();
+        let models = encoded.get("models").expect("discovered agent projects models");
+        assert_eq!(models["supported"], serde_json::json!(true));
+        assert_eq!(models["tokens"], serde_json::json!(["gpt-6-luna"]));
+        assert_eq!(models["source"], serde_json::json!("codex_app_server_model_list"));
+        assert_eq!(models["version"], serde_json::json!("0.163.0"));
+        assert_eq!(models["checked_at_ms"], serde_json::json!(42));
+        assert!(models.get("reason").is_none(), "success omits reason");
+
+        // Degraded wire keeps the block with a bounded reason.
+        let mut degraded = status("codex");
+        degraded.models = Some(crate::rpc::AgentModelsStatusView {
+            supported: false,
+            tokens: Vec::new(),
+            source: "codex_app_server_model_list".into(),
+            version: None,
+            checked_at_ms: 43,
+            reason: Some("stale_config_revision".into()),
+        });
+        let encoded = serde_json::to_value(PublicAgentStatus::from(degraded)).unwrap();
+        let models = encoded.get("models").expect("degraded evidence still projects");
+        assert_eq!(models["supported"], serde_json::json!(false));
+        assert_eq!(models["reason"], serde_json::json!("stale_config_revision"));
+    }
+
+    #[test]
+    fn status_input_defaults_probe_false_and_rejects_unknown_fields() {
+        // Deserialization contract: `{}` and omission default to passive;
+        // a typo'd field is refused instead of silently ignored.
+        let passive: StatusInput = serde_json::from_str("{}").unwrap();
+        assert!(!passive.probe);
+        let active: StatusInput = serde_json::from_str(r#"{"probe":true}"#).unwrap();
+        assert!(active.probe);
+        assert!(serde_json::from_str::<StatusInput>(r#"{"probe":"yes"}"#).is_err());
+        assert!(serde_json::from_str::<StatusInput>(r#"{"models":true}"#).is_err());
     }
 }

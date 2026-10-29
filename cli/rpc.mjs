@@ -38,7 +38,7 @@ export function waitTransportTimeoutMs(waitTime = 290) {
 
 export function daemonTransportTimeoutMs(command, params = {}) {
   if (command === 'wait') return waitTransportTimeoutMs(params.wait_time);
-  if (command === 'agent-probe' || command === 'agent-models') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
+  if (command === 'agent-probe' || command === 'agent-models' || command === 'status-refresh') return AGENT_PROBE_TRANSPORT_TIMEOUT_MS;
   if (command === 'create' || command === 'spawn') return SPAWN_TRANSPORT_TIMEOUT_MS;
   return 6000;
 }
@@ -101,6 +101,9 @@ function rejectUnknownFields(command, input, allowed) {
 function methodFor(command, input) {
   switch (command) {
     case 'status': return { method: 'system_status' };
+    case 'status-refresh':
+      rejectUnknownFields('status-refresh', input, new Set(['probe']));
+      return { method: 'system_status_refresh', params: { probe: input.probe === true } };
     case 'drain': return { method: 'daemon_begin_drain', ...(input.cancel_active === true ? { params: { cancel_active: true } } : {}) };
     case 'drain-status': return { method: 'daemon_drain_status' };
     case 'drain-abort': return { method: 'daemon_abort_drain' };
@@ -240,7 +243,7 @@ function publicWaitBody(body) {
 
 export function projectDaemonResult(command, result) {
   switch (command) {
-    case 'status': return result.status;
+    case 'status': case 'status-refresh': return result.status;
     case 'drain': case 'drain-status': case 'drain-abort': case 'activate-ready': return result;
     case 'agent-probe': return { evidence: result.evidence, status: result.status };
     case 'agent-models': return result.catalog ?? result;

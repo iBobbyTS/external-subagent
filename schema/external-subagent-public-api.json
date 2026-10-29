@@ -115,6 +115,9 @@
           },
           "additionalProperties": false
         },
+        "models": {
+          "$ref": "#/properties/subagent_models_status"
+        },
         "local": {
           "$ref": "#/properties/subagent_scope_status"
         },
@@ -123,6 +126,45 @@
         },
         "hi": {
           "$ref": "#/properties/subagent_scope_status"
+        }
+      },
+      "additionalProperties": false
+    },
+    "subagent_models_status": {
+      "type": "object",
+      "description": "Passive projection of recorded model-catalog evidence. Present only when discovery ever ran (status probe=true or an explicit models call); never discovered means the field is absent. Recorded evidence whose config revision no longer matches degrades to supported=false with reason stale_config_revision.",
+      "required": [
+        "supported",
+        "tokens",
+        "source",
+        "checked_at_ms"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "tokens": {
+          "type": "array",
+          "description": "Model selection tokens usable verbatim in spawn model (zcode provider/model, dsh provider:model, codex model id, agy bare slug). Empty when supported is false.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string",
+          "description": "Evidence source label, e.g. zcode_session_create_settings, codex_app_server_model_list, dsh_acp_models_list, agy_models_list."
+        },
+        "version": {
+          "type": "string",
+          "description": "Runtime version observed at discovery time; omitted when unknown."
+        },
+        "checked_at_ms": {
+          "type": "integer",
+          "description": "Epoch milliseconds when the evidence was recorded."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Bounded degradation reason (stale_config_revision, auth_required, model_catalog_empty, transport, ...); omitted on success."
         }
       },
       "additionalProperties": false
@@ -553,7 +595,9 @@
       "additionalProperties": false,
       "properties": {
         "external_subagent_status": {
-          "input": [],
+          "input": [
+            "probe"
+          ],
           "output": [
             "mcp_version",
             "components",

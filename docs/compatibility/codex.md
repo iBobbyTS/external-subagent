@@ -226,6 +226,33 @@ public MCP error code `codex_write_manifest_unsupported` (internal RPC
 sentinel `CODEX_WRITE_MANIFEST_UNSUPPORTED`). `zcode`/`dsh` manifest handling
 and the global "plan must be empty" rule are unchanged.
 
+## App-server model catalog (SOURCE_INSPECTED + live OBSERVED 2026-10-28)
+
+- **SOURCE_INSPECTED** (upstream `codex-rs/app-server-protocol/src/protocol/v2/model.rs`
+  and `app-server/src/request_processors/catalog_processor.rs`): the client
+  request `model/list` takes `{cursor?, limit?, includeHidden?}` and returns
+  `{data: Model[], nextCursor?}`; each `Model` carries `id`, `model`,
+  `displayName`, `hidden`, `supportedReasoningEfforts`, `defaultReasoningEffort`,
+  `isDefault` among display-only fields. The server handler gates the same
+  provider the catalog uses: a gateway-configured home whose token cannot be
+  resolved answers a JSON-RPC error ("Gateway sign-in required or unavailable…
+  retry fetching the model list"), which the daemon classifies as the bounded
+  reason `auth_required`.
+- **OBSERVED** (2026-10-28 live probe, codex-cli 0.163.0, throwaway `CODEX_HOME`,
+  no sign-in): `initialize` → `initialized` → `model/list {}` returned 8
+  models with `nextCursor: null`; `data[].id` equals the `thread/start` model
+  token (e.g. `gpt-5.6-terra`); per-model `supportedReasoningEfforts` ranged
+  over `{low,medium,high,xhigh[,max[,ultra]]}` — consistent with the effort
+  observations below. No thread and no prompt were needed; the catalog is
+  available unauthenticated on a fresh home.
+- The daemon's `agent_models` (v0.6.x) drives exactly this sequence:
+  `<runtime> app-server --listen stdio://` with `CODEX_HOME` injected
+  (explicit scope home → daemon-exported configured home → disposable 0700
+  home; never `~/.codex`), inherited `OPENAI_API_KEY`/`OPENAI_BASE_URL`
+  removed, non-hidden `id` tokens projected (≤512 bytes each, deduplicated,
+  sorted, ≤256 raw entries), 60 s whole-exchange deadline, source label
+  `codex_app_server_model_list`.
+
 ## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED + live max turn RUN)
 
 The spawn `effort` parameter (admission closed set

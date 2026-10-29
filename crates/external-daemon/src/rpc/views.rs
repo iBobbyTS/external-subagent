@@ -72,9 +72,30 @@ pub struct AgentStatusView {
     pub permission_modes: Vec<AgentPermissionModeView>,
     pub model_selection: AgentModelSelectionCapabilityView,
     pub effort_selection: AgentEffortSelectionCapabilityView,
+    /// Present only when an explicit model-catalog discovery (`agent_models`
+    /// or `status(probe=true)`) has ever recorded data for this agent. Never
+    /// discovered → the field is absent, not an empty placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<AgentModelsStatusView>,
     pub local: AgentScopeStatusView,
     pub auth: AgentScopeStatusView,
     pub hi: AgentScopeStatusView,
+}
+
+/// The passive projection of recorded model-catalog evidence inside status.
+/// `tokens` is empty whenever `supported` is false; a config revision change
+/// degrades previously recorded evidence to `stale_config_revision` until the
+/// next explicit discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentModelsStatusView {
+    pub supported: bool,
+    pub tokens: Vec<String>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub checked_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

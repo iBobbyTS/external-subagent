@@ -49,6 +49,19 @@ fn default_wait_time() -> u64 {
 #[serde(deny_unknown_fields)]
 pub struct EmptyInput {}
 
+/// `external_subagent_status` input. Every field is optional and defaults to
+/// the passive behavior, so `{}` and an omitted argument object are exactly
+/// equivalent to the historical zero-argument contract.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatusInput {
+    /// When true, refresh every configured subagent's model-catalog evidence
+    /// (bounded, prompt-free discovery) before projecting this status. The
+    /// default false keeps status a passive projection of recorded evidence.
+    #[serde(default)]
+    pub probe: bool,
+}
+
 fn optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,

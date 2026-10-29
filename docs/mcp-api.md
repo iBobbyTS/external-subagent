@@ -95,7 +95,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 工具 | 用途 | MCP annotations |
 |---|---|---|
-| `external_subagent_status` | 系统就绪、subagent 能力和身份 | 幂等；非纯只读：自动执行无模型调用的 local 层探测 |
+| `external_subagent_status` | 系统就绪、subagent 能力和身份 | 幂等；非纯只读：自动执行无模型调用的 local 层探测；`probe=true` 额外执行有界、无 prompt 的模型目录发现 |
 | `external_subagent_spawn` | 提交任务 | 非只读、非幂等 |
 | `external_subagent_wait` | 有界等待可处理请求或终态结果 | 只读、幂等 |
 | `external_subagent_observe` | 疑似循环时查看观测事实 | 只读、幂等 |
@@ -110,7 +110,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 ## 4. external_subagent_status
 
-输入为 `{}`。MCP 状态只保留路由／能力／就绪信息；部署身份（artifact 路径、配置模型来源）、配置版本、适配器传输细节和逐 scope 探测证据（scope 路径、版本、检查时间、原因）属于操作员诊断，保留在 daemon RPC 视图中，由既有 CLI `diagnose`（以及 `status --verbose`、`subagents status`）读取。读取状态时，daemon 会自动为每个已配置 subagent 执行 local 层探测（仅运行 runtime 的版本命令，不发起任何模型调用）并记录证据；`auth`/`hi` 层仍需显式 probe（hi 探测会真实发送一条最小提示词），状态读取也不代替真实执行验收。
+输入为可选对象 `{ "probe"?: boolean }`（缺省、`{}` 与完全不带参数等价，`probe` 默认 `false`）。`probe=false` 时行为与历史零参数契约一致：被动投影已记录的证据，daemon 自动为每个已配置 subagent 执行 local 层探测（仅运行 runtime 的版本命令，不发起任何模型调用）。`probe=true` 时，daemon 先为每个已配置 subagent 并行执行一次有界、无 prompt、无模型调用的模型目录发现（zcode session/create settings、codex app-server `model/list`、dsh ACP `models/list`、agy `agy models`），把证据记录后返回同一状态形状——发现失败作为证据记录（`supported=false` + 有界 reason），不是工具错误。`auth`/`hi` 层仍需显式 probe（hi 探测会真实发送一条最小提示词），状态读取也不代替真实执行验收。MCP 状态只保留路由／能力／就绪信息；部署身份（artifact 路径、配置模型来源）、配置版本、适配器传输细节和逐 scope 探测证据（scope 路径、版本、检查时间、原因）属于操作员诊断，保留在 daemon RPC 视图中，由既有 CLI `diagnose`（以及 `status --verbose`、`subagents status`）读取。
 
 ### 4.1 顶层输出
 
@@ -158,6 +158,13 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `effort_selection` | object | 描述推理力度（reasoning effort）选择能力 | 无法按 subagent 选择 effort 参数策略 |
 | `effort_selection.supported` | boolean | 是否应传 spawn.effort（随 `spawn_supported` 门） | 更容易触发不支持 effort 的错误 |
 | `effort_selection.mode` | enum | `closed_set / passthrough_token`，说明选择方式 | 不清楚应使用闭集值还是有界透传 token |
+| `models` | object/null | 模型目录证据的被动投影：仅当该 subagent 曾通过 `status(probe=true)` 或显式 models 调用记录过目录时在场；从未发现 → 字段缺席（不是空占位） | spawn 前无法从状态面发现可用模型 token，只能硬编码或试错 |
+| `models.supported` | boolean | 最近一次目录发现是否成功 | 把 degraded 证据误读为可用目录 |
+| `models.tokens` | string[] | 可直接填入 spawn `model` 的选择 token（zcode `provider/model`、dsh `provider:model`、codex model id、agy 裸 slug）；`supported=false` 时空数组 | 无法枚举可选模型 |
+| `models.source` | string | 证据来源标签（如 `zcode_session_create_settings`、`codex_app_server_model_list`、`dsh_acp_models_list`、`agy_models_list`） | 无法追溯目录出处 |
+| `models.version` | string/null | 发现时 runtime 版本（可选） | 目录与版本无法对应 |
+| `models.checked_at_ms` | integer | 证据记录时间（epoch 毫秒） | 无法判断目录新旧 |
+| `models.reason` | string/null | degraded 时的有界原因：`stale_config_revision`（配置版本已变化）、`auth_required`（codex gateway 要求登录）、`model_catalog_empty`、`transport` 等；成功时缺席 | 无法区分失败方式 |
 | `local` | AgentScopeStatus | 查看本地 runtime 检查结论 | 缺少本地可用性依据 |
 | `auth` | AgentScopeStatus | 查看认证相关检查结论 | 无法区分认证与安装故障 |
 | `hi` | AgentScopeStatus | 查看最小真实交互检查结论 | 缺少端到端就绪证据 |

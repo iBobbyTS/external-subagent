@@ -4,7 +4,7 @@ import { SUBAGENT_IDS } from '../config/schema.mjs';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
 
-const INPUT_FIELDS = new Set(['operation', 'subagent', 'through', 'workspace', 'home']);
+const INPUT_FIELDS = new Set(['operation', 'subagent', 'through', 'workspace', 'home', 'probe']);
 
 function validateInput(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new CliError('INVALID_ARGUMENT', 'subagents input must be an object', 2);
@@ -71,6 +71,14 @@ export function parseSubagentsArgs(args) {
   if (operation === 'probe') return parseProbeArgs(rest);
   if (operation === 'models') return parseModelsArgs(rest);
   if (operation === 'list' && rest.length !== 0) throw new CliError('INVALID_ARGUMENT', 'usage: subagents list', 2);
+  if (operation === 'status') {
+    // `subagents status [subagent] [--probe]`: --probe asks the daemon to
+    // refresh model-catalog evidence before projecting (bounded, no prompts).
+    const positional = rest.filter((arg) => arg !== '--probe');
+    if (rest.length - positional.length > 1) throw new CliError('INVALID_ARGUMENT', 'usage: subagents status [subagent] [--probe]', 2);
+    if (positional.length > 1) throw new CliError('INVALID_ARGUMENT', 'usage: subagents status [subagent] [--probe]', 2);
+    return { operation, ...(positional[0] ? { subagent: positional[0] } : {}), ...(rest.includes('--probe') ? { probe: true } : {}) };
+  }
   if (operation !== 'list' && rest.length > 1) throw new CliError('INVALID_ARGUMENT', `usage: subagents ${operation} [subagent]`, 2);
   return { operation, ...(rest[0] ? { subagent: rest[0] } : {}) };
 }
@@ -141,7 +149,7 @@ export async function subagentsCommand(paths, input = {}, options = {}) {
   }
   if (operation !== 'status') throw new CliError('INVALID_ARGUMENT', `unsupported subagents operation: ${operation}`, 2);
   if (typeof options.callDaemon !== 'function' || typeof options.socket !== 'string') throw new CliError('INTERNAL_ERROR', 'subagents status requires a daemon connection');
-  const status = await options.callDaemon(options.socket, 'status', {});
+  const status = await options.callDaemon(options.socket, input.probe === true ? 'status-refresh' : 'status', input.probe === true ? { probe: true } : {});
   const entries = status.subagents ?? status.agents;
   if (!Array.isArray(entries)) throw new CliError('PROTOCOL_ERROR', 'daemon status did not include subagent status');
   const subagents = entries.filter((entry) => input.subagent === undefined || (entry.subagent ?? entry.agent) === input.subagent).map(subagentView);

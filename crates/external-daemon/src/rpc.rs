@@ -42,13 +42,14 @@ pub use types::{
 pub use views::{
     running_component_identity, AgentCapabilitiesView, AgentEffortSelectionCapabilityView,
     AgentEffortSelectionModeView, AgentModelSelectionCapabilityView, AgentModelSelectionModeView,
-    AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, AgentTransportSupportView,
-    AgentTransportView, ArtifactIdentityView, CapabilityMaturityView, ComponentIdentityView,
-    ComponentStateView, DaemonIdentityView, InputIdentityView, MessageDispositionView,
-    MessageReceiptView, ModelIdentityFactView, ModelIdentityView, ObservationCapabilityView,
-    ObservationDefaultsView, PendingRequestView, QuestionView, ResponseDispositionView,
-    ResponseOutcomeView, SystemStatusView, TaskActivityView, TaskHeaderView, TaskObservationView,
-    TaskResultView, TaskView, TelemetryStatusView, VersionMismatchView,
+    AgentModelsStatusView, AgentPermissionModeView, AgentScopeStatusView, AgentStatusView,
+    AgentTransportSupportView, AgentTransportView, ArtifactIdentityView, CapabilityMaturityView,
+    ComponentIdentityView, ComponentStateView, DaemonIdentityView, InputIdentityView,
+    MessageDispositionView, MessageReceiptView, ModelIdentityFactView, ModelIdentityView,
+    ObservationCapabilityView, ObservationDefaultsView, PendingRequestView, QuestionView,
+    ResponseDispositionView, ResponseOutcomeView, SystemStatusView, TaskActivityView,
+    TaskHeaderView, TaskObservationView, TaskResultView, TaskView, TelemetryStatusView,
+    VersionMismatchView,
 };
 
 #[cfg(test)]

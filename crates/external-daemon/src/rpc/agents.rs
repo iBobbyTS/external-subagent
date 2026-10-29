@@ -9,9 +9,9 @@ use super::profiles::Profile;
 use super::types::GeneralSubmitInput;
 use super::views::{
     AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
-    AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentPermissionModeView,
-    AgentScopeStatusView, AgentStatusView, AgentTransportSupportView, AgentTransportView,
-    ComponentStateView, VersionMismatchView,
+    AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentModelsStatusView,
+    AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, AgentTransportSupportView,
+    AgentTransportView, ComponentStateView, VersionMismatchView,
 };
 use crate::agent_status::{
     AgentEvidenceStore, AgentModelsInput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
@@ -73,6 +73,7 @@ pub(super) fn configured_agent_statuses(
                 permission_modes: permission_modes(agent, entry),
                 model_selection: model_selection(agent, entry),
                 effort_selection: effort_selection(agent, entry),
+                models: models_status(evidence.latest_models(agent), config.revision),
                 local: current_scope(&observed, config.revision, |evidence| &evidence.local),
                 auth: current_scope(&observed, config.revision, |evidence| &evidence.auth),
                 hi: current_scope(&observed, config.revision, |evidence| &evidence.hi),
@@ -129,6 +130,7 @@ pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
                     version: None,
                 },
             ),
+            models: None,
             local: unprobed_scope(),
             auth: unprobed_scope(),
             hi: unprobed_scope(),
@@ -252,6 +254,35 @@ fn effort_selection(agent: &str, entry: &AgentConfigEntry) -> AgentEffortSelecti
             AgentEffortSelectionModeView::PassthroughToken
         },
     }
+}
+
+/// Project recorded model-catalog evidence into status. Recorded evidence
+/// whose config revision no longer matches the active configuration is
+/// degraded to `stale_config_revision` — the same rule probe layers follow —
+/// instead of being silently replayed as current.
+fn models_status(
+    recorded: Option<crate::agent_status::AgentModelsOutput>,
+    config_revision: u64,
+) -> Option<AgentModelsStatusView> {
+    let recorded = recorded?;
+    if recorded.config_revision != config_revision {
+        return Some(AgentModelsStatusView {
+            supported: false,
+            tokens: Vec::new(),
+            source: recorded.evidence.source,
+            version: recorded.evidence.version,
+            checked_at_ms: recorded.evidence.checked_at_ms,
+            reason: Some("stale_config_revision".into()),
+        });
+    }
+    Some(AgentModelsStatusView {
+        supported: recorded.supported,
+        tokens: recorded.models,
+        source: recorded.evidence.source,
+        version: recorded.evidence.version,
+        checked_at_ms: recorded.evidence.checked_at_ms,
+        reason: recorded.reason,
+    })
 }
 
 fn current_scope(
@@ -2089,6 +2120,62 @@ mod admission_tests {
             panic!()
         };
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn models_status_projects_absence_staleness_and_success() {
+        use crate::agent_status::{
+            AgentModelsInput, AgentModelsOutput, ModelCatalogEvidence, ProbeScope,
+        };
+
+        // Never discovered → absent (None), not an empty placeholder.
+        assert!(models_status(None, 1).is_none());
+
+        let output = |revision: u64, supported: bool| AgentModelsOutput {
+            agent: "codex".into(),
+            config_revision: revision,
+            supported,
+            models: supported
+                .then(|| vec!["gpt-6-luna".to_owned()])
+                .unwrap_or_default(),
+            evidence: ModelCatalogEvidence {
+                source: "codex_app_server_model_list".into(),
+                version: Some("0.163.0".into()),
+                scope: ProbeScope::default(),
+                checked_at_ms: 42,
+            },
+            reason: (!supported).then(|| "transport".into()),
+        };
+
+        // Current revision → verbatim projection.
+        let current = models_status(Some(output(7, true)), 7).unwrap();
+        assert!(current.supported);
+        assert_eq!(current.tokens, vec!["gpt-6-luna".to_owned()]);
+        assert_eq!(current.source, "codex_app_server_model_list");
+        assert_eq!(current.version.as_deref(), Some("0.163.0"));
+        assert_eq!(current.checked_at_ms, 42);
+        assert_eq!(current.reason, None);
+
+        // Revision drift → degraded evidence, tokens emptied, source kept.
+        let stale = models_status(Some(output(7, true)), 8).unwrap();
+        assert!(!stale.supported);
+        assert!(stale.tokens.is_empty());
+        assert_eq!(stale.reason.as_deref(), Some("stale_config_revision"));
+        assert_eq!(stale.source, "codex_app_server_model_list");
+        assert_eq!(stale.checked_at_ms, 42);
+
+        // A degraded discovery result projects verbatim at its revision.
+        let degraded = models_status(Some(output(9, false)), 9).unwrap();
+        assert!(!degraded.supported);
+        assert_eq!(degraded.reason.as_deref(), Some("transport"));
+
+        // The input shape is only referenced for the type; keep the unused
+        // variable lint quiet by asserting the alias field name.
+        let input = AgentModelsInput {
+            agent: "codex".into(),
+            scope: ProbeScope::default(),
+        };
+        assert_eq!(input.agent, "codex");
     }
 }
 
