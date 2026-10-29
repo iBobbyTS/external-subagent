@@ -176,6 +176,13 @@ impl RpcService {
             }
         }
         let mut unknown = std::collections::HashSet::new();
+        // Diagnostic attribution anchor for wait-path failures: a stable id
+        // for the log line (record_failure keys its in-memory latest map by
+        // agent id; a fleet failure belongs to the wait, not one member).
+        let primary_id_hint = agent_ids
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "wait-many".to_owned());
         // Latest per-agent snapshot: Some((body, terminal, epoch)) once the
         // agent is terminal (candidate final) or actionable (candidate early
         // return); None while it is plain running. `epoch` is the task row's
@@ -193,6 +200,15 @@ impl RpcService {
         }
         loop {
             if interrupted() {
+                self.scheduler.record_failure(
+                    &primary_id_hint,
+                    format!(
+                        "task_wait interrupted: agents={} duplicated={} unknown={}",
+                        agent_ids.len(),
+                        duplicated.len(),
+                        unknown.len()
+                    ),
+                );
                 return Err(RpcError::new(RpcErrorCode::Unavailable, "wait interrupted"));
             }
             let now = Instant::now();
@@ -219,7 +235,21 @@ impl RpcService {
                             {
                                 true
                             }
-                            Some(_) => {
+                            Some(task) => {
+                                // Phase still terminal but the epoch moved
+                                // (resume + new claim), or the phase left
+                                // terminal: either way the cached snapshot
+                                // is from a previous generation — drop it
+                                // and re-snapshot. Record the drop so a
+                                // "why did the result change" question is
+                                // answerable from the diagnostic log.
+                                self.scheduler.record_failure(
+                                    id,
+                                    format!(
+                                        "task_wait dropped stale terminal snapshot: phase={:?} cached_epoch={} current_epoch={}",
+                                        task.phase, cached_epoch, task.owner_epoch
+                                    ),
+                                );
                                 *slot = None;
                                 all_settled = false;
                                 continue;
@@ -312,7 +342,36 @@ impl RpcService {
                 // cursor: if the envelope cannot fit even after degradation,
                 // the error return must leave every cursor untouched so a
                 // later wait still sees the undelivered activity text.
-                bound_wait_many_result(&mut response)?;
+                if let Err(error) = bound_wait_many_result(&mut response) {
+                    // Preserve the degradation dead-end as a diagnostic
+                    // record: the composition (body sizes, question counts,
+                    // page totals after full degradation) is exactly the
+                    // evidence needed to answer "whose 2 MiB was this".
+                    let bodies = &response;
+                    let composition = match bodies {
+                        RpcSuccess::TaskWaitMany { waits } => {
+                            let pages: Vec<String> = waits.bodies.iter().map(|(id, body)| {
+                                let result = body.result.as_ref();
+                                format!(
+                                    "{}:page={}b/{}b",
+                                    id,
+                                    result.map(|view| view.final_text.len()).unwrap_or(0),
+                                    result.map(|view| view.total_bytes).unwrap_or(0)
+                                )
+                            }).collect();
+                            format!(
+                                "task_wait_many oversized: agents={} error_ids={} questions={} pages=[{}]",
+                                waits.bodies.len(),
+                                waits.error.len(),
+                                waits.bodies.iter().map(|(_, body)| body.pending_requests.len()).sum::<usize>(),
+                                pages.join(",")
+                            )
+                        }
+                        _ => "task_wait_many oversized".to_owned(),
+                    };
+                    self.scheduler.record_failure(&primary_id_hint, composition);
+                    return Err(error);
+                }
                 // The response is now certain to be delivered: commit each
                 // agent's activity-text delivery cursor and apply the
                 // terminal-tail dedup in the same pass (mirrors the scalar
@@ -3536,6 +3595,13 @@ pub(crate) mod wait_tests {
             &|| true, // cancelled immediately: no response is ever delivered
         );
         assert!(interrupted.is_err(), "the interrupted wait must fail");
+        // The interruption itself is recorded with the fleet shape.
+        let record = service
+            .scheduler
+            .last_error(&id1)
+            .expect("interruption must be recorded");
+        assert!(record.contains("task_wait interrupted"), "{record}");
+        assert!(record.contains("agents=2"), "{record}");
         // The cursors were never consumed: a following wait still sees the
         // full undelivered tails.
         let waits = waits_of(
@@ -3568,47 +3634,89 @@ pub(crate) mod wait_tests {
     fn many_wait_drops_the_terminal_cache_across_a_resume_recompletion_cycle() {
         let (_d, service, id1, id2) = two_running_tasks();
         terminalize(&service, &id1, "old result");
-        // Cache id1 as terminal (old generation + old result embedded).
-        let first = waits_of(
-            service
-                .dispatch(RpcMethod::TaskWait(many_query(&[&id1], 0)))
-                .unwrap(),
-        );
-        assert_eq!(body_map(&first)[&id1].result.as_ref().unwrap().final_text, "old result");
-        // The full resume cycle: requeue (result row deleted), a new claim
-        // (owner_epoch increments — the generation marker), and a SECOND
-        // terminalization with a different result. The phase reads terminal
-        // again, so only the epoch comparison can catch the staleness.
-        service
-            .store
-            .requeue_task_for_resume_with_message(&id1, "resume-message", "queue", "again")
-            .unwrap();
-        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
-        assert_eq!(claim.task.agent_id, id1);
-        service
-            .store
-            .mark_session_running(&id1, claim.owner_epoch, "runtime", None, Some("session"), None)
-            .unwrap();
-        // Drain the resume message so completion is not blocked, then finish
-        // the resumed generation with a different result.
-        let queued = service.store.claim_next_message(&id1).unwrap().unwrap();
-        assert_eq!(queued.message_id, "resume-message");
-        service
-            .store
-            .complete_message(&queued.message_id, None)
-            .unwrap();
-        terminalize(&service, &id1, "new result");
-        // id2 keeps the loop alive long enough that the cached id1 snapshot
-        // is re-validated (at least once) before the response.
-        let waits = waits_of(
-            service
-                .task_wait(
-                    many_query(&[&id1, &id2], 0),
-                    Instant::now() + Duration::from_millis(30),
-                    &|| false,
-                )
-                .unwrap(),
-        );
+        // id2 stays running so the wait below keeps polling. The sequence
+        // exercised INSIDE that single wait call:
+        //   round 1: id1 snapshot cached as terminal (generation N);
+        //   between rounds: id1 is resumed (requeue -> claim bumps the
+        //     epoch to N+1 -> message drained) and RE-completed with a new
+        //     result — the phase reads terminal again, so only the epoch
+        //     comparison can detect the stale cache;
+        //   later round: the re-check drops the cache and re-snapshots,
+        //     and the final response carries the NEW result.
+        let trigger = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service_outer = service.clone();
+        let service_inner = service.clone();
+        let id1_clone = id1.clone();
+        let trigger_clone = trigger.clone();
+        let start = Instant::now();
+        // Run the wait on a worker thread: its poll rounds call `interrupted`,
+        // which performs the resume cycle exactly once after the first round
+        // has cached the terminal snapshot.
+        let handle = std::thread::spawn(move || {
+            service_outer.task_wait(
+                many_query(&[&id1_clone, &id2], 60),
+                start + Duration::from_secs(10),
+                &move || {
+                    if trigger_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 3 {
+                        // Round 1 (and a few sleeps) have passed; the cache
+                        // exists. Perform the resume + re-completion cycle.
+                        let service_arc = &service_inner;
+                        service_arc
+                            .store
+                            .requeue_task_for_resume_with_message(
+                                &id1_clone,
+                                "resume-message",
+                                "queue",
+                                "again",
+                            )
+                            .unwrap();
+                        let claim = service_arc
+                            .store
+                            .claim_next("wait-test", 10, 10)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(claim.task.agent_id, id1_clone);
+                        service_arc
+                            .store
+                            .mark_session_running(
+                                &id1_clone,
+                                claim.owner_epoch,
+                                "runtime",
+                                None,
+                                Some("session"),
+                                None,
+                            )
+                            .unwrap();
+                        let queued = service_arc
+                            .store
+                            .claim_next_message(&id1_clone)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(queued.message_id, "resume-message");
+                        service_arc
+                            .store
+                            .complete_message(&queued.message_id, None)
+                            .unwrap();
+                        // Mark the second generation terminal with a new
+                        // result so the phase alone looks identical.
+                        service_arc
+                            .store
+                            .store_task_result(
+                                &id1_clone,
+                                &TaskResult {
+                                    outcome: TaskOutcome::Completed,
+                                    final_text: "new result".into(),
+                                    partial: false,
+                                },
+                            )
+                            .unwrap();
+                    }
+                    false
+                },
+            )
+        });
+        let response = handle.join().unwrap().unwrap();
+        let waits = waits_of(response);
         let map = body_map(&waits);
         let body1 = map[&id1];
         assert_eq!(body1.task.status, "completed");
@@ -3617,6 +3725,18 @@ pub(crate) mod wait_tests {
             "new result",
             "the recompleted generation's result must replace the stale one"
         );
+        // The stale-cache drop is visible as a diagnostic record: phase,
+        // cached epoch, and the current epoch all preserved.
+        let record = service
+            .scheduler
+            .last_error(&id1)
+            .expect("stale snapshot drop must be recorded");
+        assert!(
+            record.contains("dropped stale terminal snapshot"),
+            "{record}"
+        );
+        assert!(record.contains("cached_epoch="), "{record}");
+        assert!(record.contains("current_epoch="), "{record}");
     }
 
     #[test]
@@ -3780,6 +3900,15 @@ pub(crate) mod wait_tests {
         let failure = service.dispatch(RpcMethod::TaskWait(many_query(&refs, 0)));
         let error = failure.expect_err("this frame genuinely cannot fit");
         assert!(matches!(error.code, RpcErrorCode::Oversized));
+        // The degradation dead-end is preserved as a diagnostic record keyed
+        // by the wait's primary id, with the full body composition.
+        let record = service
+            .scheduler
+            .last_error(&ids[0])
+            .expect("oversized failure must be recorded");
+        assert!(record.contains("task_wait_many oversized"), "{record}");
+        assert!(record.contains("questions=1600"), "{record}");
+        assert!(record.contains("agents=16"), "{record}");
         // No cursor moved: the single-agent wait for one member still sees
         // its full undelivered tail.
         let probe = &ids[7];
