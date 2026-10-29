@@ -5,8 +5,8 @@
 use super::errors::{map_store, RpcError, RpcErrorCode};
 use super::handlers::{failure_message_projection, RpcService};
 use super::types::{
-    RpcResponse, RpcSuccess, TaskWaitQuery, MAX_PENDING_REQUESTS, MAX_REQUEST_ID_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
+    RpcResponse, RpcSuccess, TaskWaitBody, TaskWaitManyBody, TaskWaitQuery, WaitTarget,
+    MAX_PENDING_REQUESTS, MAX_REQUEST_ID_BYTES, MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
 };
 use super::views::{
     pending_request_view, task_activity_view, task_header_view, truncate_at_char_boundary,
@@ -45,6 +45,21 @@ impl RpcService {
         deadline: Instant,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<RpcSuccess, RpcError> {
+        match &query.agent_id {
+            WaitTarget::One(agent_id) => self.task_wait_one(agent_id, &query, deadline, interrupted),
+            WaitTarget::Many(agent_ids) => {
+                self.task_wait_many(agent_ids, deadline, interrupted)
+            }
+        }
+    }
+
+    fn task_wait_one(
+        &self,
+        agent_id: &str,
+        query: &TaskWaitQuery,
+        deadline: Instant,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<RpcSuccess, RpcError> {
         loop {
             if interrupted() {
                 return Err(RpcError::new(RpcErrorCode::Unavailable, "wait interrupted"));
@@ -53,10 +68,10 @@ impl RpcService {
             // result, and the terminal reason are read under a single store
             // lock, so a concurrent terminal write can never be interleaved
             // between them.
-            let (task, stored_result, reason) = self.require_task_with_result(&query.agent_id)?;
+            let (task, stored_result, reason) = self.require_task_with_result(agent_id)?;
             let message_receipt = if let Some(id) = &query.message_id {
                 self.store.message(id).map_err(map_store)?.and_then(|m| {
-                    (m.agent_id == query.agent_id).then(|| MessageReceiptView {
+                    (m.agent_id == *agent_id).then(|| MessageReceiptView {
                         message_id: m.message_id,
                         state: format!("{:?}", m.state).to_lowercase(),
                         failure_code: m.failure_code,
@@ -120,19 +135,281 @@ impl RpcService {
                 if let Some(page) = result_page.as_ref() {
                     dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
                 }
-                let mut response = RpcSuccess::TaskWait {
+                let mut response = RpcSuccess::TaskWait(TaskWaitBody {
                     activity,
                     task: task_header_view(&task),
                     pending_requests,
                     result: result_page,
                     timed_out,
                     message_receipt,
-                };
+                });
                 bound_wait_result(&mut response)?;
                 return Ok(response);
             }
             thread::sleep((deadline - now).min(Duration::from_millis(10)));
         }
+    }
+
+    /// List-mode wait: blocks until every distinct id is terminal, any one of
+    /// them raises an actionable pending request, or the deadline expires.
+    /// Response shape is FLAT: one key per distinct id carrying that agent's
+    /// wait body — a duplicated id is awaited once like any other — plus a
+    /// single `error` key collecting problematic ids (`duplicated`,
+    /// `unknown_agent`). Unknown ids resolve on the first snapshot and stop
+    /// participating without blocking the rest.
+    fn task_wait_many(
+        &self,
+        agent_ids: &[String],
+        deadline: Instant,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<RpcSuccess, RpcError> {
+        // Distinct ids in caller order; repetitions are only flagged in the
+        // error map, the id itself is still awaited and returned.
+        let mut distinct: Vec<String> = Vec::with_capacity(agent_ids.len());
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicated = std::collections::HashSet::new();
+        for id in agent_ids {
+            if seen.insert(id.clone()) {
+                distinct.push(id.clone());
+            } else {
+                duplicated.insert(id.clone());
+            }
+        }
+        let mut unknown = std::collections::HashSet::new();
+        // Latest per-agent snapshot: Some((body, terminal, epoch)) once the
+        // agent is terminal (candidate final) or actionable (candidate early
+        // return); None while it is plain running. `epoch` is the task row's
+        // owner_epoch at snapshot time: every claim increments it, so a
+        // terminal → resume → terminal cycle between two poll rounds is
+        // detectable even though the phase reads terminal again — the stale
+        // snapshot (with the previous round's deleted result) is dropped.
+        // Snapshots PEEK the wait tail (cursor untouched); the delivery
+        // cursor is only committed at the single response-construction
+        // point below after the frame passes its size check.
+        let mut bodies: Vec<(String, Option<(TaskWaitBody, bool, u64)>)> =
+            Vec::with_capacity(distinct.len());
+        for id in &distinct {
+            bodies.push((id.clone(), None));
+        }
+        loop {
+            if interrupted() {
+                return Err(RpcError::new(RpcErrorCode::Unavailable, "wait interrupted"));
+            }
+            let now = Instant::now();
+            let mut any_actionable = false;
+            let mut all_settled = true;
+            for (id, slot) in bodies.iter_mut() {
+                if unknown.contains(id) {
+                    continue;
+                }
+                let terminal = match slot {
+                    Some((_, true, cached_epoch)) => {
+                        // A terminal snapshot is only final while the row is
+                        // still terminal AND still the same execution
+                        // generation: a concurrent send can resume a terminal
+                        // task (the requeue clears the result row and a new
+                        // claim bumps the epoch), and the resumed run may
+                        // reach terminal again between two of our poll
+                        // rounds. Comparing the epoch catches that loop;
+                        // comparing only the phase would not.
+                        match self.store.get_task(id).map_err(map_store)? {
+                            Some(task)
+                                if task.phase == TaskPhase::Terminal
+                                    && task.owner_epoch == *cached_epoch =>
+                            {
+                                true
+                            }
+                            Some(_) => {
+                                *slot = None;
+                                all_settled = false;
+                                continue;
+                            }
+                            None => {
+                                // The task row disappeared (unknown).
+                                unknown.insert(id.clone());
+                                continue;
+                            }
+                        }
+                    }
+                    Some((_, false, _)) => false,
+                    None => match self.wait_body(id, false) {
+                        Err(error) if matches!(error.code, RpcErrorCode::NotFound) => {
+                            unknown.insert(id.clone());
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                        Ok(None) => {
+                            all_settled = false;
+                            continue;
+                        }
+                        Ok(Some((body, actionable, terminal, epoch))) => {
+                            if actionable {
+                                any_actionable = true;
+                            }
+                            *slot = Some((body, terminal, epoch));
+                            terminal
+                        }
+                    },
+                };
+                if !terminal {
+                    all_settled = false;
+                }
+            }
+            if all_settled || any_actionable || now >= deadline {
+                let deadline_expired = !all_settled && !any_actionable && now >= deadline;
+                let mut projected: Vec<(String, TaskWaitBody)> = Vec::with_capacity(distinct.len());
+                let mut terminal_ids = std::collections::HashSet::new();
+                for (id, slot) in &bodies {
+                    // Unknown ids carry no body; they are only reported in
+                    // the error map below.
+                    if unknown.contains(id) {
+                        continue;
+                    }
+                    match slot {
+                        Some((body, terminal, _)) => {
+                            if *terminal {
+                                terminal_ids.insert(id.clone());
+                            }
+                            projected.push((id.clone(), body.clone()));
+                        }
+                        None => {
+                            // Still running with no actionable request and
+                            // no captured snapshot: project a fresh forced
+                            // snapshot. timed_out is finalized below.
+                            let (body, _, _, _) = self
+                                .wait_body(id, true)?
+                                .expect("forced snapshot always projects");
+                            projected.push((id.clone(), body));
+                        }
+                    }
+                }
+                // Per-agent timed_out: claimed only when the deadline
+                // actually expired AND this agent is not terminal (a
+                // terminal element embeds its result page).
+                if deadline_expired {
+                    for (id, body) in projected.iter_mut() {
+                        if !terminal_ids.contains(id) {
+                            body.timed_out = true;
+                        }
+                    }
+                }
+                // The concentrated error map: duplicated repetitions and
+                // unknown ids, each id once.
+                let mut error = std::collections::BTreeMap::new();
+                for id in &duplicated {
+                    error.insert(id.clone(), "duplicated".to_owned());
+                }
+                for id in &unknown {
+                    error.insert(id.clone(), "unknown_agent".to_owned());
+                }
+                let mut response = RpcSuccess::TaskWaitMany {
+                    waits: TaskWaitManyBody {
+                        bodies: projected,
+                        error,
+                    },
+                };
+                // Size-check the frame BEFORE committing any delivery
+                // cursor: if the envelope cannot fit even after degradation,
+                // the error return must leave every cursor untouched so a
+                // later wait still sees the undelivered activity text.
+                bound_wait_many_result(&mut response)?;
+                // The response is now certain to be delivered: commit each
+                // agent's activity-text delivery cursor and apply the
+                // terminal-tail dedup in the same pass (mirrors the scalar
+                // wait's take-on-delivery semantics; peeked text is
+                // overwritten by the taken text, which is at least as
+                // fresh). The cursors may have advanced past what the
+                // response body carries only in the rolled-out-window
+                // degradation case, which the tracker itself flags.
+                let RpcSuccess::TaskWaitMany { waits } = &mut response else {
+                    unreachable!("response kind was just constructed");
+                };
+                for (id, body) in waits.bodies.iter_mut() {
+                    if let Some(wait_tail) = self.scheduler.take_wait_tail(id) {
+                        body.activity.latest_text_tail = wait_tail.text;
+                        body.activity.latest_text_truncated = wait_tail.truncated;
+                    }
+                    if let Some(page) = body.result.as_ref() {
+                        dedup_terminal_tail(&mut body.activity.latest_text_tail, &page.final_text);
+                    }
+                }
+                return Ok(response);
+            }
+            thread::sleep((deadline - now).min(Duration::from_millis(10)));
+        }
+    }
+
+    /// One snapshot for one agent inside the list-mode loop. Returns
+    /// `Ok(None)` while the agent is neither terminal nor actionable, and
+    /// `Ok(Some((body, actionable, terminal, owner_epoch)))` when its
+    /// current state should be projected (terminal, or actionable pending
+    /// present). With `force == true` a plain running agent is projected
+    /// too — used at response construction when the deadline expired. The
+    /// actionable and terminal flags are reported separately: a terminal
+    /// body may also carry actionable records, but only the actionable flag
+    /// wakes the loop early and only the terminal flag settles it. The
+    /// returned owner_epoch is the execution generation the snapshot was
+    /// taken under (every claim increments it), letting the caller detect a
+    /// terminal → resume → terminal cycle that a phase check alone misses.
+    /// The wait tail is only PEEKED here; the caller commits the delivery
+    /// cursor at the response-construction point.
+    fn wait_body(
+        &self,
+        agent_id: &str,
+        force: bool,
+    ) -> Result<Option<(TaskWaitBody, bool, bool, u64)>, RpcError> {
+        let (task, stored_result, reason) = self.require_task_with_result(agent_id)?;
+        let all_pending = self
+            .store
+            .pending_requests(&task.agent_id)
+            .map_err(map_store)?;
+        let actionable: Vec<_> = all_pending
+            .iter()
+            .filter(|request| wake_pending_request(request))
+            .cloned()
+            .collect();
+        let pending_requests = actionable
+            .iter()
+            .take(MAX_PENDING_REQUESTS)
+            .cloned()
+            .map(pending_request_view)
+            .collect::<Vec<_>>();
+        let actionable_now = !actionable.is_empty();
+        let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
+        let terminal = task.phase == TaskPhase::Terminal;
+        if !terminal && !actionable_now && !force {
+            return Ok(None);
+        }
+        let result_page = stored_result
+            .filter(|_| terminal)
+            .map(|stored| {
+                let failure_message = failure_message_projection(&task, &stored);
+                self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES, reason, failure_message)
+            })
+            .transpose()?;
+        let mut activity = task_activity_view(task.phase, activity);
+        // PEEK only: the delivery cursor stays untouched so an interrupted
+        // list-mode wait loses nothing; the response-construction point in
+        // task_wait_many performs the take (and terminal-tail dedup).
+        if let Some(wait_tail) = self.scheduler.peek_wait_tail(&task.agent_id) {
+            activity.latest_text_tail = wait_tail.text;
+            activity.latest_text_truncated = wait_tail.truncated;
+        }
+        Ok(Some((
+            TaskWaitBody {
+                activity,
+                task: task_header_view(&task),
+                pending_requests,
+                result: result_page,
+                // The timed_out flag is finalized by the caller at response
+                // construction; snapshots here never claim it.
+                timed_out: false,
+                message_receipt: None,
+            },
+            actionable_now,
+            terminal,
+            task.owner_epoch,
+        )))
     }
 }
 
@@ -170,66 +447,224 @@ fn wake_pending_request(request: &external_store::StoredPendingRequest) -> bool 
 // shortened page as the end of the text or points at a stale offset. Metadata
 // that still exceeds the cap uses the transport's Oversized response.
 fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
-    if wait_envelope_fits(response)? {
+    let RpcSuccess::TaskWait(body) = response else {
+        return Ok(());
+    };
+    bound_wait_body(body, &|body| {
+        wait_envelope_fits(&RpcSuccess::TaskWait(body.clone()))
+    })
+}
+
+/// The staged single-body degradation shared by scalar and list waits.
+/// `fits` measures the complete envelope this body will be embedded in.
+fn bound_wait_body(
+    body: &mut TaskWaitBody,
+    fits: &dyn Fn(&TaskWaitBody) -> Result<bool, RpcError>,
+) -> Result<(), RpcError> {
+    if fits(body)? {
         return Ok(());
     }
-    let mut candidate = response.clone();
+    let mut candidate = body.clone();
     // 1. Failure detail only: the result page, its cursor, and the questions
     //    stay byte-identical.
-    let original_detail = match &candidate {
-        RpcSuccess::TaskWait {
-            result: Some(view), ..
-        } => view.failure_message.clone(),
-        _ => None,
-    };
-    if let Some(original) = original_detail {
-        let fitted = fit_failure_message(&candidate, &original);
-        if let RpcSuccess::TaskWait {
-            result: Some(view), ..
-        } = &mut candidate
-        {
-            view.failure_message = Some(fitted);
+    if let Some(view) = candidate.result.as_ref() {
+        if let Some(original) = view.failure_message.clone() {
+            let fitted = fit_failure_message(&candidate, &original, fits);
+            if let Some(view) = candidate.result.as_mut() {
+                view.failure_message = Some(fitted);
+            }
         }
     }
-    if wait_envelope_fits(&candidate)? {
-        *response = candidate;
+    if fits(&candidate)? {
+        *body = candidate;
         return Ok(());
     }
     // 2. Embedded questions (existing bounded-prefix contract).
-    if let RpcSuccess::TaskWait {
-        pending_requests, ..
-    } = &mut candidate
-    {
-        for request in pending_requests {
+    for request in &mut candidate.pending_requests {
+        if let Some(question) = request.question.as_mut() {
+            let full = std::mem::take(&mut question.text);
+            question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
+            question.truncated |= question.text.len() < full.len();
+        }
+    }
+    if fits(&candidate)? {
+        *body = candidate;
+        return Ok(());
+    }
+    // 3. Last resort: shorten the result page. The cursor comes from the
+    //    original total/offset.
+    if let Some((end, next_offset)) = shrunk_result_page(&candidate, fits) {
+        if let Some(view) = candidate.result.as_mut() {
+            view.final_text.truncate(end);
+            view.next_offset = next_offset;
+        }
+    }
+    if !fits(&candidate)? {
+        return Err(RpcError::new(
+            RpcErrorCode::Oversized,
+            "response frame exceeds cap",
+        ));
+    }
+    *body = candidate;
+    Ok(())
+}
+
+/// List-mode envelope degradation. Unlike the scalar path, NO single body
+/// must fit the whole frame on its own: N agents each carrying a full-size
+/// result page only fit together, so degradation is cooperative —
+///
+/// 1. every body runs the structured stages (failure-detail shrink, then
+///    bounded question prefixes) measured against the FULL multi-wait
+///    envelope;
+/// 2. repeated stage-3 passes then shorten the body currently carrying the
+///    longest result page — round-robin across bodies, since shrinking one
+///    alone may never suffice — until the whole frame fits;
+/// 3. only when no body can shrink further is the response rejected.
+fn bound_wait_many_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
+    let RpcSuccess::TaskWaitMany { waits } = response else {
+        return Ok(());
+    };
+    let error = waits.error.clone();
+    let fits_all =
+        |bodies: &[(String, TaskWaitBody)]| -> Result<bool, RpcError> {
+            wait_envelope_fits(&RpcSuccess::TaskWaitMany {
+                waits: TaskWaitManyBody {
+                    bodies: bodies.to_vec(),
+                    error: error.clone(),
+                },
+            })
+        };
+    let probe_with = |index: usize, replacement: &TaskWaitBody, bodies: &[(String, TaskWaitBody)]| {
+        bodies
+            .iter()
+            .enumerate()
+            .map(|(probe_index, (probe_id, probe_body))| {
+                if probe_index == index {
+                    (probe_id.clone(), replacement.clone())
+                } else {
+                    (probe_id.clone(), probe_body.clone())
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    if fits_all(&waits.bodies)? {
+        return Ok(());
+    }
+    // Stage 1+2 per body, best-effort: apply the structured shrinks when
+    // they help the shared envelope, but never abort — the next body's
+    // shrink may be the one that makes the frame fit.
+    for index in 0..waits.bodies.len() {
+        let mut candidate = waits.bodies[index].1.clone();
+        let fits = |candidate: &TaskWaitBody| -> Result<bool, RpcError> {
+            fits_all(&probe_with(index, candidate, &waits.bodies))
+        };
+        if fits(&candidate)? {
+            continue;
+        }
+        // 1. Failure detail only.
+        if let Some(view) = candidate.result.as_ref() {
+            if let Some(original) = view.failure_message.clone() {
+                let fitted = fit_failure_message(&candidate, &original, &fits);
+                if let Some(view) = candidate.result.as_mut() {
+                    view.failure_message = Some(fitted);
+                }
+            }
+        }
+        if fits(&candidate)? {
+            waits.bodies[index].1 = candidate;
+            continue;
+        }
+        // 2. Embedded questions (bounded-prefix contract).
+        for request in &mut candidate.pending_requests {
             if let Some(question) = request.question.as_mut() {
                 let full = std::mem::take(&mut question.text);
                 question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
                 question.truncated |= question.text.len() < full.len();
             }
         }
+        // Best-effort: keep the shrunk candidate regardless; the verdict
+        // comes after every body had its chance.
+        waits.bodies[index].1 = candidate;
     }
-    if wait_envelope_fits(&candidate)? {
-        *response = candidate;
+    if fits_all(&waits.bodies)? {
         return Ok(());
     }
-    // 3. Last resort: shorten the result page. The cursor comes from the
-    //    original total/offset.
-    if let Some((end, next_offset)) = shrunk_result_page(&candidate) {
-        if let RpcSuccess::TaskWait {
-            result: Some(view), ..
-        } = &mut candidate
-        {
-            view.final_text.truncate(end);
-            view.next_offset = next_offset;
+    // Cooperative stage 3. The per-body binary search measures the FULL
+    // envelope, so when several bodies are oversized together no single
+    // shrink can make the frame fit and the search would find nothing.
+    // Instead, first give every body an equal byte budget derived from the
+    // frame cap (accounting for worst-case JSON escaping) and truncate to
+    // it directly — a coarse pass that is guaranteed to fit for any
+    // realistic body count — then fine-tune with the envelope-measured
+    // search, then round-robin any residual.
+    let body_count = waits.bodies.len().max(1);
+    // Six bytes of worst-case JSON escape per input byte, plus envelope
+    // overhead; the budget is intentionally conservative.
+    let budget = (MAX_RESPONSE_FRAME_BYTES / 6) / body_count;
+    for (_, body) in waits.bodies.iter_mut() {
+        if let Some(view) = body.result.as_mut() {
+            if view.final_text.len() > budget {
+                let truncated =
+                    truncate_at_char_boundary(&view.final_text, budget).len();
+                let next = view.offset + truncated;
+                view.final_text.truncate(truncated);
+                view.next_offset = (next < view.total_bytes).then_some(next);
+            }
         }
     }
-    if !wait_envelope_fits(&candidate)? {
+    if fits_all(&waits.bodies)? {
+        return Ok(());
+    }
+    // Fine-tune. The per-body binary search (`shrunk_result_page`) requires
+    // that a SINGLE page's shrink can make the whole frame fit; with many
+    // large bodies (e.g. a fleet of 2 KiB-question carriers plus several
+    // 256 KiB result pages) no single page is ever enough, so that search
+    // returns None and the old loop bailed out with Oversized even though a
+    // joint shrink fits. Instead: repeatedly halve the longest remaining
+    // page — a guaranteed monotone shrink that commits PARTIAL reductions —
+    // until the frame fits or every page is down to one character.
+    // Cursors stay consistent (derived from the original total/offset), so
+    // no shortened page is ever presented as the end.
+    while !fits_all(&waits.bodies)? {
+        let mut target_index = None;
+        let mut target_len = 0usize;
+        for (index, (_, body)) in waits.bodies.iter().enumerate() {
+            if let Some(view) = &body.result {
+                if view.final_text.len() > target_len {
+                    target_len = view.final_text.len();
+                    target_index = Some(index);
+                }
+            }
+        }
+        let Some(index) = target_index else {
+            break;
+        };
+        let (_, body) = &mut waits.bodies[index];
+        let Some(view) = body.result.as_mut() else {
+            break;
+        };
+        let current = view.final_text.len();
+        if current <= 1 {
+            // Every page is already at the floor and the frame still does
+            // not fit: genuinely unrepresentable.
+            break;
+        }
+        // Halve (at a char boundary), never below one character.
+        let target = (current / 2).max(1);
+        let mut end = target.min(current - 1);
+        while !view.final_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let next = view.offset + end;
+        view.final_text.truncate(end);
+        view.next_offset = (next < view.total_bytes).then_some(next);
+    }
+    if !fits_all(&waits.bodies)? {
         return Err(RpcError::new(
             RpcErrorCode::Oversized,
             "response frame exceeds cap",
         ));
     }
-    *response = candidate;
     Ok(())
 }
 
@@ -246,14 +681,18 @@ fn wait_envelope_fits(response: &RpcSuccess) -> Result<bool, RpcError> {
 /// still fits. Envelope size is monotone in the shrunk record length, so the
 /// feasible budgets form a prefix. When even the floor record cannot fit, the
 /// caller falls through to the other degradation stages with the floor record.
-fn fit_failure_message(base: &RpcSuccess, original: &str) -> String {
+fn fit_failure_message(
+    base: &TaskWaitBody,
+    original: &str,
+    fits: &dyn Fn(&TaskWaitBody) -> Result<bool, RpcError>,
+) -> String {
     let mut lo = 0usize;
     let mut hi = original.len();
     let mut best: Option<String> = None;
     while lo <= hi {
         let mid = lo + (hi - lo) / 2;
         match shrink_persistable_record(original, mid) {
-            Some(candidate) if message_envelope_fits(base, &candidate) => {
+            Some(candidate) if message_body_fits(base, &candidate, fits) => {
                 best = Some(candidate);
                 if mid == hi {
                     break;
@@ -272,15 +711,16 @@ fn fit_failure_message(base: &RpcSuccess, original: &str) -> String {
         .unwrap_or_else(|| original.to_owned())
 }
 
-fn message_envelope_fits(base: &RpcSuccess, message: &str) -> bool {
+fn message_body_fits(
+    base: &TaskWaitBody,
+    message: &str,
+    fits: &dyn Fn(&TaskWaitBody) -> Result<bool, RpcError>,
+) -> bool {
     let mut probe = base.clone();
-    if let RpcSuccess::TaskWait {
-        result: Some(view), ..
-    } = &mut probe
-    {
+    if let Some(view) = probe.result.as_mut() {
         view.failure_message = Some(message.to_owned());
     }
-    wait_envelope_fits(&probe).unwrap_or(false)
+    fits(&probe).unwrap_or(false)
 }
 
 /// The largest prefix of the embedded result page that keeps the envelope in
@@ -289,13 +729,11 @@ fn message_envelope_fits(base: &RpcSuccess, message: &str) -> bool {
 /// therefore still means "this page reaches the end of the text". Returns
 /// `None` when there is no page to shorten or even one character does not
 /// fit.
-fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>)> {
-    let RpcSuccess::TaskWait {
-        result: Some(view), ..
-    } = base
-    else {
-        return None;
-    };
+fn shrunk_result_page(
+    base: &TaskWaitBody,
+    fits: &dyn Fn(&TaskWaitBody) -> Result<bool, RpcError>,
+) -> Option<(usize, Option<usize>)> {
+    let view = base.result.as_ref()?;
     let page = &view.final_text;
     if page.is_empty() {
         return None;
@@ -314,15 +752,12 @@ fn shrunk_result_page(base: &RpcSuccess) -> Option<(usize, Option<usize>)> {
     }
     let fits_end = |end: usize| {
         let mut probe = base.clone();
-        if let RpcSuccess::TaskWait {
-            result: Some(view), ..
-        } = &mut probe
-        {
+        if let Some(view) = probe.result.as_mut() {
             let next = offset + end;
             view.final_text.truncate(end);
             view.next_offset = (next < total).then_some(next);
         }
-        wait_envelope_fits(&probe).unwrap_or(false)
+        fits(&probe).unwrap_or(false)
     };
     if !fits_end(ends[0]) {
         return None;
@@ -448,7 +883,7 @@ pub(crate) mod wait_tests {
             })
             .unwrap();
         // The drained task keeps its recorded facts.
-        let RpcSuccess::TaskWait { task, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { task, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -731,10 +1166,10 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -802,7 +1237,7 @@ pub(crate) mod wait_tests {
                 )
                 .unwrap();
             // Wait never probes for a version advisory.
-            let RpcSuccess::TaskWait { .. } = service
+            let RpcSuccess::TaskWait(TaskWaitBody { .. }) = service
                 .dispatch(RpcMethod::TaskWait(query(&id, 0)))
                 .unwrap()
             else {
@@ -950,7 +1385,7 @@ pub(crate) mod wait_tests {
 
     pub(crate) fn query(id: &str, wait_time: u64) -> TaskWaitQuery {
         TaskWaitQuery {
-            agent_id: id.into(),
+            agent_id: WaitTarget::One(id.into()),
             wait_time,
             message_id: None,
         }
@@ -959,7 +1394,7 @@ pub(crate) mod wait_tests {
     #[test]
     fn wait_task_serializes_only_the_lifecycle_header() {
         let (_directory, service, id) = fixture();
-        let RpcSuccess::TaskWait { task, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { task, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -1025,7 +1460,7 @@ pub(crate) mod wait_tests {
         assert!(!RpcMethod::is_known("task_poll"));
         let before = service.store.get_task(&id).unwrap();
         let start = Instant::now();
-        let RpcSuccess::TaskWait { timed_out: true, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { timed_out: true, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -1045,11 +1480,11 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             timed_out: false,
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1090,12 +1525,12 @@ pub(crate) mod wait_tests {
             })
             .unwrap();
         assert!(start.elapsed() >= Duration::from_millis(80));
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             timed_out: true,
             activity,
             message_receipt: Some(_),
             ..
-        } = response
+        }) = response
         else {
             panic!("ordinary activity ended wait")
         };
@@ -1155,11 +1590,11 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             activity,
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -1218,11 +1653,11 @@ pub(crate) mod wait_tests {
                 r#"{"toolName":"Read"}"#,
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests,
             timed_out,
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1249,11 +1684,11 @@ pub(crate) mod wait_tests {
             .unwrap();
         // Every actionable request wakes without a capability handshake; the
         // question is embedded in full in the projection.
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests,
             timed_out,
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1285,11 +1720,11 @@ pub(crate) mod wait_tests {
         // The unsupported sentinel is not actionable for any caller: it
         // neither wakes the wait nor appears in the projection.
         let start = Instant::now();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests,
             timed_out,
             ..
-        } = service
+        }) = service
             .task_wait(query(&id, 0), start + Duration::from_millis(30), &|| false)
             .unwrap()
         else {
@@ -1313,9 +1748,9 @@ pub(crate) mod wait_tests {
                 &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests, ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1339,9 +1774,9 @@ pub(crate) mod wait_tests {
                 &serde_json::to_string(&serde_json::json!({ "question": wide })).unwrap(),
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests, ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1373,9 +1808,9 @@ pub(crate) mod wait_tests {
                 &serde_json::to_string(&serde_json::json!({ "question": question })).unwrap(),
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests, ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 299)))
             .unwrap()
         else {
@@ -1437,9 +1872,9 @@ pub(crate) mod wait_tests {
         let response = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests, ..
-        } = &response
+        }) = &response
         else {
             panic!("expected wait response")
         };
@@ -1522,11 +1957,11 @@ pub(crate) mod wait_tests {
         let response = service
             .task_wait(query(&id, 1), start + Duration::from_millis(60), &|| false)
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests,
             timed_out,
             ..
-        } = response
+        }) = response
         else {
             panic!("expected wait response")
         };
@@ -1571,11 +2006,11 @@ pub(crate) mod wait_tests {
                 .unwrap();
         }
         let start = Instant::now();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             pending_requests,
             timed_out,
             ..
-        } = service
+        }) = service
             .task_wait(query(&id, 1), start + Duration::from_millis(60), &|| false)
             .unwrap()
         else {
@@ -1607,10 +2042,10 @@ pub(crate) mod wait_tests {
             service
                 .dispatch(RpcMethod::TaskWait(query(&id, 299)))
                 .unwrap(),
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 timed_out: false,
                 ..
-            }
+            })
         ));
         service
             .store
@@ -1624,10 +2059,10 @@ pub(crate) mod wait_tests {
                     &|| false
                 )
                 .unwrap(),
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 timed_out: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -1662,11 +2097,11 @@ pub(crate) mod wait_tests {
             let response = service
                 .dispatch(RpcMethod::TaskWait(query(&id, 299)))
                 .unwrap();
-            let RpcSuccess::TaskWait {
+            let RpcSuccess::TaskWait(TaskWaitBody {
                 result: Some(result),
                 timed_out: false,
                 ..
-            } = &response
+            }) = &response
             else {
                 panic!("terminal result missing")
             };
@@ -1923,10 +2358,10 @@ pub(crate) mod wait_tests {
             )
             .unwrap();
 
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -1968,10 +2403,10 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2021,7 +2456,7 @@ pub(crate) mod wait_tests {
         failure_message: Option<String>,
         pending_requests: Vec<PendingRequestView>,
     ) -> RpcSuccess {
-        RpcSuccess::TaskWait {
+        RpcSuccess::TaskWait(TaskWaitBody {
             task: perspective_task(),
             pending_requests,
             activity: empty_activity(),
@@ -2037,7 +2472,7 @@ pub(crate) mod wait_tests {
             }),
             timed_out: false,
             message_receipt: None,
-        }
+        })
     }
 
     fn envelope_bytes(response: &RpcSuccess) -> usize {
@@ -2089,10 +2524,10 @@ pub(crate) mod wait_tests {
             Some(detail.as_str())
         );
 
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2157,10 +2592,10 @@ pub(crate) mod wait_tests {
                 None,
                 "{outcome:?}"
             );
-            let RpcSuccess::TaskWait {
+            let RpcSuccess::TaskWait(TaskWaitBody {
                 result: Some(result),
                 ..
-            } = service
+            }) = service
                 .dispatch(RpcMethod::TaskWait(query(&id, 0)))
                 .unwrap()
             else {
@@ -2188,10 +2623,10 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2208,10 +2643,10 @@ pub(crate) mod wait_tests {
         let second = r#"{"stage":"runtime_terminal","error_code":"RUNTIME_TERMINAL","message":"round two"}"#;
         // Round one: same final_text/digest as round two, different detail.
         failed_result_for(&service, &id, "RUNTIME_TERMINAL", first);
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2245,10 +2680,10 @@ pub(crate) mod wait_tests {
                 .unwrap(),
         ] {
             let result = match read {
-                RpcSuccess::TaskWait {
+                RpcSuccess::TaskWait(TaskWaitBody {
                     result: Some(result),
                     ..
-                }
+                })
                 | RpcSuccess::TaskResult {
                     result: Some(result),
                     ..
@@ -2332,7 +2767,7 @@ pub(crate) mod wait_tests {
                     .unwrap(),
             ] {
                 let Some(result) = (match read {
-                    RpcSuccess::TaskWait { result, .. }
+                    RpcSuccess::TaskWait(TaskWaitBody { result, .. })
                     | RpcSuccess::TaskResult { result, .. } => result,
                     _ => None,
                 }) else {
@@ -2391,18 +2826,18 @@ pub(crate) mod wait_tests {
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         assert!(envelope_bytes(&build(None, question.clone())) <= MAX_RESPONSE_FRAME_BYTES);
         let original_final = match &base {
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 result: Some(view),
                 ..
-            } => view.final_text.clone(),
+            }) => view.final_text.clone(),
             _ => unreachable!(),
         };
         bound_wait_result(&mut base).unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(view),
             pending_requests,
             ..
-        } = &base
+        }) = &base
         else {
             panic!("expected wait response")
         };
@@ -2447,20 +2882,20 @@ pub(crate) mod wait_tests {
         let question_len = (deficit + 1024).div_ceil(6) + 1;
         let mut base = build(Some(detail.clone()), "\u{0}".repeat(question_len));
         let mut floor_probe = base.clone();
-        if let RpcSuccess::TaskWait {
+        if let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(view), ..
-        } = &mut floor_probe
+        }) = &mut floor_probe
         {
             view.failure_message = Some("{}".into());
         }
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         assert!(envelope_bytes(&floor_probe) > MAX_RESPONSE_FRAME_BYTES);
         bound_wait_result(&mut base).unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(view),
             pending_requests,
             ..
-        } = &base
+        }) = &base
         else {
             panic!("expected wait response")
         };
@@ -2492,11 +2927,11 @@ pub(crate) mod wait_tests {
         );
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         bound_wait_result(&mut base).unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(view),
             pending_requests,
             ..
-        } = &base
+        }) = &base
         else {
             panic!("expected wait response")
         };
@@ -2534,16 +2969,16 @@ pub(crate) mod wait_tests {
         );
         assert!(matches!(
             &base,
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 result: Some(view),
                 ..
-            } if view.next_offset.is_none()
+            }) if view.next_offset.is_none()
         ));
         assert!(envelope_bytes(&base) > MAX_RESPONSE_FRAME_BYTES);
         bound_wait_result(&mut base).unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(view), ..
-        } = &base
+        }) = &base
         else {
             panic!("expected wait response")
         };
@@ -2556,9 +2991,9 @@ pub(crate) mod wait_tests {
         // cannot fit.
         if end + 1 <= page.len() {
             let mut probe = base.clone();
-            if let RpcSuccess::TaskWait {
+            if let RpcSuccess::TaskWait(TaskWaitBody {
                 result: Some(view), ..
-            } = &mut probe
+            }) = &mut probe
             {
                 view.final_text = page[..end + 1].to_owned();
                 view.next_offset = Some(end + 1);
@@ -2602,11 +3037,11 @@ pub(crate) mod wait_tests {
         // First wait: the whole current window (AC1), delivered over the
         // timeout exit.
         inject_wait_delta(&tracker, "alpha");
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             activity,
             timed_out: true,
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2627,11 +3062,11 @@ pub(crate) mod wait_tests {
                 r#"{"toolName":"Read"}"#,
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             activity,
             timed_out: false,
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2641,7 +3076,7 @@ pub(crate) mod wait_tests {
 
         // The wake exit advanced the cursor: a second wait on the same task
         // ships an empty tail for the already-sent bytes.
-        let RpcSuccess::TaskWait { activity, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { activity, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2673,11 +3108,11 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             activity,
             result: Some(_),
             ..
-        } = service
+        }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2685,7 +3120,7 @@ pub(crate) mod wait_tests {
         };
         assert_eq!(activity.latest_text_tail, "gamma");
         // A repeated terminal wait does not re-send the consumed bytes.
-        let RpcSuccess::TaskWait { activity, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { activity, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2706,14 +3141,14 @@ pub(crate) mod wait_tests {
             .activities
             .insert(id.clone(), Arc::clone(&tracker));
         inject_wait_delta(&tracker, "delta");
-        let RpcSuccess::TaskWait { activity, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { activity, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
             panic!("expected a wait response")
         };
         assert_eq!(activity.latest_text_tail, "delta");
-        let RpcSuccess::TaskWait { activity, .. } = service
+        let RpcSuccess::TaskWait(TaskWaitBody { activity, .. }) = service
             .dispatch(RpcMethod::TaskWait(query(&id, 0)))
             .unwrap()
         else {
@@ -2721,4 +3156,671 @@ pub(crate) mod wait_tests {
         };
         assert_eq!(activity.latest_text_tail, "");
     }
+    // ---- List-mode (multi-agent) wait contract ----
+
+    fn many_query(ids: &[&str], wait_time: u64) -> TaskWaitQuery {
+        TaskWaitQuery {
+            agent_id: WaitTarget::Many(ids.iter().map(|id| (*id).to_owned()).collect()),
+            wait_time,
+            message_id: None,
+        }
+    }
+
+    fn waits_of(success: RpcSuccess) -> TaskWaitManyBody {
+        let RpcSuccess::TaskWaitMany { waits } = success else {
+            panic!("expected task_wait_many response")
+        };
+        waits
+    }
+
+    fn body_map(waits: &TaskWaitManyBody) -> std::collections::HashMap<String, &TaskWaitBody> {
+        waits.bodies.iter().map(|(id, body)| (id.clone(), body)).collect()
+    }
+
+    /// Two running tasks inside one store: the fixture's own task plus a
+    /// freshly enqueued one, both claimed and marked running like the
+    /// single-task fixture does.
+    fn two_running_tasks() -> (tempfile::TempDir, Arc<RpcService>, String, String) {
+        let (directory, service, id1) = fixture();
+        // A workspace admits one active task at a time, so the second task
+        // gets its own repository directory inside the same store.
+        let second_repo = tempfile::Builder::new()
+            .prefix("wait-second-")
+            .tempdir_in(directory.path())
+            .unwrap();
+        let submitted = service
+            .scheduler
+            .enqueue_general(&GeneralTaskManifest {
+                schema: "zcode-general-task/v1".into(),
+                agent_id: "".into(),
+                repository: second_repo.path().canonicalize().unwrap(),
+                permission_mode: Some(external_core::PermissionMode::Plan),
+                prompt: "second fixture".into(),
+                write_manifest: vec![],
+            })
+            .unwrap();
+        let id2 = submitted.agent_id;
+        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        assert_eq!(claim.task.agent_id, id2, "the fixture's own task is already claimed");
+        service
+            .store
+            .mark_session_running(&id2, claim.owner_epoch, "runtime", None, Some("session"), None)
+            .unwrap();
+        (directory, service, id1, id2)
+    }
+
+    fn terminalize(service: &Arc<RpcService>, id: &str, text: &str) {
+        service
+            .store
+            .store_task_result(
+                id,
+                &TaskResult { outcome: TaskOutcome::Completed, final_text: text.into(), partial: false },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn many_wait_returns_every_terminal_agent_with_embedded_results() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        terminalize(&service, &id1, "first");
+        terminalize(&service, &id2, "second");
+        let waits = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1, &id2], 299)))
+                .unwrap(),
+        );
+        assert_eq!(waits.bodies.len(), 2);
+        assert!(waits.error.is_empty());
+        for (id, body) in &waits.bodies {
+            assert_eq!(body.task.status, "completed");
+            assert!(!body.timed_out);
+            let result = body.result.as_ref().unwrap();
+            assert_eq!(result.next_offset, None);
+            assert_eq!(result.final_text, if *id == id1 { "first" } else { "second" });
+        }
+        // The envelope serializes as a FLAT object keyed by the ids, with no
+        // waits wrapper and no error key when nothing was problematic.
+        let encoded =
+            serde_json::to_value(&RpcSuccess::TaskWaitMany { waits: waits.clone() }).unwrap();
+        assert!(encoded.get(&id1).is_some(), "flat id key missing: {encoded}");
+        assert!(encoded.get(&id2).is_some());
+        assert!(encoded.get("error").is_none());
+        assert!(encoded.get("waits").is_none());
+    }
+
+    #[test]
+    fn many_wait_wakes_when_any_agent_raises_an_actionable_request() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        // id2 stays plain running; id1 raises a question. The shared wait
+        // must return early with id1's actionable projection and id2's
+        // running snapshot carrying timed_out=false (an actionable wake is
+        // not a timeout).
+        service
+            .store
+            .insert_pending_request(
+                "request-1",
+                &id1,
+                "correlation",
+                "user_input",
+                r#"{"question":"which branch?"}"#,
+            )
+            .unwrap();
+        let start = Instant::now();
+        let waits = waits_of(
+            service
+                .task_wait(
+                    many_query(&[&id1, &id2], 60),
+                    start + Duration::from_secs(5),
+                    &|| false,
+                )
+                .unwrap(),
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "actionable wake must be immediate"
+        );
+        let map = body_map(&waits);
+        let body1 = map[&id1];
+        assert_eq!(body1.pending_requests.len(), 1);
+        assert!(!body1.timed_out);
+        let body2 = map[&id2];
+        assert_eq!(body2.task.status, "running");
+        assert!(!body2.timed_out);
+    }
+
+    #[test]
+    fn many_wait_marks_only_unfinished_elements_timed_out_at_the_deadline() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        terminalize(&service, &id1, "first");
+        let start = Instant::now();
+        let waits = waits_of(
+            service
+                .task_wait(
+                    many_query(&[&id1, &id2], 0),
+                    start + Duration::from_millis(30),
+                    &|| false,
+                )
+                .unwrap(),
+        );
+        let map = body_map(&waits);
+        let body1 = map[&id1];
+        // Terminal elements embed the result page and never claim timeout.
+        assert_eq!(body1.task.status, "completed");
+        assert!(!body1.timed_out);
+        assert!(body1.result.is_some());
+        let body2 = map[&id2];
+        assert_eq!(body2.task.status, "running");
+        assert!(body2.timed_out);
+        assert!(body2.result.is_none());
+    }
+
+    #[test]
+    fn many_wait_flags_duplicated_and_unknown_ids_in_a_concentrated_error_map() {
+        let (_d, service, id1) = fixture();
+        terminalize(&service, &id1, "done");
+        let unknown = "12345678".to_owned();
+        let waits = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1, &id1, &unknown, &id1], 0)))
+                .unwrap(),
+        );
+        // A duplicated id is STILL awaited and returned once under its own
+        // key; only its repetition is flagged in the error map.
+        assert_eq!(waits.bodies.len(), 1, "only the known id carries a body");
+        let map = body_map(&waits);
+        let body1 = map[&id1];
+        assert_eq!(body1.task.status, "completed");
+        assert_eq!(body1.result.as_ref().unwrap().final_text, "done");
+        assert!(!map.contains_key(&unknown), "unknown ids carry no body");
+        assert_eq!(
+            waits.error.get(&id1).map(String::as_str),
+            Some("duplicated")
+        );
+        assert_eq!(
+            waits.error.get(&unknown).map(String::as_str),
+            Some("unknown_agent")
+        );
+        // The wire form is FLAT: id keys plus one error key, no wrapper.
+        let encoded = serde_json::to_value(&RpcSuccess::TaskWaitMany { waits }).unwrap();
+        assert!(encoded.get(&id1).is_some());
+        assert!(
+            encoded.get("error").unwrap().get(&id1).is_some(),
+            "error map missing duplicated id: {encoded}"
+        );
+        assert_eq!(encoded["error"][&unknown], "unknown_agent");
+        assert!(encoded.get("waits").is_none());
+    }
+
+    #[test]
+    fn many_wait_rejects_message_id_and_oversized_lists() {
+        let (_d, service, id) = fixture();
+        // message_id is scalar-only: rejected at the RPC layer.
+        let mut input = many_query(&[&id], 0);
+        input.message_id = Some("message-1".into());
+        let error = service.dispatch(RpcMethod::TaskWait(input)).unwrap_err();
+        assert!(matches!(error.code, RpcErrorCode::Validation));
+        // More than 16 ids is rejected.
+        let ids: Vec<String> = (0..17).map(|i| format!("{:08}", 10_000_000 + i)).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let error = service
+            .dispatch(RpcMethod::TaskWait(many_query(&refs, 0)))
+            .unwrap_err();
+        assert!(matches!(error.code, RpcErrorCode::Validation));
+    }
+
+    #[test]
+    fn many_wait_degrades_cooperatively_across_large_result_pages() {
+        // Ten terminal agents each carrying a near-cap result page cannot
+        // fit by shrinking any single one; the degradation must cooperate
+        // across bodies instead of erroring on the first element.
+        let (_d, service, first_id) = fixture();
+        let mut ids = vec![first_id.clone()];
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-work/tmp")
+            .join("wait-many-large");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut repos = vec![std::env::temp_dir()];
+        for index in 0..9 {
+            let repo = base.join(format!("repo-{index}"));
+            std::fs::create_dir_all(&repo).unwrap();
+            repos.push(repo);
+        }
+        // The fixture's own task used the temp dir; enqueue the rest.
+        for repo in &repos[1..] {
+            let submitted = service
+                .scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: "zcode-general-task/v1".into(),
+                    agent_id: "".into(),
+                    repository: repo.canonicalize().unwrap(),
+                    permission_mode: Some(external_core::PermissionMode::Plan),
+                    prompt: "large fixture".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap();
+            let id = submitted.agent_id;
+            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            assert_eq!(claim.task.agent_id, id);
+            service
+                .store
+                .mark_session_running(
+                    &id,
+                    claim.owner_epoch,
+                    "runtime",
+                    None,
+                    Some("session"),
+                    None,
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        // ~256 KiB ASCII payload per agent — ten of them far exceed the
+        // 2 MiB frame cap even after any single-body shrink.
+        let payload = "a".repeat(256 * 1024);
+        for id in &ids {
+            terminalize(&service, id, &payload);
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let waits = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&refs, 0)))
+                .expect("cooperative degradation must fit the frame"),
+        );
+        assert_eq!(waits.bodies.len(), ids.len());
+        // Every body carries a real (shortened) page with a consistent
+        // cursor: no page claims to be the end while text remains.
+        let mut total = 0usize;
+        for (_, body) in &waits.bodies {
+            let view = body.result.as_ref().expect("terminal body embeds a page");
+            assert!(!view.final_text.is_empty(), "page must keep at least one char");
+            let consumed = view.offset + view.final_text.len();
+            assert!(consumed < view.total_bytes, "shortened page must not claim the end");
+            assert_eq!(view.next_offset, Some(consumed));
+            total += view.final_text.len();
+        }
+        // The shared budget was actually distributed: each page shrank far
+        // below its original 256 KiB.
+        assert!(total < 10 * 256 * 1024);
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn many_wait_drops_the_terminal_cache_when_send_resumes_the_task() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        terminalize(&service, &id1, "first result");
+        // First wait caches id1 as terminal with the old result embedded.
+        let first = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1], 0)))
+                .unwrap(),
+        );
+        assert_eq!(body_map(&first)[&id1].task.status, "completed");
+        // id2 keeps a later wait blocked; meanwhile id1 is requeued for a
+        // codex-style resume (the scheduler's send path performs exactly
+        // this transition). The cached terminal snapshot must NOT shadow
+        // the resumed state: the next wait must re-read the row.
+        service
+            .store
+            .requeue_task_for_resume_with_message(&id1, "resume-message", "queue", "continue")
+            .unwrap();
+        // A zero-timeout wait projects the resumed state immediately: not
+        // terminal, no stale result, timed_out=true only because this call
+        // itself expired (id2 alone would also expire; check per element).
+        let second = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1], 0)))
+                .unwrap(),
+        );
+        let map = body_map(&second);
+        let body1 = map[&id1];
+        assert_ne!(
+            body1.task.status, "completed",
+            "the resumed state must replace the stale terminal snapshot"
+        );
+        assert_eq!(body1.task.status, "queued");
+        assert!(
+            body1.result.is_none(),
+            "the stale terminal result must not be returned for the resumed task"
+        );
+        // And the resumed agent keeps the wait unsettled: a list wait over
+        // [id1, id2] with a short deadline reports id1 (and id2) timed out
+        // rather than returning early as all-terminal.
+        let start = Instant::now();
+        let third = waits_of(
+            service
+                .task_wait(
+                    many_query(&[&id1, &id2], 0),
+                    start + Duration::from_millis(30),
+                    &|| false,
+                )
+                .unwrap(),
+        );
+        let map3 = body_map(&third);
+        assert!(map3[&id1].timed_out, "resumed id1 is no longer settled");
+        assert!(map3[&id2].timed_out);
+        assert!(map3[&id1].result.is_none());
+    }
+
+    #[test]
+    fn many_wait_interruption_does_not_consume_undelivered_activity_text() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        terminalize(&service, &id1, "first");
+        // Both agents have undelivered activity text. The interrupted
+        // list-mode wait must leave the delivery cursors untouched, so a
+        // later wait still sees the text.
+        let tracker1 = Arc::new(crate::PassiveActivityTracker::new(true));
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id1.clone(), tracker1.clone());
+        let tracker2 = Arc::new(crate::PassiveActivityTracker::new(true));
+        service
+            .scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(id2.clone(), tracker2.clone());
+        inject_wait_delta(&tracker1, "alpha-from-one");
+        inject_wait_delta(&tracker2, "beta-from-two");
+        let start = Instant::now();
+        let interrupted = service.task_wait(
+            many_query(&[&id1, &id2], 60),
+            start + Duration::from_secs(5),
+            &|| true, // cancelled immediately: no response is ever delivered
+        );
+        assert!(interrupted.is_err(), "the interrupted wait must fail");
+        // The cursors were never consumed: a following wait still sees the
+        // full undelivered tails.
+        let waits = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1, &id2], 0)))
+                .unwrap(),
+        );
+        let map = body_map(&waits);
+        // id1 is terminal with an embedded result: its tail dedups against
+        // the page, but the delivery itself only happened in THIS response.
+        let body1 = map[&id1];
+        assert_eq!(body1.task.status, "completed");
+        let body2 = map[&id2];
+        assert_eq!(
+            body2.activity.latest_text_tail, "beta-from-two",
+            "the interrupted wait must not have consumed id2's tail"
+        );
+        // And a second wait returns nothing new for id2 (cursor advanced by
+        // the delivered response only).
+        let second = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1, &id2], 0)))
+                .unwrap(),
+        );
+        let map2 = body_map(&second);
+        assert_eq!(map2[&id2].activity.latest_text_tail, "");
+    }
+
+    #[test]
+    fn many_wait_drops_the_terminal_cache_across_a_resume_recompletion_cycle() {
+        let (_d, service, id1, id2) = two_running_tasks();
+        terminalize(&service, &id1, "old result");
+        // Cache id1 as terminal (old generation + old result embedded).
+        let first = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&[&id1], 0)))
+                .unwrap(),
+        );
+        assert_eq!(body_map(&first)[&id1].result.as_ref().unwrap().final_text, "old result");
+        // The full resume cycle: requeue (result row deleted), a new claim
+        // (owner_epoch increments — the generation marker), and a SECOND
+        // terminalization with a different result. The phase reads terminal
+        // again, so only the epoch comparison can catch the staleness.
+        service
+            .store
+            .requeue_task_for_resume_with_message(&id1, "resume-message", "queue", "again")
+            .unwrap();
+        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        assert_eq!(claim.task.agent_id, id1);
+        service
+            .store
+            .mark_session_running(&id1, claim.owner_epoch, "runtime", None, Some("session"), None)
+            .unwrap();
+        // Drain the resume message so completion is not blocked, then finish
+        // the resumed generation with a different result.
+        let queued = service.store.claim_next_message(&id1).unwrap().unwrap();
+        assert_eq!(queued.message_id, "resume-message");
+        service
+            .store
+            .complete_message(&queued.message_id, None)
+            .unwrap();
+        terminalize(&service, &id1, "new result");
+        // id2 keeps the loop alive long enough that the cached id1 snapshot
+        // is re-validated (at least once) before the response.
+        let waits = waits_of(
+            service
+                .task_wait(
+                    many_query(&[&id1, &id2], 0),
+                    Instant::now() + Duration::from_millis(30),
+                    &|| false,
+                )
+                .unwrap(),
+        );
+        let map = body_map(&waits);
+        let body1 = map[&id1];
+        assert_eq!(body1.task.status, "completed");
+        assert_eq!(
+            body1.result.as_ref().unwrap().final_text,
+            "new result",
+            "the recompleted generation's result must replace the stale one"
+        );
+    }
+
+    #[test]
+    fn many_wait_fits_a_mixed_fleet_of_large_questions_and_result_pages() {
+        // Reproduction shape: 3 terminal agents with 256 KiB result pages
+        // plus 13 running agents each holding 72 pending user_input
+        // questions of 2048-byte text. Questions degrade only to a 2048-byte
+        // prefix (the embed cap), so the question fleet alone is ~1.9 MiB
+        // before the result pages; no SINGLE page shrink can fit the frame,
+        // only a joint one can.
+        let (_d, service, first_id) = fixture();
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-work/tmp")
+            .join("wait-many-mixed");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut ids = vec![first_id.clone()];
+        for index in 0..15 {
+            let repo = base.join(format!("repo-{index}"));
+            std::fs::create_dir_all(&repo).unwrap();
+            let submitted = service
+                .scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: "zcode-general-task/v1".into(),
+                    agent_id: "".into(),
+                    repository: repo.canonicalize().unwrap(),
+                    permission_mode: Some(external_core::PermissionMode::Plan),
+                    prompt: "mixed fixture".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap();
+            let id = submitted.agent_id;
+            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            assert_eq!(claim.task.agent_id, id);
+            service
+                .store
+                .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
+                .unwrap();
+            ids.push(id);
+        }
+        // Three terminal agents with large pages.
+        let payload = "p".repeat(256 * 1024);
+        for id in &ids[..3] {
+            terminalize(&service, id, &payload);
+        }
+        // Thirteen running agents each with 72 actionable questions (the
+        // actionable set wakes the wait immediately).
+        let question = "q".repeat(2048);
+        for id in &ids[3..] {
+            for request in 0..72 {
+                service
+                    .store
+                    .insert_pending_request(
+                        &format!("q-{id}-{request}"),
+                        id,
+                        &format!("correlation-{id}-{request}"),
+                        "user_input",
+                        &serde_json::to_string(&serde_json::json!({ "question": question }))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let waits = waits_of(
+            service
+                .dispatch(RpcMethod::TaskWait(many_query(&refs, 0)))
+                .expect("joint degradation must fit the mixed fleet"),
+        );
+        assert_eq!(waits.bodies.len(), ids.len());
+        // Terminal pages were shortened consistently (never claiming the
+        // end) and the question carriers kept their actionable records.
+        for (id, body) in &waits.bodies {
+            if ids[..3].contains(id) {
+                let view = body.result.as_ref().unwrap();
+                assert!(!view.final_text.is_empty());
+                let consumed = view.offset + view.final_text.len();
+                assert!(consumed < view.total_bytes, "shortened page must not claim the end");
+                assert_eq!(view.next_offset, Some(consumed));
+            } else {
+                assert!(
+                    !body.pending_requests.is_empty(),
+                    "actionable questions stay reachable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_wait_oversized_failure_leaves_delivery_cursors_untouched() {
+        // A frame that cannot fit even after full degradation (16 agents
+        // each with 100 questions of 2048-byte text ≈ 3.2 MiB after the
+        // embed cap) must return Oversized WITHOUT committing any activity
+        // delivery cursor — a later wait still sees the undelivered text.
+        let (_d, service, first_id) = fixture();
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.agent-work/tmp")
+            .join("wait-many-oversized");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut ids = vec![first_id.clone()];
+        for index in 0..15 {
+            let repo = base.join(format!("repo-{index}"));
+            std::fs::create_dir_all(&repo).unwrap();
+            let submitted = service
+                .scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: "zcode-general-task/v1".into(),
+                    agent_id: "".into(),
+                    repository: repo.canonicalize().unwrap(),
+                    permission_mode: Some(external_core::PermissionMode::Plan),
+                    prompt: "oversized fixture".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap();
+            let id = submitted.agent_id;
+            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            assert_eq!(claim.task.agent_id, id);
+            service
+                .store
+                .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
+                .unwrap();
+            ids.push(id);
+        }
+        let question = "w".repeat(2048);
+        for id in &ids {
+            for request in 0..100 {
+                service
+                    .store
+                    .insert_pending_request(
+                        &format!("q-{id}-{request}"),
+                        id,
+                        &format!("correlation-{id}-{request}"),
+                        "user_input",
+                        &serde_json::to_string(&serde_json::json!({ "question": question }))
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        // Undelivered activity text on every agent.
+        let trackers: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+                service
+                    .scheduler
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap()
+                    .activities
+                    .insert(id.clone(), tracker.clone());
+                tracker
+            })
+            .collect();
+        for (index, tracker) in trackers.iter().enumerate() {
+            inject_wait_delta(tracker, &format!("tail-{index}"));
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let failure = service.dispatch(RpcMethod::TaskWait(many_query(&refs, 0)));
+        let error = failure.expect_err("this frame genuinely cannot fit");
+        assert!(matches!(error.code, RpcErrorCode::Oversized));
+        // No cursor moved: the single-agent wait for one member still sees
+        // its full undelivered tail.
+        let probe = &ids[7];
+        let body = {
+            let response = service
+                .dispatch(RpcMethod::TaskWait(query(probe, 0)))
+                .unwrap();
+            let RpcSuccess::TaskWait(body) = response else {
+                panic!("scalar wait");
+            };
+            body
+        };
+        assert_eq!(
+            body.activity.latest_text_tail, "tail-7",
+            "the Oversized failure must not have consumed any delivery cursor"
+        );
+    }
+
+    #[test]
+    fn scalar_wait_response_shape_is_unchanged() {
+        let (_d, service, id) = fixture();
+        service
+            .store
+            .store_task_result(
+                &id,
+                &TaskResult { outcome: TaskOutcome::Completed, final_text: "done".into(), partial: false },
+            )
+            .unwrap();
+        let response = service
+            .dispatch(RpcMethod::TaskWait(query(&id, 0)))
+            .unwrap();
+        // The scalar response is the flat six-field object: exactly the keys
+        // of the pre-union contract, no waits wrapper.
+        let encoded = serde_json::to_value(&response).unwrap();
+        let mut keys = encoded.as_object().unwrap().keys().collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["activity", "kind", "message_receipt", "pending_requests", "result", "task", "timed_out"]
+        );
+        assert_eq!(encoded["kind"], "task_wait");
+    }
+
 }

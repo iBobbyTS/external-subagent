@@ -10,8 +10,9 @@ use super::agents::{
 use super::config::{read_agent_config_snapshot, AgentConfigSnapshot};
 use super::errors::{map_scheduler, map_store, RpcError, RpcErrorCode};
 use super::types::{
-    ResponseDecision, RpcMethod, RpcRequest, RpcResponse, RpcSuccess, MAX_LIST_TASKS,
-    MAX_REQUEST_FRAME_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESULT_CHUNK_BYTES, MAX_WAIT, MCP_VERSION,
+    ResponseDecision, RpcMethod, RpcRequest, RpcResponse, RpcSuccess, WaitTarget, MAX_LIST_TASKS,
+    MAX_REQUEST_FRAME_BYTES, MAX_REQUEST_ID_BYTES, MAX_RESULT_CHUNK_BYTES, MAX_WAIT,
+    MAX_WAIT_AGENTS, MCP_VERSION,
 };
 use super::views::{
     aggregate_component_state, agent_capabilities, result_page_bounds,
@@ -466,6 +467,26 @@ impl RpcService {
                         RpcErrorCode::Validation,
                         "wait_time must be between 0 and 299 seconds",
                     ));
+                }
+                if let WaitTarget::Many(ids) = &query.agent_id {
+                    if ids.is_empty() {
+                        return Err(RpcError::new(
+                            RpcErrorCode::Validation,
+                            "agent_id list must contain at least one id",
+                        ));
+                    }
+                    if ids.len() > MAX_WAIT_AGENTS {
+                        return Err(RpcError::new(
+                            RpcErrorCode::Validation,
+                            "agent_id list supports at most 16 ids",
+                        ));
+                    }
+                    if query.message_id.is_some() {
+                        return Err(RpcError::new(
+                            RpcErrorCode::Validation,
+                            "message_id is only supported with a single agent_id",
+                        ));
+                    }
                 }
                 let deadline = Instant::now() + Duration::from_secs(query.wait_time);
                 self.task_wait(query, deadline, interrupted)

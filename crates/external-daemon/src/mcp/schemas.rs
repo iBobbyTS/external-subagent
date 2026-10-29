@@ -192,13 +192,23 @@ impl From<PublicOutcomeFilter> for TaskOutcome {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentWaitInput {
-    #[schemars(range(min = 10000000, max = 99999999))]
-    pub agent_id: u64,
+    /// The wait target: one agent id (the historical scalar shape) or a
+    /// list of 1..=16 agent ids awaited together. The response shape
+    /// follows the input: scalar in → single wait object; list in → an
+    /// object keyed by agent id.
+    pub agent_id: AgentIdOrList,
     #[serde(default = "default_wait_time")]
     #[schemars(range(min = 0, max = 299))]
     pub wait_time: u64,
     #[serde(default)]
     pub message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AgentIdOrList {
+    Single(#[schemars(range(min = 10000000, max = 99999999))] u64),
+    Multiple(Vec<u64>),
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -255,4 +265,26 @@ pub struct AgentResultInput {
 
 pub(super) fn default_result_limit() -> usize {
     crate::rpc::MAX_RESULT_CHUNK_BYTES
+}
+
+#[cfg(test)]
+mod wait_input_tests {
+    use super::AgentIdOrList;
+
+    #[test]
+    fn wait_agent_id_accepts_scalar_and_list_forms() {
+        let scalar: AgentIdOrList =
+            serde_json::from_str("10000001").expect("scalar id must deserialize");
+        assert_eq!(scalar, AgentIdOrList::Single(10000001));
+        let list: AgentIdOrList =
+            serde_json::from_str("[10000001, 10000002]").expect("id list must deserialize");
+        assert_eq!(
+            list,
+            AgentIdOrList::Multiple(vec![10000001, 10000002])
+        );
+        // The untagged union rejects non-id shapes instead of coercing.
+        assert!(serde_json::from_str::<AgentIdOrList>("\"10000001\"").is_err());
+        assert!(serde_json::from_str::<AgentIdOrList>("[]").is_ok());
+        assert!(serde_json::from_str::<AgentIdOrList>("null").is_err());
+    }
 }

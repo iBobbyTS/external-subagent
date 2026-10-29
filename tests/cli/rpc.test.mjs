@@ -369,3 +369,46 @@ test('CLI preserves the steer_unsupported daemon error code', { skip: win32Socke
       (error) => error instanceof CliError && error.code === 'steer_unsupported');
   } finally { await new Promise((resolve) => server.close(resolve)); }
 });
+
+test('wait list mode sends an id array and projects keyed waits', { skip: win32Sockets }, async () => {
+  const socketPath = path.join(os.tmpdir(), `es-wait-many-${process.pid}-${Date.now()}.sock`);
+  const server = net.createServer((socket) => socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    assert.equal(request.method, 'task_wait');
+    assert.deepEqual(request.params.agent_id, ['10000001', '10000002']);
+    assert.equal(request.params.wait_time, 0);
+    assert.equal('message_id' in request.params, false);
+    const flat = {
+      kind: 'task_wait_many',
+      '10000001': {
+        task: { agent_id: '10000001', status: 'terminal' },
+        pending_requests: [],
+        activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+        result: { outcome: 'COMPLETED', final_text: 'done', partial: false, offset: 0, total_bytes: 4, next_offset: null, reason_code: null, failure_message: null },
+        timed_out: false,
+        message_receipt: null,
+      },
+      error: { '10000002': 'duplicated' },
+    };
+    socket.end(JSON.stringify({
+      request_id: request.request_id,
+      outcome: 'success',
+      result: flat,
+    }) + '\n');
+  }));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const result = await callDaemon(socketPath, 'wait', { agent_id: [10000001, 10000002], wait_time: 0 });
+    assert.deepEqual(Object.keys(result).sort(), ['10000001', 'error']);
+    assert.deepEqual(result['10000001'].task, { agent_id: 10000001, status: 'terminal' });
+    assert.equal(result['10000001'].result.final_text, 'done');
+    assert.deepEqual(result.error, { '10000002': 'duplicated' });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('wait list mode rejects malformed id lists before connecting', () => {
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: [], wait_time: 0 }), /at least one/u);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: [10000001, 10000002, 10000003, 10000004, 10000005, 10000006, 10000007, 10000008, 10000009, 10000010, 10000011, 10000012, 10000013, 10000014, 10000015, 10000016, 10000017], wait_time: 0 }), /at most 16/u);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: [10000001], message_id: 'm-1' }), /message_id/u);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), 'x'), 'wait', { agent_id: [10000001, 123], wait_time: 0 }), /agent_id/u);
+});

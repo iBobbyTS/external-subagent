@@ -34,10 +34,10 @@ pub use errors::{RpcError, RpcErrorCode};
 pub use handlers::{RpcService, RpcServiceConfigError};
 pub use types::{
     GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision, RpcMethod, RpcOutcome,
-    RpcRequest, RpcResponse, RpcSuccess, TaskListQuery, TaskPhaseFilter, TaskWaitQuery,
-    DEFAULT_WAIT_TIME, MAX_LIST_TASKS, MAX_PENDING_REQUESTS, MAX_REQUEST_FRAME_BYTES,
-    MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES, MAX_WAIT, MCP_VERSION,
-    RPC_TRANSPORT_SUPPORTED,
+    RpcRequest, RpcResponse, RpcSuccess, TaskListQuery, TaskPhaseFilter, TaskWaitBody,
+    TaskWaitManyBody, TaskWaitQuery, WaitTarget, DEFAULT_WAIT_TIME, MAX_LIST_TASKS,
+    MAX_PENDING_REQUESTS, MAX_REQUEST_FRAME_BYTES, MAX_RESPONSE_FRAME_BYTES,
+    MAX_RESULT_CHUNK_BYTES, MAX_WAIT, MAX_WAIT_AGENTS, MCP_VERSION, RPC_TRANSPORT_SUPPORTED,
 };
 pub use views::{
     running_component_identity, AgentCapabilitiesView, AgentEffortSelectionCapabilityView,

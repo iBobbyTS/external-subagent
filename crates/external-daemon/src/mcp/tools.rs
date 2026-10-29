@@ -7,19 +7,20 @@ use super::errors::{
 };
 use super::schemas::{
     tool_output_schema, validate_text, AgentInput, AgentListInput, AgentRespondInput,
-    AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, EmptyInput,
+    AgentIdOrList, AgentResultInput, AgentSendInput, AgentSpawnInput, AgentWaitInput, EmptyInput,
     PublicPermissionMode, MAX_MESSAGE_BYTES,
 };
 use super::types::{internal_task_id, public_task_id, PublicDecision, PublicResponseDisposition};
 use super::views::{
     AgentListOutput, AgentObserveOutput, AgentRespondOutput, AgentResultOutput, AgentSendOutput,
-    AgentSpawnOutput, AgentStateOutput, AgentWaitOutput, PublicMessageDisposition,
-    PublicMessageReceipt, PublicResult, PublicTask, SPAWN_INSTRUCTION, SystemStatusOutput,
+    AgentSpawnOutput, AgentStateOutput, AgentWaitAnyOutput, AgentWaitElement, AgentWaitManyOutput,
+    AgentWaitOutput, PublicMessageDisposition, PublicResult, PublicTask, SPAWN_INSTRUCTION,
+    SystemStatusOutput,
 };
 use crate::rpc::{
     GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision, ResponseOutcomeView,
     RpcClient, RpcMethod, RpcOutcome, RpcRequest, RpcService, RpcSuccess, TaskListQuery,
-    TaskWaitQuery,
+    TaskWaitQuery, WaitTarget,
 };
 use external_core::{GeneralTaskManifest, GENERAL_TASK_SCHEMA};
 use rmcp::{
@@ -39,6 +40,10 @@ use std::{
 
 #[cfg(test)]
 use super::schemas::default_result_limit;
+
+/// Upper bound on the number of agent ids accepted by a list-mode wait;
+/// the canonical constant lives in the RPC protocol limits.
+pub use crate::rpc::MAX_WAIT_AGENTS;
 
 pub const PUBLIC_TOOLS: [&str; 10] = [
     "external_subagent_cancel",
@@ -261,8 +266,17 @@ impl SubagentMcp {
     }
 }
 
-fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {
-    match method {
+/// The wait context id: the scalar id when one agent is awaited, otherwise
+/// the count hint keeps error payloads identifiable without echoing the full
+/// list.
+fn wait_context_id(target: &crate::rpc::WaitTarget) -> Option<String> {
+    match target {
+        crate::rpc::WaitTarget::One(id) => Some(id.clone()),
+        crate::rpc::WaitTarget::Many(ids) => Some(format!("{} agents", ids.len())),
+    }
+}
+
+fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {    match method {
         RpcMethod::SystemStatus => ("status", None),
         RpcMethod::DaemonBeginDrain { .. } => ("drain", None),
         RpcMethod::DaemonDrainStatus => ("drain_status", None),
@@ -272,7 +286,7 @@ fn rpc_context(method: &RpcMethod) -> (&'static str, Option<String>) {
         RpcMethod::AgentModels { .. } => ("agent_models", None),
         RpcMethod::SubmitGeneral { .. } => ("spawn", None),
         RpcMethod::TaskList(_) => ("list", None),
-        RpcMethod::TaskWait(input) => ("wait", Some(input.agent_id.clone())),
+        RpcMethod::TaskWait(input) => ("wait", wait_context_id(&input.agent_id)),
         RpcMethod::TaskMessage(input) => ("send", Some(input.agent_id.clone())),
         RpcMethod::TaskRespond(input) => ("respond", Some(input.agent_id.clone())),
         RpcMethod::TaskCancel { agent_id } => ("cancel", Some(agent_id.clone())),
@@ -427,8 +441,8 @@ impl SubagentMcp {
 
     #[tool(
     name = "external_subagent_wait",
-    output_schema = tool_output_schema::<AgentWaitOutput>(),
-    description = "Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
+    output_schema = tool_output_schema::<AgentWaitAnyOutput>(),
+    description = "Wait up to 290 seconds by default. agent_id accepts one agent id (number) or a list of 1..=16 ids. A single id returns the single wait object described below. A list blocks until every listed agent is terminal OR any one of them raises an actionable pending request, then returns a FLAT object: one key per distinct agent id carrying that agent's ordinary wait object (a repeated id is awaited once like any other), plus one \"error\" key mapping problematic ids to markers — {\"<id>\":\"duplicated\"} for ids repeated in the input and \"unknown_agent\" for ids that do not exist; the remaining ids are still awaited normally. Recommended parallel pattern: spawn every subagent first, then call wait once with all ids. In list mode message_id is not supported (pass it only with a scalar id), every element carries message_receipt=null, and each element's timed_out flag follows the same shared deadline. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -440,44 +454,93 @@ impl SubagentMcp {
         &self,
         Parameters(input): Parameters<AgentWaitInput>,
         context: RequestContext<RoleServer>,
-    ) -> Result<Json<AgentWaitOutput>, ToolError> {
-        let agent_id =
-            internal_task_id(input.agent_id).map_err(|error| error.with_operation("wait"))?;
+    ) -> Result<Json<serde_json::Value>, ToolError> {
+        let (target, context_id) = match &input.agent_id {
+            AgentIdOrList::Single(id) => (
+                WaitTarget::One(
+                    internal_task_id(*id).map_err(|error| error.with_operation("wait"))?,
+                ),
+                *id,
+            ),
+            AgentIdOrList::Multiple(ids) => {
+                if ids.is_empty() {
+                    return Err(validation_error(
+                        "agent_id list must contain at least one id",
+                    )
+                    .with_operation("wait"));
+                }
+                if ids.len() > MAX_WAIT_AGENTS {
+                    return Err(validation_error(&format!(
+                        "agent_id list supports at most {} ids",
+                        MAX_WAIT_AGENTS
+                    ))
+                    .with_operation("wait"));
+                }
+                if input.message_id.is_some() {
+                    return Err(validation_error(
+                        "message_id is only supported with a single agent_id",
+                    )
+                    .with_operation("wait"));
+                }
+                let mut internal = Vec::with_capacity(ids.len());
+                for id in ids {
+                    internal
+                        .push(internal_task_id(*id).map_err(|error| error.with_operation("wait"))?);
+                }
+                (WaitTarget::Many(internal), ids[0])
+            }
+        };
         if input.wait_time > 299 {
             return Err(validation_error("wait_time must be between 0 and 299")
                 .with_operation("wait")
-                .with_agent_id(Some(agent_id)));
+                .with_agent_id(Some(
+                    internal_task_id(context_id).unwrap_or_else(|_| context_id.to_string()),
+                )));
         }
-        match self
+        let success = self
             .rpc_wait(
                 TaskWaitQuery {
-                    agent_id,
+                    agent_id: target,
                     wait_time: input.wait_time,
                     message_id: input.message_id,
                 },
                 move || context.ct.is_cancelled(),
             )
-            .await?
-        {
-            RpcSuccess::TaskWait {
-                task,
-                pending_requests,
-                activity,
-                result,
-                timed_out,
-                message_receipt,
-            } => Ok(Json(AgentWaitOutput {
-                task: task.try_into()?,
-                pending_requests: pending_requests.into_iter().map(Into::into).collect(),
-                activity: activity.into(),
-                result: result.map(TryInto::try_into).transpose()?,
-                timed_out,
-                message_receipt: message_receipt.map(|r| PublicMessageReceipt {
-                    message_id: r.message_id,
-                    state: r.state,
-                    failure_code: r.failure_code,
-                }),
-            })),
+            .await?;
+        match success {
+            RpcSuccess::TaskWait(body) => {
+                let output: AgentWaitOutput = body.try_into()?;
+                Ok(Json(serde_json::to_value(output).map_err(|_| {
+                    protocol_error().with_operation("wait")
+                })?))
+            }
+            RpcSuccess::TaskWaitMany { waits } => {
+                // Flat keyed projection: one key per distinct id carrying the
+                // public wait body, plus the concentrated error map keyed by
+                // public numeric ids.
+                let mut projected = std::collections::BTreeMap::new();
+                for (id, body) in waits.bodies {
+                    let key = public_task_id(&id)
+                        .map_err(|error| error.with_operation("wait"))?
+                        .to_string();
+                    let output: AgentWaitOutput = body.try_into()?;
+                    projected.insert(key, AgentWaitElement::Wait(Box::new(output)));
+                }
+                let mut error = std::collections::BTreeMap::new();
+                for (id, marker) in waits.error {
+                    let key = public_task_id(&id)
+                        .map_err(|error| error.with_operation("wait"))?
+                        .to_string();
+                    error.insert(key, marker);
+                }
+                let output = AgentWaitManyOutput {
+                    waits: projected,
+                    error,
+                };
+                Ok(Json(serde_json::to_value(output).map_err(|_| {
+                    protocol_error().with_operation("wait")
+                })?))
+            }
             _ => Err(protocol_error().with_operation("wait")),
         }
     }
@@ -845,7 +908,9 @@ mod contract_default_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn wait_keeps_status_and_respond_serviceable_and_wakes_on_completion() {
-        use crate::rpc::{RespondInput, ResponseDecision, RpcSuccess, TaskResultView};
+        use crate::rpc::{
+            RespondInput, ResponseDecision, RpcSuccess, TaskResultView, TaskWaitBody,
+        };
         use external_store::TaskOutcome;
         let (_directory, service, id) = crate::rpc::wait_tests::fixture();
         let store = service.store_for_wait_test();
@@ -881,21 +946,21 @@ mod contract_default_tests {
         let (response, _) = tokio::join!(waiting, other_work);
         assert!(matches!(
             response.unwrap(),
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 timed_out: false,
                 result: Some(TaskResultView {
                     next_offset: None,
                     ..
                 }),
                 ..
-            }
+            })
         ));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn mcp_wait_output_carries_the_model_rejection_reason() {
         use crate::mcp::views::PublicResult;
-        use crate::rpc::RpcSuccess;
+        use crate::rpc::{RpcSuccess, TaskWaitBody};
         use external_store::TaskOutcome;
         let (_directory, service, id) = crate::rpc::wait_tests::fixture();
         service
@@ -916,10 +981,10 @@ mod contract_default_tests {
             .rpc_wait(crate::rpc::wait_tests::query(&id, 0), || false)
             .await
             .unwrap();
-        let RpcSuccess::TaskWait {
+        let RpcSuccess::TaskWait(TaskWaitBody {
             result: Some(result),
             ..
-        } = response
+        }) = response
         else {
             panic!("expected terminal wait response")
         };
@@ -1279,7 +1344,7 @@ mod contract_default_tests {
         let waited = facade
             .rpc_wait(
                 crate::rpc::TaskWaitQuery {
-                    agent_id: task.agent_id.clone(),
+                    agent_id: crate::rpc::WaitTarget::One(task.agent_id.clone()),
                     wait_time: 0,
                     message_id: Some("native-message".into()),
                 },
@@ -1757,6 +1822,23 @@ mod contract_default_tests {
         assert!(
             !wait_validator.is_valid(&full_task_wait),
             "wait schema must reject the full task shape"
+        );
+
+        // List-mode wait: the same schema must accept the FLAT keyed object —
+        // id keys carrying ordinary wait bodies plus one concentrated error
+        // key for duplicated/unknown ids.
+        let scalar_wait = successes.get("external_subagent_wait").unwrap().clone();
+        let many_wait = serde_json::json!({
+            "10000001": scalar_wait,
+            "error": {
+                "10000002": "unknown_agent",
+                "10000003": "duplicated"
+            }
+        });
+        assert!(
+            wait_validator.is_valid(&many_wait),
+            "wait schema rejected list-mode success: {:?}",
+            wait_validator.iter_errors(&many_wait).collect::<Vec<_>>()
         );
     }
 

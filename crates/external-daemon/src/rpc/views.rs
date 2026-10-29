@@ -739,7 +739,8 @@ mod result_paging_tests {
         TaskView, TelemetryStatusView,
     };
     use crate::rpc::{
-        RpcOutcome, RpcResponse, RpcSuccess, MAX_RESPONSE_FRAME_BYTES, MAX_RESULT_CHUNK_BYTES,
+        RpcOutcome, RpcResponse, RpcSuccess, TaskWaitBody, MAX_RESPONSE_FRAME_BYTES,
+        MAX_RESULT_CHUNK_BYTES,
     };
     use external_store::TaskOutcome;
 
@@ -839,14 +840,14 @@ mod result_paging_tests {
         // must still fit without invoking the degradation path.
         let response = RpcResponse::success(
             "q".repeat(128),
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 task: task_header(),
                 pending_requests: Vec::new(),
                 activity: activity(),
                 result: Some(failed_result()),
                 timed_out: false,
                 message_receipt: None,
-            },
+            }),
         );
         let bytes = serde_json::to_vec(&response).unwrap();
         assert!(
@@ -863,7 +864,7 @@ mod result_paging_tests {
     fn terminal_wait_projection_serializes_a_null_failure_message_when_absent() {
         let response = RpcResponse::success(
             "q".repeat(128),
-            RpcSuccess::TaskWait {
+            RpcSuccess::TaskWait(TaskWaitBody {
                 task: task_header(),
                 pending_requests: Vec::new(),
                 activity: activity(),
@@ -873,7 +874,7 @@ mod result_paging_tests {
                 }),
                 timed_out: false,
                 message_receipt: None,
-            },
+            }),
         );
         let value = serde_json::to_value(&response).unwrap();
         let result = &value["result"]["result"];
@@ -888,7 +889,7 @@ mod result_paging_tests {
         let RpcOutcome::Success { result } = decoded.outcome else {
             panic!("expected success")
         };
-        let RpcSuccess::TaskWait { result: Some(view), .. } = *result else {
+        let RpcSuccess::TaskWait(TaskWaitBody { result: Some(view), .. }) = *result else {
             panic!("expected wait result")
         };
         assert_eq!(view.failure_message, None);

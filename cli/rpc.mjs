@@ -119,6 +119,26 @@ function methodFor(command, input) {
     };
     case 'wait': {
       rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id']));
+      // agent_id accepts a scalar (historical shape) or a list of ids; the
+      // daemon's untagged WaitTarget mirrors the caller's form.
+      if (Array.isArray(input.agent_id)) {
+        if (input.agent_id.length === 0) {
+          throw new CliError('INVALID_ARGUMENT', 'wait agent_id list must contain at least one id', 2);
+        }
+        if (input.agent_id.length > 16) {
+          throw new CliError('INVALID_ARGUMENT', 'wait agent_id list supports at most 16 ids', 2);
+        }
+        if (input.message_id !== undefined && input.message_id !== null) {
+          throw new CliError('INVALID_ARGUMENT', 'wait message_id is only supported with a single agent_id', 2);
+        }
+        return {
+          method: 'task_wait',
+          params: {
+            agent_id: input.agent_id.map((id) => daemonTaskId(id)),
+            wait_time: input.wait_time ?? 290,
+          },
+        };
+      }
       return {
         method: 'task_wait',
         params: {
@@ -212,6 +232,12 @@ function publicResult(result) {
   };
 }
 
+// One per-agent wait body: identical in scalar and list mode.
+function publicWaitBody(body) {
+  const { result: taskResult, task, activity, kind: _kind, ...rest } = body;
+  return { ...rest, task: publicTaskHeader(task), activity, result: publicResult(taskResult) };
+}
+
 export function projectDaemonResult(command, result) {
   switch (command) {
     case 'status': return result.status;
@@ -221,8 +247,25 @@ export function projectDaemonResult(command, result) {
     case 'create': case 'spawn':
       return { agent_id: publicTaskId(result.task.agent_id), status: result.task.status, session_id: result.task.session_id ?? null };
     case 'wait': {
-      const { result: taskResult, task, activity, kind: _kind, ...rest } = result;
-      return { ...rest, task: publicTaskHeader(task), activity, result: publicResult(taskResult) };
+      // List-mode response: kind=task_wait_many with a FLAT keyed object —
+      // one key per distinct id carrying the wait body, plus an `error` key
+      // collecting duplicated/unknown ids. Rekey by public numeric id.
+      if (result.kind === 'task_wait_many') {
+        const projected = {};
+        const { error, kind: _kind, ...bodies } = result;
+        for (const [id, body] of Object.entries(bodies)) {
+          projected[publicTaskId(id)] = publicWaitBody(body);
+        }
+        if (error && typeof error === 'object') {
+          const errorProjected = {};
+          for (const [id, marker] of Object.entries(error)) {
+            errorProjected[publicTaskId(id)] = marker;
+          }
+          projected.error = errorProjected;
+        }
+        return projected;
+      }
+      return publicWaitBody(result);
     }
     case 'list': return { tasks: result.tasks.map(publicTask), next_cursor: result.next_cursor ?? null };
     case 'send': return { message_id: result.message_id, disposition: result.disposition };

@@ -536,6 +536,17 @@ impl Scheduler {
             .map(|activity| activity.take_wait_tail())
     }
 
+    /// Read-only wait text: same suffix as `take_wait_tail` without
+    /// advancing the delivery cursor. List-mode waits peek during scan
+    /// rounds and only take once the whole response is being delivered.
+    pub(crate) fn peek_wait_tail(&self, agent_id: &str) -> Option<WaitTail> {
+        let state = self.inner.state.lock().unwrap();
+        state
+            .activities
+            .get(agent_id)
+            .map(|activity| activity.peek_wait_tail())
+    }
+
     pub(crate) fn observation_snapshot(
         &self,
         agent_id: &str,

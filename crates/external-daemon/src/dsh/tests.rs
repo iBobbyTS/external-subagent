@@ -734,7 +734,9 @@ printf '%s\\n' \
 
 #[test]
 fn answerable_server_request_wakes_declared_waits_and_answers_over_acp() {
-    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+    use crate::rpc::{
+        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
+    };
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child parks the turn on a NON-permission server request, which
@@ -795,13 +797,13 @@ while IFS= read -r line; do :; done
     let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
     // Every actionable user-input request wakes without a capability
     // handshake and carries the embedded question.
-    let RpcSuccess::TaskWait {
+    let RpcSuccess::TaskWait(TaskWaitBody {
         pending_requests,
         timed_out,
         ..
-    } = service
+    }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 299,
             message_id: None,
         }))
@@ -848,7 +850,9 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn unsupported_dsh_requests_stay_non_respondable_even_for_answering_callers() {
-    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+    use crate::rpc::{
+        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
+    };
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // One unknown interaction method and one malformed input request
@@ -913,13 +917,13 @@ while IFS= read -r line; do :; done
     let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
     // The sentinel records are neither woken on nor conveyed: the wait
     // times out with an empty projection, and answering them fails closed.
-    let RpcSuccess::TaskWait {
+    let RpcSuccess::TaskWait(TaskWaitBody {
         pending_requests,
         timed_out,
         ..
-    } = service
+    }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
         }))
@@ -943,7 +947,9 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn answerable_request_among_unsupported_noise_is_returned_and_answerable() {
-    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery};
+    use crate::rpc::{
+        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
+    };
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child holds its input request back until the test has planted
@@ -995,13 +1001,13 @@ while IFS= read -r line; do :; done
     }
     std::fs::write(workspace.path().join("ask-now"), "").unwrap();
     let service = Arc::new(RpcService::new(scheduler.clone(), scheduler.store()).unwrap());
-    let RpcSuccess::TaskWait {
+    let RpcSuccess::TaskWait(TaskWaitBody {
         pending_requests,
         timed_out,
         ..
-    } = service
+    }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 299,
             message_id: None,
         }))
@@ -1858,7 +1864,9 @@ fn dsh_active_task_cancel_sends_session_cancel_and_reaps_without_result() {
 }
 #[test]
 fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
-    use crate::rpc::{MessageInput, RpcMethod, RpcOutcome, RpcService, RpcSuccess, TaskWaitQuery};
+    use crate::rpc::{
+        MessageInput, RpcMethod, RpcOutcome, RpcService, RpcSuccess, TaskWaitQuery, WaitTarget,
+    };
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // This child never finishes a prompt itself. Only the real cancellation
@@ -1930,7 +1938,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
     assert!(scheduler.store().message("after-drain").unwrap().is_none());
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
         }))
@@ -2045,7 +2053,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
         .unwrap();
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
         }))
@@ -2082,7 +2090,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
 fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() {
     use crate::rpc::{
         MessageInput, RpcError, RpcErrorCode, RpcMethod, RpcOutcome, RpcService, RpcSuccess,
-        TaskWaitQuery,
+        TaskWaitBody, TaskWaitQuery, WaitTarget,
     };
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
@@ -2117,7 +2125,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     // new spawn is refused by the one admission owner.
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
         }))
@@ -2163,9 +2171,9 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     // The drained task keeps its evidence: still answerable over RPC,
     // with its pending permission intact and nothing reaped underneath
     // the recovery.
-    let RpcSuccess::TaskWait { task, .. } = service
+    let RpcSuccess::TaskWait(TaskWaitBody { task, .. }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
-            agent_id: agent_id.clone(),
+            agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
         }))

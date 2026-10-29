@@ -457,6 +457,29 @@ impl TryFrom<TaskHeaderView> for PublicTaskHeader {
     }
 }
 
+impl TryFrom<crate::rpc::TaskWaitBody> for AgentWaitOutput {
+    type Error = ToolError;
+
+    fn try_from(value: crate::rpc::TaskWaitBody) -> Result<Self, Self::Error> {
+        Ok(Self {
+            task: value.task.try_into()?,
+            pending_requests: value
+                .pending_requests
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            activity: value.activity.into(),
+            result: value.result.map(TryInto::try_into).transpose()?,
+            timed_out: value.timed_out,
+            message_receipt: value.message_receipt.map(|r| PublicMessageReceipt {
+                message_id: r.message_id,
+                state: r.state,
+                failure_code: r.failure_code,
+            }),
+        })
+    }
+}
+
 impl TryFrom<TaskView> for PublicTask {
     type Error = ToolError;
 
@@ -599,6 +622,40 @@ pub struct AgentWaitOutput {
     pub result: Option<PublicResult>,
     pub timed_out: bool,
     pub message_receipt: Option<PublicMessageReceipt>,
+}
+
+/// List-mode wait response: FLAT on the wire — one key per distinct awaited
+/// agent id (public numeric id) carrying that agent's ordinary wait output,
+/// plus one `error` key collecting problematic ids (`duplicated`,
+/// `unknown_agent`). A duplicated id still carries its wait body under its
+/// own key; the repetition is only flagged in `error`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AgentWaitManyOutput {
+    #[serde(flatten)]
+    pub waits: std::collections::BTreeMap<String, AgentWaitElement>,
+    /// Problematic ids and why they were not awaited normally; omitted from
+    /// the wire when empty.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub error: std::collections::BTreeMap<String, String>,
+}
+
+/// Value under each id key: the ordinary per-agent wait output.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AgentWaitElement {
+    Wait(Box<AgentWaitOutput>),
+}
+
+/// Output schema marker for the wait tool: the declared schema accepts both
+/// response forms (the scalar single-agent object and the list-mode keyed
+/// object). Only the JsonSchema derive is used; serialization goes through
+/// the handler's concrete value.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+pub enum AgentWaitAnyOutput {
+    Single(AgentWaitOutput),
+    Many(AgentWaitManyOutput),
 }
 
 #[derive(Debug, Serialize, JsonSchema)]

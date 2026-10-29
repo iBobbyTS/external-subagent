@@ -312,6 +312,22 @@ impl PassiveActivityTracker {
     /// an empty suffix when nothing new arrived.
     pub(crate) fn take_wait_tail(&self) -> WaitTail {
         let mut state = self.state.lock().unwrap();
+        let tail = Self::wait_tail_locked(&state);
+        state.delivered_bytes = state.appended_bytes;
+        tail
+    }
+
+    /// Read-only variant of [`take_wait_tail`]: returns the same
+    /// undelivered suffix without advancing the delivery cursor. List-mode
+    /// waits peek during their scan rounds and only consume (take) once the
+    /// whole response is certain to be delivered, so an interrupted or
+    /// cancelled multi-agent wait never loses activity text.
+    pub(crate) fn peek_wait_tail(&self) -> WaitTail {
+        let state = self.state.lock().unwrap();
+        Self::wait_tail_locked(&state)
+    }
+
+    fn wait_tail_locked(state: &PassiveActivityState) -> WaitTail {
         let appended = state.appended_bytes;
         let window_len = state.latest_text_tail.len() as u64;
         debug_assert!(appended >= window_len);
@@ -326,7 +342,6 @@ impl PassiveActivityTracker {
             debug_assert!(state.latest_text_tail.is_char_boundary(start));
             (state.latest_text_tail[start..].to_owned(), false)
         };
-        state.delivered_bytes = appended;
         WaitTail { text, truncated }
     }
 

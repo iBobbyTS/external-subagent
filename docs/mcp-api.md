@@ -214,13 +214,17 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 | 参数 | 类型／必填与默认 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
-| `agent_id` | integer；必填 | 选择要等待的持久任务 | 缺少报错；无目标无法等待 |
+| `agent_id` | integer 或 integer[]（1–16 个）；必填 | 选择要等待的持久任务；数组形态一次等待多个 subagent（组合等待），推荐并行模式：先逐个 spawn，全部 spawn 完成后再调用一次 `wait([id...])` | 缺少报错；无目标无法等待 |
 | `wait_time` | integer，0–299 秒；默认 290 | 适配调用方超时预算；0 用于立即取快照 | 省略仍可能等 290 秒；移除后客户端不能调整等待预算 |
-| `message_id` | string/null；默认无 | 需要一起查看某条 send 消息回执时使用 | 省略不请求该回执；移除后失去按消息关联反馈的入口 |
+| `message_id` | string/null；默认无 | 需要一起查看某条 send 消息回执时使用；**仅标量 agent_id 支持**（列表形态同时给出则整体校验拒绝） | 省略不请求该回执；移除后失去按消息关联反馈的入口 |
+
+数组形态的等待与唤醒语义：阻塞直到**全部**列出 agent 终态、或**任一** agent 出现可响应 pending（permission/user_input），共享同一个 `wait_time` deadline。数组上限 16 个 id；空数组、元素非 8 位数字、超上限、列表同时携带 `message_id` 均整体校验拒绝。宽容处理集中在返回对象的单一 `error` 键：输入中重复出现的 id 标记 `duplicated`（该 id 本身仍照常等待并返回 wait 内容），格式合法但不存在的 id 标记 `unknown_agent`（不占用等待）；其余 id 不被错误 id 阻塞。
 
 普通进度、消息回执、已响应记录和不可操作类型不提前唤醒。权限请求与用户问题对所有调用方都是可操作的：没有能力握手参数，出现即唤醒。终态结果同样构成提前返回条件。`pending_requests` 投影只含可操作记录、最多 100 条，但唤醒判断扫描完整 pending 集合。取消本次 MCP 等待不等于取消持久任务；取消任务应调用 cancel。
 
 ### 6.2 输出
+
+返回形态由输入决定：**标量 agent_id → 单 wait 对象**（下表六字段，与历史形状完全一致）；**列表 agent_id → 扁平键控对象** `{"<agent_id>": <单 wait 对象>, ..., "error": {"<id>": "duplicated"|"unknown_agent"}}`。键为公共数字 id，每个 id 键下即下表六字段的原样投影（重复 id 只等待一次、照常返回，重复本身仅进入 error 标记），不做跨 agent 合并；`error` 键仅在存在问题 id 时出现。列表元素一律 `message_receipt: null`，每元素 `timed_out` 跟随共享 deadline。
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
@@ -231,7 +235,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
 
-嵌入结果 `next_offset=null` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。终态后的清理（close）与响应（respond）由调用方根据 `result`、`pending_requests` 与工具描述决定；wait 不再携带 advisory instruction 文本。任务失败且该 agent 的 expected/observed 版本不匹配时，版本提示由 spawn 输出的 `version_mismatch` 对象与 result 工具的 `instruction` 承载，wait 不重复。
+嵌入结果 `next_offset=null` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。终态后的清理（close）与响应（respond）由调用方根据 `result`、`pending_requests` 与工具描述决定；wait 不再携带 advisory instruction 文本。任务失败且该 agent 的 expected/observed 版本不匹配时，版本提示由 spawn 输出的 `version_mismatch` 对象与 result 工具的 `instruction` 承载，wait 不重复。列表形态下 N 份 activity/result 线性放大帧体积，2MiB 上限与分级降级链照常兜底（超出时逐元素收缩结果页，游标保持一致，不会把缩短页伪装成 `next_offset=null`）。
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel；需要查看最近跑的是哪条指令或调用参数时，调用 observe。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 
@@ -532,6 +536,14 @@ dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单�
 ```
 
 继续 wait，结果完整后调用 close；若结果未完整则用 result 分页。
+
+**并行多 subagent 模式**：先逐个 spawn 全部 subagent，全部 spawn 完成后再调用一次 wait 并传入全部 id：
+
+```json
+{ "agent_id": [12345678, 23456789, 34567890], "wait_time": 120 }
+```
+
+返回扁平键控：`{"12345678": {…单 wait 对象…}, "34567890": {…}, "error": {"23456789": "unknown_agent"}}`。任一 agent 提问即整体返回，respond 后再次 `wait([...])` 续等；全部终态时每元素内嵌结果首页。重复出现在输入中的 id（如 `[12345678, 12345678]`）照常等待并在自己的键下返回内容，重复仅在 `error` 中标记一次：`"error": {"12345678": "duplicated"}`。
 
 设计精简时，可以区别以下情况，而不把所有字段都视为不可删除：
 
