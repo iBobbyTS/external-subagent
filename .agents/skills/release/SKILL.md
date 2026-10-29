@@ -16,7 +16,45 @@ description: 发布 external-subagent 新版本到 npm（tag 驱动的 GitHub Ac
 2. 提交并推送 `main`
 3. `git tag vX.Y.Z && git push origin vX.Y.Z`
 4. GitHub Actions（`.github/workflows/npm-publish.yml`）在 Apple Silicon runner 上构建并发布。环境里没有任何 npm token，凭证是运行器的 OIDC 身份（npm Trusted Publishing）
-5. 验证：`npm view external-subagent version` 等于新版本号；Actions run 为绿
+5. 验证：`npm view external-subagent version` 等于新版本号；Actions run 为绿（registry 传播可滞后数分钟，`npm view external-subagent@X.Y.Z` 先 404 不代表失败——去 run 日志确认 `+ external-subagent@X.Y.Z` 行）
+6. 发布后本机升级 + 生产冒烟（见下节清单）
+
+## 发布后本机升级 + 生产冒烟（必做）
+
+tag 转绿只证明"CI 环境里二进制能过门禁"；本机生产环境有 CI 复现不了的维度（真实 home、
+PATH 解析出的运行时**路径形态**、已存在的数据/绑定）。v0.6.4 的教训：CI 与 scratch 验证
+全绿，但生产 daemon 把 codex 解析成 `.js` 启动器路径（npm 布局），触发 script 分支的参数
+重复 bug，目录探测 degraded——scratch 验证恰好用了同二进制的无扩展名符号链接形态，只覆盖
+了另一分支。
+
+1. `npm install -g external-subagent@X.Y.Z`（等 registry 传播）
+2. `external-subagent version` 报新版本
+3. `external-subagent update` → `phase: "active"`、`active.version` = 新版本
+4. 确认 daemon 进程从 `payload-store/X.Y.Z/` 起且启动时间是刚刚（`pgrep -f external-subagentd` + `ps -p <pid> -o lstart,command`）
+5. **生产 socket 冒烟**本次变更真正改的行为：对 `~/Library/Application Support/external-subagent/external-subagent.sock` 直接发一条真实请求（node net 客户端，帧 = `{"request_id":"<uuid>","method":<m>,"params":{…}}\n`；注意 adjacent-tag 下 unit variant 的 `system_status` **不带** params 键），断言结果非 degraded
+6. scratch 验证不替代本步骤——scratch 的配置/解析形态是人为构造的，必须至少一条请求打到生产 socket
+
+## CI publish job 失败处置
+
+publish job（"Run release-path test suites" 步）在 macOS runner 上有**已知的间歇失败家族**，
+同签名历史上反复出现（v0.5.3/v0.5.4/v0.6.4）：
+
+- `dsh::tests::abort_drain…` / `aborting a drain reopens real provider admission…`：
+  tests/upgrade/*.test.mjs 的 cargo oracle（`cargo test -p external-daemon <name> -- --exact`
+  逐个单跑）驱动真实 script 子进程，负载高的 runner 上 I/O 同步超时（150s 死限）。
+  代码无关；本地单跑同一 oracle 数秒即绿即可确认。
+- `the win32 platform seam …` / 版本 disagree 类（v0.5.3/v0.5.4 曾发）：结构性失败，
+  **不是**间歇家族，按真实回归处理。
+
+处置判据与流程：
+
+1. `gh run view <id> --log` 找 `✖` 行，与上面家族比对签名
+2. 命中间歇家族 → 先本地复跑对应 oracle（`node --test tests/upgrade/draining.test.mjs`
+   或直接 `cargo test -p external-daemon <过滤串> -- --exact`）；本地绿 + 签名匹配 → 判定环境性
+3. **rerun 前的安全检查（必做）**：`npm view external-subagent@X.Y.Z version`——404 才允许
+   `gh run rerun <id> --failed`；rerun 会重新执行 Publish 步，若版本已在 registry 会撞
+   EPUBLISHCONFLICT 并浪费一次运行
+4. rerun 后仍失败 → 换新版本号修复发版，不要反复 rerun（同 tag rerun 上限与时间成本都不划算）
 
 ## 发布门禁（自动生效，排障先看这里）
 
@@ -49,3 +87,16 @@ npm lifecycle 串起三道门禁，本地 `npm pack` 与 CI publish 都会全部
 - npm 侧绑定（已配置）：npmjs.com → 包 Settings → Trusted publishing → GitHub Actions，iBobbyTS / external-subagent / `npm-publish.yml` / environment 留空
 - provenance 公开包自动生成，无需 `--provenance` 标志；`publishConfig` 里**不要**加回 `provenance: true`——本地 publish 会因无 OIDC provider 直接 EUSAGE 失败
 - debug 变体（`EXTERNAL_SUBAGENT_VARIANT=debug`）与发布无关：其 payload 与插件源是开发机构建产物（gitignored），且被 postpack 明确拒绝在发布包之外
+
+## 运行时路径形态覆盖（新增子进程/探测路径时的测试义务）
+
+`runtime_command`（agent_status.rs）按解析出的 runtime 路径**扩展名**分派：`.js/.cjs/.mjs`
+走 `node <script>` 并**自动追加子命令**；无扩展名/原生二进制走直接执行。同一个 codex/zcode
+安装在本机可能以三种形态被解析到——npm 布局的真实 `.js` 启动器、Homebrew 式无扩展名符号
+链接、原生二进制——**分支不同，参数拼接也不同**。新增任何"启动 runtime 子进程"的代码时：
+
+- 测试夹具必须同时覆盖 script 形态与原生形态（一个 `.mjs` 夹具 + 一个可执行脚本夹具），
+  或至少断言最终 argv 不含重复子命令
+- live 验证要核对**生产 daemon 实际解析到的路径**（`agent_probe` local 层的
+  `runtime_path`），不要默认 scratch 环境的解析形态与生产一致——v0.6.4 的目录探测 bug
+  正是只在无扩展名形态下验证、script 形态带了重复 `app-server`

@@ -46,6 +46,19 @@ node scripts/test/affected.mjs --list      # 列全部块与成本
 - `tests/<dir>/x.test.mjs` → 对应 node 块；`tests/live-agent/**` → rust:daemon-full。
 - **未知路径策略**：只有白名单输出"无需运行"；任何未映射路径选择保守全量并显式标注原因。
 
+## CI-only 测试面（本地 test:affected 覆盖不到）
+
+`tests/upgrade/*.test.mjs`（draining/cancel 等cargo-oracle 包装）不在本地任何选择器块里，
+**只在 CI publish job 的 "Run release-path test suites" 步执行**（`node --test tests/upgrade/*.test.mjs`
+是 CI 专属命令行）。后果：
+
+- 本地全绿 ≠ 这层绿；发版 tag 是它们的主执行场。
+- 这层的 dsh drain-oracle（`abort_drain…` / `aborting a drain reopens real provider
+  admission…`，真实 script 子进程 I/O 同步，150s 死限）在负载高的 macOS runner 上**间歇
+  超时**——同签名至少 v0.5.3、v0.5.4、v0.6.4 三次出现，本地单跑数秒即绿。这是环境性
+  失败家族，处置（rerun 前的 npm 安全检查、签名比对、何时换新版本号）见
+  `.agents/skills/release/SKILL.md` 的「CI publish job 失败处置」。
+
 ## 维护规则
 
 - 新增测试目录或 crate：同步 `BLOCKS` + `IMPACT_RULES` + 本文档；`tests/cli/affected.test.mjs` 有表驱动校验（块表一致性、映射、消重、--fast、rename/untracked 采集）。

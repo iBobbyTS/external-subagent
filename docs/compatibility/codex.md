@@ -252,6 +252,17 @@ and the global "plan must be empty" rule are unchanged.
   removed, non-hidden `id` tokens projected (≤512 bytes each, deduplicated,
   sorted, ≤256 raw entries), 60 s whole-exchange deadline, source label
   `codex_app_server_model_list`.
+- **OBSERVED** (2026-10-29, v0.6.4→v0.6.5): the launch line above is
+  path-form dependent. A npm-layout codex resolves to the real
+  `…/bin/codex.js` launcher — the script path takes `runtime_command`'s
+  `node <script> app-server` reconstruction, so the probe must append only
+  `--listen stdio://`; appending `app-server` again spawns
+  `node codex.js app-server app-server …` which exits 2 with "unrecognized
+  subcommand" and degrades the catalog to `transport` (fixed in v0.6.5).
+  The same install can also surface as an extension-less symlink
+  (`/opt/homebrew/bin/codex` → the `.js`), which takes the direct-execution
+  branch and appends the full subcommand. Any new child-launch site must
+  test both resolution forms.
 
 ## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED + live max turn RUN)
 
