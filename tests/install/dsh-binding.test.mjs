@@ -433,3 +433,130 @@ test('uninstallAllDshBindings releases every bound profile and the shared skill'
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+// --- persistent-registry reconcile (the desktop-rewrite restore path) ---
+
+import { registerDshBinding, unregisterDshBinding, loadDshBindings, canonicalHome } from '../../cli/install/dsh-registry.mjs';
+
+function registryFileFor(paths) {
+  return path.join(paths.data, 'dsh-bindings.json');
+}
+
+test('reconcile restores a registered profile whose sentinel was dropped by a dsh desktop rewrite', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    const patchFile = path.join(dshHome, 'profiles', 'web', 'cordis.patch.yml');
+    const skillFile = path.join(dshHome, 'skills', 'external-subagent', 'SKILL.md');
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    registerDshBinding(paths, dshHome, 'web', { status: 'claimed' });
+    assert.ok(fs.existsSync(skillFile), 'precondition: skill staged');
+    // The dsh desktop rewrites the user layer wholesale: sentinel, managed
+    // block, and the staged skill all vanish.
+    fs.writeFileSync(patchFile, SHIPPED_TEMPLATE);
+    fs.rmSync(path.join(dshHome, 'skills', 'external-subagent'), { recursive: true, force: true });
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    const entry = result.profiles.find((item) => item.profile === 'web');
+    assert.equal(entry?.status, 'rebound', 'a dropped binding is restored, not forgotten');
+    assert.ok(readPatch(patchFile).includes(SENTINEL), 'the managed block is back');
+    assert.ok(fs.existsSync(skillFile), 'the staged skill is back');
+    const registry = JSON.parse(fs.readFileSync(registryFileFor(paths), 'utf8'));
+    assert.equal(registry.bindings[0].last_status, 'rebound');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconcile adopts a sentinel-bearing profile absent from the registry', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    // Bound by an older build (or by hand): sentinel present, registry empty.
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    assert.equal(result.profiles.find((item) => item.profile === 'web')?.status, 'updated');
+    const registry = JSON.parse(fs.readFileSync(registryFileFor(paths), 'utf8'));
+    assert.deepEqual(registry.bindings.map((entry) => entry.profile), ['web'], 'adoption writes the claim');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconcile reports a registered profile whose directory vanished without failing', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    registerDshBinding(paths, dshHome, 'web', { status: 'claimed' });
+    fs.rmSync(path.join(dshHome, 'profiles', 'web'), { recursive: true, force: true });
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    assert.equal(result.profiles.find((item) => item.profile === 'web')?.status, 'missing_profile_dir');
+    const registry = JSON.parse(fs.readFileSync(registryFileFor(paths), 'utf8'));
+    assert.equal(registry.bindings[0].last_status, 'missing_profile_dir');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('reconcile keeps registry entries of other dsh homes untouched', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    const otherHome = path.join(home, 'other-dsh');
+    registerDshBinding(paths, otherHome, 'web', { status: 'claimed' });
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    assert.equal(result.bound, false, 'the foreign home claim is not acted on');
+    const registry = JSON.parse(fs.readFileSync(registryFileFor(paths), 'utf8'));
+    assert.equal(registry.bindings.length, 1);
+    // The registry key is the canonical (deepest-existing-ancestor
+    // realpath) form, stable whether or not the home directory exists yet.
+    assert.equal(registry.bindings[0].home, canonicalHome(otherHome));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a corrupted registry is preserved and recovered, then reconcile proceeds', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    fs.mkdirSync(paths.data, { recursive: true });
+    fs.writeFileSync(registryFileFor(paths), '{ not json');
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    assert.equal(result.recovery?.status, 'recovered');
+    assert.ok(result.recovery.backup.includes('.corrupt-'), 'the bad bytes are preserved as evidence');
+    assert.equal(JSON.parse(fs.readFileSync(registryFileFor(paths), 'utf8')).bindings.length, 0);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('uninstalling a profile releases its registry claim; uninstallAll clears the rest', () => {
+  const { home, paths, dshHome } = fixture({ patch: SHIPPED_TEMPLATE });
+  try {
+    const headlessDir = path.join(dshHome, 'profiles', 'headless');
+    fs.mkdirSync(headlessDir, { recursive: true });
+    fs.writeFileSync(path.join(headlessDir, 'cordis.patch.yml'), SHIPPED_TEMPLATE);
+    installDshPlugin(paths, { dshHome, profile: 'web', verify: okVerify });
+    installDshPlugin(paths, { dshHome, profile: 'headless', verify: okVerify });
+    registerDshBinding(paths, dshHome, 'web', { status: 'claimed' });
+    registerDshBinding(paths, dshHome, 'headless', { status: 'claimed' });
+    const claim = unregisterDshBinding(paths, dshHome, 'web');
+    assert.equal(claim.unregistered, true);
+    assert.equal(claim.bindings, 1, 'the sibling claim survives');
+    uninstallAllDshBindings(paths, { dshHome });
+    const { registry } = loadDshBindings(paths);
+    assert.equal(registry.bindings.length, 0, 'product uninstall releases every claim');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a sentinel-less registered profile with no directory is reported once, not duplicated', () => {
+  const home = fixtureHome();
+  try {
+    const paths = fixturePaths(home);
+    const dshHome = path.join(home, '.dsh');
+    registerDshBinding(paths, dshHome, 'ghost', { status: 'claimed' });
+    fs.mkdirSync(path.join(dshHome, 'profiles'), { recursive: true });
+    const result = reconcileDshBindings(paths, { dshHome, verify: okVerify });
+    assert.deepEqual(result.profiles, [{ profile: 'ghost', status: 'missing_profile_dir' }]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

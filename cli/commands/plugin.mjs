@@ -1,8 +1,9 @@
 import { CliError } from '../errors.mjs';
 import { installMcp, installPlugin, uninstallPlugin } from '../install/codex.mjs';
 import { installZcodePlugin, uninstallZcodePlugin } from '../install/zcode.mjs';
-import { installDshPlugin, uninstallDshPlugin } from '../install/dsh.mjs';
+import { installDshPlugin, uninstallDshPlugin, dshHomeFor } from '../install/dsh.mjs';
 import { registerCodexHome, unregisterCodexHome } from '../install/reconcile.mjs';
+import { registerDshBinding, unregisterDshBinding } from '../install/dsh-registry.mjs';
 import { verifyPayload } from '../install/payload.mjs';
 
 // Command surface for the managed host bindings.  `install-plugin` takes an
@@ -68,7 +69,23 @@ export function pluginCommand(paths, args) {
     // error at the CLI parsing boundary with the other flag-combination
     // errors instead of deep inside the installer.
     if (!options.profile) throw new CliError('INVALID_ARGUMENT', 'the dsh host requires --profile <name>', 2);
-    return options.uninstall ? uninstallDshPlugin(paths, installerOptions) : installDshPlugin(paths, installerOptions);
+    const result = options.uninstall ? uninstallDshPlugin(paths, installerOptions) : installDshPlugin(paths, installerOptions);
+    // Registry bookkeeping survives a dsh-desktop rewrite that drops the
+    // managed block: a registered profile is RESTORED by reconcile, an
+    // unregistered one is forgotten.  Dry-runs never touch the registry.
+    if (!options.dry_run) {
+      const dshHome = dshHomeFor(installerOptions, paths);
+      if (options.uninstall) {
+        if (result.uninstalled) {
+          const claim = unregisterDshBinding(paths, dshHome, options.profile);
+          result.claim_released = claim.unregistered;
+        }
+      } else if (result.installed) {
+        const claim = registerDshBinding(paths, dshHome, options.profile, { status: 'claimed' });
+        result.claim = { registered: claim.registered, deduplicated: claim.deduplicated, bindings: claim.bindings };
+      }
+    }
+    return result;
   }
   if (options.profile) throw new CliError('INVALID_ARGUMENT', '--profile applies to the dsh host only', 2);
   if (options.dshHome) throw new CliError('INVALID_ARGUMENT', '--dsh-home applies to the dsh host only', 2);

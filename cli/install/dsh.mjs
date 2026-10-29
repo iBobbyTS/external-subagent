@@ -7,6 +7,7 @@ import { atomicWrite, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { MCP_BIN_NAME } from '../constants.mjs';
 import { nativeBinary, pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
 import { guardedRestores } from './plugin-stage.mjs';
+import { loadDshBindings, persistRegistry as persistDshRegistry, dshBindingsRegistryPath, canonicalHome } from './dsh-registry.mjs';
 
 // Managed DSH host binding.  DSH boots profiles as an ordered stack of
 // plugin-bundle patch layers under the user's own overrides; the user layer
@@ -17,9 +18,11 @@ import { guardedRestores } from './plugin-stage.mjs';
 // into the user skill root (<dshHome>/skills), which dsh-skill-filesystem
 // scans by default (rank 400; OBSERVED against dsh 0.2.0-rc.2).  It never
 // touches the profile's package.json, bundles, node_modules, or any dsh
-// market/plugin-install state.  There is no registry file: the binding is
-// fully derivable from the patch sentinel plus the staged skill, so
-// reconcile and uninstall detect rather than remember it (the zcode model).
+// market/plugin-install state.  Claims also live in the persistent
+// dsh-bindings.json registry (dsh-registry.mjs): the dsh desktop rewrites
+// cordis.patch.yml wholesale on upgrade and DROPS the managed block
+// (OBSERVED 2026-10-28), so reconcile pairs the sentinel scan with the
+// registry to RESTORE a dropped binding instead of forgetting it.
 
 // The MCP client plugin is resolved by the dsh loader from the CLI's own
 // install tree when the bare package name is used (OBSERVED: a fresh
@@ -546,61 +549,135 @@ export function uninstallDshPlugin(paths, options = {}) {
   };
 }
 
-// Stateless reconcile for update flows (the zcode model): every profile
-// directory whose patch file carries the sentinel is rebound; the skill is
-// refreshed alongside.  Unknown/corrupt states are reported, never fatal to
-// the caller's broader reconcile.
+// Reconcile for update flows: the persistent registry (dsh-bindings.json)
+// UNION the sentinel scan.  The scan alone follows the zcode model — detect
+// rather than remember — but the dsh desktop rewrites cordis.patch.yml
+// wholesale on upgrade and DROPS the managed block (OBSERVED 2026-10-28),
+// after which a sentinel-only reconcile silently forgets the profile was
+// ever bound.  Registry entries therefore drive a RESTORE: a registered
+// profile whose patch lost the sentinel is re-bound (status `rebound`),
+// and one whose profile directory itself vanished is reported
+// (`missing_profile_dir`) without failing the reconcile.  Profiles bearing
+// the sentinel but absent from the registry (bound by an older build, or
+// by hand) are adopted into the registry so future drops restore too.
 export function reconcileDshBindings(paths, options = {}) {
   const dshHome = dshHomeFor(options, paths);
+  // Registry entries store realpath-resolved homes (registerDshBinding
+  // resolves); compare and dedupe against the SAME resolved form, or a
+  // symlinked dshHome (/var -> /private/var on macOS tmpdirs) would never
+  // match its own registry claims.
+  const resolvedHome = canonicalHome(dshHome);
   const profilesRoot = path.join(dshHome, 'profiles');
-  let entries;
-  try {
-    entries = fs.readdirSync(profilesRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-  } catch (error) {
-    if (error?.code === 'ENOENT') return { bound: false, profiles: [], note: 'no dsh profiles directory' };
-    return { bound: false, profiles: [], error: { code: 'DSH_PROFILES_UNREADABLE', message: error.message } };
-  }
+  const { registry, recovery } = loadDshBindings(paths);
   const results = [];
-  for (const entry of entries) {
-    if (DSH_FORBIDDEN_PROFILES.includes(entry.name)) continue;
-    const patchFile = path.join(profilesRoot, entry.name, 'cordis.patch.yml');
-    const bytes = readOptional(patchFile);
-    if (bytes === null || !bytes.toString('utf8').includes(SENTINEL)) continue;
-    try {
-      const install = installDshPlugin(paths, { ...options, profile: entry.name });
-      results.push({ profile: entry.name, status: 'updated', idempotent: Boolean(install.idempotent) });
-    } catch (error) {
-      results.push({ profile: entry.name, status: 'failed', error: { code: error.code || 'DSH_BINDING_FAILED', message: error.message } });
+  const visited = new Set();
+  let directories = [];
+  let profilesRootAbsent = false;
+  try {
+    directories = fs.readdirSync(profilesRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch (error) {
+    if (error?.code === 'ENOENT') profilesRootAbsent = true;
+    else {
+      return { bound: false, profiles: [], error: { code: 'DSH_PROFILES_UNREADABLE', message: error.message }, ...(recovery ? { recovery } : {}) };
     }
   }
-  return { bound: results.length > 0, profiles: results };
+  const directorySet = new Set(directories);
+  // Sentinel scan: refresh every surviving binding and adopt unregistered ones.
+  for (const name of directories) {
+    if (DSH_FORBIDDEN_PROFILES.includes(name)) continue;
+    const patchFile = path.join(profilesRoot, name, 'cordis.patch.yml');
+    const bytes = readOptional(patchFile);
+    if (bytes === null || !bytes.toString('utf8').includes(SENTINEL)) continue;
+    visited.add(`${resolvedHome}\u0000${name}`);
+    try {
+      installDshPlugin(paths, { ...options, profile: name });
+      upsertRegistryEntry(registry, resolvedHome, name, 'updated');
+      results.push({ profile: name, status: 'updated', idempotent: true });
+    } catch (error) {
+      results.push({ profile: name, status: 'failed', error: { code: error.code || 'DSH_BINDING_FAILED', message: error.message } });
+    }
+  }
+  // Registry pass: restore registered profiles whose sentinel was dropped.
+  for (const entry of registry.bindings) {
+    if (entry.home !== resolvedHome) continue;
+    if (visited.has(`${entry.home}\u0000${entry.profile}`)) continue;
+    if (DSH_FORBIDDEN_PROFILES.includes(entry.profile)) continue;
+    if (!directorySet.has(entry.profile)) {
+      entry.last_status = 'missing_profile_dir';
+      results.push({ profile: entry.profile, status: 'missing_profile_dir' });
+      continue;
+    }
+    try {
+      installDshPlugin(paths, { ...options, dshHome: entry.home, profile: entry.profile });
+      entry.last_status = 'rebound';
+      entry.last_sync_ms = Date.now();
+      results.push({ profile: entry.profile, status: 'rebound' });
+    } catch (error) {
+      entry.last_status = 'failed';
+      results.push({ profile: entry.profile, status: 'failed', error: { code: error.code || 'DSH_BINDING_FAILED', message: error.message } });
+    }
+  }
+  if (results.length > 0 || fs.existsSync(dshBindingsRegistryPath(paths))) {
+    persistDshRegistry(paths, registry);
+  }
+  return {
+    bound: results.length > 0,
+    profiles: results,
+    ...(profilesRootAbsent ? { note: 'no dsh profiles directory' } : {}),
+    ...(recovery ? { recovery } : {}),
+  };
+}
+
+// Insert or refresh a registry entry in place (the loaded registry object is
+// the caller's working copy; persisting happens once at the end).
+function upsertRegistryEntry(registry, dshHome, profile, status) {
+  const home = canonicalHome(dshHome);
+  const existing = registry.bindings.find((entry) => entry.home === home && entry.profile === profile);
+  if (existing) {
+    existing.last_status = status;
+    existing.last_sync_ms = Date.now();
+  } else {
+    registry.bindings.push({
+      home,
+      profile,
+      claimed_at_ms: Date.now(),
+      last_sync_ms: Date.now(),
+      last_status: status,
+    });
+  }
 }
 
 // Product uninstall: release every detected binding at once.  Detection is
-// the same sentinel scan as reconcile; each profile is uninstalled
-// independently (a failure on one never skips the rest, matching the
-// per-home codex release posture), and the shared staged skill is removed
-// when no bound profile remains.
+// the same sentinel scan plus the registry, so a desktop-rewritten patch
+// (sentinel dropped) is still unregistered even though its block is gone.
+// Each profile is uninstalled independently (a failure on one never skips
+// the rest, matching the per-home codex release posture), and the shared
+// staged skill is removed when no bound profile remains.
 export function uninstallAllDshBindings(paths, options = {}) {
   const dshHome = dshHomeFor(options, paths);
   const profilesRoot = path.join(dshHome, 'profiles');
-  let entries;
+  let entries = [];
   try {
-    entries = fs.readdirSync(profilesRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-  } catch {
-    return { released: 0, profiles: [] };
+    entries = fs.readdirSync(profilesRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch { /* registry pass below still releases claims */ }
+  const names = new Set(entries);
+  const resolvedHome = canonicalHome(dshHome);
+  const { registry } = loadDshBindings(paths);
+  for (const entry of registry.bindings) {
+    if (entry.home === resolvedHome) names.add(entry.profile);
   }
   const results = [];
-  for (const entry of entries) {
-    if (DSH_FORBIDDEN_PROFILES.includes(entry.name)) continue;
-    const patchFile = path.join(profilesRoot, entry.name, 'cordis.patch.yml');
-    const bytes = readOptional(patchFile);
-    if (bytes === null || !bytes.toString('utf8').includes(SENTINEL)) continue;
+  for (const name of names) {
+    if (DSH_FORBIDDEN_PROFILES.includes(name)) continue;
     try {
-      const removed = uninstallDshPlugin(paths, { ...options, profile: entry.name });
-      results.push({ profile: entry.name, status: removed.uninstalled ? 'released' : 'absent' });
+      const removed = uninstallDshPlugin(paths, { ...options, profile: name });
+      results.push({ profile: name, status: removed.uninstalled ? 'released' : 'absent' });
     } catch (error) {
-      results.push({ profile: entry.name, status: 'failed', error: { code: error.code || 'DSH_BINDING_RELEASE_FAILED', message: error.message } });
+      results.push({ profile: name, status: 'failed', error: { code: error.code || 'DSH_BINDING_RELEASE_FAILED', message: error.message } });
     }
   }
   // The skill is shared across profiles; remove it once no binding remains.
@@ -609,5 +686,10 @@ export function uninstallAllDshBindings(paths, options = {}) {
       unstageSkill(dshHome, options.source || pluginSourceRoot());
     } catch { /* reported per-profile above; a stuck skill never fails the release */ }
   }
-  return { released: results.filter((result) => result.status === 'released').length, profiles: results };
+  // Release every registry claim for THIS dsh home (other homes keep theirs).
+  const before = registry.bindings.length;
+  registry.bindings = registry.bindings.filter((entry) => entry.home !== resolvedHome);
+  const registry_cleared = before !== registry.bindings.length || fs.existsSync(dshBindingsRegistryPath(paths));
+  if (registry_cleared) persistDshRegistry(paths, registry);
+  return { released: results.filter((result) => result.status === 'released').length, profiles: results, registry_cleared };
 }

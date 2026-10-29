@@ -131,14 +131,24 @@ DSH 除作为 subagent 外也可作为 host 调用本产品。内置绑定命令
   loader 从 CLI 自带安装树解析（实测全新 DSH_HOME 无 profile node_modules
   也能干净组合）。安装时探测 CLI 安装树中该包的存在性，缺失时回执附
   warning 并给出 `dsh plugin --profile <name> add ...` 补装指引，不静默。
-- **无注册表**：绑定状态从 patch 哨兵无状态推导（zcode 模式）。reconcile
-  扫描 `$DSH_HOME/profiles/*/cordis.patch.yml` 的哨兵并逐 profile 重绑（含
-  desktop）；`uninstall` 释放所有哨兵 profile 并移除共享 skill（仅当内容仍是
-  产品字节），同时剥离携带本条目 id 的顶层 `disabled` 覆盖行（dsh 的
-  plugin manager 开关后留下的 `{id, disabled}` 行——块删掉后它指向空目标，
-  dsh 每次启动报 `patch: entry not found`，且会被本产品下次安装的 dump
-  验证误判为失败；携带 `name`/`config` 的同 id 用户行不属此列，保留）。
-  部分失败按 profile 逐项上报（`DSH_SYNC_PARTIAL`），可重跑 reconcile 补齐。
+- **持久注册表 + 哨兵扫描**：绑定声明持久化于 `$DATA/dsh-bindings.json`
+  （codex-homes D08 同款模式：原子写、逐条 status 记账、损坏时备份
+  `.corrupt-<ts>` 后重置为空表继续，不阻断调用方）。reconcile 取
+  **注册表 ∪ 哨兵扫描**的并集：哨兵存活的 profile 逐个重绑（含 desktop）
+  并把未注册者收养入注册表；注册过但哨兵被 dsh 桌面端整体重写丢掉的
+  profile（OBSERVED 2026-10-28，0.2.1-rc.3 升级重写 cordis.patch.yml 连带
+  清掉受管块与 staged skill）自动**补绑**（status `rebound`）；注册过但
+  profile 目录消失的报 `missing_profile_dir` 不 fatal；其他 dsh home 的
+  注册条目不动。注册键为 canonical home（最深存在祖先的 realpath），对
+  符号链接 tmpdir 与尚不存在的目录稳定。`install-plugin` 成功即注册、
+  `--uninstall` 成功即注销（dry-run 不写）；`uninstall` 释放所有哨兵或
+  注册的 profile 并移除共享 skill（仅当内容仍是产品字节），同时剥离携带
+  本条目 id 的顶层 `disabled` 覆盖行（dsh 的 plugin manager 开关后留下的
+  `{id, disabled}` 行——块删掉后它指向空目标，dsh 每次启动报
+  `patch: entry not found`，且会被本产品下次安装的 dump 验证误判为失败；
+  携带 `name`/`config` 的同 id 用户行不属此列，保留），最后清空该 home
+  的注册条目。部分失败按 profile 逐项上报（`DSH_SYNC_PARTIAL`），可重跑
+  reconcile 补齐。
 - **边界**：dump 验证只证明组合合法；真实工具注入需用户 boot 该 profile 后
   自行确认。用户手工破坏哨兵块时，卸载走 `serverName: external_subagent`
   兜底搜索并 warning，绝不改动用户条目。

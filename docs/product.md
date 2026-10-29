@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `host.codex` | 支持多个 instance | `hosts.codex.installations[].home` | 每个 `home` 代表一个独立 Codex 安装绑定；同步、状态和解绑按 home 分别报告 |
 | `host.zcode` | 单 instance（单用户配置，无 home 概念） | `~/.zcode/cli/config.json` 的 `plugins.dirs` | 由 `install-plugin zcode` 注册一个受管 inline plugin 目录；绑定状态从 config 无状态推导，不设注册表 |
-| `host.dsh` | 每 profile 一条绑定（`$DSH_HOME/profiles/<name>/cordis.patch.yml` 的哨兵块） | `install-plugin dsh --profile <name>` | 受管块为一条钉死 `id: mcp-external-subagent` 的 `dsh-mcp-client` stdio 条目 + 共享 user skill（`$DSH_HOME/skills`）；绑定状态从哨兵无状态推导；`desktop` 走 Electron CLI 镜像 dump 验证（Linux 拒绝） |
+| `host.dsh` | 每 profile 一条绑定（`$DSH_HOME/profiles/<name>/cordis.patch.yml` 的哨兵块） | `install-plugin dsh --profile <name>` | 受管块为一条钉死 `id: mcp-external-subagent` 的 `dsh-mcp-client` stdio 条目 + 共享 user skill（`$DSH_HOME/skills`）；绑定声明持久化于 `$DATA/dsh-bindings.json`，reconcile 取注册表 ∪ 哨兵扫描并集，丢失哨兵自动补绑；`desktop` 走 Electron CLI 镜像 dump 验证（Linux 拒绝） |
 | `host.custom` | 支持任意未注册本机 MCP client；不要求持久化 instance | 无需配置 | 连接按 MCP session 识别；不提供安装或自动升级绑定，也不要求预先登记 |
 | `subagents.zcode`、`subagents.dsh`、`subagents.codex`、`subagents.agy` | 暂不支持多个 instance | `subagents.<name>` | 一个名称只对应一个受管 runtime/home；不承诺按任务选择多个同名实例 |
 
@@ -118,8 +118,9 @@ marketplace/cache/安装记录状态；配置合并原子并保留全部无关�
 `toolCallTimeoutMs: 300000` 覆盖 dsh 默认 60s），并把 SKILL.md 装载到
 `$DSH_HOME/skills/external-subagent/`（dsh-skill-filesystem 默认扫描的 user
 root）。写入后以 `dsh --profile <name> --dump-config` 验证组合（stderr 的
-`patch: ... not found` 即 fail-closed），失败整体回滚。绑定状态从哨兵无状态
-推导，reconcile 逐 profile 重绑，`uninstall` 释放全部哨兵 profile 与共享
+`patch: ... not found` 即 fail-closed），失败整体回滚。绑定声明持久化于 `$DATA/dsh-bindings.json`，reconcile 取注册表 ∪ 哨兵扫描
+并集（注册过但哨兵被 dsh 桌面端重写丢掉的 profile 自动补绑），`uninstall` 释放
+全部注册或哨兵 profile 与共享
 skill。详见 [compatibility/dsh.md](compatibility/dsh.md)。
 
 plugin manifest 的 `version` 是 Codex 全局 content-store 的缓存身份（`plugin@marketplace@version`），每个发布候选必须携带独立版本（最终候选 C2 为 `0.1.2`；修复前的 C1 是 `0.1.1`，两次消费运行已分别把各自身份写入全局 store，后续候选同样需要再提升版本），否则已缓存同一身份的其他 home 会覆盖新候选的字节。C2 已于 2026-09-13 完成自己的 fresh consumer 验收（`C2_FRESH_CONSUMER_VERIFICATION_PASS`）：通过公开安装面装入隔离 prefix，`install-plugin` 回执 `cache_verified: true` 且 cache 与 staged binding 逐字节一致，四格矩阵（DSH/ZCode × 公开 CLI / 真实 Codex CLI→受管 plugin→MCP）全部真实上游任务 COMPLETED；C1 的四格证据保留为该候选的历史记录，不随身份提升继承。安装器在返回成功前会读回实际 cache 的 `.mcp.json`/manifest 并与本次 staged binding 比对：复用了其他 binding 的字节以 `CODEX_CACHE_BINDING_MISMATCH` 显式失败，cache 缺失或不可读以 `CODEX_CACHE_UNVERIFIABLE` 显式失败（均 fail-closed——不存在返回 `installed`/`cache_verified: false` 的路径，cache 缺失本身就使整个安装失败）；只有校验通过的 cache 才会以 `cache_verified: true` 返回并记录 installed/claimed/updated，且安装器从不改动 Codex cache 本身；详见 [compatibility/codex.md](compatibility/codex.md)。
