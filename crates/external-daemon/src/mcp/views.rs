@@ -634,9 +634,14 @@ pub struct AgentWaitManyOutput {
     #[serde(flatten)]
     pub waits: std::collections::BTreeMap<String, AgentWaitElement>,
     /// Problematic ids and why they were not awaited normally; omitted from
-    /// the wire when empty.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub error: std::collections::BTreeMap<String, String>,
+    /// the wire when empty.  Option (not skip_serializing_if on a required
+    /// map) so the GENERATED schema leaves the key out of `required`: MCP
+    /// host clients validate structured output against the declared schema,
+    /// and a schema-required `error` would reject every successful response
+    /// that legitimately omits it (observed: dsh-mcp-client failing the
+    /// whole list-mode wait on the missing `error` key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Value under each id key: the ordinary per-agent wait output.
@@ -1072,5 +1077,93 @@ mod version_mismatch_projection_tests {
         assert!(version_mismatch(Some("1.0.0"), None).is_none());
         assert!(version_mismatch(Some("1.0.0"), Some("1.0.0")).is_none());
         assert!(version_mismatch(Some("1.0.0"), Some("1.0.1")).is_some());
+    }
+}
+
+#[cfg(test)]
+mod wait_many_schema_tests {
+    use super::*;
+    use schemars::schema_for;
+
+    fn wait_output() -> AgentWaitOutput {
+        AgentWaitOutput {
+            task: PublicTaskHeader {
+                agent_id: 10000001,
+                status: "completed".into(),
+            },
+            pending_requests: Vec::new(),
+            activity: PublicActivity {
+                latest_text_tail: String::new(),
+                latest_text_truncated: false,
+                tool_calls_last_60s: 0,
+                in_flight_tool_count: 0,
+                model_request_active: false,
+                last_activity_age_ms: None,
+                oldest_in_flight_tool_age_ms: None,
+                telemetry_status: PublicTelemetryStatus::Unavailable,
+            },
+            result: None,
+            timed_out: false,
+            message_receipt: None,
+        }
+    }
+
+    fn many_output(error: Option<std::collections::BTreeMap<String, String>>) -> AgentWaitManyOutput {
+        let mut waits = std::collections::BTreeMap::new();
+        waits.insert(
+            "10000001".to_owned(),
+            AgentWaitElement::Wait(Box::new(wait_output())),
+        );
+        AgentWaitManyOutput { waits, error }
+    }
+
+    #[test]
+    fn wait_many_schema_does_not_require_the_error_key() {
+        // The declared output schema must accept a successful list-mode
+        // response that legitimately omits `error` (it is only present when
+        // an id was duplicated or unknown).  skip_serializing_if on a
+        // required map keeps the key in schema `required`, and MCP host
+        // clients that validate structured output against the schema then
+        // reject every successful response (observed: dsh-mcp-client).
+        let schema = schema_for!(AgentWaitManyOutput);
+        let root = serde_json::to_value(&schema).unwrap();
+        let required = root["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|v| v == "error"),
+            "error must not be schema-required: {required:?}"
+        );
+    }
+
+    #[test]
+    fn wait_many_success_wire_omits_error_and_error_wire_carries_it() {
+        let success = serde_json::to_value(many_output(None)).unwrap();
+        assert!(success.get("error").is_none(), "{success}");
+        assert!(success.get("10000001").is_some());
+
+        let mut error = std::collections::BTreeMap::new();
+        error.insert("10000002".to_owned(), "unknown_agent".to_owned());
+        let flagged = serde_json::to_value(many_output(Some(error))).unwrap();
+        assert_eq!(
+            flagged["error"]["10000002"].as_str(),
+            Some("unknown_agent")
+        );
+    }
+}
+
+#[cfg(test)]
+mod wait_many_schema_settings_probe {
+    use super::*;
+    use schemars::generate::SchemaSettings;
+
+    #[test]
+    fn draft202012_generator_option_field_is_not_required() {
+        let generator = SchemaSettings::draft2020_12().into_generator();
+        let schema = generator.into_root_schema_for::<AgentWaitManyOutput>();
+        let root = serde_json::to_value(&schema).unwrap();
+        let required = root["required"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !required.iter().any(|v| v == "error"),
+            "draft2020-12 generator must not require error: {required:?} — full: {root}"
+        );
     }
 }

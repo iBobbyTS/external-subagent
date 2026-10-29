@@ -224,7 +224,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 ### 6.2 输出
 
-返回形态由输入决定：**标量 agent_id → 单 wait 对象**（下表六字段，与历史形状完全一致）；**列表 agent_id → 扁平键控对象** `{"<agent_id>": <单 wait 对象>, ..., "error": {"<id>": "duplicated"|"unknown_agent"}}`。键为公共数字 id，每个 id 键下即下表六字段的原样投影（重复 id 只等待一次、照常返回，重复本身仅进入 error 标记），不做跨 agent 合并；`error` 键仅在存在问题 id 时出现。列表元素一律 `message_receipt: null`，每元素 `timed_out` 跟随共享 deadline。
+返回形态由输入决定：**标量 agent_id → 单 wait 对象**（下表六字段，与历史形状完全一致）；**列表 agent_id → 扁平键控对象** `{"<agent_id>": <单 wait 对象>, ..., "error": {"<id>": "duplicated"|"unknown_agent"}}`。键为公共数字 id，每个 id 键下即下表六字段的原样投影（重复 id 只等待一次、照常返回，重复本身仅进入 error 标记），不做跨 agent 合并；`error` 键仅在存在问题 id 时出现（成功响应省略该键；声明的 output schema 中它不是必填，MCP 宿主按 schema 校验结构化输出时不会因缺 `error` 拒绝成功响应）。列表元素一律 `message_receipt: null`，每元素 `timed_out` 跟随共享 deadline。
 
 | 字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|

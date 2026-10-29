@@ -535,7 +535,7 @@ impl SubagentMcp {
                 }
                 let output = AgentWaitManyOutput {
                     waits: projected,
-                    error,
+                    error: if error.is_empty() { None } else { Some(error) },
                 };
                 Ok(Json(serde_json::to_value(output).map_err(|_| {
                     protocol_error().with_operation("wait")
