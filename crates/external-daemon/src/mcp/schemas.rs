@@ -204,11 +204,80 @@ pub struct AgentWaitInput {
     pub message_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-#[serde(untagged)]
+/// The wait target: one agent id (the historical scalar shape) or a list of
+/// up to 16 agent ids awaited together. The wire tolerance below is
+/// one-directional compatibility for MCP host clients that serialize
+/// non-string arguments as JSON strings (observed with dsh-mcp-client
+/// stringifying arrays; scalar-id strings accepted too): a string is
+/// accepted when it parses as a JSON array of ids or as a bare decimal id.
+/// The schema still declares integer | array; the tolerant branch exists so
+/// a broken host cannot lock users out of wait, not to widen the contract.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[serde(
+    untagged,
+    expecting = "agent_id must be an agent id or a list of agent ids"
+)]
 pub enum AgentIdOrList {
     Single(#[schemars(range(min = 10000000, max = 99999999))] u64),
     Multiple(Vec<u64>),
+}
+
+impl AgentIdOrList {
+    /// Decode the tolerant string form: either a JSON-encoded array of ids
+    /// (e.g. `"[10000001, 10000002]"`) or a bare decimal id string
+    /// (e.g. `"10000001"`). Returns None for anything else (malformed
+    /// JSON, non-integer or non-array JSON, junk text) — those stay hard
+    /// errors.
+    fn decode_string_form(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.starts_with('[') {
+            let parsed: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            let values = parsed.as_array()?;
+            let mut ids = Vec::with_capacity(values.len());
+            for value in values {
+                ids.push(value.as_u64()?);
+            }
+            if ids.is_empty() {
+                return None;
+            }
+            Some(Self::Multiple(ids))
+        } else {
+            trimmed.parse::<u64>().ok().map(Self::Single)
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentIdOrList {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = AgentIdOrList;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(
+                    "agent id, list of agent ids, or a string encoding either form",
+                )
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(AgentIdOrList::Single(value))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut ids = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(value) = seq.next_element::<u64>()? {
+                    ids.push(value);
+                }
+                Ok(AgentIdOrList::Multiple(ids))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                AgentIdOrList::decode_string_form(value).ok_or_else(|| {
+                    E::custom("agent_id string encodes neither an id nor a list of ids")
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -282,9 +351,48 @@ mod wait_input_tests {
             list,
             AgentIdOrList::Multiple(vec![10000001, 10000002])
         );
-        // The untagged union rejects non-id shapes instead of coercing.
-        assert!(serde_json::from_str::<AgentIdOrList>("\"10000001\"").is_err());
+        // The union rejects non-id shapes instead of coercing. A bare
+        // decimal id STRING is the tolerant scalar form (hosts that
+        // stringify arguments); junk stays rejected.
+        let bare: AgentIdOrList =
+            serde_json::from_str("\"10000001\"").expect("bare id string must deserialize");
+        assert_eq!(bare, AgentIdOrList::Single(10000001));
         assert!(serde_json::from_str::<AgentIdOrList>("[]").is_ok());
         assert!(serde_json::from_str::<AgentIdOrList>("null").is_err());
+        assert!(serde_json::from_str::<AgentIdOrList>("\"abc\"").is_err());
+    }
+
+    #[test]
+    fn wait_agent_id_accepts_a_json_encoded_list_string_for_broken_hosts() {
+        // dsh-mcp-client serializes array arguments as a JSON string; the
+        // tolerant branch decodes exactly that shape into the equivalent
+        // list form.
+        let encoded: AgentIdOrList = serde_json::from_str(
+            "\"[10000001, 10000002, 10000001]\"",
+        )
+        .expect("JSON-encoded list string must deserialize");
+        assert_eq!(
+            encoded,
+            AgentIdOrList::Multiple(vec![10000001, 10000002, 10000001])
+        );
+        // Whitespace inside the encoded array is tolerated.
+        let spaced: AgentIdOrList = serde_json::from_str(
+            "\"[10001468, 10001469, 10001470]\"",
+        )
+        .expect("spaced encoded list must deserialize");
+        assert_eq!(
+            spaced,
+            AgentIdOrList::Multiple(vec![10001468, 10001469, 10001470])
+        );
+        // Scalar strings in their bare decimal form are accepted too; junk,
+        // empty arrays, non-integer elements, and malformed JSON stay hard
+        // errors.
+        let bare: AgentIdOrList =
+            serde_json::from_str("\"12345678\"").expect("bare scalar string must deserialize");
+        assert_eq!(bare, AgentIdOrList::Single(12345678));
+        assert!(serde_json::from_str::<AgentIdOrList>("\"[]\"").is_err());
+        assert!(serde_json::from_str::<AgentIdOrList>("\"[\\\"a\\\"]\"").is_err());
+        assert!(serde_json::from_str::<AgentIdOrList>("\"[10000001\"").is_err());
+        assert!(serde_json::from_str::<AgentIdOrList>("\"hello\"").is_err());
     }
 }
