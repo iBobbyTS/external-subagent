@@ -385,7 +385,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, and effort cannot be specified. Specify subagent unless default_subagent is configured. ZCode requires an explicit provider/model token from the spawn request or a named profile; a bare token, an omitted model, and agents.zcode.default_model are rejected at admission. dsh spawns when its enabled + spawn_supported + profile=acp + absolute executable runtime_path configuration admits it (the runtime version is advisory only: a difference never blocks a spawn and surfaces in status and failure instructions). A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, effort, and developer_instructions cannot be specified. developer_instructions (also settable per-spawn) routes to the codex-native developerInstructions channel on thread/start and is spliced as a Developer Instructions prefix block for every other subagent. Specify subagent unless default_subagent is configured. ZCode requires an explicit provider/model token from the spawn request or a named profile; a bare token, an omitted model, and agents.zcode.default_model are rejected at admission. dsh spawns when its enabled + spawn_supported + profile=acp + absolute executable runtime_path configuration admits it (the runtime version is advisory only: a difference never blocks a spawn and surfaces in status and failure instructions). A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -412,10 +412,11 @@ impl SubagentMcp {
             && (input.agent.is_some()
                 || input.permission_mode.is_some()
                 || input.model.is_some()
-                || input.effort.is_some())
+                || input.effort.is_some()
+                || input.developer_instructions.is_some())
         {
             return Err(validation_error(
-                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile",
+                "profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions; specify these in the profile JSON or omit profile",
             )
             .with_operation("spawn"));
         }
@@ -427,6 +428,7 @@ impl SubagentMcp {
                     agent: input.agent.clone(),
                     model: input.model.clone(),
                     effort: input.effort.clone(),
+                    developer_instructions: input.developer_instructions.clone(),
                     manifest,
                 },
                 request_cancelled,
@@ -1490,6 +1492,7 @@ mod contract_default_tests {
                 agent: Some(agent.into()),
                 model: model.map(str::to_owned),
                 effort: None,
+                developer_instructions: None,
                 repository: "invalid-relative-path".into(),
                 prompt: "".into(),
                 permission_mode: Some(PublicPermissionMode::Plan),
@@ -1541,6 +1544,7 @@ mod contract_default_tests {
             agent: Some("zcode".into()),
             model: Some("provider/model".into()),
             effort: Some("high".into()),
+            developer_instructions: None,
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "effort passthrough".into(),
             permission_mode: Some(PublicPermissionMode::Plan),
@@ -1563,6 +1567,46 @@ mod contract_default_tests {
         );
     }
 
+    #[tokio::test]
+    async fn spawn_passes_developer_instructions_through_the_submit_general_wire() {
+        // ZCode routes developer_instructions through prompt splicing, so the
+        // persisted initial_prompt anchors the facade → daemon passthrough.
+        let _config_guard = crate::rpc::admission_fixtures::config_env_guard();
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("agents.json");
+        std::fs::write(
+            &config_path,
+            r#"{"schema_version":2,"subagents":{"zcode":{"enabled":true,"spawn_supported":true}}}"#,
+        )
+        .unwrap();
+        let _config_scope = crate::rpc::admission_fixtures::ConfigEnvScope::install(&config_path);
+        let (_directory, service, _id) = crate::rpc::wait_tests::runnable_fixture();
+        let store = service.store_for_wait_test();
+        let repository = tempfile::tempdir().unwrap();
+        let facade = SubagentMcp::from_service(service);
+        let input = AgentSpawnInput {
+            profile: None,
+            agent: Some("zcode".into()),
+            model: Some("provider/model".into()),
+            effort: None,
+            developer_instructions: Some("Facade spawn instructions".into()),
+            repository: repository.path().to_string_lossy().into_owned(),
+            prompt: "di passthrough".into(),
+            permission_mode: Some(PublicPermissionMode::Plan),
+            write_manifest: Vec::new(),
+        };
+        let output = facade.agent_spawn_inner(input, || false).await.unwrap();
+        assert_eq!(output.status, "running");
+        let stored = store
+            .get_task(&output.agent_id.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.initial_prompt,
+            "Developer Instructions: Facade spawn instructions\n----------\ndi passthrough"
+        );
+    }
+
     #[test]
     fn spawn_rpc_context_omits_the_preallocation_placeholder() {
         let method = RpcMethod::SubmitGeneral(GeneralSubmitInput {
@@ -1570,6 +1614,7 @@ mod contract_default_tests {
             agent: Some("zcode".into()),
             model: None,
             effort: None,
+            developer_instructions: None,
             manifest: external_core::GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
@@ -2046,6 +2091,7 @@ mod contract_default_tests {
             agent: Some("zcode".into()),
             model: Some("provider/model".into()),
             effort: None,
+            developer_instructions: None,
             repository: repository.path().to_string_lossy().into_owned(),
             prompt: "spawn session test".into(),
             permission_mode: Some(PublicPermissionMode::Plan),
@@ -2252,6 +2298,7 @@ mod contract_default_tests {
             agent: Some("zcode".into()),
             model: Some("provider/model".into()),
             effort: None,
+            developer_instructions: None,
             repository: repo2.path().to_string_lossy().into_owned(),
             permission_mode: Some(PublicPermissionMode::Plan),
             prompt: "direct interrupt test".into(),
@@ -2388,6 +2435,16 @@ mod contract_default_tests {
         assert_eq!(err.body.code, "validation");
         assert!(err.body.message.contains("profile cannot be combined with"));
 
+        // 2e. With developer_instructions
+        let mut with_di = base.clone();
+        with_di["developer_instructions"] = serde_json::json!("Be concise");
+        let err = facade
+            .agent_spawn_inner(serde_json::from_value(with_di).unwrap(), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.body.code, "validation");
+        assert!(err.body.message.contains("profile cannot be combined with"));
+
         // 3. Wire three-state: explicit null rejected via optional_non_null
         let mut null_profile = base.clone();
         null_profile["profile"] = serde_json::Value::Null;
@@ -2396,5 +2453,10 @@ mod contract_default_tests {
         let mut null_mode = base.clone();
         null_mode["permission_mode"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<AgentSpawnInput>(null_mode).is_err());
+
+        // developer_instructions shares the same three-state wire rule.
+        let mut null_di = base.clone();
+        null_di["developer_instructions"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<AgentSpawnInput>(null_di).is_err());
     }
 }

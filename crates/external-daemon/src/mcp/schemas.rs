@@ -120,6 +120,15 @@ pub struct AgentSpawnInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
     pub effort: Option<String>,
+    /// Per-task developer instructions. codex routes them through the native
+    /// `developerInstructions` channel on thread/start (prompt stays
+    /// verbatim); every other subagent splices them as a
+    /// `Developer Instructions:` prefix block ahead of the prompt. A
+    /// trimmed-empty string means "not provided". Mutually exclusive with
+    /// profile (profiles carry their own developer_instructions).
+    #[serde(default, deserialize_with = "optional_non_null")]
+    #[schemars(with = "String")]
+    pub developer_instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

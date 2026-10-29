@@ -303,17 +303,19 @@ impl RpcService {
                 })
             }
             RpcMethod::SubmitGeneral(mut input) => {
-                // Mutex validation: profile cannot be combined with agent, model, effort, or manifest permission_mode.
+                // Mutex validation: profile cannot be combined with agent, model, effort,
+                // developer_instructions, or manifest permission_mode.
                 // This check MUST run before attempting to load or read any profile file.
                 if input.profile.is_some()
                     && (input.agent.is_some()
                         || input.model.is_some()
                         || input.effort.is_some()
+                        || input.developer_instructions.is_some()
                         || input.manifest.permission_mode.is_some())
                 {
                     return Err(RpcError::new_profile_error(
                         RpcErrorCode::Validation,
-                        "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile",
+                        "profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions; specify these in the profile JSON or omit profile",
                     ));
                 }
 
@@ -338,8 +340,35 @@ impl RpcService {
                     input.manifest.permission_mode = profile.permission_mode;
                     (profile.developer_instructions.clone(), Some(profile))
                 } else {
-                    (None, None)
+                    // Spawn-parameter developer_instructions follows the profile
+                    // normalization: trimmed-empty means "not provided" (None),
+                    // otherwise the original text is kept verbatim (no content
+                    // trimming), so one admission path serves both sources.
+                    (
+                        input
+                            .developer_instructions
+                            .take()
+                            .filter(|di| !di.trim().is_empty()),
+                        None,
+                    )
                 };
+
+                // Both developer_instructions sources (profile file and spawn
+                // parameter) share one bound; the codex native channel carries
+                // the text as-is, so this check is its only length guard. The
+                // splicing channel is additionally bounded by MAX_PROMPT_BYTES
+                // below, which still rejects oversized combinations.
+                if let Some(di) = developer_instructions.as_deref() {
+                    if di.len() > external_core::MAX_DEVELOPER_INSTRUCTIONS_BYTES {
+                        return Err(RpcError::new(
+                            RpcErrorCode::Validation,
+                            format!(
+                                "developer_instructions exceeds {} bytes",
+                                external_core::MAX_DEVELOPER_INSTRUCTIONS_BYTES
+                            ),
+                        ));
+                    }
+                }
 
                 let config = read_agent_config_snapshot()?;
                 let effective_agent = input
@@ -1884,13 +1913,14 @@ mod observe_gate_tests {
                     agent: agent.map(str::to_owned),
                     model: model.map(str::to_owned),
                     effort: effort.map(str::to_owned),
+                    developer_instructions: None,
                     profile: Some("worker".into()),
                     manifest,
                 };
                 let err = env.service.dispatch(RpcMethod::SubmitGeneral(input)).unwrap_err();
                 assert_eq!(err.code, RpcErrorCode::Validation);
                 assert!(
-                    err.message.contains("profile cannot be combined with subagent, permission_mode, model, or effort"),
+                    err.message.contains("profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions"),
                     "Error must contain user guidance: {}",
                     err.message
                 );
@@ -1902,6 +1932,7 @@ mod observe_gate_tests {
                 agent: Some("codex".into()),
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("non_existent_profile_xyz".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2029,6 +2060,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("full_profile".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "merge test"),
             };
@@ -2053,6 +2085,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("minimal_profile".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "minimal test"),
             };
@@ -2080,6 +2113,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("dsh_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "dsh prompt"),
             };
@@ -2096,6 +2130,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("dsh_bad".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "dsh prompt"),
             };
@@ -2114,6 +2149,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("zcode_slash".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "zcode prompt"),
             };
@@ -2129,6 +2165,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("zcode_bare".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "zcode prompt"),
             };
@@ -2151,6 +2188,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_slug".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
             };
@@ -2166,6 +2204,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_slash".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
             };
@@ -2189,6 +2228,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Verbatim codex prompt"),
             };
@@ -2230,6 +2270,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("zcode_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Original zcode prompt"),
             };
@@ -2260,6 +2301,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("dsh_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Original dsh prompt"),
             };
@@ -2286,6 +2328,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("agy_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Original agy prompt"),
             };
@@ -2306,6 +2349,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("empty_di_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Unchanged prompt"),
             };
@@ -2320,6 +2364,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_empty_worker".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "Unchanged codex prompt"),
             };
@@ -2342,11 +2387,107 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("big_di".into()),
                 manifest: test_manifest(env.workspace_dir.path(), &base_prompt),
             };
             let err_oversized = env.service.dispatch(RpcMethod::SubmitGeneral(input_oversized)).unwrap_err();
             assert_eq!(err_oversized.code, RpcErrorCode::Validation);
+        }
+
+        #[test]
+        fn spawn_parameter_developer_instructions_follows_the_dispatch_channel() {
+            let env = setup_environment();
+
+            // 1. codex spawn parameter: native channel, verbatim prompt
+            let input_codex = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                effort: None,
+                developer_instructions: Some("Spawn param instructions".into()),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "Verbatim codex prompt"),
+            };
+            let response_codex = env.service.dispatch(RpcMethod::SubmitGeneral(input_codex)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_codex } = response_codex else { panic!() };
+            let record_codex = env.store.get_task(&task_codex.agent_id).unwrap().unwrap();
+            assert_eq!(record_codex.initial_prompt, "Verbatim codex prompt");
+            let prepared_codex: PreparedGeneralTask = serde_json::from_str(&record_codex.prepared_launch_json).unwrap();
+            assert_eq!(
+                prepared_codex.admission.unwrap().developer_instructions,
+                Some("Spawn param instructions".into())
+            );
+
+            // 2. zcode spawn parameter: prompt splicing, admission carries None
+            let input_zcode = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: Some("provider/model".into()),
+                effort: None,
+                developer_instructions: Some("Spawn param instructions".into()),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "Original zcode prompt"),
+            };
+            let response_zcode = env.service.dispatch(RpcMethod::SubmitGeneral(input_zcode)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_zcode } = response_zcode else { panic!() };
+            let record_zcode = env.store.get_task(&task_zcode.agent_id).unwrap().unwrap();
+            assert_eq!(
+                record_zcode.initial_prompt,
+                "Developer Instructions: Spawn param instructions\n----------\nOriginal zcode prompt"
+            );
+            let prepared_zcode: PreparedGeneralTask = serde_json::from_str(&record_zcode.prepared_launch_json).unwrap();
+            assert_eq!(prepared_zcode.admission.unwrap().developer_instructions, None);
+
+            // 3. Whitespace-only spawn parameter means "not provided": prompt
+            //    unchanged and admission carries None (profile normalization).
+            let input_ws = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: Some("provider/model".into()),
+                effort: None,
+                developer_instructions: Some("   \t ".into()),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "Unchanged prompt"),
+            };
+            let response_ws = env.service.dispatch(RpcMethod::SubmitGeneral(input_ws)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task: task_ws } = response_ws else { panic!() };
+            let record_ws = env.store.get_task(&task_ws.agent_id).unwrap().unwrap();
+            assert_eq!(record_ws.initial_prompt, "Unchanged prompt");
+            let prepared_ws: PreparedGeneralTask = serde_json::from_str(&record_ws.prepared_launch_json).unwrap();
+            assert_eq!(prepared_ws.admission.unwrap().developer_instructions, None);
+
+            // 4. Spliced spawn-parameter prompt exceeding MAX_PROMPT_BYTES is
+            //    rejected by the same 256 KiB prompt bound as profiles.
+            let base_prompt = "a".repeat(MAX_PROMPT_BYTES - 50);
+            let input_oversized = GeneralSubmitInput {
+                agent: Some("zcode".into()),
+                model: Some("provider/model".into()),
+                effort: None,
+                developer_instructions: Some("Instructions: ".repeat(20)),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), &base_prompt),
+            };
+            let err_oversized = env.service.dispatch(RpcMethod::SubmitGeneral(input_oversized)).unwrap_err();
+            assert_eq!(err_oversized.code, RpcErrorCode::Validation);
+
+            // 5. developer_instructions itself is bounded at 1 MiB from either
+            //    source. The codex native channel carries the text as-is, so
+            //    this check is its only length guard; an exactly-1-MiB value
+            //    stays admissible (boundary is inclusive).
+            let oversized = "i".repeat(external_core::MAX_DEVELOPER_INSTRUCTIONS_BYTES + 1);
+            let input_huge_codex = GeneralSubmitInput {
+                agent: Some("codex".into()),
+                model: Some("gpt-5".into()),
+                effort: None,
+                developer_instructions: Some(oversized),
+                profile: None,
+                manifest: test_manifest(env.workspace_dir.path(), "boundary codex prompt"),
+            };
+            let err_huge = env.service.dispatch(RpcMethod::SubmitGeneral(input_huge_codex)).unwrap_err();
+            assert_eq!(err_huge.code, RpcErrorCode::Validation);
+            assert!(
+                err_huge.message.contains("developer_instructions exceeds"),
+                "oversized developer_instructions must name the field: {}",
+                err_huge.message
+            );
         }
 
         #[test]
@@ -2372,6 +2513,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("bad".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2386,6 +2528,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("good".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2397,6 +2540,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2410,6 +2554,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("missing_profile".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2483,6 +2628,7 @@ mod observe_gate_tests {
                 agent: Some("zcode".into()),
                 model: Some("zai/GLM-5.3".into()),
                 effort: Some("high".into()),
+                developer_instructions: None,
                 profile: None,
                 manifest,
             };
@@ -2506,6 +2652,7 @@ mod observe_gate_tests {
                 agent: Some("zcode".into()),
                 model: Some("provider/model".into()),
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: manifest_default,
             };
@@ -2537,6 +2684,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("dsh_bad".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2559,6 +2707,7 @@ mod observe_gate_tests {
                 agent: Some("dsh".into()),
                 model: Some("bare_model_without_colon".into()),
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2576,6 +2725,7 @@ mod observe_gate_tests {
                 agent: Some("zcode".into()),
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("good".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "test prompt"),
             };
@@ -2583,7 +2733,7 @@ mod observe_gate_tests {
             assert_eq!(err_mutex.code, RpcErrorCode::Validation);
             assert_eq!(
                 err_mutex.message,
-                "profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile"
+                "profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions; specify these in the profile JSON or omit profile"
             );
             assert!(!err_mutex.message.contains("available profiles"));
         }
@@ -2621,6 +2771,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("agy_plan".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "agy plan prompt"),
             };
@@ -2648,6 +2799,7 @@ mod observe_gate_tests {
                 agent: Some("agy".into()),
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: manifest_agy_plain,
             };
@@ -2714,6 +2866,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_no_model".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
             };
@@ -2735,6 +2888,7 @@ mod observe_gate_tests {
                 agent: Some("codex".into()),
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
             };
@@ -2753,6 +2907,7 @@ mod observe_gate_tests {
                 agent: None,
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: Some("codex_bad_effort".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
             };
@@ -2772,6 +2927,7 @@ mod observe_gate_tests {
                 agent: Some("codex".into()),
                 model: Some("gpt-5".into()),
                 effort: Some("ultra".into()),
+                developer_instructions: None,
                 profile: None,
                 manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
             };
@@ -2792,6 +2948,7 @@ mod observe_gate_tests {
                 agent: Some("codex".into()),
                 model: Some("gpt-5".into()),
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: manifest_wm.clone(),
             };
@@ -2806,6 +2963,7 @@ mod observe_gate_tests {
                 agent: Some("agy".into()),
                 model: None,
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: manifest_wm,
             };
@@ -2822,6 +2980,7 @@ mod observe_gate_tests {
                 agent: Some("zcode".into()),
                 model: Some("provider/model".into()),
                 effort: None,
+                developer_instructions: None,
                 profile: None,
                 manifest: test_manifest(env.workspace_dir.path(), &base_prompt),
             };

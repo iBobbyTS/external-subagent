@@ -566,22 +566,28 @@ test('explicit null spawn selection is rejected while omitted route fields stay 
   assert.throws(() => prepareSpawnInput({ subagent: 'zcode', model: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => prepareSpawnInput({ subagent: 'zcode', effort: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   assert.throws(() => prepareSpawnInput({ subagent: 'zcode', effort: '', repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
+  assert.throws(() => prepareSpawnInput({ subagent: 'zcode', developer_instructions: null, repository: '/repo', prompt: 'hi' }), (error) => error.code === 'INVALID_ARGUMENT');
   const omitted = prepareSpawnInput({ repository: '/repo', prompt: 'hi' });
   assert.equal(Object.hasOwn(omitted, 'subagent'), false);
   assert.equal(Object.hasOwn(omitted, 'model'), false);
   assert.equal(Object.hasOwn(omitted, 'effort'), false);
+  assert.equal(Object.hasOwn(omitted, 'developer_instructions'), false);
   assert.deepEqual(prepareSpawnInput({ subagent: 'zcode', effort: 'high', repository: '/repo', prompt: 'hi' }), {
     subagent: 'zcode', effort: 'high', repository: '/repo', prompt: 'hi',
   });
+  // Unlike model/effort, a whitespace-only developer_instructions survives
+  // CLI validation: the daemon owns the trimmed-empty normalization.
+  const di = prepareSpawnInput({ subagent: 'zcode', developer_instructions: '  ', repository: '/repo', prompt: 'hi' });
+  assert.equal(di.developer_instructions, '  ');
 });
 
 test('spawn flags build the shared DTO and reject malformed values', () => {
   assert.deepEqual(parseSpawnArgs([
     '--subagent', 'future-provider', '--repository', '/repo', '--prompt', 'hi', '--permission-mode', 'build',
-    '--model', 'catalog-token', '--effort', 'high', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
+    '--model', 'catalog-token', '--effort', 'high', '--developer-instructions', 'Be precise', '--write-manifest', 'src/**', '--write-manifest', 'tests/**',
   ]), {
     subagent: 'future-provider', repository: '/repo', prompt: 'hi', permission_mode: 'build',
-    model: 'catalog-token', effort: 'high', write_manifest: ['src/**', 'tests/**'],
+    model: 'catalog-token', effort: 'high', developer_instructions: 'Be precise', write_manifest: ['src/**', 'tests/**'],
   });
   assert.throws(() => parseSpawnArgs(['--repository', '/repo']), /--prompt is required/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt']), /requires a non-null value/u);
@@ -589,6 +595,7 @@ test('spawn flags build the shared DTO and reject malformed values', () => {
   assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--model', 'null']).model, 'null');
   assert.equal(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--effort', 'null']).effort, 'null');
   assert.equal(Object.hasOwn(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi']), 'effort'), false);
+  assert.equal(Object.hasOwn(parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi']), 'developer_instructions'), false);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--prompt', 'hi', '--unknown', 'x']), /unsupported spawn option/u);
   assert.throws(() => parseSpawnArgs(['--repository', '/repo', '--repository', '/other', '--prompt', 'hi']), /only once/u);
 });

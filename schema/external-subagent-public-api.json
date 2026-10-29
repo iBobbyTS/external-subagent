@@ -198,7 +198,7 @@
         "profile": {
           "type": "string",
           "minLength": 1,
-          "description": "Profile name referencing a JSON preset in profiles/*.json. Mutually exclusive with subagent, permission_mode, model, and effort."
+          "description": "Profile name referencing a JSON preset in profiles/*.json. Mutually exclusive with subagent, permission_mode, model, effort, and developer_instructions."
         },
         "subagent": {
           "type": "string",
@@ -228,6 +228,11 @@
           "maxLength": 24,
           "pattern": "^[a-z0-9_]+$",
           "description": "Reasoning-effort token: 1..24 bytes of [a-z0-9_]. codex admits only low, medium, high or xhigh; agy admits only low, medium, high or max; zcode and dsh pass the bounded token through. Omission keeps the runtime default."
+        },
+        "developer_instructions": {
+          "type": "string",
+          "maxLength": 1048576,
+          "description": "Per-task developer instructions (at most 1 MiB). codex routes them through the native developerInstructions channel on thread/start (prompt stays verbatim); every other subagent splices them as a 'Developer Instructions:' prefix block ahead of the prompt. A trimmed-empty string means not provided (no admission effect). Mutually exclusive with profile: profiles carry their own developer_instructions. The spliced prompt stays under the shared 256 KiB prompt bound, which rejects the spawn before task creation; oversized developer_instructions are themselves rejected with validation before any task."
         },
         "write_manifest": {
           "type": "array",
@@ -614,6 +619,7 @@
             "prompt",
             "model",
             "effort",
+            "developer_instructions",
             "write_manifest"
           ],
           "output": [

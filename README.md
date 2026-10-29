@@ -159,11 +159,16 @@ from the available set.
 | `permission_mode` | `build`, `edit`, `plan`, or `yolo`; defaults to `build` when unset |
 | `developer_instructions` | Free-form instructions, delivered as described below |
 
-`--profile` cannot be combined with `--subagent`, `--model`, `--effort`, or
-`--permission_mode`; put those in the profile JSON or omit `profile`. Fields
+`--profile` cannot be combined with `--subagent`, `--model`, `--effort`,
+`--developer-instructions`, or `--permission-mode`; put those in the profile
+JSON or omit `profile`. Fields
 left out of the profile fall back to the same defaults as an unprofiled
-spawn. `developer_instructions` rides the codex runtime's native
-`developerInstructions` channel when the effective subagent is `codex`; every
+spawn. `developer_instructions` is also accepted as a per-spawn parameter
+(`--developer-instructions` on the CLI, `developer_instructions` in the MCP
+and daemon RPC spawn inputs) with identical delivery semantics; the codex
+runtime's native
+`developerInstructions` channel carries it when the effective subagent is
+`codex`; every
 other subagent receives it silently concatenated in front of the prompt:
 
 ```

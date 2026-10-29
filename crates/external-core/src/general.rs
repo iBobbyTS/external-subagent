@@ -11,6 +11,11 @@ use std::{
 
 pub const GENERAL_TASK_SCHEMA: &str = "zcode-general-task/v1";
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
+/// Bound for `developer_instructions` from either source (spawn parameter or
+/// profile file). The splicing channel additionally stays under
+/// `MAX_PROMPT_BYTES` after the prefix is attached; the codex native channel
+/// carries the text as-is, so this bound is its only length guard.
+pub const MAX_DEVELOPER_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
 static SUBMISSION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

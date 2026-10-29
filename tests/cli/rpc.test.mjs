@@ -205,6 +205,32 @@ test('CLI spawn wire forwards effort beside the manifest without leaking it insi
   assert.throws(() => callDaemon(path.join(os.tmpdir(), `missing-spawn-effort-${process.pid}.sock`), 'spawn', { repository: '/r', prompt: 'hi', effort: null }), (error) => error instanceof CliError && error.code === 'INVALID_ARGUMENT');
 });
 
+test('CLI spawn wire forwards developer_instructions beside the manifest without leaking it inside', { skip: win32Sockets }, async () => {
+  const socketPath = path.join(os.tmpdir(), `external-cli-spawn-di-${process.pid}-${Date.now()}.sock`);
+  const seen = [];
+  const server = net.createServer((socket) => socket.once('data', (chunk) => {
+    const request = JSON.parse(chunk);
+    seen.push(request);
+    socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'success', result: { kind: 'general_submitted', task: { agent_id: '10000001', status: 'running', session_id: 'session-123', input_identity: null } } }) + '\n');
+  }));
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  try {
+    const res1 = await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi', developer_instructions: 'Be concise' });
+    assert.deepEqual(res1, { agent_id: 10000001, status: 'running', session_id: 'session-123' });
+    // A whitespace-only value stays on the wire verbatim: the daemon owns the
+    // trimmed-empty → not-provided normalization (single source of truth).
+    await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi', developer_instructions: '  ' });
+    await callDaemon(socketPath, 'spawn', { subagent: 'zcode', repository: '/workspace', prompt: 'hi' });
+  } finally { await new Promise((resolve) => server.close(resolve)); }
+  assert.equal(seen[0].method, 'submit_general');
+  assert.equal(seen[0].params.developer_instructions, 'Be concise');
+  assert.equal(Object.hasOwn(seen[0].params.manifest, 'developer_instructions'), false);
+  assert.equal(seen[1].params.developer_instructions, '  ');
+  assert.equal(seen[2].params.developer_instructions, undefined);
+  assert.equal(Object.hasOwn(seen[2].params, 'developer_instructions'), false);
+  assert.throws(() => callDaemon(path.join(os.tmpdir(), `missing-spawn-di-${process.pid}.sock`), 'spawn', { repository: '/r', prompt: 'hi', developer_instructions: null }), (error) => error instanceof CliError && error.code === 'INVALID_ARGUMENT');
+});
+
 test('CLI applies documented list and result defaults before connecting', { skip: win32Sockets }, async () => {
   for (const [command, input, expected] of [
     ['list', { repository: '/workspace' }, { phase: null, outcome: null, cursor: null, limit: 100 }],

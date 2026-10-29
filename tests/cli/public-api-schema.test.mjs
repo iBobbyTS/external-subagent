@@ -44,6 +44,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.equal(schema.properties.spawn.properties.effort.type, 'string');
   assert.equal(schema.properties.spawn.properties.effort.pattern, '^[a-z0-9_]+$');
   assert.equal(schema.properties.spawn.properties.effort.maxLength, 24);
+  assert.equal(schema.properties.spawn.properties.developer_instructions.type, 'string');
+  assert.equal(schema.properties.spawn.properties.developer_instructions.maxLength, 1048576);
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
   assert.equal(schema.properties.wait.properties.supports_answer, undefined);
@@ -88,7 +90,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.output, ['agent_id', 'status', 'session_id', 'instruction']);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.input, [
-    'profile', 'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest',
+    'profile', 'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'developer_instructions', 'write_manifest',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_spawn.idempotent, false);
   assert.deepEqual(schema.properties.result_projection.required, [

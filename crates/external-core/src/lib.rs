@@ -12,6 +12,7 @@ pub use general::{
     canonical_general_repository, AccessMode, AdmissionIdentity, CompletionOutcome,
     GeneralCompletion, GeneralFinalizer, GeneralTaskManifest, GeneralTaskPreparer,
     PreparedGeneralTask, PreparedWorkspace, GENERAL_TASK_SCHEMA,
+    MAX_DEVELOPER_INSTRUCTIONS_BYTES,
 };
 
 pub use policy::{

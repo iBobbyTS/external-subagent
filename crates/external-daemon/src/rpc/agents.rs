@@ -984,6 +984,7 @@ mod admission_tests {
             agent: Some("zcode".into()),
             model: None,
             effort: None,
+            developer_instructions: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "daemon-prepared".into(),
@@ -1157,6 +1158,7 @@ mod admission_tests {
             agent: Some("dsh".into()),
             model: None,
             effort: None,
+            developer_instructions: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "gate-test".into(),
@@ -1301,6 +1303,7 @@ mod admission_tests {
             agent: Some("codex".into()),
             model: Some("gpt-5.6-terra".into()),
             effort: None,
+            developer_instructions: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "codex-gate-test".into(),
@@ -1507,6 +1510,7 @@ mod admission_tests {
             agent: Some("agy".into()),
             model: Some("claude-sonnet-4-6".into()),
             effort: None,
+            developer_instructions: None,
             manifest: GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "agy-gate-test".into(),
@@ -2321,6 +2325,7 @@ mod admission_policy_tests {
             agent: agent.map(str::to_owned),
             model: model.map(str::to_owned),
             effort: None,
+            developer_instructions: None,
             manifest: external_core::GeneralTaskManifest {
                 schema: external_core::GENERAL_TASK_SCHEMA.into(),
                 agent_id: "admission-oracle".into(),

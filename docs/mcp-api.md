@@ -183,7 +183,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 | 参数 | 类型／必填与默认 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
-| `profile` | string；可选 | 引用 profiles/*.json 中定义的全局预设（subagent、permission_mode、model、effort、developer_instructions） | 省略则使用独立参数；指定 profile 时与 subagent、permission_mode、model、effort 互斥 |
+| `profile` | string；可选 | 引用 profiles/*.json 中定义的全局预设（subagent、permission_mode、model、effort、developer_instructions） | 省略则使用独立参数；指定 profile 时与 subagent、permission_mode、model、effort、developer_instructions 互斥 |
 | `subagent` | string；可选 | 选择 subagent，或避免默认配置变化影响路由 | 省略使用 `default_subagent`，未配置则 `subagent_required`；移除后无法逐任务选 subagent |
 | `repository` | string；必填 | 指定存在的绝对 workspace 目录，建立执行和写入范围 | 缺少报错；移除后必须设计另一种明确作用域，不能默认为任意目录 |
 | `permission_mode` | PermissionMode；默认 `build` | 区分执行、编辑、只读规划等授权模式 | 省略采用 build，不是自动只读；移除后无法逐任务选权限模式 |
@@ -191,6 +191,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | `write_manifest` | string[]；默认 `[]` | 需要明确约束可写相对路径时使用 | codex 和 agy 不支持非空清单（创建任务前分别返回 `codex_write_manifest_unsupported` / `agy_write_manifest_unsupported`，agy 无 write-manifest 守卫，显式 `["."]` 同样被拒）；dsh build 接受非空清单，进入 workspace-write 的 manifest-build 组合（仅 `tool-fs` 可写，清单外路径由 write-guard 以 `FS_WRITE_MANIFEST_DENIED` 拒绝），上限 256 条／序列化 64 KiB，显式 `["."]` 走现行 build 组合（此前与任意非空清单同样被拒），plan 仍必须为空；其他 subagent 的非 plan 空清单会采用受保护 workspace scope，并非禁止写入；移除后失去细粒度调用方写入范围 |
 | `model` | string；可选 | subagent 支持时指定任务模型；dsh 要求 `provider:model`（按第一个 `:` 分割，model 侧可再含 `:`）；zcode 要求显式 `provider/model`（spawn 请求或具名 profile 携带；裸 token 与省略均在准入阶段以 `validation` 拒绝，`agents.zcode.default_model` 以 `model_selection_unsupported` 拒绝）；agy 要求不含 `:`／`/`／空白的裸 slug（启动时按 `agy models` 目录校验，未知 slug 会响亮失败） | 省略采用 subagent 配置／原生默认（dsh、agy）；zcode 无配置默认与原生兜底（必须显式 `provider/model`）；codex 允许配置 `default_model`，但无原生兜底；移除后失去逐任务模型选择；codex 使用自有模型 ID |
 | `effort` | string；可选 | 逐任务指定推理力度；token 先按 trim 处理再校验 | 省略保持各 subagent 现状默认（codex/agy 维持既有 wire 默认，zcode/dsh 不下发任何 effort 字段/调用）；codex 仅接受闭集 `low/medium/high/xhigh/max`（`minimal`/`ultra` 被拒绝），agy 仅接受实测闭集 `low/medium/high/max`，zcode/dsh 接受 1..24 字节 `[a-z0-9_]` 的有界透传 token（支持集运行时才知道，准入不伪造目录）；非法或越界 token 在派发前以 `validation` 拒绝，不产生任务 |
+| `developer_instructions` | string；可选 | 逐任务指定开发者指令，语义与 profile 内同名字段一致：codex 走 thread/start 原生 `developerInstructions` 通道（prompt 保持逐字），其余 subagent 在 prompt 前拼接 `Developer Instructions: {di}\n----------\n` 前缀块 | 省略或 trim 后为空等价于未提供（无准入影响）；与 profile 互斥（profile 自带 developer_instructions）；本体上限 1 MiB（spawn 参数与 profile 两个来源同界，也是 codex 原生通道的唯一长度防线），超限以 `validation` 拒绝、不产生任务；拼接通道另受拼接后 prompt 256 KiB 上限约束 |
 
 `PermissionMode = build | edit | plan | yolo`，实际可用组合以 subagent 能力和 admission 为准。Codex 支持四模式：build/edit 映射 workspace-write，plan 映射 read-only，yolo 映射 danger-full-access；全部固定 approvalPolicy=never。DSH 当前支持 build 和严格 plan，不能因为公共枚举有 edit/yolo 就假设可用。agy 仅支持 build（`--mode accept-edits`）与 yolo（`--dangerously-skip-permissions`），plan/edit 在准入阶段以 `agy_permission_mode_unsupported` 拒绝。
 

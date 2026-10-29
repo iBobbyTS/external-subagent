@@ -180,12 +180,13 @@ test('AC1: CLI spawn wire forwards top-level profile and omits permission_mode f
 // AC2: 互斥 (Mutex validation with exit 2 + guidance)
 // ---------------------------------------------------------------------------
 
-test('AC2: --profile combined with any of four mutex flags fails with exit 2 and guidance', () => {
+test('AC2: --profile combined with any of five mutex flags fails with exit 2 and guidance', () => {
   const mutexFlags = [
     ['--subagent', 'dsh'],
     ['--permission-mode', 'build'],
     ['--model', 'gpt-5'],
     ['--effort', 'high'],
+    ['--developer-instructions', 'Be concise'],
   ];
 
   for (const [flag, val] of mutexFlags) {
@@ -196,7 +197,7 @@ test('AC2: --profile combined with any of four mutex flags fails with exit 2 and
         assert.ok(error instanceof CliError);
         assert.equal(error.code, 'INVALID_ARGUMENT');
         assert.equal(error.exitCode, 2);
-        assert.match(error.message, /profile cannot be combined with subagent, permission_mode, model, or effort/u);
+        assert.match(error.message, /profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions/u);
         assert.match(error.message, /specify these in the profile JSON or omit profile/u);
         return true;
       },
@@ -217,7 +218,7 @@ test('AC2: --profile combined with any of four mutex flags fails with exit 2 and
   }
 
   // 3. Structured object / JSON form (prepareSpawnInput)
-  const fields = ['subagent', 'permission_mode', 'model', 'effort'];
+  const fields = ['subagent', 'permission_mode', 'model', 'effort', 'developer_instructions'];
   for (const field of fields) {
     assert.throws(
       () => prepareSpawnInput({ profile: 'my-prof', [field]: 'val', repository: '/repo', prompt: 'hi' }),

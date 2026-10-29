@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { CliError } from '../errors.mjs';
 import { profilesDir } from '../paths.mjs';
 
-const SPAWN_FIELDS = new Set(['profile', 'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'write_manifest']);
+const SPAWN_FIELDS = new Set(['profile', 'subagent', 'repository', 'permission_mode', 'prompt', 'model', 'effort', 'developer_instructions', 'write_manifest']);
 const FLAG_FIELDS = new Map([
   ['--profile', 'profile'],
   ['--subagent', 'subagent'],
@@ -11,9 +11,10 @@ const FLAG_FIELDS = new Map([
   ['--permission-mode', 'permission_mode'],
   ['--model', 'model'],
   ['--effort', 'effort'],
+  ['--developer-instructions', 'developer_instructions'],
 ]);
 
-const PROFILE_MUTEX_ERROR = 'profile cannot be combined with subagent, permission_mode, model, or effort; specify these in the profile JSON or omit profile';
+const PROFILE_MUTEX_ERROR = 'profile cannot be combined with subagent, permission_mode, model, effort, or developer_instructions; specify these in the profile JSON or omit profile';
 
 function flagValue(args, option) {
   const value = args.shift();
@@ -38,7 +39,7 @@ export function parseSpawnArgs(args) {
     input[field] = flagValue(remaining, option);
   }
   if (Object.hasOwn(input, 'profile')) {
-    if (Object.hasOwn(input, 'subagent') || Object.hasOwn(input, 'permission_mode') || Object.hasOwn(input, 'model') || Object.hasOwn(input, 'effort')) {
+    if (Object.hasOwn(input, 'subagent') || Object.hasOwn(input, 'permission_mode') || Object.hasOwn(input, 'model') || Object.hasOwn(input, 'effort') || Object.hasOwn(input, 'developer_instructions')) {
       throw new CliError('INVALID_ARGUMENT', PROFILE_MUTEX_ERROR, 2);
     }
   }
@@ -59,7 +60,7 @@ export function prepareSpawnInput(input) {
     throw new CliError('INVALID_ARGUMENT', 'profile must be a non-empty string', 2);
   }
   if (input.profile !== undefined) {
-    if (input.subagent !== undefined || input.permission_mode !== undefined || input.model !== undefined || input.effort !== undefined) {
+    if (input.subagent !== undefined || input.permission_mode !== undefined || input.model !== undefined || input.effort !== undefined || input.developer_instructions !== undefined) {
       throw new CliError('INVALID_ARGUMENT', PROFILE_MUTEX_ERROR, 2);
     }
   }
@@ -80,6 +81,15 @@ export function prepareSpawnInput(input) {
   }
   if (input.effort !== undefined && (typeof input.effort !== 'string' || input.effort.length === 0)) {
     throw new CliError('INVALID_ARGUMENT', 'effort must be a non-empty string', 2);
+  }
+  // Mirrors the daemon's spawn-parameter normalization: null is rejected on
+  // the wire, an empty/whitespace-only string stays accepted here (the daemon
+  // treats it as "not provided").
+  if (Object.prototype.hasOwnProperty.call(input, 'developer_instructions') && input.developer_instructions === null) {
+    throw new CliError('INVALID_ARGUMENT', 'developer_instructions must be omitted or a non-null string', 2);
+  }
+  if (input.developer_instructions !== undefined && typeof input.developer_instructions !== 'string') {
+    throw new CliError('INVALID_ARGUMENT', 'developer_instructions must be a string', 2);
   }
   return { ...input };
 }
