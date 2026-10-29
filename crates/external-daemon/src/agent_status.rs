@@ -1020,14 +1020,28 @@ fn codex_models_degraded(
 /// tokens. Non-`hidden` entries project their `id` verbatim — the same token
 /// `thread/start` accepts — sorted, deduplicated, and capped at
 /// `CODEX_MAX_MODELS` raw entries.
+///
+/// `runtime_command(…, false)` already appends `app-server` for a script
+/// launcher (a `node <codex.js> app-server` reconstruction, mirroring
+/// `main.rs`'s zcode launch); only the listener flags are added here, so a
+/// script runtime never receives a duplicated subcommand (verified live:
+/// `node codex.js app-server app-server …` exits 2 with "unrecognized
+/// subcommand").
 fn run_codex_model_list(
     runtime: &Path,
     home: &str,
     cwd: &Path,
 ) -> Result<Vec<String>, String> {
     let mut command = runtime_command(runtime, false);
+    let script = matches!(
+        runtime.extension().and_then(|value| value.to_str()),
+        Some("js" | "cjs" | "mjs")
+    );
+    if !script {
+        command.args(["app-server"]);
+    }
     command
-        .args(["app-server", "--listen", "stdio://"])
+        .args(["--listen", "stdio://"])
         .env("CODEX_HOME", home)
         .env_remove("OPENAI_API_KEY")
         .env_remove("OPENAI_BASE_URL")
