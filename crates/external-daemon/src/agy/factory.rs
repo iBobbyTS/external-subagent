@@ -32,13 +32,17 @@ pub enum AgySpawnGate {
 /// model/effort/permission selections assembled into the pinned stream-json
 /// argv. The model is optional: a `native` admission (no explicit and no
 /// configured default) launches without `--model` and lets the `agy` CLI use
-/// its own default.
+/// its own default. A persisted session id carries the resumed conversation:
+/// the scheduler claims a task through the resume path exactly when
+/// `task.session_id` is set (`scheduler/lifecycle.rs`), so the discriminator
+/// is the task row itself and a fresh task keeps a byte-identical argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgyLaunch {
     runtime_path: PathBuf,
     model: Option<String>,
     effort: Option<AgyEffort>,
     permission: AgyPermissionMode,
+    conversation: Option<String>,
 }
 
 impl AgyLaunch {
@@ -53,15 +57,16 @@ impl AgyLaunch {
     }
 
     /// The pinned child command: the absolute runtime with the stream-json
-    /// framing plus the admitted model/effort/permission, cwd pinned to the
-    /// task workspace. A native admission (no admitted model) omits `--model`.
+    /// framing plus the admitted model/effort/permission (and, for a resumed
+    /// claim, the persisted conversation id), cwd pinned to the task
+    /// workspace. A native admission (no admitted model) omits `--model`.
     fn command(&self, cwd: &Path) -> Command {
         let mut command = Command::new(&self.runtime_path);
         command.args(launch_args(&AgyLaunchOptions {
             model: self.model.clone(),
             effort: self.effort,
             permission: Some(self.permission),
-            conversation: None,
+            conversation: self.conversation.clone(),
         }));
         command.current_dir(cwd);
         command
@@ -205,6 +210,10 @@ impl AgyRuntimeFactory {
             model,
             effort,
             permission,
+            conversation: task
+                .session_id
+                .clone()
+                .filter(|session_id| !session_id.is_empty()),
         };
         launch.validate()?;
         Ok(launch)

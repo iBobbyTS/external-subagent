@@ -2504,3 +2504,64 @@ fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
     );
     assert!(!after.tools[0].recent_calls[0].arguments_truncated);
 }
+
+#[test]
+fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
+    // dsh owns no ACP session re-entry (its owner re-runs the full bootstrap
+    // on every claim), so it stays in the terminal-send exclusion set: a
+    // terminal dsh task must keep the clean admission rejection even when a
+    // session id is persisted, instead of requeueing into a resume that
+    // replays the initial prompt on a fresh session.
+    let workspace = dsh_workspace();
+    let scheduler = dsh_scheduler(workspace.path(), DshRuntimeFactory::closed());
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    let store = scheduler.store();
+    let claim = store
+        .claim_next("terminal-dsh", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, agent_id);
+    store
+        .mark_session_running(
+            &agent_id,
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some(SESSION_ID),
+            Some(external_store::TurnState::Idle),
+        )
+        .unwrap();
+    store
+        .store_task_result(
+            &agent_id,
+            &external_store::TaskResult {
+                outcome: TaskOutcome::Completed,
+                final_text: "done".into(),
+                partial: false,
+            },
+        )
+        .unwrap();
+    store
+        .transition_terminal(
+            &agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Completed,
+                failure_code: None,
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    let error = scheduler
+        .send_message(&agent_id, "dsh-terminal-msg", "queue", "continue")
+        .unwrap_err();
+    assert!(error.to_string().contains("TERMINAL_SEND_UNSUPPORTED"));
+    assert!(store.message("dsh-terminal-msg").unwrap().is_none());
+    // The terminal row was not requeued.
+    let task = store.get_task(&agent_id).unwrap().unwrap();
+    assert_eq!(task.phase, TaskPhase::Terminal);
+}

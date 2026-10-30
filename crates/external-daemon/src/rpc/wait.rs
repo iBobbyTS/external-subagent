@@ -2309,6 +2309,11 @@ pub(crate) mod wait_tests {
                 },
             )
             .unwrap();
+        // The fixture task is a resume-eligible terminal zcode task (agent +
+        // persisted session id), which terminal send now requeues by design.
+        // The rejection-without-deletion invariant belongs to the ineligible
+        // rows: request a close so the durable requeue must refuse.
+        service.store.request_close(&id).unwrap();
         let before = service.store.task_result(&id).unwrap().unwrap();
         let response = service.dispatch(RpcMethod::TaskMessage(MessageInput {
             agent_id: id.clone(),

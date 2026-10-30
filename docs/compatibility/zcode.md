@@ -319,4 +319,6 @@ context completes initialize → tools/list (all ten tools) → a real
 
 活跃 queue 由 es 暂存，在既有 turn 边界经 session/send 投递。活跃 steer 先 session/stop，边界落定后 session/send 新 turn。空闲时两种 mode 均普通发送。原生并发 session/send 的实测 -32010 拒绝是暂存兜底的依据。
 
+终态任务经 resume 接续：scheduler 对带持久化 session id 的终态任务 requeue，claim 起新 app-server 进程走 `session/resume` + `session/subscribe`，排队消息是唯一下一轮触发，中断前的 turn 不重放；resume 的会话模型粘性沿用（不重读不重设）。上游能力 live 验证（2026-10-29，ZCode 3.17.1 / glm runtime，直连双进程探测）：SIGKILL 回收后新进程 resume 同一 sessionId，快照含完整历史，send 后 turn.completed 答出首进程埋下的暗号；探测日志见 `.agent-work/tmp/zcode-send-after-end/probe-cold-resume.log`。同轮次实测补充：3.17.x 的 `session/setModel` 对推理模型强制 `options.reasoningLevel`（缺失报 "Reasoning level is required"），daemon 无 effort 时以 catalog `defaultLevel` 补齐的既有行为与之兼容。
+
 接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

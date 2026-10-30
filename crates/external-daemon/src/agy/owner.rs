@@ -207,6 +207,44 @@ impl ManagedRuntime for AgyRuntimeOwner {
         })
     }
 
+    fn resume_session_with_mcp(
+        &self,
+        task: &TaskRecord,
+        _mcp_servers: &[external_contract::StdioMcpServer],
+        timeout: Duration,
+    ) -> Result<SessionReady, RuntimeCommandError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(RuntimeCommandError::Timeout)?;
+        let session_id = task
+            .session_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && id.len() <= 512)
+            .ok_or_else(|| {
+                RuntimeCommandError::InvalidSession("task has no persisted session id".into())
+            })?;
+        let model = Self::admitted_model(task)?;
+        // The factory launched this child with `--conversation <session_id>`
+        // (see `resolve_launch`), so `init` must echo the persisted
+        // conversation id. A different id means the `agy` CLI silently started
+        // a new conversation; the follow-up must fail closed instead of
+        // continuing on the wrong history.
+        let observed = self.shared.wait_start(remaining_time(deadline)?)?;
+        if observed != session_id {
+            return Err(RuntimeCommandError::InvalidSession(format!(
+                "agy resumed conversation {observed} does not match the persisted session id"
+            )));
+        }
+        // A resumed conversation never replays the pre-stop prompt: the queued
+        // message delivered by the scheduler is the sole trigger for the next
+        // turn, mirroring the codex/zcode resume owners.
+        Ok(SessionReady {
+            session_id: session_id.to_owned(),
+            initial_turn_id: None,
+            configured_model: model,
+        })
+    }
+
     fn send_turn(
         &self,
         session_id: &str,

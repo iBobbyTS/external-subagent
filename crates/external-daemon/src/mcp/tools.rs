@@ -630,7 +630,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_send",
     output_schema = tool_output_schema::<AgentSendOutput>(),
-    description = "发送有界消息，必须指定 mode：queue 优先原生非破坏投递，必要时由 es 暂存；steer 中断后启动新 turn（仅 codex/zcode 支持）。省略 message_id 时 daemon 生成并返回有效 id",
+    description = "发送有界消息，必须指定 mode：queue 优先原生非破坏投递，必要时由 es 暂存；steer 中断后启动新 turn（仅 codex/zcode 支持）。终态任务默认经 resume 接续（dsh 返回 TERMINAL_SEND_UNSUPPORTED）。省略 message_id 时 daemon 生成并返回有效 id",
     annotations(
         read_only_hint = false,
         destructive_hint = false,

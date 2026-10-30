@@ -236,4 +236,6 @@ separate strict read-only operation.
 
 活跃 queue 由 es 暂存，在既有 turn 边界投递；这是对旧版活跃时直接失败的行为改进。空闲 queue 沿用 session/prompt 路径。steer 始终公开返回 steer_unsupported，不降级为 queue，也不尝试硬杀。原生并发 prompt 实测 -32602，session/cancel 实测 -32601。
 
+终态任务的 send 续聊对 dsh **不放开**：ACP 无会话重入，dsh owner 每次 claim 重跑完整 bootstrap（新会话 + 原 initial prompt），requeue 只会在新会话上重放有副作用的 prompt 而非接续持久化会话。因此 dsh 显式列在 scheduler 终态 send 的排除集（`terminal_resume_excluded`），即使带有持久化 session id 也保持 `TERMINAL_SEND_UNSUPPORTED` 干净拒绝；其余 subagent 默认进入接续集合（见 docs/compatibility/agents.md）。
+
 接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。

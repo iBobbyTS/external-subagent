@@ -87,7 +87,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 
 ## 8. 对照产品 MCP 面的结论（以实测为准）
 
-**可直接实现**：spawn（prompt+cwd）；长驻多轮 send/queue_message；result 的 final_text+outcome 映射（SUCCESS/ERROR+error/interrupted）；wait 增量 text tail（text_delta）；tool activity（tool step 含 name/parameters/output，粒度超需求）；cancel 硬杀路径（`interrupted` result + 部分文本 + exit 1，进程组 TERM/KILL 语义匹配）；close/list/durable history；probe local（`--version`）；probe hi（any tool step 即 policy_violation，检测面完整）；auth 层无独立检查 → 按惯例 UNKNOWN；`agent_models`（`agy models`/错误目录）；yolo 权限；effort（closed set low/medium/high/max）；model 启动时选择+会话 sticky；**restart recovery resume（streaming + `--conversation` 原生可用）**；`denied_actions` 上报（respond 缺失的部分代偿——调用方至少能看到任务被拒了什么）；structured_output（超出项目现有面的免费加分）。
+**可直接实现**：spawn（prompt+cwd）；长驻多轮 send/queue_message；result 的 final_text+outcome 映射（SUCCESS/ERROR+error/interrupted）；wait 增量 text tail（text_delta）；tool activity（tool step 含 name/parameters/output，粒度超需求）；cancel 硬杀路径（`interrupted` result + 部分文本 + exit 1，进程组 TERM/KILL 语义匹配）；close/list/durable history；probe local（`--version`）；probe hi（any tool step 即 policy_violation，检测面完整）；auth 层无独立检查 → 按惯例 UNKNOWN；`agent_models`（`agy models`/错误目录）；yolo 权限；effort（closed set low/medium/high/max）；model 启动时选择+会话 sticky；**终态 send 续聊 resume（streaming + `--conversation`，已实现；live 验证 2026-10-29 agy 1.4.10：新进程接续同 conversation，init 回显同 id、num_turns 累计、答出原会话暗号，探测日志 `.agent-work/tmp/terminal-send-probe/probe-agy-resume.log`）**；`denied_actions` 上报（respond 缺失的部分代偿——调用方至少能看到任务被拒了什么）；structured_output（超出项目现有面的免费加分）。
 
 **降级/变通**：build/edit 权限（allow 规则注入 + `--mode accept-edits`；预授权 ≠ 拦截守卫）；plan 姿态（`--mode plan` + `deny` 兜底可构造，但语义是"强制拒绝"非"工具禁用"，需产品决策是否承认为 plan）；reasoning tail（无 thought 流 → 不采集，照 codex 先例）；resume 单轮延迟 53–58s（上下文重放成本）。
 
@@ -120,7 +120,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 - permission request/respond 交互缺失：流中无请求事件，工具被 soft-deny 自动决；被拒动作仅经失败/取消路径拼入 bounded 诊断尾部。
 - 成功路径的 `denied_actions` 无公共投影面：`TaskResult` 无该字段、Completed 不携带 diagnostics，成功 turn 的 soft-deny 明细不上报。
 - 无 write-manifest 守卫：无 `FS_WRITE_MANIFEST_DENIED` 等价物，故 admission 只接受空 manifest。
-- 无 daemon 重启 resume：探测虽确认 streaming + `--conversation` 原生可用，适配器当前不实现重启恢复。
+- daemon 崩溃后的活跃行自动恢复仍不实现（沿用 RUNTIME_LOST 不重放语义）；终态任务的显式 send 续聊**已实现**：factory 以持久化 session id 追加 `--conversation` 重启子进程，owner 校验 `init` 回显一致后由排队消息开启下一 turn（见「可直接实现」与 docs/compatibility/agents.md 的 send 双模式投递）。
 - 运行时 set-model/set-effort/cancel 控制面缺失（`control_request` 明示 not supported yet）。
 - model×effort 非正交：admission 不做 per-model 校验，交给 `agy` CLI 在 session 启动时 loud-fail。
 

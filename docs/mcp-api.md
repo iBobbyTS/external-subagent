@@ -308,7 +308,7 @@ zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道，
 
 ## 9. external_subagent_send
 
-发送补充指令，必须指定 `mode: "queue" | "steer"`。旧调用缺少 mode 或值非法均以 `validation` 拒绝，MCP 与 CLI 输入一致。符合恢复条件的终态 codex 任务经现有 resume 路径接续；保存请求的 mode，queue/steer 的恢复动作相同。
+发送补充指令，必须指定 `mode: "queue" | "steer"`。旧调用缺少 mode 或值非法均以 `validation` 拒绝，MCP 与 CLI 输入一致。终态任务默认经现有 resume 路径接续（codex `thread/resume`、zcode `session/resume`、agy `--conversation`；dsh 无 ACP 会话重入，保持 `TERMINAL_SEND_UNSUPPORTED` 干净拒绝）；保存请求的 mode，queue/steer 的恢复动作相同（agy 的 steer 仍按适配层返回 `steer_unsupported`）。新接入的 subagent 默认进入接续集合，其 owner 未实现 resume 合同的必须加入 scheduler 的显式排除集。
 
 | 输入参数 | 类型／要求 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|

@@ -1370,6 +1370,89 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
 }
 
 #[test]
+fn terminal_send_requeues_a_zcode_task_with_a_persisted_session_id() {
+    // Terminal-send resume is open by default: a zcode task (the historical
+    // non-codex rejection case) with a persisted session id must requeue for
+    // resume instead of rejecting. Only the admission contract is asserted
+    // here; the resume machinery itself is adapter-owned and exercised by the
+    // codex/agy scripted suites, and this suite's zcode factory must never
+    // spawn, so the requeued row is inspected without driving a claim.
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let scheduler = codex_scheduler(
+        workspace.path(),
+        harness_factory(
+            &happy_turn(workspace.path(), PermissionMode::Plan),
+            workspace.path(),
+        ),
+    );
+    let zcode_task = scheduler
+        .enqueue_general(&manifest_for(
+            workspace.path(),
+            "zcode terminal resume task",
+        ))
+        .unwrap();
+    let store = scheduler.store();
+    let claim = store
+        .claim_next("terminal-zcode", usize::MAX, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.task.agent_id, zcode_task.agent_id);
+    store
+        .mark_session_running(
+            &zcode_task.agent_id,
+            claim.owner_epoch,
+            "runtime",
+            None,
+            Some("sess-terminal-resume"),
+            Some(external_store::TurnState::Idle),
+        )
+        .unwrap();
+    store
+        .store_task_result(
+            &zcode_task.agent_id,
+            &external_store::TaskResult {
+                outcome: TaskOutcome::Completed,
+                final_text: "done".into(),
+                partial: false,
+            },
+        )
+        .unwrap();
+    store
+        .transition_terminal(
+            &zcode_task.agent_id,
+            claim.owner_epoch,
+            &external_store::TerminalUpdate {
+                outcome: TaskOutcome::Completed,
+                failure_code: None,
+                failure_message: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        scheduler
+            .send_message(
+                &zcode_task.agent_id,
+                "zcode-resume-msg",
+                "queue",
+                "continue"
+            )
+            .unwrap(),
+        crate::MessageDisposition::Queued
+    );
+    let task = store.get_task(&zcode_task.agent_id).unwrap().unwrap();
+    assert_eq!(task.phase, TaskPhase::Queued);
+    assert_eq!(
+        task.session_id.as_deref(),
+        Some("sess-terminal-resume"),
+        "the resume requeue must preserve the persisted session id"
+    );
+    let message = store.message("zcode-resume-msg").unwrap().unwrap();
+    assert_eq!(message.state, external_store::MessageState::Queued);
+    assert_eq!(message.mode, "queue");
+}
+
+#[test]
 fn server_overloaded_and_mcp_startup_failures_stay_bounded_and_diagnostic() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
@@ -1879,7 +1962,21 @@ fn terminal_send_never_overwrites_a_committed_close_or_cancel() {
         await_result(&scheduler, &agent_id);
         let before = await_terminal_task(&scheduler, &agent_id);
         assert_eq!(before.outcome, Some(TaskOutcome::Completed));
-        assert!(before.reaped_at.is_some(), "completed task must be reaped");
+        // The terminal transition and the monitor's reap are two async steps;
+        // under a loaded suite the reap can trail the phase flip by a poll
+        // cycle, so wait for it instead of asserting it already happened.
+        let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+        while scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .reaped_at
+            .is_none()
+        {
+            assert!(Instant::now() < deadline, "completed task was never reaped");
+            thread::sleep(Duration::from_millis(10));
+        }
 
         let phase = if close {
             scheduler.close_task(&agent_id)

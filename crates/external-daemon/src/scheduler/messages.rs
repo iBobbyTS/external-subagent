@@ -212,10 +212,10 @@ impl Scheduler {
         Ok(MessageDisposition::Queued)
     }
 
-    /// The explicit recovery trigger for a terminal Codex task. Only an
-    /// eligible terminal Codex task — a persisted thread id and no
-    /// cancellation or close — requeues through the existing store path; a
-    /// later claim spawns a fresh app-server, resumes the same thread, and
+    /// The explicit recovery trigger for a terminal task. Only an eligible
+    /// terminal task — a persisted session id, a resume-capable adapter, and
+    /// no cancellation or close — requeues through the existing store path; a
+    /// later claim spawns a fresh app-server, resumes the same session, and
     /// starts exactly one new turn with the queued message. The interrupted
     /// pre-crash turn is never replayed. The durable eligibility check and
     /// the requeue state update share one store transaction, so a close or
@@ -235,7 +235,7 @@ impl Scheduler {
         // The prepared route is immutable, so this precheck only refuses
         // early; every durable field is re-checked inside the requeue
         // transaction before any state changes.
-        let eligible = task_agent(&task) == "codex"
+        let eligible = !terminal_resume_excluded(&task_agent(&task))
             && task
                 .session_id
                 .as_deref()
@@ -476,4 +476,19 @@ fn control_failure_code(error: &RuntimeCommandError) -> &'static str {
     } else {
         "CONTROL_RUNTIME_FAILED"
     }
+}
+
+/// Terminal-send resume is open by default: any adapter that is not listed
+/// here resumes a terminal task through its runtime owner's
+/// `resume_session_with_mcp`. A newly integrated subagent therefore joins the
+/// resume set without a scheduler change, provided its owner implements the
+/// resume contract; an owner that cannot (yet) resume must be listed here so
+/// its terminal sends keep the clean admission rejection
+/// (`TERMINAL_SEND_UNSUPPORTED`) instead of requeueing into a task that fails
+/// with `SESSION_START_FAILED` and loses its persisted terminal result.
+/// `dsh` is excluded because ACP has no session re-entry: its owner re-runs
+/// the full bootstrap on every claim, which would replay the initial prompt
+/// on a fresh session rather than continue the persisted one.
+fn terminal_resume_excluded(agent: &str) -> bool {
+    matches!(agent, "dsh")
 }

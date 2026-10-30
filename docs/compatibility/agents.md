@@ -48,7 +48,7 @@ Executable version discovery uses the same bounded process discipline as catalog
 
 `external_subagent_send` 的 mode 必填，仅接受 queue/steer；缺失或非法值以 validation 拒绝。
 
-活跃 queue：codex 原生 turn/start 注入当前 turn，agy stdin user 直写并原生按序缓冲，zcode/dsh 则由 es 暂存至 turn 边界。活跃 steer：codex interrupt+start，zcode stop+send；dsh/agy 返回 steer_unsupported。空闲 runtime 普通发送；符合条件的终态 codex 经 resume 接续，mode 原值落库。
+活跃 queue：codex 原生 turn/start 注入当前 turn，agy stdin user 直写并原生按序缓冲，zcode/dsh 则由 es 暂存至 turn 边界。活跃 steer：codex interrupt+start，zcode stop+send；dsh/agy 返回 steer_unsupported。空闲 runtime 普通发送；终态任务默认经 resume 接续（codex/zcode/agy，mode 原值落库；dsh 无会话重入，返回 TERMINAL_SEND_UNSUPPORTED）。
 
 接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。
 

@@ -865,3 +865,148 @@ fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
         .is_err());
     assert_eq!(shared.turn_snapshot(), second);
 }
+
+/// One scripted child serves both invocations: without `--conversation` it
+/// settles a first turn; with it, it echoes the same conversation on `init`
+/// and settles a second turn after exactly one follow-up user line.
+const RESUME_SCRIPT: &str = r#"
+case " $* " in
+  *" --conversation "*)
+    printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+    read_frame
+    printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"RESUMED_OK","num_turns":2}}'
+    ;;
+  *)
+    printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+    read_frame
+    printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"FIRST_OK","num_turns":1}}'
+    ;;
+esac
+"#;
+
+#[test]
+fn terminal_send_resumes_the_conversation_and_delivers_the_follow_up_only() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let script = RESUME_SCRIPT.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let first = await_result(&scheduler, &agent_id);
+    assert_eq!(first.result.final_text, "FIRST_OK");
+    assert_eq!(first.result.outcome, TaskOutcome::Completed);
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // The terminal task carries the persisted conversation id, so the public
+    // send requeues it for resume instead of rejecting.
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "resume-msg", "queue", "follow-up question")
+            .unwrap(),
+        MessageDisposition::Queued
+    );
+    scheduler.start_ready().unwrap();
+    let resumed = await_result(&scheduler, &agent_id);
+    assert_eq!(resumed.result.final_text, "RESUMED_OK");
+    assert_eq!(resumed.result.outcome, TaskOutcome::Completed);
+    let message = scheduler.store().message("resume-msg").unwrap().unwrap();
+    assert_eq!(message.state, external_store::MessageState::Delivered);
+    assert_eq!(message.mode, "queue");
+
+    // The factory threaded the persisted session id as --conversation: the
+    // flag appears exactly once, in the resumed invocation only.
+    let argv = argv(workspace.path());
+    let flag_positions: Vec<usize> = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == "ARG--conversation").then_some(index))
+        .collect();
+    assert_eq!(flag_positions.len(), 1, "argv: {argv:?}");
+    assert_eq!(argv[flag_positions[0] + 1], format!("ARG{CONV}"));
+
+    // The resumed conversation never replays the initial prompt: the second
+    // process receives exactly the follow-up as its sole user line.
+    let users: Vec<String> = deliveries(workspace.path())
+        .iter()
+        .filter(|frame| frame["event"] == "user")
+        .map(|frame| frame["message"]["content"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(users, ["inspect the repository", "follow-up question"]);
+}
+
+#[test]
+fn terminal_send_resume_fails_closed_when_the_conversation_echo_diverges() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let other = "00000000-0000-4000-8000-000000000000";
+    // Same shape as RESUME_SCRIPT, but the resumed branch echoes a different
+    // conversation id on `init`: the resume must fail closed without ever
+    // continuing the diverging conversation.
+    let script = format!(
+        r#"
+case " $* " in
+  *" --conversation "*)
+    printf '%s\n' '{{"event":"init","conversation_id":"{other}","init":{{}}}}'
+    ;;
+  *)
+    printf '%s\n' '{{"event":"init","conversation_id":"{CONV}","init":{{}}}}'
+    read_frame
+    printf '%s\n' '{{"event":"result","result":{{"conversation_id":"{CONV}","status":"SUCCESS","response":"FIRST_OK","num_turns":1}}}}'
+    ;;
+esac
+"#
+    );
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let first = await_result(&scheduler, &agent_id);
+    assert_eq!(first.result.final_text, "FIRST_OK");
+
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    while scheduler.active_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "first runtime was never released"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        scheduler
+            .send_message(&agent_id, "resume-mismatch", "queue", "follow-up question")
+            .unwrap(),
+        MessageDisposition::Queued
+    );
+    // The failing resume surfaces through start_ready and terminalizes the
+    // task with SESSION_START_FAILED.
+    let error = scheduler.start_ready().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match the persisted session id"),
+        "{error}"
+    );
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.phase, TaskPhase::Terminal);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    assert_eq!(task.failure_code.as_deref(), Some("SESSION_START_FAILED"));
+    let message = scheduler
+        .store()
+        .message("resume-mismatch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(message.state, external_store::MessageState::Failed);
+    // The diverging conversation was never continued: no follow-up user line
+    // reached any child after the first turn.
+    let users = deliveries(workspace.path())
+        .iter()
+        .filter(|frame| frame["event"] == "user")
+        .count();
+    assert_eq!(users, 1);
+}
