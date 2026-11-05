@@ -214,14 +214,30 @@ impl ObservationState {
         }
         let payload = params.get("payload").unwrap_or(&Value::Null);
         let kind = payload.get("kind").and_then(Value::as_str);
-        if kind == Some("text_delta") {
-            return;
-        }
-        if !matches!(kind, Some("reasoning_delta" | "tool_call")) {
-            // Unknown shapes on the supported stream are a coverage gap, not
-            // evidence of inactivity. Unrelated notification methods stay ignored.
-            self.observe_loss();
-            return;
+        match kind {
+            // Text is consumed by activity_parser / the final-text projection.
+            // Stream boundaries carry no additional reasoning/tool arguments.
+            Some("start" | "text_start" | "text_delta" | "text_end"
+                | "reasoning_start" | "reasoning_end" | "finish" | "error"
+                | "message_finished" | "message_done" | "text_done") => return,
+            // ZCode emits raw argument fragments before the normalized tool_call.
+            // Recognize their shape, but use that final input as the argument owner:
+            // fragments neither prove execution nor form safe public JSON yet.
+            Some("tool_input_start" | "tool_input_delta" | "tool_input_end") => {
+                let valid = valid_id(payload.get("toolCallId")).is_some()
+                    && match kind {
+                        Some("tool_input_start") => valid_id(payload.get("toolName")).is_some(),
+                        Some("tool_input_delta") => payload.get("delta").is_some_and(Value::is_string),
+                        _ => true,
+                    };
+                if !valid { self.drop_event(true); }
+                return;
+            }
+            Some("reasoning_delta" | "tool_call") => {}
+            _ => {
+                self.observe_loss();
+                return;
+            }
         }
         if kind == Some("reasoning_delta") && !self.collect_reasoning {
             return;
@@ -293,7 +309,11 @@ impl ObservationState {
         if !payload.get("input").is_some_and(Value::is_object) {
             // Missing or incompatible arguments are unknown for every adapter.
             arguments_truncated = true;
-            self.drop_event(true);
+            // ACP's canonical tool companion intentionally omits input; its
+            // capability is already incomplete. A malformed supplied input is loss.
+            if self.reasoning_source != ReasoningSource::dsh() || payload.get("input").is_some() {
+                self.drop_event(true);
+            }
         }
         self.record_tool_call(
             turn_id,
@@ -656,6 +676,29 @@ mod tests {
             "turnId": "turn-1",
             "payload": { "kind": kind, "toolCallId": payload.get("toolCallId"), "toolName": payload.get("toolName"), "input": payload.get("input"), "delta": payload.get("delta") }
         })
+    }
+
+    #[test]
+    fn zcode_normal_stream_boundaries_do_not_invent_loss_or_tool_execution() {
+        let mut state = ObservationState::for_adapter("zcode");
+        let kinds = ["start", "text_start", "text_delta", "text_end", "reasoning_start",
+            "reasoning_delta", "reasoning_end", "tool_input_start", "tool_input_delta",
+            "tool_input_end", "tool_call", "finish", "error"];
+        for (i, kind) in kinds.iter().enumerate() {
+            let frame = serde_json::json!({"type":"model.streaming", "eventId":i.to_string(), "turnId":"turn",
+                "payload":{"kind":kind, "delta":"sample", "toolCallId":"call", "toolName":"Read", "input":{"path":"file"}}});
+            state.observe_message("session/event", &frame);
+        }
+        let snapshot = state.snapshot();
+        assert!(snapshot.coverage.tool_history_complete);
+        assert!(snapshot.coverage.reasoning_complete);
+        assert_eq!(snapshot.coverage.dropped_events, 0);
+        assert_eq!(snapshot.tools[0].call_count, 1);
+        assert_eq!(snapshot.tools[0].recent_calls[0].arguments["path"], "file");
+        assert_eq!(snapshot.reasoning.text, "sample");
+        state.observe_message("session/event", &serde_json::json!({"type":"model.streaming","payload":{"kind":"tool_input_delta","delta":42}}));
+        assert_eq!(state.dropped_events, 1);
+        assert!(!state.tool_history_complete);
     }
 
     #[test]

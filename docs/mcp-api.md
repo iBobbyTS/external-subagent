@@ -249,7 +249,17 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 ## 7. external_subagent_observe
 
-已识别的 model.streaming 流中，未知 kind 或缺失／错误类型的 payload 标记现有 coverage 缺口；非对象工具参数标记未知。正常 text_delta 与无关通知不构成缺口，解析降级不阻断任务。
+`model.streaming` 按 ZCode 的实际生产者合同处理：
+
+| 事件 | ES 消费与归属 |
+|---|---|
+| `text_delta` | 现有 activity/final-text 投影消费文本；observe 不复制正文 |
+| `reasoning_delta` | observe 保留公开 reasoning 尾部 |
+| `tool_call` | observe 使用归一化 input 记录工具与参数，按调用身份去重 |
+| `tool_input_start/delta/end` | 识别身份与分片形状；参数以最终 tool_call 为准，不将输入生成误计为工具执行，不公开未完成的原始 JSON |
+| `start`、`text_start/end`、`reasoning_start/end`、`finish`、`error` | 识别为正常流边界；不重复存储无新增观测内容的标记，模型请求和任务终态仍归现有生命周期事件 |
+
+其他适配器已归一化的 `message_finished/message_done/text_done` 由既有正文完成投影消费；DSH ACP 未提供 input 时保留参数未知及既有不完整能力，不误称丢包。以上正常事件不计 loss。未知 kind、损坏目标事件或实际丢失的数据标记现有 coverage 缺口；非对象工具参数标记未知。无关通知不构成缺口，解析降级不阻断任务。源码参考：ZCode `core/src/runtime/methods/model.ts` 的模型流生产者；`provider_tool_result` 经工具卡生命周期发送，不是 model.streaming kind。
 
 仅在怀疑 subagent 任务无进展循环时使用，不作为健康任务的常规轮询。读取已捕获的公开数据，不启动模型、不执行工具、不自动判定循环或取消。
 
