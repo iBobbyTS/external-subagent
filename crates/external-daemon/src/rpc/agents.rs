@@ -2,16 +2,15 @@
 //!
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
+use super::agent_policy::{self, AgentKind};
 use super::config::{AgentConfigEntry, AgentConfigSnapshot};
 use super::errors::{RpcError, RpcErrorCode};
 use super::handlers::validate_text;
 use super::profiles::Profile;
 use super::types::GeneralSubmitInput;
 use super::views::{
-    AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
-    AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentModelsStatusView,
-    AgentPermissionModeView, AgentScopeStatusView, AgentStatusView, AgentTransportSupportView,
-    AgentTransportView, ComponentStateView, VersionMismatchView,
+    AgentModelsStatusView, AgentScopeStatusView, AgentStatusView, ComponentStateView,
+    VersionMismatchView,
 };
 use crate::agent_status::{
     AgentEvidenceStore, AgentModelsInput, AgentProbeEvidence, AgentProbeInput, EvidenceState,
@@ -22,7 +21,11 @@ use std::{env, path::Path};
 use std::fs;
 
 #[cfg(test)]
-use super::views::{flat_identity, task_view};
+use super::views::{
+    flat_identity, task_view, AgentEffortSelectionCapabilityView, AgentEffortSelectionModeView,
+    AgentModelSelectionCapabilityView, AgentModelSelectionModeView, AgentPermissionModeView,
+    AgentTransportView,
+};
 #[cfg(test)]
 use crate::rpc::wait_tests;
 #[cfg(test)]
@@ -42,16 +45,17 @@ pub(super) fn configured_agent_statuses(
     config: &AgentConfigSnapshot,
     evidence: &AgentEvidenceStore,
 ) -> Vec<AgentStatusView> {
-    ["zcode", "dsh", "codex", "agy"]
+    AgentKind::ALL
         .into_iter()
-        .map(|agent| {
+        .map(|kind| {
+            let agent = kind.name();
+            let policy = kind.policy();
             let entry = &config.subagents[agent];
             let observed = evidence.latest(agent);
             let observed_version = observed
                 .as_ref()
                 .and_then(|evidence| evidence.local.version.as_deref());
-            let expected =
-                crate::agent_status::expected_version(agent, entry.version.as_deref());
+            let expected = policy.expected_version(entry.version.as_deref());
             let version_mismatch = crate::agent_status::version_mismatch(
                 expected.as_deref(),
                 observed_version,
@@ -63,16 +67,16 @@ pub(super) fn configured_agent_statuses(
             });
             AgentStatusView {
                 agent: agent.into(),
-                required_version: required_version(agent),
+                required_version: policy.required_version(),
                 version_mismatch,
                 config_revision: config.revision,
                 configured: true,
                 enabled: entry.enabled,
-                spawn_supported: effective_spawn_supported(agent, entry),
-                transport_support: transport_support(agent, entry),
-                permission_modes: permission_modes(agent, entry),
-                model_selection: model_selection(agent, entry),
-                effort_selection: effort_selection(agent, entry),
+                spawn_supported: policy.spawn_supported(entry),
+                transport_support: policy.transport_support(entry),
+                permission_modes: policy.permission_mode_views(entry),
+                model_selection: policy.model_selection_view(entry),
+                effort_selection: policy.effort_selection_view(entry),
                 models: models_status(evidence.latest_models(agent), config.revision),
                 local: current_scope(&observed, config.revision, |evidence| &evidence.local),
                 auth: current_scope(&observed, config.revision, |evidence| &evidence.auth),
@@ -83,177 +87,45 @@ pub(super) fn configured_agent_statuses(
 }
 
 pub(super) fn unavailable_agent_statuses() -> Vec<AgentStatusView> {
-    ["zcode", "dsh", "codex", "agy"]
+    AgentKind::ALL
         .into_iter()
-        .map(|agent| AgentStatusView {
-            agent: agent.into(),
-            required_version: required_version(agent),
-            version_mismatch: None,
-            config_revision: 0,
-            configured: false,
-            enabled: false,
-            spawn_supported: false,
-            transport_support: transport_support(
-                agent,
-                &AgentConfigEntry {
-                    enabled: false,
-                    spawn_supported: false,
-                    default_model: None,
-                    runtime_path: None,
-                    home: None,
-                    profile: None,
-                    version: None,
-                },
-            ),
-            permission_modes: Vec::new(),
-            model_selection: model_selection(
-                agent,
-                &AgentConfigEntry {
-                    enabled: false,
-                    spawn_supported: false,
-                    default_model: None,
-                    runtime_path: None,
-                    home: None,
-                    profile: None,
-                    version: None,
-                },
-            ),
-            effort_selection: effort_selection(
-                agent,
-                &AgentConfigEntry {
-                    enabled: false,
-                    spawn_supported: false,
-                    default_model: None,
-                    runtime_path: None,
-                    home: None,
-                    profile: None,
-                    version: None,
-                },
-            ),
-            models: None,
-            local: unprobed_scope(),
-            auth: unprobed_scope(),
-            hi: unprobed_scope(),
+        .map(|kind| {
+            let policy = kind.policy();
+            // A fully closed row: no spawn gate, no selectable capability.
+            let entry = AgentConfigEntry {
+                enabled: false,
+                spawn_supported: false,
+                default_model: None,
+                runtime_path: None,
+                home: None,
+                profile: None,
+                version: None,
+            };
+            AgentStatusView {
+                agent: kind.name().into(),
+                required_version: policy.required_version(),
+                version_mismatch: None,
+                config_revision: 0,
+                configured: false,
+                enabled: false,
+                spawn_supported: false,
+                transport_support: policy.transport_support(&entry),
+                permission_modes: Vec::new(),
+                model_selection: policy.model_selection_view(&entry),
+                effort_selection: policy.effort_selection_view(&entry),
+                models: None,
+                local: unprobed_scope(),
+                auth: unprobed_scope(),
+                hi: unprobed_scope(),
+            }
         })
         .collect()
 }
 
-fn required_version(agent: &str) -> Option<String> {
-    (agent == "dsh").then(|| external_agent_dsh::profile::PINNED_DSH_VERSION.into())
-}
-
+/// The spawn gate is a policy fact; this thin wrapper also preserves the
+/// historical config-only fallback for a name outside the roster.
 fn effective_spawn_supported(agent: &str, entry: &AgentConfigEntry) -> bool {
-    if agent == "dsh" {
-        // Version is advisory here: a persisted version difference never
-        // closes the dsh spawn gate. The remaining identity terms stay
-        // fail-closed.
-        return entry.enabled
-            && entry.spawn_supported
-            && entry.profile.as_deref() == Some("acp")
-            && entry
-                .runtime_path
-                .as_deref()
-                .map(Path::new)
-                .is_some_and(|path| {
-                    // Host executable semantics: the Unix execute bit, or the
-                    // Windows PATHEXT extension gate over a regular file.
-                    path.is_absolute() && crate::executable::is_executable_file(path)
-                });
-    }
-    if agent == "codex" {
-        // The Codex gate pins the persisted runtime executable only; the home
-        // precedence (agents.codex.home over inherited CODEX_HOME) is enforced
-        // at admission and spawn so no launch ever falls back to ~/.codex.
-        return entry.enabled
-            && entry.spawn_supported
-            && entry
-                .runtime_path
-                .as_deref()
-                .map(Path::new)
-                .is_some_and(|path| {
-                    // Host executable semantics: the Unix execute bit, or the
-                    // Windows PATHEXT extension gate over a regular file.
-                    path.is_absolute() && crate::executable::is_executable_file(path)
-                });
-    }
-    if agent == "agy" {
-        // agy pins the same codex-style gate: enabled + spawn_supported + an
-        // absolute executable runtime_path. agy has no home override — the
-        // launch reads AGY_RUNTIME_PATH only — so no home term participates.
-        return entry.enabled
-            && entry.spawn_supported
-            && entry
-                .runtime_path
-                .as_deref()
-                .map(Path::new)
-                .is_some_and(|path| {
-                    // Host executable semantics: the Unix execute bit, or the
-                    // Windows PATHEXT extension gate over a regular file.
-                    path.is_absolute() && crate::executable::is_executable_file(path)
-                });
-    }
-    entry.enabled && entry.spawn_supported
-}
-
-fn transport_support(agent: &str, entry: &AgentConfigEntry) -> AgentTransportSupportView {
-    AgentTransportSupportView {
-        transport: match agent {
-            "zcode" => AgentTransportView::ZcodeAppServer,
-            "codex" => AgentTransportView::CodexAppServer,
-            "agy" => AgentTransportView::AgyStreamJson,
-            _ => AgentTransportView::DshAcp,
-        },
-        probe: true,
-        spawn: effective_spawn_supported(agent, entry),
-    }
-}
-
-fn permission_modes(agent: &str, entry: &AgentConfigEntry) -> Vec<AgentPermissionModeView> {
-    if !effective_spawn_supported(agent, entry) {
-        return Vec::new();
-    }
-    if agent == "dsh" {
-        // First-launch dsh admission proves only the read-bounded build and
-        // strict plan scopes; edit/yolo are refused before the prompt.
-        return vec![
-            AgentPermissionModeView::Build,
-            AgentPermissionModeView::Plan,
-        ];
-    }
-    if agent == "agy" {
-        // agy has no write-manifest guard and no permission-respond surface,
-        // so only the two postures with a measured mapping are admitted:
-        // build -> --mode accept-edits and yolo -> --dangerously-skip-permissions.
-        return vec![
-            AgentPermissionModeView::Build,
-            AgentPermissionModeView::Yolo,
-        ];
-    }
-    vec![
-        AgentPermissionModeView::Build,
-        AgentPermissionModeView::Edit,
-        AgentPermissionModeView::Plan,
-        AgentPermissionModeView::Yolo,
-    ]
-}
-
-fn model_selection(agent: &str, entry: &AgentConfigEntry) -> AgentModelSelectionCapabilityView {
-    AgentModelSelectionCapabilityView {
-        supported: matches!(agent, "zcode" | "dsh" | "codex" | "agy")
-            && effective_spawn_supported(agent, entry),
-        mode: AgentModelSelectionModeView::CatalogToken,
-    }
-}
-
-fn effort_selection(agent: &str, entry: &AgentConfigEntry) -> AgentEffortSelectionCapabilityView {
-    AgentEffortSelectionCapabilityView {
-        supported: effective_spawn_supported(agent, entry),
-        mode: if agent == "codex" || agent == "agy" {
-            AgentEffortSelectionModeView::ClosedSet
-        } else {
-            AgentEffortSelectionModeView::PassthroughToken
-        },
-    }
+    agent_policy::spawn_supported_for(agent, entry)
 }
 
 /// Project recorded model-catalog evidence into status. Recorded evidence
@@ -528,136 +400,145 @@ pub(super) fn resolve_admission_with_instructions(
             profile_provided: subagent_from_profile,
         });
     }
+    // Every per-agent admission branch below is keyed on the policy row, never
+    // on an agent-name literal; the `None` arms preserve the historical
+    // fallbacks for a name outside the roster.
+    let kind = AgentKind::from_name(agent);
+    let policy = kind.map(AgentKind::policy);
     let effort_from_profile =
         input.effort.is_some() && profile.map_or(false, |p| p.effort.is_some());
-    let effort = resolve_effort_selection(agent, input, effort_from_profile)?;
+    let effort = resolve_effort_selection(kind, input, effort_from_profile)?;
     let model_from_profile =
         input.model.is_some() && profile.map_or(false, |p| p.model.is_some());
-    let (model, model_source) = if agent == "dsh" {
-        // Explicit spawn token, then the configured default, then the
-        // provider-native model. The configured default is a selection too:
-        // an unusable token is refused here rather than silently downgraded
-        // to native. The dsh model is `{provider}:{model}` (split at the first
-        // colon); the ACP session re-serializes it to the byte-exact wire
-        // tuple immediately before the prompt gate.
-        let token = input
-            .model
-            .as_deref()
-            .map(str::trim)
-            .or_else(|| configured.default_model.as_deref().map(str::trim));
-        match token {
-            Some(token) => {
-                if external_agent_dsh::acp::model::parse_colon_token(token).is_err() {
-                    return Err(AdmissionFailure {
-                        error: RpcError::new(
-                            RpcErrorCode::Validation,
-                            dsh_model_format_error(token),
-                        ),
-                        field: AdmissionField::Model,
-                        profile_provided: model_from_profile,
-                    });
+    let (model, model_source) = match policy.map(|policy| policy.model_shape) {
+        Some(agent_policy::ModelShape::DshColonToken) => {
+            // Explicit spawn token, then the configured default, then the
+            // provider-native model. The configured default is a selection too:
+            // an unusable token is refused here rather than silently downgraded
+            // to native. The dsh model is `{provider}:{model}` (split at the
+            // first colon); the ACP session re-serializes it to the byte-exact
+            // wire tuple immediately before the prompt gate.
+            let token = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .or_else(|| configured.default_model.as_deref().map(str::trim));
+            match token {
+                Some(token) => {
+                    if external_agent_dsh::acp::model::parse_colon_token(token).is_err() {
+                        return Err(AdmissionFailure {
+                            error: RpcError::new(
+                                RpcErrorCode::Validation,
+                                dsh_model_format_error(token),
+                            ),
+                            field: AdmissionField::Model,
+                            profile_provided: model_from_profile,
+                        });
+                    }
+                    if input.model.is_some() {
+                        (Some(token.to_owned()), "spawn_catalog")
+                    } else {
+                        (Some(token.to_owned()), "configured_default")
+                    }
                 }
-                if input.model.is_some() {
-                    (Some(token.to_owned()), "spawn_catalog")
-                } else {
-                    (Some(token.to_owned()), "configured_default")
-                }
+                None => (None, "native"),
             }
-            None => (None, "native"),
         }
-    } else if agent == "codex" {
-        // Explicit submit model, then the configured default. Absence is
-        // rejected: the daemon never silently picks a provider-default model.
-        let token = input
-            .model
-            .as_deref()
-            .map(str::trim)
-            .or_else(|| configured.default_model.as_deref().map(str::trim));
-        let Some(token) = token else {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::Validation,
-                    "codex requires an explicit model or agents.codex.default_model",
-                ),
-                field: AdmissionField::Model,
-                profile_provided: false,
-            });
-        };
-        if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::Validation,
-                    "model token is not a bounded non-empty string",
-                ),
-                field: AdmissionField::Model,
-                profile_provided: model_from_profile,
-            });
-        }
-        if input.model.is_some() {
-            (Some(token.to_owned()), "spawn_catalog")
-        } else {
-            (Some(token.to_owned()), "configured_default")
-        }
-    } else if agent == "agy" {
-        // Explicit spawn token, then the configured default, then the native
-        // model — the same three-level precedence as dsh. agy models are
-        // bare slugs: the ':' and '/' separators and embedded whitespace are
-        // refused here so an invalid selection never reaches the runtime after
-        // the task exists.
-        let token = input
-            .model
-            .as_deref()
-            .map(str::trim)
-            .or_else(|| configured.default_model.as_deref().map(str::trim));
-        match token {
-            Some(token) => {
-                if !agy_model_is_valid(token) {
-                    return Err(AdmissionFailure {
-                        error: RpcError::new(
-                            RpcErrorCode::Validation,
-                            agy_model_format_error(token),
-                        ),
-                        field: AdmissionField::Model,
-                        profile_provided: model_from_profile,
-                    });
-                }
-                if input.model.is_some() {
-                    (Some(token.to_owned()), "spawn_catalog")
-                } else {
-                    (Some(token.to_owned()), "configured_default")
-                }
+        Some(agent_policy::ModelShape::CodexBoundedToken) => {
+            // Explicit submit model, then the configured default. Absence is
+            // rejected: the daemon never silently picks a provider-default model.
+            let token = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .or_else(|| configured.default_model.as_deref().map(str::trim));
+            let Some(token) = token else {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        "codex requires an explicit model or agents.codex.default_model",
+                    ),
+                    field: AdmissionField::Model,
+                    profile_provided: false,
+                });
+            };
+            if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        "model token is not a bounded non-empty string",
+                    ),
+                    field: AdmissionField::Model,
+                    profile_provided: model_from_profile,
+                });
             }
-            None => (None, "native"),
+            if input.model.is_some() {
+                (Some(token.to_owned()), "spawn_catalog")
+            } else {
+                (Some(token.to_owned()), "configured_default")
+            }
         }
-    } else if agent == "zcode" {
-        // ZCode has no daemon-injected provider environment and no supported
-        // configured default: the model must be selected explicitly, either in
-        // the spawn request or by the named profile merged into it before
-        // admission. The token is always `{provider}/{model}`; a bare token is
-        // not a selection.
-        let Some(token) = input.model.as_deref().map(str::trim) else {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::Validation,
-                    "zcode model must be {provider}/{model}; an explicit model is required from the spawn request or a named profile",
-                ),
-                field: AdmissionField::Model,
-                profile_provided: false,
-            });
-        };
-        let Some(normalized) = normalized_zcode_model(token) else {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::Validation,
-                    zcode_model_format_error(token),
-                ),
-                field: AdmissionField::Model,
-                profile_provided: model_from_profile,
-            });
-        };
-        (Some(normalized), "spawn_catalog")
-    } else {
-        (None, "native")
+        Some(agent_policy::ModelShape::AgyBareSlug) => {
+            // Explicit spawn token, then the configured default, then the native
+            // model — the same three-level precedence as dsh. agy models are
+            // bare slugs: the ':' and '/' separators and embedded whitespace are
+            // refused here so an invalid selection never reaches the runtime
+            // after the task exists.
+            let token = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .or_else(|| configured.default_model.as_deref().map(str::trim));
+            match token {
+                Some(token) => {
+                    if !agy_model_is_valid(token) {
+                        return Err(AdmissionFailure {
+                            error: RpcError::new(
+                                RpcErrorCode::Validation,
+                                agy_model_format_error(token),
+                            ),
+                            field: AdmissionField::Model,
+                            profile_provided: model_from_profile,
+                        });
+                    }
+                    if input.model.is_some() {
+                        (Some(token.to_owned()), "spawn_catalog")
+                    } else {
+                        (Some(token.to_owned()), "configured_default")
+                    }
+                }
+                None => (None, "native"),
+            }
+        }
+        Some(agent_policy::ModelShape::ZcodeProviderModel) => {
+            // ZCode has no daemon-injected provider environment and no supported
+            // configured default: the model must be selected explicitly, either
+            // in the spawn request or by the named profile merged into it before
+            // admission. The token is always `{provider}/{model}`; a bare token
+            // is not a selection.
+            let Some(token) = input.model.as_deref().map(str::trim) else {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        "zcode model must be {provider}/{model}; an explicit model is required from the spawn request or a named profile",
+                    ),
+                    field: AdmissionField::Model,
+                    profile_provided: false,
+                });
+            };
+            let Some(normalized) = normalized_zcode_model(token) else {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        zcode_model_format_error(token),
+                    ),
+                    field: AdmissionField::Model,
+                    profile_provided: model_from_profile,
+                });
+            };
+            (Some(normalized), "spawn_catalog")
+        }
+        None => (None, "native"),
     };
     let permission_mode_from_profile =
         profile.map_or(false, |p| p.permission_mode.is_some());
@@ -665,120 +546,102 @@ pub(super) fn resolve_admission_with_instructions(
         .manifest
         .permission_mode
         .unwrap_or(external_core::PermissionMode::Build);
-    if agent == "dsh" {
-        if !matches!(
-            permission_mode,
-            external_core::PermissionMode::Build | external_core::PermissionMode::Plan
-        ) {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::AgentUnsupported,
-                    "dsh first-launch admission supports only the build and plan permission modes",
-                ),
-                field: AdmissionField::PermissionMode,
-                profile_provided: permission_mode_from_profile,
-            });
+    if let Some(policy) = policy {
+        let name = policy.kind.name();
+        if let Some(refusal) = policy.permission_refusal {
+            // Only the measured permission postures are admitted; everything
+            // else is refused before the prompt. The public code is projected
+            // from a sentinel detail by mcp::errors where the detail is a
+            // sentinel (agy_permission_mode_unsupported).
+            if !policy.permission_modes.contains(&permission_mode) {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(RpcErrorCode::AgentUnsupported, refusal),
+                    field: AdmissionField::PermissionMode,
+                    profile_provided: permission_mode_from_profile,
+                });
+            }
         }
-        // A caller write manifest is admitted for build tasks: the factory
-        // routes a non-`["."]` manifest to the manifest-build composition
-        // (per-task write-guard patch) instead of refusing it. Plan + a
-        // non-empty manifest is still refused later by external-core, not here.
-        // The manifest is materialized into a patch, so the shared entry/byte
-        // bounds owned by external-core (the same pair the ZCode policy
-        // environment enforces) are applied before any task is persisted.
-        let serialized = serde_json::to_string(
-            &input
-                .manifest
-                .write_manifest
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| AdmissionFailure {
-            error: RpcError::new(
-                RpcErrorCode::Validation,
-                format!("dsh write manifest could not be serialized: {error}"),
-            ),
-            field: AdmissionField::None,
-            profile_provided: false,
-        })?;
-        if input.manifest.write_manifest.len() > external_core::MAX_WRITE_MANIFEST_ENTRIES
-            || serialized.len() > external_core::MAX_WRITE_MANIFEST_BYTES
-        {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::Validation,
-                    format!(
-                        "dsh write manifest exceeds the admission bounds (max {} entries / {} KiB)",
-                        external_core::MAX_WRITE_MANIFEST_ENTRIES,
-                        external_core::MAX_WRITE_MANIFEST_BYTES / 1024
+        match policy.write_manifest {
+            agent_policy::WriteManifestPolicy::Unrestricted => {}
+            agent_policy::WriteManifestPolicy::GuardedBuildComposition => {
+                // A caller write manifest is admitted for build tasks: the
+                // factory routes a non-`["."]` manifest to the manifest-build
+                // composition (per-task write-guard patch) instead of refusing
+                // it. Plan + a non-empty manifest is still refused later by
+                // external-core, not here. The manifest is materialized into a
+                // patch, so the shared entry/byte bounds owned by external-core
+                // (the same pair the ZCode policy environment enforces) are
+                // applied before any task is persisted.
+                let serialized = serde_json::to_string(
+                    &input
+                        .manifest
+                        .write_manifest
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        format!("{name} write manifest could not be serialized: {error}"),
                     ),
-                ),
-                field: AdmissionField::None,
-                profile_provided: false,
-            });
+                    field: AdmissionField::None,
+                    profile_provided: false,
+                })?;
+                if input.manifest.write_manifest.len()
+                    > external_core::MAX_WRITE_MANIFEST_ENTRIES
+                    || serialized.len() > external_core::MAX_WRITE_MANIFEST_BYTES
+                {
+                    return Err(AdmissionFailure {
+                        error: RpcError::new(
+                            RpcErrorCode::Validation,
+                            format!(
+                                "{name} write manifest exceeds the admission bounds (max {} entries / {} KiB)",
+                                external_core::MAX_WRITE_MANIFEST_ENTRIES,
+                                external_core::MAX_WRITE_MANIFEST_BYTES / 1024
+                            ),
+                        ),
+                        field: AdmissionField::None,
+                        profile_provided: false,
+                    });
+                }
+            }
+            agent_policy::WriteManifestPolicy::Refused(message) => {
+                // No write-manifest guard exists on this transport, so only an
+                // empty manifest is admitted — even an explicit ["."] is
+                // refused before any task exists.
+                if !input.manifest.write_manifest.is_empty() {
+                    return Err(AdmissionFailure {
+                        error: RpcError::new(RpcErrorCode::AgentUnsupported, message),
+                        field: AdmissionField::None,
+                        profile_provided: false,
+                    });
+                }
+            }
+        }
+        if let agent_policy::HomeRequirement::ConfiguredOrEnv(variable) = policy.home {
+            // Home precedence is the configured home over the inherited
+            // variable; neither being present rejects before the prompt, never
+            // the runtime's default home.
+            if configured.home.is_none() && env::var_os(variable).is_none() {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::AgentUnsupported,
+                        format!("{name} home is unconfigured"),
+                    ),
+                    field: AdmissionField::None,
+                    profile_provided: false,
+                });
+            }
         }
     }
-    if agent == "codex" {
-        if !input.manifest.write_manifest.is_empty() {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::AgentUnsupported,
-                    "CODEX_WRITE_MANIFEST_UNSUPPORTED",
-                ),
-                field: AdmissionField::None,
-                profile_provided: false,
-            });
+    let developer_instructions = match policy.map(|policy| policy.developer_instructions) {
+        Some(agent_policy::DeveloperInstructionsChannel::NativeThreadStart) => {
+            developer_instructions
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
         }
-        // Home precedence is agents.codex.home over the inherited CODEX_HOME;
-        // neither being present rejects before the prompt, never ~/.codex.
-        if configured.home.is_none() && env::var_os("CODEX_HOME").is_none() {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::AgentUnsupported,
-                    "codex home is unconfigured",
-                ),
-                field: AdmissionField::None,
-                profile_provided: false,
-            });
-        }
-    }
-    if agent == "agy" {
-        // Only the two measured permission mappings are admitted; plan/edit are
-        // refused before the prompt. The public code is projected from the
-        // sentinel detail by mcp::errors (agy_permission_mode_unsupported).
-        if !matches!(
-            permission_mode,
-            external_core::PermissionMode::Build | external_core::PermissionMode::Yolo
-        ) {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::AgentUnsupported,
-                    "AGY_PERMISSION_MODE_UNSUPPORTED",
-                ),
-                field: AdmissionField::PermissionMode,
-                profile_provided: permission_mode_from_profile,
-            });
-        }
-        // agy has no write-manifest guard, so only an empty manifest is
-        // admitted — even an explicit ["."] is refused before any task exists.
-        if !input.manifest.write_manifest.is_empty() {
-            return Err(AdmissionFailure {
-                error: RpcError::new(
-                    RpcErrorCode::AgentUnsupported,
-                    "AGY_WRITE_MANIFEST_UNSUPPORTED",
-                ),
-                field: AdmissionField::None,
-                profile_provided: false,
-            });
-        }
-    }
-    let developer_instructions = if agent == "codex" {
-        developer_instructions
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-    } else {
-        None
+        _ => None,
     };
     Ok(external_core::AdmissionIdentity {
         agent: agent.to_owned(),
@@ -912,9 +775,9 @@ fn agy_model_format_error(token: &str) -> String {
 }
 
 /// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
-/// NUL. Codex additionally admits only its closed effort set {low, medium,
-/// high, xhigh, max}. Evidence notes for the values left OUT and the max
-/// admission (2026-09-22 live probe,
+/// NUL. A closed-set row (`AgentPolicy::effort`) additionally admits only the
+/// measured values in that table entry. Evidence notes for the values left OUT
+/// and the max admission (2026-09-22 live probe,
 /// .agent-work/tmp/codex-effort-max-20260922/): the backend API rejects an
 /// unknown effort with an oracle listing exactly
 /// none/minimal/low/medium/high/xhigh/max, and a live `turn/start`
@@ -927,7 +790,7 @@ fn agy_model_format_error(token: &str) -> String {
 /// tokens because their supported sets are only known at runtime and
 /// admission must not fabricate a catalog.
 fn resolve_effort_selection(
-    agent: &str,
+    kind: Option<AgentKind>,
     input: &GeneralSubmitInput,
     profile_provided: bool,
 ) -> Result<Option<String>, AdmissionFailure> {
@@ -950,27 +813,26 @@ fn resolve_effort_selection(
             profile_provided,
         });
     }
-    if agent == "codex" && !matches!(token, "low" | "medium" | "high" | "xhigh" | "max") {
-        return Err(AdmissionFailure {
-            error: RpcError::new(
-                RpcErrorCode::Validation,
-                "codex effort must be one of low, medium, high, xhigh, max",
-            ),
-            field: AdmissionField::Effort,
-            profile_provided,
-        });
-    }
-    // agy's measured closed set includes `max` (unlike the official docs) and
-    // excludes every other well-formed token.
-    if agent == "agy" && !matches!(token, "low" | "medium" | "high" | "max") {
-        return Err(AdmissionFailure {
-            error: RpcError::new(
-                RpcErrorCode::Validation,
-                "agy effort must be one of low, medium, high, max",
-            ),
-            field: AdmissionField::Effort,
-            profile_provided,
-        });
+    if let Some(kind) = kind {
+        if let agent_policy::EffortPolicy::Closed(admitted) = kind.policy().effort {
+            // The closed sets are measured facts owned by the policy table;
+            // agy's set includes `max` (unlike the official docs) while codex
+            // additionally admits `xhigh`.
+            if !admitted.contains(&token) {
+                return Err(AdmissionFailure {
+                    error: RpcError::new(
+                        RpcErrorCode::Validation,
+                        format!(
+                            "{} effort must be one of {}",
+                            kind.name(),
+                            admitted.join(", ")
+                        ),
+                    ),
+                    field: AdmissionField::Effort,
+                    profile_provided,
+                });
+            }
+        }
     }
     Ok(Some(token.to_owned()))
 }

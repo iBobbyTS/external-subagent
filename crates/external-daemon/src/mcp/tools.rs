@@ -1711,6 +1711,166 @@ mod contract_default_tests {
         );
     }
 
+    /// The spawn description must carry prose (the MCP contract is text), so
+    /// its factual admission claims are locked to the single policy table
+    /// rather than to a second hand-maintained copy. Every expected sentence
+    /// below is rebuilt from `AgentPolicy`: flipping one table fact (a mode, an
+    /// effort value, a manifest rule, a gate term, a model shape) changes the
+    /// expected sentence and turns this test red until the description is
+    /// updated with it.
+    #[test]
+    fn spawn_description_admission_claims_match_the_agent_policy_table() {
+        use crate::rpc::agent_policy::{
+            permission_mode_name, AgentKind, EffortPolicy, ModelShape, SpawnGate,
+            WriteManifestPolicy,
+        };
+        use external_core::{PermissionMode, MAX_WRITE_MANIFEST_BYTES, MAX_WRITE_MANIFEST_ENTRIES};
+
+        fn mode(
+            policy: &crate::rpc::agent_policy::AgentPolicy,
+            mode: PermissionMode,
+        ) -> &'static str {
+            assert!(
+                policy.permission_modes.contains(&mode),
+                "{} does not admit {mode:?} in the policy table",
+                policy.kind.name()
+            );
+            permission_mode_name(mode)
+        }
+
+        fn oxford(items: &[&str]) -> String {
+            match items.split_last() {
+                None => String::new(),
+                Some((last, [])) => (*last).to_string(),
+                Some((last, init)) => format!("{} or {last}", init.join(", ")),
+            }
+        }
+
+        let facade = SubagentMcp::new(
+            PathBuf::from("/tmp/spawn-policy.sock"),
+            Duration::from_secs(1),
+        );
+        let spawn = facade
+            .tool_router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "external_subagent_spawn")
+            .unwrap();
+        let description = spawn.description.as_deref().unwrap();
+
+        // Permission mode sets.
+        let codex = AgentKind::Codex.policy();
+        assert_eq!(
+            codex.permission_modes.len(),
+            4,
+            "the codex prose names exactly four modes"
+        );
+        assert!(description.contains(&format!(
+            "Codex supports {}/{} (workspace-write), {} (read-only), and {} (danger-full-access)",
+            mode(codex, PermissionMode::Build),
+            mode(codex, PermissionMode::Edit),
+            mode(codex, PermissionMode::Plan),
+            mode(codex, PermissionMode::Yolo),
+        )));
+        let agy = AgentKind::Agy.policy();
+        assert_eq!(
+            agy.permission_modes.len(),
+            2,
+            "the agy prose names exactly two modes"
+        );
+        assert!(description.contains(&format!(
+            "it supports {} (--mode accept-edits) and {} (--dangerously-skip-permissions) only",
+            mode(agy, PermissionMode::Build),
+            mode(agy, PermissionMode::Yolo),
+        )));
+
+        // Effort sets and passthrough rows.
+        let closed = |kind: AgentKind| match kind.policy().effort {
+            EffortPolicy::Closed(set) => set,
+            EffortPolicy::Passthrough => panic!("{} must be a closed-set row", kind.name()),
+        };
+        assert!(description.contains(&format!(
+            "codex admits only {}",
+            oxford(closed(AgentKind::Codex))
+        )));
+        assert!(description.contains(&format!(
+            "admits effort only from {}",
+            closed(AgentKind::Agy).join("/")
+        )));
+        let passthrough: Vec<&str> = AgentKind::ALL
+            .iter()
+            .filter(|kind| matches!(kind.policy().effort, EffortPolicy::Passthrough))
+            .map(|kind| kind.name())
+            .collect();
+        assert_eq!(passthrough, ["zcode", "dsh"]);
+        assert!(description.contains(&format!(
+            "{} pass a bounded token through to the runtime",
+            passthrough.join(" and ")
+        )));
+
+        // Write-manifest support.
+        assert!(matches!(
+            AgentKind::Dsh.policy().write_manifest,
+            WriteManifestPolicy::GuardedBuildComposition
+        ));
+        assert!(description.contains("dsh admits a non-empty write_manifest in build"));
+        assert!(description.contains(&format!(
+            "bounded to {MAX_WRITE_MANIFEST_ENTRIES} entries and {} KiB serialized",
+            MAX_WRITE_MANIFEST_BYTES / 1024
+        )));
+        for kind in [AgentKind::Codex, AgentKind::Agy] {
+            let marker = match kind.policy().write_manifest {
+                WriteManifestPolicy::Refused(message) => message.to_ascii_lowercase(),
+                other => panic!("{} must refuse write manifests: {other:?}", kind.name()),
+            };
+            assert!(
+                description.contains(&format!("({marker})")),
+                "{}'s published manifest refusal marker is not documented",
+                kind.name()
+            );
+        }
+        assert!(description.contains("codex rejects non-empty write_manifest before task creation"));
+        assert!(description.contains("rejects any non-empty write_manifest"));
+        assert!(matches!(
+            AgentKind::Zcode.policy().write_manifest,
+            WriteManifestPolicy::Unrestricted
+        ));
+        assert!(description.contains(
+            "For other subagents an omitted write_manifest uses the protected workspace scope."
+        ));
+
+        // Spawn-gate and model-shape facts named by the prose.
+        assert!(matches!(
+            AgentKind::Dsh.policy().spawn_gate,
+            SpawnGate::AcpProfileRuntime
+        ));
+        assert!(
+            description.contains("profile=acp + absolute executable runtime_path configuration")
+        );
+        assert!(matches!(
+            AgentKind::Agy.policy().spawn_gate,
+            SpawnGate::ExecutableRuntime
+        ));
+        assert!(description.contains(
+            "its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable"
+        ));
+        assert!(description.contains("ZCode requires an explicit provider/model token"));
+        assert!(matches!(
+            AgentKind::Zcode.policy().model_shape,
+            ModelShape::ZcodeProviderModel
+        ));
+        assert!(matches!(
+            AgentKind::Dsh.policy().model_shape,
+            ModelShape::DshColonToken
+        ));
+        assert!(description.contains("A dsh model is provider:model, split at the first colon"));
+        assert!(matches!(
+            AgentKind::Agy.policy().model_shape,
+            ModelShape::AgyBareSlug
+        ));
+        assert!(description.contains("takes a bare model slug whose shape admission validates"));
+    }
+
     #[test]
     fn observation_tool_catalog_matches_the_frozen_description_and_bounds() {
         let facade = SubagentMcp::new(PathBuf::from("/tmp/observe.sock"), Duration::from_secs(1));

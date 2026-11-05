@@ -1,3 +1,6 @@
+use crate::rpc::agent_policy::{
+    CatalogProbe, CatalogRuntime, ProbeDepth, ProbeHome, RuntimeSource,
+};
 use external_agent_dsh::{
     acp::session::AcpSession,
     profile::{preflight, resolve_launch, DshLaunch, STRICT_PLAN_PATCH_YAML},
@@ -79,14 +82,14 @@ impl Default for ProbeLayer {
 pub const VERSION_MISMATCH_INSTRUCTION: &str = "version mismatch, it may not work as expected";
 
 /// The expected runtime version for one agent: the daemon-tested DSH reference
-/// for dsh, otherwise the persisted `agents.<agent>.version`. Absence means no
-/// expected version, so no mismatch can be reported.
+/// for a pinned row, otherwise the persisted `agents.<agent>.version`. Absence
+/// means no expected version, so no mismatch can be reported. A name outside
+/// the roster keeps the configured-only reading.
 pub fn expected_version(agent: &str, configured: Option<&str>) -> Option<String> {
-    if agent == "dsh" {
-        Some(external_agent_dsh::profile::PINNED_DSH_VERSION.into())
-    } else {
-        configured.map(str::to_owned)
-    }
+    crate::rpc::agent_policy::policy_for(agent).map_or_else(
+        || configured.map(str::to_owned),
+        |policy| policy.expected_version(configured),
+    )
 }
 
 /// A known expected/observed version pair that differs.
@@ -365,27 +368,32 @@ struct ProcessProbeBackend {
 impl AgentProbeBackend for ProcessProbeBackend {
     fn probe(&self, input: &AgentProbeInput) -> AgentProbeEvidence {
         let checked_at_ms = wall_now_millis();
+        let policy = crate::rpc::agent_policy::policy_for(&input.agent);
         let mut scope = input.scope.clone();
         if scope.home.is_none() {
-            let variable = match input.agent.as_str() {
-                "dsh" => "DSH_HOME",
-                // Codex never falls back to ~/.codex: only an explicit home
-                // (persisted configuration or exported CODEX_HOME) counts.
-                "codex" => "CODEX_HOME",
-                // agy has no home override: the default HOME is the only source
-                // (there is no AGY_HOME), so a scoped home just records HOME.
-                "agy" => "HOME",
-                _ => "ZCODE_HOME",
-            };
-            scope.home = if variable == "CODEX_HOME" {
-                env::var_os(variable)
-            } else {
-                env::var_os(variable).or_else(|| env::var_os("HOME"))
-            }
-            .map(|value| value.to_string_lossy().into_owned());
+            // Codex never falls back to ~/.codex: only an explicit home
+            // (persisted configuration or exported CODEX_HOME) counts. agy has
+            // no home override, so its row records HOME itself.
+            let probe_home = policy.map_or(
+                ProbeHome {
+                    variable: "ZCODE_HOME",
+                    falls_back_to_home: true,
+                },
+                |policy| policy.probe_home,
+            );
+            scope.home = env::var_os(probe_home.variable)
+                .or_else(|| {
+                    probe_home
+                        .falls_back_to_home
+                        .then(|| env::var_os("HOME"))
+                        .flatten()
+                })
+                .map(|value| value.to_string_lossy().into_owned());
         }
-        let disposable_workspace = if input.agent == "zcode"
-            && input.through == ProbeLayer::Hi
+        let disposable_workspace = if matches!(
+            policy.map(|policy| policy.probe_depth),
+            Some(ProbeDepth::ZcodeHi)
+        ) && input.through == ProbeLayer::Hi
             && scope.workspace.is_none()
         {
             tempfile::Builder::new()
@@ -403,65 +411,64 @@ impl AgentProbeBackend for ProcessProbeBackend {
             }
             scope.workspace = Some(workspace.path().to_string_lossy().into_owned());
         }
-        let executable = match input.agent.as_str() {
-            "zcode" => self.runtime_source.clone(),
-            "dsh" => discover_runtime("DSH_RUNTIME_PATH", "dsh"),
-            "codex" => discover_runtime("CODEX_RUNTIME_PATH", "codex"),
-            "agy" => discover_runtime("AGY_RUNTIME_PATH", "agy"),
-            _ => None,
+        let executable = match policy.map(|policy| policy.runtime_source) {
+            Some(RuntimeSource::Injected) => self.runtime_source.clone(),
+            Some(RuntimeSource::Variable { variable, binary }) => {
+                discover_runtime(variable, binary)
+            }
+            None => None,
         };
         let local = probe_local(executable.as_deref(), scope.clone(), checked_at_ms);
         let mut auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
         let mut hi = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "hi_not_probed");
 
-        if input.agent == "dsh" && input.through == ProbeLayer::Hi {
-            let (a, h) = probe_dsh_hi(
-                executable.as_deref(),
-                &scope,
-                local.version.clone(),
-                checked_at_ms,
-            );
-            auth = a;
-            hi = h;
-        } else if input.agent == "dsh" && input.through == ProbeLayer::Auth {
-            // DSH has no independent credential endpoint in the ACP dialect
-            // we support. Auth-only must remain side-effect free: do not
-            // create a session or send a prompt merely to infer auth.
-            auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
-        } else if input.agent == "agy" && input.through == ProbeLayer::Hi {
-            let (a, h) = probe_agy_hi(
-                executable.as_deref(),
-                &scope,
-                local.version.clone(),
-                checked_at_ms,
-            );
-            auth = a;
-            hi = h;
-        } else if input.agent == "agy" && input.through == ProbeLayer::Auth {
-            // agy exposes no independent credential endpoint either: auth-only
-            // stays side-effect free (never spawn a streaming session just to
-            // infer auth), matching the dsh precedent.
-            auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_not_probed");
-        } else if input.agent == "zcode" && input.through != ProbeLayer::Local {
-            if local.state != EvidenceState::Ready {
-                auth = derived_failure(&local, scope.clone(), checked_at_ms);
-                if input.through == ProbeLayer::Hi {
-                    hi = derived_failure(&local, scope.clone(), checked_at_ms);
-                }
-            } else if input.through == ProbeLayer::Auth {
-                auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_requires_hi");
-            } else {
-                let (auth_result, hi_result) = probe_zcode_hi(
-                    executable
-                        .as_deref()
-                        .expect("ready evidence has executable"),
+        // Probe depth is a policy fact. DSH and agy expose no independent
+        // credential endpoint (dsh in the ACP dialect we support), so their
+        // auth-only layer stays side-effect free: never create a session or
+        // send a prompt merely to infer auth. Codex takes no deeper layer.
+        match (policy.map(|policy| policy.probe_depth), input.through) {
+            (Some(ProbeDepth::DshHi), ProbeLayer::Hi) => {
+                let (a, h) = probe_dsh_hi(
+                    executable.as_deref(),
                     &scope,
                     local.version.clone(),
                     checked_at_ms,
                 );
-                auth = auth_result;
-                hi = hi_result;
+                auth = a;
+                hi = h;
             }
+            (Some(ProbeDepth::AgyHi), ProbeLayer::Hi) => {
+                let (a, h) = probe_agy_hi(
+                    executable.as_deref(),
+                    &scope,
+                    local.version.clone(),
+                    checked_at_ms,
+                );
+                auth = a;
+                hi = h;
+            }
+            (Some(ProbeDepth::ZcodeHi), layer) if layer != ProbeLayer::Local => {
+                if local.state != EvidenceState::Ready {
+                    auth = derived_failure(&local, scope.clone(), checked_at_ms);
+                    if input.through == ProbeLayer::Hi {
+                        hi = derived_failure(&local, scope.clone(), checked_at_ms);
+                    }
+                } else if input.through == ProbeLayer::Auth {
+                    auth = ScopeEvidence::unknown(scope.clone(), checked_at_ms, "auth_requires_hi");
+                } else {
+                    let (auth_result, hi_result) = probe_zcode_hi(
+                        executable
+                            .as_deref()
+                            .expect("ready evidence has executable"),
+                        &scope,
+                        local.version.clone(),
+                        checked_at_ms,
+                    );
+                    auth = auth_result;
+                    hi = hi_result;
+                }
+            }
+            _ => {}
         }
 
         AgentProbeEvidence {
@@ -476,27 +483,28 @@ impl AgentProbeBackend for ProcessProbeBackend {
     }
 
     fn models(&self, input: &AgentModelsInput) -> AgentModelsOutput {
-        if input.agent == "zcode" {
-            return probe_zcode_models(self.runtime_source.as_deref(), input);
+        let policy = crate::rpc::agent_policy::policy_for(&input.agent);
+        let catalog = policy.map_or(CatalogProbe::DshAcpModels, |policy| policy.catalog);
+        // The dsh catalog preflight reads only its configured variable; codex
+        // and agy also scan PATH. A name outside the roster keeps the dsh
+        // fallback.
+        let catalog_runtime = policy.map_or(
+            CatalogRuntime::EnvironmentVariable("DSH_RUNTIME_PATH"),
+            |policy| policy.catalog_runtime,
+        );
+        let executable: Option<PathBuf> = match catalog_runtime {
+            CatalogRuntime::Injected => self.runtime_source.clone(),
+            CatalogRuntime::EnvironmentVariable(variable) => {
+                env::var_os(variable).map(PathBuf::from)
+            }
+            CatalogRuntime::Discovered { variable, binary } => discover_runtime(variable, binary),
+        };
+        match catalog {
+            CatalogProbe::ZcodeSessionCreate => probe_zcode_models(executable.as_deref(), input),
+            CatalogProbe::CodexModelList => probe_codex_models(executable.as_deref(), input),
+            CatalogProbe::AgyModelsList => probe_agy_models(executable.as_deref(), input),
+            CatalogProbe::DshAcpModels => probe_dsh_models(executable.as_deref(), input),
         }
-        if input.agent == "codex" {
-            return probe_codex_models(
-                discover_runtime("CODEX_RUNTIME_PATH", "codex").as_deref(),
-                input,
-            );
-        }
-        if input.agent == "agy" {
-            return probe_agy_models(
-                discover_runtime("AGY_RUNTIME_PATH", "agy").as_deref(),
-                input,
-            );
-        }
-        probe_dsh_models(
-            env::var_os("DSH_RUNTIME_PATH")
-                .map(PathBuf::from)
-                .as_deref(),
-            input,
-        )
     }
 }
 
@@ -791,12 +799,11 @@ fn unsupported_models(input: &AgentModelsInput, reason: &str) -> AgentModelsOutp
         supported: false,
         models: Vec::new(),
         evidence: ModelCatalogEvidence {
-            source: match input.agent.as_str() {
-                "zcode" => "zcode_native_model".into(),
-                "codex" => "codex_app_server_model_list".into(),
-                "agy" => "agy_models_list".into(),
-                _ => "dsh_acp_models_list".into(),
-            },
+            source: crate::rpc::agent_policy::policy_for(&input.agent)
+                .map_or("dsh_acp_models_list", |policy| {
+                    policy.catalog.unsupported_source()
+                })
+                .into(),
             version: None,
             scope: input.scope.clone(),
             checked_at_ms: wall_now_millis(),

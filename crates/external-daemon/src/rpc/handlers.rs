@@ -2,6 +2,7 @@
 //!
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
+use super::agent_policy::{AgentKind, DeveloperInstructionsChannel, ObservationSupport};
 use super::agents::{
     configured_agent_statuses, resolve_admission_with_instructions,
     unavailable_agent_statuses, unknown_agent_name_error, validate_agent_models_input,
@@ -376,8 +377,19 @@ impl RpcService {
                     .as_deref()
                     .or(config.default_subagent.as_deref());
 
-                let admission_res = if effective_agent == Some("codex") {
-                    // codex uses native developerInstructions on thread/start; prompt remains verbatim
+                // The developer-instructions channel is a per-agent policy
+                // fact. A name outside the roster keeps the historical
+                // prompt-splicing route.
+                let developer_instructions_channel = effective_agent
+                    .and_then(AgentKind::from_name)
+                    .map_or(DeveloperInstructionsChannel::PromptSplice, |kind| {
+                        kind.policy().developer_instructions
+                    });
+                let admission_res = if developer_instructions_channel
+                    == DeveloperInstructionsChannel::NativeThreadStart
+                {
+                    // The native channel carries developerInstructions on
+                    // thread/start; the prompt remains verbatim.
                     resolve_admission_with_instructions(
                         &input,
                         &config,
@@ -385,7 +397,8 @@ impl RpcService {
                         profile_context.as_ref(),
                     )
                 } else {
-                    // other subagents fallback to prompt splicing when developer_instructions is non-empty
+                    // Every other channel splices the block into the prompt
+                    // when developer_instructions is non-empty.
                     if let Some(di) = developer_instructions.as_deref() {
                         if !di.is_empty() {
                             input.manifest.prompt = format!(
@@ -439,8 +452,8 @@ impl RpcService {
             }
             RpcMethod::TaskList(query) => {
                 if let Some(agent) = query.agent.as_deref() {
-                    if !matches!(agent, "zcode" | "dsh" | "codex" | "agy") {
-                        // The literal fast path keeps the happy read free of a
+                    if AgentKind::from_name(agent).is_none() {
+                        // The roster check keeps the happy read free of a
                         // config load; only the error path pays for the roster.
                         let config = read_agent_config_snapshot()?;
                         return Err(unknown_agent_name_error(&config));
@@ -647,8 +660,11 @@ impl RpcService {
                 let (snapshot, runtime_source_verified) =
                     self.scheduler.observation_snapshot(&task.agent_id);
                 let adapter = crate::task_agent(&task);
-                if !runtime_source_verified && adapter != "dsh" && adapter != "codex" && adapter != "agy"
-                {
+                // The source-verification gate and the reasoning projection are
+                // per-agent policy facts. A name outside the roster keeps the
+                // historical gated, reasoning-reporting reading.
+                let observation_support = ObservationSupport::for_name(&adapter);
+                if !runtime_source_verified && observation_support.requires_verified_source {
                     return Err(RpcError::new(
                         RpcErrorCode::Unavailable,
                         "observation runtime source is not verified",
@@ -660,7 +676,8 @@ impl RpcService {
                         agent_id: task.agent_id,
                         count_scope: "agent_lifetime".into(),
                         tools: snapshot.tools,
-                        reasoning: (!matches!(adapter.as_str(), "codex" | "agy"))
+                        reasoning: observation_support
+                            .reports_reasoning
                             .then_some(snapshot.reasoning),
                         coverage: snapshot.coverage,
                     },

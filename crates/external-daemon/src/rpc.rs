@@ -7,6 +7,7 @@
 //! crate::rpc::X` consumers keep resolving unchanged.
 
 mod agents;
+pub(crate) mod agent_policy;
 mod config;
 mod errors;
 mod handlers;
