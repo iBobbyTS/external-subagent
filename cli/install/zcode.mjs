@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { CliError } from '../errors.mjs';
+import { stableNodeExecutable } from './path.mjs';
 import { atomicWrite, jsonBytes, readOptional, restoreOptional } from '../fs-atomic.mjs';
 import { pluginSourceRoot, PLUGIN_NAME } from './layout.mjs';
 import { pluginManifest, treeDigest, preparePluginStage, guardedRestores } from './plugin-stage.mjs';
@@ -25,7 +26,7 @@ const MANIFEST_PROBES = ['.zcode-plugin/plugin.json', '.claude-plugin/plugin.jso
 // ZCode spawns plugin MCP servers inside a restricted execution context
 // that kills ad-hoc-signed native binaries (observed live: SIGKILL,
 // "Connection closed"), while node processes and unix sockets are
-// allowed.  The zcode binding therefore pins the installing node running
+// allowed. The binding uses a stable alias for the installing node, running
 // the staged stdio bridge instead of the native facade binary.  It also
 // pins `timeoutMs` on the server entry: the zcode host's MCP client caps
 // every tool call at a default 30000ms unless the server config overrides
@@ -34,7 +35,7 @@ const MANIFEST_PROBES = ['.zcode-plugin/plugin.json', '.claude-plugin/plugin.jso
 const ZCODE_MCP_TIMEOUT_MS = 300000;
 
 export function zcodeMcpBinding(staging) {
-  return { command: process.execPath, args: [path.join(staging, 'scripts', 'mcp-stdio-bridge.mjs')], timeoutMs: ZCODE_MCP_TIMEOUT_MS };
+  return { command: stableNodeExecutable(), args: [path.join(staging, 'scripts', 'mcp-stdio-bridge.mjs')], timeoutMs: ZCODE_MCP_TIMEOUT_MS };
 }
 
 export function zcodeConfigFor(options = {}, paths) {

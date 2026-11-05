@@ -210,6 +210,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskWaitQuery {
+    #[serde(default)]
+    pub wait_mode: WaitMode,
     pub agent_id: WaitTarget,
     #[serde(default = "default_wait_time")]
     pub wait_time: u64,
@@ -225,6 +227,15 @@ pub struct TaskWaitQuery {
 pub enum WaitTarget {
     One(String),
     Many(Vec<String>),
+}
+
+/// Which terminal boundary wakes a multi-agent wait. Pending requests always wake it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitMode {
+    #[default]
+    All,
+    Any,
 }
 
 impl WaitTarget {

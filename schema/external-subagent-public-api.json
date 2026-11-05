@@ -385,11 +385,12 @@
           "default": 100
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "description": "List tasks for the required absolute repository path. Pass repository, not scope; subagent, phase and outcome are optional filters."
     },
     "wait": {
       "type": "object",
-      "description": "agent_id accepts one agent id (number) or a list of 1..=16 ids. A single id returns the single wait object described below. A list blocks until every listed agent is terminal OR any one of them raises an actionable pending request, then returns a FLAT object: one key per distinct agent id carrying that agent's ordinary wait object (a repeated id is awaited once like any other), plus one \"error\" key mapping problematic ids to markers - duplicated for ids repeated in the input and unknown_agent for ids that do not exist; the remaining ids are still awaited normally. Recommended parallel pattern: spawn every subagent first, then call wait once with all ids. In list mode message_id is not supported (pass it only with a scalar id), every element carries message_receipt=null, and each element's timed_out flag follows the same shared deadline. Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.Wait up to 290 seconds by default. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
+      "description": "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..299 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
       "required": [
         "agent_id"
       ],
@@ -426,6 +427,15 @@
             "null"
           ],
           "description": "Only supported with a scalar agent_id."
+        },
+        "wait_mode": {
+          "type": "string",
+          "enum": [
+            "all",
+            "any"
+          ],
+          "default": "all",
+          "description": "all waits for every task; any wakes on one terminal task. Pending requests wake both. Scalar waits behave identically."
         }
       },
       "additionalProperties": false
@@ -447,7 +457,7 @@
     },
     "result": {
       "type": "object",
-      "description": "Pages bounded terminal task-owned text with the offset and limit continuation contract. Questions from user-input requests are embedded in full in wait projections, not paged here.",
+      "description": "Read a terminal task result. Read outcome before treating final_text as a successful report, preserve failure_message, and follow next_offset until null. Return the complete output to the caller; do not truncate or replace it with selected fields. The result keeps its stable outcome and partial status. Returns null result while the task is non-terminal. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
       "required": [
         "agent_id"
       ],
@@ -634,7 +644,8 @@
           "input": [
             "agent_id",
             "wait_time",
-            "message_id"
+            "message_id",
+            "wait_mode"
           ],
           "output": [
             "task",

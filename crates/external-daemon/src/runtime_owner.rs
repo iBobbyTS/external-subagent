@@ -40,6 +40,10 @@ pub trait ManagedRuntime: Send + Sync + 'static {
     fn diagnostic_tail(&self) -> String {
         String::new()
     }
+    /// Public turn failure captured before process cleanup; absent if not supplied.
+    fn diagnostic_failure(&self) -> Option<String> {
+        None
+    }
     fn diagnostic_session_id(&self) -> Option<String> {
         None
     }
@@ -151,6 +155,10 @@ impl ManagedRuntime for RuntimeOwner {
 
     fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
         self.wait_terminal(timeout)
+    }
+
+    fn diagnostic_failure(&self) -> Option<String> {
+        self.turn_tracker.failure_detail()
     }
 
     fn diagnostic_tail(&self) -> String {

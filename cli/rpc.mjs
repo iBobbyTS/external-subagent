@@ -123,7 +123,10 @@ function methodFor(command, input) {
       },
     };
     case 'wait': {
-      rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id']));
+      if (input.wait_mode !== undefined && !['all', 'any'].includes(input.wait_mode)) {
+        throw new CliError('INVALID_ARGUMENT', 'wait_mode must be all or any', 2);
+      }
+      rejectUnknownFields('wait', input, new Set(['agent_id', 'wait_time', 'message_id', 'wait_mode']));
       // agent_id accepts a scalar (historical shape) or a list of ids; the
       // daemon's untagged WaitTarget mirrors the caller's form.
       if (Array.isArray(input.agent_id)) {
@@ -141,6 +144,7 @@ function methodFor(command, input) {
           params: {
             agent_id: input.agent_id.map((id) => daemonTaskId(id)),
             wait_time: input.wait_time ?? 290,
+            ...(input.wait_mode !== undefined ? { wait_mode: input.wait_mode } : {}),
           },
         };
       }
@@ -149,6 +153,7 @@ function methodFor(command, input) {
         params: {
           agent_id: daemonTaskId(input.agent_id),
           wait_time: input.wait_time ?? 290,
+          ...(input.wait_mode !== undefined ? { wait_mode: input.wait_mode } : {}),
           ...(input.message_id ? { message_id: input.message_id } : {}),
         },
       };

@@ -173,6 +173,10 @@ impl ManagedRuntime for DshRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
+    fn diagnostic_failure(&self) -> Option<String> {
+        self.shared.turn_tracker.failure_detail()
+    }
+
     fn diagnostic_tail(&self) -> String {
         self.driver.diagnostic_tail()
     }

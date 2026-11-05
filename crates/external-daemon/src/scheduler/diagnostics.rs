@@ -127,7 +127,13 @@ pub(crate) fn runtime_failure_record(
         }
         // The transport closure's bounded evidence: detection lower bound,
         // frame cap, and the last admitted event sequence at latch time.
-        for field in ["bytes", "cap", "last_event_seq"] {
+        if let Some(code) = detail.get("cause_code").and_then(serde_json::Value::as_str) {
+            record["cause_code"] = bounded_prefix(code, 128).into();
+        }
+        if let Some(retryable) = detail.get("retryable").and_then(serde_json::Value::as_bool) {
+            record["retryable"] = retryable.into();
+        }
+        for field in ["bytes", "cap", "last_event_seq", "status_code"] {
             if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
                 record[field] = value.into();
             }
@@ -151,7 +157,7 @@ pub(crate) fn bounded_error(message: &str) -> String {
 /// variant must fit a single 16 KiB `tasks.failure_message` value while still
 /// carrying a latest-suffix stderr tail. Escaping expands one input byte to at
 /// most six (`\u0001`), so the non-tail budget below has a hard ceiling of
-/// `2*256 + 2*128 + 512 + 3*192 = 1,856` raw bytes (11,136 escaped) and the
+/// `2*256 + 3*128 + 512 + 3*192 = 1,984` raw bytes (11,904 escaped) and the
 /// empty-tail record is asserted below 12 KiB, leaving room for a bounded tail
 /// inside the 16 KiB total.
 pub(crate) const PERSISTABLE_RECORD_BYTES: usize = 16 * 1024;
@@ -238,7 +244,13 @@ fn render_persistable(fields: &PersistableFields<'_>, budgets: &PersistableBudge
                 record[field] = bounded_prefix(value, budgets.evidence).into();
             }
         }
-        for field in ["bytes", "cap", "last_event_seq"] {
+        if let Some(code) = detail.get("cause_code").and_then(serde_json::Value::as_str) {
+            record["cause_code"] = bounded_prefix(code, budgets.code).into();
+        }
+        if let Some(retryable) = detail.get("retryable").and_then(serde_json::Value::as_bool) {
+            record["retryable"] = retryable.into();
+        }
+        for field in ["bytes", "cap", "last_event_seq", "status_code"] {
             if let Some(value) = detail.get(field).and_then(serde_json::Value::as_u64) {
                 record[field] = value.into();
             }
@@ -580,5 +592,83 @@ impl Write for RotatingDiagnosticWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Consume only the public error summary, never data, stack, headers or raw frames.
+/// ZCode supplies ErrorPayload; other adapters supply a canonical reason_code.
+pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_json::Value> {
+    let payload = params.get("payload")?;
+    let error = payload.get("error");
+    let message = error.and_then(|e| e.get("message")).and_then(serde_json::Value::as_str)
+        .or_else(|| error.and_then(serde_json::Value::as_str))
+        .or_else(|| payload.get("reason_code").and_then(serde_json::Value::as_str));
+    let underlying = error.and_then(|e| e.get("underlyingErrorMessage"))
+        .and_then(serde_json::Value::as_str);
+    let text = match (underlying, message) {
+        (Some(cause), Some(summary)) if cause != summary =>
+            format!("{}; {}", public_failure_text(cause), public_failure_text(summary)),
+        (Some(text), _) | (_, Some(text)) => public_failure_text(text),
+        _ => return None,
+    };
+    let mut detail = serde_json::json!({"message": bounded_error(&text)});
+    if let Some(error) = error {
+        let attribution = error.get("attribution").unwrap_or(&serde_json::Value::Null);
+        if let Some(code) = attribution.get("providerErrorCode").or_else(|| error.get("code"))
+            .and_then(serde_json::Value::as_str) {
+            detail["cause_code"] = public_failure_text(code).into();
+        }
+        if let Some(retryable) = attribution.get("retryable").or_else(|| error.get("retryable"))
+            .and_then(serde_json::Value::as_bool) {
+            detail["retryable"] = retryable.into();
+        }
+        if let Some(status) = attribution.get("statusCode").and_then(serde_json::Value::as_u64) {
+            detail["status_code"] = status.into();
+        }
+    }
+    Some(detail)
+}
+
+fn public_failure_text(text: &str) -> String {
+    static SENSITIVE: OnceLock<regex::Regex> = OnceLock::new();
+    let redactor = SENSITIVE.get_or_init(|| regex::Regex::new(
+        r#"(?i)(?:bearer\s+[^\s,;]+|(?:authorization|api[_-]?key|access[_-]?token|password|(?:set-)?cookie)\s*[:=]\s*[^\s,;]+)"#
+    ).expect("failure redaction regex"));
+    let clean = redactor.replace_all(text, "[REDACTED]");
+    bounded_prefix(&clean.split_whitespace().collect::<Vec<_>>().join(" "), 2048)
+}
+
+#[cfg(test)]
+mod public_failure_tests {
+    use super::*;
+
+    #[test]
+    fn public_turn_failure_keeps_cause_and_retryability_without_raw_details() {
+        let detail = turn_failure_detail(&serde_json::json!({"payload":{"error":{
+            "message":"Model request failed.", "underlyingErrorMessage":"read EADDRNOTAVAIL",
+            "code":"model_request_failed", "attribution":{"retryable":false},
+            "data":{"apiKey":"private-data"}, "stack":"private-stack",
+            "detail":"private-detail", "underlyingErrorDetail":"private-underlying-detail"
+        }}})).unwrap();
+        assert_eq!(detail["message"], "read EADDRNOTAVAIL; Model request failed.");
+        assert_eq!(detail["retryable"], false);
+        assert!(!detail.to_string().contains("private-"));
+        let quota = turn_failure_detail(&serde_json::json!({"payload":{"error":{
+            "message":"Weekly/Monthly Limit Exhausted", "code":"model_request_failed",
+            "attribution":{"providerErrorCode":"1310","statusCode":429,"retryable":false}
+        }}})).unwrap();
+        assert_eq!(quota["cause_code"], "1310");
+        assert_eq!(quota["status_code"], 429);
+        assert_eq!(quota["retryable"], false);
+    }
+
+    #[test]
+    fn public_failure_text_redacts_credentials_and_omits_absent_evidence() {
+        assert_eq!(public_failure_text("failed Bearer private-token api_key=private-key"),
+            "failed [REDACTED] [REDACTED]");
+        assert!(turn_failure_detail(&serde_json::json!({"payload":{}})).is_none());
+        let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":"serverOverloaded: busy"}})).unwrap();
+        assert_eq!(detail["message"], "serverOverloaded: busy");
+        assert!(detail.get("retryable").is_none());
     }
 }

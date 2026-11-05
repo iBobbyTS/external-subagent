@@ -146,8 +146,8 @@ pub struct AgentListInput {
     #[schemars(with = "String")]
     #[serde(rename = "subagent")]
     pub agent: Option<String>,
-    #[serde(default, deserialize_with = "optional_non_null")]
-    pub repository: Option<String>,
+    /// Absolute repository path to list; required even when other filters are set.
+    pub repository: String,
     #[serde(default, deserialize_with = "optional_non_null")]
     pub phase: Option<PublicTaskPhase>,
     #[serde(default, deserialize_with = "optional_non_null")]
@@ -214,6 +214,10 @@ impl From<PublicOutcomeFilter> for TaskOutcome {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentWaitInput {
+    /// all (default): wait for all tasks; any: return when one task is terminal.
+    /// Scalar waits behave identically in either mode.
+    #[serde(default)]
+    pub wait_mode: crate::rpc::WaitMode,
     /// The wait target: one agent id (the historical scalar shape) or a
     /// list of 1..=16 agent ids awaited together. The response shape
     /// follows the input: scalar in → single wait object; list in → an

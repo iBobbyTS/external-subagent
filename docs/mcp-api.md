@@ -49,7 +49,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 
 **CLI 与 MCP 同构**：`external-subagent <command> --json '<object>'` 与同名 `external_subagent_<command>` 工具使用相同的输入字段和输出投影（差异仅限 CLI 外层的 `ok/product/command` 包裹与 `agent_id` 的数字形式）。CLI 投影逻辑见 [rpc.mjs](../cli/rpc.mjs) 的 `projectDaemonResult`；两处必须同步修改。
 
-已知需按实现理解的差异：`list.repository` 在 Rust 输入中可省略，但 handler 强制要求提供；静态 JSON 允许 `list.phase/outcome/cursor=null`，实际自定义反序列化拒绝显式 `null`。调用方应省略无过滤条件的键。某些生成 schema 对 `Option<T>` 的可空表达也不能替代实际反序列化约束。
+`list.repository` 在生成 schema、静态 schema 和 handler 中均要求提供。已知需按实现理解的差异：静态 JSON 允许 `list.phase/outcome/cursor=null`，实际自定义反序列化拒绝显式 `null`。调用方应省略无过滤条件的键。某些生成 schema 对 `Option<T>` 的可空表达也不能替代实际反序列化约束。
 
 ## 2. 协议外层与通用输入约束
 
@@ -223,12 +223,15 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | 参数 | 类型／必填与默认 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|
 | `agent_id` | integer 或 integer[]（1–16 个）；必填 | 选择要等待的持久任务；数组形态一次等待多个 subagent（组合等待），推荐并行模式：先逐个 spawn，全部 spawn 完成后再调用一次 `wait([id...])` | 缺少报错；无目标无法等待 |
+| `wait_mode` | `all` / `any`；默认 `all` | `all` 等整批；`any` 在任一任务终态时返回，用于滚动补位；标量输入两者行为相同 | 保持原有整批等待 |
 | `wait_time` | integer，0–299 秒；默认 290 | 适配调用方超时预算；0 用于立即取快照 | 省略仍可能等 290 秒；移除后客户端不能调整等待预算 |
 | `message_id` | string/null；默认无 | 需要一起查看某条 send 消息回执时使用；**仅标量 agent_id 支持**（列表形态同时给出则整体校验拒绝） | 省略不请求该回执；移除后失去按消息关联反馈的入口 |
 
-数组形态的等待与唤醒语义：阻塞直到**全部**列出 agent 终态、或**任一** agent 出现可响应 pending（permission/user_input），共享同一个 `wait_time` deadline。数组上限 16 个 id；空数组、元素非 8 位数字、超上限、列表同时携带 `message_id` 均整体校验拒绝。宽容处理集中在返回对象的单一 `error` 键：输入中重复出现的 id 标记 `duplicated`（该 id 本身仍照常等待并返回 wait 内容），格式合法但不存在的 id 标记 `unknown_agent`（不占用等待）；其余 id 不被错误 id 阻塞。
+数组形态按 `wait_mode` 等待全部或任一已知 agent 终态；任一 agent 出现可响应 pending（permission/user_input）时，两种模式都提前返回。共享同一个 `wait_time` deadline。`any` 因终态提前唤醒时返回所有目标的快照，仍运行的项不标记超时；已终态 ID 会立即唤醒，后续等待应移除它们。未知 ID 不构成终态唤醒。数组上限 16 个 id；空数组、元素非 8 位数字、超上限、列表同时携带 `message_id` 均整体校验拒绝。宽容处理集中在返回对象的单一 `error` 键：输入中重复出现的 id 标记 `duplicated`（该 id 本身仍照常等待并返回 wait 内容），格式合法但不存在的 id 标记 `unknown_agent`（不占用等待）；其余 id 不被错误 id 阻塞。
 
 普通进度、消息回执、已响应记录和不可操作类型不提前唤醒。权限请求与用户问题对所有调用方都是可操作的：没有能力握手参数，出现即唤醒。终态结果同样构成提前返回条件。`pending_requests` 投影只含可操作记录、最多 100 条，但唤醒判断扫描完整 pending 集合。取消本次 MCP 等待不等于取消持久任务；取消任务应调用 cancel。
+
+调用方读取完整输出后，按 `outcome` 区分成功与失败；`final_text` 是报告文本，`failure_message` 是失败诊断。失败时先判断原因再决定继续原任务、重试或请求用户输入，不能把额度/鉴权失败立即排回同一路由。不得在 wrapper 中裁剪诊断或只保留结果开头。
 
 ### 6.2 输出
 
@@ -246,6 +249,8 @@ spawn 标注非幂等；返回超时按变体如实处理：
 嵌入结果 `next_offset=null` 时已取得全部结果，不必重复 result；否则沿 `next_offset` 继续。终态后的清理（close）与响应（respond）由调用方根据 `result`、`pending_requests` 与工具描述决定；wait 不再携带 advisory instruction 文本。任务失败且该 agent 的 expected/observed 版本不匹配时，版本提示由 spawn 输出的 `version_mismatch` 对象与 result 工具的 `instruction` 承载，wait 不重复。列表形态下 N 份 activity/result 线性放大帧体积，2MiB 上限与分级降级链照常兜底（超出时逐元素收缩结果页，游标保持一致，不会把缩短页伪装成 `next_offset=null`）。
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel；需要查看最近跑的是哪条指令或调用参数时，调用 observe。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
+
+原生 `turn.failed` 提供的公开错误摘要保留到 `failure_message`：`message` 优先包含底层原因，`cause_code`、`retryable`、`status_code` 仅在原生事件确实提供时出现；`cleanup_result` 单独说明进程清理结果。ES 不据此自动重试任务，也不把退出码当作原始原因。原始事件的 stack、data、headers 不进入新增的错误摘要。
 
 ## 7. external_subagent_observe
 

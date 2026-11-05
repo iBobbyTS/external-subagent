@@ -811,6 +811,10 @@ impl Scheduler {
                     CompletionOutcome::Completed | CompletionOutcome::Cancelled
                 ) {
                     let session_id = self.active_session(agent_id).map(|active| active.2);
+                    let failure_message = failure_message.or_else(|| {
+                        matches!(terminal, RuntimeTerminal::FailedTurn(_))
+                            .then(|| runtime.diagnostic_failure()).flatten()
+                    });
                     let message = if let Some(cause) = failure_message {
                         let mut detail = serde_json::from_str::<serde_json::Value>(&cause)
                             .ok()

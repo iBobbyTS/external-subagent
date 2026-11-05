@@ -48,6 +48,9 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.equal(schema.properties.spawn.properties.developer_instructions.maxLength, 1048576);
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
+  assert.equal(schema.properties.wait.properties.wait_mode.default, 'all');
+  assert.deepEqual(schema.properties.wait.properties.wait_mode.enum, ['all', 'any']);
+  assert.ok(schema.properties.list.required.includes('repository'));
   assert.equal(schema.properties.wait.properties.supports_answer, undefined);
   assert.equal(schema.properties.wait.properties.after_revision, undefined);
   assert.match(schema.properties.wait.description, /actionable pending request/u);
@@ -68,7 +71,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'mcp_version', 'components', 'capabilities', 'subagents',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.input, [
-    'agent_id', 'wait_time', 'message_id',
+    'agent_id', 'wait_time', 'message_id', 'wait_mode',
   ]);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_wait.output, [
     'task', 'pending_requests', 'activity', 'result', 'timed_out', 'message_receipt',

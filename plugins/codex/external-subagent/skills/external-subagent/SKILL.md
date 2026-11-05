@@ -5,21 +5,35 @@ description: Manage bounded repository-scoped tasks through external-subagent.
 
 # external-subagent
 
-Use the `external_subagent_*` tools to inspect status, spawn a task with an explicit
-`subagent`, wait for progress, retrieve the complete result, and close the task.
+Use the `external_subagent_*` tools to inspect status, spawn with a named `profile`
+or explicit `subagent`, wait for progress, retrieve the complete result, and close
+the task. A profile supplies the runtime settings; do not also pass its settings
+as spawn overrides.
 Execution targets are `zcode`, `dsh`, `codex`, and `agy`; each name currently has one
-runtime instance and no instance selector is supported. Omitting `subagent` uses
+runtime instance and no instance selector is supported. Without a profile, omitting `subagent` uses
 `default_subagent` or returns `subagent_required`; unknown targets return
 `subagent_unknown`, and unknown spawn fields are rejected before dispatch.
 
 Spawn is intentionally non-idempotent: every successful call creates a fresh task
-and returns `{agent_id, status}` (a duplicate workspace or id is a `conflict`
-error, never reuse of an existing task). `status` carries only routing,
+and returns `{agent_id, status}`; it never reuses an existing task.
+`status` carries only routing,
 capability, and readiness facts (`subagents[]` with `configured`, `enabled`,
 `spawn_supported`, permission modes, model selection, and per-scope states);
 deployment identity, config revisions, adapter transport detail, and probe
 evidence are operator diagnostics — read them with the CLI `diagnose` command
 instead of the MCP status tool.
+
+For task progress, use `wait` with `agent_id` (one number or an array). Use
+`wait_mode: "any"` for rolling replacement, omitting already-terminal IDs from
+the next wait; the default `"all"` waits for the whole batch. Read the complete
+output, including failure details, before taking the next action. `result: null`
+means no final result yet. Only `outcome: "COMPLETED"` is successful; consume
+`final_text` and follow `next_offset` until null. On failure, inspect
+`failure_message` before choosing continuation, retry, or user input. A quota
+or authentication failure needs the blocking condition resolved before retry.
+Use `send` to continue a recoverable task rather than automatically spawning
+another one; keep its assignment and any caller-owned retry count across calls.
+When listing tasks, provide `repository`, not a `scope` field.
 
 Spawn accepts an optional `effort` token that steers the task's reasoning
 effort. Omit it to keep each agent's current default (codex and agy keep their

@@ -49,7 +49,7 @@ impl RpcService {
         match &query.agent_id {
             WaitTarget::One(agent_id) => self.task_wait_one(agent_id, &query, deadline, interrupted),
             WaitTarget::Many(agent_ids) => {
-                self.task_wait_many(agent_ids, deadline, interrupted)
+                self.task_wait_many(agent_ids, query.wait_mode, deadline, interrupted)
             }
         }
     }
@@ -115,8 +115,8 @@ impl RpcService {
         }
     }
 
-    /// List-mode wait: blocks until every distinct id is terminal, any one of
-    /// them raises an actionable pending request, or the deadline expires.
+    /// List-mode wait: blocks until the selected any/all terminal boundary,
+    /// an actionable pending request, or the deadline.
     /// Response shape is FLAT: one key per distinct id carrying that agent's
     /// wait body — a duplicated id is awaited once like any other — plus a
     /// single `error` key collecting problematic ids (`duplicated`,
@@ -125,6 +125,7 @@ impl RpcService {
     fn task_wait_many(
         &self,
         agent_ids: &[String],
+        wait_mode: super::WaitMode,
         deadline: Instant,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<RpcSuccess, RpcError> {
@@ -179,6 +180,7 @@ impl RpcService {
             let now = Instant::now();
             let mut any_actionable = false;
             let mut all_settled = true;
+            let mut any_settled = false;
             for (id, slot) in bodies.iter_mut() {
                 if unknown.contains(id) {
                     continue;
@@ -246,12 +248,14 @@ impl RpcService {
                         }
                     },
                 };
+                any_settled |= terminal;
                 if !terminal {
                     all_settled = false;
                 }
             }
-            if all_settled || any_actionable || now >= deadline {
-                let deadline_expired = !all_settled && !any_actionable && now >= deadline;
+            let settled = all_settled || (wait_mode == super::WaitMode::Any && any_settled);
+            if settled || any_actionable || now >= deadline {
+                let deadline_expired = !settled && !any_actionable && now >= deadline;
                 let mut projected: Vec<(String, TaskWaitBody)> = Vec::with_capacity(distinct.len());
                 let mut terminal_ids = std::collections::HashSet::new();
                 for (id, slot) in &bodies {
@@ -1464,6 +1468,7 @@ pub(crate) mod wait_tests {
 
     pub(crate) fn query(id: &str, wait_time: u64) -> TaskWaitQuery {
         TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(id.into()),
             wait_time,
             message_id: None,
@@ -3244,6 +3249,7 @@ pub(crate) mod wait_tests {
 
     fn many_query(ids: &[&str], wait_time: u64) -> TaskWaitQuery {
         TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::Many(ids.iter().map(|id| (*id).to_owned()).collect()),
             wait_time,
             message_id: None,
@@ -3330,6 +3336,40 @@ pub(crate) mod wait_tests {
         assert!(encoded.get(&id2).is_some());
         assert!(encoded.get("error").is_none());
         assert!(encoded.get("waits").is_none());
+    }
+
+    #[test]
+    fn many_wait_any_returns_one_terminal_and_the_running_peer_without_timeout() {
+        for outcome in [TaskOutcome::Completed, TaskOutcome::Failed] {
+            let (_d, service, id1, id2) = two_running_tasks();
+            service.store.store_task_result(&id1, &TaskResult {
+                outcome, final_text: "first result".into(), partial: false,
+            }).unwrap();
+            let mut query = many_query(&[&id1, &id2], 60);
+            query.wait_mode = crate::rpc::WaitMode::Any;
+            // An interrupt guards the test against an accidental wait-all loop.
+            let start = Instant::now();
+            let waits = waits_of(service.task_wait(query, start + Duration::from_secs(60),
+                &|| start.elapsed() > Duration::from_secs(2)).unwrap());
+            let map = body_map(&waits);
+            assert!(map[&id1].result.is_some());
+            assert!(!map[&id1].timed_out);
+            assert_eq!(map[&id2].task.status, "running");
+            assert!(map[&id2].result.is_none());
+            assert!(!map[&id2].timed_out);
+        }
+    }
+
+    #[test]
+    fn many_wait_any_unknown_id_does_not_wake_a_running_task() {
+        let (_d, service, id) = fixture();
+        let mut query = many_query(&[&id, "12345678"], 60);
+        query.wait_mode = crate::rpc::WaitMode::Any;
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let result = service.task_wait(query, Instant::now() + Duration::from_secs(60), &|| {
+            polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2
+        });
+        assert!(result.is_err(), "unknown id must not act as a terminal wake");
     }
 
     #[test]

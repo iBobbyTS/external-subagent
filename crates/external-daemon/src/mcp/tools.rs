@@ -449,7 +449,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_wait",
     output_schema = tool_output_schema::<AgentWaitAnyOutput>(),
-    description = "result=null means no final result yet, not malformed output; inspect task status, pending_requests and timed_out before waiting or responding. Failed terminal results retain their failure outcome. Wait up to 290 seconds by default. agent_id accepts one agent id (number) or a list of 1..=16 ids. A single id returns the single wait object described below. A list blocks until every listed agent is terminal OR any one of them raises an actionable pending request, then returns a FLAT object: one key per distinct agent id carrying that agent's ordinary wait object (a repeated id is awaited once like any other), plus one \"error\" key mapping problematic ids to markers — {\"<id>\":\"duplicated\"} for ids repeated in the input and \"unknown_agent\" for ids that do not exist; the remaining ids are still awaited normally. Recommended parallel pattern: spawn every subagent first, then call wait once with all ids. In list mode message_id is not supported (pass it only with a scalar id), every element carries message_receipt=null, and each element's timed_out flag follows the same shared deadline. Returns early only when an actionable pending request exists (permission requests need allow/deny; user-input requests carry the full embedded question and need answer with non-empty content) or the terminal result is available; ordinary progress, message receipts, already-responded and unsupported requests never wake it, and its timeout still returns timed_out=true. When the embedded result page carries next_offset=null it is the whole final result and no further result call is needed; otherwise continue reading with external_subagent_result from next_offset. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Read failure_message before falling back to daemon logs or sqlite. The pending_requests projection stays capped at 100 records while the wake decision scans the full pending set, and the request that woke the wait is always part of the returned projection so its request_id can be answered directly. activity carries the text tail incrementally: each wait returns only the text appended since the previous wait (an empty tail means nothing new), every byte is delivered by wait at most once, and latest_text_truncated flags the case where undelivered bytes rolled out of the bounded window so this response degraded to the whole window (on the terminal response, bytes repeating the embedded result page verbatim are stripped so they are not shipped twice), tool calls started in the last 60 seconds, and telemetry status; activity also exposes last_activity_age_ms (null before any activity) and model_request_active; additionally in_flight_tool_count counts tracked in-flight tool calls (scheduled or started without a matching result, error or permission resolution; 0 when there is no snapshot or the adapter has no per-call lifecycle tracking, such as codex) and oldest_in_flight_tool_age_ms is the age since the oldest tracked in-flight call first appeared (null when none is tracked); use external_subagent_observe only when these liveness signals suggest a meaningless loop or a stuck command, to inspect recent tool-call detail.",
+    description = "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..299 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -507,6 +507,7 @@ impl SubagentMcp {
         let success = self
             .rpc_wait(
                 TaskWaitQuery {
+                    wait_mode: input.wait_mode,
                     agent_id: target,
                     wait_time: input.wait_time,
                     message_id: input.message_id,
@@ -588,7 +589,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_list",
     output_schema = tool_output_schema::<AgentListOutput>(),
-    description = "List tasks within an explicit daemon-enforced scope",
+    description = "List tasks for the required absolute repository path. Pass repository, not scope; subagent, phase and outcome are optional filters.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -603,14 +604,9 @@ impl SubagentMcp {
         if !(1..=100).contains(&input.limit) {
             return Err(validation_error("limit must be between 1 and 100").with_operation("list"));
         }
-        if input.repository.is_none() {
-            return Err(
-                validation_error("at least one list scope is required").with_operation("list")
-            );
-        }
         match self.rpc(RpcMethod::TaskList(TaskListQuery {
             agent: input.agent,
-            repository: input.repository,
+            repository: Some(input.repository),
             phase: input.phase.map(Into::into),
             outcome: input.outcome.map(Into::into),
             cursor: input.cursor,
@@ -768,7 +764,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_result",
     output_schema = tool_output_schema::<AgentResultOutput>(),
-    description = "Read a terminal task result with stable outcome, partial status, and bounded final-text segments. Returns null result while the task is non-terminal. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
+    description = "Read a terminal task result. Read outcome before treating final_text as a successful report, preserve failure_message, and follow next_offset until null. Return the complete output to the caller; do not truncate or replace it with selected fields. The result keeps its stable outcome and partial status. Returns null result while the task is non-terminal. A failed terminal result also carries failure_message: usually the daemon's bounded single-line JSON failure detail, but an early fail_claim row may be plain text, so treat it as an opaque bounded string and attempt JSON parsing defensively (null when the task has no persisted detail or the outcome is not a failure). Questions from user-input requests are embedded in full in external_subagent_wait projections, not paged here.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -864,6 +860,32 @@ mod contract_default_tests {
     };
 
     #[test]
+    fn wait_policy_and_required_repository_are_exposed_in_tool_schemas() {
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/schema.sock"), Duration::from_secs(1));
+        let tools = facade.tool_router.list_all();
+        let list = tools.iter().find(|t| t.name == "external_subagent_list").unwrap();
+        let list_schema = serde_json::to_value(&list.input_schema).unwrap();
+        let validator = jsonschema::validator_for(&list_schema).unwrap();
+        assert!(!validator.is_valid(&serde_json::json!({})));
+        assert!(validator.is_valid(&serde_json::json!({"repository":"/tmp/repo"})));
+        let wait = tools.iter().find(|t| t.name == "external_subagent_wait").unwrap();
+        let wait_schema = serde_json::to_value(&wait.input_schema).unwrap();
+        let validator = jsonschema::validator_for(&wait_schema).unwrap();
+        for mode in ["any", "all"] {
+            let input = serde_json::json!({"agent_id":[10000001,10000002],"wait_mode":mode});
+            assert!(validator.is_valid(&input));
+            let parsed: AgentWaitInput = serde_json::from_value(input).unwrap();
+            assert_eq!(parsed.wait_mode == crate::rpc::WaitMode::Any, mode == "any");
+        }
+        assert!(!validator.is_valid(&serde_json::json!({"agent_id":10000001,"wait_mode":"invalid"})));
+        let packaged: serde_json::Value = serde_json::from_str(include_str!("../../../../schema/external-subagent-public-api.json")).unwrap();
+        for name in ["wait", "list", "result"] {
+            let tool = tools.iter().find(|t| t.name == format!("external_subagent_{name}")).unwrap();
+            assert_eq!(packaged["properties"][name]["description"].as_str(), tool.description.as_deref());
+        }
+    }
+
+    #[test]
     fn omitted_public_fields_use_the_frozen_defaults() {
         let list: AgentListInput = serde_json::from_value(serde_json::json!({
             "repository": "/tmp/repository"
@@ -877,6 +899,7 @@ mod contract_default_tests {
         let wait: AgentWaitInput =
             serde_json::from_value(serde_json::json!({"agent_id": 10000000})).unwrap();
         assert_eq!(wait.wait_time, 290);
+        assert_eq!(wait.wait_mode, crate::rpc::WaitMode::All);
         assert!(wait.message_id.is_none());
         let immediate: AgentWaitInput =
             serde_json::from_value(serde_json::json!({"agent_id": 10000000, "wait_time": 0}))
@@ -1351,6 +1374,7 @@ mod contract_default_tests {
         let waited = facade
             .rpc_wait(
                 crate::rpc::TaskWaitQuery {
+                    wait_mode: crate::rpc::WaitMode::All,
                     agent_id: crate::rpc::WaitTarget::One(task.agent_id.clone()),
                     wait_time: 0,
                     message_id: Some("native-message".into()),

@@ -647,6 +647,24 @@ sleep 2
     }
 
     #[test]
+    fn failed_turn_keeps_public_cause_instead_of_cleanup_exit() {
+        let protocol = FAILED_TURN_PROTOCOL.replace(
+            r#""type":"turn.failed""#,
+            r#""type":"turn.failed","payload":{"error":{"message":"Model request failed.","underlyingErrorMessage":"read EADDRNOTAVAIL","code":"model_request_failed","attribution":{"retryable":false},"data":{"apiKey":"private-data"}}}"#,
+        );
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+        scheduler.start_ready().unwrap();
+        assert_eq!(await_result(&scheduler, &agent_id).result.outcome, TaskOutcome::Failed);
+        let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+        let detail: serde_json::Value = serde_json::from_str(task.failure_message.as_ref().unwrap()).unwrap();
+        assert!(detail["message"].as_str().unwrap().starts_with("read EADDRNOTAVAIL"));
+        assert_eq!(detail["cause_code"], "model_request_failed");
+        assert_eq!(detail["retryable"], false);
+        assert!(detail["cleanup_result"].as_str().unwrap().contains("FailedTurn"));
+        assert!(!detail.to_string().contains("private-data"));
+    }
+
+    #[test]
     fn natural_result_invalid_persists_final_text_missing_detail() {
         let (_workspace, scheduler, agent_id) = diagnostic_scheduler(MISSING_TEXT_PROTOCOL);
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
@@ -1728,6 +1746,9 @@ sleep 2
             "cap": u64::MAX,
             "last_event_seq": u64::MAX,
             "remote_code": i64::MIN,
+            "cause_code": "\u{1}".repeat(128),
+            "retryable": false,
+            "status_code": u64::MAX,
         })
         .to_string()
     }

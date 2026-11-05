@@ -12,6 +12,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { stableNodeExecutable } from '../../cli/install/path.mjs';
+import { execFileSync } from 'node:child_process';
 import { installZcodePlugin, reconcileZcodeBinding, uninstallZcodePlugin, zcodeMcpBinding } from '../../cli/install/zcode.mjs';
 import { LEGACY_SOCKET_ENV, SOCKET_ENV, stagePlugin, treeDigest } from '../../cli/install/plugin-stage.mjs';
 import { nativeBinary, pluginSourceRoot } from '../../cli/install/layout.mjs';
@@ -100,7 +102,7 @@ test('install stages the plugin tree and registers one inline dirs entry, preser
     const manifest = JSON.parse(fs.readFileSync(path.join(paths.zcodePlugin, '.codex-plugin', 'plugin.json'), 'utf8'));
     assert.equal(manifest.name, 'external-subagent');
     const server = stagedServer(paths);
-    assert.equal(server.command, process.execPath, 'the staged MCP command is the installing node, not the native facade (ZCode kills ad-hoc native binaries)');
+    assert.equal(server.command, zcodeMcpBinding(paths.zcodePlugin).command, 'the staged MCP command is the installing node, not the native facade (ZCode kills ad-hoc native binaries)');
     assert.deepEqual(server.args, [path.join(paths.zcodePlugin, 'scripts', 'mcp-stdio-bridge.mjs')], 'the staged MCP args run the node stdio bridge from the staged tree');
     assert.ok(fs.existsSync(server.args[0]), 'the pinned bridge script exists in the staged tree');
     assert.equal(server.timeoutMs, 300000, 'the staged MCP entry pins timeoutMs=300000 because the zcode host default tool timeout is 30000ms, below the 299s wait ceiling');
@@ -153,7 +155,7 @@ test('refresh publishes a replacement tree: deleted source files disappear and u
     assert.equal(result.installed, true);
     assert.equal(fs.existsSync(removed), false, 'a file deleted from the source disappears from the published tree');
     const server = stagedServer(paths);
-    assert.equal(server.command, process.execPath, 'the replacement tree still carries the final binding paths');
+    assert.equal(server.command, zcodeMcpBinding(paths.zcodePlugin).command, 'the replacement tree still carries the final binding paths');
     assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
     assert.equal(fs.readFileSync(path.join(parent, 'unrelated-user-file.txt'), 'utf8'), 'keep me', 'unrelated files beside the staging survive the swap');
     assert.deepEqual(fs.readdirSync(parent).sort(), ['external-subagent', 'unrelated-user-file.txt'], 'no candidate or prior sibling residue remains');
@@ -495,7 +497,7 @@ test('a prior native-facade staging from this product is refreshed to the node b
     const result = installZcodePlugin(paths);
     assert.equal(result.installed, true, 'an older managed binding upgrades in place');
     const server = stagedServer(paths);
-    assert.equal(server.command, process.execPath);
+    assert.equal(server.command, zcodeMcpBinding(paths.zcodePlugin).command);
     assert.deepEqual(server.args, zcodeMcpBinding(paths.zcodePlugin).args);
     assert.equal(server.timeoutMs, zcodeMcpBinding(paths.zcodePlugin).timeoutMs, 'the refreshed binding carries the managed tool timeout');
     assert.equal(readConfig(paths).plugins.dirs.length, 1);
@@ -688,4 +690,25 @@ test('reconcile is stateless: absent, refreshed, and failed detection', () => {
   } finally {
     for (const dir of [home, absentHome, brokenHome]) fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a staged Node alias survives replacement of its versioned target', { skip: process.platform === 'win32' }, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'es-node-alias-'));
+  try {
+    const bin = path.join(root, 'bin'); fs.mkdirSync(bin);
+    const first = path.join(root, 'v1', 'node'); fs.mkdirSync(path.dirname(first));
+    const second = path.join(root, 'v2', 'node'); fs.mkdirSync(path.dirname(second));
+    fs.writeFileSync(first, '#!/bin/sh\necho v1\n', { mode: 0o755 });
+    fs.writeFileSync(second, '#!/bin/sh\necho v2\n', { mode: 0o755 });
+    const alias = path.join(bin, 'node'); fs.symlinkSync(first, alias);
+    const command = stableNodeExecutable(first, { PATH: bin });
+    assert.equal(command, alias);
+    assert.equal(execFileSync(command, [], { encoding: 'utf8' }).trim(), 'v1');
+    fs.unlinkSync(alias); fs.symlinkSync(second, alias); fs.unlinkSync(first);
+    assert.equal(execFileSync(command, [], { encoding: 'utf8' }).trim(), 'v2');
+    // A different interpreter is never selected just because it is on PATH.
+    const third = path.join(root, 'v3', 'node'); fs.mkdirSync(path.dirname(third));
+    fs.writeFileSync(third, '#!/bin/sh\necho v3\n', { mode: 0o755 });
+    assert.equal(stableNodeExecutable(third, { PATH: bin }), third);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

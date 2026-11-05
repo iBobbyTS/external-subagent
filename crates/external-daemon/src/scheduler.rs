@@ -15,6 +15,7 @@ use super::*;
 pub use self::diagnostics::configure_diagnostic_log;
 pub(crate) use self::diagnostics::{
     bounded_error, bounded_prefix, persistable_failure_record, shrink_persistable_record,
+    turn_failure_detail,
 };
 #[cfg(test)]
 use self::state::ResponseClaimHookStage;

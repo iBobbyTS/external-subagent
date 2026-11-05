@@ -167,6 +167,10 @@ impl ManagedRuntime for AgyRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
+    fn diagnostic_failure(&self) -> Option<String> {
+        self.shared.turn_tracker.failure_detail()
+    }
+
     fn diagnostic_tail(&self) -> String {
         let stderr = self.driver.diagnostic_tail();
         let agy = self.shared.diagnostic_tail();

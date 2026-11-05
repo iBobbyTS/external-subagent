@@ -330,6 +330,7 @@ struct TurnTrackerState {
     generation: u64,
     active: bool,
     boundary: Option<TurnBoundary>,
+    failure: Option<serde_json::Value>,
     model_request_started_at: Option<Instant>,
     last_stream_activity_at: Option<Instant>,
 }
@@ -345,6 +346,7 @@ impl TurnTracker {
                 generation: 0,
                 active: false,
                 boundary: None,
+                failure: None,
                 model_request_started_at: None,
                 last_stream_activity_at: None,
             }),
@@ -369,6 +371,7 @@ impl TurnTracker {
                 state.generation = state.generation.saturating_add(1);
                 state.active = true;
                 state.boundary = None;
+                state.failure = None;
                 state.model_request_started_at = Some(now);
                 state.last_stream_activity_at = Some(now);
             }
@@ -380,6 +383,7 @@ impl TurnTracker {
             }
             "turn.failed" if state.active => {
                 state.active = false;
+                state.failure = scheduler::turn_failure_detail(&event.params);
                 state.boundary = Some(TurnBoundary::Failed);
                 state.model_request_started_at = None;
                 state.last_stream_activity_at = None;
@@ -387,6 +391,10 @@ impl TurnTracker {
             _ => return,
         }
         self.changed.notify_all();
+    }
+
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        self.state.lock().unwrap().failure.as_ref().map(ToString::to_string)
     }
 
     pub(crate) fn snapshot(&self) -> TurnSnapshot {
@@ -2250,5 +2258,25 @@ mod task_route_tests {
             Err(message) => assert_eq!(message, "stored general preparation is invalid"),
             Ok(_) => panic!("legacy prepared launch must not route"),
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_failure_continuity_tests {
+    use super::*;
+
+    #[test]
+    fn new_turn_clears_previous_public_failure() {
+        let tracker = TurnTracker::new();
+        let event = |params| Inbound::Message(WireMessage::Event(external_contract::EventEnvelope {
+            method: "session/event".into(), params,
+        }));
+        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
+        tracker.observe(&event(serde_json::json!({"type":"turn.failed","payload":{"reason_code":"network failure"}})));
+        assert!(tracker.failure_detail().unwrap().contains("network failure"));
+        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
+        assert!(tracker.failure_detail().is_none());
+        tracker.observe(&event(serde_json::json!({"type":"turn.failed"})));
+        assert!(tracker.failure_detail().is_none());
     }
 }

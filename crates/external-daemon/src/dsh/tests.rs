@@ -802,6 +802,7 @@ while IFS= read -r line; do :; done
         ..
     }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 299,
             message_id: None,
@@ -922,6 +923,7 @@ while IFS= read -r line; do :; done
         ..
     }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
@@ -1006,6 +1008,7 @@ while IFS= read -r line; do :; done
         ..
     }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 299,
             message_id: None,
@@ -1913,6 +1916,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
     assert!(scheduler.store().message("after-drain").unwrap().is_none());
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
@@ -2028,6 +2032,7 @@ fn drain_cancel_active_reaps_dsh_and_preserves_admitted_rpc_lifecycle() {
         .unwrap();
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
@@ -2100,6 +2105,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     // new spawn is refused by the one admission owner.
     service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,
@@ -2148,6 +2154,7 @@ fn aborted_drain_reopens_dsh_admission_while_the_drained_task_keeps_answering() 
     // the recovery.
     let RpcSuccess::TaskWait(TaskWaitBody { task, .. }) = service
         .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
             agent_id: WaitTarget::One(agent_id.clone()),
             wait_time: 0,
             message_id: None,

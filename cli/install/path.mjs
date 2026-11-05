@@ -66,3 +66,19 @@ export function pathReport(options = {}) {
     node_executable: process.execPath,
   };
 }
+
+// Keep the public alias (e.g. Homebrew bin/node), not its versioned realpath.
+// Only an alias to this interpreter is eligible; GUI PATH is not consulted later.
+export function stableNodeExecutable(execPath = process.execPath, env = process.env) {
+  const real = fs.realpathSync(execPath);
+  const dirs = (env.PATH || '').split(path.delimiter).filter(dir => path.isAbsolute(dir));
+  if (process.platform !== 'win32') dirs.push('/opt/homebrew/bin', '/usr/local/bin');
+  for (const dir of dirs) {
+    const candidate = path.join(dir, path.basename(execPath));
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      if (fs.realpathSync(candidate) === real && candidate !== real) return candidate;
+    } catch { /* Not an executable alias of this interpreter. */ }
+  }
+  return execPath;
+}
