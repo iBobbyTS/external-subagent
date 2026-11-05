@@ -33,15 +33,11 @@ pub(crate) struct PassiveActivityTracker {
     /// construction: `Mixed` for [`Self::new`], inferred from the adapter name
     /// by [`Self::for_adapter`]. See [`ToolActivityMode`].
     mode: ToolActivityMode,
-    /// Launch-scoped public-source evidence: true only when the adapter that
-    /// actually launched this task has a verified public observation source.
-    /// Constructed from the claimed task's route identity, never from a
-    /// scheduler-global proof about a different runtime.
-    runtime_source_verified: AtomicBool,
+
 }
 
 impl PassiveActivityTracker {
-    pub(crate) fn new(runtime_source_verified: bool) -> Self {
+    pub(crate) fn new() -> Self {
         let state = PassiveActivityState::default();
         Self {
             state: Mutex::new(state),
@@ -49,12 +45,11 @@ impl PassiveActivityTracker {
             // The pre-mode default: accept both vocabularies so an
             // unregistered caller keeps its behavior.
             mode: ToolActivityMode::Mixed,
-            runtime_source_verified: AtomicBool::new(runtime_source_verified),
         }
     }
 
-    pub(crate) fn for_adapter(adapter: &str, runtime_source_verified: bool) -> Self {
-        Self::for_launch(adapter, runtime_source_verified, 0)
+    pub(crate) fn for_adapter(adapter: &str) -> Self {
+        Self::for_launch(adapter, 0)
     }
 
     /// Construct a tracker for one fresh runtime launch. `launch_scope` is the
@@ -63,10 +58,9 @@ impl PassiveActivityTracker {
     /// with inherited ids from a previous claim.
     pub(crate) fn for_launch(
         adapter: &str,
-        runtime_source_verified: bool,
         launch_scope: u64,
     ) -> Self {
-        let mut tracker = Self::new(runtime_source_verified);
+        let mut tracker = Self::new();
         tracker.state.lock().unwrap().observation =
             observation::ObservationState::for_launch(adapter, launch_scope);
         tracker.mode = match adapter {
@@ -412,19 +406,6 @@ impl PassiveActivityTracker {
         self.state.lock().unwrap().observation.snapshot()
     }
 
-    /// Post-spawn re-verification of the launched adapter's public source.
-    /// Degrade-only: a changed or vanished runtime file clears trust for the
-    /// rest of the run; a later passing re-check can never resurrect it.
-    pub(crate) fn confirm_runtime_source(&self, still_verified: bool) {
-        if !still_verified {
-            self.runtime_source_verified.store(false, Ordering::Release);
-        }
-    }
-
-    pub(crate) fn runtime_source_verified(&self) -> bool {
-        self.runtime_source_verified.load(Ordering::Acquire)
-    }
-
     #[cfg(test)]
     pub(crate) fn activity_mode(&self) -> ToolActivityMode {
         self.mode
@@ -525,7 +506,7 @@ mod tests {
 
     #[test]
     fn tool_descriptors_feed_observation_without_duplicate_counts_across_turns() {
-        let tracker = PassiveActivityTracker::for_adapter("codex", false);
+        let tracker = PassiveActivityTracker::for_adapter("codex");
         let now = Instant::now();
         assert!(tracker.observation_snapshot().tools.is_empty());
         for n in 0..4 {
@@ -588,8 +569,8 @@ mod tests {
             }))
         }
 
-        let old = PassiveActivityTracker::for_launch("zcode", false, 1);
-        let new = PassiveActivityTracker::for_launch("zcode", false, 2);
+        let old = PassiveActivityTracker::for_launch("zcode", 1);
+        let new = PassiveActivityTracker::for_launch("zcode", 2);
         let now = Instant::now();
         old.observe_at(&reasoning("r-old", "old "), now, 0);
         old.observe_at(&tool_call("e1", "c1", 1), now, 0);
@@ -686,8 +667,8 @@ mod tests {
 
     #[test]
     fn launch_scoped_guards_accept_recycled_event_ids_after_reclaim() {
-        let old = PassiveActivityTracker::for_launch("dsh", true, 1);
-        let new = PassiveActivityTracker::for_launch("dsh", true, 2);
+        let old = PassiveActivityTracker::for_launch("dsh", 1);
+        let new = PassiveActivityTracker::for_launch("dsh", 2);
         let now = Instant::now();
         old.observe_at(
             &session_fixture(serde_json::json!({
@@ -748,7 +729,7 @@ mod tests {
 
     #[test]
     fn zcode_wire_tool_call_retains_compact_parameters_without_extra_counts() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", true);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let frame = session_fixture(serde_json::json!({
             "type":"model.streaming", "eventId":"e", "turnId":"t",
             "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"echo 中","timeout":10}}
@@ -774,7 +755,7 @@ mod tests {
 
     #[test]
     fn replayed_streaming_tool_frame_keeps_the_newer_arguments() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", true);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let empty = session_fixture(serde_json::json!({
             "type":"model.streaming", "eventId":"e1", "turnId":"t",
             "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{}}
@@ -800,7 +781,7 @@ mod tests {
 
     #[test]
     fn replayed_started_descriptor_keeps_the_newer_streaming_arguments() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", true);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let started = session_fixture(serde_json::json!({
             "type":"tool.updated", "eventId":"start-1", "turnId":"t",
             "payload":{"kind":"started","toolCallId":"c","toolName":"Bash","input":{}}
@@ -847,7 +828,7 @@ mod tests {
             Some("commandExecution"),
             Some("true"),
         ));
-        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let codex = PassiveActivityTracker::for_adapter("codex");
         codex.observe_at(&old, now, 0);
         assert!(codex.observation_snapshot().tools.is_empty());
         assert_eq!(codex.snapshot().window_60s.tool_calls_started, 2);
@@ -860,7 +841,7 @@ mod tests {
             observed.tools[0].recent_calls[0].arguments,
             serde_json::json!({"detail":"true"}).as_object().unwrap().clone()
         );
-        let zcode = PassiveActivityTracker::for_adapter("zcode", false);
+        let zcode = PassiveActivityTracker::for_adapter("zcode");
         zcode.observe_at(&count, now, 0);
         assert!(zcode.observation_snapshot().tools.is_empty());
         assert_eq!(zcode.snapshot().window_60s.tool_calls_started, 0);
@@ -894,7 +875,7 @@ mod tests {
                 },
             )))
         }
-        let tracker = PassiveActivityTracker::new(false);
+        let tracker = PassiveActivityTracker::new();
         let base = Instant::now();
         tracker.observe_at(&count_event("a", 3), base, 1_000);
         tracker.observe_at(&count_event("b", 2), base, 1_000);
@@ -930,7 +911,7 @@ mod tests {
 
     #[test]
     fn in_flight_projection_counts_tracked_calls_and_ages_them_from_first_insertion() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let base = Instant::now();
         let scheduled = |id: &str| {
             session_fixture(serde_json::json!({
@@ -978,7 +959,7 @@ mod tests {
 
     #[test]
     fn in_flight_projection_removes_on_settlement_and_clears_at_turn_edges() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let base = Instant::now();
         let started = |id: &str| {
             session_fixture(serde_json::json!({
@@ -1035,7 +1016,7 @@ mod tests {
 
     #[test]
     fn in_flight_projection_stays_empty_for_count_only_adapters() {
-        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let codex = PassiveActivityTracker::for_adapter("codex");
         let now = Instant::now();
         codex.observe_at(
             &session_fixture(external_contract::activity::tool_count_event(
@@ -1066,7 +1047,7 @@ mod tests {
 
     #[test]
     fn in_flight_aggregate_is_independent_of_the_observation_call_window() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode", false);
+        let tracker = PassiveActivityTracker::for_adapter("zcode");
         let base = Instant::now();
         for n in 0..5 {
             tracker.observe_at(
@@ -1096,24 +1077,24 @@ mod tests {
     #[test]
     fn for_adapter_infers_the_activity_mode() {
         assert_eq!(
-            PassiveActivityTracker::new(false).activity_mode(),
+            PassiveActivityTracker::new().activity_mode(),
             ToolActivityMode::Mixed,
             "the bare constructor stays on the safe Mixed default"
         );
         assert_eq!(
-            PassiveActivityTracker::for_adapter("codex", false).activity_mode(),
+            PassiveActivityTracker::for_adapter("codex").activity_mode(),
             ToolActivityMode::CountOnly
         );
         assert_eq!(
-            PassiveActivityTracker::for_adapter("zcode", false).activity_mode(),
+            PassiveActivityTracker::for_adapter("zcode").activity_mode(),
             ToolActivityMode::Detailed
         );
         assert_eq!(
-            PassiveActivityTracker::for_adapter("dsh", false).activity_mode(),
+            PassiveActivityTracker::for_adapter("dsh").activity_mode(),
             ToolActivityMode::Detailed
         );
         assert_eq!(
-            PassiveActivityTracker::for_adapter("future-agent", false).activity_mode(),
+            PassiveActivityTracker::for_adapter("future-agent").activity_mode(),
             ToolActivityMode::Mixed
         );
     }
@@ -1170,8 +1151,8 @@ mod tests {
                 )),
             ]
         };
-        let zcode = PassiveActivityTracker::for_adapter("zcode", false);
-        let zcode_mixed = PassiveActivityTracker::new(false);
+        let zcode = PassiveActivityTracker::for_adapter("zcode");
+        let zcode_mixed = PassiveActivityTracker::new();
         for event in zcode_events() {
             zcode.observe_at(&event, now, 1_000);
             zcode_mixed.observe_at(&event, now, 1_000);
@@ -1249,8 +1230,8 @@ mod tests {
             }
             events
         };
-        let dsh = PassiveActivityTracker::for_adapter("dsh", false);
-        let dsh_mixed = PassiveActivityTracker::new(false);
+        let dsh = PassiveActivityTracker::for_adapter("dsh");
+        let dsh_mixed = PassiveActivityTracker::new();
         for event in dsh_events() {
             dsh.observe_at(&event, now, 1_000);
             dsh_mixed.observe_at(&event, now, 1_000);
@@ -1271,8 +1252,8 @@ mod tests {
                 )),
             ]
         };
-        let codex = PassiveActivityTracker::for_adapter("codex", false);
-        let codex_mixed = PassiveActivityTracker::new(false);
+        let codex = PassiveActivityTracker::for_adapter("codex");
+        let codex_mixed = PassiveActivityTracker::new();
         for event in codex_events() {
             codex.observe_at(&event, now, 1_000);
             codex_mixed.observe_at(&event, now, 1_000);
@@ -1317,8 +1298,8 @@ mod tests {
         ] {
             let valid_empty =
                 content.as_ref().and_then(|c| c.get("text")) == Some(&serde_json::json!(""));
-            let dsh = PassiveActivityTracker::for_adapter("dsh", true);
-            let codex = PassiveActivityTracker::for_adapter("codex", false);
+            let dsh = PassiveActivityTracker::for_adapter("dsh");
+            let codex = PassiveActivityTracker::for_adapter("codex");
             let mut params = serde_json::json!({
                 "sessionId": "s1", "update": {"sessionUpdate": "agent_thought_chunk"}
             });
@@ -1352,8 +1333,8 @@ mod tests {
     #[test]
     fn dsh_public_acp_thoughts_reach_observe_but_codex_never_collects() {
         use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-        let dsh = PassiveActivityTracker::for_adapter("dsh", true);
-        let codex = PassiveActivityTracker::for_adapter("codex", false);
+        let dsh = PassiveActivityTracker::for_adapter("dsh");
+        let codex = PassiveActivityTracker::for_adapter("codex");
         let delta = format!("prefix{}", "中🙂".repeat(110));
         let update = parse_update(&serde_json::json!({
             "sessionId": "s1", "update": {
@@ -1410,24 +1391,6 @@ mod tests {
         assert!(!hidden.coverage.tool_history_complete);
     }
 
-    #[test]
-    fn launch_scoped_evidence_only_degrades_across_reverification() {
-        let tracker = PassiveActivityTracker::new(true);
-        assert!(tracker.runtime_source_verified());
-        // A post-spawn re-verification that fails (the launched adapter's
-        // runtime file changed or vanished) clears trust for the run...
-        tracker.confirm_runtime_source(false);
-        assert!(!tracker.runtime_source_verified());
-        // ...and a later passing re-check can never resurrect it mid-run.
-        tracker.confirm_runtime_source(true);
-        assert!(!tracker.runtime_source_verified());
-        // An unverified launch (non-ZCode adapter, or absent proof) stays
-        // unverified no matter what a later re-check observes.
-        let unverified = PassiveActivityTracker::new(false);
-        unverified.confirm_runtime_source(true);
-        assert!(!unverified.runtime_source_verified());
-    }
-
     fn append_delta(tracker: &PassiveActivityTracker, delta: &str) {
         tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
@@ -1449,11 +1412,11 @@ mod tests {
     fn inherit_wait_text_merges_text_appended_before_the_swap() {
         // Old window "AB" with "A" delivered; the incoming tracker already
         // collected "N" from the runtime sink before the map swap.
-        let old = PassiveActivityTracker::new(false);
+        let old = PassiveActivityTracker::new();
         append_delta(&old, "A");
         assert_eq!(old.take_wait_tail().text, "A");
         append_delta(&old, "B");
-        let new = PassiveActivityTracker::new(false);
+        let new = PassiveActivityTracker::new();
         append_delta(&new, "N");
 
         new.inherit_wait_text(&old);
@@ -1469,11 +1432,11 @@ mod tests {
 
     #[test]
     fn inherit_wait_text_trims_the_merged_window_to_the_cap() {
-        let old = PassiveActivityTracker::new(false);
+        let old = PassiveActivityTracker::new();
         // 3000 * 3 = 9000 bytes; append drains to the largest char-aligned
         // suffix <= 8192, i.e. 810 bytes are dropped, leaving 2730 "界" (8190).
         append_delta(&old, &"界".repeat(3000));
-        let new = PassiveActivityTracker::new(false);
+        let new = PassiveActivityTracker::new();
         append_delta(&new, "尾");
 
         new.inherit_wait_text(&old);
@@ -1494,7 +1457,7 @@ mod tests {
 
     #[test]
     fn take_wait_tail_delivers_only_the_new_suffix() {
-        let tracker = PassiveActivityTracker::new(false);
+        let tracker = PassiveActivityTracker::new();
         append_delta(&tracker, "hello");
         assert_eq!(
             tracker.take_wait_tail(),
@@ -1523,7 +1486,7 @@ mod tests {
     fn take_wait_tail_rolls_the_window_with_per_call_truncation() {
         // (a) A caller that falls behind the rolling window gets the whole
         // window plus a truncation flag, and the cursor catches up.
-        let tracker = PassiveActivityTracker::new(false);
+        let tracker = PassiveActivityTracker::new();
         append_delta(&tracker, "中");
         let first = tracker.take_wait_tail();
         assert_eq!(first.text, "中");
@@ -1548,7 +1511,7 @@ mod tests {
 
         // (b) Delivered up to the full window, then roll it and append a small
         // multibyte delta: only the delta, no truncation.
-        let tracker = PassiveActivityTracker::new(false);
+        let tracker = PassiveActivityTracker::new();
         append_delta(&tracker, &"x".repeat(MAX_LATEST_TEXT_BYTES));
         let full = tracker.take_wait_tail();
         assert_eq!(full.text.len(), MAX_LATEST_TEXT_BYTES);
@@ -1564,7 +1527,7 @@ mod tests {
 
         // (c) delivered == window_start exactly is NOT degradation: the whole
         // window is returned without a truncation flag.
-        let tracker = PassiveActivityTracker::new(false);
+        let tracker = PassiveActivityTracker::new();
         append_delta(&tracker, &"a".repeat(1808));
         assert_eq!(tracker.take_wait_tail().text.len(), 1808);
         append_delta(&tracker, &"b".repeat(MAX_LATEST_TEXT_BYTES));
@@ -1586,7 +1549,7 @@ mod tests {
         const DELTAS: usize = 200;
         const TOKEN_BYTES: usize = 8;
         const CONSUMERS: usize = 4;
-        let tracker = Arc::new(PassiveActivityTracker::new(false));
+        let tracker = Arc::new(PassiveActivityTracker::new());
         let token = |index: usize| format!("d{index:07}");
         let produced: String = (0..DELTAS).map(token).collect();
         assert!(produced.len() < MAX_LATEST_TEXT_BYTES, "no window roll");

@@ -96,7 +96,7 @@ fn agy_scheduler(workspace: &Path, agy: AgyRuntimeFactory) -> Scheduler {
         SchedulerConfig {
             bootstrap_timeout: Duration::from_secs(30),
             control_timeout: Duration::from_secs(30),
-            per_workspace_max_agents: 1,
+
             ..SchedulerConfig::default()
         },
     )
@@ -409,8 +409,7 @@ fn tool_step_pair_feeds_the_wait_window_and_observe_capture() {
 
     // The started frame's tool name and parameters are captured by observe;
     // wait no longer carries per-call details. Reasoning stays uncollected.
-    let (observation, verified) = scheduler.observation_snapshot(&agent_id);
-    assert!(!verified);
+    let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(observation.tools.len(), 1);
     assert_eq!(observation.tools[0].tool_name, "run_command");
     assert_eq!(observation.tools[0].call_count, 1);

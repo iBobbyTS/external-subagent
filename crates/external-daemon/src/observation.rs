@@ -1,20 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::File,
-    io::Read,
-    path::Path,
 };
 
 pub const OBSERVATION_SCHEMA: &str = "external-subagent-observation/1.1";
-pub const VERIFIED_RUNTIME_VERSION: &str = "3.11.2";
-pub const VERIFIED_EVENT_TYPE: &str = "model.streaming";
-pub const VERIFIED_DELTA_POINTER: &str = "/params/payload/delta";
-const VERIFIED_RUNTIME_PATH: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
-const VERIFIED_RUNTIME_SHA256: &str =
-    "e9f1868c0fdb863537ed910ee3828b9be96b8c2fd805473f63b439e1113266b8";
+pub const PUBLIC_EVENT_TYPE: &str = "model.streaming";
+pub const PUBLIC_DELTA_POINTER: &str = "/params/payload/delta";
 const MAX_IDENTITIES: usize = 65_536;
 const MAX_TOOL_TYPES: usize = 64;
 const MAX_RECENT_CALLS: usize = 5;
@@ -67,16 +59,16 @@ pub struct ReasoningSource {
 }
 
 impl ReasoningSource {
-    pub fn verified() -> Self {
+    pub fn zcode() -> Self {
         Self {
-            status: "VERIFIED_RUNTIME_PUBLIC".into(),
-            runtime_version: VERIFIED_RUNTIME_VERSION.into(),
-            event_type: VERIFIED_EVENT_TYPE.into(),
-            delta_pointer: VERIFIED_DELTA_POINTER.into(),
+            status: "PUBLIC_RUNTIME_EVENT".into(),
+            runtime_version: "unreported".into(),
+            event_type: PUBLIC_EVENT_TYPE.into(),
+            delta_pointer: PUBLIC_DELTA_POINTER.into(),
         }
     }
 
-    /// DSH's public ACP thought contract, independent of the ZCode file pin.
+    /// DSH's public ACP thought contract.
     pub fn dsh() -> Self {
         Self {
             status: "VERIFIED_PROTOCOL_PUBLIC".into(),
@@ -86,8 +78,8 @@ impl ReasoningSource {
         }
     }
 
-    pub fn is_verified_public(&self) -> bool {
-        *self == Self::verified() || *self == Self::dsh()
+    pub fn is_supported_public(&self) -> bool {
+        *self == Self::zcode() || *self == Self::dsh()
     }
 }
 
@@ -106,7 +98,7 @@ impl ObservationSnapshot {
             reasoning: ObservedReasoning {
                 text: String::new(),
                 truncated: false,
-                source: ReasoningSource::verified(),
+                source: ReasoningSource::zcode(),
             },
             coverage: ObservationCoverage {
                 tool_history_complete: false,
@@ -117,7 +109,7 @@ impl ObservationSnapshot {
     }
 }
 
-/// One detailed tool descriptor collected outside the verified model.streaming
+/// One detailed tool descriptor collected outside the supported model.streaming
 /// vocabulary: an agy/dsh `tool.updated` started frame (name + input) or a
 /// codex count event's `(tool, detail)` pair. It feeds the same identity,
 /// bound, and redaction rules as [`ObservationState::observe_message`].
@@ -170,7 +162,7 @@ impl Default for ObservationState {
         Self {
             launch_scope: 0,
             collect_reasoning: true,
-            reasoning_source: ReasoningSource::verified(),
+            reasoning_source: ReasoningSource::zcode(),
             snapshot_seq: 0,
             next_call_seq: 0,
             seen_source_events: HashSet::new(),
@@ -201,14 +193,14 @@ impl ObservationState {
             launch_scope,
             collect_reasoning: public,
             reasoning_complete: public,
-            // Only ZCode exposes the verified per-call history. DSH, agy and
+            // Only ZCode exposes the supported per-call history. DSH, agy and
             // codex contribute best-effort descriptors (no results or
             // lifecycle), so their history stays explicitly incomplete.
             tool_history_complete: adapter == "zcode",
             reasoning_source: if adapter == "dsh" {
                 ReasoningSource::dsh()
             } else {
-                ReasoningSource::verified()
+                ReasoningSource::zcode()
             },
             ..Self::default()
         }
@@ -216,13 +208,19 @@ impl ObservationState {
 
     pub fn observe_message(&mut self, method: &str, params: &Value) {
         if method != "session/event"
-            || params.get("type").and_then(Value::as_str) != Some(VERIFIED_EVENT_TYPE)
+            || params.get("type").and_then(Value::as_str) != Some(PUBLIC_EVENT_TYPE)
         {
             return;
         }
         let payload = params.get("payload").unwrap_or(&Value::Null);
         let kind = payload.get("kind").and_then(Value::as_str);
+        if kind == Some("text_delta") {
+            return;
+        }
         if !matches!(kind, Some("reasoning_delta" | "tool_call")) {
+            // Unknown shapes on the supported stream are a coverage gap, not
+            // evidence of inactivity. Unrelated notification methods stay ignored.
+            self.observe_loss();
             return;
         }
         if kind == Some("reasoning_delta") && !self.collect_reasoning {
@@ -292,11 +290,10 @@ impl ObservationState {
         let turn_id = valid_id(params.get("turnId")).unwrap_or("");
         let (arguments, mut arguments_truncated, redacted_fields) =
             project_arguments(payload.get("input"));
-        if self.reasoning_source == ReasoningSource::dsh()
-            && !payload.get("input").is_some_and(Value::is_object)
-        {
-            // An absent ACP input is unknown, not an observed empty object.
+        if !payload.get("input").is_some_and(Value::is_object) {
+            // Missing or incompatible arguments are unknown for every adapter.
             arguments_truncated = true;
+            self.drop_event(true);
         }
         self.record_tool_call(
             turn_id,
@@ -648,41 +645,6 @@ fn project_arguments(input: Option<&Value>) -> (Map<String, Value>, bool, u64) {
     (projected, true, excluded_fields)
 }
 
-/// ZCode retains its pinned runtime evidence; DSH uses its public ACP
-/// thought contract. Codex has no public reasoning source.
-pub fn adapter_runtime_source_verified(adapter: &str, runtime_source: Option<&Path>) -> bool {
-    match adapter {
-        "zcode" => runtime_source_verified(runtime_source),
-        "dsh" => true,
-        _ => false,
-    }
-}
-
-pub fn runtime_source_verified(path: Option<&Path>) -> bool {
-    let Some(path) = path else { return false };
-    let Ok(canonical) = path.canonicalize() else {
-        return false;
-    };
-    if canonical != Path::new(VERIFIED_RUNTIME_PATH) {
-        return false;
-    }
-    let Ok(mut file) = File::open(&canonical) else {
-        return false;
-    };
-    let mut digest = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let Ok(read) = file.read(&mut buffer) else {
-            return false;
-        };
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    format!("{:x}", digest.finalize()) == VERIFIED_RUNTIME_SHA256
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,6 +656,23 @@ mod tests {
             "turnId": "turn-1",
             "payload": { "kind": kind, "toolCallId": payload.get("toolCallId"), "toolName": payload.get("toolName"), "input": payload.get("input"), "delta": payload.get("delta") }
         })
+    }
+
+    #[test]
+    fn unknown_stream_shapes_mark_loss_without_blocking_observation() {
+        for payload in [Value::Null, serde_json::json!({"kind":"future_kind"})] {
+            let mut state = ObservationState::for_adapter("zcode");
+            state.observe_message("session/event", &serde_json::json!({"type":"model.streaming","payload":payload}));
+            assert!(!state.tool_history_complete);
+            assert!(!state.reasoning_complete);
+            assert_eq!(state.dropped_events, 1);
+        }
+        let mut state = ObservationState::for_adapter("zcode");
+        state.observe_message("session/event", &event("text", "text_delta", Value::Null));
+        assert_eq!(state.dropped_events, 0);
+        state.observe_message("session/event", &event("bad", "tool_call", serde_json::json!({"toolCallId":"call","toolName":"read","input":42})));
+        assert!(!state.tool_history_complete);
+        assert_eq!(state.dropped_events, 1);
     }
 
     #[test]
@@ -723,7 +702,9 @@ mod tests {
             format!("{}{}", "中🙂".repeat(50), "乙".repeat(100))
         );
         assert!(snapshot.reasoning.truncated);
-        assert_eq!(snapshot.snapshot_seq, 2);
+        assert_eq!(snapshot.snapshot_seq, 3);
+        assert!(!snapshot.coverage.reasoning_complete);
+        assert_eq!(state.dropped_events, 1);
     }
 
     #[test]
@@ -987,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_runtime_fixture_uses_only_the_confirmed_public_fields() {
+    fn public_event_fixture_uses_only_supported_fields() {
         let events: Vec<Value> = serde_json::from_str(include_str!(
             "../../../tests/live-agent/non-git-based/observation-public-fixture.json"
         ))
@@ -1087,42 +1068,13 @@ mod tests {
     }
 
     #[test]
-    fn observation_evidence_binds_to_the_launched_adapter_not_the_global_source() {
-        // Pointing the scheduler's runtime_source at the literal pinned ZCode
-        // path must not confer observation trust on any other adapter: the
-        // pin is a proof about the ZCode runtime only. These verdicts hold
-        // whether or not that file actually exists on the machine.
-        let pinned = Path::new(VERIFIED_RUNTIME_PATH);
-        for adapter in ["codex", "dsh-preview", "codex-cli", ""] {
-            assert!(
-                !adapter_runtime_source_verified(adapter, Some(pinned)),
-                "adapter {adapter:?} must not borrow the ZCode pin"
-            );
-            assert!(!adapter_runtime_source_verified(adapter, None));
-        }
-        // The ZCode adapter keeps the pinned-file contract: an absent or
-        // arbitrary runtime source stays unverified.
-        assert!(!adapter_runtime_source_verified("zcode", None));
-        assert!(!runtime_source_verified(None));
-    }
-
-    #[test]
-    fn changed_runtime_version_or_hash_degrades_the_proof_truthfully() {
-        // A ZCode runtime whose bytes differ from the pinned digest (an
-        // updated version) is explicitly unverified until its public-source
-        // contract is re-proven; the gate is never widened to let it pass.
-        let changed = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(changed.path(), b"changed runtime bytes").unwrap();
-        assert!(!runtime_source_verified(Some(changed.path())));
-        assert!(!adapter_runtime_source_verified(
-            "zcode",
-            Some(changed.path())
-        ));
-        assert!(adapter_runtime_source_verified("dsh", Some(changed.path())));
-        assert!(!adapter_runtime_source_verified(
-            "codex",
-            Some(changed.path())
-        ));
+    fn empty_observation_is_available_without_runtime_file_authentication() {
+        let state = ObservationState::for_launch("zcode", 1);
+        let snapshot = state.snapshot();
+        assert!(snapshot.tools.is_empty());
+        assert!(snapshot.reasoning.text.is_empty());
+        assert_eq!(snapshot.reasoning.source, ReasoningSource::zcode());
+        assert!(snapshot.coverage.tool_history_complete);
     }
 
     #[test]

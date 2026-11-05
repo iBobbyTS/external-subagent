@@ -7,7 +7,6 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchedulerConfig {
-    pub per_workspace_max_agents: usize,
     pub stop_grace: Duration,
     pub bootstrap_timeout: Duration,
     pub control_timeout: Duration,
@@ -16,7 +15,6 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            per_workspace_max_agents: 1,
             stop_grace: Duration::from_secs(1),
             bootstrap_timeout: Duration::from_secs(2),
             control_timeout: Duration::from_secs(2),

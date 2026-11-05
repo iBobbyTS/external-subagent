@@ -657,19 +657,10 @@ impl RpcService {
             }
             RpcMethod::TaskObserve { agent_id } => {
                 let task = self.require_task(&agent_id)?;
-                let (snapshot, runtime_source_verified) =
+                let snapshot =
                     self.scheduler.observation_snapshot(&task.agent_id);
                 let adapter = crate::task_agent(&task);
-                // The source-verification gate and the reasoning projection are
-                // per-agent policy facts. A name outside the roster keeps the
-                // historical gated, reasoning-reporting reading.
                 let observation_support = ObservationSupport::for_name(&adapter);
-                if !runtime_source_verified && observation_support.requires_verified_source {
-                    return Err(RpcError::new(
-                        RpcErrorCode::Unavailable,
-                        "observation runtime source is not verified",
-                    ));
-                }
                 Ok(RpcSuccess::TaskObserved {
                     observation: TaskObservationView {
                         schema: OBSERVATION_SCHEMA.into(),
@@ -1556,11 +1547,8 @@ mod observe_gate_tests {
     use super::*;
     use crate::{CommandRuntimeFactory, Scheduler, SchedulerConfig};
 
-    /// The literal pinned ZCode runtime path: the strongest deterministic
-    /// "pinned ZCode installation present" fixture. The assertions hold
-    /// whether or not the file exists or matches the pinned digest, because
-    /// observe trust is bound to the launched adapter, never the global file.
-    const PINNED_ZCODE_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    /// Runtime location must not affect public event observation.
+    const ARBITRARY_RUNTIME_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
 
     fn admission(agent: &str) -> external_core::AdmissionIdentity {
         external_core::AdmissionIdentity {
@@ -1574,7 +1562,7 @@ mod observe_gate_tests {
         }
     }
 
-    fn service_with_pinned_source(
+    fn service_with_arbitrary_source(
         directory: &std::path::Path,
         adapter: &str,
     ) -> (Arc<RpcService>, external_store::TaskRecord) {
@@ -1589,7 +1577,7 @@ mod observe_gate_tests {
             Arc::clone(&store),
             factory,
             SchedulerConfig {
-                runtime_source: Some(PathBuf::from(PINNED_ZCODE_SOURCE)),
+                runtime_source: Some(PathBuf::from(ARBITRARY_RUNTIME_SOURCE)),
                 ..SchedulerConfig::default()
             },
         )
@@ -1620,12 +1608,10 @@ mod observe_gate_tests {
                 .prefix("active-")
                 .tempdir_in(&root)
                 .unwrap();
-            let (service, task) = service_with_pinned_source(directory.path(), adapter);
-            // Supply the launch-scoped verdict; production obtains it from
-            // the pinned file (zcode) or the public ACP contract (dsh).
+            let (service, task) = service_with_arbitrary_source(directory.path(), adapter);
+            // Public event parsing follows the launched adapter.
             let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter(
                 adapter,
-                adapter != "codex",
             ));
             tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
                 external_contract::WireMessage::UnknownEvent {
@@ -1679,14 +1665,10 @@ mod observe_gate_tests {
                 .prefix("observe-")
                 .tempdir_in(&root)
                 .unwrap();
-            let (service, task) = service_with_pinned_source(directory.path(), adapter);
+            let (service, task) = service_with_arbitrary_source(directory.path(), adapter);
             let result = service.dispatch(RpcMethod::TaskObserve {
                 agent_id: task.agent_id,
             });
-            if adapter == "zcode" {
-                assert_eq!(result.unwrap_err().code, RpcErrorCode::Unavailable);
-                continue;
-            }
             let RpcSuccess::TaskObserved { observation } = result.unwrap() else {
                 panic!("expected observation");
             };
@@ -1699,7 +1681,7 @@ mod observe_gate_tests {
             } else {
                 let reasoning = observation.reasoning.as_ref().unwrap();
                 assert!(reasoning.text.is_empty());
-                assert_eq!(reasoning.source, crate::observation::ReasoningSource::dsh());
+                assert_eq!(reasoning.source, if adapter == "dsh" { crate::observation::ReasoningSource::dsh() } else { crate::observation::ReasoningSource::zcode() });
             }
         }
     }

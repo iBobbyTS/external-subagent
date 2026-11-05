@@ -25,7 +25,7 @@ fn store() -> (TempDir, PathBuf, Store) {
 }
 
 fn running(store: &Store, id: &str) -> u64 {
-    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, id);
     assert!(store
         .mark_session_running(id, claim.owner_epoch, "runtime", None, None, None)
@@ -54,10 +54,10 @@ fn queued_cancel_fence_blocks_claim_and_survives_reopen() {
     store.fence_queued_cancellation().unwrap();
     assert!(!store.get_task("10000001").unwrap().unwrap().stop_requested);
     assert!(store.get_task("10000002").unwrap().unwrap().stop_requested);
-    assert!(store.claim_next("loop", 10, 1).unwrap().is_none());
+    assert!(store.claim_next("loop").unwrap().is_none());
     drop(store);
     let reopened = Store::open(path).unwrap();
-    assert!(reopened.claim_next("restart", 10, 1).unwrap().is_none());
+    assert!(reopened.claim_next("restart").unwrap().is_none());
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn startup_recovery_includes_fenced_queue_but_preserves_unfenced_queue() {
     assert_eq!(recovery[0].phase, TaskPhase::Queued);
     assert!(recovery[0].stop_requested);
     assert!(reopened.task_result("fenced").unwrap().is_none());
-    let ordinary = reopened.claim_next("claim-loop", 10, 1).unwrap().unwrap();
+    let ordinary = reopened.claim_next("claim-loop").unwrap().unwrap();
     assert_eq!(ordinary.task.agent_id, "ordinary");
 }
 
@@ -663,7 +663,7 @@ fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
     store
         .enqueue_task_authoritative(&task("agent", "/repo", None))
         .unwrap();
-    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
     store
         .mark_session_running(
             "agent",
@@ -692,7 +692,7 @@ fn terminal_reason_code_after_resume_completion_ignores_the_stale_failure() {
         Some("MODEL_REJECTED")
     );
 
-    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
     store
         .mark_session_running(
             "agent",
@@ -920,7 +920,7 @@ fn task_with_result_holds_one_lock_across_a_resume_and_second_failure() {
     store
         .enqueue_task_authoritative(&task("agent", "/repo", None))
         .unwrap();
-    let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
     store
         .mark_session_running(
             "agent",
@@ -954,7 +954,7 @@ fn task_with_result_holds_one_lock_across_a_resume_and_second_failure() {
         writer_store
             .requeue_task_for_resume_with_message("agent", "resume-msg", "queue", "continue")
             .unwrap();
-        let claim = writer_store.claim_next("daemon", 10, 10).unwrap().unwrap();
+        let claim = writer_store.claim_next("daemon").unwrap().unwrap();
         writer_store
             .mark_session_running(
                 "agent",
@@ -1067,7 +1067,7 @@ fn terminal_resume_persists_both_modes_and_rejects_invalid_mode_without_mutation
         store
             .enqueue_task_authoritative(&task("agent", "/repo", None))
             .unwrap();
-        let claim = store.claim_next("daemon", 10, 10).unwrap().unwrap();
+        let claim = store.claim_next("daemon").unwrap().unwrap();
         assert!(store
             .mark_session_running(
                 "agent",
@@ -1125,4 +1125,26 @@ fn terminal_unreaped_tasks_lists_only_unreaped_terminal_rows() {
     assert_eq!(unreaped[0].agent_id, "straggler");
     assert_eq!(unreaped[0].phase, TaskPhase::Terminal);
     assert!(unreaped[0].reaped_at.is_none());
+}
+
+#[test]
+fn shared_workspace_admits_distinct_actors_and_terminal_resume() {
+    let (_directory, _path, store) = store();
+    let mut first = task("10000001", "/repo", None);
+    first.workspace_path = "/shared".into();
+    store.enqueue_task_authoritative(&first).unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
+    store.mark_session_running(&first.agent_id, claim.owner_epoch, "runtime", None, Some("first-session"), None).unwrap();
+    let mut second = task("10000002", "/repo", None);
+    second.workspace_path = first.workspace_path.clone();
+    store.enqueue_task_authoritative(&second).unwrap();
+    assert!(store.enqueue_task_authoritative(&first).is_err(), "same actor still cannot be duplicated");
+    let second_claim = store.claim_next("daemon").unwrap().unwrap();
+    assert_eq!(second_claim.task.agent_id, second.agent_id);
+    store.mark_session_running(&second.agent_id, second_claim.owner_epoch, "runtime", None, Some("second-session"), None).unwrap();
+    store.store_task_result(&first.agent_id, &result(TaskOutcome::Completed)).unwrap();
+    assert!(store.requeue_task_for_resume_with_message(&first.agent_id, "resume-first", "queue", "continue").unwrap());
+    assert_eq!(store.get_task(&second.agent_id).unwrap().unwrap().phase, TaskPhase::Running);
+    assert_eq!(store.get_task(&first.agent_id).unwrap().unwrap().phase, TaskPhase::Queued);
+    assert!(store.task_result(&second.agent_id).unwrap().is_none());
 }

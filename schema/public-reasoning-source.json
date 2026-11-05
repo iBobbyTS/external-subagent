@@ -3,10 +3,8 @@
   "subagents": {
     "zcode": {
       "public": true,
-      "status": "VERIFIED_RUNTIME_PUBLIC",
-      "runtime_path": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
-      "runtime_version": "3.11.2",
-      "runtime_sha256": "e9f1868c0fdb863537ed910ee3828b9be96b8c2fd805473f63b439e1113266b8",
+      "status": "PUBLIC_RUNTIME_EVENT",
+      "runtime_version": "unreported",
       "wire_method": "session/event",
       "event_type_pointer": "/params/type",
       "event_type": "model.streaming",

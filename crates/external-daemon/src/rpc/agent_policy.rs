@@ -349,21 +349,17 @@ pub(crate) enum CatalogRuntime {
     },
 }
 
-/// The two per-agent observation facts: whether a live snapshot needs a
-/// source-verified runtime, and whether reasoning activity is reported.
+/// Per-agent observation policy: whether public reasoning activity is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObservationSupport {
-    pub(crate) requires_verified_source: bool,
     pub(crate) reports_reasoning: bool,
 }
 
 impl ObservationSupport {
-    /// Unknown adapters keep the historical zcode-shaped defaults: the source
-    /// gate applies and reasoning is reported.
+    /// Unknown adapters report the supported public reasoning projection.
     pub(crate) fn for_name(name: &str) -> Self {
         policy_for(name).map_or(
             Self {
-                requires_verified_source: true,
                 reports_reasoning: true,
             },
             |policy| policy.observation,
@@ -405,7 +401,6 @@ static ZCODE: AgentPolicy = AgentPolicy {
     catalog: CatalogProbe::ZcodeSessionCreate,
     catalog_runtime: CatalogRuntime::Injected,
     observation: ObservationSupport {
-        requires_verified_source: true,
         reports_reasoning: true,
     },
 };
@@ -436,7 +431,6 @@ static DSH: AgentPolicy = AgentPolicy {
     catalog: CatalogProbe::DshAcpModels,
     catalog_runtime: CatalogRuntime::EnvironmentVariable("DSH_RUNTIME_PATH"),
     observation: ObservationSupport {
-        requires_verified_source: false,
         reports_reasoning: true,
     },
 };
@@ -468,7 +462,6 @@ static CODEX: AgentPolicy = AgentPolicy {
         binary: "codex",
     },
     observation: ObservationSupport {
-        requires_verified_source: false,
         reports_reasoning: false,
     },
 };
@@ -502,7 +495,6 @@ static AGY: AgentPolicy = AgentPolicy {
         binary: "agy",
     },
     observation: ObservationSupport {
-        requires_verified_source: false,
         reports_reasoning: false,
     },
 };

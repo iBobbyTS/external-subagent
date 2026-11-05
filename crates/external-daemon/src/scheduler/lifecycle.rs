@@ -11,11 +11,7 @@ impl Scheduler {
             if let Some(hook) = self.inner.before_claim_hook.lock().unwrap().clone() {
                 hook();
             }
-            let claim = self.inner.store.claim_next(
-                &self.inner.owner_id,
-                usize::MAX,
-                self.inner.config.per_workspace_max_agents,
-            )?;
+            let claim = self.inner.store.claim_next(&self.inner.owner_id)?;
             let Some(claim) = claim else {
                 return Ok(started);
             };
@@ -132,15 +128,11 @@ impl Scheduler {
         };
         let runtime_agent_id = format!("{}:{}", claim.task.agent_id, claim.owner_epoch);
         let runtime_lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
-        // Public-source policy follows the launched adapter: pinned ZCode,
+        // Public event parsing follows the launched adapter: ZCode events,
         // public DSH ACP thoughts, and no Codex reasoning collection.
         let adapter = task_agent(&claim.task);
         let activity = Arc::new(PassiveActivityTracker::for_launch(
             &adapter,
-            observation::adapter_runtime_source_verified(
-                &adapter,
-                self.inner.config.runtime_source.as_deref(),
-            ),
             claim.owner_epoch,
         ));
         let sink = Arc::new(StoreLifecycleSink::new(
@@ -254,10 +246,6 @@ impl Scheduler {
             return Ok(false);
         }
 
-        activity.confirm_runtime_source(observation::adapter_runtime_source_verified(
-            &adapter,
-            self.inner.config.runtime_source.as_deref(),
-        ));
         let mcp_servers = Vec::new();
         let bootstrap_timeout = self.inner.config.bootstrap_timeout;
         let session = match if claim.task.session_id.is_some() {

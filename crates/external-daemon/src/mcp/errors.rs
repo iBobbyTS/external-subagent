@@ -200,7 +200,6 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
         RpcErrorCode::Conflict => (
             "conflict",
             match detail.as_str() {
-                "WORKSPACE_BUSY" => "WORKSPACE_BUSY",
                 "MESSAGE_ID_CONFLICT" => "MESSAGE_ID_CONFLICT",
                 _ => "durable state conflict",
             },
@@ -372,17 +371,6 @@ mod tests {
         ))
         .legacy_text
         .starts_with("daemon_unavailable:"));
-    }
-
-    #[test]
-    fn workspace_busy_preserves_code_message_and_active_agent() {
-        let mut error = RpcError::new(RpcErrorCode::Conflict, "WORKSPACE_BUSY");
-        error.active_agent_id = Some("10000042".into());
-        let rendered = public_error(error);
-        assert!(rendered.legacy_text.starts_with("conflict: WORKSPACE_BUSY"));
-        assert!(rendered.legacy_text.contains("active_agent_id=10000042"));
-        assert_eq!(rendered.body.code, "conflict");
-        assert_eq!(rendered.body.agent_id, Some(10000042));
     }
 
     #[test]

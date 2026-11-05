@@ -168,7 +168,7 @@ mod queued_recovery_tests {
             if claimed {
                 scheduler
                     .store()
-                    .claim_next("prior-owner", 10, 1)
+                    .claim_next("prior-owner")
                     .unwrap()
                     .unwrap();
                 scheduler.store().request_stop(&task.agent_id).unwrap();
@@ -209,7 +209,7 @@ mod observation_evidence_tests {
     /// present" fixture a deterministic test can build: every assertion below
     /// is invariant to whether that file exists or matches the pinned digest,
     /// because the verdicts are bound to the launched adapter, not the file.
-    const PINNED_ZCODE_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
+    const ARBITRARY_RUNTIME_SOURCE: &str = "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs";
     /// Mirrors observation.rs's public-argument bound (4 KiB).
     const MAX_ARGUMENT_BYTES: usize = 4 * 1024;
 
@@ -315,12 +315,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     ) -> observation::ObservationSnapshot {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (snapshot, verified) = scheduler.observation_snapshot(agent_id);
-            assert_eq!(
-                verified,
-                adapter == "dsh",
-                "only DSH has its own public source"
-            );
+            let snapshot = scheduler.observation_snapshot(agent_id);
             // The fixture emits both tools after reasoning; hidden adapters
             // must not wait for reasoning that must never be collected.
             if snapshot.tools.len() == 2 {
@@ -339,9 +334,9 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     fn non_zcode_adapters_never_inherit_the_zcode_runtime_proof() {
         for (agent, runtime_source) in [
             ("dsh", None),
-            ("dsh", Some(PINNED_ZCODE_SOURCE)),
-            ("codex", Some(PINNED_ZCODE_SOURCE)),
-            ("unsupported-adapter-fixture", Some(PINNED_ZCODE_SOURCE)),
+            ("dsh", Some(ARBITRARY_RUNTIME_SOURCE)),
+            ("codex", Some(ARBITRARY_RUNTIME_SOURCE)),
+            ("unsupported-adapter-fixture", Some(ARBITRARY_RUNTIME_SOURCE)),
         ] {
             let directory = workspace("observation-");
             let scheduler = observation_scheduler(
@@ -403,8 +398,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             let result = await_result(&scheduler, &agent_id);
             assert_eq!(result.result.outcome, TaskOutcome::Completed);
             // Terminalization preserves the same adapter-scoped evidence.
-            let (terminal_snapshot, verified) = scheduler.observation_snapshot(&agent_id);
-            assert_eq!(verified, agent == "dsh");
+            let terminal_snapshot = scheduler.observation_snapshot(&agent_id);
             assert_eq!(terminal_snapshot.reasoning, snapshot.reasoning);
             assert_eq!(terminal_snapshot.coverage, snapshot.coverage);
             assert!(!terminal_snapshot.tools.is_empty());
@@ -412,14 +406,13 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
     }
 
     #[test]
-    fn missing_activity_never_borrows_the_global_runtime_proof() {
+    fn missing_activity_reports_empty_incomplete_capture() {
         let directory = workspace("observation-missing-");
-        // A task that was never launched has no launch-scoped activity; the
-        // scheduler-global pinned ZCode path must not stand in for it.
+        // A task that was never launched has no captured activity.
         let scheduler = observation_scheduler(
             directory.path(),
             "exit 0",
-            Some(PathBuf::from(PINNED_ZCODE_SOURCE)),
+            Some(PathBuf::from(ARBITRARY_RUNTIME_SOURCE)),
         );
         let submitted = scheduler
             .enqueue_general_with_admission(
@@ -427,13 +420,11 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
                 Some(admission("dsh")),
             )
             .unwrap();
-        let (queued, verified) = scheduler.observation_snapshot(&submitted.agent_id);
-        assert!(!verified);
+        let queued = scheduler.observation_snapshot(&submitted.agent_id);
         assert_eq!(queued.snapshot_seq, 0);
         assert!(queued.tools.is_empty());
         // An unknown task id reports the same unavailable, untrusted verdict.
-        let (unknown, unknown_verified) = scheduler.observation_snapshot("99999999");
-        assert!(!unknown_verified);
+        let unknown = scheduler.observation_snapshot("99999999");
         assert_eq!(unknown.snapshot_seq, queued.snapshot_seq);
         assert_eq!(unknown.tools, queued.tools);
         assert_eq!(unknown.coverage, queued.coverage);
@@ -868,7 +859,7 @@ sleep 2
     fn resumed_policy_launcher_failure_persists_preparation_detail() {
         let (_workspace, scheduler, agent_id) = diagnostic_scheduler("unused");
         let store = scheduler.store();
-        let claim = store.claim_next("old-daemon", 10, 1).unwrap().unwrap();
+        let claim = store.claim_next("old-daemon").unwrap().unwrap();
         assert!(store
             .mark_session_running(
                 &agent_id,
@@ -1239,7 +1230,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         for cancelled in [false, true] {
             let (workspace, scheduler, agent_id) = diagnostic_scheduler("unused");
             let store = scheduler.store();
-            let claim = store.claim_next("old-daemon", 1, 1).unwrap().unwrap();
+            let claim = store.claim_next("old-daemon").unwrap().unwrap();
             // An actual isolated child supplies the persisted identity. No monitor is
             // attached: this models loss of the daemon after claiming delivery.
             let mut command = Command::new("sh");
@@ -1565,7 +1556,7 @@ sleep 2
 
     #[test]
     fn known_driver_loss_marks_observation_coverage_without_query_side_effects() {
-        let tracker = PassiveActivityTracker::new(true);
+        let tracker = PassiveActivityTracker::new();
         tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
                 method: "session/event".into(),
@@ -1598,7 +1589,7 @@ sleep 2
 
     #[test]
     fn terminal_text_is_scoped_to_the_settling_turn() {
-        let tracker = PassiveActivityTracker::new(true);
+        let tracker = PassiveActivityTracker::new();
         let session_event = |params: serde_json::Value| {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
                 external_contract::EventEnvelope {
@@ -1668,7 +1659,7 @@ sleep 2
     #[test]
     fn near_limit_observation_does_not_starve_the_shared_cancel_lifecycle_lock() {
         let lifecycle = Arc::new(RuntimeLifecycle::new(1));
-        let tracker = Arc::new(PassiveActivityTracker::new(true));
+        let tracker = Arc::new(PassiveActivityTracker::new());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let worker_lifecycle = Arc::clone(&lifecycle);
         let worker_tracker = Arc::clone(&tracker);
@@ -2253,7 +2244,7 @@ mod legacy_row_recovery_tests {
         let (_repository, _scratch) = enqueue_legacy(&scheduler, &directory);
         scheduler
             .store()
-            .claim_next("prior-owner", 10, 1)
+            .claim_next("prior-owner")
             .unwrap()
             .unwrap();
         drop(scheduler);
@@ -2295,7 +2286,7 @@ mod legacy_row_recovery_tests {
         enqueue_legacy(&scheduler, &directory);
         scheduler
             .store()
-            .claim_next("prior-owner", 10, 1)
+            .claim_next("prior-owner")
             .unwrap()
             .unwrap();
         let original = TaskResult {
@@ -2768,16 +2759,17 @@ exit 0\n",
         let barrier = TransportBarrier::install(&scheduler);
         let agent_id = enqueue(&scheduler, directory.path(), "oversized then orphan");
         let queued_id = "10009999".to_string();
-        // R4: an already-queued same-workspace task must be admitted by the
-        // fault closure's own queue advancement.
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        barrier.wait_ready(Duration::from_secs(30));
+        // Queue work after initial dispatch while the fault monitor is paused.
+        // Its cleanup must advance this queue without relying on a workspace cap.
         insert_queued_task(
             directory.path(),
             &agent_id,
             &queued_id,
             "queued normal task",
         );
-        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
-        barrier.wait_ready(Duration::from_secs(30));
+        assert_eq!(scheduler.store().get_task(&queued_id).unwrap().unwrap().phase, TaskPhase::Queued);
 
         let (_, runtime, _, _, _) = scheduler
             .active_session(&agent_id)
@@ -3370,7 +3362,7 @@ mod turn_adjudication_tests {
         // The task carries an admitted model, but its resume adapter cannot
         // re-read the persisted model (configured_model None). Resume must not
         // re-validate the sticky session, so the task still reaches RUNNING.
-        let claim = store.claim_next("adjudication-test", 10, 1).unwrap().unwrap();
+        let claim = store.claim_next("adjudication-test").unwrap().unwrap();
         assert!(store
             .mark_session_running(
                 &harness.agent_id,
@@ -3768,7 +3760,7 @@ mod turn_adjudication_tests {
             write_manifest: Vec::new(),
         };
         let agent_id = scheduler.enqueue_general(&manifest).unwrap().agent_id;
-        let claim = store.claim_next("sink-race", 999, 1).unwrap().unwrap();
+        let claim = store.claim_next("sink-race").unwrap().unwrap();
         assert_eq!(claim.task.phase, TaskPhase::Preparing);
 
         let lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
@@ -3778,7 +3770,7 @@ mod turn_adjudication_tests {
             "sink-race-runtime".into(),
             claim.owner_epoch,
             Arc::clone(&lifecycle),
-            Arc::new(crate::activity_tracker::PassiveActivityTracker::new(false)),
+            Arc::new(crate::activity_tracker::PassiveActivityTracker::new()),
         ));
         let record = crate::LifecycleRecord {
             sequence: 7,
@@ -3988,7 +3980,7 @@ mod wait_tail_inheritance_tests {
 
     /// Install an outgoing tracker whose window is "AB" with "A" delivered.
     fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
-        let old = Arc::new(PassiveActivityTracker::new(true));
+        let old = Arc::new(PassiveActivityTracker::new());
         old.set_wait_tail_fixture("A");
         assert_eq!(old.take_wait_tail().text, "A");
         inject_text(&old, "B");
@@ -4794,7 +4786,7 @@ mod spawn_established_return_tests {
         let bg_finished_for_hook = Arc::clone(&bg_finished);
         let scheduler_for_bg = scheduler.clone();
         scheduler.set_before_claim_hook(Some(Arc::new(move || {
-            if let Ok(Some(claim)) = scheduler_for_bg.inner.store.claim_next("bg-claim-thread", 10, 1) {
+            if let Ok(Some(claim)) = scheduler_for_bg.inner.store.claim_next("bg-claim-thread") {
                 let s = scheduler_for_bg.clone();
                 let finished = Arc::clone(&bg_finished_for_hook);
                 std::thread::spawn(move || {
@@ -5264,7 +5256,7 @@ mod spawn_established_return_tests {
         assert!(matches!(mismatch_queued, Err(t) if t.phase == TaskPhase::Queued && t.session_id.is_some() && !t.stop_requested));
 
         store
-            .claim_specific(&agent_id, "test-owner", 1)
+            .claim_specific(&agent_id, "test-owner")
             .unwrap();
         let prep = store.get_task(&agent_id).unwrap().unwrap();
         assert_eq!(prep.phase, TaskPhase::Preparing);
@@ -5620,7 +5612,7 @@ mod spawn_established_return_tests {
     }
 
     #[test]
-    fn ac5_workspace_busy_and_drain_unavailable() {
+    fn shared_workspace_admission_and_drain_unavailable() {
         let (dir, scheduler, _) = test_harness(|_| {
             Ok(Arc::new(TestRuntime {
                 session_id: "session-ac5".into(),
@@ -5637,15 +5629,10 @@ mod spawn_established_return_tests {
             .submit_and_start_general(&manifest, default_admission(), &|| false)
             .unwrap();
 
-        let second_err = scheduler
+        let second = scheduler
             .submit_and_start_general(&manifest, default_admission(), &|| false)
-            .unwrap_err();
-        match second_err {
-            SchedulerError::Store(external_store::StoreError::Conflict(msg)) => {
-                assert!(msg.starts_with("WORKSPACE_BUSY"), "expected WORKSPACE_BUSY, got {msg}");
-            }
-            other => panic!("expected Store Conflict WORKSPACE_BUSY, got {other:?}"),
-        }
+            .unwrap();
+        assert_ne!(_first.agent_id, second.agent_id);
 
         let dir2 = tempfile::tempdir().unwrap();
         let manifest2 = default_manifest(dir2.path());
@@ -5779,7 +5766,7 @@ mod drain_straggler_tests {
         let submitted = scheduler.enqueue_general(&manifest).unwrap();
         let claim = scheduler
             .store()
-            .claim_next("drain-stragglers", 10, 1)
+            .claim_next("drain-stragglers")
             .unwrap()
             .expect("enqueued straggler must be claimable");
         assert_eq!(claim.task.agent_id, submitted.agent_id);

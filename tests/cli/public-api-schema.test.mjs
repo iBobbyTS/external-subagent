@@ -124,9 +124,10 @@ test('observation contract preserves public tails and object-level hidden reason
   assert.deepEqual(schema.properties.reasoning.required, ['text', 'truncated']);
   const { subagents } = JSON.parse(fs.readFileSync(path.join(root, 'schema/public-reasoning-source.json'), 'utf8'));
   assert.deepEqual(Object.keys(subagents), ['zcode', 'dsh', 'codex', 'agy']);
-  assert.equal(subagents.zcode.status, 'VERIFIED_RUNTIME_PUBLIC');
-  assert.equal(subagents.zcode.runtime_version, '3.11.2');
-  assert.equal(subagents.zcode.runtime_sha256, 'e9f1868c0fdb863537ed910ee3828b9be96b8c2fd805473f63b439e1113266b8');
+  assert.equal(subagents.zcode.status, 'PUBLIC_RUNTIME_EVENT');
+  assert.equal(subagents.zcode.runtime_version, 'unreported');
+  assert.equal(subagents.zcode.runtime_sha256, undefined);
+  assert.equal(subagents.zcode.runtime_path, undefined);
   assert.equal(subagents.zcode.delta_pointer, '/params/payload/delta');
   assert.equal(subagents.dsh.public, true);
   assert.equal(subagents.dsh.status, 'VERIFIED_PROTOCOL_PUBLIC');

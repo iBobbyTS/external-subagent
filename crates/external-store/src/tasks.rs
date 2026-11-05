@@ -31,7 +31,7 @@ impl Store {
     }
 
     /// Enqueue a fresh task. Submission is intentionally non-idempotent:
-    /// agent-id and active-workspace collisions are conflicts, never reuse,
+    /// agent-id collisions are conflicts, never reuse,
     /// so the only possible outcome is the newly created record.
     pub fn enqueue_task_authoritative(&self, task: &NewTask) -> StoreResult<TaskRecord> {
         validate_task(task)?;
@@ -41,23 +41,6 @@ impl Store {
             return Err(StoreError::Conflict(format!(
                 "agent id {} already exists",
                 task.agent_id
-            )));
-        }
-        // Workspace ownership is the collision boundary.  It applies to every
-        // submission, regardless of launch metadata or repository identity;
-        // terminal rows remain queryable and therefore do not block reuse.
-        if let Some(active_agent_id) = transaction
-            .query_row(
-                "SELECT agent_id FROM tasks WHERE workspace_path=?1
-             AND phase IN ('QUEUED','PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
-             ORDER BY created_at, rowid LIMIT 1",
-                [&task.workspace_path],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return Err(StoreError::Conflict(format!(
-                "WORKSPACE_BUSY active_agent_id={active_agent_id}"
             )));
         }
         let created_at = now_millis();
@@ -216,28 +199,15 @@ impl Store {
     pub fn claim_next(
         &self,
         owner_id: &str,
-        global_limit: usize,
-        per_workspace_limit: usize,
     ) -> StoreResult<Option<TaskClaim>> {
-        // The product contract deliberately has no process-wide agent cap.
-        // Keep the parameter for source compatibility with older daemon
-        // callers, but do not use it as an admission gate.  Concurrency is
-        // scoped to the canonical repository/workspace below.
-        let _ = global_limit;
-        if per_workspace_limit == 0 {
-            return Ok(None);
-        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = transaction
             .query_row(
                 "SELECT agent_id FROM tasks queued
                  WHERE phase='QUEUED' AND close_requested=0 AND stop_requested=0
-                   AND (SELECT COUNT(*) FROM tasks active
-                        WHERE active.repository=queued.repository
-                          AND active.phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')) < ?1
                  ORDER BY queued.created_at,queued.rowid LIMIT 1",
-                [usize_to_i64(per_workspace_limit)?],
+                [],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -279,21 +249,14 @@ impl Store {
         &self,
         agent_id: &str,
         owner_id: &str,
-        per_workspace_limit: usize,
     ) -> StoreResult<Option<TaskClaim>> {
-        if per_workspace_limit == 0 {
-            return Ok(None);
-        }
         let mut connection = self.connection.lock().unwrap();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidate = transaction
             .query_row(
                 "SELECT agent_id FROM tasks queued
-                 WHERE agent_id=?1 AND phase='QUEUED' AND close_requested=0 AND stop_requested=0
-                   AND (SELECT COUNT(*) FROM tasks active
-                        WHERE active.repository=queued.repository
-                          AND active.phase IN ('PREPARING','RUNNING','WAITING_INPUT','CANCELLING')) < ?2",
-                params![agent_id, usize_to_i64(per_workspace_limit)?],
+                 WHERE agent_id=?1 AND phase='QUEUED' AND close_requested=0 AND stop_requested=0",
+                [agent_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -658,7 +621,7 @@ mod tests {
 
         // 1. Success path
         store.enqueue_task_authoritative(&test_task("task-1", "/repo-a")).unwrap();
-        let claim = store.claim_specific("task-1", "starter-thread", 5).unwrap();
+        let claim = store.claim_specific("task-1", "starter-thread").unwrap();
         assert!(claim.is_some());
         let claim = claim.unwrap();
         assert_eq!(claim.owner_epoch, 1);
@@ -680,25 +643,20 @@ mod tests {
         drop(conn);
 
         // 2. Already claimed / non-QUEUED -> Ok(None) and no row modification
-        let second = store.claim_specific("task-1", "other", 5).unwrap();
+        let second = store.claim_specific("task-1", "other").unwrap();
         assert!(second.is_none());
         let current = store.get_task("task-1").unwrap().unwrap();
         assert_eq!(current.owner_id.as_deref(), Some("starter-thread"));
         assert_eq!(current.owner_epoch, 1);
 
-        // 3. Capacity exceeded (active tasks count >= per_workspace_limit)
+        // A different actor in the same repository may be claimed concurrently.
         store.enqueue_task_authoritative(&test_task("task-2", "/repo-a")).unwrap();
-        // task-1 is in PREPARING, so active count in /repo-a is 1. With limit=1, task-2 cannot be claimed.
-        let blocked = store.claim_specific("task-2", "starter", 1).unwrap();
-        assert!(blocked.is_none());
-        // With limit=2, task-2 can be claimed
-        let allowed = store.claim_specific("task-2", "starter", 2).unwrap();
-        assert!(allowed.is_some());
+        assert!(store.claim_specific("task-2", "starter").unwrap().is_some());
 
         // 4. close_requested or stop_requested -> Ok(None)
         store.enqueue_task_authoritative(&test_task("task-3", "/repo-b")).unwrap();
         store.request_stop("task-3").unwrap();
-        assert!(store.claim_specific("task-3", "starter", 5).unwrap().is_none());
+        assert!(store.claim_specific("task-3", "starter").unwrap().is_none());
     }
 
     #[test]
@@ -730,7 +688,7 @@ mod tests {
 
         // 2. Fresh in PREPARING (session_id is None, phase=PREPARING, stop_requested=0)
         store.enqueue_task_authoritative(&test_task("task-p", "/repo")).unwrap();
-        let claim = store.claim_specific("task-p", "starter", 5).unwrap().unwrap();
+        let claim = store.claim_specific("task-p", "starter").unwrap().unwrap();
         assert_eq!(claim.task.phase, TaskPhase::Preparing);
         let cancel_p = store.cancel_unstarted_if_still_fresh("task-p").unwrap();
         assert_eq!(cancel_p, Ok((TaskPhase::Preparing, claim.owner_epoch)));
@@ -745,7 +703,7 @@ mod tests {
 
         // 4. session_id is not None -> mismatch does not write, returns current row
         store.enqueue_task_authoritative(&test_task("task-s", "/repo")).unwrap();
-        let claim_s = store.claim_specific("task-s", "starter", 5).unwrap().unwrap();
+        let claim_s = store.claim_specific("task-s", "starter").unwrap().unwrap();
         store
             .mark_session_running(
                 "task-s",

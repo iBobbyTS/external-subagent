@@ -239,7 +239,6 @@ impl Store {
         let (
             phase,
             session_id,
-            workspace_path,
             owner_epoch,
             outcome,
             stop_requested,
@@ -250,7 +249,6 @@ impl Store {
         ): (
             TaskPhase,
             Option<String>,
-            String,
             i64,
             Option<TaskOutcome>,
             bool,
@@ -259,7 +257,7 @@ impl Store {
             Option<i64>,
             Option<i64>,
         ) = transaction.query_row(
-            "SELECT phase,session_id,workspace_path,owner_epoch,outcome,
+            "SELECT phase,session_id,owner_epoch,outcome,
                     stop_requested,close_requested,closed_at,pid,reaped_at
              FROM tasks WHERE agent_id=?1",
             [agent_id],
@@ -274,8 +272,7 @@ impl Store {
                     })?,
                     row.get(1)?,
                     row.get(2)?,
-                    row.get(3)?,
-                    row.get::<_, Option<String>>(4)?
+                    row.get::<_, Option<String>>(3)?
                         .map(|value| TaskOutcome::parse(&value))
                         .transpose()
                         .map_err(|error| {
@@ -285,11 +282,11 @@ impl Store {
                                 Box::new(error),
                             )
                         })?,
+                    row.get::<_, i64>(4)? != 0,
                     row.get::<_, i64>(5)? != 0,
-                    row.get::<_, i64>(6)? != 0,
+                    row.get(6)?,
                     row.get(7)?,
                     row.get(8)?,
-                    row.get(9)?,
                 ))
             },
         )?;
@@ -313,21 +310,7 @@ impl Store {
         if pid.is_some() && reaped_at.is_none() {
             return Ok(false);
         }
-        if let Some(active_agent_id) = transaction
-            .query_row(
-                "SELECT agent_id FROM tasks
-                 WHERE workspace_path=?1 AND agent_id!=?2
-                   AND phase IN ('QUEUED','PREPARING','RUNNING','WAITING_INPUT','CANCELLING')
-                 ORDER BY created_at,rowid LIMIT 1",
-                params![workspace_path, agent_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-        {
-            return Err(StoreError::Conflict(format!(
-                "WORKSPACE_BUSY active_agent_id={active_agent_id}"
-            )));
-        }
+
         if transaction
             .query_row(
                 "SELECT 1 FROM messages WHERE message_id=?1",

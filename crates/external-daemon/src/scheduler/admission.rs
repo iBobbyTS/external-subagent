@@ -63,7 +63,6 @@ impl Scheduler {
         let agent_id = enqueued.agent_id.clone();
         let starter_scheduler = self.clone();
         let starter_agent_id = agent_id.clone();
-        let per_workspace_limit = self.inner.config.per_workspace_max_agents;
 
         thread::Builder::new()
             .name(format!("starter-{}", starter_agent_id))
@@ -72,11 +71,7 @@ impl Scheduler {
                 if let Some(hook) = starter_scheduler.inner.before_claim_hook.lock().unwrap().clone() {
                     hook();
                 }
-                match starter_scheduler.inner.store.claim_specific(
-                    &starter_agent_id,
-                    &starter_scheduler.inner.owner_id,
-                    per_workspace_limit,
-                ) {
+                match starter_scheduler.inner.store.claim_specific(&starter_agent_id, &starter_scheduler.inner.owner_id) {
                     Ok(Some(claim)) => {
                         let _ = starter_scheduler.start_claim(claim);
                     }

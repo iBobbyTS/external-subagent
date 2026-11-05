@@ -249,6 +249,8 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 ## 7. external_subagent_observe
 
+已识别的 model.streaming 流中，未知 kind 或缺失／错误类型的 payload 标记现有 coverage 缺口；非对象工具参数标记未知。正常 text_delta 与无关通知不构成缺口，解析降级不阻断任务。
+
 仅在怀疑 subagent 任务无进展循环时使用，不作为健康任务的常规轮询。读取已捕获的公开数据，不启动模型、不执行工具、不自动判定循环或取消。
 
 输入：
@@ -495,7 +497,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `error.component` | string/省略 | 诊断 facade、daemon、daemon_transport 等层次 | 难以定位失败边界 |
 | `error.operation` | string/省略 | 诊断哪种操作失败 | 多操作日志难以关联 |
 | `error.request_id` | string/省略 | 关联 facade 发起的 RPC 请求 | 无法从错误定位具体 RPC；不是待回答问题的 ID |
-| `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务；workspace busy 时尤其有用 |
+| `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务 |
 | `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝及 Validation/Malformed 准入拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
 
 当前公开映射的错误码：
@@ -509,7 +511,7 @@ timeout, runtime_lost, result_invalid, persistence, internal,
 unavailable, daemon_unavailable
 ```
 
-`conflict` 的 message 可为 `WORKSPACE_BUSY`、`MESSAGE_ID_CONFLICT` 或通用 `durable state conflict`。结构化 message 可能是有意收敛后的说明，文本 content 可能包含有界校验细节；不要假设两者完全相同。错误不保证都能附带 operation、request_id、agent_id，例如在请求派发前失败时。
+`conflict` 的 message 可为 `MESSAGE_ID_CONFLICT` 或通用 `durable state conflict`。结构化 message 可能是有意收敛后的说明，文本 content 可能包含有界校验细节；不要假设两者完全相同。错误不保证都能附带 operation、request_id、agent_id，例如在请求派发前失败时。
 
 dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单在上限内（≤256 条且序列化 ≤64 KiB）即放行进入 manifest-build 组合，显式 `["."]` 走现行 build 组合；只有超上限或 plan + 非空清单才拒绝，且都以 `validation` 返回（plan + 非空清单此前由 daemon 侧报 `agent_unsupported`，现由 core 以 `validation` 拒绝并同样不产生任务）；`agent_unsupported` 继续描述 dsh 的 edit/yolo 等未证明模式。
 
@@ -574,3 +576,5 @@ CLI `profile list`/`profile show` 与 daemon 的 JSON 身份判定在以下**手
 - profiles 目录路径含重复分隔符（`a//b`）时 CLI 展示字符串与 daemon 不同（`a//profiles` vs `a/profiles`），指向同一目录；
 - 可用名列表排序为 UTF-16 码元序，与 daemon 的字节序在增补平面字符与 BMP 混排时顺序不同（仅展示顺序）；
 - MCP 出口对 profile 错误消息无独立的 512 字节限制，保真上限为 RPC 响应帧上限（2 MiB）。
+
+同 workspace 的不同 actor 可以同时接纳与恢复；调用方分配协作范围，ES 不提供目录互斥。公开 observation 按受支持事件乐观解析，不校验 runtime 文件路径或 hash；没有事件时返回空观测，丢失/不兼容事件由 coverage 的完整性与 dropped_events 如实反映，实际调用错误按原错误合同返回。

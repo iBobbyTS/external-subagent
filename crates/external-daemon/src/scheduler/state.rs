@@ -341,8 +341,7 @@ impl Scheduler {
         factory: Arc<dyn RuntimeFactory>,
         config: SchedulerConfig,
     ) -> Result<Self, SchedulerError> {
-        if config.per_workspace_max_agents == 0
-            || config.bootstrap_timeout.is_zero()
+        if config.bootstrap_timeout.is_zero()
             || config.control_timeout.is_zero()
         {
             return Err(SchedulerError::InvalidConfig(
@@ -550,7 +549,7 @@ impl Scheduler {
     pub(crate) fn observation_snapshot(
         &self,
         agent_id: &str,
-    ) -> (observation::ObservationSnapshot, bool) {
+    ) -> observation::ObservationSnapshot {
         let activity = self
             .inner
             .state
@@ -560,10 +559,7 @@ impl Scheduler {
             .get(agent_id)
             .cloned();
         match activity {
-            Some(activity) => (
-                activity.observation_snapshot(),
-                activity.runtime_source_verified(),
-            ),
+            Some(activity) => activity.observation_snapshot(),
             None => {
                 // No activity means no captured history, even when the adapter
                 // has a public protocol. Never borrow a global runtime proof.
@@ -578,7 +574,7 @@ impl Scheduler {
                 {
                     snapshot.reasoning.source = observation::ReasoningSource::dsh();
                 }
-                (snapshot, false)
+                snapshot
             }
         }
     }

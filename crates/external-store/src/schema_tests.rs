@@ -208,7 +208,7 @@ fn v12_migration_preserves_records_and_lifecycle_across_reopen() {
     assert_eq!(version(&store.connection.lock().unwrap()), 14);
     assert_eq!(store.reserve_task_id().unwrap(), "10000002");
     // Exercise the store lifecycle consumed by spawn/wait/result after migration.
-    let claim = store.claim_next("daemon", 10, 1).unwrap().unwrap();
+    let claim = store.claim_next("daemon").unwrap().unwrap();
     assert_eq!(claim.task.session_id.as_deref(), Some("t_123"));
     assert!(store
         .mark_session_running("10000001", claim.owner_epoch, "runtime", None, None, None)

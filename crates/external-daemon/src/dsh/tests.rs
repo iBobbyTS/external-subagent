@@ -152,14 +152,13 @@ fn request_methods(frames: &[serde_json::Value]) -> Vec<&str> {
 // The scripted children speak real process I/O; under the parallel
 // workspace suite the default 2s windows are too tight, so the tests
 // budget generously (none of them asserts deadline behavior). The
-// per-workspace limit is the contract every provider shares: one agent
-// slot per workspace, no provider-private concurrency.
+// scheduler and lifecycle contract is shared across providers.
 fn scheduler_over(workspace: &std::path::Path, factory: Arc<dyn RuntimeFactory>) -> Scheduler {
     let store = Arc::new(external_store::Store::open(workspace.join("state.sqlite")).unwrap());
     let config = SchedulerConfig {
         bootstrap_timeout: Duration::from_secs(30),
         control_timeout: Duration::from_secs(10),
-        per_workspace_max_agents: 1,
+
         ..SchedulerConfig::default()
     };
     Scheduler::new("dsh-test", store, factory, config).unwrap()
@@ -556,7 +555,7 @@ printf '%s\\n' \
     assert_eq!(activity.window_60s.tool_calls_started, 1);
     // The daemon attaches the ACP rawInput to the started frame, so observe
     // sees the real arguments instead of the empty-input fallback.
-    let (observation, _) = scheduler.observation_snapshot(&agent_id);
+    let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(observation.tools[0].tool_name, "edit");
     assert_eq!(observation.tools[0].call_count, 1);
     assert_eq!(
@@ -1679,7 +1678,7 @@ fn cross_provider_shared_scheduler_contract() {
     );
 
     // The first provider (the fake zcode runtime, one active turn) is
-    // admitted and occupies the workspace's single agent slot.
+    // admitted and stays active in the shared workspace.
     let first = scheduler
         .enqueue_general(&manifest_for(
             workspace.path(),
@@ -1693,24 +1692,11 @@ fn cross_provider_shared_scheduler_contract() {
     assert_eq!(scheduler.active_count(), 1);
     assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
 
-    // While the workspace is occupied the second provider's admission is
-    // rejected with the workspace conflict naming the active agent;
-    // nothing is queued and no dsh provider process is spawned.
-    let conflict = scheduler
-        .enqueue_general_with_admission(
-            &manifest_for(workspace.path(), "second provider must wait"),
-            Some(dsh_admission(Some("fixture-provider:fixture-model"))),
-        )
-        .unwrap_err();
-    match &conflict {
-        SchedulerError::Store(external_store::StoreError::Conflict(message)) => {
-            assert_eq!(message, &format!("WORKSPACE_BUSY active_agent_id={first}"));
-        }
-        other => panic!("expected a workspace conflict, got {other:?}"),
-    }
-    assert!(!workspace.path().join("wire.jsonl").exists());
-    assert!(scheduler.start_ready().unwrap().is_empty());
-    assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
+    // A second provider is admitted while the first remains active.
+    let second = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:fixture-model"));
+    assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
+    let _request = await_pending_permission(&scheduler, &second);
+    assert_eq!(scheduler.active_count(), 2);
 
     // Cancelling the occupier terminalizes it exactly once and releases
     // the slot; the cancelled provider never revives.
@@ -1730,26 +1716,15 @@ fn cross_provider_shared_scheduler_contract() {
             .outcome,
         TaskOutcome::Cancelled
     );
+    // Cancelling one actor preserves the other actor's live turn.
     let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
-    while scheduler.active_count() != 0 {
-        assert!(Instant::now() < deadline, "occupier runtime was not reaped");
+    while scheduler.active_count() != 1 {
+        assert!(Instant::now() < deadline, "first runtime was not reaped");
         thread::sleep(Duration::from_millis(10));
     }
+    assert_eq!(scheduler.store().get_task(&second).unwrap().unwrap().phase, TaskPhase::WaitingInput);
     assert_eq!(scheduler.cancel_task(&first).unwrap(), TaskPhase::Terminal);
-    assert!(scheduler.start_ready().unwrap().is_empty());
     assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
-
-    // After release the same workspace admits the dsh provider for real:
-    // the scripted child performs the ACP bootstrap and blocks on the
-    // fixture permission, holding the slot the cancelled provider lost.
-    let second = enqueue_dsh(
-        &scheduler,
-        workspace.path(),
-        Some("fixture-provider:fixture-model"),
-    );
-    assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
-    let _request = await_pending_permission(&scheduler, &second);
-    assert_eq!(scheduler.active_count(), 1);
 
     // Cancelling the second provider reaps it without reviving either
     // provider: one cooperative session/cancel, both tasks terminal.
@@ -2294,7 +2269,7 @@ fn queued_only_drain_cannot_claim_activation_but_default_drain_can_start_admitte
     // durable production claim owner isolates this from provider setup.
     let claim = scheduler
         .store()
-        .claim_next("default-drain", 10, 1)
+        .claim_next("default-drain")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, id);
@@ -2458,7 +2433,7 @@ while [ ! -f test-release ]; do sleep 0.05; done
 #[test]
 fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
     use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-    let tracker = crate::PassiveActivityTracker::for_adapter("dsh", true);
+    let tracker = crate::PassiveActivityTracker::for_adapter("dsh");
     let update = parse_update(&serde_json::json!({
         "sessionId": "s1", "update": {
             "sessionUpdate": "tool_call", "toolCallId": "tool-7", "kind": "edit",
@@ -2521,7 +2496,7 @@ fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
     );
     let store = scheduler.store();
     let claim = store
-        .claim_next("terminal-dsh", usize::MAX, 1)
+        .claim_next("terminal-dsh")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, agent_id);

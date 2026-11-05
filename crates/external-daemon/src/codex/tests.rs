@@ -443,8 +443,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
     // The count-only tool descriptors now feed observe: each distinct call is
     // visible once with its detail wrapped in the argument object.
-    let (observation, verified) = scheduler.observation_snapshot(&agent_id);
-    assert!(!verified);
+    let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(
         observation
             .tools
@@ -489,7 +488,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 
 #[test]
 fn count_descriptor_feeds_observe_once_per_event_with_wrapped_detail() {
-    let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
+    let tracker = crate::PassiveActivityTracker::for_adapter("codex");
     let event = crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
         external_contract::WireMessage::Event(external_contract::EventEnvelope {
             method: "session/event".into(),
@@ -594,7 +593,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         "the same item id counts once per turn after the boundary clears the dedupe set"
     );
     // 计数去重按 turn 重置，observe 的调用身份同样按 turn 区分。
-    let (observation, _) = scheduler.observation_snapshot(&agent_id);
+    let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(observation.tools.len(), 1);
     assert_eq!(observation.tools[0].tool_name, "commandExecution");
     assert_eq!(observation.tools[0].call_count, 2);
@@ -1239,7 +1238,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         .unwrap();
     let store = scheduler.store();
     let claim = store
-        .claim_next("terminal-reject", usize::MAX, 1)
+        .claim_next("terminal-reject")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
@@ -1288,7 +1287,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         .unwrap();
     let store = scheduler.store();
     let claim = store
-        .claim_next("terminal-reject", usize::MAX, 1)
+        .claim_next("terminal-reject")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, cancelled.agent_id);
@@ -1328,7 +1327,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         .unwrap();
     let store = scheduler.store();
     let claim = store
-        .claim_next("terminal-reject", usize::MAX, 1)
+        .claim_next("terminal-reject")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, sessionless.agent_id);
@@ -1394,7 +1393,7 @@ fn terminal_send_requeues_a_zcode_task_with_a_persisted_session_id() {
         .unwrap();
     let store = scheduler.store();
     let claim = store
-        .claim_next("terminal-zcode", usize::MAX, 1)
+        .claim_next("terminal-zcode")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
@@ -2133,7 +2132,7 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
         .unwrap();
     let agent_id = submitted.agent_id.clone();
     let claim = store
-        .claim_next("orphan-owner", usize::MAX, 1)
+        .claim_next("orphan-owner")
         .unwrap()
         .unwrap();
     assert_eq!(claim.task.agent_id, agent_id);

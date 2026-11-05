@@ -182,7 +182,7 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
         if value.schema != OBSERVATION_SCHEMA
             || value.count_scope != "agent_lifetime"
             || value.reasoning.as_ref().is_some_and(|reasoning| {
-                !reasoning.source.is_verified_public() || reasoning.text.chars().count() > 200
+                !reasoning.source.is_supported_public() || reasoning.text.chars().count() > 200
             })
             || (value.reasoning.is_none() && value.coverage.reasoning_complete)
         {
@@ -897,7 +897,7 @@ mod observation_contract_tests {
                 .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for source in [
-            Some(ReasoningSource::verified()),
+            Some(ReasoningSource::zcode()),
             Some(ReasoningSource::dsh()),
             None,
         ] {
@@ -957,7 +957,7 @@ mod activity_projection_tests {
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
         assert!(value.get("last_tool_calls").is_none());
         assert!(value.get("latest_reasoning").is_none());
-        let tracker = crate::PassiveActivityTracker::for_adapter("codex", false);
+        let tracker = crate::PassiveActivityTracker::for_adapter("codex");
         for n in 0..4 {
             tracker.observe(&crate::RuntimeEvent::Driver(
                 external_runtime::Inbound::Message(external_contract::WireMessage::Event(

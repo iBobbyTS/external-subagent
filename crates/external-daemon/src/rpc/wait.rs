@@ -1203,7 +1203,7 @@ pub(crate) mod wait_tests {
             )
             .unwrap();
         let id = submitted.agent_id;
-        let claim = store.claim_next("version-wait-test", 10, 10).unwrap().unwrap();
+        let claim = store.claim_next("version-wait-test").unwrap().unwrap();
         store
             .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
             .unwrap();
@@ -1367,7 +1367,7 @@ pub(crate) mod wait_tests {
             })
             .unwrap();
         let id = submitted.agent_id;
-        let claim = store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        let claim = store.claim_next("wait-test").unwrap().unwrap();
         store
             .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
             .unwrap();
@@ -1579,7 +1579,7 @@ pub(crate) mod wait_tests {
             .store
             .insert_message("message-1", &id, "queue", "continue")
             .unwrap();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -1648,7 +1648,7 @@ pub(crate) mod wait_tests {
     #[test]
     fn terminal_wait_dedups_activity_tail_against_embedded_result() {
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker = Arc::new(crate::PassiveActivityTracker::new());
         tracker.set_wait_tail_fixture("我会按只读方式检查。HEAD 为 4cd6c57，总结……");
         service
             .scheduler
@@ -2744,7 +2744,7 @@ pub(crate) mod wait_tests {
             .store
             .requeue_task_for_resume_with_message(&id, "resume-detail", "queue", "continue")
             .unwrap());
-        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        let claim = service.store.claim_next("wait-test").unwrap().unwrap();
         service
             .store
             .mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None)
@@ -2808,7 +2808,7 @@ pub(crate) mod wait_tests {
                 .unwrap());
             let claim = writer_service
                 .store
-                .claim_next("wait-test", 10, 10)
+                .claim_next("wait-test")
                 .unwrap()
                 .unwrap();
             writer_service
@@ -3108,7 +3108,7 @@ pub(crate) mod wait_tests {
         // Timeout and actionable-wake exits over one tracker; the terminal exit
         // uses a second fixture because a pending request blocks completion.
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -3171,7 +3171,7 @@ pub(crate) mod wait_tests {
         // Terminal exit: a fresh fixture (a pending request blocks completion)
         // proves the terminal response also advances the cursor.
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -3215,7 +3215,7 @@ pub(crate) mod wait_tests {
         // Nothing appended is an empty tail, verified on the non-terminal path
         // (a second wait over the same tracker).
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -3266,8 +3266,8 @@ pub(crate) mod wait_tests {
     /// single-task fixture does.
     fn two_running_tasks() -> (tempfile::TempDir, Arc<RpcService>, String, String) {
         let (directory, service, id1) = fixture();
-        // A workspace admits one active task at a time, so the second task
-        // gets its own repository directory inside the same store.
+        // Use a separate repository to exercise multi-task projection across
+        // repository identities inside the same store.
         let second_repo = tempfile::Builder::new()
             .prefix("wait-second-")
             .tempdir_in(directory.path())
@@ -3284,7 +3284,7 @@ pub(crate) mod wait_tests {
             })
             .unwrap();
         let id2 = submitted.agent_id;
-        let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+        let claim = service.store.claim_next("wait-test").unwrap().unwrap();
         assert_eq!(claim.task.agent_id, id2, "the fixture's own task is already claimed");
         service
             .store
@@ -3484,7 +3484,7 @@ pub(crate) mod wait_tests {
                 })
                 .unwrap();
             let id = submitted.agent_id;
-            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            let claim = service.store.claim_next("wait-test").unwrap().unwrap();
             assert_eq!(claim.task.agent_id, id);
             service
                 .store
@@ -3593,7 +3593,7 @@ pub(crate) mod wait_tests {
         // Both agents have undelivered activity text. The interrupted
         // list-mode wait must leave the delivery cursors untouched, so a
         // later wait still sees the text.
-        let tracker1 = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker1 = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -3602,7 +3602,7 @@ pub(crate) mod wait_tests {
             .unwrap()
             .activities
             .insert(id1.clone(), tracker1.clone());
-        let tracker2 = Arc::new(crate::PassiveActivityTracker::new(true));
+        let tracker2 = Arc::new(crate::PassiveActivityTracker::new());
         service
             .scheduler
             .inner
@@ -3697,7 +3697,7 @@ pub(crate) mod wait_tests {
                             .unwrap();
                         let claim = service_arc
                             .store
-                            .claim_next("wait-test", 10, 10)
+                            .claim_next("wait-test")
                             .unwrap()
                             .unwrap();
                         assert_eq!(claim.task.agent_id, id1_clone);
@@ -3794,7 +3794,7 @@ pub(crate) mod wait_tests {
                 })
                 .unwrap();
             let id = submitted.agent_id;
-            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            let claim = service.store.claim_next("wait-test").unwrap().unwrap();
             assert_eq!(claim.task.agent_id, id);
             service
                 .store
@@ -3878,7 +3878,7 @@ pub(crate) mod wait_tests {
                 })
                 .unwrap();
             let id = submitted.agent_id;
-            let claim = service.store.claim_next("wait-test", 10, 10).unwrap().unwrap();
+            let claim = service.store.claim_next("wait-test").unwrap().unwrap();
             assert_eq!(claim.task.agent_id, id);
             service
                 .store
@@ -3906,7 +3906,7 @@ pub(crate) mod wait_tests {
         let trackers: Vec<_> = ids
             .iter()
             .map(|id| {
-                let tracker = Arc::new(crate::PassiveActivityTracker::new(true));
+                let tracker = Arc::new(crate::PassiveActivityTracker::new());
                 service
                     .scheduler
                     .inner

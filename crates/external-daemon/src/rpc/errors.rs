@@ -156,14 +156,6 @@ pub(super) fn map_store(error: StoreError) -> RpcError {
         StoreError::Sqlite(_) => {
             RpcError::new(RpcErrorCode::Persistence, "durable store operation failed")
         }
-        StoreError::Conflict(message) if message.starts_with("WORKSPACE_BUSY") => {
-            let active_agent_id = message
-                .strip_prefix("WORKSPACE_BUSY active_agent_id=")
-                .map(str::to_owned);
-            let mut error = RpcError::new(RpcErrorCode::Conflict, "WORKSPACE_BUSY");
-            error.active_agent_id = active_agent_id;
-            error
-        }
         StoreError::Conflict(message)
             if message == "message id is already bound to different content"
                 || message == "MESSAGE_ID_CONFLICT"
