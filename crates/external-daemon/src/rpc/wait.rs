@@ -10,10 +10,11 @@ use super::types::{
 };
 use super::views::{
     pending_request_view, task_activity_view, task_header_view, truncate_at_char_boundary,
-    MessageReceiptView, MAX_QUESTION_SUMMARY_BYTES,
+    MessageReceiptView, PendingRequestView, MAX_QUESTION_SUMMARY_BYTES,
 };
 use crate::scheduler::shrink_persistable_record;
-use external_store::{PendingRequestState, TaskPhase};
+use crate::PassiveActivitySnapshot;
+use external_store::{PendingRequestState, StoredTaskResult, TaskPhase, TaskRecord};
 use std::{
     thread,
     time::{Duration, Instant},
@@ -32,7 +33,7 @@ use crate::{Scheduler, SchedulerError};
 #[cfg(test)]
 use external_core::GeneralTaskManifest;
 #[cfg(test)]
-use external_store::{Store, TaskOutcome, TaskRecord};
+use external_store::{Store, TaskOutcome};
 #[cfg(test)]
 use std::path::Path;
 #[cfg(test)]
@@ -85,64 +86,28 @@ impl RpcService {
             // wait; only ordinary progress, message receipts, and records the
             // caller cannot act on (already responded, unsupported kinds)
             // keep it blocked.
-            let all_pending = self
-                .store
-                .pending_requests(&task.agent_id)
-                .map_err(map_store)?;
-            let actionable: Vec<_> = all_pending
-                .iter()
-                .filter(|request| wake_pending_request(request))
-                .cloned()
-                .collect();
-            let wake_request = actionable.first().cloned();
-            // The projection carries only actionable records and is capped;
-            // the wake target is the first actionable record, so it is always
-            // part of the returned projection.
-            let pending_requests = actionable
-                .iter()
-                .take(MAX_PENDING_REQUESTS)
-                .cloned()
-                .map(pending_request_view)
-                .collect::<Vec<_>>();
-            let wake_respondable = wake_request.is_some();
+            let (pending_requests, wake_respondable) =
+                self.pending_wait_projection(&task.agent_id)?;
             let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
             let terminal = task.phase == TaskPhase::Terminal;
             let now = Instant::now();
             if wake_respondable || terminal || now >= deadline {
                 let timed_out = !wake_respondable && !terminal && now >= deadline;
-                let result_page = stored_result
-                    .filter(|_| terminal)
-                    .map(|stored| {
-                        let failure_message = failure_message_projection(&task, &stored);
-                        self.task_result_view(
-                            stored,
-                            0,
-                            MAX_RESULT_CHUNK_BYTES,
-                            reason,
-                            failure_message,
-                        )
-                    })
-                    .transpose()?;
-                let mut activity = task_activity_view(task.phase, activity);
-                // Take-on-delivery: only bytes appended since the previous
-                // wait are shipped, and the cursor advances in the same lock.
-                // The take happens here, at the single response construction
-                // point, never mid-loop.
-                if let Some(wait_tail) = self.scheduler.take_wait_tail(&task.agent_id) {
-                    activity.latest_text_tail = wait_tail.text;
-                    activity.latest_text_truncated = wait_tail.truncated;
-                }
-                if let Some(page) = result_page.as_ref() {
-                    dedup_terminal_tail(&mut activity.latest_text_tail, &page.final_text);
-                }
-                let mut response = RpcSuccess::TaskWait(TaskWaitBody {
-                    activity,
-                    task: task_header_view(&task),
+                // Take-on-delivery happens inside the projection, at the
+                // single response construction point, never mid-loop: only
+                // bytes appended since the previous wait are shipped and the
+                // cursor advances before the frame is bounded.
+                let body = self.wait_body_projection(
+                    &task,
                     pending_requests,
-                    result: result_page,
-                    timed_out,
+                    stored_result,
+                    reason,
                     message_receipt,
-                });
+                    timed_out,
+                    activity,
+                    WaitTailDelivery::Take,
+                )?;
+                let mut response = RpcSuccess::TaskWait(body);
                 bound_wait_result(&mut response)?;
                 return Ok(response);
             }
@@ -374,23 +339,15 @@ impl RpcService {
                 }
                 // The response is now certain to be delivered: commit each
                 // agent's activity-text delivery cursor and apply the
-                // terminal-tail dedup in the same pass (mirrors the scalar
-                // wait's take-on-delivery semantics; peeked text is
-                // overwritten by the taken text, which is at least as
-                // fresh). The cursors may have advanced past what the
-                // response body carries only in the rolled-out-window
-                // degradation case, which the tracker itself flags.
+                // terminal-tail dedup. The shared take-on-delivery helper is
+                // the same implementation the scalar wait runs before
+                // bounding; here it runs only after the whole frame fits, so
+                // an oversized return leaves every cursor untouched.
                 let RpcSuccess::TaskWaitMany { waits } = &mut response else {
                     unreachable!("response kind was just constructed");
                 };
                 for (id, body) in waits.bodies.iter_mut() {
-                    if let Some(wait_tail) = self.scheduler.take_wait_tail(id) {
-                        body.activity.latest_text_tail = wait_tail.text;
-                        body.activity.latest_text_truncated = wait_tail.truncated;
-                    }
-                    if let Some(page) = body.result.as_ref() {
-                        dedup_terminal_tail(&mut body.activity.latest_text_tail, &page.final_text);
-                    }
+                    self.deliver_wait_tail(id, body);
                 }
                 return Ok(response);
             }
@@ -418,58 +375,127 @@ impl RpcService {
         force: bool,
     ) -> Result<Option<(TaskWaitBody, bool, bool, u64)>, RpcError> {
         let (task, stored_result, reason) = self.require_task_with_result(agent_id)?;
-        let all_pending = self
-            .store
-            .pending_requests(&task.agent_id)
-            .map_err(map_store)?;
-        let actionable: Vec<_> = all_pending
-            .iter()
-            .filter(|request| wake_pending_request(request))
-            .cloned()
-            .collect();
-        let pending_requests = actionable
-            .iter()
-            .take(MAX_PENDING_REQUESTS)
-            .cloned()
-            .map(pending_request_view)
-            .collect::<Vec<_>>();
-        let actionable_now = !actionable.is_empty();
+        let (pending_requests, actionable_now) =
+            self.pending_wait_projection(&task.agent_id)?;
         let activity = self.scheduler.passive_activity_snapshot(&task.agent_id);
         let terminal = task.phase == TaskPhase::Terminal;
         if !terminal && !actionable_now && !force {
             return Ok(None);
         }
+        let body = self.wait_body_projection(
+            &task,
+            pending_requests,
+            stored_result,
+            reason,
+            None,  // list-mode bodies never carry a message receipt
+            false, // timed_out is finalized by the caller at construction
+            activity,
+            WaitTailDelivery::Peek,
+        )?;
+        Ok(Some((body, actionable_now, terminal, task.owner_epoch)))
+    }
+
+    /// The single projection of one wait body: the result page (with its
+    /// failure-detail projection), the activity view, and the activity tail.
+    /// Both wait modes build their bodies here. Only the tail delivery point
+    /// differs: the scalar wait TAKES its tail here (the cursor advances
+    /// before the frame is bounded), while the list wait PEEKS here and lets
+    /// the caller commit with [`Self::deliver_wait_tail`] once the whole
+    /// frame fits.
+    fn wait_body_projection(
+        &self,
+        task: &TaskRecord,
+        pending_requests: Vec<PendingRequestView>,
+        stored_result: Option<StoredTaskResult>,
+        reason: Option<String>,
+        message_receipt: Option<MessageReceiptView>,
+        timed_out: bool,
+        activity: Option<PassiveActivitySnapshot>,
+        tail_delivery: WaitTailDelivery,
+    ) -> Result<TaskWaitBody, RpcError> {
+        let terminal = task.phase == TaskPhase::Terminal;
         let result_page = stored_result
             .filter(|_| terminal)
             .map(|stored| {
-                let failure_message = failure_message_projection(&task, &stored);
+                let failure_message = failure_message_projection(task, &stored);
                 self.task_result_view(stored, 0, MAX_RESULT_CHUNK_BYTES, reason, failure_message)
             })
             .transpose()?;
-        let mut activity = task_activity_view(task.phase, activity);
-        // PEEK only: the delivery cursor stays untouched so an interrupted
-        // list-mode wait loses nothing; the response-construction point in
-        // task_wait_many performs the take (and terminal-tail dedup).
-        if let Some(wait_tail) = self.scheduler.peek_wait_tail(&task.agent_id) {
-            activity.latest_text_tail = wait_tail.text;
-            activity.latest_text_truncated = wait_tail.truncated;
+        let mut body = TaskWaitBody {
+            activity: task_activity_view(task.phase, activity),
+            task: task_header_view(task),
+            pending_requests,
+            result: result_page,
+            timed_out,
+            message_receipt,
+        };
+        match tail_delivery {
+            WaitTailDelivery::Take => self.deliver_wait_tail(&task.agent_id, &mut body),
+            WaitTailDelivery::Peek => {
+                // PEEK only: the delivery cursor stays untouched so an
+                // interrupted list-mode wait loses nothing.
+                if let Some(wait_tail) = self.scheduler.peek_wait_tail(&task.agent_id) {
+                    body.activity.latest_text_tail = wait_tail.text;
+                    body.activity.latest_text_truncated = wait_tail.truncated;
+                }
+            }
         }
-        Ok(Some((
-            TaskWaitBody {
-                activity,
-                task: task_header_view(&task),
-                pending_requests,
-                result: result_page,
-                // The timed_out flag is finalized by the caller at response
-                // construction; snapshots here never claim it.
-                timed_out: false,
-                message_receipt: None,
-            },
-            actionable_now,
-            terminal,
-            task.owner_epoch,
-        )))
+        Ok(body)
     }
+
+    /// The capped actionable-pending projection shared by both wait modes.
+    /// The wake decision scans the real pending owner, so an actionable
+    /// request beyond the 100-record output projection still wakes the wait;
+    /// only ordinary progress, message receipts, and records the caller
+    /// cannot act on (already responded, unsupported kinds) keep it blocked.
+    /// The projection carries only actionable records and is capped; the wake
+    /// target is the first actionable record, so it is always part of it.
+    /// Returns the projected requests and whether the wait should wake.
+    fn pending_wait_projection(
+        &self,
+        agent_id: &str,
+    ) -> Result<(Vec<PendingRequestView>, bool), RpcError> {
+        let all_pending = self.store.pending_requests(agent_id).map_err(map_store)?;
+        let actionable: Vec<_> = all_pending
+            .iter()
+            .filter(|request| wake_pending_request(request))
+            .cloned()
+            .collect();
+        let respondable = !actionable.is_empty();
+        let pending_requests = actionable
+            .iter()
+            .take(MAX_PENDING_REQUESTS)
+            .cloned()
+            .map(pending_request_view)
+            .collect();
+        Ok((pending_requests, respondable))
+    }
+
+    /// Take-on-delivery: ship only the bytes appended since the previous
+    /// wait (the cursor advances in the same lock), then strip a tail that
+    /// repeats the final-result page so the same text is not delivered twice.
+    /// This is the single take/dedup implementation behind both wait modes:
+    /// the scalar wait runs it inside its projection before bounding, the list
+    /// wait runs it per body only after the frame fits. The cursor may have
+    /// advanced past what the response body carries in the rolled-out-window
+    /// degradation case, which the tracker itself flags.
+    fn deliver_wait_tail(&self, agent_id: &str, body: &mut TaskWaitBody) {
+        if let Some(wait_tail) = self.scheduler.take_wait_tail(agent_id) {
+            body.activity.latest_text_tail = wait_tail.text;
+            body.activity.latest_text_truncated = wait_tail.truncated;
+        }
+        if let Some(page) = body.result.as_ref() {
+            dedup_terminal_tail(&mut body.activity.latest_text_tail, &page.final_text);
+        }
+    }
+}
+
+/// Whether a wait body delivery advances the activity-text cursor now
+/// (scalar wait / list commit pass) or only reads it (list snapshot).
+#[derive(Clone, Copy)]
+enum WaitTailDelivery {
+    Take,
+    Peek,
 }
 
 /// The terminal wait embeds the final-result page next to the activity tail;
@@ -514,7 +540,46 @@ fn bound_wait_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
     })
 }
 
-/// The staged single-body degradation shared by scalar and list waits.
+/// Degradation stages 1-2 shared by the scalar and list waits: re-shrink the
+/// structured failure detail first (field-level, so it stays parseable with a
+/// latest-suffix tail), then fall back to bounded prefixes for embedded
+/// questions so actionable request_ids stay reachable. Every applied shrink
+/// stays in `body`; the return reports whether the envelope measured by
+/// `fits` now fits. The caller owns stage 3 and the commit decision: the
+/// scalar wait commits only a fitting candidate, the list wait keeps the
+/// best-effort shrink for its cooperative pass.
+fn shrink_structured_wait_fields(
+    body: &mut TaskWaitBody,
+    fits: &dyn Fn(&TaskWaitBody) -> Result<bool, RpcError>,
+) -> Result<bool, RpcError> {
+    if fits(body)? {
+        return Ok(true);
+    }
+    // 1. Failure detail only: the result page, its cursor, and the questions
+    //    stay byte-identical.
+    if let Some(view) = body.result.as_ref() {
+        if let Some(original) = view.failure_message.clone() {
+            let fitted = fit_failure_message(body, &original, fits);
+            if let Some(view) = body.result.as_mut() {
+                view.failure_message = Some(fitted);
+            }
+        }
+    }
+    if fits(body)? {
+        return Ok(true);
+    }
+    // 2. Embedded questions (existing bounded-prefix contract).
+    for request in &mut body.pending_requests {
+        if let Some(question) = request.question.as_mut() {
+            let full = std::mem::take(&mut question.text);
+            question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
+            question.truncated |= question.text.len() < full.len();
+        }
+    }
+    fits(body)
+}
+
+/// The staged single-body degradation used by the scalar wait.
 /// `fits` measures the complete envelope this body will be embedded in.
 fn bound_wait_body(
     body: &mut TaskWaitBody,
@@ -524,29 +589,7 @@ fn bound_wait_body(
         return Ok(());
     }
     let mut candidate = body.clone();
-    // 1. Failure detail only: the result page, its cursor, and the questions
-    //    stay byte-identical.
-    if let Some(view) = candidate.result.as_ref() {
-        if let Some(original) = view.failure_message.clone() {
-            let fitted = fit_failure_message(&candidate, &original, fits);
-            if let Some(view) = candidate.result.as_mut() {
-                view.failure_message = Some(fitted);
-            }
-        }
-    }
-    if fits(&candidate)? {
-        *body = candidate;
-        return Ok(());
-    }
-    // 2. Embedded questions (existing bounded-prefix contract).
-    for request in &mut candidate.pending_requests {
-        if let Some(question) = request.question.as_mut() {
-            let full = std::mem::take(&mut question.text);
-            question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
-            question.truncated |= question.text.len() < full.len();
-        }
-    }
-    if fits(&candidate)? {
+    if shrink_structured_wait_fields(&mut candidate, fits)? {
         *body = candidate;
         return Ok(());
     }
@@ -611,38 +654,15 @@ fn bound_wait_many_result(response: &mut RpcSuccess) -> Result<(), RpcError> {
     }
     // Stage 1+2 per body, best-effort: apply the structured shrinks when
     // they help the shared envelope, but never abort — the next body's
-    // shrink may be the one that makes the frame fit.
+    // shrink may be the one that makes the frame fit. The shrunk candidate
+    // is kept regardless (best-effort); the verdict comes after every body
+    // had its chance.
     for index in 0..waits.bodies.len() {
         let mut candidate = waits.bodies[index].1.clone();
         let fits = |candidate: &TaskWaitBody| -> Result<bool, RpcError> {
             fits_all(&probe_with(index, candidate, &waits.bodies))
         };
-        if fits(&candidate)? {
-            continue;
-        }
-        // 1. Failure detail only.
-        if let Some(view) = candidate.result.as_ref() {
-            if let Some(original) = view.failure_message.clone() {
-                let fitted = fit_failure_message(&candidate, &original, &fits);
-                if let Some(view) = candidate.result.as_mut() {
-                    view.failure_message = Some(fitted);
-                }
-            }
-        }
-        if fits(&candidate)? {
-            waits.bodies[index].1 = candidate;
-            continue;
-        }
-        // 2. Embedded questions (bounded-prefix contract).
-        for request in &mut candidate.pending_requests {
-            if let Some(question) = request.question.as_mut() {
-                let full = std::mem::take(&mut question.text);
-                question.text = truncate_at_char_boundary(&full, MAX_QUESTION_SUMMARY_BYTES);
-                question.truncated |= question.text.len() < full.len();
-            }
-        }
-        // Best-effort: keep the shrunk candidate regardless; the verdict
-        // comes after every body had its chance.
+        shrink_structured_wait_fields(&mut candidate, &fits)?;
         waits.bodies[index].1 = candidate;
     }
     if fits_all(&waits.bodies)? {
