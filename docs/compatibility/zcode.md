@@ -30,18 +30,19 @@ from inside that sandbox), and official plugins run their MCP servers
 through the app-signed `ZCode Helper` executing node scripts.
 
 Consequence: the zcode binding must not point `command` at the native
-facade. `install-plugin zcode` pins the **installing node
-(`process.execPath`) running the staged
-`scripts/mcp-stdio-bridge.mjs`** — a node reimplementation of the native
-facade's stdio↔`.mcp`-socket byte pipe (`crates/external-mcp`), with the
-same `EXTERNAL_SUBAGENT_SOCKET` → sibling `.mcp` endpoint resolution and
-either-side-EOF exit semantics. The pinned path follows the
-installing interpreter (e.g. a Homebrew Cellar path); `update`/`reconcile`
-re-stage the binding with the current interpreter, and a prior binding
-pinned to a since-replaced interpreter path refreshes in place — the
-staged-bridge args living inside the product-owned staging prove ownership
-— instead of failing with `PLUGIN_STAGING_CONFLICT`. The native facade
-remains the codex-host entry point, where spawns are unrestricted.
+facade. `install-plugin zcode` uses an absolute executable alias resolving to
+the installing Node when available (for example `/opt/homebrew/bin/node`),
+preserving that alias rather than a versioned Cellar realpath. Without a matching
+alias, it retains `process.execPath`; it does not depend on the GUI PATH or choose
+a different interpreter. Node runs the staged `scripts/mcp-stdio-bridge.mjs`,
+which preserves the native facade's stdio↔`.mcp` socket piping,
+`EXTERNAL_SUBAGENT_SOCKET` endpoint resolution and either-side-EOF semantics.
+
+`update`/`reconcile` refresh the binding with the current interpreter. Reconcile
+after replacing an interpreter that has no stable alias; prior versioned paths
+also refresh in place. The staged bridge args inside product-owned staging prove
+ownership, so an interpreter path change is not `PLUGIN_STAGING_CONFLICT`.
+The native facade remains the codex-host entry point.
 
 A staging tree carrying the earlier native-command binding from this
 product is likewise treated as refreshable (not a conflict) and is
@@ -322,13 +323,3 @@ context completes initialize → tools/list (all ten tools) → a real
 终态任务经 resume 接续：scheduler 对带持久化 session id 的终态任务 requeue，claim 起新 app-server 进程走 `session/resume` + `session/subscribe`，排队消息是唯一下一轮触发，中断前的 turn 不重放；resume 的会话模型粘性沿用（不重读不重设）。上游能力 live 验证（2026-10-29，ZCode 3.17.1 / glm runtime，直连双进程探测）：SIGKILL 回收后新进程 resume 同一 sessionId，快照含完整历史，send 后 turn.completed 答出首进程埋下的暗号；探测日志见 `.agent-work/tmp/zcode-send-after-end/probe-cold-resume.log`。同轮次实测补充：3.17.x 的 `session/setModel` 对推理模型强制 `options.reasoningLevel`（缺失报 "Reasoning level is required"），daemon 无 effort 时以 catalog `defaultLevel` 补齐的既有行为与之兼容。
 
 接入新 subagent 时原生 mid-turn 投递优先于 es 暂存，es 暂存是文档化的标准兜底。queued 仅表示 es 暂存；原生直写／注入完成即 delivered，执行结果仍由 wait/result 查询。同 message_id、同 mode、同 content 重试幂等，改变任一绑定字段会冲突。
-
-
-### Node binding maintenance
-
-The managed MCP bridge uses an absolute executable alias resolving to the installing
-Node when available (for example `/opt/homebrew/bin/node`), preserving that alias
-rather than a versioned Cellar realpath. It does not depend on the GUI PATH or pick
-a different interpreter. Without a matching alias, it retains the installing path.
-Reconcile the ZCode binding after replacing an interpreter that has no stable alias;
-reconciliation also refreshes previously installed versioned paths.

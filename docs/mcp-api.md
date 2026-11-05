@@ -231,7 +231,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 普通进度、消息回执、已响应记录和不可操作类型不提前唤醒。权限请求与用户问题对所有调用方都是可操作的：没有能力握手参数，出现即唤醒。终态结果同样构成提前返回条件。`pending_requests` 投影只含可操作记录、最多 100 条，但唤醒判断扫描完整 pending 集合。取消本次 MCP 等待不等于取消持久任务；取消任务应调用 cancel。
 
-调用方读取完整输出后，按 `outcome` 区分成功与失败；`final_text` 是报告文本，`failure_message` 是失败诊断。失败时先判断原因再决定继续原任务、重试或请求用户输入，不能把额度/鉴权失败立即排回同一路由。不得在 wrapper 中裁剪诊断或只保留结果开头。
+调用方读取完整输出后，按 `outcome` 区分成功与失败；`final_text` 是成功报告或原生失败错误正文，`failure_message` 是有界 ES 诊断。失败时先判断原因再决定继续原任务、重试或请求用户输入，不能把额度/鉴权失败立即排回同一路由。不得在 wrapper 中裁剪诊断或只保留结果开头。
 
 ### 6.2 输出
 
@@ -250,7 +250,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 
 **停滞判断归 host：**daemon 不再做任何自动停滞判定：RUNNING 任务只由封闭集合中的真实来源终态化——自然完成、已发布 runtime 终态、显式 cancel/close、transport frame-limit 故障、lifecycle sink 失败、消息投递或控制响应失败、cancelling drain 与 graceful shutdown、以及 daemon 重启对持久 active 行的收敛。因此一个挂起的任务（例如某条工具调用一直不返回）会一直占用其容量槽位，直到 host 调用 cancel/close、执行显式 cancelling drain，或 daemon graceful shutdown。**注意：普通 drain（cancel_active 默认 false）不取消活跃任务，可能无限等待。** 新执行不再产生 `STALLED_NO_ACTIVITY` reason code；历史持久化的该 reason 仍照常透传（例如 `result.failure_message` 与 `reason_code`）。host 通过 status（RUNNING⇒进程活着）加上本节的 activity 观测（`in_flight_tool_count`/`oldest_in_flight_tool_age_ms` 是否仍有已跟踪调用未返回）自行决定是否 cancel；需要查看最近跑的是哪条指令或调用参数时，调用 observe。in-flight 只证明 subagent 尚未发出该调用的 result 事件，不证明命令子进程在推进；es 不传递工具输出、不探测子进程。
 
-原生 `turn.failed` 提供的公开错误摘要保留到 `failure_message`：`message` 优先包含底层原因，`cause_code`、`retryable`、`status_code` 仅在原生事件确实提供时出现；`cleanup_result` 单独说明进程清理结果。ES 不据此自动重试任务，也不把退出码当作原始原因。原始事件的 stack、data、headers 不进入新增的错误摘要。
+原生 `turn.failed` 的错误在 `final_text` 中以 JSON 完整交付，仅脱敏凭据；原始字段、错误链、stack、detail、非敏感 data 和文本换行保留，不摘要改写。长错误沿既有 `next_offset` 分页读取至 null。`failure_message` 保留有界 ES 诊断和 `cleanup_result`，不能替代原始错误。当前 turn 已提供的错误不会因进程自行退出或清理结果而丢失；`cause_code`、`retryable`、`status_code` 只投影原生提供的值。ES 不据此自动重试任务，也不把退出码当作原始原因。
 
 ## 7. external_subagent_observe
 
@@ -439,7 +439,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | 结构／字段 | 类型 | 什么时候用、为什么有 | 移除影响 |
 |---|---|---|---|
 | Result.`outcome` | Outcome | 独立消费结果页时判断任务成功与否 | 需依赖外层 task；属于随结果携带的冗余上下文 |
-| Result.`final_text` | string | 当前页结果正文 | 没有结果内容 |
+| Result.`final_text` | string | 当前页结果正文；原生 turn 失败时为完整脱敏错误 JSON 的当前页 | 没有报告或原始错误内容 |
 | Result.`partial` | boolean | 标识任务产物本身是否不完整 | 可能把中断后的片段当完整任务产物 |
 | Question.`text` | string | 问题正文（完整内嵌，最多16KiB） | 无法作出有上下文的回答 |
 | Question.`truncated` | boolean | 标识问题是否超出内嵌上限 | 易把截断问题当完整题目 |

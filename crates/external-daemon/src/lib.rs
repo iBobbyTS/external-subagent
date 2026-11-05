@@ -1526,6 +1526,10 @@ fn spawn_event_pump(
                 let terminal = match &event {
                     Inbound::ChildExited(exit) => {
                         match observe_process_group(driver.identity().pgid) {
+                            Ok(members) if members.is_empty()
+                                && turn_tracker.snapshot().boundary == Some(TurnBoundary::Failed) => {
+                                Some(RuntimeTerminal::FailedTurn(StopOutcome::AlreadyExited(exit.clone())))
+                            }
                             Ok(members) if members.is_empty() => match exit {
                                 ChildExit::Exited(Some(0)) => {
                                     let turn = turn_tracker.snapshot();

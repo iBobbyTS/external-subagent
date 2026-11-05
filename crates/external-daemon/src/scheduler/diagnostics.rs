@@ -89,7 +89,7 @@ fn runtime_diagnostic(runtime: Option<&dyn ManagedRuntime>) -> (Option<String>, 
     (
         runtime.and_then(ManagedRuntime::diagnostic_session_id),
         runtime
-            .map(ManagedRuntime::diagnostic_tail)
+            .map(|runtime| redact_error_text(&runtime.diagnostic_tail()))
             .unwrap_or_default(),
     )
 }
@@ -595,47 +595,70 @@ impl Write for RotatingDiagnosticWriter {
     }
 }
 
-/// Consume only the public error summary, never data, stack, headers or raw frames.
-/// ZCode supplies ErrorPayload; other adapters supply a canonical reason_code.
+/// Retain the native error unchanged except for credential redaction. The full
+/// value is delivered through the existing paged result; diagnostic metadata may
+/// be bounded independently without destroying the original error.
 pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_json::Value> {
     let payload = params.get("payload")?;
-    let error = payload.get("error");
-    let message = error.and_then(|e| e.get("message")).and_then(serde_json::Value::as_str)
-        .or_else(|| error.and_then(serde_json::Value::as_str))
-        .or_else(|| payload.get("reason_code").and_then(serde_json::Value::as_str));
-    let underlying = error.and_then(|e| e.get("underlyingErrorMessage"))
-        .and_then(serde_json::Value::as_str);
-    let text = match (underlying, message) {
-        (Some(cause), Some(summary)) if cause != summary =>
-            format!("{}; {}", public_failure_text(cause), public_failure_text(summary)),
-        (Some(text), _) | (_, Some(text)) => public_failure_text(text),
-        _ => return None,
-    };
-    let mut detail = serde_json::json!({"message": bounded_error(&text)});
-    if let Some(error) = error {
-        let attribution = error.get("attribution").unwrap_or(&serde_json::Value::Null);
-        if let Some(code) = attribution.get("providerErrorCode").or_else(|| error.get("code"))
-            .and_then(serde_json::Value::as_str) {
-            detail["cause_code"] = public_failure_text(code).into();
-        }
-        if let Some(retryable) = attribution.get("retryable").or_else(|| error.get("retryable"))
-            .and_then(serde_json::Value::as_bool) {
-            detail["retryable"] = retryable.into();
-        }
-        if let Some(status) = attribution.get("statusCode").and_then(serde_json::Value::as_u64) {
-            detail["status_code"] = status.into();
-        }
+    let original = payload.get("error").filter(|v| !v.is_null())
+        .or_else(|| payload.get("reason_code"))?;
+    let original = redact_native_error(original);
+    let message = original.get("message").and_then(serde_json::Value::as_str)
+        .or_else(|| original.as_str()).unwrap_or("turn.failed");
+    let mut detail = serde_json::json!({"message": message});
+    let attribution = original.get("attribution").unwrap_or(&serde_json::Value::Null);
+    if let Some(code) = attribution.get("providerErrorCode").or_else(|| original.get("code"))
+        .and_then(serde_json::Value::as_str) {
+        detail["cause_code"] = code.into();
     }
+    if let Some(retryable) = attribution.get("retryable").or_else(|| original.get("retryable"))
+        .and_then(serde_json::Value::as_bool) {
+        detail["retryable"] = retryable.into();
+    }
+    if let Some(status) = attribution.get("statusCode").and_then(serde_json::Value::as_u64) {
+        detail["status_code"] = status.into();
+    }
+    detail["original_error"] = original;
     Some(detail)
 }
 
-fn public_failure_text(text: &str) -> String {
-    static SENSITIVE: OnceLock<regex::Regex> = OnceLock::new();
-    let redactor = SENSITIVE.get_or_init(|| regex::Regex::new(
-        r#"(?i)(?:bearer\s+[^\s,;]+|(?:authorization|api[_-]?key|access[_-]?token|password|(?:set-)?cookie)\s*[:=]\s*[^\s,;]+)"#
-    ).expect("failure redaction regex"));
-    let clean = redactor.replace_all(text, "[REDACTED]");
-    bounded_prefix(&clean.split_whitespace().collect::<Vec<_>>().join(" "), 2048)
+fn sensitive_error_key(key: &str) -> bool {
+    let key: String = key.chars().filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase).collect();
+    matches!(key.as_str(), "authorization" | "proxyauthorization" | "cookie" | "setcookie"
+        | "apikey" | "xapikey" | "accesstoken" | "refreshtoken" | "idtoken" | "token"
+        | "password" | "passwd" | "secret" | "clientsecret" | "privatekey")
+}
+
+fn redact_native_error(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter().map(|(key, value)| {
+            (key.clone(), if sensitive_error_key(key) && !value.is_null() && value.as_str() != Some("") { "[REDACTED]".into() } else { redact_native_error(value) })
+        }).collect()),
+        serde_json::Value::Array(values) => values.iter().map(redact_native_error).collect(),
+        serde_json::Value::String(text) => redact_error_text(text).into(),
+        other => other.clone(),
+    }
+}
+
+fn redact_error_text(text: &str) -> String {
+    static PATTERNS: OnceLock<[regex::Regex; 4]> = OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| [
+        regex::Regex::new(r#"(?i)((?:bearer|basic)[ \t]+)[^\s,;"']+"#).unwrap(),
+        regex::Regex::new(r#"(?i)(["']?(?:authorization|proxy-authorization|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|client[_-]?secret|secret|private[_-]?key|(?:set-)?cookie)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&]+)"#).unwrap(),
+        regex::Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@"#).unwrap(),
+        regex::Regex::new(r#"(?im)^([ \t]*(?:authorization|proxy-authorization|cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*"#).unwrap(),
+    ]);
+    let clean = patterns[3].replace_all(text, "${1}[REDACTED]");
+    let clean = patterns[0].replace_all(&clean, "${1}[REDACTED]");
+    let clean = patterns[1].replace_all(&clean, |captures: &regex::Captures<'_>| {
+        let value = &captures[2];
+        let masked = if value.starts_with('"') { "\"[REDACTED]\"" }
+            else if value.starts_with('\'') { "'[REDACTED]'" }
+            else { "[REDACTED]" };
+        format!("{}{}", &captures[1], masked)
+    });
+    patterns[2].replace_all(&clean, "${1}[REDACTED]@").into_owned()
 }
 
 #[cfg(test)]
@@ -643,32 +666,49 @@ mod public_failure_tests {
     use super::*;
 
     #[test]
-    fn public_turn_failure_keeps_cause_and_retryability_without_raw_details() {
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"error":{
-            "message":"Model request failed.", "underlyingErrorMessage":"read EADDRNOTAVAIL",
-            "code":"model_request_failed", "attribution":{"retryable":false},
-            "data":{"apiKey":"private-data"}, "stack":"private-stack",
-            "detail":"private-detail", "underlyingErrorDetail":"private-underlying-detail"
-        }}})).unwrap();
-        assert_eq!(detail["message"], "read EADDRNOTAVAIL; Model request failed.");
+    fn native_error_keeps_all_non_sensitive_fields_and_formatting() {
+        let original = serde_json::json!({
+            "message":"Model request failed.\n  Keep whitespace\tand details.",
+            "underlyingErrorMessage":"read EADDRNOTAVAIL", "code":"model_request_failed",
+            "attribution":{"retryable":false,"providerErrorCode":"1310","statusCode":429},
+            "data":{"apiKey":"private-data","retryAfter":109727},
+            "stack":"frame 1\n  frame 2", "detail":"detail stays", "underlyingErrorDetail":"root detail stays",
+            "futureField":[{"value":1},{"access_token":"private-token"}]
+        });
+        let detail = turn_failure_detail(&serde_json::json!({"payload":{"error":original}})).unwrap();
+        let mut expected = original;
+        expected["data"]["apiKey"] = "[REDACTED]".into();
+        expected["futureField"][1]["access_token"] = "[REDACTED]".into();
+        assert_eq!(detail["original_error"], expected);
+        assert_eq!(detail["message"], expected["message"]);
+        assert_eq!(detail["cause_code"], "1310");
+        assert_eq!(detail["status_code"], 429);
         assert_eq!(detail["retryable"], false);
-        assert!(!detail.to_string().contains("private-"));
-        let quota = turn_failure_detail(&serde_json::json!({"payload":{"error":{
-            "message":"Weekly/Monthly Limit Exhausted", "code":"model_request_failed",
-            "attribution":{"providerErrorCode":"1310","statusCode":429,"retryable":false}
-        }}})).unwrap();
-        assert_eq!(quota["cause_code"], "1310");
-        assert_eq!(quota["status_code"], 429);
-        assert_eq!(quota["retryable"], false);
     }
 
     #[test]
-    fn public_failure_text_redacts_credentials_and_omits_absent_evidence() {
-        assert_eq!(public_failure_text("failed Bearer private-token api_key=private-key"),
-            "failed [REDACTED] [REDACTED]");
+    fn native_error_text_is_not_shortened_or_rewritten() {
+        let text = format!("begin\n{}\nend", "信息 ".repeat(20000));
+        let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":text}})).unwrap();
+        assert_eq!(detail["original_error"], text);
         assert!(turn_failure_detail(&serde_json::json!({"payload":{}})).is_none());
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":"serverOverloaded: busy"}})).unwrap();
-        assert_eq!(detail["message"], "serverOverloaded: busy");
-        assert!(detail.get("retryable").is_none());
+    }
+
+    #[test]
+    fn native_error_redaction_covers_structured_and_text_credentials() {
+        for text in [r#"{"api_key":"private-key"}"#, "Authorization: Bearer private-key",
+            "Authorization: Basic private-key", "Cookie: a=private-key; b=private-key",
+            "cookie=private-key", "https://user:private-key@example.com/error",
+            "https://example.com?token=private-key&reason=network"] {
+            let redacted = redact_error_text(text);
+            assert!(!redacted.contains("private-key"), "{redacted}");
+        }
+        let embedded = redact_error_text(r#"{"api_key":"private-key","message":"keep"}"#);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&embedded).unwrap(),
+            serde_json::json!({"api_key":"[REDACTED]","message":"keep"}));
+        let empty = serde_json::json!({"apiKey":null,"access_token":""});
+        assert_eq!(redact_native_error(&empty), empty);
+        assert_eq!(redact_error_text("read EADDRNOTAVAIL\n  at socket (network.ts:3)"),
+            "read EADDRNOTAVAIL\n  at socket (network.ts:3)");
     }
 }

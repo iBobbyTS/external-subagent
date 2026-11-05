@@ -657,11 +657,88 @@ sleep 2
         assert_eq!(await_result(&scheduler, &agent_id).result.outcome, TaskOutcome::Failed);
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         let detail: serde_json::Value = serde_json::from_str(task.failure_message.as_ref().unwrap()).unwrap();
-        assert!(detail["message"].as_str().unwrap().starts_with("read EADDRNOTAVAIL"));
+        assert_eq!(detail["message"], "Model request failed.");
+        let stored = scheduler.store().task_result(&agent_id).unwrap().unwrap();
+        let original: serde_json::Value = serde_json::from_str(&stored.result.final_text).unwrap();
+        assert_eq!(original["underlyingErrorMessage"], "read EADDRNOTAVAIL");
+        assert_eq!(original["data"]["apiKey"], "[REDACTED]");
         assert_eq!(detail["cause_code"], "model_request_failed");
         assert_eq!(detail["retryable"], false);
         assert!(detail["cleanup_result"].as_str().unwrap().contains("FailedTurn"));
         assert!(!detail.to_string().contains("private-data"));
+    }
+
+    #[test]
+    fn native_failure_survives_exit_before_monitor_and_paginates_without_loss() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+        for exit_code in [0, 1] {
+            let files = tempfile::tempdir().unwrap();
+            let release = files.path().join("release");
+            let event_file = files.path().join("failure.json");
+            let original = serde_json::json!({
+                "message":"Network error\n  keep original formatting",
+                "underlyingErrorMessage":"read EADDRNOTAVAIL",
+                "stack":format!("{}\nLAST_STACK_FRAME", "frame 信息\n".repeat(30000)),
+                "code":"model_request_failed", "attribution":{"retryable":false},
+                "data":{"apiKey":"private-key","retryAfter":30},
+                "futureField":{"preserved":true}
+            });
+            let event = serde_json::json!({"method":"session/event","params":{
+                "type":"turn.failed","payload":{"error":original}
+            }});
+            fs::write(&event_file, format!("{event}\n")).unwrap();
+            let protocol = format!(r#"
+read request
+printf '%s\n' '{{"id":1,"result":{{"session":{{"sessionId":"failed-session"}}}}}}'
+read request
+printf '%s\n' '{{"id":2,"result":{{}}}}'
+read request
+printf '%s\n' '{{"id":3,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+cat '{}'
+exit {exit_code}
+"#, release.display(), event_file.display());
+            let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+            let weak = Arc::downgrade(&scheduler.inner);
+            let id = agent_id.clone();
+            scheduler.set_before_terminal_wait_hook(Arc::new(move || {
+                let scheduler = Scheduler { inner: weak.upgrade().unwrap() };
+                let (_, runtime, _, _, _) = scheduler.active_session(&id).unwrap();
+                fs::write(&release, "release native failure").unwrap();
+                // Force the process exit to be observed before the monitor runs.
+                assert!(runtime.wait_terminal(Duration::from_secs(5)).is_some());
+            }));
+            scheduler.start_ready().unwrap();
+            let stored = await_result(&scheduler, &agent_id);
+            assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+            let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+            let diagnostic: serde_json::Value = serde_json::from_str(task.failure_message.as_ref().unwrap()).unwrap();
+            assert!(diagnostic["cleanup_result"].as_str().unwrap().contains("AlreadyExited"));
+            let mut expected = original;
+            expected["data"]["apiKey"] = "[REDACTED]".into();
+            let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+            let first = service.dispatch(RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+                agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+                wait_time: 0, message_id: None, wait_mode: crate::rpc::WaitMode::All,
+            })).unwrap();
+            let RpcSuccess::TaskWait(first) = first else { panic!("wait response") };
+            let first = first.result.unwrap();
+            assert!(first.next_offset.is_some(), "long original must be paged, not discarded");
+            let mut text = first.final_text;
+            let mut offset = first.next_offset;
+            while let Some(next) = offset {
+                let response = service.dispatch(RpcMethod::TaskResult {
+                    agent_id: agent_id.clone(), offset: next, limit: 16384,
+                }).unwrap();
+                let RpcSuccess::TaskResult {result: Some(page), ..} = response else {panic!("result page")};
+                assert_eq!(page.outcome, TaskOutcome::Failed);
+                text.push_str(&page.final_text);
+                offset = page.next_offset;
+            }
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), expected);
+            assert_eq!(text, stored.result.final_text);
+            assert!(!text.contains("private-key"));
+        }
     }
 
     #[test]

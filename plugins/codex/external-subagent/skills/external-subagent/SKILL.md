@@ -29,7 +29,9 @@ the next wait; the default `"all"` waits for the whole batch. Read the complete
 output, including failure details, before taking the next action. `result: null`
 means no final result yet. Only `outcome: "COMPLETED"` is successful; consume
 `final_text` and follow `next_offset` until null. On failure, inspect
-`failure_message` before choosing continuation, retry, or user input. A quota
+`failure_message` and the complete `final_text` before choosing continuation,
+retry, or user input. For native turn failures, `final_text` carries the original
+error as JSON with credentials redacted; `failure_message` is bounded ES diagnostics. A quota
 or authentication failure needs the blocking condition resolved before retry.
 Use `send` to continue a recoverable task rather than automatically spawning
 another one; keep its assignment and any caller-owned retry count across calls.

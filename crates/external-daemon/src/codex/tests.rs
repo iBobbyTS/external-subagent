@@ -947,23 +947,26 @@ fn a_queued_followup_turn_in_the_same_process_keeps_the_admitted_effort() {
     // flight is dropped as unsolicited traffic by the attribution gate.
     let script = format!(
         r#"
-IFS= read -r line
-printf '%s\n' "$line" >> deliveries.jsonl
+read_request() {{
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> deliveries.jsonl
+    case "$line" in
+      *\"method\":\"$1\"*) return 0 ;;
+    esac
+  done
+  return 1
+}}
+read_request initialize || exit 1
 printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
-IFS= read -r line
-printf '%s\n' "$line" >> deliveries.jsonl
+read_request thread/start || exit 1
 printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{echo}}}}}'
-IFS= read -r line
-printf '%s\n' "$line" >> deliveries.jsonl
+read_request turn/start || exit 1
 printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' \
   '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
 while [ ! -f release ]; do sleep 0.01; done
 printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-1","item":{{"type":"agentMessage","id":"msg_1","text":"FIRST_OK"}}}}}}' \
   '{{"method":"turn/completed","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-1","status":"completed","error":null}}}}}}'
-IFS= read -r line
-printf '%s\n' "$line" >> deliveries.jsonl
-IFS= read -r line
-printf '%s\n' "$line" >> deliveries.jsonl
+read_request turn/start || exit 1
 printf '%s\n' '{{"id":4,"result":{{"turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
   '{{"method":"turn/started","params":{{"threadId":"codex-thread-1","turn":{{"id":"codex-turn-2","status":"inProgress"}}}}}}' \
   '{{"method":"item/completed","params":{{"threadId":"codex-thread-1","turnId":"codex-turn-2","item":{{"type":"agentMessage","id":"msg_2","text":"SECOND_OK"}}}}}}' \

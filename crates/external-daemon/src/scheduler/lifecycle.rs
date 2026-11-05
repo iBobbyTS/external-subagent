@@ -806,15 +806,15 @@ impl Scheduler {
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
+                let native_failure = runtime.diagnostic_failure()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
+                let original_error = native_failure.as_ref().and_then(|value| value.get("original_error"));
                 let routed_failure_message = if !matches!(
                     outcome,
                     CompletionOutcome::Completed | CompletionOutcome::Cancelled
                 ) {
                     let session_id = self.active_session(agent_id).map(|active| active.2);
-                    let failure_message = failure_message.or_else(|| {
-                        matches!(terminal, RuntimeTerminal::FailedTurn(_))
-                            .then(|| runtime.diagnostic_failure()).flatten()
-                    });
+                    let failure_message = failure_message.or_else(|| native_failure.as_ref().map(ToString::to_string));
                     let message = if let Some(cause) = failure_message {
                         let mut detail = serde_json::from_str::<serde_json::Value>(&cause)
                             .ok()
@@ -877,7 +877,12 @@ impl Scheduler {
                 } else {
                     unreaped_general(outcome, &reason, &reason, None)
                 };
-                if completion.summary.trim().is_empty() {
+                if !matches!(completion.outcome, CompletionOutcome::Completed | CompletionOutcome::Cancelled) {
+                    if let Some(original) = original_error {
+                        completion.summary = original.to_string();
+                    }
+                }
+                if completion.summary.trim().is_empty() && original_error.is_none() {
                     completion.summary = reason.clone();
                 }
                 if completion.reason_code.is_none()
