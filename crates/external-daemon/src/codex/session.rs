@@ -37,31 +37,17 @@ impl CodexRuntimeOwner {
         &self,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
-        let params = serde_json::json!({
-            "clientInfo": {
-                "name": "external-subagent",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-            "capabilities": {},
-        });
-        let response = self
-            .driver
-            .request("initialize", params, remaining_time(deadline)?)?;
-        let home = response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("codexHome"))
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| {
-                RuntimeCommandError::InvalidSession("initialize result is missing codexHome".into())
-            })?;
-        if home.is_empty() || home.len() > 4096 {
-            return Err(RuntimeCommandError::InvalidSession(
-                "initialize returned an invalid codexHome".into(),
-            ));
-        }
+        let response = self.driver.request(
+            "initialize",
+            wire::initialize_params(env!("CARGO_PKG_VERSION")),
+            remaining_time(deadline)?,
+        )?;
+        // The shared handshake shapes live in the protocol crate so the
+        // task-session and catalog-probe paths cannot drift apart.
+        wire::validate_initialize_codex_home(response.result.as_ref())
+            .map_err(runtime_command_error)?;
         self.driver
-            .send(&serde_json::json!({"method": "initialized"}))
+            .send(&wire::initialized_notification())
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         Ok(())
     }

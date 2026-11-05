@@ -62,6 +62,46 @@ pub fn codex_posture(mode: CodexPermissionMode) -> CodexPosture {
     }
 }
 
+/// The `initialize` request parameters every app-server session opens with:
+/// this product as the client, no capabilities. The version comes from the
+/// caller (the shipping binary's crate version) so the wire identity stays
+/// with the daemon instead of this protocol crate's own version.
+pub fn initialize_params(client_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "clientInfo": {
+            "name": "external-subagent",
+            "version": client_version,
+        },
+        "capabilities": {},
+    })
+}
+
+/// Validate the `initialize` result: `codexHome` must be a non-empty
+/// string of at most 4096 bytes. Shared by the task-session handshake and
+/// the daemon's catalog probe so the two paths cannot drift; returns the
+/// validated home.
+pub fn validate_initialize_codex_home(
+    result: Option<&serde_json::Value>,
+) -> Result<&str, CodexError> {
+    let home = result
+        .and_then(|result| result.get("codexHome"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            CodexError::InvalidSession("initialize result is missing codexHome".into())
+        })?;
+    if home.is_empty() || home.len() > 4096 {
+        return Err(CodexError::InvalidSession(
+            "initialize returned an invalid codexHome".into(),
+        ));
+    }
+    Ok(home)
+}
+
+/// The post-initialize `initialized` notification body.
+pub fn initialized_notification() -> serde_json::Value {
+    serde_json::json!({"method": "initialized"})
+}
+
 /// The `thread/start` request parameters: the admitted model and workspace
 /// with the never-approve policy, the mode's pinned sandbox, and a
 /// persistent (non-ephemeral) thread.
@@ -396,6 +436,56 @@ mod tests {
     const YOLO: CodexPermissionMode = CodexPermissionMode::Yolo;
     const WRITE: CodexPermissionMode = CodexPermissionMode::WorkspaceWrite;
     const WORKSPACE: &str = "/tmp/codex-echo-workspace";
+
+    #[test]
+    fn initialize_params_pin_the_client_identity_and_version() {
+        let params = super::initialize_params("9.9.9");
+        assert_eq!(params["clientInfo"]["name"], "external-subagent");
+        assert_eq!(params["clientInfo"]["version"], "9.9.9");
+        assert!(params["capabilities"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn initialize_codex_home_validation_is_fail_closed() {
+        let missing_input = serde_json::json!({"userAgent": "fake"});
+        match super::validate_initialize_codex_home(Some(&missing_input))
+            .expect_err("missing codexHome must fail")
+        {
+            super::CodexError::InvalidSession(message) => {
+                assert!(message.contains("missing codexHome"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        let number_input = serde_json::json!({"codexHome": 7});
+        assert!(super::validate_initialize_codex_home(Some(&number_input)).is_err());
+        assert!(super::validate_initialize_codex_home(None).is_err());
+        let empty_input = serde_json::json!({"codexHome": ""});
+        match super::validate_initialize_codex_home(Some(&empty_input))
+            .expect_err("empty codexHome must fail")
+        {
+            super::CodexError::InvalidSession(message) => {
+                assert!(message.contains("invalid codexHome"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        let oversized_input = serde_json::json!({"codexHome": "x".repeat(4097)});
+        assert!(super::validate_initialize_codex_home(Some(&oversized_input)).is_err());
+        let boundary_input = serde_json::json!({"codexHome": "x".repeat(4096)});
+        assert_eq!(
+            super::validate_initialize_codex_home(Some(&boundary_input))
+                .expect("4096-byte home is admitted")
+                .len(),
+            4096
+        );
+    }
+
+    #[test]
+    fn initialized_notification_carries_only_the_method() {
+        assert_eq!(
+            super::initialized_notification(),
+            serde_json::json!({"method": "initialized"})
+        );
+    }
 
     fn plan_start_result() -> serde_json::Value {
         serde_json::json!({

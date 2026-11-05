@@ -73,20 +73,14 @@ impl AgyLaunch {
     }
 }
 
-/// The one executable-bit predicate shared by the production environment path
-/// and the harness launch validation: an absolute, existing, executable file.
+/// The runtime gate shared by the production environment path and the
+/// harness launch validation: an absolute path that passes the host
+/// executable predicate in `crate::executable` (the Unix execute bit, or the
+/// Windows PATHEXT extension gate over a regular file) — the same
+/// predicate admission uses, so the launch and admission gates cannot
+/// disagree on any platform.
 fn runtime_path_is_executable_file(path: &Path) -> bool {
-    path.is_absolute() && path.is_file() && {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            true
-        }
-    }
+    path.is_absolute() && crate::executable::is_executable_file(path)
 }
 
 fn env_runtime_path() -> Result<Option<PathBuf>, io::Error> {
@@ -233,5 +227,31 @@ impl RuntimeFactory for AgyRuntimeFactory {
             sink,
             self.process_model,
         )?))
+    }
+}
+
+#[cfg(test)]
+mod runtime_gate_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_gate_requires_an_absolute_executable_file() {
+        assert!(!runtime_path_is_executable_file(Path::new("runtime")));
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("runtime");
+        std::fs::write(&runtime, b"binary").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(!runtime_path_is_executable_file(&runtime));
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let executable = directory.path().join("runtime.exe");
+            std::fs::write(&executable, b"pe").unwrap();
+            assert!(runtime_path_is_executable_file(&executable));
+        }
+        assert!(runtime_path_is_executable_file(&runtime));
     }
 }

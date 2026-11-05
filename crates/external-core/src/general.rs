@@ -16,6 +16,13 @@ const MAX_PROMPT_BYTES: usize = 256 * 1024;
 /// `MAX_PROMPT_BYTES` after the prefix is attached; the codex native channel
 /// carries the text as-is, so this bound is its only length guard.
 pub const MAX_DEVELOPER_INSTRUCTIONS_BYTES: usize = 1024 * 1024;
+/// Bound for the caller `write_manifest` admitted into a task: at most 256
+/// entries whose serialized form stays under 64 KiB. This is the single
+/// owner of the bound — admission (rpc/agents.rs) and the runtime policy
+/// environment (runtime_owner.rs) both enforce it by referencing these
+/// constants, so the two gates cannot drift apart.
+pub const MAX_WRITE_MANIFEST_ENTRIES: usize = 256;
+pub const MAX_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
 static SUBMISSION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +490,12 @@ mod tests {
         )
         .expect_err("plan admission must reject writes");
         assert!(error.to_string().contains("plan mode does not accept"));
+    }
+
+    #[test]
+    fn write_manifest_bounds_are_the_shared_policy_constants() {
+        assert_eq!(super::MAX_WRITE_MANIFEST_ENTRIES, 256);
+        assert_eq!(super::MAX_WRITE_MANIFEST_BYTES, 64 * 1024);
     }
 
     #[test]

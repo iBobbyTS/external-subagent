@@ -297,8 +297,6 @@ impl<F> CommandRuntimeFactory<F> {
 
 /// Bind the daemon-owned policy envelope to every ZCode child.
 fn apply_agent_policy_environment(command: &mut Command, task: &TaskRecord) -> io::Result<()> {
-    const MAX_AGENT_WRITE_MANIFEST_ENTRIES: usize = 256;
-    const MAX_AGENT_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
     let root = Path::new(&task.workspace_path);
     if !root.is_absolute() {
         return Err(io::Error::new(
@@ -306,47 +304,35 @@ fn apply_agent_policy_environment(command: &mut Command, task: &TaskRecord) -> i
             "runtime workspace path must be absolute",
         ));
     }
-    let manifest = match task_route(task)
-        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
-    {
-        TaskRoute::General(prepared) => prepared
-            .write_manifest
-            .iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-    };
+    let TaskRoute::General(prepared) = task_route(task)
+        .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+    let manifest = prepared
+        .write_manifest
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
     let serialized = serde_json::to_string(&manifest).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("write manifest could not be serialized: {error}"),
         )
     })?;
-    if manifest.len() > MAX_AGENT_WRITE_MANIFEST_ENTRIES
-        || serialized.len() > MAX_AGENT_WRITE_MANIFEST_BYTES
+    // The bounds are owned by external-core; admission enforces the same
+    // pair before any task is persisted.
+    if manifest.len() > external_core::MAX_WRITE_MANIFEST_ENTRIES
+        || serialized.len() > external_core::MAX_WRITE_MANIFEST_BYTES
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "write manifest exceeds runtime policy bounds",
         ));
     }
-    command
-        .env("ZCODE_AGENT_POLICY", "1")
-        .env(
-            "ZCODE_AGENT_PERMISSION_MODE",
-            match task_route(task)
-                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?
-            {
-                TaskRoute::General(prepared) => match prepared.permission_mode {
-                    external_core::PermissionMode::Build => "build",
-                    external_core::PermissionMode::Edit => "edit",
-                    external_core::PermissionMode::Plan => "plan",
-                    external_core::PermissionMode::Yolo => "yolo",
-                },
-            },
-        )
-        .env("ZCODE_AGENT_WORKSPACE_ROOT", root)
-        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
-        .env("ZCODE_AGENT_WRITE_MANIFEST", serialized);
+    crate::zcode::apply_policy_environment(
+        command,
+        root,
+        crate::zcode::permission_mode_environment_value(prepared.permission_mode),
+        &serialized,
+    );
     Ok(())
 }
 

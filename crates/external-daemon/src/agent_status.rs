@@ -865,12 +865,9 @@ fn probe_zcode_models(executable: Option<&Path>, input: &AgentModelsInput) -> Ag
     if let Some(home) = scope.home.as_deref() {
         command.env("ZCODE_HOME", home);
     }
-    command
-        .env("ZCODE_AGENT_POLICY", "1")
-        .env("ZCODE_AGENT_PERMISSION_MODE", "plan")
-        .env("ZCODE_AGENT_WORKSPACE_ROOT", workspace)
-        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
-        .env("ZCODE_AGENT_WRITE_MANIFEST", "[]");
+    // The probe runs under the production policy envelope (plan posture,
+    // no writes); the shared builder keeps it from drifting from spawn.
+    crate::zcode::apply_policy_environment(&mut command, Path::new(workspace), "plan", "[]");
     if let Some(data_root) = crate::zcode::data_root_from_environment() {
         crate::zcode::apply_provider_environment(&mut command, executable, &data_root);
     }
@@ -1062,27 +1059,19 @@ fn codex_catalog_exchange(driver: &Driver) -> Result<Vec<String>, String> {
     let initialize = driver
         .request(
             "initialize",
-            serde_json::json!({
-                "clientInfo": {
-                    "name": "external-subagent",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {},
-            }),
+            external_agent_codex::session::initialize_params(env!("CARGO_PKG_VERSION")),
             remaining(deadline)?,
         )
         .map_err(|_| "transport".to_owned())?;
-    let codex_home_ok = initialize
-        .result
-        .as_ref()
-        .and_then(|result| result.get("codexHome"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|home| !home.is_empty() && home.len() <= 4096);
-    if !codex_home_ok {
+    // Shared handshake validation (the same shapes the task session uses)
+    // so the probe and spawn handshakes cannot drift apart.
+    if external_agent_codex::session::validate_initialize_codex_home(initialize.result.as_ref())
+        .is_err()
+    {
         return Err("handshake_failed".into());
     }
     driver
-        .send(&serde_json::json!({"method": "initialized"}))
+        .send(&external_agent_codex::session::initialized_notification())
         .map_err(|_| "transport".to_owned())?;
     let mut models = Vec::new();
     let mut cursor: Option<String> = None;
@@ -2093,12 +2082,9 @@ fn probe_zcode_hi(
     if let Some(home) = scope.home.as_deref() {
         command.env("ZCODE_HOME", home);
     }
-    command
-        .env("ZCODE_AGENT_POLICY", "1")
-        .env("ZCODE_AGENT_PERMISSION_MODE", "plan")
-        .env("ZCODE_AGENT_WORKSPACE_ROOT", workspace)
-        .env("ZCODE_AGENT_BOOTSTRAP_ROOTS", "/Applications/ZCode.app")
-        .env("ZCODE_AGENT_WRITE_MANIFEST", "[]");
+    // The probe runs under the production policy envelope (plan posture,
+    // no writes); the shared builder keeps it from drifting from spawn.
+    crate::zcode::apply_policy_environment(&mut command, Path::new(workspace), "plan", "[]");
     if let Some(data_root) = crate::zcode::data_root_from_environment() {
         crate::zcode::apply_provider_environment(&mut command, executable, &data_root);
     }

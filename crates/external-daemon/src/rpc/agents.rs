@@ -683,12 +683,9 @@ pub(super) fn resolve_admission_with_instructions(
         // routes a non-`["."]` manifest to the manifest-build composition
         // (per-task write-guard patch) instead of refusing it. Plan + a
         // non-empty manifest is still refused later by external-core, not here.
-        // The manifest is materialized into a patch, so the same entry/byte
-        // bounds the ZCode policy environment enforces are applied before any
-        // task is persisted. This mirrors `apply_agent_policy_environment` in
-        // `runtime_owner.rs` (entries <= 256, serialized <= 64 KiB).
-        const MAX_DSH_WRITE_MANIFEST_ENTRIES: usize = 256;
-        const MAX_DSH_WRITE_MANIFEST_BYTES: usize = 64 * 1024;
+        // The manifest is materialized into a patch, so the shared entry/byte
+        // bounds owned by external-core (the same pair the ZCode policy
+        // environment enforces) are applied before any task is persisted.
         let serialized = serde_json::to_string(
             &input
                 .manifest
@@ -705,13 +702,17 @@ pub(super) fn resolve_admission_with_instructions(
             field: AdmissionField::None,
             profile_provided: false,
         })?;
-        if input.manifest.write_manifest.len() > MAX_DSH_WRITE_MANIFEST_ENTRIES
-            || serialized.len() > MAX_DSH_WRITE_MANIFEST_BYTES
+        if input.manifest.write_manifest.len() > external_core::MAX_WRITE_MANIFEST_ENTRIES
+            || serialized.len() > external_core::MAX_WRITE_MANIFEST_BYTES
         {
             return Err(AdmissionFailure {
                 error: RpcError::new(
                     RpcErrorCode::Validation,
-                    "dsh write manifest exceeds the admission bounds (max 256 entries / 64 KiB)",
+                    format!(
+                        "dsh write manifest exceeds the admission bounds (max {} entries / {} KiB)",
+                        external_core::MAX_WRITE_MANIFEST_ENTRIES,
+                        external_core::MAX_WRITE_MANIFEST_BYTES / 1024
+                    ),
                 ),
                 field: AdmissionField::None,
                 profile_provided: false,
