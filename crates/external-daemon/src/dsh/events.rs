@@ -304,6 +304,22 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                 shared.turn_tracker.observe(&event);
                 shared.publisher.emit_driver(event, None);
             }
+            // Correlation belongs to pending/in-flight calls, not finished
+            // history. Keep the name through terminal projection, then free
+            // its bounded slot for the next call (including terminal-only
+            // announcements). Unrelated pending permission names stay intact.
+            if let update::UpdateKind::ToolCall {
+                tool_call_id,
+                status: Some(update::ToolStatus::Completed | update::ToolStatus::Failed),
+                ..
+            }
+            | update::UpdateKind::ToolCallUpdate {
+                tool_call_id,
+                status: Some(update::ToolStatus::Completed | update::ToolStatus::Failed),
+            } = &parsed.kind
+            {
+                shared.tool_names.lock().unwrap().remove(tool_call_id);
+            }
             None
         }
         WireMessage::Request(request) => {

@@ -2821,6 +2821,170 @@ fn repair2_failed_announcement_preserves_observation_without_start() {
     assert_terminal_tool_announcement("failed");
 }
 
+fn projected_permission_tool_name(
+    shared: &super::events::DshRuntimeShared,
+    call_id: &str,
+) -> String {
+    let request = Inbound::Message(WireMessage::Request(
+        external_contract::RequestEnvelope::new(
+            external_contract::WireId::String(format!("permission-{call_id}")),
+            "session/request_permission",
+            serde_json::json!({"sessionId":"s","toolCallId":call_id,
+            "options":[{"optionId":"allow-once","kind":"allow_once"}]}),
+        ),
+    ));
+    let Some(Inbound::Message(WireMessage::Request(projected))) =
+        super::events::project_dsh_inbound(shared, &request)
+    else {
+        panic!("permission request must be projected");
+    };
+    assert_eq!(
+        projected.method,
+        external_contract::INTERACTION_REQUEST_PERMISSION
+    );
+    projected.params["toolName"].as_str().unwrap().to_owned()
+}
+
+fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_json::Value) {
+    let (shared, tracker) = tool_projection_tracker();
+    for index in 0..128 {
+        let warmup = serde_json::json!({"sessionUpdate":"tool_call",
+            "toolCallId":format!("warmup-{index}"),"status":"completed",
+            "title":"Warmup","kind":"other","rawInput":{}});
+        deliver_tool_update(&shared, warmup.clone());
+        deliver_tool_update(&shared, warmup);
+    }
+    let warm = tracker.snapshot();
+    assert_eq!(warm.window_60s.tool_calls_started, 0);
+    assert_eq!(warm.window_60s.tool_calls_completed, 128);
+    assert!(warm.active_tools.is_empty());
+
+    let pending = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"current",
+        "status":"pending","title":tool_name,"kind":"other","rawInput":input});
+    deliver_tool_update(&shared, pending.clone());
+    deliver_tool_update(&shared, pending);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 0);
+    // Capture the actual permission correlation while still pending, without
+    // echoing a title in the permission offer itself.
+    let pending_name = projected_permission_tool_name(&shared, "current");
+    let observed = tracker.observation_snapshot();
+    let current = observed
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == tool_name)
+        .unwrap();
+    assert_eq!(current.call_count, 1);
+    assert_eq!(
+        &current.recent_calls[0].arguments,
+        input.as_object().unwrap()
+    );
+    assert!(!current.recent_calls[0].arguments_truncated);
+
+    let started = serde_json::json!({"sessionUpdate":"tool_call_update",
+        "toolCallId":"current","status":"in_progress"});
+    deliver_tool_update(&shared, started.clone());
+    deliver_tool_update(&shared, started);
+    let running = tracker.snapshot();
+    assert_eq!(running.window_60s.tool_calls_started, 1);
+    assert_eq!(
+        running.window_60s.read_calls,
+        u64::from(tool_name == "Read"),
+        "{tool_name}"
+    );
+    assert_eq!(
+        running.window_60s.bash_calls,
+        u64::from(tool_name == "Bash"),
+        "{tool_name}"
+    );
+    assert_eq!(running.window_60s.other_tool_calls, 0);
+    assert_eq!(running.active_tools.len(), 1);
+    assert_eq!(running.active_tools[0].tool_call_id, "current");
+    assert_eq!(
+        running.active_tools[0].kind,
+        if tool_name == "Read" {
+            crate::PassiveToolKind::Read
+        } else {
+            crate::PassiveToolKind::Bash
+        }
+    );
+    assert_eq!(pending_name, tool_name);
+    assert_eq!(
+        projected_permission_tool_name(&shared, "current"),
+        tool_name
+    );
+    assert_eq!(shared.tool_names.lock().unwrap().len(), 1);
+    assert_eq!(tracker.observation_snapshot(), observed);
+
+    let terminal = serde_json::json!({"sessionUpdate":"tool_call_update",
+        "toolCallId":"current","status":"completed"});
+    deliver_tool_update(&shared, terminal.clone());
+    deliver_tool_update(&shared, terminal);
+    let settled = tracker.snapshot();
+    assert_eq!(settled.window_60s.tool_calls_started, 1);
+    assert_eq!(settled.window_60s.tool_calls_completed, 129);
+    assert_eq!(settled.window_60s.tool_calls_failed, 0);
+    assert!(settled.active_tools.is_empty());
+    assert_eq!(tracker.observation_snapshot(), observed);
+    assert!(shared.tool_names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn repair3_completed_history_preserves_new_pending_read() {
+    assert_finished_history_preserves_current_tool("Read", serde_json::json!({"path":"a.ts"}));
+}
+
+#[test]
+fn repair3_completed_history_preserves_new_pending_bash() {
+    assert_finished_history_preserves_current_tool("Bash", serde_json::json!({"command":"pwd"}));
+}
+
+#[test]
+fn repair3_terminal_phases_release_only_finished_names() {
+    let (shared, tracker) = tool_projection_tracker();
+    deliver_tool_update(
+        &shared,
+        serde_json::json!({"sessionUpdate":"tool_call",
+        "toolCallId":"keep-pending","status":"pending","title":"Read","rawInput":{"path":"a.ts"}}),
+    );
+    for kind in ["tool_call", "tool_call_update"] {
+        for status in ["completed", "failed"] {
+            let id = format!("{kind}-{status}");
+            if kind == "tool_call_update" {
+                deliver_tool_update(
+                    &shared,
+                    serde_json::json!({"sessionUpdate":"tool_call",
+                    "toolCallId":id,"status":"pending","title":"Bash","rawInput":{"command":"pwd"}}),
+                );
+                assert_eq!(projected_permission_tool_name(&shared, &id), "Bash");
+                deliver_tool_update(
+                    &shared,
+                    serde_json::json!({"sessionUpdate":"tool_call_update",
+                    "toolCallId":id,"status":"in_progress"}),
+                );
+                assert_eq!(projected_permission_tool_name(&shared, &id), "Bash");
+            }
+            let terminal = serde_json::json!({"sessionUpdate":kind,"toolCallId":id,
+                "status":status,"title":"Bash","rawInput":{"command":"pwd"}});
+            deliver_tool_update(&shared, terminal.clone());
+            let before_replay = tracker.snapshot().window_60s;
+            deliver_tool_update(&shared, terminal);
+            assert_eq!(tracker.snapshot().window_60s, before_replay);
+            let names = shared.tool_names.lock().unwrap();
+            assert!(
+                !names.contains_key(&id),
+                "{kind}/{status} retained finished history"
+            );
+            assert_eq!(names.get("keep-pending").map(String::as_str), Some("Read"));
+            assert_eq!(names.len(), 1);
+            drop(names);
+            assert_eq!(
+                projected_permission_tool_name(&shared, "keep-pending"),
+                "Read"
+            );
+        }
+    }
+}
+
 #[test]
 fn repair1_large_prompt_result_has_explicit_limit_semantics() {
     let _guard = scripted_test_guard();
