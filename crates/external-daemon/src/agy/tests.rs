@@ -1622,3 +1622,125 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
     };
     assert!(second.activity.latest_text_tail.is_empty());
 }
+
+fn current_conversation_probe() -> (super::events::AgyRuntimeShared, Arc<AgyFactSink>) {
+    let (shared, sink) = agy_fact_probe();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"init","conversation_id":"current","init":{}}),
+    );
+    (shared, sink)
+}
+
+#[test]
+fn foreign_malformed_conversation_is_excluded_before_payload_validation() {
+    // SYNTHETIC known envelopes: nested identity wins; missing/empty nested
+    // identity falls back to the top-level field, as in the native parser.
+    let cases = [
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":"foreign","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":"","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"conversation_id":"foreign","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"result","result":{"conversation_id":"foreign","status":7}}),
+        serde_json::json!({"event":"result","conversation_id":"foreign","result":{"status":7}}),
+        serde_json::json!({"event":"init","conversation_id":"foreign","init":{"model":7}}),
+        // Preserve the existing valid-foreign-frame exclusion too.
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":"foreign","step_index":7,"state":"DONE","step_type":"tool"}}),
+    ];
+    for raw in cases {
+        let (shared, sink) = current_conversation_probe();
+        let before = sink.1.observation_snapshot();
+        let before_facts = sink.facts();
+        let before_turn = shared.turn_snapshot();
+        feed_agy(&shared, raw.clone());
+        assert_eq!(
+            sink.facts(),
+            before_facts,
+            "foreign frame emitted current facts: {raw}"
+        );
+        assert_eq!(
+            sink.1.observation_snapshot(),
+            before,
+            "foreign frame damaged current coverage: {raw}"
+        );
+        assert!(
+            !sink.1.snapshot().telemetry_degraded,
+            "foreign frame degraded current telemetry: {raw}"
+        );
+        assert_eq!(shared.turn_snapshot(), before_turn);
+        assert_eq!(shared.session_id().as_deref(), Some("current"));
+    }
+}
+
+#[test]
+fn current_malformed_conversation_retains_dimension_damage() {
+    use external_contract::events::*;
+    let cases = [
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":"current","step_index":"bad","state":"DONE","step_type":"tool"}}),
+            CoverageDimension::Tools,
+        ),
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"conversation_id":"","step_index":"bad","state":"DONE","step_type":"tool"}}),
+            CoverageDimension::Tools,
+        ),
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"step_index":"bad","state":"DONE","step_type":"agent_response"}}),
+            CoverageDimension::Text,
+        ),
+        (
+            serde_json::json!({"event":"result","result":{"conversation_id":"current","status":7}}),
+            CoverageDimension::Turn,
+        ),
+    ];
+    for (raw, dimension) in cases {
+        let (shared, sink) = current_conversation_probe();
+        let dropped = sink.1.observation_snapshot().coverage.dropped_events;
+        feed_agy(&shared, raw);
+        let facts = sink.facts();
+        let event = facts.last().unwrap();
+        assert!(matches!(&event.fact, EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed && gap.impact == Impact::Known(vec![dimension])
+            && gap.activity == ActivityScope::Turn(TurnId::Local(1))));
+        assert_eq!(
+            event.context.source.session_id,
+            Some(SessionId("current".into()))
+        );
+        assert_eq!(
+            sink.1.observation_snapshot().coverage.dropped_events,
+            dropped + 1
+        );
+        assert_eq!(
+            sink.1.snapshot().telemetry_degraded,
+            dimension != CoverageDimension::Text
+        );
+    }
+}
+
+#[test]
+fn unreadable_or_unknown_conversation_identity_retains_prior_classification() {
+    use external_contract::events::*;
+    // SYNTHETIC malformed identities must not acquire a foreign attribution
+    // from a fallback the parser cannot apply to a non-string nested field.
+    for identity in [serde_json::Value::Null, serde_json::json!(7)] {
+        let (shared, sink) = current_conversation_probe();
+        feed_agy(
+            &shared,
+            serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":identity,"step_index":"bad","state":"DONE","step_type":"tool"}}),
+        );
+        assert!(
+            matches!(&sink.facts().last().unwrap().fact, EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed && gap.impact == Impact::Known(vec![CoverageDimension::Tools]))
+        );
+        assert!(sink.1.snapshot().telemetry_degraded);
+    }
+    let (shared, sink) = current_conversation_probe();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"banana","conversation_id":"foreign","payload":{"private":"not diagnostic content"}}),
+    );
+    assert!(
+        matches!(&sink.facts().last().unwrap().fact, EventFact::Diagnostic(diagnostic)
+        if diagnostic.reason == DiagnosticReason::UnknownSemantics)
+    );
+}

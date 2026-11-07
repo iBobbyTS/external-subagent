@@ -152,10 +152,8 @@ impl AgyRuntimeShared {
         }
     }
 
-    /// Pump-only entry for parsed native records. Never called concurrently.
-    pub(super) fn project_event(&self, event: &AgyEvent) {
-        // An established conversation cannot be replaced by foreign traffic.
-        if let (Some(expected), Some(actual)) = (self.session_id(), event.conversation_id()) {
+    fn ignore_foreign_session(&self, actual: Option<&str>) -> bool {
+        if let (Some(expected), Some(actual)) = (self.session_id(), actual) {
             if expected != actual {
                 let turn = self.turn.lock().unwrap();
                 let input =
@@ -165,8 +163,16 @@ impl AgyRuntimeShared {
                     Attribution::ForeignSession,
                     IgnoreReason::ForeignSession,
                 );
-                return;
+                return true;
             }
+        }
+        false
+    }
+
+    /// Pump-only entry for parsed native records. Never called concurrently.
+    pub(super) fn project_event(&self, event: &AgyEvent) {
+        if self.ignore_foreign_session(event.conversation_id()) {
+            return;
         }
         match event {
             AgyEvent::Init {
@@ -575,6 +581,12 @@ pub(super) fn project_agy_inbound(shared: &AgyRuntimeShared, event: &Inbound) ->
     let Inbound::Message(WireMessage::UnknownEvent { raw, .. }) = event else {
         return Some(event.clone());
     };
+    // Attribute readable known envelopes before body validation can fail;
+    // malformed foreign traffic must not damage the current turn's coverage.
+    let session = external_agent_agy::event::envelope_conversation_id(raw);
+    if shared.ignore_foreign_session(session) {
+        return None;
+    }
     match serde_json::to_string(raw)
         .ok()
         .and_then(|line| external_agent_agy::event::parse_line(&line).ok())
@@ -583,7 +595,7 @@ pub(super) fn project_agy_inbound(shared: &AgyRuntimeShared, event: &Inbound) ->
         None => {
             let turn = shared.turn.lock().unwrap();
             let discriminator = raw.get("event").and_then(Value::as_str);
-            let input = shared.input_context(discriminator, turn_id(&turn), None);
+            let input = shared.input_context(discriminator, turn_id(&turn), session);
             let impact = match discriminator {
                 Some("step_update") => raw
                     .pointer("/step_update/step_type")

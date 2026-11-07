@@ -250,6 +250,33 @@ impl AgyEvent {
     }
 }
 
+/// Read a known stream-json envelope's identity without validating its body.
+/// Init uses only the top-level ID; step/result prefer their nested ID and
+/// fall back to the top level only when the nested string is empty or absent.
+/// A non-string nested ID is unreadable, not permission to use a fallback.
+/// Unknown event kinds have no established identity contract here.
+pub fn envelope_conversation_id(raw: &Value) -> Option<&str> {
+    let event = raw.get("event").and_then(Value::as_str)?;
+    let top = raw
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    match event {
+        "init" => top,
+        "step_update" | "result" => {
+            match raw
+                .get(event)
+                .and_then(|payload| payload.get("conversation_id"))
+            {
+                Some(Value::String(id)) if !id.is_empty() => Some(id.as_str()),
+                Some(Value::String(_)) | None => top,
+                Some(_) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Parse one stdout NDJSON line into an [`AgyEvent`].
 ///
 /// A known event name whose payload is missing or malformed is an error (the
@@ -263,9 +290,7 @@ pub fn parse_line(line: &str) -> Result<AgyEvent, serde_json::Error> {
     };
     match event {
         "init" => {
-            let conversation_id = raw
-                .get("conversation_id")
-                .and_then(Value::as_str)
+            let conversation_id = envelope_conversation_id(&raw)
                 .unwrap_or_default()
                 .to_owned();
             let init = raw.get("init").cloned().unwrap_or(Value::Null);
@@ -301,8 +326,8 @@ fn payload(raw: &Value, key: &str) -> Value {
 /// modeled shape.
 fn fallback_conversation_id(conversation_id: &mut String, raw: &Value) {
     if conversation_id.is_empty() {
-        if let Some(top) = raw.get("conversation_id").and_then(Value::as_str) {
-            *conversation_id = top.to_owned();
+        if let Some(id) = envelope_conversation_id(raw) {
+            *conversation_id = id.to_owned();
         }
     }
 }
@@ -452,5 +477,67 @@ mod tests {
             }
             other => panic!("expected result, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod envelope_identity_tests {
+    use super::*;
+
+    #[test]
+    fn known_envelope_identity_matches_parsed_nested_and_top_level_precedence() {
+        // SYNTHETIC valid shapes: the independent parser result must agree
+        // with the header read used before malformed-body classification.
+        for kind in ["init", "step_update", "result"] {
+            for nested in [None, Some(""), Some("nested")] {
+                for top in [None, Some(""), Some("top")] {
+                    let mut payload = match kind {
+                        "step_update" => {
+                            serde_json::json!({"step_index":0,"state":"DONE","step_type":"tool"})
+                        }
+                        "result" => serde_json::json!({"status":"SUCCESS"}),
+                        _ => serde_json::json!({}),
+                    };
+                    if let Some(id) = nested {
+                        payload["conversation_id"] = id.into();
+                    }
+                    let mut raw = serde_json::json!({"event":kind,(kind):payload});
+                    if let Some(id) = top {
+                        raw["conversation_id"] = id.into();
+                    }
+                    let parsed = parse_line(&raw.to_string()).unwrap();
+                    let expected = if kind == "init" {
+                        top.filter(|id| !id.is_empty())
+                    } else {
+                        nested
+                            .filter(|id| !id.is_empty())
+                            .or(top.filter(|id| !id.is_empty()))
+                    };
+                    assert_eq!(envelope_conversation_id(&raw), expected, "{raw}");
+                    assert_eq!(parsed.conversation_id(), expected, "{raw}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_nested_identity_and_unknown_event_have_no_inferred_identity() {
+        for kind in ["step_update", "result"] {
+            for unreadable in [
+                Value::Null,
+                serde_json::json!(7),
+                serde_json::json!({"id":"nested"}),
+            ] {
+                let raw = serde_json::json!({"event":kind,"conversation_id":"top",(kind):{"conversation_id":unreadable}});
+                assert_eq!(envelope_conversation_id(&raw), None);
+                assert!(parse_line(&raw.to_string()).is_err());
+            }
+        }
+        assert_eq!(
+            envelope_conversation_id(
+                &serde_json::json!({"event":"banana","conversation_id":"top"})
+            ),
+            None
+        );
     }
 }
