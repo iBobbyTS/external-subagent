@@ -1800,6 +1800,133 @@ fn long_native_error_paginates_without_loss() {
     assert!(!text.contains("sk-test-secret"));
 }
 
+/// Synthetic app-server error followed by a process exit, with no settling
+/// turn boundary. The release gate lets the test observe the processed error
+/// while the task is still running, independently of child scheduling.
+fn assert_native_error_survives_exit_before_boundary(exit_code: i32) {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let detail = "native detail 信息 ";
+    let body = detail.repeat(crate::rpc::MAX_RESULT_CHUNK_BYTES / detail.len() + 1);
+    let native = serde_json::json!({
+        "message": "upstream response stream closed",
+        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+        "additionalDetails": format!("api_key=sk-exit-secret；上下文：{body}"),
+    });
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": native,
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let script = format!(
+        "{}\nwhile [ ! -f exit-release ]; do sleep 0.01; done\nexit {exit_code}\n",
+        error_turn_script(workspace.path(), &[error]),
+    );
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "error then exit");
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    // This fixture's only unprojected notification is the attributable error.
+    // Its persisted observation follows recording of the complete native value.
+    while codex_event_count(workspace.path(), &agent_id, "raw.unknown") == 0 {
+        assert!(Instant::now() < deadline, "error notification was not processed");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (turn, stop_boundaries) = scheduler.active_turn_observation(&agent_id).unwrap();
+    assert!(turn.active, "an error notification must not settle the turn");
+    assert_eq!(turn.boundary, None);
+    assert_eq!(stop_boundaries, 0);
+    assert_eq!(
+        scheduler.store().get_task(&agent_id).unwrap().unwrap().phase,
+        TaskPhase::Running,
+    );
+    assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+    std::fs::write(workspace.path().join("exit-release"), "").unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::RuntimeLost);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::RuntimeLost));
+    assert_eq!(task.failure_code.as_deref(), Some("RUNTIME_TERMINAL"));
+    assert_eq!(
+        codex_event_count(workspace.path(), &agent_id, "runtime.turn_failed"),
+        0,
+    );
+    let diagnostic = scheduler.last_error(&agent_id).unwrap();
+    assert!(!diagnostic.contains("sk-exit-secret"));
+    assert!(!diagnostic.contains("additionalDetails"));
+    assert!(diagnostic.len() <= 16 * 1024, "diagnostics remain bounded");
+
+    let mut expected = native;
+    expected["additionalDetails"] = format!("api_key=[REDACTED]；上下文：{body}").into();
+    expected["willRetry"] = true.into();
+    let delivered: serde_json::Value = serde_json::from_str(&stored.result.final_text)
+        .unwrap_or_else(|error| {
+            panic!(
+                "runtime loss must deliver the already received native error: {error}; final_text prefix: {:?}",
+                stored.result.final_text.chars().take(160).collect::<String>(),
+            )
+        });
+    assert_eq!(delivered, expected);
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let first = service
+        .dispatch(RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+            wait_mode: crate::rpc::WaitMode::All,
+        }))
+        .unwrap();
+    let RpcSuccess::TaskWait(first) = first else {
+        panic!("wait response")
+    };
+    let first = first.result.expect("terminal runtime-loss result");
+    assert_eq!(first.outcome, TaskOutcome::RuntimeLost);
+    assert!(first.next_offset.is_some(), "the complete error must be paged");
+    assert!(!first.final_text.contains("sk-exit-secret"));
+    let mut text = first.final_text;
+    let mut offset = first.next_offset;
+    while let Some(next) = offset {
+        let response = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: next,
+                limit: 16384,
+            })
+            .unwrap();
+        let RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::RuntimeLost);
+        assert!(!page.final_text.contains("sk-exit-secret"));
+        text.push_str(&page.final_text);
+        offset = page.next_offset;
+    }
+    assert_eq!(text, stored.result.final_text);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        expected,
+    );
+}
+
+#[test]
+fn native_error_survives_exit_before_boundary_with_exit_zero() {
+    assert_native_error_survives_exit_before_boundary(0);
+}
+
+#[test]
+fn native_error_survives_exit_before_boundary_with_exit_one() {
+    assert_native_error_survives_exit_before_boundary(1);
+}
+
 #[test]
 fn strict_envelope_missing_thread_and_model_mismatch_fail_the_start_bounded() {
     let _guard = scripted_test_guard();

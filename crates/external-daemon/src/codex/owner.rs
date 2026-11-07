@@ -150,7 +150,19 @@ impl ManagedRuntime for CodexRuntimeOwner {
     }
 
     fn diagnostic_failure(&self) -> Option<String> {
-        self.shared.turn_tracker.failure_detail()
+        self.shared.turn_tracker.failure_detail().or_else(|| {
+            // An error notification does not settle a turn, but remains its
+            // native cause if the process exits before a settling boundary.
+            // A recovered error from a completed turn must not be reused.
+            if !self.shared.turn_tracker.snapshot().active {
+                return None;
+            }
+            let native = self.shared.turn_failure.lock().unwrap().clone()?;
+            crate::scheduler::turn_failure_detail(&serde_json::json!({
+                "payload": {"error": native},
+            }))
+            .map(|detail| detail.to_string())
+        })
     }
 
     fn diagnostic_tail(&self) -> String {
