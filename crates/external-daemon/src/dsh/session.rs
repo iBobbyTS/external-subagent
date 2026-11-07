@@ -46,7 +46,7 @@ impl DshRuntimeOwner {
                 self.shared
                     .apply_failed_settlement("ACP_PROMPT_WRITE_FAILED", None);
             }
-            RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+            RuntimeCommandError::InvalidSession(dsh_session_message(&error).into())
         })?;
         let shared = Arc::clone(&self.shared);
         thread::Builder::new()
@@ -104,20 +104,20 @@ impl DshRuntimeOwner {
                 )
             }
             Err(message) => {
-                return Err(RuntimeCommandError::InvalidSession(message));
+                return Err(RuntimeCommandError::InvalidSession(message.into()));
             }
         };
         let mut session = self.session.lock().unwrap();
         let remaining = || remaining_time(deadline);
         let capabilities = session
             .initialize(remaining()?)
-            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error)))?;
+            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error).into()))?;
         transport::require_build_capabilities(&capabilities)
-            .map_err(|error| RuntimeCommandError::InvalidSession(error.to_string()))?;
+            .map_err(|error| RuntimeCommandError::InvalidSession(error.to_string().into()))?;
         let cwd = PathBuf::from(&task.workspace_path);
         session
             .new_session(&cwd, remaining()?)
-            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error)))?;
+            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error).into()))?;
         let session_id = session
             .session_id()
             .expect("session id is set after new_session")
@@ -126,9 +126,9 @@ impl DshRuntimeOwner {
         let configured_model = if let Some(token) = model.as_deref() {
             session.set_model(token, remaining()?).map_err(|error| match error {
                 SessionError::Remote(_) | SessionError::Model(_) => {
-                    RuntimeCommandError::ModelRejected(model_rejection_message(&error))
+                    RuntimeCommandError::ModelRejected(model_rejection_message(&error).into())
                 }
-                error => RuntimeCommandError::InvalidSession(dsh_session_message(&error)),
+                error => RuntimeCommandError::InvalidSession(dsh_session_message(&error).into()),
             })?;
             Some(token.to_owned())
         } else {
@@ -144,7 +144,7 @@ impl DshRuntimeOwner {
             session
                 .set_reasoning_effort(token, remaining()?)
                 .map_err(|error| {
-                    RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+                    RuntimeCommandError::InvalidSession(dsh_session_message(&error).into())
                 })?;
         }
         // The initial prompt only leaves after initialize, session/new, and

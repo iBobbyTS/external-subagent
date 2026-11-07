@@ -375,12 +375,21 @@ impl Scheduler {
             }
         };
         if let Some(disposition) = existing_disposition {
+            let winner = self.inner.store.pending_request(agent_id, request_id)?.ok_or_else(|| {
+                SchedulerError::Store(StoreError::InvalidState(format!("unknown request {request_id}")))
+            })?;
+            let effective_decision = winner.response_decision.ok_or_else(|| {
+                SchedulerError::InvalidConfig("persisted response outcome is incomplete".into())
+            })?;
+            let policy_overrode = effective_decision != decision;
             return Ok(ResponseOutcome {
-                disposition,
+                disposition: if winner.state == PendingRequestState::Responded {
+                    ResponseDisposition::AlreadyResponded
+                } else { disposition },
                 requested_decision: decision.to_owned(),
-                effective_decision: decision.to_owned(),
-                policy_overrode: false,
-                policy_reason_code: None,
+                effective_decision,
+                policy_overrode,
+                policy_reason_code: policy_overrode.then_some(winner.response_content).flatten(),
             });
         }
         #[cfg(test)]

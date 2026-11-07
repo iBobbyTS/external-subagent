@@ -304,7 +304,7 @@ printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","eve
 pad=$(awk 'BEGIN{for(i=0;i<12000;i++)printf "x"}')
 printf '%s\n' "{\"method\":\"session/event\",\"params\":{\"type\":\"model.streaming\",\"eventId\":\"e-big\",\"turnId\":\"t1\",\"payload\":{\"kind\":\"tool_call\",\"toolCallId\":\"c-big\",\"toolName\":\"Read\",\"input\":{\"path\":\"$pad\"}}}}"
 while [ ! -f release-observe ]; do sleep 0.01; done
-printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","payload":{"kind":"text_delta","delta":"final answer","assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"message.finished","payload":{"assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"turn.completed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","payload":{"kind":"text_delta","delta":"final answer","assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"message.finished","payload":{"assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"turn.completed","payload":{"response":"final answer"}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#;
 
@@ -605,9 +605,113 @@ printf '%s\n' '{"id":2,"result":{}}'
 read request
 printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
 printf failed-turn-tail >&2
-printf '%s\n' '{"method":"session/event","params":{"type":"turn.failed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.failed","payload":{"error":{"message":"RUNTIME_TERMINAL"}}}}'
 sleep 2
 "#;
+
+    #[test]
+    fn zcode_typed_terminal_reaches_wait_observe_and_paged_result_after_complete_batch() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+        let files = tempfile::tempdir().unwrap();
+        let release = files.path().join("release");
+        let final_event = files.path().join("final.json");
+        let final_text = format!("prefix {}", "完整答案".repeat(crate::rpc::MAX_RESULT_CHUNK_BYTES / 12 + 100));
+        fs::write(&final_event, format!("{}\n", serde_json::json!({"method":"session/event","params":{
+            "eventId":"final","sessionId":"typed-session","turnId":"typed-turn","type":"turn.completed","payload":{"response":final_text}
+        }}))).unwrap();
+        let protocol = format!(r#"
+read request
+printf '%s\n' '{{"id":1,"result":{{"session":{{"sessionId":"typed-session"}}}}}}'
+read request
+printf '%s\n' '{{"id":2,"result":{{}}}}'
+read request
+printf '%s\n' '{{"id":3,"result":{{}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.started","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"model.request.status","requestId":"request","status":"model_request_started","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","sessionId":"typed-session","turnId":"typed-turn","payload":{{"kind":"text_delta","assistantMessageId":"m","delta":"prefix "}}}}}}'
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"turn.terminal","status":"success","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","sessionId":"typed-session","turnId":"typed-turn","payload":{{"kind":"tool_call","toolCallId":"call","toolName":"Read","input":{{"path":"example"}}}}}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+cat '{}'
+while read request; do :; done
+"#, release.display(), final_event.display());
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+        scheduler.start_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.observation_snapshot(&agent_id).tools.is_empty() {
+            assert!(Instant::now() < deadline, "adapter batch did not reach observer");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(scheduler.passive_activity_snapshot(&agent_id).unwrap().model_request_active);
+        assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+        let (_, runtime, _, _, _) = scheduler.active_session(&agent_id).unwrap();
+        assert!(runtime.turn_snapshot().active, "telemetry terminal must not release scheduler");
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let query = || RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()), wait_time: 0,
+            message_id: None, wait_mode: crate::rpc::WaitMode::All,
+        });
+        let RpcSuccess::TaskWait(waiting) = service.dispatch(query()).unwrap() else { panic!("wait") };
+        assert!(waiting.result.is_none());
+        fs::write(&release, "settle").unwrap();
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        assert_eq!(stored.result.final_text, final_text);
+        assert!(!runtime.turn_snapshot().active);
+        let RpcSuccess::TaskWait(waited) = service.dispatch(query()).unwrap() else { panic!("wait") };
+        let first = waited.result.unwrap();
+        assert!(first.next_offset.is_some());
+        let mut text = first.final_text;
+        let mut offset = first.next_offset;
+        while let Some(next) = offset {
+            let RpcSuccess::TaskResult { result: Some(page), .. } = service.dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(), offset: next, limit: 16384,
+            }).unwrap() else { panic!("result page") };
+            text.push_str(&page.final_text);
+            offset = page.next_offset;
+        }
+        assert_eq!(text, final_text);
+    }
+
+    #[test]
+    fn zcode_native_permission_denial_resolves_pending_without_finishing_execution() {
+        let files = tempfile::tempdir().unwrap();
+        let deny = files.path().join("deny");
+        let finish = files.path().join("finish");
+        let protocol = format!(r#"{RUNNING_PROTOCOL}
+printf '%s\n' '{{"method":"session/event","params":{{"type":"tool.updated","payload":{{"kind":"started","toolCallId":"call","toolName":"Bash"}}}}}}'
+printf '%s\n' '{{"id":42,"method":"interaction/requestPermission","params":{{"toolCallId":"call","toolName":"Bash","options":[{{"optionId":"deny","kind":"reject_once","label":"Deny"}}]}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"permission.lifecycle","phase":"denied","toolCallId":"call"}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"continued after native denial"}}}}}}'
+while read request; do :; done
+"#, deny.display(), finish.display());
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+        scheduler.start_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request_id = loop {
+            let pending = scheduler.store().pending_requests(&agent_id).unwrap();
+            if let Some(request) = pending.first() { break request.request_id.clone(); }
+            assert!(Instant::now() < deadline, "native permission was not published");
+            thread::sleep(Duration::from_millis(10));
+        };
+        fs::write(&deny, "deny natively").unwrap();
+        loop {
+            if scheduler.store().pending_requests(&agent_id).unwrap().is_empty() { break; }
+            assert!(Instant::now() < deadline, "native denial did not resolve pending input");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let request = scheduler.store().pending_request(&agent_id, &request_id).unwrap().unwrap();
+        assert_eq!(request.state, external_store::PendingRequestState::Responded);
+        assert_eq!(request.response_decision.as_deref(), Some("deny"));
+        let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+        assert_eq!(activity.active_tools.len(), 1);
+        assert_eq!(activity.window_60s.tool_calls_completed, 0);
+        assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+        fs::write(&finish, "finish").unwrap();
+        assert_eq!(await_result(&scheduler, &agent_id).result.outcome, TaskOutcome::Completed);
+    }
 
     /// A completed turn that never verifies a visible final text.
     const MISSING_TEXT_PROTOCOL: &str = r#"
@@ -618,7 +722,7 @@ printf '%s\n' '{"id":2,"result":{}}'
 read request
 printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
 printf missing-text-tail >&2
-printf '%s\n' '{"method":"session/event","params":{"type":"turn.completed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.completed","payload":{"response":""}}}'
 sleep 2
 "#;
 
@@ -628,7 +732,7 @@ sleep 2
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
-        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), serde_json::json!({"message":"RUNTIME_TERMINAL"}));
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         let raw = task.failure_message.expect("persisted failure detail");
         assert!(raw.len() <= PERSISTABLE_RECORD_BYTES);
@@ -641,15 +745,14 @@ sleep 2
             .as_str()
             .unwrap()
             .contains("failed-turn-tail"));
-        // The immutable result keeps the bare reason code (final_text
-        // semantics unchanged).
-        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+        // The immutable result keeps the complete synthetic native error.
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), serde_json::json!({"message":"RUNTIME_TERMINAL"}));
     }
 
     #[test]
     fn failed_turn_keeps_public_cause_instead_of_cleanup_exit() {
         let protocol = FAILED_TURN_PROTOCOL.replace(
-            r#""type":"turn.failed""#,
+            r#""type":"turn.failed","payload":{"error":{"message":"RUNTIME_TERMINAL"}}"#,
             r#""type":"turn.failed","payload":{"error":{"message":"Model request failed.","underlyingErrorMessage":"read EADDRNOTAVAIL","code":"model_request_failed","attribution":{"retryable":false},"data":{"apiKey":"private-data"}}}"#,
         );
         let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
@@ -1044,13 +1147,13 @@ exit {exit_code}
             r#"{RUNNING_PROTOCOL}
 read request
 printf '%s\n' "$request" >> steer.jsonl
-printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 read request
 printf '%s\n' "$request" >> steer.jsonl
 printf '%s\n' '{{"id":5,"result":{{"turnId":"steered-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
 while read request; do
   request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 done
 "#
         );
@@ -1111,7 +1214,7 @@ done
             let reply = if failure == "stop" {
                 r#"printf '%s\n' '{"id":4,"error":{"code":-32001,"message":"stop refused"}}'"#
             } else {
-                r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"session/event","params":{"type":"turn.failed"}}'
+                r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"session/event","params":{"type":"turn.failed","payload":{"error":{"message":"cancelled"}}}}'
 read request
 printf '%s\n' '{"id":5,"error":{"code":-32002,"message":"send refused"}}'"#
             };
@@ -1121,7 +1224,7 @@ read request
 {reply}
 while read request; do
   request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 done
 "#
             );
@@ -1174,12 +1277,12 @@ done
         let script = format!(
             r#"{RUNNING_PROTOCOL}
 while [ ! -f release-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":""}}}}}}'
 read request
 printf '%s\n' "$request" >> deliveries.jsonl
 printf '%s\n' '{{"id":4,"result":{{"turnId":"queued-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
 while [ ! -f finish-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"queued answer","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"queued answer","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"queued answer"}}}}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#
         );
@@ -1248,7 +1351,7 @@ printf '%s\n' '{{"id":"srv-input-1","method":"interaction/requestUserInput","par
 read answer
 printf '%s\n' "$answer" >> deliveries.jsonl
 while [ ! -f release-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"answered with the release scope","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"answered with the release scope","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"answered with the release scope"}}}}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#
         );
@@ -1465,7 +1568,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         let script = format!(
             r#"{RUNNING_PROTOCOL}
 printf normal-stderr-tail >&2
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"task answer","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"task answer","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"task answer"}}}}}}'
 sleep 2
 "#
         );
@@ -2559,7 +2662,7 @@ mod transport_failure_tests {
         let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
         connection
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='driver.oversized_line'",
+                "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND (event_type='driver.oversized_line' OR (event_type='runtime.fact' AND json_extract(payload_json,'$.category')='transport' AND json_extract(payload_json,'$.reason')='truncated'))",
                 [agent_id],
                 |row| row.get(0),
             )
@@ -2588,7 +2691,7 @@ printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type"
             "{ZCODE_RUNNING_PREFIX}\
 printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.streaming\",\"payload\":{{\"kind\":\"text_delta\",\"delta\":\"queued task answer\",\"assistantMessageId\":\"m1\"}}}}}}' \
 '{{\"method\":\"session/event\",\"params\":{{\"type\":\"message.finished\",\"payload\":{{\"assistantMessageId\":\"m1\"}}}}}}' \
-'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\"}}}}'\nsleep 1\n"
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\",\"payload\":{{\"response\":\"queued task answer\"}}}}}}'\nsleep 1\n"
         )
     }
 
@@ -3168,6 +3271,7 @@ mod turn_adjudication_tests {
         publisher: Arc<Publisher>,
         tracker: Arc<TurnTracker>,
         respond_fails: bool,
+        response_calls: AtomicU64,
         cleanup_calls: Arc<AtomicU64>,
     }
 
@@ -3263,6 +3367,7 @@ mod turn_adjudication_tests {
             _validated_denial: Option<&external_core::ValidatedPermissionDenial>,
             _deadline: Instant,
         ) -> Result<(), RuntimeCommandError> {
+            self.response_calls.fetch_add(1, Ordering::AcqRel);
             if self.respond_fails {
                 Err(RuntimeCommandError::InvalidSession(
                     "injected response failure".into(),
@@ -3292,6 +3397,7 @@ mod turn_adjudication_tests {
                 publisher: Arc::new(Publisher::new(sink)),
                 tracker: Arc::new(TurnTracker::new()),
                 respond_fails: self.respond_fails,
+                response_calls: AtomicU64::new(0),
                 cleanup_calls: Arc::clone(&self.cleanup_calls),
             });
             self.runtimes.lock().unwrap().push(Arc::clone(&runtime));
@@ -3373,6 +3479,243 @@ mod turn_adjudication_tests {
             runtimes,
             cleanup_calls,
             agent_id: submitted.agent_id,
+        }
+    }
+
+    #[test]
+    fn zcode_native_resolution_and_user_respond_have_one_pending_winner() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget};
+        use std::sync::mpsc;
+        for (method, decision, content, native_method, native_params, native_decision) in [
+            (
+                external_contract::INTERACTION_REQUEST_PERMISSION,
+                "allow",
+                None,
+                "v4/telemetry/event",
+                serde_json::json!({"kind":"permission.lifecycle","phase":"denied","toolCallId":"race-call","requestId":"race-native-request","turnId":"race-turn"}),
+                "deny",
+            ),
+            (
+                external_contract::INTERACTION_REQUEST_USER_INPUT,
+                "answer",
+                Some("client answer"),
+                "session/event",
+                serde_json::json!({"type":"userInput.resolved","turnId":"race-turn","payload":{"requestId":"race-native-request","value":"native answer"}}),
+                "answer",
+            ),
+        ] {
+            for stage in [
+                ResponseClaimHookStage::BeforeClaim,
+                ResponseClaimHookStage::AfterClaim,
+            ] {
+                let harness = harness(false, "");
+                let scheduler = &harness.scheduler;
+                let agent_id = &harness.agent_id;
+                scheduler.start_ready().unwrap();
+                assert_eq!(
+                    scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+                    TaskPhase::Running
+                );
+                let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
+                let (task, launch) = runtime.publisher.event_scope();
+                let mut adapter = crate::zcode::events::ZcodeAdapter::new(task, launch);
+                let send = |adapter: &mut crate::zcode::events::ZcodeAdapter,
+                            method: &str,
+                            params: serde_json::Value| {
+                    let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                        method: method.into(),
+                        raw: serde_json::json!({"method":method,"params":params}),
+                    });
+                    runtime
+                        .publisher
+                        .emit_typed(adapter.decode(&inbound).unwrap(), &runtime.tracker);
+                };
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"turn.started","turnId":"race-turn"}),
+                );
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"tool.updated","turnId":"race-turn","payload":{"kind":"started","toolCallId":"race-call","toolName":"Bash"}}),
+                );
+                let request = Inbound::Message(WireMessage::Request(
+                    external_contract::RequestEnvelope::new(
+                        WireId::String("race-native-request".into()),
+                        method,
+                        serde_json::json!({"toolCallId":"race-call","toolName":"Bash","question":"allow?"}),
+                    ),
+                ));
+                assert!(adapter.decode(&request).is_none());
+                runtime.emit(request);
+                let pending = scheduler.store().pending_requests(agent_id).unwrap();
+                assert_eq!(pending.len(), 1);
+                let request_id = pending[0].request_id.clone();
+                let connection = rusqlite::Connection::open(scheduler.store().database_path()).unwrap();
+                connection.execute_batch("CREATE TABLE pending_race_transitions(old_state TEXT,new_state TEXT);
+                    CREATE TRIGGER record_pending_race AFTER UPDATE OF state ON pending_requests
+                    WHEN OLD.state<>NEW.state BEGIN INSERT INTO pending_race_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let release_rx = Mutex::new(release_rx);
+                *scheduler.inner.response_claim_hook.lock().unwrap() = Some(Arc::new(move |at, _| {
+                    if at == stage {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("claim gate must release");
+                    }
+                }));
+                let response_scheduler = scheduler.clone();
+                let response_agent = agent_id.clone();
+                let response_request = request_id.clone();
+                let responder = thread::spawn(move || {
+                    response_scheduler.respond_request(
+                        &response_agent,
+                        &response_request,
+                        decision,
+                        content,
+                    )
+                });
+                entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("respond must reach the selected claim boundary");
+                let state = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap()
+                    .state;
+                assert_eq!(
+                    state,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        PendingRequestState::Sending
+                    } else {
+                        PendingRequestState::Pending
+                    }
+                );
+                let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+                let query = || {
+                    RpcMethod::TaskWait(TaskWaitQuery {
+                        agent_id: WaitTarget::One(agent_id.clone()),
+                        wait_time: 0,
+                        message_id: None,
+                        wait_mode: WaitMode::All,
+                    })
+                };
+                let RpcSuccess::TaskWait(waiting) = service.dispatch(query()).unwrap() else {
+                    panic!("wait")
+                };
+                assert_eq!(
+                    waiting.pending_requests.len(),
+                    usize::from(stage == ResponseClaimHookStage::BeforeClaim),
+                    "SENDING is not an answerable wait request"
+                );
+                // SENDING is owned by the user responder. A native contender must
+                // lose that claim, then the user completes it exactly once. At
+                // BeforeClaim the native resolution owns the only claim instead.
+                send(&mut adapter, native_method, native_params.clone());
+                let during = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    during.state,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        PendingRequestState::Sending
+                    } else {
+                        PendingRequestState::Responded
+                    }
+                );
+                let second = scheduler
+                    .respond_request(agent_id, &request_id, decision, content)
+                    .unwrap();
+                assert_eq!(
+                    second.disposition,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        ResponseDisposition::InFlight
+                    } else {
+                        ResponseDisposition::AlreadyResponded
+                    }
+                );
+                release_tx.send(()).unwrap();
+                let response = responder.join().unwrap().unwrap();
+                *scheduler.inner.response_claim_hook.lock().unwrap() = None;
+                assert_eq!(
+                    response.disposition,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        ResponseDisposition::Responded
+                    } else {
+                        ResponseDisposition::AlreadyResponded
+                    }
+                );
+                let expected_decision = if stage == ResponseClaimHookStage::AfterClaim {
+                    decision
+                } else {
+                    native_decision
+                };
+                assert_eq!(
+                    response.effective_decision, expected_decision,
+                    "the loser must report the persisted winner"
+                );
+                assert_eq!(
+                    runtime.response_calls.load(Ordering::Acquire),
+                    u64::from(stage == ResponseClaimHookStage::AfterClaim)
+                );
+                let closed = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(closed.state, PendingRequestState::Responded);
+                assert_eq!(closed.response_decision.as_deref(), Some(expected_decision));
+                send(&mut adapter, native_method, native_params.clone());
+                let transitions: Vec<(String, String)> = connection
+                    .prepare("SELECT old_state,new_state FROM pending_race_transitions ORDER BY rowid")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(
+                    transitions,
+                    vec![
+                        ("PENDING".into(), "SENDING".into()),
+                        ("SENDING".into(), "RESPONDED".into())
+                    ]
+                );
+                let RpcSuccess::TaskWait(resolved) = service.dispatch(query()).unwrap() else {
+                    panic!("resolved wait")
+                };
+                assert!(resolved.pending_requests.is_empty());
+                assert_eq!(
+                    scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+                    TaskPhase::Running
+                );
+                assert!(
+                    resolved.result.is_none(),
+                    "input resolution cannot settle a turn"
+                );
+                let activity = scheduler.passive_activity_snapshot(agent_id).unwrap();
+                assert_eq!(activity.active_tools.len(), 1);
+                assert_eq!(activity.window_60s.tool_calls_started, 1);
+                assert_eq!(activity.window_60s.tool_calls_completed, 0);
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"tool.updated","turnId":"race-turn","payload":{"kind":"result","toolCallId":"race-call","result":{}}}),
+                );
+                assert!(scheduler
+                    .passive_activity_snapshot(agent_id)
+                    .unwrap()
+                    .active_tools
+                    .is_empty());
+                scheduler.cancel_task(agent_id).unwrap();
+            }
         }
     }
 

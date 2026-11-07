@@ -350,6 +350,11 @@ pub(crate) fn unreaped_general(
 }
 
 impl LifecycleSink for StoreLifecycleSink {
+    fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> {
+        Some((external_contract::events::TaskId(self.agent_id.clone()),
+            external_contract::events::LaunchId(format!("{}:{}", self.agent_id, self.owner_epoch))))
+    }
+
     fn emit(&self, record: LifecycleRecord) {
         let mut admission = self.runtime_lifecycle.admit_event();
         if admission.is_none() {
@@ -369,11 +374,16 @@ impl LifecycleSink for StoreLifecycleSink {
         // persisted. Latching is a pure write under the sink's own state lock:
         // it never publishes a terminal and never re-enters stop, so the
         // shared `Publisher` callback lock is never re-entered.
-        if let RuntimeEvent::Driver(Inbound::OversizedLine { bytes }) = &record.event {
+        let frame_bytes = match &record.event {
+            RuntimeEvent::Driver(Inbound::OversizedLine { bytes }) => Some(*bytes),
+            RuntimeEvent::Normalized(external_contract::events::NormalizedEvent { fact: external_contract::events::EventFact::TransportFault { kind: external_contract::events::TransportFaultKind::FrameLimit, .. }, .. }) => Some(external_runtime::MAX_NDJSON_LINE_BYTES + 1),
+            _ => None,
+        };
+        if let Some(bytes) = frame_bytes {
             if state.transport_failure.is_none() {
                 state.transport_failure = Some(TransportFrameLimit {
                     reason: crate::TRANSPORT_FRAME_LIMIT_REASON,
-                    bytes: *bytes,
+                    bytes,
                     cap: external_runtime::MAX_NDJSON_LINE_BYTES,
                     last_event_seq: state.last_source_sequence,
                 });
@@ -382,6 +392,29 @@ impl LifecycleSink for StoreLifecycleSink {
         if matches!(record.event, RuntimeEvent::Terminal(_)) {
             state.pending_terminal_sequence = Some(record.sequence);
             return;
+        }
+        if let RuntimeEvent::Normalized(event) = &record.event {
+            if let external_contract::events::EventFact::InputResolved(resolution) = &event.fact {
+                let resolved = (|| -> Result<(), StoreError> {
+                    let correlation = serde_json::to_string(&resolution.request_id).expect("wire id");
+                    for pending in self.store.pending_requests(&self.agent_id)? {
+                        if pending.correlation_id == correlation {
+                            let decision = match resolution.outcome {
+                                external_contract::events::InputOutcome::Denied => "deny",
+                                external_contract::events::InputOutcome::Allowed => "allow",
+                                external_contract::events::InputOutcome::Answered => "answer",
+                                external_contract::events::InputOutcome::Cancelled => "cancel",
+                            };
+                            let claim = self.store.claim_pending_response_if_accepting(&self.agent_id, &pending.request_id, decision, None)?;
+                            if matches!(claim, external_store::PendingResponseClaimDisposition::Claimed) {
+                                self.store.complete_pending_response(&self.agent_id, &pending.request_id)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = resolved { state.first_error = Some(error.to_string()); return; }
+            }
         }
         let pending_request_id = match &record.event {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
@@ -477,6 +510,12 @@ impl LifecycleSink for StoreLifecycleSink {
             redaction_level: projection.redaction_level.into(),
             terminal: None,
             turn_state: match &record.event {
+                RuntimeEvent::Normalized(event) => match &event.fact {
+                    external_contract::events::EventFact::TurnStarted { .. } => Some(TurnState::Active),
+                    external_contract::events::EventFact::TurnSettled(settlement) => Some(
+                        if settlement.outcome == external_contract::events::TurnOutcome::Failed { TurnState::Failed } else { TurnState::Idle }),
+                    _ => None,
+                },
                 RuntimeEvent::Driver(Inbound::Lifecycle { method, .. }) => match method.as_str() {
                     "turn.started" => Some(TurnState::Active),
                     "turn.completed" => Some(TurnState::Idle),

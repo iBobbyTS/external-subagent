@@ -1,102 +1,7 @@
-//! The daemon-side tool-activity contract: two event vocabularies, one
-//! emission mode per adapter, and the single point where a malformed frame
-//! is refused instead of inventing activity.
-//!
-//! # Two vocabularies
-//!
-//! Producers feed the wait window over the generic `session/event` stream (or
-//! the `v4/telemetry/event` stream) with one of two shapes, both shared with
-//! [`external_contract::activity`]:
-//!
-//! - **Detailed**: `tool.updated` / `streamRecovery.updated` with
-//!   `payload.kind` one of `scheduled`/`started`/`result`/`error`/`batch`,
-//!   plus `payload.toolCallId` and an optional `payload.toolName` (the DSH and
-//!   ZCode native dialects). A single `started` contributes weight `1`; the
-//!   sample identity is `tool:{toolCallId}:{phase}` and it also drives
-//!   `active_tools` bookkeeping (started/scheduled insert, result/error
-//!   remove). Telemetry `tool.lifecycle` frames carry the same fields with
-//!   `phase` in place of `kind`.
-//! - **Count-only**: `payload.kind == "count"` with a bounded positive
-//!   integer `payload.count` and a params-level `eventId`. It carries no tool
-//!   identity; the sample identity is `tool:{eventId}:count`, the weight is
-//!   `count`, and it never touches `active_tools`. [`MAX_TOOL_COUNT`] is the
-//!   single upper bound: `1..=MAX_TOOL_COUNT` is accepted, `0`, a value above
-//!   the bound, a non-integer, or a missing/unbounded `eventId` invents
-//!   nothing.
-//!
-//! Both identities are stable and **re-delivery idempotent** at the tracker:
-//! an already-admitted identity neither adds weight nor refreshes the
-//! sample's receipt time. The one exception is a source upgrade: when a
-//! `v4/telemetry/event` sample for an identity is later replaced by the same
-//! identity delivered over `session/event`, the tracker accepts the session
-//! sample in place of the telemetry one and re-stamps it at the new receipt
-//! time (the Telemetry→Session replace path in `observe_at`). This models a
-//! producer upgrading a degraded telemetry frame to the authoritative session
-//! frame; after the replacement the identity is again re-delivery idempotent.
-//!
-//! # Emission modes
-//!
-//! An adapter declares which vocabularies it may emit as a
-//! [`ToolActivityMode`], inferred by `PassiveActivityTracker::for_adapter`:
-//!
-//! - `"codex"` → [`ToolActivityMode::CountOnly`] (the Codex item whitelist
-//!   folds first-seen tool items into count events);
-//! - `"zcode"` | `"dsh"` | `"agy"` → [`ToolActivityMode::Detailed`] (native
-//!   detailed `tool.updated` events);
-//! - any other name → [`ToolActivityMode::Mixed`] (accept both).
-//!
-//! The bare `PassiveActivityTracker::new()` is fixed to `Mixed` so the
-//! pre-mode behavior is preserved for callers that never register an adapter.
-//! In production the only construction site is the scheduler lifecycle, which
-//! derives the name from `task_agent` → `"zcode"`/`"dsh"`/`"codex"`/`"agy"`
-//! (or the `"zcode"` fallback), so `Mixed` is unreachable on the production
-//! path and exists only as the safe default for unregistered names.
-//!
-//! # Gating and its expected semantic change surface
-//!
-//! The mode is applied at three entry points: the session `tool.updated` /
-//! `streamRecovery.updated` arm (count branch and every detailed phase), and
-//! the `v4/telemetry/event` `tool.lifecycle` arm. `Detailed` ignores the
-//! count branch; `CountOnly` ignores every detailed tool phase at both
-//! entries (no sample, no transition, nothing enters `active_tools`);
-//! `Mixed` accepts both.
-//!
-//! This is behavior-preserving for the current producers — ZCode/DSH emit
-//! only detailed started/result, Codex emits only count, and no producer
-//! emits `v4/telemetry/event` today. The one expected change is for
-//! pass-through notifications: an adapter (notably the Codex pump) re-emits
-//! unrecognized frames unchanged, so a future `v4/telemetry` `tool.lifecycle`
-//! frame observed under `CountOnly` is now ignored where the pre-mode parser
-//! would have accepted it. That is the intended effect of strict mode, not a
-//! regression.
-//!
-//! # Registering a future acquisition mechanism
-//!
-//! Pick the archetype that matches how the adapter learns about tool calls,
-//! then implement it against the shared constructors in
-//! [`external_contract::activity`]:
-//!
-//! - **Event-lifecycle** (the Codex paradigm): the adapter whitelists the
-//!   tool item types it counts, tracks first-seen ids for the current turn,
-//!   and emits one count event per newly seen tool item. Register as
-//!   `CountOnly`.
-//! - **Polling**: a daemon-side poller observes the adapter's progress on an
-//!   interval and emits a count event carrying the delta observed since the
-//!   previous poll. Register as `CountOnly`.
-//! - **Cumulative counter**: the adapter owns a monotonic counter and emits a
-//!   count event carrying only the increment (never the running total, which
-//!   would double-count). Register as `CountOnly`.
-//! - **Post-hoc batch**: the adapter reports a completed batch of `N` calls
-//!   at once as a single count event with `count = N`. Register as
-//!   `CountOnly`.
-//!
-//! # Window and receipt-time semantics
-//!
-//! The wait window is a 60-second rolling window measured from the **receipt
-//! time** of each admitted sample, not from any producer-side timestamp.
-//! Re-delivering an admitted identity does not refresh that receipt time, and
-//! a late backfill (a count for work that happened earlier) is weighted at
-//! the moment the daemon observes it, exactly like any other sample.
+//! Legacy activity vocabulary for channels awaiting typed migration.
+//! ZCode session/telemetry notifications are decoded by zcode::events and
+//! bypass this parser. The remaining canonical session shapes belong to
+//! Codex/DSH/AGY until their respective adapter migrations.
 
 use external_contract::activity::MAX_TOOL_COUNT;
 
@@ -325,56 +230,6 @@ fn parse_activity_message(
                 parsed.identity = event_id.or(turn_id).map(|id| format!("turn:{id}:failed"));
             }
             _ => {}
-        }
-    } else if method == "v4/telemetry/event" {
-        parsed.telemetry_known = true;
-        match params.get("kind").and_then(serde_json::Value::as_str) {
-            Some("stream.chunk") => {
-                let channel = match params.get("channel").and_then(serde_json::Value::as_str) {
-                    Some("thought") => "reasoning",
-                    Some("text") => "text",
-                    _ => {
-                        parsed.telemetry_known = false;
-                        return parsed;
-                    }
-                };
-                parsed.stream_key = stream_key(params, params, channel);
-                parsed.identity =
-                    activity_id(params.get("eventId")).map(|id| format!("stream:{id}"));
-                parsed.sample = Some(if channel == "reasoning" {
-                    ActivitySampleKind::ReasoningDelta
-                } else {
-                    ActivitySampleKind::TextDelta
-                });
-            }
-            Some("tool.lifecycle") => {
-                if mode != ToolActivityMode::CountOnly {
-                    parse_tool_activity(&mut parsed, params, source);
-                }
-            }
-            Some("model.request.status") => {
-                let started = params.get("status").and_then(serde_json::Value::as_str)
-                    == Some("model_request_started");
-                let completed = params.get("status").and_then(serde_json::Value::as_str)
-                    == Some("model_request_completed");
-                if started || completed {
-                    parse_model_activity(&mut parsed, params, started);
-                } else {
-                    parsed.telemetry_known = false;
-                }
-            }
-            Some("permission.lifecycle") => {
-                match params.get("phase").and_then(serde_json::Value::as_str) {
-                    Some("requested") => parse_permission_activity(&mut parsed, params, true),
-                    Some("resolved") => parse_permission_activity(&mut parsed, params, false),
-                    _ => parsed.telemetry_known = false,
-                }
-            }
-            Some("turn.started") => parsed.transition = Some(ActivityTransition::TurnStarted),
-            Some("turn.completed") => parsed.transition = Some(ActivityTransition::TurnCompleted),
-            Some("turn.failed") => parsed.transition = Some(ActivityTransition::TurnFailed),
-            Some("usage.delta") => {}
-            _ => parsed.telemetry_known = false,
         }
     }
     parsed
@@ -872,20 +727,12 @@ mod tests {
                 "payload": {"kind": phase, "toolCallId": "call-1", "toolName": "Bash"},
             })
         }
-        fn telemetry_params(phase: &str) -> serde_json::Value {
-            serde_json::json!({
-                "kind": "tool.lifecycle",
-                "phase": phase,
-                "toolCallId": "call-1",
-                "toolName": "Bash",
-            })
-        }
         let phases = ["scheduled", "started", "result", "error", "batch"];
         // The vocabulary (tool.updated vs streamRecovery.updated) lives in
         // params.type; the dispatch entry is the transport method. Count
         // events are emitted under both session types, so each session entry
         // carries its own event type into the count assertion below.
-        let entries: [(&str, ActivitySource, fn(&str) -> serde_json::Value, Option<&str>); 3] = [
+        let entries: [(&str, ActivitySource, fn(&str) -> serde_json::Value, Option<&str>); 2] = [
             (
                 "session/event",
                 ActivitySource::Session,
@@ -897,12 +744,6 @@ mod tests {
                 ActivitySource::Session,
                 |phase| session_params("streamRecovery.updated", phase),
                 Some("streamRecovery.updated"),
-            ),
-            (
-                "v4/telemetry/event",
-                ActivitySource::Telemetry,
-                telemetry_params,
-                None,
             ),
         ];
 

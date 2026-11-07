@@ -13,6 +13,35 @@ pub(crate) fn lifecycle_projection(
     pending_request_id: Option<&str>,
 ) -> LifecycleProjection {
     let (event_type, payload, redaction_level) = match event {
+        RuntimeEvent::Normalized(event) => (
+            "runtime.fact",
+            serde_json::to_value(external_contract::events::LifecycleSummary {
+                category: Some(event.fact.lifecycle_category()), source: event.context.source.protocol,
+                discriminator: event.context.source.discriminator.clone(),
+                disposition: match event.fact {
+                    external_contract::events::EventFact::Diagnostic(ref diagnostic) if diagnostic.reason == external_contract::events::DiagnosticReason::UnknownSemantics => external_contract::events::DispositionKind::Unknown,
+                    external_contract::events::EventFact::CoverageGap(_) => external_contract::events::DispositionKind::InvalidLost,
+                    _ => external_contract::events::DispositionKind::Consumed,
+                },
+                reason: match &event.fact {
+                    external_contract::events::EventFact::Diagnostic(d) => Some(d.reason),
+                    external_contract::events::EventFact::CoverageGap(g) => Some(match g.reason {
+                        external_contract::events::LossReason::UnknownSemantics => external_contract::events::DiagnosticReason::UnknownSemantics,
+                        external_contract::events::LossReason::Malformed => external_contract::events::DiagnosticReason::Malformed,
+                        external_contract::events::LossReason::Truncated => external_contract::events::DiagnosticReason::Truncated,
+                        external_contract::events::LossReason::Dropped => external_contract::events::DiagnosticReason::Dropped,
+                    }),
+                    external_contract::events::EventFact::TransportFault { kind: external_contract::events::TransportFaultKind::FrameLimit, .. } => Some(external_contract::events::DiagnosticReason::Truncated),
+                    _ => None,
+                },
+                impact: match &event.fact {
+                    external_contract::events::EventFact::Diagnostic(d) => Some(d.impact.clone()),
+                    external_contract::events::EventFact::CoverageGap(g) => Some(g.impact.clone()),
+                    _ => None,
+                },
+            }).expect("safe summary"),
+            "allowlisted",
+        ),
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request))) => (
             "driver.message",
             serde_json::json!({

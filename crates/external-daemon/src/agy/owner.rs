@@ -124,7 +124,7 @@ impl AgyRuntimeOwner {
                 }
                 Ok(admission.model.clone().filter(|model| !model.is_empty()))
             }
-            Err(message) => Err(RuntimeCommandError::InvalidSession(message)),
+            Err(message) => Err(RuntimeCommandError::InvalidSession(message.into())),
         }
     }
 
@@ -237,7 +237,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         if observed != session_id {
             return Err(RuntimeCommandError::InvalidSession(format!(
                 "agy resumed conversation {observed} does not match the persisted session id"
-            )));
+            ).into()));
         }
         // A resumed conversation never replays the pre-stop prompt: the queued
         // message delivered by the scheduler is the sole trigger for the next

@@ -428,9 +428,9 @@ fn start_failure_error(reason: &str) -> RuntimeCommandError {
         || reason.contains("invalid effort")
         || reason.contains("model selection")
     {
-        RuntimeCommandError::ModelRejected(bounded)
+        RuntimeCommandError::ModelRejected(bounded.into())
     } else {
-        RuntimeCommandError::InvalidSession(bounded)
+        RuntimeCommandError::InvalidSession(bounded.into())
     }
 }
 

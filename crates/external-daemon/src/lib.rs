@@ -58,6 +58,7 @@ pub mod rpc;
 mod runtime_owner;
 mod scheduler;
 pub mod zcode;
+mod typed_inbound;
 use external_core::{
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
@@ -272,14 +273,68 @@ pub struct SessionReady {
     pub configured_model: Option<String>,
 }
 
+/// Existing classification text with an optional complete native error.
+/// String conversions preserve local validation constructors and their Display.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeCommandDetail {
+    pub message: String,
+    pub native_failure: Option<external_contract::events::NativeFailure>,
+}
+
+impl RuntimeCommandDetail {
+    pub fn from_native(message: impl Into<String>, original: &serde_json::Value) -> Self {
+        Self {
+            message: message.into(),
+            native_failure: Some(external_contract::events::NativeFailure {
+                original: scheduler::redact_native_error(original),
+                projection: None,
+            }),
+        }
+    }
+}
+impl From<String> for RuntimeCommandDetail {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            native_failure: None,
+        }
+    }
+}
+impl From<&str> for RuntimeCommandDetail {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl std::ops::Deref for RuntimeCommandDetail {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+impl fmt::Display for RuntimeCommandDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl fmt::Debug for RuntimeCommandDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.message, f)
+    }
+}
+impl PartialEq<&str> for RuntimeCommandDetail {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommandError {
     Unsupported,
     Timeout,
     Transport(String),
     Remote(serde_json::Value),
-    ModelRejected(String),
-    InvalidSession(String),
+    ModelRejected(RuntimeCommandDetail),
+    InvalidSession(RuntimeCommandDetail),
 }
 
 impl fmt::Display for RuntimeCommandError {
@@ -298,6 +353,18 @@ impl fmt::Display for RuntimeCommandError {
 }
 
 impl RuntimeCommandError {
+    /// Complete received error, credential-redacted, for the common error
+    /// consumer. Local validation errors have no native original.
+    pub fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        match self {
+            Self::Remote(original) => Some(external_contract::events::NativeFailure {
+                original: scheduler::redact_native_error(original), projection: None,
+            }),
+            Self::ModelRejected(detail) | Self::InvalidSession(detail) => detail.native_failure.clone(),
+            _ => None,
+        }
+    }
+
     fn diagnostic(&self, operation: &str) -> String {
         let mut detail = serde_json::json!({"operation": operation, "message": bounded_error(&self.to_string())});
         if let Self::Remote(value) = self {
@@ -312,7 +379,7 @@ impl RuntimeCommandError {
     }
 }
 
-// Keep only the remote code/message, never error.data or provider configuration.
+// Legacy diagnostic formatting stays bounded; native_failure() retains the original separately.
 impl std::error::Error for RuntimeCommandError {}
 
 impl From<RequestError> for RuntimeCommandError {
@@ -473,6 +540,7 @@ impl TurnTracker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeEvent {
     Driver(Inbound),
+    Normalized(external_contract::events::NormalizedEvent),
     Terminal(RuntimeTerminal),
 }
 
@@ -483,6 +551,9 @@ pub struct LifecycleRecord {
 }
 
 pub trait LifecycleSink: Send + Sync + 'static {
+    /// Production sinks supply the durable task and claim identity. Test sinks
+    /// may use the publisher's unique process-local launch scope.
+    fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> { None }
     fn emit(&self, record: LifecycleRecord);
 }
 
@@ -880,7 +951,7 @@ impl RuntimeOwner {
             let observed = configured_thought_level_from_result(result).map_err(|error| {
                 RuntimeCommandError::InvalidSession(format!(
                     "session/resume projection is invalid: {error}"
-                ))
+                ).into())
             })?;
             validate_requested_effort(
                 SESSION_RESUME,
@@ -961,7 +1032,7 @@ impl RuntimeOwner {
         let projection = SessionCreateProjection::from_result(result).map_err(|error| {
             RuntimeCommandError::InvalidSession(format!(
                 "session/create projection is invalid: {error}"
-            ))
+            ).into())
         })?;
         let session_id = projection.session_id.clone();
         // Correlation only: the command-plane session is still registered only
@@ -1035,7 +1106,7 @@ impl RuntimeOwner {
             return Err(RuntimeCommandError::InvalidSession(format!(
                 "MODEL_REQUEST_INVALID: {}",
                 bounded_prefix(requested, 128)
-            )));
+            ).into()));
         }
         let entry = projection
             .available_models
@@ -1051,7 +1122,7 @@ impl RuntimeOwner {
                 RuntimeCommandError::InvalidSession(model_not_offered_message(
                     requested,
                     &projection.available_models,
-                ))
+                ).into())
             })?;
         let (Some(provider), Some(model)) =
             (entry.provider_id.as_deref(), entry.model_id.as_deref())
@@ -1070,7 +1141,7 @@ impl RuntimeOwner {
                             "MODEL_NOT_OFFERED: effort {} not in levels [{}]",
                             bounded_prefix(effort, 128),
                             bounded_prefix(&entry.reasoning_levels.join(", "), 512)
-                        ))
+                        ).into())
                     })?,
             ),
             None => entry.default_level.as_deref(),
@@ -1101,7 +1172,7 @@ impl RuntimeOwner {
         let echo = set_model_projection_from_result(result).map_err(|error| {
             RuntimeCommandError::InvalidSession(format!(
                 "session/setModel projection is invalid: {error}"
-            ))
+            ).into())
         })?;
         let (Some(observed_provider), Some(observed_model)) =
             (echo.provider_id.as_deref(), echo.model_id.as_deref())
@@ -1433,21 +1504,14 @@ fn model_not_offered_message(requested: &str, available: &[CatalogModelEntry]) -
 /// is an unrecognized bootstrap failure and stays `InvalidSession` (scheduler
 /// `SESSION_START_FAILED`) instead of mislabeling the model as rejected.
 fn remote_set_model_error(error: &serde_json::Value) -> RuntimeCommandError {
-    let code = error
-        .get("data")
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str);
+    let code = error.get("data").and_then(|data| data.get("code")).and_then(serde_json::Value::as_str);
     match code {
-        Some("invalid_model_request" | "model_not_found") => {
-            RuntimeCommandError::ModelRejected(model_rejection_message(error))
-        }
-        Some(code) => RuntimeCommandError::InvalidSession(format!(
-            "session/setModel was rejected: {}",
-            bounded_prefix(code, 128)
-        )),
-        None => {
-            RuntimeCommandError::InvalidSession("session/setModel was rejected: unknown".into())
-        }
+        Some("invalid_model_request" | "model_not_found") => RuntimeCommandError::ModelRejected(
+            RuntimeCommandDetail::from_native(model_rejection_message(error), error)),
+        Some(code) => RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+            format!("session/setModel was rejected: {}", bounded_prefix(code, 128)), error)),
+        None => RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+            "session/setModel was rejected: unknown", error)),
     }
 }
 
@@ -1493,7 +1557,10 @@ fn spawn_event_pump(
     turn_tracker: Arc<TurnTracker>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
 ) {
-    thread::spawn(move || loop {
+    let (task_id, launch_id) = publisher.event_scope();
+    thread::spawn(move || {
+      let mut adapter = zcode::events::ZcodeAdapter::new(task_id, launch_id);
+      loop {
         if shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -1518,7 +1585,12 @@ fn spawn_event_pump(
                         }
                     }
                 }
-                turn_tracker.observe(&event);
+                if let Some(batch) = adapter.decode(&event) {
+                    publisher.emit_typed(batch, &turn_tracker);
+                    continue;
+                }
+                // Transport lifecycle markers duplicate the typed native boundary.
+                if matches!(event, Inbound::Lifecycle { .. }) { continue; }
                 let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
                 if is_exit_boundary {
                     driver.wait_diagnostics(Duration::from_secs(1));
@@ -1569,6 +1641,7 @@ fn spawn_event_pump(
                 return;
             }
         }
+      }
     });
 }
 
@@ -1794,7 +1867,7 @@ printf '%s\n' '{{"id":2,"result":{{}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
 printf '%s\n' '{{"id":3,"result":{{"turnId":"t1"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"effort ok","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"effort ok","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"effort ok"}}}}}}'
 while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 "#
         )

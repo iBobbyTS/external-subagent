@@ -1153,3 +1153,61 @@ mod tests {
         assert_eq!(snapshot.coverage.dropped_events, 1);
     }
 }
+
+impl ObservationState {
+    /// Typed facts already passed the native adapter's replay/shape checks.
+    pub(crate) fn observe_fact(&mut self, event: &external_contract::events::NormalizedEvent) {
+        use external_contract::events::*;
+        match &event.fact {
+            EventFact::PublicReasoningDelta(reasoning) if self.collect_reasoning => {
+                self.observe_reasoning(&reasoning.delta);
+                self.bump_snapshot();
+            }
+            EventFact::ToolChanged(tool) => {
+                // Progress and permission-only updates cannot invent a call.
+                if tool.phase == Some(ToolPhase::Progress)
+                    || (tool.phase.is_none() && tool.arguments.is_none())
+                {
+                    return;
+                }
+                let Some(name) = &tool.name else {
+                    return;
+                };
+                let input = match &tool.arguments {
+                    Some(ArgumentUpdate::Snapshot(value)) => Some(value),
+                    _ => None,
+                };
+                let (arguments, mut truncated, redacted) = project_arguments(input);
+                if input.is_none() {
+                    truncated = true;
+                }
+                let turn = format!("{:?}:{:?}", event.context.launch_id, event.context.turn_id);
+                self.record_tool_call(&turn, &tool.call_id.0, name, arguments, truncated, redacted);
+            }
+            EventFact::CoverageGap(gap) => {
+                let affects = |dimension| {
+                    matches!(&gap.impact, Impact::Unknown)
+                        || matches!(&gap.impact, Impact::Known(dimensions) if dimensions.contains(&dimension))
+                };
+                if affects(CoverageDimension::Tools) {
+                    self.tool_history_complete = false;
+                }
+                if affects(CoverageDimension::PublicReasoning) {
+                    self.reasoning_complete = false;
+                }
+                self.dropped_events = self.dropped_events.saturating_add(1);
+                self.bump_snapshot();
+            }
+            EventFact::Diagnostic(diagnostic)
+                if diagnostic.reason == DiagnosticReason::UnknownSemantics =>
+            {
+                if matches!(&diagnostic.impact, Impact::Unknown) {
+                    self.tool_history_complete = false;
+                    self.reasoning_complete = false;
+                }
+                self.bump_snapshot(); // uncertainty is not a known dropped event
+            }
+            _ => {}
+        }
+    }
+}

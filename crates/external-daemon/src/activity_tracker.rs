@@ -23,6 +23,9 @@ struct PassiveActivityState {
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
     telemetry_degraded: bool,
+    typed_messages: HashMap<String, String>,
+    typed_finished_requests: std::collections::HashSet<String>,
+    typed_finished_tools: std::collections::HashSet<String>,
     observation: observation::ObservationState,
 }
 
@@ -76,6 +79,10 @@ impl PassiveActivityTracker {
     }
 
     fn observe_at(&self, event: &RuntimeEvent, now: Instant, wall_now_ms: u64) {
+        if let RuntimeEvent::Normalized(event) = event {
+            self.observe_typed_at(event, now, wall_now_ms);
+            return;
+        }
         let mut state = self.state.lock().unwrap();
         match event {
             RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(event))) => {
@@ -1665,5 +1672,165 @@ mod tests {
             }
             std::thread::yield_now();
         }
+    }
+}
+
+impl PassiveActivityTracker {
+    fn observe_typed_at(
+        &self,
+        event: &external_contract::events::NormalizedEvent,
+        now: Instant,
+        wall_now_ms: u64,
+    ) {
+        use external_contract::events::*;
+        let mut state = self.state.lock().unwrap();
+        state.revision = state.revision.saturating_add(1);
+        state.last_runtime_event_at = Some((now, wall_now_ms));
+        state.observation.observe_fact(event);
+        let turn = format!("{:?}", event.context.turn_id);
+        let mut sample = None;
+        match &event.fact {
+            EventFact::TurnStarted { .. } => {
+                state.terminal_text.clear();
+                state.terminal_text_settled = false;
+                state.typed_messages.clear();
+                state.active_model_requests.clear();
+                state.active_tools.clear();
+                state.typed_finished_requests.clear();
+                state.typed_finished_tools.clear();
+                state.telemetry_degraded = false;
+            }
+            EventFact::TurnSettled(settlement) => {
+                if let Some(text) = &settlement.final_text {
+                    state.terminal_text = text.clone();
+                }
+                state.terminal_text_settled = true;
+                state.active_model_requests.clear();
+                state.active_tools.clear();
+                state.telemetry_degraded = false;
+            }
+            EventFact::MessageUpdated(message) if !state.terminal_text_settled => {
+                let previous = state
+                    .typed_messages
+                    .entry(message.message_id.0.clone())
+                    .or_default();
+                let delta = match &message.text {
+                    TextUpdate::Delta(text) => {
+                        previous.push_str(text);
+                        text.clone()
+                    }
+                    TextUpdate::Snapshot(text) => {
+                        let delta = text
+                            .strip_prefix(previous.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        *previous = text.clone();
+                        delta
+                    }
+                };
+                if !delta.is_empty() {
+                    append_latest_text(&mut state, &delta, wall_now_ms);
+                    state.last_model_delta_at = Some(now);
+                    sample = Some((
+                        format!("text:{}", event.context.sequence),
+                        ActivitySampleKind::TextDelta,
+                    ));
+                }
+            }
+            EventFact::PublicReasoningDelta(_) => {
+                state.last_model_delta_at = Some(now);
+                sample = Some((
+                    format!("reasoning:{}", event.context.sequence),
+                    ActivitySampleKind::ReasoningDelta,
+                ));
+            }
+            EventFact::ModelActivityChanged(model) => {
+                if let Some(request) = &model.request_id {
+                    let key = format!("{turn}:{}", request.0);
+                    match model.phase {
+                        ModelPhase::Started | ModelPhase::StreamStalled => {
+                            if !state.typed_finished_requests.contains(&key) {
+                                state.active_model_requests.entry(key).or_insert(now);
+                            }
+                        }
+                        ModelPhase::Completed | ModelPhase::Failed | ModelPhase::RetryScheduled => {
+                            state.active_model_requests.remove(&key);
+                            if state.typed_finished_requests.len() < MAX_ACTIVITY_IDENTITIES {
+                                state.typed_finished_requests.insert(key);
+                            }
+                        }
+                    }
+                }
+            }
+            EventFact::ToolChanged(tool) => {
+                let key = format!("{turn}:{}", tool.call_id.0);
+                let kind = match tool.name.as_deref() {
+                    Some("Read" | "read") => PassiveToolKind::Read,
+                    Some("Bash" | "bash") => PassiveToolKind::Bash,
+                    _ => PassiveToolKind::Other,
+                };
+                match tool.phase {
+                    Some(ToolPhase::Scheduled | ToolPhase::Started) => {
+                        if !state.typed_finished_tools.contains(&key) {
+                            state
+                                .active_tools
+                                .entry(tool.call_id.0.clone())
+                                .or_insert((kind, now));
+                        }
+                        if tool.phase == Some(ToolPhase::Started) {
+                            sample = Some((
+                                format!("{key}:started"),
+                                ActivitySampleKind::ToolStarted { kind, count: 1 },
+                            ));
+                        }
+                    }
+                    Some(ToolPhase::Finished) => {
+                        state.active_tools.remove(&tool.call_id.0);
+                        if state.typed_finished_tools.len() < MAX_ACTIVITY_IDENTITIES {
+                            state.typed_finished_tools.insert(key.clone());
+                        }
+                        sample = Some((
+                            format!("{key}:finished"),
+                            if tool.outcome == Some(ToolOutcome::Failed) {
+                                ActivitySampleKind::ToolFailed
+                            } else {
+                                ActivitySampleKind::ToolCompleted
+                            },
+                        ));
+                    }
+                    _ => {} // progress/permission denial do not end execution
+                }
+            }
+            EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics => {
+                state.telemetry_degraded = true
+            }
+            EventFact::CoverageGap(g) => {
+                if matches!(g.impact, Impact::Unknown)
+                    || matches!(&g.impact, Impact::Known(dimensions) if dimensions.iter().any(|d| matches!(d, CoverageDimension::ModelActivity | CoverageDimension::Tools | CoverageDimension::Turn)))
+                {
+                    state.telemetry_degraded = true;
+                }
+            }
+            _ => {}
+        }
+        if let Some((key, kind)) = sample {
+            if !state.samples.contains_key(&key) {
+                state.sample_order.push_back(key.clone());
+                state.samples.insert(
+                    key,
+                    ActivitySample {
+                        source: ActivitySource::Runtime,
+                        observed_at: now,
+                        kind,
+                    },
+                );
+            }
+        }
+        while state.sample_order.len() > MAX_ACTIVITY_IDENTITIES {
+            if let Some(key) = state.sample_order.pop_front() {
+                state.samples.remove(&key);
+            }
+        }
+        self.changed.notify_all();
     }
 }

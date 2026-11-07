@@ -27,7 +27,7 @@ fn runtime_command_error(error: CodexError) -> RuntimeCommandError {
         CodexError::Timeout => RuntimeCommandError::Timeout,
         CodexError::Transport(message) => RuntimeCommandError::Transport(message),
         CodexError::Remote(value) => RuntimeCommandError::Remote(value),
-        CodexError::InvalidSession(message) => RuntimeCommandError::InvalidSession(message),
+        CodexError::InvalidSession(message) => RuntimeCommandError::InvalidSession(message.into()),
     }
 }
 
@@ -95,7 +95,7 @@ impl CodexRuntimeOwner {
                     permission_mode,
                 })
             }
-            Err(message) => Err(RuntimeCommandError::InvalidSession(message)),
+            Err(message) => Err(RuntimeCommandError::InvalidSession(message.into())),
         }
     }
 

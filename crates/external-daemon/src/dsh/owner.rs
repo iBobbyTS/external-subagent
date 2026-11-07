@@ -225,7 +225,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         {
             let session = self.session.lock().unwrap();
             session.cancel().map_err(|error| {
-                RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+                RuntimeCommandError::InvalidSession(dsh_session_message(&error).into())
             })?;
         }
         let boundary = self
@@ -290,7 +290,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         let session = self.session.lock().unwrap();
         session
             .close(timeout)
-            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error)))
+            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error).into()))
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {

@@ -602,7 +602,10 @@ pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_js
     let payload = params.get("payload")?;
     let original = payload.get("error").filter(|v| !v.is_null())
         .or_else(|| payload.get("reason_code"))?;
-    let original = redact_native_error(original);
+    Some(native_failure_detail(&redact_native_error(original)))
+}
+
+pub(crate) fn native_failure_detail(original: &serde_json::Value) -> serde_json::Value {
     let message = original.get("message").and_then(serde_json::Value::as_str)
         .or_else(|| original.as_str()).unwrap_or("turn.failed");
     let mut detail = serde_json::json!({"message": message});
@@ -618,8 +621,8 @@ pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_js
     if let Some(status) = attribution.get("statusCode").and_then(serde_json::Value::as_u64) {
         detail["status_code"] = status.into();
     }
-    detail["original_error"] = original;
-    Some(detail)
+    detail["original_error"] = original.clone();
+    detail
 }
 
 fn sensitive_error_key(key: &str) -> bool {
@@ -630,7 +633,7 @@ fn sensitive_error_key(key: &str) -> bool {
         | "password" | "passwd" | "secret" | "clientsecret" | "privatekey")
 }
 
-fn redact_native_error(value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn redact_native_error(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter().map(|(key, value)| {
             (key.clone(), if sensitive_error_key(key) && !value.is_null() && value.as_str() != Some("") { "[REDACTED]".into() } else { redact_native_error(value) })

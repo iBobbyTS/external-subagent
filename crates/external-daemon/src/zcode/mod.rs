@@ -12,6 +12,7 @@
 //! errors or `Debug` output.
 
 mod provider;
+pub(crate) mod events;
 
 #[cfg(test)]
 mod tests;
