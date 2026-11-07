@@ -1343,6 +1343,96 @@ mod typed_tests {
         );
     }
 
+    #[test]
+    fn collaboration_inputs_reach_observe_without_spawn_outputs() {
+        // Synthetic public items based on pinned event_mapping.rs. Populated
+        // optional model/effort fields on closeAgent exercise the declared
+        // item shape; the pinned close producer itself currently emits null.
+        for tool in [
+            "closeAgent",
+            "sendInput",
+            "resumeAgent",
+            "wait",
+            "spawnAgent",
+        ] {
+            for with_start in [false, true] {
+                for with_options in [true, false] {
+                    let trace = Trace::new();
+                    trace.start_turn("turn-1");
+                    let receivers = if tool == "wait" {
+                        json!(["agent-B", "agent-C"])
+                    } else {
+                        json!(["agent-B"])
+                    };
+                    let prompt =
+                        matches!(tool, "sendInput" | "spawnAgent").then_some("public prompt");
+                    let mut expected = json!({"tool": tool});
+                    if tool != "spawnAgent" {
+                        expected["receiverThreadIds"] = receivers.clone();
+                    }
+                    if let Some(prompt) = prompt {
+                        expected["prompt"] = json!(prompt);
+                    }
+                    if with_options {
+                        expected["model"] = json!("gpt-5.6-terra");
+                        expected["reasoningEffort"] = json!("high");
+                    }
+                    let mut item = json!({
+                        "type": "collabAgentToolCall", "id": "call-1", "tool": tool,
+                        "status": "completed", "senderThreadId": "agent-A",
+                        "receiverThreadIds": receivers, "prompt": prompt,
+                        "model": with_options.then_some("gpt-5.6-terra"),
+                        "reasoningEffort": with_options.then_some("high"),
+                        "agentsStates": {"agent-B": {"status": "completed", "message": "PRIVATE_RESULT"}},
+                    });
+                    if with_start {
+                        let mut started_item = item.clone();
+                        started_item["status"] = json!("inProgress");
+                        started_item["agentsStates"] = json!({});
+                        if tool == "spawnAgent" {
+                            started_item["receiverThreadIds"] = json!([]);
+                        }
+                        let started = trace.send("item/started", json!({"threadId": "thread-1", "turnId": "turn-1", "item": started_item}));
+                        assert_eq!(
+                            tool_fact(&started).arguments,
+                            Some(ArgumentUpdate::Snapshot(expected.clone()))
+                        );
+                    }
+                    if tool == "spawnAgent" {
+                        item["receiverThreadIds"] = json!(["newly-created-agent"]);
+                    }
+                    let completed = trace.send(
+                        "item/completed",
+                        json!({"threadId": "thread-1", "turnId": "turn-1", "item": item}),
+                    );
+                    let observation = trace.sink.activity.observation_snapshot();
+                    assert_eq!(observation.tools.len(), 1);
+                    let group = &observation.tools[0];
+                    assert_eq!(group.tool_name, tool);
+                    assert_eq!(group.call_count, 1);
+                    assert_eq!(group.recent_calls.len(), 1);
+                    assert_eq!(
+                        group.recent_calls[0].arguments,
+                        expected.as_object().unwrap().clone(),
+                        "{tool}, with_start={with_start}, with_options={with_options}"
+                    );
+                    assert!(!group.recent_calls[0].arguments_truncated);
+                    let fact = tool_fact(&completed);
+                    assert_eq!(fact.arguments, Some(ArgumentUpdate::Snapshot(expected)));
+                    assert_eq!(fact.phase, Some(ToolPhase::Finished));
+                    assert_eq!(fact.outcome, Some(ToolOutcome::Succeeded));
+                    let activity = trace.sink.activity.snapshot();
+                    assert_eq!(
+                        activity.window_60s.tool_calls_started,
+                        u64::from(with_start)
+                    );
+                    assert_eq!(activity.window_60s.tool_calls_completed, 1);
+                    assert!(activity.active_tools.is_empty());
+                }
+            }
+        }
+    }
+
     // Synthetic item fixtures follow pinned Codex 23934d31b1 public shapes.
     #[test]
     fn repair_wave2_native_names_reach_distinct_observe_groups() {

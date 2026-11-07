@@ -184,6 +184,13 @@ fn tool_arguments(item: &serde_json::Value, item_type: &str) -> Option<serde_jso
         "collabAgentToolCall" => {
             copy(item, "tool", &mut arguments);
             copy(item, "prompt", &mut arguments);
+            copy(item, "model", &mut arguments);
+            copy(item, "reasoningEffort", &mut arguments);
+            // A spawn's receivers are newly created outputs. Other collab
+            // receivers identify the requested targets, including at start.
+            if item.get("tool").and_then(|value| value.as_str()) != Some("spawnAgent") {
+                copy(item, "receiverThreadIds", &mut arguments);
+            }
         }
         "imageView" => copy(item, "path", &mut arguments),
         "sleep" => copy(item, "durationMs", &mut arguments),
