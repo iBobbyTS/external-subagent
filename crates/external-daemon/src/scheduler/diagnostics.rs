@@ -645,7 +645,7 @@ fn redact_error_text(text: &str) -> String {
     static PATTERNS: OnceLock<[regex::Regex; 4]> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| [
         regex::Regex::new(r#"(?i)((?:bearer|basic)[ \t]+)[^\s,;"']+"#).unwrap(),
-        regex::Regex::new(r#"(?i)(["']?(?:authorization|proxy-authorization|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|client[_-]?secret|secret|private[_-]?key|(?:set-)?cookie)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&]+)"#).unwrap(),
+        regex::Regex::new(r#"(?i)(["']?(?:authorization|proxy-authorization|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|client[_-]?secret|secret|private[_-]?key|(?:set-)?cookie)["']?\s*[:=：＝]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&；，：、]+)"#).unwrap(),
         regex::Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@"#).unwrap(),
         regex::Regex::new(r#"(?im)^([ \t]*(?:authorization|proxy-authorization|cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*"#).unwrap(),
     ]);
@@ -692,6 +692,34 @@ mod public_failure_tests {
         let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":text}})).unwrap();
         assert_eq!(detail["original_error"], text);
         assert!(turn_failure_detail(&serde_json::json!({"payload":{}})).is_none());
+    }
+
+    #[test]
+    fn native_error_redaction_covers_full_width_credential_boundaries() {
+        let cases = [
+            (
+                "API-KEY=sk-dash-key；api_key: sk-underscore-key，X-Api-Key: sk-x-key",
+                "API-KEY=[REDACTED]；api_key: [REDACTED]，X-Api-Key: [REDACTED]",
+            ),
+            ("api_key：sk-fullwidth-colon", "api_key：[REDACTED]"),
+            (
+                "api_key=sk-a；password=sk-b",
+                "api_key=[REDACTED]；password=[REDACTED]",
+            ),
+            ("api_key＝sk-fullwidth-equals", "api_key＝[REDACTED]"),
+            ("api_key=sk-a：详情保留", "api_key=[REDACTED]：详情保留"),
+            (
+                "api_key=sk-a、password=sk-b",
+                "api_key=[REDACTED]、password=[REDACTED]",
+            ),
+            (
+                "请求失败：api_key=private-key，请稍后重试；错误码：429、网络正常。",
+                "请求失败：api_key=[REDACTED]，请稍后重试；错误码：429、网络正常。",
+            ),
+        ];
+        let actual: Vec<_> = cases.iter().map(|(text, _)| redact_error_text(text)).collect();
+        let expected: Vec<_> = cases.iter().map(|(_, expected)| *expected).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
