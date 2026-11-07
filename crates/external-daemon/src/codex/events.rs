@@ -431,6 +431,15 @@ impl CodexShared {
             };
             let outcome = (phase == ToolPhase::Finished).then(|| tool_outcome(tool.status));
             let denied = (tool.status == Some("declined")).then_some(true);
+            // Wait completions carry result receivers, not requested targets.
+            // Missing arguments preserve a known start; a missed start stays
+            // unknown rather than advertising a result-derived input snapshot.
+            let arguments =
+                if completed && tool.item_type == "collabAgentToolCall" && tool.name == "wait" {
+                    None
+                } else {
+                    tool.arguments.map(ArgumentUpdate::Snapshot)
+                };
             let failure = tool.error.map(|original| NativeFailure {
                 original: crate::scheduler::redact_native_error(&original),
                 projection: None,
@@ -441,7 +450,7 @@ impl CodexShared {
                     call_id: CallId(tool.id.to_owned()),
                     name: Some(tool.name.to_owned()),
                     category: SafeToken::new(tool.item_type),
-                    arguments: tool.arguments.map(ArgumentUpdate::Snapshot),
+                    arguments,
                     phase: Some(phase),
                     outcome,
                     failure,
@@ -1344,26 +1353,106 @@ mod typed_tests {
     }
 
     #[test]
+    fn wait_completion_preserves_requested_targets_from_start() {
+        // Pinned v1 wait completion receivers are derived from result statuses,
+        // not from the requested target list carried by the start.
+        for receivers in [json!([]), json!(["agent-B"]), json!(["agent-B", "agent-C"])] {
+            let trace = Trace::new();
+            trace.start_turn("turn-1");
+            let requested = json!({"tool": "wait", "receiverThreadIds": ["agent-B", "agent-C"]});
+            let started = trace.send("item/started", json!({"threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "collabAgentToolCall", "id": "wait-1", "tool": "wait",
+                    "status": "inProgress", "senderThreadId": "agent-A", "receiverThreadIds": ["agent-B", "agent-C"],
+                    "prompt": null, "model": null, "reasoningEffort": null, "agentsStates": {}}}));
+            assert_eq!(
+                tool_fact(&started).arguments,
+                Some(ArgumentUpdate::Snapshot(requested.clone()))
+            );
+            let before = trace.sink.activity.observation_snapshot();
+            let params = json!({"threadId": "thread-1", "turnId": "turn-1", "item": {
+                "type": "collabAgentToolCall", "id": "wait-1", "tool": "wait", "status": "completed",
+                "senderThreadId": "agent-A", "receiverThreadIds": receivers,
+                "prompt": null, "model": null, "reasoningEffort": null,
+                "agentsStates": if receivers.as_array().unwrap().is_empty() { json!({}) }
+                    else { json!({"agent-B": {"status": "completed", "message": "PRIVATE_RESULT"}}) },
+            }});
+            let completed = trace.send("item/completed", params.clone());
+            let after = trace.sink.activity.observation_snapshot();
+            assert_eq!(
+                after.tools[0].recent_calls[0].arguments,
+                requested.as_object().unwrap().clone(),
+                "result receivers: {receivers}"
+            );
+            assert!(!after.tools[0].recent_calls[0].arguments_truncated);
+            assert_eq!(
+                after, before,
+                "result receivers cannot refine known input arguments"
+            );
+            let fact = tool_fact(&completed);
+            assert!(
+                fact.arguments.is_none(),
+                "a wait result is not an input snapshot"
+            );
+            assert_eq!(fact.phase, Some(ToolPhase::Finished));
+            assert_eq!(fact.outcome, Some(ToolOutcome::Succeeded));
+            // Replay completion must not invent another call or terminal phase.
+            trace.send("item/completed", params);
+            assert_eq!(trace.sink.activity.observation_snapshot(), after);
+            assert_eq!(after.tools[0].call_count, 1);
+            let activity = trace.sink.activity.snapshot();
+            assert_eq!(activity.window_60s.tool_calls_started, 1);
+            assert_eq!(activity.window_60s.tool_calls_completed, 1);
+            assert!(activity.active_tools.is_empty());
+        }
+    }
+
+    #[test]
+    fn wait_completion_without_start_keeps_requested_inputs_unknown() {
+        for receivers in [json!([]), json!(["agent-B"]), json!(["agent-B", "agent-C"])] {
+            let trace = Trace::new();
+            trace.start_turn("turn-1");
+            let completed = trace.send("item/completed", json!({"threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "collabAgentToolCall", "id": "wait-1", "tool": "wait", "status": "completed",
+                    "senderThreadId": "agent-A", "receiverThreadIds": receivers,
+                    "prompt": null, "model": null, "reasoningEffort": null, "agentsStates": {}}}));
+            let observation = trace.sink.activity.observation_snapshot();
+            assert_eq!(observation.tools.len(), 1);
+            let group = &observation.tools[0];
+            assert_eq!(group.tool_name, "wait");
+            assert_eq!(group.call_count, 1);
+            assert!(
+                group.recent_calls[0].arguments.is_empty(),
+                "result receivers are not requested targets: {receivers}"
+            );
+            assert!(
+                group.recent_calls[0].arguments_truncated,
+                "missed start leaves inputs unknown"
+            );
+            let fact = tool_fact(&completed);
+            assert!(fact.arguments.is_none());
+            assert_eq!(fact.phase, Some(ToolPhase::Finished));
+            assert_eq!(fact.outcome, Some(ToolOutcome::Succeeded));
+            let activity = trace.sink.activity.snapshot();
+            assert_eq!(activity.window_60s.tool_calls_started, 0);
+            assert_eq!(activity.window_60s.tool_calls_completed, 1);
+            assert!(activity.active_tools.is_empty());
+            assert!(!activity.telemetry_degraded);
+            assert_eq!(observation.coverage.dropped_events, 0);
+        }
+    }
+
+    #[test]
     fn collaboration_inputs_reach_observe_without_spawn_outputs() {
         // Synthetic public items based on pinned event_mapping.rs. Populated
         // optional model/effort fields on closeAgent exercise the declared
         // item shape; the pinned close producer itself currently emits null.
-        for tool in [
-            "closeAgent",
-            "sendInput",
-            "resumeAgent",
-            "wait",
-            "spawnAgent",
-        ] {
+        // Wait has phase-specific receiver semantics, covered separately above.
+        for tool in ["closeAgent", "sendInput", "resumeAgent", "spawnAgent"] {
             for with_start in [false, true] {
                 for with_options in [true, false] {
                     let trace = Trace::new();
                     trace.start_turn("turn-1");
-                    let receivers = if tool == "wait" {
-                        json!(["agent-B", "agent-C"])
-                    } else {
-                        json!(["agent-B"])
-                    };
+                    let receivers = json!(["agent-B"]);
                     let prompt =
                         matches!(tool, "sendInput" | "spawnAgent").then_some("public prompt");
                     let mut expected = json!({"tool": tool});
