@@ -382,13 +382,13 @@ impl CodexShared {
         let item = params.get("item").unwrap_or(&serde_json::Value::Null);
         let frame_turn = params.get("turnId").and_then(|value| value.as_str());
         let item_type = item.get("type").and_then(|value| value.as_str());
+        let Some(turn) = self.attributable_turn(frame_turn) else {
+            let input = self.context(method, params, None);
+            return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
+        };
+        let input = self.context(method, params, Some(&turn));
 
         if completed && item_type == Some("agentMessage") {
-            let Some(turn) = self.attributable_turn(frame_turn) else {
-                let input = self.context(method, params, None);
-                return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
-            };
-            let input = self.context(method, params, Some(&turn));
             let Some((item_id, text)) = update::completed_agent_message(params) else {
                 return self.invalid(
                     input,
@@ -409,11 +409,6 @@ impl CodexShared {
         }
 
         if let Some(tool) = update::tool_item(params) {
-            let Some(turn) = self.attributable_turn(frame_turn) else {
-                let input = self.context(method, params, None);
-                return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
-            };
-            let input = self.context(method, params, Some(&turn));
             if !completed
                 && !update::observe_tool_item(&mut self.seen_tool_items.lock().unwrap(), tool.id)
             {
@@ -444,7 +439,7 @@ impl CodexShared {
                 input,
                 vec![EventFact::ToolChanged(ToolChange {
                     call_id: CallId(tool.id.to_owned()),
-                    name: Some(tool.item_type.to_owned()),
+                    name: Some(tool.name.to_owned()),
                     category: SafeToken::new(tool.item_type),
                     arguments: tool.arguments.map(ArgumentUpdate::Snapshot),
                     phase: Some(phase),
@@ -455,12 +450,7 @@ impl CodexShared {
             );
         }
 
-        let input = self.context(method, params, None);
         if item_type.is_some_and(update::is_tool_item) {
-            let Some(turn) = self.attributable_turn(frame_turn) else {
-                return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
-            };
-            let input = self.context(method, params, Some(&turn));
             // A whitelisted tool without a usable identity can never be
             // attributed to a call.
             return self.invalid(
@@ -469,10 +459,16 @@ impl CodexShared {
                 Impact::Known(vec![CoverageDimension::Tools]),
             );
         }
-        if item_type.is_none() {
-            return self.invalid(input, LossReason::Malformed, Impact::Unknown);
+        match item_type {
+            None => self.invalid(input, LossReason::Malformed, Impact::Unknown),
+            // Public non-tool item variants at pinned Codex 23934d31b1.
+            Some(
+                "userMessage" | "hookPrompt" | "agentMessage" | "functionCallOutput" | "plan"
+                | "reasoning" | "subAgentActivity" | "enteredReviewMode" | "exitedReviewMode"
+                | "contextCompaction",
+            ) => Self::ignored(input, Attribution::Current, IgnoreReason::NoConsumer),
+            Some(item_type) => Self::unknown_input(input, item_type),
         }
-        self.ignored_current(method, params, IgnoreReason::NoConsumer)
     }
 
     fn on_summary_delta(&self, params: &serde_json::Value) -> DecodedInput {
@@ -682,11 +678,18 @@ impl CodexShared {
         if let Some(reason) = ignored_notification(method) {
             return Self::ignored(input, Attribution::Current, reason);
         }
+        Self::unknown_input(input, method)
+    }
+
+    fn unknown_input(mut input: NativeInputContext, discriminator: &str) -> DecodedInput {
         let diagnostic = Diagnostic {
             reason: DiagnosticReason::UnknownSemantics,
             impact: Impact::Unknown,
-            discriminator: SafeToken::new(method),
+            discriminator: SafeToken::new(discriminator),
         };
+        // Lifecycle summaries read the source discriminator. Retain the same
+        // safe method/item token there, never a raw item payload.
+        input.source.discriminator = diagnostic.discriminator.clone();
         Self::batch(
             input,
             Attribution::Current,
@@ -1337,6 +1340,265 @@ mod typed_tests {
                 .window_60s
                 .tool_calls_completed,
             0
+        );
+    }
+
+    // Synthetic item fixtures follow pinned Codex 23934d31b1 public shapes.
+    #[test]
+    fn repair_wave2_native_names_reach_distinct_observe_groups() {
+        for family in ["mcpToolCall", "dynamicToolCall", "collabAgentToolCall"] {
+            let trace = Trace::new();
+            trace.start_turn("turn-1");
+            for (id, name) in [("call-1", "spawnAgent"), ("call-2", "sendInput")] {
+                for method in ["item/started", "item/completed"] {
+                    let batch = trace.send(
+                        method,
+                        json!({"threadId": "thread-1", "turnId": "turn-1",
+                        "item": {"type": family, "id": id, "tool": name, "server": "tools",
+                            "arguments": {"input": "public"}, "status": "completed"}}),
+                    );
+                    let tool = tool_fact(&batch);
+                    assert_eq!(tool.name.as_deref(), Some(name), "{family}");
+                    assert_eq!(tool.category.as_ref().map(SafeToken::as_str), Some(family));
+                }
+            }
+            let observation = trace.sink.activity.observation_snapshot();
+            assert_eq!(observation.tools.len(), 2, "{family}: {observation:?}");
+            for name in ["spawnAgent", "sendInput"] {
+                let group = observation
+                    .tools
+                    .iter()
+                    .find(|tool| tool.tool_name == name)
+                    .unwrap();
+                assert_eq!(group.call_count, 1);
+                assert_eq!(group.recent_calls.len(), 1);
+            }
+            let activity = trace.sink.activity.snapshot();
+            assert_eq!(activity.window_60s.tool_calls_started, 2);
+            assert_eq!(activity.window_60s.tool_calls_completed, 2);
+        }
+    }
+
+    #[test]
+    fn repair_wave2_web_search_actions_reach_observe_without_results() {
+        for action in [
+            json!({"type": "search", "query": null, "queries": ["first", "second"]}),
+            json!({"type": "openPage", "url": "https://example.test/page"}),
+            json!({"type": "findInPage", "url": "https://example.test/page", "pattern": "needle"}),
+        ] {
+            let trace = Trace::new();
+            trace.start_turn("turn-1");
+            let mut input_action = action.clone();
+            input_action["results"] = json!(["PRIVATE_NESTED_OUTPUT"]);
+            let batch = trace.send(
+                "item/completed",
+                json!({"threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "webSearch", "id": "search-1", "query": "first ...",
+                    "action": input_action, "results": [{"body": "PRIVATE_SEARCH_OUTPUT"}]}}),
+            );
+            // Null optional inputs may be omitted, but every declared value survives.
+            let mut expected_action = action.clone();
+            expected_action
+                .as_object_mut()
+                .unwrap()
+                .retain(|_, value| !value.is_null());
+            let expected = json!({"query": "first ...", "action": expected_action});
+            assert_eq!(
+                tool_fact(&batch).arguments,
+                Some(ArgumentUpdate::Snapshot(expected.clone()))
+            );
+            let observation = trace.sink.activity.observation_snapshot();
+            assert_eq!(
+                observation.tools[0].recent_calls[0].arguments,
+                expected.as_object().unwrap().clone()
+            );
+            assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
+        }
+    }
+
+    #[test]
+    fn repair_wave2_image_generation_failure_preserves_redacted_native_object() {
+        for with_start in [false, true] {
+            let trace = Trace::new();
+            trace.start_turn("turn-1");
+            if with_start {
+                trace.send("item/started", json!({"threadId": "thread-1", "turnId": "turn-1",
+                    "item": {"type": "imageGeneration", "id": "image-1", "status": "inProgress", "failure": null}}));
+            }
+            // The quota fields are upstream-shaped; api_key exercises existing
+            // credential redaction on an additional native error field.
+            let failure = json!({"type": "usageLimitExceeded", "limitId": "image-generation",
+                "resetsAt": 1900000000, "api_key": "sk-image-secret"});
+            let batch = trace.send(
+                "item/completed",
+                json!({"threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "imageGeneration", "id": "image-1", "status": "failed",
+                    "revisedPrompt": "public prompt", "result": "", "failure": failure}}),
+            );
+            let tool = tool_fact(&batch);
+            assert_eq!(tool.phase, Some(ToolPhase::Finished));
+            assert_eq!(tool.outcome, Some(ToolOutcome::Failed));
+            let expected = json!({"type": "usageLimitExceeded", "limitId": "image-generation",
+                "resetsAt": 1900000000, "api_key": "[REDACTED]"});
+            assert_eq!(
+                tool.failure.as_ref().map(|failure| &failure.original),
+                Some(&expected)
+            );
+            assert!(
+                trace.shared.turn_tracker.snapshot().active,
+                "a tool failure does not settle the turn"
+            );
+            let success = trace.send("item/completed", json!({"threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "imageGeneration", "id": "image-2", "status": "completed", "failure": null}}));
+            assert_eq!(tool_fact(&success).outcome, Some(ToolOutcome::Succeeded));
+            assert!(tool_fact(&success).failure.is_none());
+        }
+    }
+
+    #[test]
+    fn repair_wave2_unknown_item_types_emit_safe_unknown_diagnostics() {
+        let trace = Trace::new();
+        trace.start_turn("turn-1");
+        for method in ["item/started", "item/completed"] {
+            for item_type in ["futureTool", "unsafe discriminator: PRIVATE_TYPE"] {
+                let batch = trace.send(
+                    method,
+                    json!({"threadId": "thread-1", "turnId": "turn-1",
+                    "item": {"type": item_type, "id": "future-1", "payload": "PRIVATE_PAYLOAD"}}),
+                );
+                assert_eq!(batch.attribution(), Attribution::Current);
+                let DecodeDisposition::Unknown(diagnostic) = batch.disposition() else {
+                    panic!(
+                        "unknown item was silently ignored: {:?}",
+                        batch.disposition()
+                    );
+                };
+                assert_eq!(diagnostic.reason, DiagnosticReason::UnknownSemantics);
+                assert_eq!(diagnostic.impact, Impact::Unknown);
+                assert_eq!(diagnostic.discriminator, SafeToken::new(item_type));
+                assert_eq!(batch.events().len(), 1);
+                assert_eq!(
+                    batch.events()[0].fact,
+                    EventFact::Diagnostic(diagnostic.clone())
+                );
+                let event = crate::RuntimeEvent::Normalized(batch.events()[0].clone());
+                let summary = crate::projection::lifecycle_projection(&event, None);
+                let value: serde_json::Value = serde_json::from_str(&summary.payload_json).unwrap();
+                assert_eq!(value["discriminator"], json!(diagnostic.discriminator));
+                assert_eq!(value["disposition"], "unknown");
+                assert!(!summary.payload_json.contains("PRIVATE"));
+            }
+            for item_type in [
+                "userMessage",
+                "hookPrompt",
+                "functionCallOutput",
+                "plan",
+                "reasoning",
+                "subAgentActivity",
+                "enteredReviewMode",
+                "exitedReviewMode",
+                "contextCompaction",
+            ] {
+                let batch = trace.send(
+                    method,
+                    json!({"threadId": "thread-1", "turnId": "turn-1",
+                    "item": {"type": item_type, "id": "known", "content": "PRIVATE"}}),
+                );
+                assert_eq!(
+                    batch.disposition(),
+                    &DecodeDisposition::RecognizedIgnored(IgnoreReason::NoConsumer)
+                );
+                assert!(batch.events().is_empty());
+            }
+            let before = trace.sink.activity.observation_snapshot();
+            for (thread, turn, attribution, reason) in [
+                ("thread-1", "turn-0", Attribution::Late, IgnoreReason::Late),
+                (
+                    "foreign",
+                    "turn-1",
+                    Attribution::ForeignSession,
+                    IgnoreReason::ForeignSession,
+                ),
+            ] {
+                let batch = trace.send(
+                    method,
+                    json!({"threadId": thread, "turnId": turn,
+                    "item": {"type": "futureTool", "id": "future-1"}}),
+                );
+                assert_eq!(batch.attribution(), attribution);
+                assert_eq!(
+                    batch.disposition(),
+                    &DecodeDisposition::RecognizedIgnored(reason)
+                );
+                assert!(batch.events().is_empty());
+            }
+            assert_eq!(trace.sink.activity.observation_snapshot(), before);
+        }
+        assert_eq!(
+            trace
+                .sink
+                .activity
+                .observation_snapshot()
+                .coverage
+                .dropped_events,
+            0
+        );
+        assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    }
+
+    #[test]
+    fn repair_wave2_malformed_item_types_are_late_before_coverage_mutation() {
+        let trace = Trace::new();
+        trace.start_turn("turn-1");
+        let before = trace.sink.activity.observation_snapshot();
+        for method in ["item/started", "item/completed"] {
+            for item_type in [
+                None,
+                Some(json!(null)),
+                Some(json!(42)),
+                Some(json!({"bad": "type"})),
+            ] {
+                let mut params = json!({"threadId": "thread-1", "item": {"id": "old-item"}});
+                if let Some(item_type) = item_type {
+                    params["item"]["type"] = item_type;
+                }
+                for turn in [Some("turn-0"), None] {
+                    if let Some(turn) = turn {
+                        params["turnId"] = json!(turn);
+                    } else {
+                        params.as_object_mut().unwrap().remove("turnId");
+                    }
+                    let batch = trace.send(method, params.clone());
+                    assert_eq!(batch.attribution(), Attribution::Late);
+                    assert_eq!(
+                        batch.disposition(),
+                        &DecodeDisposition::RecognizedIgnored(IgnoreReason::Late)
+                    );
+                    assert!(batch.events().is_empty());
+                    assert_eq!(trace.sink.activity.observation_snapshot(), before);
+                }
+                params["turnId"] = json!("turn-1");
+                let current = trace.decode(method, params);
+                assert_eq!(current.attribution(), Attribution::Current);
+                assert!(
+                    matches!(current.disposition(), DecodeDisposition::InvalidLost(gap)
+                    if gap.reason == LossReason::Malformed && gap.impact == Impact::Unknown)
+                );
+            }
+        }
+        let current = trace.send(
+            "item/started",
+            json!({"threadId": "thread-1", "turnId": "turn-1", "item": {"id": "bad"}}),
+        );
+        assert_eq!(current.attribution(), Attribution::Current);
+        assert_eq!(
+            trace
+                .sink
+                .activity
+                .observation_snapshot()
+                .coverage
+                .dropped_events,
+            1
         );
     }
 

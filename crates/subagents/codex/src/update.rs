@@ -85,12 +85,14 @@ pub fn observe_tool_item(seen: &mut Vec<String>, id: &str) -> bool {
 pub struct ToolItem<'a> {
     pub id: &'a str,
     pub item_type: &'a str,
+    /// Native tool name for named families, otherwise the public item type.
+    pub name: &'a str,
     /// Native terminal status of the item, when the protocol type declares it.
     pub status: Option<&'a str>,
     /// Public arguments of the call, projected per item type. Never includes
     /// diffs, outputs, raw reasoning or encrypted content.
     pub arguments: Option<serde_json::Value>,
-    /// The item's native error object, when the completed item carries one.
+    /// The item's native error/failure object, when the completed item carries one.
     pub error: Option<serde_json::Value>,
 }
 
@@ -102,9 +104,23 @@ pub fn tool_item(params: &serde_json::Value) -> Option<ToolItem<'_>> {
     Some(ToolItem {
         id,
         item_type,
+        name: match item_type {
+            "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" => item
+                .get("tool")
+                .and_then(|value| value.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(item_type),
+            _ => item_type,
+        },
         status: item.get("status").and_then(|value| value.as_str()),
         arguments: tool_arguments(item, item_type),
-        error: item.get("error").filter(|value| !value.is_null()).cloned(),
+        error: (if item_type == "imageGeneration" {
+            item.get("failure").filter(|value| !value.is_null())
+        } else {
+            None
+        })
+        .or_else(|| item.get("error").filter(|value| !value.is_null()))
+        .cloned(),
     })
 }
 
@@ -145,7 +161,26 @@ fn tool_arguments(item: &serde_json::Value, item_type: &str) -> Option<serde_jso
             copy(item, "tool", &mut arguments);
             copy(item, "arguments", &mut arguments);
         }
-        "webSearch" => copy(item, "query", &mut arguments),
+        "webSearch" => {
+            copy(item, "query", &mut arguments);
+            if let Some(action) = item.get("action").filter(|value| value.is_object()) {
+                let mut projected = serde_json::Map::new();
+                copy(action, "type", &mut projected);
+                match action.get("type").and_then(|value| value.as_str()) {
+                    Some("search") => {
+                        copy(action, "query", &mut projected);
+                        copy(action, "queries", &mut projected);
+                    }
+                    Some("openPage") => copy(action, "url", &mut projected),
+                    Some("findInPage") => {
+                        copy(action, "url", &mut projected);
+                        copy(action, "pattern", &mut projected);
+                    }
+                    _ => {}
+                }
+                arguments.insert("action".into(), projected.into());
+            }
+        }
         "collabAgentToolCall" => {
             copy(item, "tool", &mut arguments);
             copy(item, "prompt", &mut arguments);
