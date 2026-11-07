@@ -23,9 +23,10 @@ impl Publisher {
         let mut applied = Vec::new();
         for mut event in batch.into_events() {
             event.context.sequence = state.next_sequence;
-            applied.push(event.clone());
-            self.emit_locked(&mut state, RuntimeEvent::Normalized(event));
+            state.next_sequence = state.next_sequence.saturating_add(1);
+            applied.push(event);
         }
+        self.sink.emit_normalized_batch(&applied);
         // The complete batch (including text and failure) reaches the sink
         // before scheduler command waiters can observe its settlement.
         tracker.observe_typed(&applied);

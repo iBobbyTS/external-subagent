@@ -3,6 +3,8 @@ use crate::{
     LifecycleRecord, LifecycleSink, RuntimeEvent, RuntimeLifecycle, RuntimeLifecyclePhase,
     RuntimeTerminal,
 };
+use external_contract::events::{EventFact, NormalizedEvent, TurnId};
+use crate::scheduler::RuntimeLifecycleSnapshot;
 use external_contract::{
     WireMessage, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
     INTERACTION_REQUEST_USER_INPUT,
@@ -12,7 +14,7 @@ use external_runtime::Inbound;
 use external_store::{
     LifecycleWrite, Store, StoreError, TaskOutcome, TaskPhase, TaskResult, TurnState,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// How long a respondable request that arrived before the RUNNING commit may
 /// keep retrying the store's phase gate. The commit itself is one transaction
@@ -50,6 +52,8 @@ struct SinkWriteState {
     pending_terminal_sequence: Option<u64>,
     terminal_written: bool,
     transport_failure: Option<TransportFrameLimit>,
+    // Admission correlation only; the typed reducer still owns turn state.
+    active_typed_turn: Option<TurnId>,
 }
 
 /// The first transport fault observed by the shared sink.
@@ -349,17 +353,46 @@ pub(crate) fn unreaped_general(
     }
 }
 
-impl LifecycleSink for StoreLifecycleSink {
-    fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> {
-        Some((external_contract::events::TaskId(self.agent_id.clone()),
-            external_contract::events::LaunchId(format!("{}:{}", self.agent_id, self.owner_epoch))))
+impl StoreLifecycleSink {
+    /// Stopping does not discard an already-received settlement for the open
+    /// turn. A complete batch must end at its sole boundary, use this claim's
+    /// identity throughout, and contain no new session/turn/input admission.
+    fn accepts_stopping_settlement(&self, events: &[NormalizedEvent]) -> bool {
+        let Some(active) = self.write_state.lock().unwrap().active_typed_turn.clone() else {
+            return false;
+        };
+        let Some(NormalizedEvent { fact: EventFact::TurnSettled(settlement), .. }) = events.last() else {
+            return false;
+        };
+        if settlement.turn_id != active {
+            return false;
+        }
+        let (task, launch) = self.event_scope().expect("store scope");
+        events.iter().enumerate().all(|(index, event)| {
+            event.context.task_id == task
+                && event.context.launch_id == launch
+                && event.context.turn_id.as_ref() == Some(&active)
+                && match &event.fact {
+                    EventFact::TurnSettled(_) => index + 1 == events.len(),
+                    EventFact::MessageUpdated(_)
+                    | EventFact::MessageFinished { .. }
+                    | EventFact::PublicReasoningDelta(_)
+                    | EventFact::ToolChanged(_)
+                    | EventFact::ModelActivityChanged(_)
+                    | EventFact::InputResolved(_)
+                    | EventFact::ErrorObserved { .. }
+                    | EventFact::Diagnostic(_)
+                    | EventFact::CoverageGap(_) => true,
+                    _ => false,
+                }
+        })
     }
 
-    fn emit(&self, record: LifecycleRecord) {
-        let mut admission = self.runtime_lifecycle.admit_event();
-        if admission.is_none() {
-            return;
-        }
+    fn emit_admitted<'a>(
+        &'a self,
+        record: LifecycleRecord,
+        admission: &mut Option<MutexGuard<'a, RuntimeLifecycleSnapshot>>,
+    ) {
         #[cfg(test)]
         if let Some(hook) = self.after_admission_hook.lock().unwrap().clone() {
             hook();
@@ -370,6 +403,24 @@ impl LifecycleSink for StoreLifecycleSink {
             return;
         }
         state.last_source_sequence = state.last_source_sequence.max(record.sequence);
+        if let RuntimeEvent::Normalized(event) = &record.event {
+            let (task, launch) = self.event_scope().expect("store scope");
+            if event.context.task_id == task && event.context.launch_id == launch {
+                match &event.fact {
+                    EventFact::TurnStarted { turn_id }
+                        if event.context.turn_id.as_ref() == Some(turn_id) =>
+                    {
+                        state.active_typed_turn = Some(turn_id.clone());
+                    }
+                    EventFact::TurnSettled(settlement)
+                        if state.active_typed_turn.as_ref() == Some(&settlement.turn_id) =>
+                    {
+                        state.active_typed_turn = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Latch the first transport fault while its oversized-frame record is
         // persisted. Latching is a pure write under the sink's own state lock:
         // it never publishes a terminal and never re-enters stop, so the
@@ -454,7 +505,7 @@ impl LifecycleSink for StoreLifecycleSink {
                 // post-close event, and the deadline keeps a genuinely stuck
                 // PREPARING row from blocking the pump forever, preserving the
                 // pre-fix fail-loud path.
-                admission = None;
+                *admission = None;
                 let pending_insert_deadline = std::time::Instant::now()
                     + std::time::Duration::from_secs(PENDING_INSERT_RETRY_WINDOW_SECS);
                 let inserted = loop {
@@ -492,7 +543,7 @@ impl LifecycleSink for StoreLifecycleSink {
                 if readmission.is_none() {
                     return;
                 }
-                admission = readmission;
+                *admission = readmission;
                 Some(request_id)
             }
             _ => None,
@@ -528,5 +579,48 @@ impl LifecycleSink for StoreLifecycleSink {
         if let Err(error) = self.store.append_lifecycle(&write) {
             state.first_error = Some(error.to_string());
         }
+    }
+}
+
+impl LifecycleSink for StoreLifecycleSink {
+    fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> {
+        Some((external_contract::events::TaskId(self.agent_id.clone()),
+            external_contract::events::LaunchId(format!("{}:{}", self.agent_id, self.owner_epoch))))
+    }
+
+    fn emit(&self, record: LifecycleRecord) {
+        let mut admission = self.runtime_lifecycle.admit_event();
+        if admission.is_none() {
+            return;
+        }
+        self.emit_admitted(record, &mut admission);
+    }
+
+    fn emit_normalized_batch(&self, events: &[NormalizedEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        let mut admission = Some(self.runtime_lifecycle.state.lock().unwrap());
+        let lifecycle = admission.as_mut().expect("admission latch");
+        if lifecycle.phase != RuntimeLifecyclePhase::Running
+            && !(matches!(lifecycle.phase,
+                RuntimeLifecyclePhase::StopRequested
+                | RuntimeLifecyclePhase::StopAcknowledged
+                | RuntimeLifecyclePhase::ForceTerminating)
+                && self.accepts_stopping_settlement(events))
+        {
+            lifecycle.reject_late_event();
+            return;
+        }
+        // Keep one admission decision through the whole native batch. In
+        // particular, neither stop nor terminalization can split its text
+        // from the boundary, and accepting the boundary clears its correlation.
+        for event in events {
+            self.emit_admitted(LifecycleRecord {
+                sequence: event.context.sequence,
+                event: RuntimeEvent::Normalized(event.clone()),
+            }, &mut admission);
+        }
+
     }
 }

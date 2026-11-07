@@ -353,6 +353,17 @@ impl AgyRuntimeShared {
                 .map(|e| native_failure(&Value::String(e.clone())))
         };
         let mut facts = Vec::new();
+        if outcome == TurnOutcome::Cancelled {
+            // An interrupted response can arrive without any earlier text
+            // delta. Preserve AGY's existing append-to-wait delivery before
+            // the settlement becomes visible, through this same typed batch.
+            if let Some(partial) = text.as_deref().filter(|text| !text.is_empty()) {
+                facts.push(EventFact::MessageUpdated(MessageUpdate {
+                    message_id: MessageId("interrupted-response".into()),
+                    text: TextUpdate::Delta(partial.to_owned()),
+                }));
+            }
+        }
         self.record_denied_actions(&settlement.denied_actions);
         if !settlement.denied_actions.is_empty() {
             facts.push(EventFact::Diagnostic(Diagnostic {

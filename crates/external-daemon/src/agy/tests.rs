@@ -1354,3 +1354,120 @@ fn synthetic_long_result_error_survives_the_real_scheduler_result_path() {
     }
     assert_eq!(reconstructed, result.result.final_text);
 }
+
+#[test]
+fn interruption_only_observed_response_matches_wait_tail_before_boundary() {
+    use external_contract::events::*;
+    let raw: serde_json::Value = serde_json::from_str(
+        include_str!("../../../subagents/agy/tests/fixtures/interrupted.ndjson")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = raw["result"]["response"].as_str().unwrap();
+    let (shared, sink) = agy_fact_probe();
+    feed_agy(&shared, raw.clone());
+    assert_eq!(sink.1.take_wait_tail().text, expected);
+    assert!(
+        sink.1.take_wait_tail().text.is_empty(),
+        "wait cursor must consume the appended response once"
+    );
+    let facts = sink.facts();
+    let text = facts.iter().position(|e| matches!(&e.fact, EventFact::MessageUpdated(m) if matches!(&m.text, TextUpdate::Delta(t) | TextUpdate::Snapshot(t) if t == expected))).expect("partial response text fact");
+    let boundary = facts.iter().position(|e| matches!(&e.fact, EventFact::TurnSettled(s) if s.outcome == TurnOutcome::Cancelled && s.final_text.as_deref() == Some(expected))).expect("original cancellation settlement");
+    assert!(
+        text < boundary,
+        "text must be published before the settling boundary"
+    );
+    assert_eq!(facts[text].context.turn_id, facts[boundary].context.turn_id);
+}
+
+#[test]
+fn interruption_only_response_reaches_wait_and_preserves_cancellation_result() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    const PARTIAL: &str = "ONLY_IN_INTERRUPTED_RESPONSE_结束";
+    // SYNTHETIC signal harness using the observed interrupted-result shape.
+    // Install the trap before init opens the bootstrap gate; no response delta
+    // is emitted before cancellation, so only the result can supply the text.
+    let script = r#"
+read_frame
+trap 'printf "%s\n" "{\"event\":\"result\",\"result\":{\"conversation_id\":\"__CONV__\",\"status\":\"ERROR\",\"response\":\"ONLY_IN_INTERRUPTED_RESPONSE_结束\",\"error\":\"interrupted\",\"num_turns\":1}}"; exit 1' TERM
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"__CONV__","step_index":0,"state":"DONE","step_type":"user_input"}}'
+"#.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    await_turn_active(&scheduler, &agent_id);
+    assert!(scheduler
+        .passive_activity_snapshot(&agent_id)
+        .unwrap()
+        .latest_text_tail
+        .is_empty());
+    scheduler.cancel_task(&agent_id).unwrap();
+    assert_eq!(
+        await_terminal_task(&scheduler, &agent_id).outcome,
+        Some(TaskOutcome::Cancelled)
+    );
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Cancelled);
+    assert!(stored.result.partial);
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "native stop must reach its boundary: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = || {
+        crate::rpc::RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+        })
+    };
+    let crate::rpc::RpcSuccess::TaskWait(wait) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert_eq!(wait.activity.latest_text_tail, PARTIAL);
+    assert_eq!(
+        wait.result.as_ref().unwrap().outcome,
+        TaskOutcome::Cancelled
+    );
+    assert!(wait.result.as_ref().unwrap().partial);
+    let crate::rpc::RpcSuccess::TaskWait(second) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert!(second.activity.latest_text_tail.is_empty());
+    // Cancellation's existing result format remains independent of its live
+    // text tail; result pagination must still reconstruct that stored result.
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 7,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::Cancelled);
+        reconstructed.push_str(&page.final_text);
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(reconstructed, stored.result.final_text);
+    assert_eq!(wait.result.unwrap().final_text, reconstructed);
+}

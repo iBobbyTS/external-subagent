@@ -23,6 +23,6 @@ use self::state::{
     ActiveCheck, ActiveRuntime, FaultDisposition, MonitorContext, TerminalDecision, TerminalTarget,
 };
 pub use self::state::{MessageDisposition, ResponseDisposition, ResponseOutcome, Scheduler};
-pub(crate) use self::state::{RuntimeLifecycle, RuntimeLifecyclePhase};
+pub(crate) use self::state::{RuntimeLifecycle, RuntimeLifecyclePhase, RuntimeLifecycleSnapshot};
 pub(crate) use self::types::ControlDeadline;
 pub use self::types::{SchedulerConfig, SchedulerError};

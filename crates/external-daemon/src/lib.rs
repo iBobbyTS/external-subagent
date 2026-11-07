@@ -555,6 +555,17 @@ pub trait LifecycleSink: Send + Sync + 'static {
     /// may use the publisher's unique process-local launch scope.
     fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> { None }
     fn emit(&self, record: LifecycleRecord);
+
+    /// One native input's ordered facts. Sinks may hold their admission latch
+    /// across the complete batch; ordinary sinks retain per-record delivery.
+    fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
+        for event in events {
+            self.emit(LifecycleRecord {
+                sequence: event.context.sequence,
+                event: RuntimeEvent::Normalized(event.clone()),
+            });
+        }
+    }
 }
 
 #[derive(Debug)]

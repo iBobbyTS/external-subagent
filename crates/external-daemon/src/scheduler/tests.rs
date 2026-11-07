@@ -6458,3 +6458,341 @@ exit 3
         assert!(scheduler.ready_for_activation());
     }
 }
+
+mod stopping_settlement_ingress_tests {
+    use super::*;
+    use external_contract::events::*;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        store: Arc<Store>,
+        sink: Arc<StoreLifecycleSink>,
+        publisher: Publisher,
+        tracker: TurnTracker,
+        lifecycle: Arc<RuntimeLifecycle>,
+        id: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let id = "10000000".to_owned();
+            store
+                .enqueue_task_authoritative(&external_store::NewTask {
+                    agent_id: id.clone(),
+                    repository: directory.path().to_string_lossy().into_owned(),
+                    workspace_path: directory.path().to_string_lossy().into_owned(),
+                    runtime_hash: None,
+                    prepared_launch_json: "{}".into(),
+                    initial_prompt: "settlement ingress".into(),
+                })
+                .unwrap();
+            let claim = store.claim_next("settlement-test").unwrap().unwrap();
+            store
+                .mark_session_running(
+                    &id,
+                    claim.owner_epoch,
+                    "runtime",
+                    None,
+                    Some("session"),
+                    None,
+                )
+                .unwrap();
+            let lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
+            let sink = Arc::new(StoreLifecycleSink::new(
+                store.clone(),
+                id.clone(),
+                "runtime".into(),
+                claim.owner_epoch,
+                lifecycle.clone(),
+                Arc::new(PassiveActivityTracker::for_adapter("agy")),
+            ));
+            let fixture = Self {
+                _directory: directory,
+                store,
+                publisher: Publisher::new(sink.clone()),
+                sink,
+                tracker: TurnTracker::new(),
+                lifecycle,
+                id,
+            };
+            fixture.send(
+                TurnId::Local(1),
+                vec![EventFact::TurnStarted {
+                    turn_id: TurnId::Local(1),
+                }],
+            );
+            fixture
+        }
+        fn batch(&self, turn: TurnId, facts: Vec<EventFact>) -> DecodedInput {
+            let (task_id, launch_id) = self.publisher.event_scope();
+            let input = NativeInputContext {
+                task_id,
+                launch_id,
+                turn_id: Some(turn),
+                source: NativeSource {
+                    protocol: SourceProtocol::AgyStreamJson,
+                    discriminator: SafeToken::new("result"),
+                    session_id: Some(SessionId("session".into())),
+                    turn_id: None,
+                    item_id: None,
+                    call_id: None,
+                    event_id: None,
+                    timestamp: None,
+                },
+            };
+            let events = facts
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| NormalizedEvent {
+                    context: EventContext {
+                        task_id: input.task_id.clone(),
+                        launch_id: input.launch_id.clone(),
+                        sequence: index as u64 + 1,
+                        turn_id: input.turn_id.clone(),
+                        source: input.source.clone(),
+                    },
+                    fact,
+                })
+                .collect();
+            DecodedInput::new(
+                input,
+                Attribution::Current,
+                DecodeDisposition::Consumed,
+                events,
+            )
+            .unwrap()
+        }
+        fn send(&self, turn: TurnId, facts: Vec<EventFact>) {
+            self.publisher
+                .emit_typed(self.batch(turn, facts), &self.tracker);
+        }
+        fn stop(&self, phase: RuntimeLifecyclePhase) {
+            self.store.request_stop(&self.id).unwrap();
+            self.lifecycle.request_stop(&self.tracker.snapshot());
+            self.lifecycle.state.lock().unwrap().phase = phase;
+        }
+        fn seq(&self) -> u64 {
+            self.store
+                .get_task(&self.id)
+                .unwrap()
+                .unwrap()
+                .last_event_seq
+        }
+    }
+    fn text(value: &str) -> EventFact {
+        EventFact::MessageUpdated(MessageUpdate {
+            message_id: MessageId("partial".into()),
+            text: TextUpdate::Delta(value.into()),
+        })
+    }
+    fn settled(turn: TurnId) -> EventFact {
+        EventFact::TurnSettled(TurnSettlement {
+            turn_id: turn,
+            outcome: TurnOutcome::Cancelled,
+            stop_reason: SafeToken::new("ERROR"),
+            final_text: Some("partial".into()),
+            failure: None,
+        })
+    }
+
+    #[test]
+    fn stopping_settlement_batch_reaches_activity_and_store_once() {
+        for phase in [
+            RuntimeLifecyclePhase::StopRequested,
+            RuntimeLifecyclePhase::StopAcknowledged,
+            RuntimeLifecyclePhase::ForceTerminating,
+        ] {
+            let f = Fixture::new();
+            f.stop(phase);
+            let before = f.seq();
+            let failure = NativeFailure {
+                original: serde_json::json!({"message":"interrupted"}),
+                projection: None,
+            };
+            f.send(
+                TurnId::Local(1),
+                vec![
+                    text("partial"),
+                    EventFact::ToolChanged(ToolChange {
+                        call_id: CallId("tool".into()),
+                        name: Some("run_command".into()),
+                        category: None,
+                        arguments: None,
+                        phase: Some(ToolPhase::Finished),
+                        outcome: Some(ToolOutcome::Failed),
+                        failure: Some(failure.clone()),
+                        denied: None,
+                    }),
+                    EventFact::ErrorObserved {
+                        operation: Operation::Turn,
+                        failure,
+                    },
+                    settled(TurnId::Local(1)),
+                ],
+            );
+            assert_eq!(
+                f.sink.activity.take_wait_tail().text,
+                "partial",
+                "{phase:?}"
+            );
+            assert_eq!(f.seq(), before + 4);
+            assert_eq!(f.sink.activity.snapshot().window_60s.tool_calls_failed, 1);
+            assert!(f.tracker.failure_detail().unwrap().contains("interrupted"));
+            assert!(f.sink.error().is_none());
+            assert_eq!(
+                f.lifecycle.state.lock().unwrap().phase,
+                phase,
+                "settlement evidence must not reopen ingress"
+            );
+            assert_eq!(
+                f.store.get_task(&f.id).unwrap().unwrap().phase,
+                TaskPhase::Cancelling
+            );
+            f.send(
+                TurnId::Local(1),
+                vec![text("late"), settled(TurnId::Local(1))],
+            );
+            f.send(
+                TurnId::Local(2),
+                vec![
+                    EventFact::TurnStarted {
+                        turn_id: TurnId::Local(2),
+                    },
+                    text("new turn"),
+                    settled(TurnId::Local(2)),
+                ],
+            );
+            assert!(f.sink.activity.take_wait_tail().text.is_empty());
+            assert_eq!(
+                f.seq(),
+                before + 4,
+                "post-settlement facts must stay rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_ingress_rejects_incomplete_foreign_and_post_boundary_batches() {
+        let cases = [
+            (TurnId::Local(1), vec![text("not a settlement")]),
+            (
+                TurnId::Local(2),
+                vec![text("foreign turn"), settled(TurnId::Local(2))],
+            ),
+            (
+                TurnId::Local(1),
+                vec![settled(TurnId::Local(1)), text("after boundary")],
+            ),
+            (
+                TurnId::Local(1),
+                vec![settled(TurnId::Local(1)), settled(TurnId::Local(1))],
+            ),
+            (
+                TurnId::Local(1),
+                vec![
+                    EventFact::TurnStarted {
+                        turn_id: TurnId::Local(1),
+                    },
+                    text("restart"),
+                    settled(TurnId::Local(1)),
+                ],
+            ),
+            (
+                TurnId::Local(1),
+                vec![
+                    EventFact::InputRequested(InputRequest {
+                        request_id: WireId::String("new-request".into()),
+                        kind: InputKind::Permission,
+                        respondable: true,
+                        question: serde_json::json!("new input"),
+                    }),
+                    settled(TurnId::Local(1)),
+                ],
+            ),
+            (
+                TurnId::Local(1),
+                vec![text("wrong boundary"), settled(TurnId::Local(2))],
+            ),
+        ];
+        for (turn, facts) in cases {
+            let f = Fixture::new();
+            f.stop(RuntimeLifecyclePhase::StopRequested);
+            let before = f.seq();
+            f.send(turn, facts);
+            assert!(f.sink.activity.take_wait_tail().text.is_empty());
+            assert_eq!(f.seq(), before);
+        }
+    }
+
+    #[test]
+    fn running_settlement_cannot_be_readmitted_after_stop() {
+        let f = Fixture::new();
+        f.send(TurnId::Local(1), vec![settled(TurnId::Local(1))]);
+        f.stop(RuntimeLifecyclePhase::StopRequested);
+        let before = f.seq();
+        f.send(
+            TurnId::Local(1),
+            vec![text("late"), settled(TurnId::Local(1))],
+        );
+        assert!(f.sink.activity.take_wait_tail().text.is_empty());
+        assert_eq!(f.seq(), before);
+    }
+
+    #[test]
+    fn terminal_ingress_rejects_even_a_matching_settlement_batch() {
+        let f = Fixture::new();
+        f.stop(RuntimeLifecyclePhase::Terminal);
+        let before = f.seq();
+        f.send(
+            TurnId::Local(1),
+            vec![text("late"), settled(TurnId::Local(1))],
+        );
+        assert!(f.sink.activity.take_wait_tail().text.is_empty());
+        assert_eq!(f.seq(), before);
+    }
+    #[test]
+    fn stopping_settlement_rejects_other_claims_and_mixed_turn_contexts() {
+        for mismatch in ["task", "launch", "mixed_turn"] {
+            let f = Fixture::new();
+            f.stop(RuntimeLifecyclePhase::StopRequested);
+            let before = f.seq();
+            let batch = f.batch(
+                TurnId::Local(1),
+                vec![text("foreign"), settled(TurnId::Local(1))],
+            );
+            let mut input = batch.input().clone();
+            let mut events = batch.into_events();
+            match mismatch {
+                "task" => {
+                    input.task_id = TaskId("10000001".into());
+                    for event in &mut events {
+                        event.context.task_id = input.task_id.clone();
+                    }
+                }
+                "launch" => {
+                    input.launch_id = LaunchId("other-claim".into());
+                    for event in &mut events {
+                        event.context.launch_id = input.launch_id.clone();
+                    }
+                }
+                _ => events[0].context.turn_id = Some(TurnId::Local(2)),
+            }
+            f.publisher.emit_typed(
+                DecodedInput::new(
+                    input,
+                    Attribution::Current,
+                    DecodeDisposition::Consumed,
+                    events,
+                )
+                .unwrap(),
+                &f.tracker,
+            );
+            assert!(
+                f.sink.activity.take_wait_tail().text.is_empty(),
+                "{mismatch}"
+            );
+            assert_eq!(f.seq(), before, "{mismatch}");
+        }
+    }
+}

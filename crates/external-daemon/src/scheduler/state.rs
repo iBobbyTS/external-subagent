@@ -108,6 +108,15 @@ pub(crate) struct RuntimeLifecycleSnapshot {
     late_event_count: u64,
 }
 
+impl RuntimeLifecycleSnapshot {
+    pub(crate) fn reject_late_event(&mut self) {
+        self.late_event_count = self
+            .late_event_count
+            .saturating_add(1)
+            .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
+    }
+}
+
 pub(crate) struct RuntimeLifecycle {
     pub(crate) state: Mutex<RuntimeLifecycleSnapshot>,
     /// One-shot flag so a transient store read failure is reported once
@@ -235,10 +244,7 @@ impl RuntimeLifecycle {
         if state.phase == RuntimeLifecyclePhase::Running {
             return Some(state);
         }
-        state.late_event_count = state
-            .late_event_count
-            .saturating_add(1)
-            .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
+        state.reject_late_event();
         None
     }
 
