@@ -15,8 +15,10 @@ use external_runtime::Inbound;
 const MAX_ITEM_TEXT_BYTES: usize = 512 * 1024;
 /// Hard bound on the number of tracked agent-message items.
 const MAX_TRACKED_ITEMS: usize = 128;
-/// Hard bound (Unicode chars) on one recorded turn-failure detail.
-const MAX_TURN_FAILURE_DETAIL_BYTES: usize = 512;
+/// Hard bound (Unicode chars) on the ES-composed turn-failure label carried by
+/// diagnostics and by the boundary payload's `reason_code` fallback. The
+/// native error object itself is never bounded.
+const MAX_TURN_FAILURE_LABEL_CHARS: usize = 512;
 /// Hard bound on the retained MCP startup-failure diagnostic tail.
 const MAX_MCP_DIAGNOSTIC_BYTES: usize = 2 * 1024;
 /// Hard bound on the retired-turn memory.
@@ -160,44 +162,76 @@ pub fn final_text(turn: &serde_json::Value, tracked: Option<String>) -> Option<S
         .map(str::to_owned)
 }
 
-/// The failure reason for a failed or interrupted turn: a recorded
-/// turn-scoped error when one exists, otherwise the turn's own error
-/// message (bounded), otherwise a status-derived default.
-pub fn turn_failure_reason(
+/// The failure of a failed or interrupted turn: the ES-composed label plus the
+/// complete native error the turn carried. A recorded turn-scoped error wins
+/// over the turn boundary's own error — a later async boundary or natural exit
+/// must never overwrite the earlier native cause — and both are retained in
+/// full instead of being summarized.
+pub fn turn_failure(
     turn: &serde_json::Value,
     status: &str,
-    recorded: Option<String>,
-) -> String {
-    if let Some(recorded) = recorded {
-        return recorded;
-    }
-    let message = turn
-        .pointer("/error/message")
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("codex turn ended with status {status}"));
-    let bounded: String = message.chars().take(256).collect();
-    bounded
+    recorded: Option<serde_json::Value>,
+) -> (String, Option<serde_json::Value>) {
+    let native = recorded.or_else(|| turn.get("error").filter(|value| !value.is_null()).cloned());
+    let label = native.as_ref().map_or_else(
+        || format!("codex turn ended with status {status}"),
+        turn_failure_label,
+    );
+    (label, native)
 }
 
-/// The recorded detail line for a turn-scoped application error (for
-/// example a serverOverloaded capacity failure): `codexErrorInfo: message`
-/// with protocol defaults for either missing field. By itself it never
-/// completes a task; only the boundary projection consumes it.
-pub fn turn_error_detail(params: &serde_json::Value) -> String {
-    let error = params
-        .get("error")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+/// The bounded ES label of one native error (`codexErrorInfo: message` with
+/// protocol defaults). It is diagnostic only: the native error object itself
+/// is delivered unmodified through the turn boundary payload.
+pub fn turn_failure_label(error: &serde_json::Value) -> String {
     let info = error
         .get("codexErrorInfo")
-        .and_then(|value| value.as_str())
-        .unwrap_or("codex_error");
+        .map(codex_error_info_label)
+        .unwrap_or_else(|| "codex_error".to_owned());
     let message = error
         .get("message")
         .and_then(|value| value.as_str())
         .unwrap_or("codex reported a turn error");
-    format!("{info}: {message}")
+    let label = format!("{info}: {message}");
+    label.chars().take(MAX_TURN_FAILURE_LABEL_CHARS).collect()
+}
+
+/// The wire name of one `codexErrorInfo`: a unit variant is its own name; an
+/// externally tagged struct variant (`{"httpConnectionFailed":
+/// {"httpStatusCode": 502}}`) keeps the HTTP status its classification already
+/// carries.
+fn codex_error_info_label(info: &serde_json::Value) -> String {
+    match info {
+        serde_json::Value::String(name) => name.clone(),
+        serde_json::Value::Object(fields) => {
+            let Some((name, body)) = fields.iter().next() else {
+                return "codex_error".to_owned();
+            };
+            match body.get("httpStatusCode").and_then(|value| value.as_u64()) {
+                Some(status) => format!("{name} http {status}"),
+                None => name.clone(),
+            }
+        }
+        _ => "codex_error".to_owned(),
+    }
+}
+
+/// The complete native error of a turn-scoped `error` notification: the
+/// `error` object exactly as received, with the notification's sibling
+/// `willRetry` retained under its native wire name. Never summarized or
+/// bounded here; only the shared delivery layer redacts credentials.
+pub fn turn_error_native(params: &serde_json::Value) -> Option<serde_json::Value> {
+    let error = params.get("error").filter(|value| !value.is_null())?;
+    let mut native = error.clone();
+    let will_retry = params.get("willRetry").filter(|value| !value.is_null());
+    if let (Some(object), Some(will_retry)) = (native.as_object_mut(), will_retry) {
+        // The notification-level retry flag travels beside the error. Never
+        // shadow a field the server already sent.
+        object
+            .entry("willRetry")
+            .or_insert_with(|| will_retry.clone());
+    }
+    Some(native)
 }
 
 /// A failed MCP server startup (`name`, `error`) with protocol defaults.
@@ -298,14 +332,25 @@ pub fn turn_completed_payload(
     })
 }
 
-/// The canonical `turn.failed` boundary payload with the bounded failure
-/// reason.
-pub fn turn_failed_payload(event_id: &str, turn_id: &str, reason: &str) -> serde_json::Value {
+/// The canonical `turn.failed` boundary payload with the bounded ES label and,
+/// when the turn carried one, the complete native error under the shared
+/// `payload.error` slot the delivery layer already delivers through the task
+/// result.
+pub fn turn_failed_payload(
+    event_id: &str,
+    turn_id: &str,
+    reason: &str,
+    native: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({"reason_code": reason});
+    if let Some(native) = native {
+        payload["error"] = native.clone();
+    }
     serde_json::json!({
         "type": "turn.failed",
         "eventId": event_id,
         "turnId": turn_id,
-        "payload": {"reason_code": reason},
+        "payload": payload,
     })
 }
 
@@ -339,11 +384,6 @@ pub fn record_completed_item(items: &mut HashMap<String, String>, item_id: &str,
     if items.contains_key(item_id) || items.len() < MAX_TRACKED_ITEMS {
         items.insert(item_id.to_owned(), text.to_owned());
     }
-}
-
-/// Bound one recorded turn-failure detail (Unicode chars).
-pub fn bounded_turn_failure_detail(detail: &str) -> String {
-    detail.chars().take(MAX_TURN_FAILURE_DETAIL_BYTES).collect()
 }
 
 /// Append one MCP startup-failure line to the diagnostic tail and keep the
@@ -525,42 +565,91 @@ mod tests {
     }
 
     #[test]
-    fn turn_failure_reason_prefers_the_recorded_detail() {
-        assert_eq!(
-            turn_failure_reason(&serde_json::json!({}), "failed", Some("recorded".into())),
-            "recorded"
-        );
-        let error_turn = serde_json::json!({"error": {"message": "capacity exhausted"}});
-        assert_eq!(
-            turn_failure_reason(&error_turn, "failed", None),
-            "capacity exhausted"
-        );
-        assert_eq!(
-            turn_failure_reason(&serde_json::json!({}), "interrupted", None),
-            "codex turn ended with status interrupted"
-        );
-        let long = "é".repeat(300);
-        let bounded_turn = serde_json::json!({"error": {"message": long}});
-        assert_eq!(
-            turn_failure_reason(&bounded_turn, "failed", None)
-                .chars()
-                .count(),
-            256
-        );
+    fn turn_failure_retains_the_complete_native_error() {
+        let recorded = serde_json::json!({
+            "message": "Selected model is at capacity.",
+            "codexErrorInfo": "serverOverloaded",
+            "additionalDetails": "please retry later",
+            "willRetry": true,
+        });
+        let (label, native) =
+            turn_failure(&serde_json::json!({}), "failed", Some(recorded.clone()));
+        assert_eq!(native, Some(recorded));
+        assert_eq!(label, "serverOverloaded: Selected model is at capacity.");
+
+        let boundary = serde_json::json!({"error": {
+            "message": "capacity exhausted",
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+        }});
+        let (label, native) = turn_failure(&boundary, "failed", None);
+        assert_eq!(native, boundary.get("error").cloned());
+        assert_eq!(label, "httpConnectionFailed http 502: capacity exhausted");
+
+        let (label, native) =
+            turn_failure(&serde_json::json!({"error": null}), "interrupted", None);
+        assert_eq!(native, None);
+        assert_eq!(label, "codex turn ended with status interrupted");
     }
 
     #[test]
-    fn turn_error_detail_applies_the_protocol_defaults() {
+    fn the_failure_label_is_bounded_while_the_native_error_is_not() {
+        let long = "é".repeat(MAX_TURN_FAILURE_LABEL_CHARS + 10);
+        let turn = serde_json::json!({"error": {"message": long}});
+        let (label, native) = turn_failure(&turn, "failed", None);
+        assert_eq!(label.chars().count(), MAX_TURN_FAILURE_LABEL_CHARS);
+        assert_eq!(native.expect("native error")["message"], long);
+    }
+
+    #[test]
+    fn turn_error_native_retains_every_native_field() {
         let params = serde_json::json!({
-            "error": {"codexErrorInfo": "serverOverloaded", "message": "try again"}
+            "error": {
+                "message": "usage limit reached",
+                "codexErrorInfo": "usageLimitExceeded",
+                "additionalDetails": "resets at 12:00",
+            },
+            "willRetry": true,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
         });
-        assert_eq!(turn_error_detail(&params), "serverOverloaded: try again");
         assert_eq!(
-            turn_error_detail(&serde_json::json!({})),
+            turn_error_native(&params),
+            Some(serde_json::json!({
+                "message": "usage limit reached",
+                "codexErrorInfo": "usageLimitExceeded",
+                "additionalDetails": "resets at 12:00",
+                "willRetry": true,
+            }))
+        );
+        // A scalar error is retained exactly as received.
+        assert_eq!(
+            turn_error_native(&serde_json::json!({"error": "boom"})),
+            Some(serde_json::json!("boom"))
+        );
+        assert_eq!(turn_error_native(&serde_json::json!({"error": null})), None);
+        assert_eq!(turn_error_native(&serde_json::json!({})), None);
+        // A field the server already sent is never shadowed.
+        let own = serde_json::json!({
+            "error": {"message": "m", "willRetry": false},
+            "willRetry": true,
+        });
+        assert_eq!(turn_error_native(&own).unwrap()["willRetry"], false);
+    }
+
+    #[test]
+    fn turn_failure_label_applies_the_protocol_defaults() {
+        assert_eq!(
+            turn_failure_label(&serde_json::json!({
+                "codexErrorInfo": "serverOverloaded", "message": "try again"
+            })),
+            "serverOverloaded: try again"
+        );
+        assert_eq!(
+            turn_failure_label(&serde_json::json!({})),
             "codex_error: codex reported a turn error"
         );
         assert_eq!(
-            turn_error_detail(&serde_json::json!({"error": {"message": "boom"}})),
+            turn_failure_label(&serde_json::json!({"message": "boom"})),
             "codex_error: boom"
         );
     }
@@ -650,14 +739,36 @@ mod tests {
             turn_completed_payload("codex-event-5", "turn-1", None)["payload"],
             serde_json::json!({})
         );
+        let native = serde_json::json!({
+            "message": "Selected model is at capacity.",
+            "codexErrorInfo": "serverOverloaded",
+            "willRetry": false,
+        });
         assert_eq!(
-            turn_failed_payload("codex-event-6", "turn-1", "serverOverloaded: boom"),
+            turn_failed_payload(
+                "codex-event-6",
+                "turn-1",
+                "serverOverloaded: boom",
+                Some(&native)
+            ),
             serde_json::json!({
                 "type": "turn.failed",
                 "eventId": "codex-event-6",
                 "turnId": "turn-1",
-                "payload": {"reason_code": "serverOverloaded: boom"},
+                "payload": {
+                    "reason_code": "serverOverloaded: boom",
+                    "error": native,
+                },
             })
+        );
+        assert_eq!(
+            turn_failed_payload(
+                "codex-event-7",
+                "turn-1",
+                "codex turn ended with status failed",
+                None
+            )["payload"],
+            serde_json::json!({"reason_code": "codex turn ended with status failed"})
         );
     }
 
@@ -694,13 +805,6 @@ mod tests {
         }
         record_completed_item(&mut items, "item-new", "refused");
         assert!(!items.contains_key("item-new"));
-    }
-
-    #[test]
-    fn turn_failure_detail_is_char_bounded() {
-        let detail: String = "é".repeat(MAX_TURN_FAILURE_DETAIL_BYTES + 10);
-        let bounded = bounded_turn_failure_detail(&detail);
-        assert_eq!(bounded.chars().count(), MAX_TURN_FAILURE_DETAIL_BYTES);
     }
 
     #[test]

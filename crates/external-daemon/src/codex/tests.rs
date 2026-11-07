@@ -1495,6 +1495,311 @@ sleep 1
     assert!(record.contains("cloudflare-api"), "record: {record}");
 }
 
+/// A scripted fresh task whose first turn replays `frames` after
+/// `turn/started`, in one NDJSON burst. The frames travel through a file so a
+/// fixture's own text (quotes, apostrophes, megabytes) needs no shell
+/// escaping at all.
+fn error_turn_script(workspace: &Path, frames: &[serde_json::Value]) -> String {
+    let echo = start_echo(workspace, PermissionMode::Plan);
+    let replay = frame_replay(workspace, frames);
+    format!(
+        r#"
+IFS= read -r line
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
+IFS= read -r line
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+{replay}
+sleep 2
+"#
+    )
+}
+
+/// Write the native frames to one NDJSON file and return the shell line that
+/// replays them.
+fn frame_replay(workspace: &Path, frames: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for frame in frames {
+        body.push_str(&frame.to_string());
+        body.push('\n');
+    }
+    std::fs::write(workspace.join("native-frames.jsonl"), body).unwrap();
+    "cat native-frames.jsonl".to_owned()
+}
+
+/// Submit one probe task against a scripted child and return the scheduler and
+/// its agent id once the task is ready to start.
+fn scripted_probe(workspace: &Path, script: &str, prompt: &str) -> (Scheduler, String) {
+    let scheduler = codex_scheduler(workspace, harness_factory(script, workspace));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace, prompt),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    (scheduler, submitted.agent_id)
+}
+
+#[test]
+fn usage_limit_failure_delivers_the_complete_native_error() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // Synthetic composition of the documented `TurnError` fields
+    // (app-server-protocol v2 `thread_data.rs`) and the `error`
+    // notification's `willRetry` sibling (`notification.rs`): terminal
+    // usage-limit errors are exercised as a fixture, never by exhausting a
+    // real quota.
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "You've hit your usage limit.",
+                "codexErrorInfo": "usageLimitExceeded",
+            },
+            "willRetry": false,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    // The settling boundary names the same cause with a shorter message: the
+    // earlier complete native object is what the delivered result must carry.
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {
+                "id": "codex-turn-1",
+                "status": "failed",
+                "error": {
+                    "message": "usage limit reached",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "usage limit probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let delivered: serde_json::Value = serde_json::from_str(&result.result.final_text)
+        .expect("the failed turn delivers the structured native error");
+    assert_eq!(
+        delivered,
+        serde_json::json!({
+            "message": "You've hit your usage limit.",
+            "codexErrorInfo": "usageLimitExceeded",
+            "willRetry": false,
+        })
+    );
+    await_terminal_task(&scheduler, &agent_id);
+}
+
+#[test]
+fn http_object_error_delivers_the_status_details_and_retry_flag() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // The reference app-server reports a retrying stream error as an `error`
+    // notification with `willRetry: true` and the surface-specific
+    // `additionalDetails` (bespoke_event_handling `EventMsg::StreamError`).
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "upstream response stream closed",
+                "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+                "additionalDetails": "The upstream proxy closed the stream mid-response.",
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    // The turn still fails, but the boundary carries no error object of its
+    // own, so the recorded notification error is all the native cause there is.
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "failed"},
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "http error probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let delivered: serde_json::Value = serde_json::from_str(&result.result.final_text)
+        .expect("the failed turn delivers the structured native error");
+    assert_eq!(
+        delivered,
+        serde_json::json!({
+            "message": "upstream response stream closed",
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+            "additionalDetails": "The upstream proxy closed the stream mid-response.",
+            "willRetry": true,
+        })
+    );
+    await_terminal_task(&scheduler, &agent_id);
+}
+
+#[test]
+fn retry_error_does_not_settle_the_turn_and_a_later_completion_wins() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Selected model is at capacity.",
+                "codexErrorInfo": "serverOverloaded",
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let delta = serde_json::json!({
+        "method": "item/agentMessage/delta",
+        "params": {
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+            "itemId": "msg_1",
+            "delta": "RETRY_OK",
+        },
+    });
+    let finished = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+            "item": {"type": "agentMessage", "id": "msg_1", "text": "RETRY_OK"},
+        },
+    });
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "completed", "error": null},
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, delta, finished, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "retry probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        result.result.outcome,
+        TaskOutcome::Completed,
+        "a retryable error notification must not settle the task as a failure"
+    );
+    assert_eq!(result.result.final_text, "RETRY_OK");
+    await_terminal_task(&scheduler, &agent_id);
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "a retried error must not be recorded as this task's cause: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+}
+
+#[test]
+fn long_native_error_paginates_without_loss() {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let details = format!(
+        "Authorization: Bearer sk-test-secret\n{}",
+        "detail 信息 ".repeat(50_000)
+    );
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Model request failed.",
+                "codexErrorInfo": "internalServerError",
+                "additionalDetails": details,
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "failed"},
+        },
+    });
+    // The error frame is far above any shell argument bound: the replay file
+    // carries it the way a real app-server replays a large terminal frame.
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "long error probe");
+    scheduler.start_ready().unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    assert!(
+        !stored.result.final_text.contains("sk-test-secret"),
+        "the delivered native error must be redacted"
+    );
+    assert!(stored.result.final_text.contains("[REDACTED]"));
+    let delivered: serde_json::Value = serde_json::from_str(&stored.result.final_text).unwrap();
+    assert_eq!(delivered["message"], "Model request failed.");
+    assert_eq!(delivered["codexErrorInfo"], "internalServerError");
+    assert_eq!(delivered["willRetry"], true);
+    let delivered_details = delivered["additionalDetails"].as_str().unwrap();
+    assert!(
+        delivered_details.ends_with("detail 信息 "),
+        "the full additionalDetails must survive instead of being truncated"
+    );
+    assert!(delivered_details.len() > 400_000);
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let first = service
+        .dispatch(RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+            wait_mode: crate::rpc::WaitMode::All,
+        }))
+        .unwrap();
+    let RpcSuccess::TaskWait(first) = first else {
+        panic!("wait response")
+    };
+    let first = first.result.expect("terminal result view");
+    assert!(
+        first.next_offset.is_some(),
+        "a long native error must be paged, not discarded"
+    );
+    let mut text = first.final_text;
+    let mut offset = first.next_offset;
+    while let Some(next) = offset {
+        let response = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: next,
+                limit: 16384,
+            })
+            .unwrap();
+        let RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::Failed);
+        text.push_str(&page.final_text);
+        offset = page.next_offset;
+    }
+    assert_eq!(text, stored.result.final_text);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        delivered
+    );
+    assert!(!text.contains("sk-test-secret"));
+}
+
 #[test]
 fn strict_envelope_missing_thread_and_model_mismatch_fail_the_start_bounded() {
     let _guard = scripted_test_guard();

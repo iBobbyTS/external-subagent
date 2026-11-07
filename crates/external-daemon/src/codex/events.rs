@@ -38,7 +38,9 @@ pub(super) struct CodexShared {
     /// started/completed item must not be counted twice. Cleared at every turn
     /// boundary (a new `turn/started` and turn retirement).
     pub(super) seen_tool_items: Mutex<Vec<String>>,
-    pub(super) turn_failure: Mutex<Option<String>>,
+    /// The current turn's native error notification, retained complete: the
+    /// boundary projection needs the original object, not a summary of it.
+    pub(super) turn_failure: Mutex<Option<serde_json::Value>>,
     pub(super) mcp_tail: Mutex<String>,
     pub(super) sequence: AtomicU64,
     pub(super) stop_boundaries: AtomicU64,
@@ -72,8 +74,8 @@ impl CodexShared {
         self.items.lock().unwrap().get(item_id).cloned()
     }
 
-    fn record_turn_failure(&self, detail: String) {
-        *self.turn_failure.lock().unwrap() = Some(update::bounded_turn_failure_detail(&detail));
+    fn record_turn_failure(&self, native: serde_json::Value) {
+        *self.turn_failure.lock().unwrap() = Some(native);
     }
 
     fn record_mcp_failure(&self, name: &str, error: &str) {
@@ -300,13 +302,20 @@ impl CodexShared {
                     }
                     Some("failed") | Some("interrupted") => {
                         let recorded = self.turn_failure.lock().unwrap().clone();
-                        let reason = update::turn_failure_reason(
+                        let (reason, native) = update::turn_failure(
                             completed.turn,
                             completed.status.unwrap_or("failed"),
                             recorded,
                         );
-                        self.record_turn_failure(reason.clone());
-                        let params = update::turn_failed_payload(&event_id, &current, &reason);
+                        if let Some(native) = native.clone() {
+                            self.record_turn_failure(native);
+                        }
+                        let params = update::turn_failed_payload(
+                            &event_id,
+                            &current,
+                            &reason,
+                            native.as_ref(),
+                        );
                         let boundary = self.canonical_event(params.clone());
                         self.emit_canonical(params);
                         self.turn_tracker.observe(&boundary);
@@ -322,12 +331,15 @@ impl CodexShared {
                 // serverOverloaded capacity failure) is recorded for the
                 // boundary projection; by itself it never completes a task.
                 // Only an error attributable to the current turn may label
-                // this task's failure reason.
+                // this task's failure reason. The notification's native error
+                // is retained complete, including its sibling `willRetry`.
                 let frame_turn = params.get("turnId").and_then(|value| value.as_str());
                 if self.attributable_turn(frame_turn).is_none() {
                     return true;
                 }
-                self.record_turn_failure(update::turn_error_detail(&params));
+                if let Some(native) = update::turn_error_native(&params) {
+                    self.record_turn_failure(native);
+                }
                 true
             }
             "mcpServer/startupStatus/updated" => {
@@ -379,7 +391,10 @@ impl CodexShared {
     pub(super) fn diagnostic_tail(&self) -> String {
         let mut sections = Vec::new();
         if let Some(failure) = self.turn_failure.lock().unwrap().clone() {
-            sections.push(format!("codex turn failure: {failure}"));
+            sections.push(format!(
+                "codex turn failure: {}",
+                update::turn_failure_label(&failure)
+            ));
         }
         let mcp = self.mcp_tail.lock().unwrap().clone();
         if !mcp.is_empty() {
