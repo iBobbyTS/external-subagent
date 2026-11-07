@@ -3127,3 +3127,93 @@ fn repair1_failed_prompt_write_closes_the_reserved_turn() {
     assert!(messages.is_empty());
     assert_eq!(messages.turn_text("dsh-prompt-1"), None);
 }
+
+#[test]
+fn repair4_nul_chunk_is_preserved_in_persisted_and_paged_result() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let updates = workspace.path().join("nul-updates.jsonl");
+    let chunk = |text: &str| {
+        serde_json::json!({"jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk",
+            "messageId":"native-nul","content":{"type":"text","text":text}}}})
+        .to_string()
+    };
+    std::fs::write(
+        &updates,
+        format!(
+            "{}\n{}\n{}\n",
+            chunk("prefix "),
+            chunk("important\0suffix"),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "{}\ncat {:?}\n",
+        BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        updates
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    let expected = "prefix important\0suffix";
+    assert_eq!(
+        stored.result.final_text, expected,
+        "complete success must retain the entire received text"
+    );
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert!(!stored.result.partial);
+
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    let mut saw_nul_escape = false;
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 8,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page");
+        };
+        assert_eq!(page.outcome, TaskOutcome::Completed);
+        assert!(!page.partial);
+        assert_eq!(page.total_bytes, expected.len());
+        assert_eq!(page.offset, offset);
+        let encoded = serde_json::to_string(&page).unwrap();
+        saw_nul_escape |= encoded.contains("\\u0000");
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        reconstructed.push_str(decoded["final_text"].as_str().unwrap());
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        saw_nul_escape,
+        "RPC must safely encode NUL as a JSON escape"
+    );
+    assert_eq!(reconstructed, expected);
+}

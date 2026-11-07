@@ -91,13 +91,12 @@ impl MessageAggregation {
     ///
     /// A native `message_id` groups the text by its native identity; the text
     /// also joins the prompt bucket while that prompt is open, which is what
-    /// makes the standard chunk-only settlement readable. Malformed identities
-    /// and NUL-bearing text are refused rather than aggregated.
+    /// makes the standard chunk-only settlement readable. Malformed native
+    /// identities are refused; legal JSON body text, including NUL, is retained.
     pub fn observe(&mut self, turn_id: &str, message_id: Option<&str>, text: &str) {
         if self.turn.turn_id.as_deref() != Some(turn_id)
             || self.turn.limited
             || text.is_empty()
-            || text.contains('\0')
         {
             return;
         }
@@ -302,6 +301,35 @@ mod tests {
     }
 
     #[test]
+    fn repair4_nul_body_is_complete_in_prompt_and_native_scopes() {
+        let expected = "prefix important\0suffix";
+        let mut messages = aggregated();
+        messages.observe(TURN, Some("native"), "prefix ");
+        messages.observe(TURN, Some("native"), "important\0suffix");
+        assert_eq!(messages.turn_text(TURN), Some(expected));
+        assert_eq!(messages.message("native"), Some(expected));
+        for message_id in [None, Some("native")] {
+            assert_eq!(
+                fold_settlement(&settlement("end_turn", message_id), &messages, TURN),
+                SettlementOutcome::Completed {
+                    final_text: Some(expected.into())
+                }
+            );
+        }
+        messages.seal_turn(TURN);
+        messages.observe(TURN, Some("late"), "late\0text");
+        assert_eq!(messages.message("late"), None);
+        messages.begin_turn("next");
+        messages.observe("next", None, expected);
+        assert_eq!(
+            fold_settlement(&settlement("end_turn", None), &messages, "next"),
+            SettlementOutcome::Completed {
+                final_text: Some(expected.into())
+            }
+        );
+    }
+
+    #[test]
     fn end_turn_returns_only_the_verified_message() {
         let mut messages = aggregated();
         messages.observe(TURN, Some("progress-1"), "partial progress");
@@ -454,11 +482,11 @@ mod tests {
         assert!(messages.is_empty());
         assert_eq!(messages.turn_text(TURN), Some("xxx"));
 
-        // NUL-bearing text is refused in both scopes.
+        // Legal NUL-bearing body text is preserved in both scopes.
         messages.begin_turn("dsh-prompt-2");
         messages.observe("dsh-prompt-2", Some("m"), "bad\0text");
-        assert_eq!(messages.message("m"), None);
-        assert_eq!(messages.turn_text("dsh-prompt-2"), None);
+        assert_eq!(messages.message("m"), Some("bad\0text"));
+        assert_eq!(messages.turn_text("dsh-prompt-2"), Some("bad\0text"));
 
         messages.begin_turn(TURN);
         messages.observe(TURN, Some("m"), &"y".repeat(MAX_MESSAGE_BYTES + 4096));

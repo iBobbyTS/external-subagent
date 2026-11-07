@@ -127,9 +127,8 @@ fn block_text(content: &Value) -> Option<String> {
             .or_else(|| object.get("delta").and_then(Value::as_str)),
         _ => None,
     }?;
-    if text.contains('\0') {
-        return None;
-    }
+    // U+0000 is legal JSON body text. Preserve it through assistant output
+    // instead of silently discarding the entire containing block.
     Some(text.to_owned())
 }
 
@@ -178,7 +177,8 @@ pub fn parse_update(params: &Value) -> Option<SessionUpdate> {
             committed: false,
         },
         "agent_thought_chunk" | "agent_thought" | "thought" => UpdateKind::AgentThoughtChunk {
-            text: block_text(update.get("content").unwrap_or(&Value::Null)),
+            text: block_text(update.get("content").unwrap_or(&Value::Null))
+                .filter(|text| !text.contains('\0')),
         },
         "tool_call" => UpdateKind::ToolCall {
             tool_call_id: bounded_id(update.get("toolCallId"))?,
@@ -371,6 +371,40 @@ mod tests {
             "sessionId": "s",
             "update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}}
         })
+    }
+
+    #[test]
+    fn repair4_assistant_text_preserves_nul_without_changing_empty_or_thought_rules() {
+        let nul_text = "important\0suffix";
+        for update in [
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":nul_text}}),
+            json!({"type":"agent_message","messageId":"native","content":[
+                {"type":"text","text":""},{"type":"image","data":"ignored"},
+                {"type":"text","text":nul_text}]}),
+        ] {
+            let parsed = parse_update(&json!({"sessionId":"s","update":update})).unwrap();
+            let UpdateKind::AgentMessage { text, .. } = &parsed.kind else {
+                panic!("assistant text");
+            };
+            assert_eq!(text, nul_text);
+            let payloads = canonical_event_payloads(&parsed, "event", "turn");
+            assert_eq!(payloads[0]["payload"]["delta"], nul_text);
+        }
+        for content in [
+            json!({"type":"text","text":""}),
+            json!({"type":"image","data":"ignored"}),
+        ] {
+            let parsed = parse_update(
+                &json!({"update":{"sessionUpdate":"agent_message_chunk","content":content}}),
+            )
+            .unwrap();
+            assert!(matches!(&parsed.kind, UpdateKind::AgentMessage { text, .. } if text.is_empty()));
+            assert!(canonical_event_payloads(&parsed, "empty", "turn").is_empty());
+        }
+        let thought = parse_update(&json!({"update":{"sessionUpdate":"agent_thought_chunk",
+            "content":{"type":"text","text":nul_text}}}))
+        .unwrap();
+        assert_eq!(thought.kind, UpdateKind::AgentThoughtChunk { text: None });
     }
 
     #[test]
