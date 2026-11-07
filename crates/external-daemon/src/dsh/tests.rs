@@ -2710,8 +2710,10 @@ fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
 }
 
 /// Exercise the real adapter projector and observation/activity consumers.
-#[test]
-fn repair1_pending_tool_preserves_descriptor_without_premature_execution() {
+fn tool_projection_tracker() -> (
+    super::events::DshRuntimeShared,
+    Arc<crate::PassiveActivityTracker>,
+) {
     struct TrackerSink(Arc<crate::PassiveActivityTracker>);
     impl LifecycleSink for TrackerSink {
         fn emit(&self, record: crate::LifecycleRecord) {
@@ -2734,35 +2736,89 @@ fn repair1_pending_tool_preserves_descriptor_without_premature_execution() {
         stop_boundaries: std::sync::atomic::AtomicU64::new(0),
     };
     shared.begin_turn(1);
-    let deliver = |update: serde_json::Value| {
-        let event = Inbound::Message(WireMessage::UnknownEvent {
-            method: "session/update".into(),
-            raw: serde_json::json!({"params":{"sessionId":"s","update":update}}),
-        });
-        assert!(super::events::project_dsh_inbound(&shared, &event).is_none());
-    };
+    (shared, tracker)
+}
+
+fn deliver_tool_update(shared: &super::events::DshRuntimeShared, update: serde_json::Value) {
+    let event = Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/update".into(),
+        raw: serde_json::json!({"params":{"sessionId":"s","update":update}}),
+    });
+    assert!(super::events::project_dsh_inbound(shared, &event).is_none());
+}
+
+fn assert_pending_tool_counters(tool_name: &str, input: serde_json::Value) {
+    let (shared, tracker) = tool_projection_tracker();
     let pending = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"c",
-        "status":"pending","title":"Read","kind":"other","rawInput":{"path":"a.ts"}});
-    deliver(pending.clone());
-    deliver(pending); // A replay has fresh envelope IDs but the same call identity.
-    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 0);
+        "status":"pending","title":tool_name,"kind":"other","rawInput":input});
+    deliver_tool_update(&shared, pending.clone());
+    deliver_tool_update(&shared, pending); // Fresh envelopes, same call.
+    let scheduled = tracker.snapshot();
+    assert_eq!(scheduled.window_60s.tool_calls_started, 0);
+    assert_eq!(scheduled.window_60s.read_calls, 0);
+    assert_eq!(scheduled.window_60s.bash_calls, 0);
+    assert_eq!(scheduled.window_60s.other_tool_calls, 0);
     let observed = tracker.observation_snapshot();
     assert_eq!(observed.tools.len(), 1, "pending descriptor was lost");
-    assert_eq!(observed.tools[0].tool_name, "Read");
+    assert_eq!(observed.tools[0].tool_name, tool_name);
     assert_eq!(observed.tools[0].call_count, 1);
-    assert_eq!(observed.tools[0].recent_calls[0].arguments["path"], "a.ts");
+    assert_eq!(&observed.tools[0].recent_calls[0].arguments, input.as_object().unwrap());
     let started = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"in_progress"});
-    deliver(started.clone());
-    deliver(started);
-    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 1);
-    assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 0);
+    deliver_tool_update(&shared, started.clone());
+    deliver_tool_update(&shared, started);
+    let running = tracker.snapshot();
+    assert_eq!(running.window_60s.tool_calls_started, 1);
+    assert_eq!(running.window_60s.tool_calls_completed, 0);
+    assert_eq!(running.window_60s.read_calls, u64::from(tool_name == "Read"), "{tool_name}");
+    assert_eq!(running.window_60s.bash_calls, u64::from(tool_name == "Bash"), "{tool_name}");
+    assert_eq!(running.window_60s.other_tool_calls, 0, "{tool_name}");
     let completed = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed"});
-    deliver(completed.clone());
-    deliver(completed);
+    deliver_tool_update(&shared, completed.clone());
+    deliver_tool_update(&shared, completed);
     assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 1);
     assert_eq!(tracker.snapshot().window_60s.tool_calls_failed, 0);
     assert!(tracker.snapshot().active_tools.is_empty());
     assert_eq!(tracker.observation_snapshot(), observed);
+}
+
+#[test]
+fn repair1_pending_tool_preserves_descriptor_without_premature_execution() {
+    assert_pending_tool_counters("Read", serde_json::json!({"path":"a.ts"}));
+}
+
+#[test]
+fn repair2_pending_bash_preserves_descriptor_and_activity_counters() {
+    assert_pending_tool_counters("Bash", serde_json::json!({"command":"pwd"}));
+}
+
+fn assert_terminal_tool_announcement(status: &str) {
+    let (shared, tracker) = tool_projection_tracker();
+    let terminal = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"terminal",
+        "status":status,"title":"Read","kind":"other","rawInput":{"path":"a.ts"}});
+    deliver_tool_update(&shared, terminal.clone());
+    let observed = tracker.observation_snapshot();
+    assert_eq!(observed.tools.len(), 1, "{status} announcement descriptor was lost");
+    assert_eq!(observed.tools[0].tool_name, "Read");
+    assert_eq!(observed.tools[0].call_count, 1);
+    assert_eq!(&observed.tools[0].recent_calls[0].arguments, serde_json::json!({"path":"a.ts"}).as_object().unwrap());
+    assert!(!observed.tools[0].recent_calls[0].arguments_truncated);
+    deliver_tool_update(&shared, terminal);
+    let activity = tracker.snapshot();
+    assert_eq!(activity.window_60s.tool_calls_started, 0);
+    assert_eq!(activity.window_60s.tool_calls_completed, u64::from(status == "completed"));
+    assert_eq!(activity.window_60s.tool_calls_failed, u64::from(status == "failed"));
+    assert!(activity.active_tools.is_empty());
+    assert_eq!(tracker.observation_snapshot(), observed, "replay must not recount");
+}
+
+#[test]
+fn repair2_completed_announcement_preserves_observation_without_start() {
+    assert_terminal_tool_announcement("completed");
+}
+
+#[test]
+fn repair2_failed_announcement_preserves_observation_without_start() {
+    assert_terminal_tool_announcement("failed");
 }
 
 #[test]

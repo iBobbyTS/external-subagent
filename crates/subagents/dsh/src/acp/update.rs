@@ -271,15 +271,13 @@ pub fn canonical_event_payloads(
             };
             let mut events = Vec::new();
             // Observation retains the announcement independently of execution.
-            // A pending companion records identity/name; only tool.updated
-            // carries the scheduled/started activity phase.
-            if matches!(phase, ToolPhase::Scheduled | ToolPhase::Started) {
-                events.push(base(json!({
-                    "kind": "tool_call",
-                    "toolCallId": tool_call_id,
-                    "toolName": name.clone().unwrap_or_else(|| "dsh_tool".into()),
-                })));
-            }
+            // Even a terminal announcement records identity/name; only
+            // tool.updated carries the activity phase, without inventing start.
+            events.push(base(json!({
+                "kind": "tool_call",
+                "toolCallId": tool_call_id,
+                "toolName": name.clone().unwrap_or_else(|| "dsh_tool".into()),
+            })));
             events.push(tool_activity_payload(
                 event_id,
                 turn_id,

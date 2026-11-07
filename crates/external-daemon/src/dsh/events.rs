@@ -275,6 +275,16 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                     .observe(&turn_id, message_id.as_deref(), text);
             }
             for mut payload in update::canonical_event_payloads(&parsed, &event_id, &turn_id) {
+                // Phase updates may omit the announcement's title. Reuse its
+                // known name so activity counters classify the same call as
+                // observation and active-tools state, without inventing input.
+                if let update::UpdateKind::ToolCallUpdate { tool_call_id, .. } = &parsed.kind {
+                    if payload["type"] == "tool.updated" {
+                        if let Some(name) = shared.tool_names.lock().unwrap().get(tool_call_id) {
+                            payload["payload"]["toolName"] = serde_json::Value::String(name.clone());
+                        }
+                    }
+                }
                 // Keep the announcement's descriptor even while scheduled.
                 // The observation companion does not count as execution;
                 // activity phases still come only from tool.updated.
