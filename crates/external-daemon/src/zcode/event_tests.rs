@@ -637,3 +637,65 @@ fn zcode_bootstrap_remote_conversion_keeps_complete_sanitized_native_view() {
         assert!(error.native_failure().is_none());
     }
 }
+
+#[test]
+fn user_input_resolution_uses_wire_identity_after_attribution() {
+    for envelope_id in [WireId::String("server-7".into()), WireId::Integer(7)] {
+        let mut trace = Trace::new();
+        trace.send("session/event", json!({"type":"turn.started"}));
+        let request = Inbound::Message(WireMessage::Request(
+            external_contract::RequestEnvelope::new(
+                envelope_id.clone(),
+                external_contract::INTERACTION_REQUEST_USER_INPUT,
+                json!({"requestId":"mcp-elicit-xyz","prompt":"Synthetic question"}),
+            ),
+        ));
+        assert!(trace.adapter.decode(&request).is_none());
+        for (session, turn, attribution) in [
+            ("foreign-session", "turn-1", Attribution::ForeignSession),
+            ("session-1", "older-turn", Attribution::Late),
+        ] {
+            let ignored = trace
+                .adapter
+                .decode(&Inbound::Message(WireMessage::UnknownEvent {
+                    method: "session/event".into(),
+                    raw: json!({"params":{
+                        "type":"userInput.resolved","sessionId":session,"turnId":turn,
+                        "payload":{"requestId":"mcp-elicit-xyz","cancelled":true}
+                    }}),
+                }))
+                .unwrap();
+            assert_eq!(ignored.attribution(), attribution);
+            assert!(ignored.events().is_empty());
+            assert_eq!(
+                trace.adapter.user_inputs.get("mcp-elicit-xyz"),
+                Some(&envelope_id)
+            );
+        }
+        let resolved = trace.send(
+            "session/event",
+            json!({"type":"userInput.resolved", "payload":{
+                "requestId":"mcp-elicit-xyz","cancelled":true
+            }}),
+        );
+        let EventFact::InputResolved(resolution) = &resolved.events()[0].fact else {
+            panic!("resolution")
+        };
+        assert_eq!(resolution.request_id, envelope_id);
+        assert_eq!(resolution.outcome, InputOutcome::Cancelled);
+        assert!(trace.adapter.user_inputs.is_empty());
+        let replay = trace
+            .adapter
+            .decode(&Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: json!({"params":{
+                    "type":"userInput.resolved","eventId":resolved.input().source.event_id,
+                    "sessionId":"session-1","turnId":"turn-1",
+                    "payload":{"requestId":"mcp-elicit-xyz","cancelled":true}
+                }}),
+            }))
+            .unwrap();
+        assert_eq!(replay.attribution(), Attribution::Replay);
+        assert!(replay.events().is_empty());
+    }
+}

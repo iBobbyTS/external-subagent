@@ -14,6 +14,7 @@ pub(crate) struct ZcodeAdapter {
     settled: HashSet<TurnId>,
     frames: HashSet<NativeFrameKey>,
     permissions: HashMap<String, WireId>,
+    user_inputs: HashMap<String, WireId>,
     message: MessageId,
 }
 
@@ -28,6 +29,7 @@ impl ZcodeAdapter {
             settled: HashSet::new(),
             frames: HashSet::new(),
             permissions: HashMap::new(),
+            user_inputs: HashMap::new(),
             message: MessageId("assistant-stream".into()),
         }
     }
@@ -37,6 +39,11 @@ impl ZcodeAdapter {
             if request.method == external_contract::INTERACTION_REQUEST_PERMISSION {
                 if let Some(call) = string(&request.params, "toolCallId") {
                     self.permissions.insert(call.into(), request.id.clone());
+                }
+            } else if request.method == external_contract::INTERACTION_REQUEST_USER_INPUT {
+                if let Some(interaction) = string(&request.params, "requestId") {
+                    self.user_inputs
+                        .insert(interaction.into(), request.id.clone());
                 }
             }
             return None; // native RPC response remains owned by command handling
@@ -211,6 +218,10 @@ impl ZcodeAdapter {
                         if let Some(call) = &resolution.call_id {
                             if let Some(id) = self.permissions.get(&call.0) {
                                 resolution.request_id = id.clone();
+                            }
+                        } else if let WireId::String(interaction) = &resolution.request_id {
+                            if let Some(envelope_id) = self.user_inputs.remove(interaction) {
+                                resolution.request_id = envelope_id;
                             }
                         }
                     }

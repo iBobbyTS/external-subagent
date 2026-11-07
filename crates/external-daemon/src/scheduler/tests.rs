@@ -3486,9 +3486,20 @@ mod turn_adjudication_tests {
     fn zcode_native_resolution_and_user_respond_have_one_pending_winner() {
         use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget};
         use std::sync::mpsc;
-        for (method, decision, content, native_method, native_params, native_decision) in [
+        for (
+            method,
+            envelope_id,
+            interaction_id,
+            decision,
+            content,
+            native_method,
+            native_params,
+            native_decision,
+        ) in [
             (
                 external_contract::INTERACTION_REQUEST_PERMISSION,
+                "race-native-request",
+                "race-native-request",
                 "allow",
                 None,
                 "v4/telemetry/event",
@@ -3497,10 +3508,22 @@ mod turn_adjudication_tests {
             ),
             (
                 external_contract::INTERACTION_REQUEST_USER_INPUT,
+                "race-native-request",
+                "race-native-request",
                 "answer",
                 Some("client answer"),
                 "session/event",
                 serde_json::json!({"type":"userInput.resolved","turnId":"race-turn","payload":{"requestId":"race-native-request","value":"native answer"}}),
+                "answer",
+            ),
+            (
+                external_contract::INTERACTION_REQUEST_USER_INPUT,
+                "server-7",
+                "mcp-elicit-xyz",
+                "answer",
+                Some("client answer"),
+                "session/event",
+                serde_json::json!({"type":"userInput.resolved","turnId":"race-turn","payload":{"requestId":"mcp-elicit-xyz","value":"native answer"}}),
                 "answer",
             ),
         ] {
@@ -3542,9 +3565,9 @@ mod turn_adjudication_tests {
                 );
                 let request = Inbound::Message(WireMessage::Request(
                     external_contract::RequestEnvelope::new(
-                        WireId::String("race-native-request".into()),
+                        WireId::String(envelope_id.into()),
                         method,
-                        serde_json::json!({"toolCallId":"race-call","toolName":"Bash","question":"allow?"}),
+                        serde_json::json!({"requestId":interaction_id,"toolCallId":"race-call","toolName":"Bash","question":"allow?"}),
                     ),
                 ));
                 assert!(adapter.decode(&request).is_none());
@@ -3554,8 +3577,8 @@ mod turn_adjudication_tests {
                 let request_id = pending[0].request_id.clone();
                 let connection = rusqlite::Connection::open(scheduler.store().database_path()).unwrap();
                 connection.execute_batch("CREATE TABLE pending_race_transitions(old_state TEXT,new_state TEXT);
-                    CREATE TRIGGER record_pending_race AFTER UPDATE OF state ON pending_requests
-                    WHEN OLD.state<>NEW.state BEGIN INSERT INTO pending_race_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+                        CREATE TRIGGER record_pending_race AFTER UPDATE OF state ON pending_requests
+                        WHEN OLD.state<>NEW.state BEGIN INSERT INTO pending_race_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
                 let (entered_tx, entered_rx) = mpsc::sync_channel(1);
                 let (release_tx, release_rx) = mpsc::sync_channel(1);
                 let release_rx = Mutex::new(release_rx);
@@ -3624,13 +3647,14 @@ mod turn_adjudication_tests {
                     .unwrap()
                     .unwrap();
                 assert_eq!(
-                    during.state,
-                    if stage == ResponseClaimHookStage::AfterClaim {
-                        PendingRequestState::Sending
-                    } else {
-                        PendingRequestState::Responded
-                    }
-                );
+                        during.state,
+                        if stage == ResponseClaimHookStage::AfterClaim {
+                            PendingRequestState::Sending
+                        } else {
+                            PendingRequestState::Responded
+                        },
+                        "native resolution: envelope={envelope_id}, interaction={interaction_id}, stage={stage:?}"
+                    );
                 let second = scheduler
                     .respond_request(agent_id, &request_id, decision, content)
                     .unwrap();
