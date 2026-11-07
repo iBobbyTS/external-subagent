@@ -270,7 +270,10 @@ pub fn canonical_event_payloads(
                 return Vec::new();
             };
             let mut events = Vec::new();
-            if phase == ToolPhase::Started {
+            // Observation retains the announcement independently of execution.
+            // A pending companion records identity/name; only tool.updated
+            // carries the scheduled/started activity phase.
+            if matches!(phase, ToolPhase::Scheduled | ToolPhase::Started) {
                 events.push(base(json!({
                     "kind": "tool_call",
                     "toolCallId": tool_call_id,

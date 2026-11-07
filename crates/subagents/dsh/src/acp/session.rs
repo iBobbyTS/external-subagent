@@ -202,6 +202,17 @@ impl AcpSession {
     /// A session whose model or reasoning-effort selection was refused never
     /// sends a prompt.
     pub fn prompt(&mut self, prompt: &str) -> Result<(u64, PendingRequest), SessionError> {
+        self.prompt_with_start(prompt, |_| {})
+    }
+
+    /// Reserve the prompt identity and initialize its consumer before any
+    /// request bytes can produce inbound updates. Validation precedes `start`;
+    /// if the subsequent write fails, the caller must roll back that turn.
+    pub fn prompt_with_start(
+        &mut self,
+        prompt: &str,
+        start: impl FnOnce(u64),
+    ) -> Result<(u64, PendingRequest), SessionError> {
         if self.model_refused {
             return Err(SessionError::Shape(ShapeError(
                 "model selection was refused; no prompt may be sent".into(),
@@ -221,6 +232,9 @@ impl AcpSession {
                 )))
             }
         };
+        let prompt_id = u64::try_from(numeric)
+            .map_err(|_| SessionError::Shape(ShapeError("request id is negative".into())))?;
+        start(prompt_id);
         let pending = self
             .driver
             .begin_request_with_id(
@@ -229,11 +243,7 @@ impl AcpSession {
                 transport::prompt_params(self.session_id.as_deref().unwrap_or(""), prompt),
             )
             .map_err(SessionError::from)?;
-        Ok((
-            u64::try_from(numeric)
-                .map_err(|_| SessionError::Shape(ShapeError("request id is negative".into())))?,
-            pending,
-        ))
+        Ok((prompt_id, pending))
     }
 
     /// `session/cancel` is a notification in the upstream method set.

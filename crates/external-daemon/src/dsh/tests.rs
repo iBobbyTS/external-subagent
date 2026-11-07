@@ -734,9 +734,7 @@ printf '%s\\n' \
 
 #[test]
 fn answerable_server_request_wakes_declared_waits_and_answers_over_acp() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child parks the turn on a NON-permission server request, which
@@ -851,9 +849,7 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn unsupported_dsh_requests_stay_non_respondable_even_for_answering_callers() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // One unknown interaction method and one malformed input request
@@ -949,9 +945,7 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn answerable_request_among_unsupported_noise_is_returned_and_answerable() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child holds its input request back until the test has planted
@@ -1855,7 +1849,11 @@ fn cross_provider_shared_scheduler_contract() {
     assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
 
     // A second provider is admitted while the first remains active.
-    let second = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:fixture-model"));
+    let second = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
     let _request = await_pending_permission(&scheduler, &second);
     assert_eq!(scheduler.active_count(), 2);
@@ -2709,4 +2707,203 @@ fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
     // The terminal row was not requeued.
     let task = store.get_task(&agent_id).unwrap().unwrap();
     assert_eq!(task.phase, TaskPhase::Terminal);
+}
+
+/// Exercise the real adapter projector and observation/activity consumers.
+#[test]
+fn repair1_pending_tool_preserves_descriptor_without_premature_execution() {
+    struct TrackerSink(Arc<crate::PassiveActivityTracker>);
+    impl LifecycleSink for TrackerSink {
+        fn emit(&self, record: crate::LifecycleRecord) {
+            self.0.observe(&record.event);
+        }
+    }
+    let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter("dsh"));
+    let shared = super::events::DshRuntimeShared {
+        publisher: Arc::new(crate::Publisher::new(Arc::new(TrackerSink(Arc::clone(
+            &tracker,
+        ))))),
+        turn_tracker: Arc::new(TurnTracker::new()),
+        offers: Mutex::new(Default::default()),
+        tool_names: Mutex::new(Default::default()),
+        messages: Mutex::new(Default::default()),
+        session_id: Mutex::new(Some("s".into())),
+        current_prompt: Mutex::new(None),
+        settled_turn: Mutex::new(None),
+        sequence: std::sync::atomic::AtomicU64::new(0),
+        stop_boundaries: std::sync::atomic::AtomicU64::new(0),
+    };
+    shared.begin_turn(1);
+    let deliver = |update: serde_json::Value| {
+        let event = Inbound::Message(WireMessage::UnknownEvent {
+            method: "session/update".into(),
+            raw: serde_json::json!({"params":{"sessionId":"s","update":update}}),
+        });
+        assert!(super::events::project_dsh_inbound(&shared, &event).is_none());
+    };
+    let pending = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"c",
+        "status":"pending","title":"Read","kind":"other","rawInput":{"path":"a.ts"}});
+    deliver(pending.clone());
+    deliver(pending); // A replay has fresh envelope IDs but the same call identity.
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 0);
+    let observed = tracker.observation_snapshot();
+    assert_eq!(observed.tools.len(), 1, "pending descriptor was lost");
+    assert_eq!(observed.tools[0].tool_name, "Read");
+    assert_eq!(observed.tools[0].call_count, 1);
+    assert_eq!(observed.tools[0].recent_calls[0].arguments["path"], "a.ts");
+    let started = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"in_progress"});
+    deliver(started.clone());
+    deliver(started);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 1);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 0);
+    let completed = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed"});
+    deliver(completed.clone());
+    deliver(completed);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 1);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_failed, 0);
+    assert!(tracker.snapshot().active_tools.is_empty());
+    assert_eq!(tracker.observation_snapshot(), observed);
+}
+
+#[test]
+fn repair1_large_prompt_result_has_explicit_limit_semantics() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let updates = workspace.path().join("large-updates.jsonl");
+    let chunk = |id: &str, text: String| {
+        serde_json::json!({"jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk",
+        "messageId":id,"content":{"type":"text","text":text}}}})
+        .to_string()
+    };
+    std::fs::write(
+        &updates,
+        format!(
+            "{}\n{}\n{}\n",
+            chunk(
+                "first",
+                "x".repeat(external_agent_dsh::acp::result::MAX_MESSAGE_BYTES)
+            ),
+            chunk("last", "done".into()),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "{}\ncat {:?}\n",
+        BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        updates
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        stored.result.outcome,
+        TaskOutcome::Failed,
+        "capped text must not be completed"
+    );
+    assert!(
+        stored.result.partial,
+        "the text limit must be visible as a partial result"
+    );
+    assert!(
+        stored.result.final_text.contains("ACP_RESULT_TEXT_LIMIT"),
+        "missing limit reason"
+    );
+}
+
+/// Backpressure holds the prompt writer in send while the peer emits its first
+/// chunk. The peer drains the request only after the tracker has seen that
+/// chunk, forcing the write-before-begin interleaving without timing guesses.
+#[test]
+fn repair1_fast_peer_first_chunk_precedes_prompt_write_completion() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let release = workspace.path().join("release-prompt-reader");
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}"}}}}'
+# Read a single byte, leaving a legal prompt larger than the pipe capacity.
+dd bs=1 count=1 >/dev/null 2>/dev/null
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"sessionUpdate":"agent_message_chunk","messageId":"first","content":{{"type":"text","text":"immediate "}}}}}}}}'
+while [ ! -f {release:?} ]; do sleep 0.01; done
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"answer"}}}}}}}}' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = Arc::new(dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    ));
+    let agent_id = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), &"p".repeat(240 * 1024)),
+            Some(dsh_admission(None)),
+        )
+        .unwrap()
+        .agent_id;
+    let starter = {
+        let scheduler = Arc::clone(&scheduler);
+        thread::spawn(move || scheduler.start_ready())
+    };
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    let saw_first_chunk = loop {
+        let connection = rusqlite::Connection::open(workspace.path().join("state.sqlite")).unwrap();
+        let projected: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND json_extract(payload_json, '$.type')='model.streaming'",
+            [&agent_id], |row| row.get(0)).unwrap();
+        if projected == 1 {
+            break true;
+        }
+        if Instant::now() >= deadline || starter.is_finished() {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let writer_was_blocked = !starter.is_finished();
+    // Always release the peer before asserting, including a failed barrier.
+    std::fs::write(release, "release").unwrap();
+    let started = starter.join().unwrap().unwrap();
+    assert!(saw_first_chunk && writer_was_blocked,
+        "first chunk must be projected while the prompt writer is blocked");
+    assert_eq!(started, vec![agent_id.clone()]);
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "immediate answer");
+    assert!(!stored.result.partial);
+}
+
+#[test]
+fn repair1_failed_prompt_write_closes_the_reserved_turn() {
+    let _guard = scripted_test_guard();
+    let mut command = Command::new("sh");
+    command.args(["-c", "cat >/dev/null"]);
+    let owner = DshRuntimeOwner::spawn(command, Arc::new(NoopSink)).unwrap();
+    // This is only the test-owned child. No installed daemon is touched.
+    owner.session.lock().unwrap().driver().stop_and_reap(Duration::from_secs(1)).unwrap();
+    assert!(owner.send_prompt("cannot be written").is_err());
+    let turn = owner.shared.turn_tracker.snapshot();
+    assert!(!turn.active, "failed write left a phantom prompt active");
+    assert_eq!(turn.boundary, Some(crate::TurnBoundary::Failed));
+    assert!(owner.shared.current_prompt.lock().unwrap().is_none());
+    let messages = owner.shared.messages.lock().unwrap();
+    assert!(messages.is_empty());
+    assert_eq!(messages.turn_text("dsh-prompt-1"), None);
 }

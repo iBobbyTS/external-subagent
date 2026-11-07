@@ -30,13 +30,24 @@ impl DshRuntimeOwner {
                 "a prompt is already in flight for this dsh session".into(),
             ));
         }
-        let (prompt_id, pending) = {
+        let mut started = false;
+        let result = {
             let mut session = self.session.lock().unwrap();
-            session
-                .prompt(prompt)
-                .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error)))
-        }?;
-        self.shared.begin_turn(prompt_id);
+            session.prompt_with_start(prompt, |prompt_id| {
+                self.shared.begin_turn(prompt_id);
+                started = true;
+            })
+        };
+        let (_, pending) = result.map_err(|error| {
+            if started {
+                // No watcher exists for a failed write. Seal the reserved
+                // bucket and close the shared turn rather than leaving a
+                // phantom prompt active or retaining its text.
+                self.shared
+                    .apply_failed_settlement("ACP_PROMPT_WRITE_FAILED", None);
+            }
+            RuntimeCommandError::InvalidSession(dsh_session_message(&error))
+        })?;
         let shared = Arc::clone(&self.shared);
         thread::Builder::new()
             .name("dsh-settlement".into())

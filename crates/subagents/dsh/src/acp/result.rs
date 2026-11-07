@@ -19,8 +19,11 @@ use std::collections::HashMap;
 
 use super::transport::PromptSettlement;
 
-/// Hard bound on one aggregated message before it reaches the result path.
+/// Hard bound on each prompt text bucket (and its duplicate native-ID text).
 pub const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Bound native identity overhead as well as duplicate text bytes.
+const MAX_MESSAGE_IDS: usize = 128;
 
 /// Classifications the daemon maps onto its terminal outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,8 @@ struct TurnText {
     /// the bucket: text that arrives afterwards belongs to no open prompt.
     turn_id: Option<String>,
     text: String,
+    /// A bounded observation must never become an authoritative full result.
+    limited: bool,
 }
 
 /// Bounded aggregation of the current prompt's assistant text.
@@ -59,28 +64,26 @@ fn valid_identity(value: &str, max_bytes: usize) -> bool {
     !value.is_empty() && value.len() <= max_bytes && !value.contains('\0')
 }
 
-/// Append `text`, keeping the aggregation byte-bounded on a char boundary.
-fn append_bounded(target: &mut String, text: &str) {
-    if target.len() >= MAX_MESSAGE_BYTES {
-        return;
+/// Append a bounded prefix on a UTF-8 boundary, returning whether text was lost.
+fn append_bounded(target: &mut String, text: &str) -> bool {
+    let mut end = text
+        .len()
+        .min(MAX_MESSAGE_BYTES.saturating_sub(target.len()));
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    target.push_str(text);
-    if target.len() > MAX_MESSAGE_BYTES {
-        let mut split = target.len() - MAX_MESSAGE_BYTES;
-        while split < target.len() && !target.is_char_boundary(split) {
-            split += 1;
-        }
-        *target = target[split..].to_owned();
-    }
+    target.push_str(&text[..end]);
+    end < text.len()
 }
 
 impl MessageAggregation {
     /// Open a fresh prompt bucket. The caller owns the local turn identity and
     /// passes the same one for every update of that prompt.
     pub fn begin_turn(&mut self, turn_id: &str) {
+        self.messages.clear();
         self.turn = TurnText {
             turn_id: Some(turn_id.to_owned()),
-            text: String::new(),
+            ..TurnText::default()
         };
     }
 
@@ -91,16 +94,30 @@ impl MessageAggregation {
     /// makes the standard chunk-only settlement readable. Malformed identities
     /// and NUL-bearing text are refused rather than aggregated.
     pub fn observe(&mut self, turn_id: &str, message_id: Option<&str>, text: &str) {
-        if text.contains('\0') {
+        if self.turn.turn_id.as_deref() != Some(turn_id)
+            || self.turn.limited
+            || text.is_empty()
+            || text.contains('\0')
+        {
             return;
         }
-        if let Some(message_id) = message_id {
-            if valid_identity(message_id, 512) && !text.is_empty() {
-                append_bounded(self.messages.entry(message_id.to_owned()).or_default(), text);
-            }
+        let message_id = message_id.filter(|id| valid_identity(id, 512));
+        if message_id.is_some_and(|id| !self.messages.contains_key(id))
+            && self.messages.len() >= MAX_MESSAGE_IDS
+        {
+            self.turn.limited = true;
+            return;
         }
-        if self.turn.turn_id.as_deref() == Some(turn_id) && !text.is_empty() {
-            append_bounded(&mut self.turn.text, text);
+        let before = self.turn.text.len();
+        self.turn.limited = append_bounded(&mut self.turn.text, text);
+        // Copy only the admitted prefix. Across all IDs this retains at most
+        // MAX_MESSAGE_BYTES, rather than that bound for every native message.
+        let admitted = self.turn.text.len() - before;
+        if let Some(id) = message_id.filter(|_| admitted > 0) {
+            self.messages
+                .entry(id.to_owned())
+                .or_default()
+                .push_str(&text[..admitted]);
         }
     }
 
@@ -108,6 +125,7 @@ impl MessageAggregation {
     pub fn seal_turn(&mut self, turn_id: &str) {
         if self.turn.turn_id.as_deref() == Some(turn_id) {
             self.turn = TurnText::default();
+            self.messages.clear();
         }
     }
 
@@ -161,6 +179,14 @@ pub fn fold_settlement(
             reason_code: stop_reason_code(&settlement.stop_reason),
         };
     }
+    if messages.turn.turn_id.as_deref() != Some(turn_id) {
+        return SettlementOutcome::Completed { final_text: None };
+    }
+    if messages.turn.limited {
+        return SettlementOutcome::Failed {
+            reason_code: "ACP_RESULT_TEXT_LIMIT".into(),
+        };
+    }
     let final_text = settlement
         .message_id
         .as_deref()
@@ -187,6 +213,92 @@ mod tests {
         let mut messages = MessageAggregation::default();
         messages.begin_turn(TURN);
         messages
+    }
+
+    #[test]
+    fn repair1_overflow_is_an_explicit_limit_not_a_completed_prefix() {
+        let mut messages = aggregated();
+        messages.observe(TURN, Some("first"), &"x".repeat(MAX_MESSAGE_BYTES));
+        messages.observe(TURN, Some("last"), "done");
+        assert_eq!(
+            fold_settlement(&settlement("end_turn", None), &messages, TURN),
+            SettlementOutcome::Failed {
+                reason_code: "ACP_RESULT_TEXT_LIMIT".into()
+            }
+        );
+        // Native stop reasons still take precedence over local text limits.
+        assert_eq!(
+            fold_settlement(&settlement("cancelled", None), &messages, TURN),
+            SettlementOutcome::Failed {
+                reason_code: "CANCELLED".into()
+            }
+        );
+    }
+
+    #[test]
+    fn repair1_native_storage_is_prompt_scoped_and_refuses_out_of_scope_writes() {
+        let mut messages = MessageAggregation::default();
+        messages.observe("unopened", Some("orphan"), "orphan");
+        assert!(messages.is_empty(), "unopened prompt retained native text");
+        for i in 0..8 {
+            let turn = format!("turn-{i}");
+            let id = format!("native-{i}");
+            messages.begin_turn(&turn);
+            messages.observe("stale-turn", Some("stale"), "late");
+            assert_eq!(messages.message("stale"), None);
+            messages.observe(&turn, Some(&id), "named ");
+            messages.observe(&turn, None, "tail");
+            assert_eq!(
+                fold_settlement(&settlement("end_turn", Some(&id)), &messages, &turn),
+                SettlementOutcome::Completed {
+                    final_text: Some("named ".into())
+                }
+            );
+            assert_eq!(
+                fold_settlement(&settlement("end_turn", None), &messages, &turn),
+                SettlementOutcome::Completed {
+                    final_text: Some("named tail".into())
+                }
+            );
+            messages.seal_turn("wrong-turn");
+            assert_eq!(messages.len(), 1);
+            messages.seal_turn(&turn);
+            assert!(messages.is_empty(), "settled native storage retained");
+            messages.observe(&turn, Some(&id), "late");
+            assert!(messages.is_empty(), "late frame repopulated sealed storage");
+        }
+        messages.begin_turn("abandoned");
+        messages.observe("abandoned", Some("old"), "old");
+        messages.begin_turn("new");
+        assert!(
+            messages.is_empty(),
+            "new prompt inherited abandoned native storage"
+        );
+    }
+
+    #[test]
+    fn repair1_native_storage_has_an_aggregate_and_identity_bound() {
+        let mut messages = aggregated();
+        for i in 0..256 {
+            messages.observe(TURN, Some(&format!("id-{i}")), &"x".repeat(16 * 1024));
+        }
+        let bytes: usize = messages.messages.values().map(String::len).sum();
+        assert!(
+            bytes <= MAX_MESSAGE_BYTES,
+            "native text retained {bytes} bytes"
+        );
+        messages.begin_turn("tiny");
+        for i in 0..1024 {
+            messages.observe("tiny", Some(&format!("id-{i}")), "x");
+        }
+        assert!(
+            messages.len() <= 128,
+            "native identity count is not bounded"
+        );
+        assert!(matches!(
+            fold_settlement(&settlement("end_turn", None), &messages, "tiny"),
+            SettlementOutcome::Failed { .. }
+        ));
     }
 
     #[test]

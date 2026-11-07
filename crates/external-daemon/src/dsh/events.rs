@@ -114,10 +114,11 @@ impl DshRuntimeShared {
 
     pub(super) fn begin_turn(&self, prompt_id: u64) {
         let turn_id = format!("dsh-prompt-{prompt_id}");
-        *self.current_prompt.lock().unwrap() = Some(turn_id.clone());
+        let mut current_prompt = self.current_prompt.lock().unwrap();
         // The prompt is the only output boundary the standard ACP flow
         // provides, so its aggregation bucket opens with the turn.
         self.messages.lock().unwrap().begin_turn(&turn_id);
+        *current_prompt = Some(turn_id);
         let params = serde_json::json!({"type": "turn.started"});
         let started = self.canonical_event(params.clone());
         // The canonical start event opens the shared tracker's per-turn
@@ -125,6 +126,9 @@ impl DshRuntimeShared {
         self.emit_canonical(params);
         self.turn_tracker.observe(&started);
         self.emit_lifecycle("turn.started");
+        // Projection cannot read the new identity until its aggregation and
+        // shared tracker have both opened. The caller sends only after return.
+        drop(current_prompt);
     }
 
     /// The local turn identity of the prompt currently being settled.
@@ -180,7 +184,11 @@ impl DshRuntimeShared {
         let turn_id = self.open_turn_id();
         let outcome = {
             let messages = self.messages.lock().unwrap();
-            fold_settlement(settlement, &messages, turn_id.as_deref().unwrap_or_default())
+            fold_settlement(
+                settlement,
+                &messages,
+                turn_id.as_deref().unwrap_or_default(),
+            )
         };
         // The prompt is settled: whatever arrives afterwards cannot belong to
         // it, so the prompt's text bucket closes before the boundary lands.
@@ -202,11 +210,7 @@ impl DshRuntimeShared {
     ///
     /// `reason` is this layer's bounded label; `native` is the complete
     /// JSON-RPC error when the peer answered with one.
-    pub(super) fn apply_failed_settlement(
-        &self,
-        reason: &str,
-        native: Option<&serde_json::Value>,
-    ) {
+    pub(super) fn apply_failed_settlement(&self, reason: &str, native: Option<&serde_json::Value>) {
         let bounded: String = reason.chars().take(256).collect();
         if let Some(turn_id) = self.open_turn_id() {
             self.messages.lock().unwrap().seal_turn(&turn_id);
@@ -271,11 +275,14 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                     .observe(&turn_id, message_id.as_deref(), text);
             }
             for mut payload in update::canonical_event_payloads(&parsed, &event_id, &turn_id) {
-                // rawInput 在 subagents 的 UpdateKind 中已丢弃，只补给活动 started 帧。
-                // observe 的 tool_call 投影保持不变。
+                // Keep the announcement's descriptor even while scheduled.
+                // The observation companion does not count as execution;
+                // activity phases still come only from tool.updated.
                 if matches!(parsed.kind, update::UpdateKind::ToolCall { .. })
-                    && payload["type"] == "tool.updated"
-                    && payload["payload"]["kind"] == "started"
+                    && ((payload["type"] == "model.streaming"
+                        && payload["payload"]["kind"] == "tool_call")
+                        || (payload["type"] == "tool.updated"
+                            && payload["payload"]["kind"] == "started"))
                 {
                     if let Some(input) = params.pointer("/update/rawInput") {
                         payload["payload"]["input"] = input.clone();
