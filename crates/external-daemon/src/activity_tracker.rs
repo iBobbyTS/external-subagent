@@ -1801,12 +1801,9 @@ impl PassiveActivityTracker {
                     _ => {} // progress/permission denial do not end execution
                 }
             }
-            EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics => {
-                state.telemetry_degraded = true
-            }
             EventFact::CoverageGap(g) => {
-                if matches!(g.impact, Impact::Unknown)
-                    || matches!(&g.impact, Impact::Known(dimensions) if dimensions.iter().any(|d| matches!(d, CoverageDimension::ModelActivity | CoverageDimension::Tools | CoverageDimension::Turn)))
+                if !matches!(g.activity, ActivityScope::None)
+                    && matches!(&g.impact, Impact::Known(dimensions) if dimensions.iter().any(|d| matches!(d, CoverageDimension::ModelActivity | CoverageDimension::Tools | CoverageDimension::Turn)))
                 {
                     state.telemetry_degraded = true;
                 }

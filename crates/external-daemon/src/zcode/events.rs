@@ -3,7 +3,9 @@
 use external_contract::{events::*, WireId, WireMessage};
 use external_runtime::Inbound;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+const MAX_REPLAY_FRAMES: usize = 65_536;
 
 pub(crate) struct ZcodeAdapter {
     task: TaskId,
@@ -13,6 +15,7 @@ pub(crate) struct ZcodeAdapter {
     local_turn: u64,
     settled: HashSet<TurnId>,
     frames: HashSet<NativeFrameKey>,
+    frame_order: VecDeque<NativeFrameKey>,
     permissions: HashMap<String, WireId>,
     user_inputs: HashMap<String, WireId>,
     message: MessageId,
@@ -28,6 +31,7 @@ impl ZcodeAdapter {
             local_turn: 0,
             settled: HashSet::new(),
             frames: HashSet::new(),
+            frame_order: VecDeque::new(),
             permissions: HashMap::new(),
             user_inputs: HashMap::new(),
             message: MessageId("assistant-stream".into()),
@@ -113,9 +117,16 @@ impl ZcodeAdapter {
                     IgnoreReason::Replay,
                 ));
             }
-            if self.frames.len() >= 65_536 {
-                return Some(self.invalid(input, LossReason::Dropped, Impact::Unknown));
+            // Replay proof covers the latest distinct identities in receipt
+            // order; replays do not refresh that window. An evicted identity
+            // is processed under the native session/turn attribution rules.
+            // Eviction loses no received fact and asserts no coverage damage.
+            if self.frames.len() >= MAX_REPLAY_FRAMES {
+                if let Some(oldest) = self.frame_order.pop_front() {
+                    self.frames.remove(&oldest);
+                }
             }
+            self.frame_order.push_back(key.clone());
             self.frames.insert(key);
         }
         let kind = discriminator.unwrap_or("");
@@ -265,7 +276,7 @@ impl ZcodeAdapter {
                     model(p, string(p, "status"))
                 }
             }
-            "tool.lifecycle" => tool(p, string(p, "phase")),
+            "tool.lifecycle" => tool(p, string(p, "phase"), true),
             "permission.lifecycle" => permission(p, string(p, "phase")),
             "turn.terminal" => {
                 if !matches!(
@@ -438,7 +449,7 @@ impl ZcodeAdapter {
                     ),
                 }]))
             }
-            "tool.updated" => tool(p, string(p, "kind")),
+            "tool.updated" => tool(p, string(p, "kind"), false),
             "streamRecovery.updated" => {
                 if p.is_object() {
                     Ok(Err(IgnoreReason::NoConsumer))
@@ -636,14 +647,34 @@ fn model(p: &Value, status: Option<&str>) -> Parsed {
         failure: (phase == ModelPhase::Failed).then(|| failure(p)),
     })]))
 }
-fn tool(p: &Value, phase: Option<&str>) -> Parsed {
+fn tool(p: &Value, phase: Option<&str>, telemetry: bool) -> Parsed {
+    let native_error = p.get("error").filter(|error| !error.is_null()).or_else(|| {
+        (!telemetry && phase == Some("result"))
+            .then(|| p.get("result").and_then(|result| result.get("error")))
+            .flatten()
+            .filter(|error| !error.is_null())
+    });
     let (phase, outcome) = match phase {
         Some("scheduled") => (ToolPhase::Scheduled, None),
         Some("started") => (ToolPhase::Started, None),
         Some("progress") => (ToolPhase::Progress, None),
-        Some("result" | "completed") => (ToolPhase::Finished, Some(ToolOutcome::Succeeded)),
-        Some("error" | "failed") => (ToolPhase::Finished, Some(ToolOutcome::Failed)),
-        Some("batch" | "raw") => return Ok(Err(IgnoreReason::NoConsumer)),
+        Some("result") if !telemetry => {
+            let outcome = match p
+                .get("result")
+                .and_then(|result| result.get("success"))
+                .and_then(Value::as_bool)
+            {
+                Some(true) => ToolOutcome::Succeeded,
+                Some(false) => ToolOutcome::Failed,
+                None if native_error.is_some() => ToolOutcome::Failed,
+                None => ToolOutcome::Unknown,
+            };
+            (ToolPhase::Finished, Some(outcome))
+        }
+        Some("completed") if telemetry => (ToolPhase::Finished, Some(ToolOutcome::Succeeded)),
+        Some("error") if !telemetry => (ToolPhase::Finished, Some(ToolOutcome::Failed)),
+        Some("failed") if telemetry => (ToolPhase::Finished, Some(ToolOutcome::Failed)),
+        Some("batch" | "raw") if !telemetry => return Ok(Err(IgnoreReason::NoConsumer)),
         None => return Err(true),
         _ => return Err(false),
     };
@@ -657,8 +688,7 @@ fn tool(p: &Value, phase: Option<&str>) -> Parsed {
             .map(|v| ArgumentUpdate::Snapshot(public_arguments(v))),
         phase: Some(phase),
         outcome,
-        failure: p
-            .get("error")
+        failure: native_error
             .map(failure)
             .or_else(|| (outcome == Some(ToolOutcome::Failed)).then(|| failure(p))),
         denied: None,

@@ -1186,8 +1186,7 @@ impl ObservationState {
             }
             EventFact::CoverageGap(gap) => {
                 let affects = |dimension| {
-                    matches!(&gap.impact, Impact::Unknown)
-                        || matches!(&gap.impact, Impact::Known(dimensions) if dimensions.contains(&dimension))
+                    matches!(&gap.impact, Impact::Known(dimensions) if dimensions.contains(&dimension))
                 };
                 if affects(CoverageDimension::Tools) {
                     self.tool_history_complete = false;
@@ -1201,11 +1200,9 @@ impl ObservationState {
             EventFact::Diagnostic(diagnostic)
                 if diagnostic.reason == DiagnosticReason::UnknownSemantics =>
             {
-                if matches!(&diagnostic.impact, Impact::Unknown) {
-                    self.tool_history_complete = false;
-                    self.reasoning_complete = false;
-                }
-                self.bump_snapshot(); // uncertainty is not a known dropped event
+                // Retain the diagnostic without inferring a lost history
+                // dimension from uncertainty about native semantics.
+                self.bump_snapshot();
             }
             _ => {}
         }

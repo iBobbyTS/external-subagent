@@ -299,7 +299,7 @@ fn known_ignored_and_unknown_or_damage_have_distinct_coverage() {
         unknown.disposition(),
         DecodeDisposition::Unknown(_)
     ));
-    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     assert_eq!(
         trace
             .sink
@@ -408,7 +408,10 @@ fn malformed_and_oversized_transport_frames_keep_safe_fault_and_loss() {
             .dropped_events,
         2
     );
-    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    let coverage = trace.sink.activity.observation_snapshot().coverage;
+    assert!(coverage.tool_history_complete);
+    assert!(coverage.reasoning_complete);
     for record in trace.sink.records.lock().unwrap().iter() {
         assert!(
             !crate::projection::lifecycle_projection(&record.event, None)
@@ -698,4 +701,336 @@ fn user_input_resolution_uses_wire_identity_after_attribution() {
         assert_eq!(replay.attribution(), Attribution::Replay);
         assert!(replay.events().is_empty());
     }
+}
+
+fn session_frame(kind: &str, turn: &str, id: &str, payload: Value) -> Inbound {
+    Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/event".into(),
+        raw: json!({"params":{"type":kind,"turnId":turn,"sessionId":"session-1","eventId":id,"payload":payload}}),
+    })
+}
+
+#[test]
+fn replay_window_eviction_keeps_authoritative_terminals_usable() {
+    for failed in [false, true] {
+        let mut trace = Trace::new();
+        trace.send("session/event", json!({"type":"turn.started"}));
+        for _ in 0..65_537 {
+            trace.send("state.updated", json!({}));
+        }
+        let terminal = trace.send("session/event", if failed {
+            json!({"type":"turn.failed","payload":{"error":{"message":"complete native failure","futureField":true}}})
+        } else { json!({"type":"turn.completed","payload":{"response":"complete final text"}}) });
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .any(|event| matches!(event.fact, EventFact::TurnSettled(_))),
+            "fresh authoritative terminal must survive replay-cache saturation"
+        );
+        assert!(!trace.tracker.snapshot().active);
+        if failed {
+            let original: Value =
+                serde_json::from_str(&trace.tracker.failure_detail().unwrap()).unwrap();
+            assert_eq!(
+                original["original_error"],
+                json!({"message":"complete native failure","futureField":true})
+            );
+        } else {
+            assert_eq!(
+                trace.sink.activity.take_terminal_text(),
+                crate::TerminalText::Visible("complete final text".into())
+            );
+        }
+        assert_eq!(
+            trace
+                .sink
+                .activity
+                .observation_snapshot()
+                .coverage
+                .dropped_events,
+            0
+        );
+        assert!(trace.adapter.frames.len() <= 65_536);
+        let replay = trace
+            .adapter
+            .decode(&session_frame(
+                if failed {
+                    "turn.failed"
+                } else {
+                    "turn.completed"
+                },
+                "turn-1",
+                terminal.input().source.event_id.as_deref().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(replay.attribution(), Attribution::Replay);
+        let start = trace
+            .adapter
+            .decode(&session_frame(
+                "turn.started",
+                "turn-2",
+                "next-start",
+                json!({}),
+            ))
+            .unwrap();
+        trace.publisher.emit_typed(start, &trace.tracker);
+        assert!(trace.tracker.snapshot().active);
+        let late = trace
+            .adapter
+            .decode(&session_frame(
+                "model.streaming",
+                "turn-1",
+                "evicted-old-turn",
+                json!({"kind":"text_delta","delta":"must not leak"}),
+            ))
+            .unwrap();
+        assert_eq!(late.attribution(), Attribution::Late);
+        let done = trace
+            .adapter
+            .decode(&session_frame(
+                "turn.completed",
+                "turn-2",
+                "next-final",
+                json!({"response":"next turn complete"}),
+            ))
+            .unwrap();
+        trace.publisher.emit_typed(done, &trace.tracker);
+        assert_eq!(trace.tracker.snapshot().generation, 2);
+        assert!(!trace.tracker.snapshot().active);
+        assert_eq!(
+            trace.sink.activity.take_terminal_text(),
+            crate::TerminalText::Visible("next turn complete".into())
+        );
+    }
+}
+
+#[test]
+fn session_tool_result_failure_retains_nested_error() {
+    let mut trace = Trace::new();
+    trace.send("session/event", json!({"type":"turn.started"}));
+    trace.send("session/event", json!({"type":"tool.updated","payload":{"kind":"started","toolCallId":"call","toolName":"Bash"}}));
+    let error = json!({"code":"spawn_error","message":"complete native cause", "stack":"frame\n".repeat(2000),"nested":{"apiKey":"private-key","status":503},"futureField":[1,2]});
+    let result = json!({"success":false,"content":"failure output","error":error});
+    let batch = trace.send("session/event", json!({"type":"tool.updated","payload":{"kind":"result","toolCallId":"call","result":result}}));
+    let EventFact::ToolChanged(tool) = &batch.events()[0].fact else {
+        panic!("tool")
+    };
+    assert_eq!(tool.phase, Some(ToolPhase::Finished));
+    assert_eq!(
+        tool.outcome,
+        Some(ToolOutcome::Failed),
+        "native false success cannot become a successful tool fact"
+    );
+    let mut expected = error;
+    expected["nested"]["apiKey"] = json!("[REDACTED]");
+    assert_eq!(tool.failure.as_ref().unwrap().original, expected);
+    let activity = trace.sink.activity.snapshot();
+    assert_eq!(activity.window_60s.tool_calls_failed, 1);
+    assert_eq!(activity.window_60s.tool_calls_completed, 0);
+    assert!(activity.active_tools.is_empty());
+    for (result, outcome) in [
+        (
+            json!({"success":true,"content":"ok"}),
+            ToolOutcome::Succeeded,
+        ),
+        (
+            json!({"content":"finished without outcome evidence"}),
+            ToolOutcome::Unknown,
+        ),
+    ] {
+        let mut trace = Trace::new();
+        let batch = trace.send("session/event", json!({"type":"tool.updated","payload":{"kind":"result","toolCallId":"call","result":result}}));
+        let EventFact::ToolChanged(tool) = &batch.events()[0].fact else {
+            panic!("tool")
+        };
+        assert_eq!(tool.phase, Some(ToolPhase::Finished));
+        assert_eq!(tool.outcome, Some(outcome));
+    }
+    for telemetry_first in [false, true] {
+        let mut trace = Trace::new();
+        trace.send("session/event", json!({"type":"turn.started"}));
+        trace.send("session/event", json!({"type":"tool.updated","payload":{"kind":"started","toolCallId":"call","toolName":"Bash"}}));
+        let native = json!({"type":"tool.updated","payload":{"kind":"result","toolCallId":"call","result":{"success":false,"content":"failed","error":{"message":"native failure"}}}});
+        let telemetry_payload = json!({"kind":"tool.lifecycle","phase":"failed","toolCallId":"call","errorMessage":"native failure"});
+        for telemetry in [telemetry_first, !telemetry_first] {
+            let batch = if telemetry {
+                trace.send("v4/telemetry/event", telemetry_payload.clone())
+            } else {
+                trace.send("session/event", native.clone())
+            };
+            let EventFact::ToolChanged(tool) = &batch.events()[0].fact else {
+                panic!("tool")
+            };
+            assert_eq!(tool.outcome, Some(ToolOutcome::Failed));
+        }
+        let window = trace.sink.activity.snapshot().window_60s;
+        assert_eq!(window.tool_calls_started, 1);
+        assert_eq!(window.tool_calls_failed, 1);
+        assert_eq!(window.tool_calls_completed, 0);
+    }
+}
+
+#[test]
+fn unknown_impact_preserves_current_and_historical_state() {
+    let mut trace = Trace::new();
+    trace.send("session/event", json!({"type":"turn.started"}));
+    trace.model("request", "model_request_started");
+    trace.send("session/event", json!({"type":"model.streaming","payload":{"kind":"reasoning_delta","delta":"public reasoning"}}));
+    trace.send("session/event", json!({"type":"tool.updated","payload":{"kind":"started","toolCallId":"call","toolName":"Bash","input":{"command":"pwd"}}}));
+    let before = trace.sink.activity.observation_snapshot();
+    let unknown = trace.send(
+        "session/event",
+        json!({"type":"future.fact","payload":{"private":"not a diagnostic"}}),
+    );
+    assert!(matches!(
+        unknown.disposition(),
+        DecodeDisposition::Unknown(Diagnostic {
+            impact: Impact::Unknown,
+            ..
+        })
+    ));
+    assert!(matches!(
+        &unknown.events()[0].fact,
+        EventFact::Diagnostic(Diagnostic {
+            reason: DiagnosticReason::UnknownSemantics,
+            impact: Impact::Unknown,
+            ..
+        })
+    ));
+    let activity = trace.sink.activity.snapshot();
+    let observed = trace.sink.activity.observation_snapshot();
+    assert_eq!(
+        (
+            activity.telemetry_degraded,
+            observed.coverage.tool_history_complete,
+            observed.coverage.reasoning_complete,
+            observed.coverage.dropped_events
+        ),
+        (
+            false,
+            before.coverage.tool_history_complete,
+            before.coverage.reasoning_complete,
+            0
+        ),
+        "unknown impact is uncertainty, not established current or historical damage"
+    );
+    assert!(activity.model_request_active);
+    assert_eq!(activity.active_tools.len(), 1);
+    assert_eq!(observed.tools, before.tools);
+    assert_eq!(observed.reasoning, before.reasoning);
+    let projection = crate::projection::lifecycle_projection(
+        &trace.sink.records.lock().unwrap().last().unwrap().event,
+        None,
+    );
+    assert!(projection.payload_json.contains("unknown"));
+    assert!(!projection.payload_json.contains("not a diagnostic"));
+    trace.send(
+        "v4/telemetry/event",
+        json!({"kind":"model.request.status","status":"model_request_started"}),
+    );
+    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    let damaged = trace.sink.activity.observation_snapshot();
+    assert!(damaged.coverage.tool_history_complete);
+    assert!(damaged.coverage.reasoning_complete);
+    assert_eq!(damaged.coverage.dropped_events, 1);
+}
+
+#[test]
+fn replay_window_retirement_preserves_uncertainty_without_asserting_event_loss() {
+    let mut trace = Trace::new();
+    trace.send("session/event", json!({"type":"turn.started"}));
+    let first = trace.send("state.updated", json!({}));
+    let old_key = first.input().frame_key().unwrap();
+    let mut latest = first;
+    for _ in 0..65_537 {
+        latest = trace.send("state.updated", json!({}));
+    }
+    assert!(!trace.adapter.frames.contains(&old_key));
+    assert_eq!(trace.adapter.frames.len(), MAX_REPLAY_FRAMES);
+    assert_eq!(trace.adapter.frame_order.len(), MAX_REPLAY_FRAMES);
+    let ignored_frame = |id: &str| {
+        Inbound::Message(WireMessage::UnknownEvent {
+            method: "state.updated".into(),
+            raw: json!({"params":{
+                "eventId":id,"sessionId":"session-1","turnId":"turn-1"
+            }}),
+        })
+    };
+    let recent = trace
+        .adapter
+        .decode(&ignored_frame(
+            latest.input().source.event_id.as_deref().unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(recent.attribution(), Attribution::Replay);
+    let evicted = trace
+        .adapter
+        .decode(&ignored_frame(&old_key.event_id))
+        .unwrap();
+    assert_eq!(
+        evicted.attribution(),
+        Attribution::Current,
+        "an evicted key has no remembered replay proof"
+    );
+    assert!(matches!(
+        evicted.disposition(),
+        DecodeDisposition::RecognizedIgnored(_)
+    ));
+    assert!(evicted.events().is_empty());
+    assert!(trace.tracker.snapshot().active);
+    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    let coverage = trace.sink.activity.observation_snapshot().coverage;
+    assert_eq!(coverage.dropped_events, 0);
+    assert!(coverage.tool_history_complete && coverage.reasoning_complete);
+}
+
+#[test]
+fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
+    let mut trace = Trace::new();
+    trace.send("session/event", json!({"type":"turn.started"}));
+    trace.send(
+        "session/event",
+        json!({"type":"tool.updated","payload":{"kind":"future_phase","toolCallId":"call"}}),
+    );
+    assert!(
+        !trace.sink.activity.snapshot().telemetry_degraded,
+        "an unknown phase alone does not establish a broken correlation"
+    );
+    let clean = trace.sink.activity.observation_snapshot().coverage;
+    assert_eq!(clean.dropped_events, 0);
+    assert!(clean.tool_history_complete && clean.reasoning_complete);
+    trace.send(
+        "session/event",
+        json!({"type":"tool.updated","payload":{"kind":"started"}}),
+    );
+    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    let known_damage = trace.sink.activity.observation_snapshot().coverage;
+    assert!(!known_damage.tool_history_complete);
+    assert!(known_damage.reasoning_complete);
+    assert_eq!(known_damage.dropped_events, 1);
+    // A known damaged tool frame outside any observed turn affects tool history,
+    // with no evidence of a current correlation to mark degraded.
+    let mut trace = Trace::new();
+    let no_turn = Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/event".into(),
+        raw: json!({"params":{
+            "type":"tool.updated","payload":{"kind":"started"}
+        }}),
+    });
+    let batch = trace.adapter.decode(&no_turn).unwrap();
+    assert!(matches!(
+        batch.disposition(),
+        DecodeDisposition::InvalidLost(CoverageGap {
+            activity: ActivityScope::None,
+            ..
+        })
+    ));
+    trace.publisher.emit_typed(batch, &trace.tracker);
+    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    let historical = trace.sink.activity.observation_snapshot().coverage;
+    assert!(!historical.tool_history_complete);
+    assert!(historical.reasoning_complete);
+    assert_eq!(historical.dropped_events, 1);
 }
