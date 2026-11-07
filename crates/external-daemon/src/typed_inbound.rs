@@ -56,11 +56,18 @@ impl TurnTracker {
                 }
                 EventFact::TurnSettled(settlement) if state.active => {
                     state.active = false;
-                    state.boundary = Some(if settlement.outcome == TurnOutcome::Failed {
-                        TurnBoundary::Failed
-                    } else {
-                        TurnBoundary::Completed
-                    });
+                    // A native cancellation is not successful completion.
+                    // A committed ES stop still wins in scheduler arbitration.
+                    state.boundary = Some(
+                        if matches!(
+                            settlement.outcome,
+                            TurnOutcome::Failed | TurnOutcome::Cancelled
+                        ) {
+                            TurnBoundary::Failed
+                        } else {
+                            TurnBoundary::Completed
+                        },
+                    );
                     if settlement.outcome == TurnOutcome::Completed {
                         // A successful authoritative boundary retires errors
                         // recovered within this turn, before any later exit.

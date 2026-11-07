@@ -1384,6 +1384,11 @@ fn interruption_only_observed_response_matches_wait_tail_before_boundary() {
         "text must be published before the settling boundary"
     );
     assert_eq!(facts[text].context.turn_id, facts[boundary].context.turn_id);
+    assert_eq!(
+        shared.turn_snapshot().boundary,
+        Some(crate::TurnBoundary::Failed),
+        "typed cancellation must not authorize legacy successful completion"
+    );
 }
 
 #[test]
@@ -1567,4 +1572,53 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
     assert_eq!(result.result.final_text, "MODEL_IDENTITY_PRESERVED");
+}
+
+#[test]
+fn native_interruption_without_es_stop_cannot_succeed_in_the_scheduler() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    const PARTIAL: &str = "NATIVE_INTERRUPTED_PARTIAL_结束";
+    // SYNTHETIC observed interrupted-result shape, with no ES stop/close.
+    // Keep the child alive after the result so the real monitor must adjudicate
+    // the turn boundary before any child-exit terminal can hide its projection.
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+while [ ! -f release-native-interruption ]; do sleep 0.01; done
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"ERROR","response":"NATIVE_INTERRUPTED_PARTIAL_结束","error":"interrupted","num_turns":1}}'
+"#.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    await_turn_active(&scheduler, &agent_id);
+    let before = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+    assert!(!before.stop_requested && !before.close_requested);
+    std::fs::write(workspace.path().join("release-native-interruption"), "").unwrap();
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert!(
+        !task.stop_requested && !task.close_requested,
+        "no ES cancellation may rescue this oracle"
+    );
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = || {
+        crate::rpc::RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+        })
+    };
+    let crate::rpc::RpcSuccess::TaskWait(wait) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert_eq!(wait.activity.latest_text_tail, PARTIAL);
+    assert_eq!(wait.result.unwrap().outcome, TaskOutcome::Failed);
+    let crate::rpc::RpcSuccess::TaskWait(second) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert!(second.activity.latest_text_tail.is_empty());
 }

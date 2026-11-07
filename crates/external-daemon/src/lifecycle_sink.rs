@@ -564,7 +564,7 @@ impl StoreLifecycleSink {
                 RuntimeEvent::Normalized(event) => match &event.fact {
                     external_contract::events::EventFact::TurnStarted { .. } => Some(TurnState::Active),
                     external_contract::events::EventFact::TurnSettled(settlement) => Some(
-                        if settlement.outcome == external_contract::events::TurnOutcome::Failed { TurnState::Failed } else { TurnState::Idle }),
+                        if matches!(settlement.outcome, external_contract::events::TurnOutcome::Failed | external_contract::events::TurnOutcome::Cancelled) { TurnState::Failed } else { TurnState::Idle }),
                     _ => None,
                 },
                 RuntimeEvent::Driver(Inbound::Lifecycle { method, .. }) => match method.as_str() {
