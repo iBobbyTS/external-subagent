@@ -1298,14 +1298,17 @@ printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{"model":"nat
 "#.replace("__CONV__", CONV);
     let child = workspace.path().join("model-view.sh");
     write_scripted_child(&child, workspace.path(), &script);
-    let owner = AgyRuntimeOwner::spawn(Command::new(child), Arc::new(NoopSink)).unwrap();
+    let sink = Arc::new(AgyFactSink::default());
+    let owner = AgyRuntimeOwner::spawn(Command::new(child), sink.clone()).unwrap();
     let ready = owner
         .bootstrap_session_with_mcp(&agy_task_record(workspace.path()), &[], SCRIPTED_SYNC_WAIT)
         .unwrap();
-    assert_eq!(
-        ready.configured_model.as_deref(),
-        Some("native-effective-model")
-    );
+    assert_eq!(ready.configured_model.as_deref(), Some(MODEL));
+    assert!(sink.facts().iter().any(|event| matches!(
+        &event.fact,
+        external_contract::events::EventFact::SessionReady(info)
+            if info.model.as_deref() == Some("native-effective-model")
+    )));
 }
 
 #[test]
@@ -1470,4 +1473,98 @@ printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"__CONV__
     }
     assert_eq!(reconstructed, stored.result.final_text);
     assert_eq!(wait.result.unwrap().final_text, reconstructed);
+}
+
+#[test]
+fn native_init_model_identity_does_not_reject_the_admitted_scheduler_task() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    // SYNTHETIC valid init whose observed model differs from the admission.
+    // Hold settlement until after the real fresh-session model gate has run.
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{"model":"native-effective-model"}}'
+while [ ! -f release-model-response ]; do sleep 0.01; done
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"MODEL_IDENTITY_PRESERVED","num_turns":1}}'
+"#.replace("__CONV__", CONV);
+    struct CapturedFactory {
+        inner: AgyRuntimeFactory,
+        facts: Arc<AgyFactSink>,
+    }
+    struct CapturedSink {
+        delegate: Arc<dyn LifecycleSink>,
+        facts: Arc<AgyFactSink>,
+    }
+    impl LifecycleSink for CapturedSink {
+        fn event_scope(
+            &self,
+        ) -> Option<(
+            external_contract::events::TaskId,
+            external_contract::events::LaunchId,
+        )> {
+            self.delegate.event_scope()
+        }
+        fn emit(&self, record: crate::LifecycleRecord) {
+            self.facts.emit(record.clone());
+            self.delegate.emit(record);
+        }
+        fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
+            self.facts.emit_normalized_batch(events);
+            self.delegate.emit_normalized_batch(events);
+        }
+    }
+    impl RuntimeFactory for CapturedFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            self.inner.spawn(
+                task,
+                Arc::new(CapturedSink {
+                    delegate: sink,
+                    facts: self.facts.clone(),
+                }),
+            )
+        }
+    }
+    let facts = Arc::new(AgyFactSink::default());
+    let store =
+        Arc::new(external_store::Store::open(workspace.path().join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "agy-model-identity-test",
+        store,
+        Arc::new(CapturedFactory {
+            inner: harness_factory(&script, workspace.path()),
+            facts: facts.clone(),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: SCRIPTED_SYNC_WAIT,
+            control_timeout: SCRIPTED_SYNC_WAIT,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    let started = scheduler.start_ready();
+    assert!(
+        facts.facts().iter().any(|event| matches!(
+            &event.fact,
+            external_contract::events::EventFact::SessionReady(info)
+                if info.model.as_deref() == Some("native-effective-model")
+        )),
+        "the actual typed identity must preserve init.model"
+    );
+    assert_eq!(started.unwrap(), vec![agent_id.clone()]);
+    let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+    assert_eq!(task.phase, TaskPhase::Running);
+    assert_eq!(
+        crate::admitted_model_from_task(&task).as_deref(),
+        Some(MODEL)
+    );
+    assert!(scheduler.last_error(&agent_id).is_none());
+    std::fs::write(workspace.path().join("release-model-response"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "MODEL_IDENTITY_PRESERVED");
 }

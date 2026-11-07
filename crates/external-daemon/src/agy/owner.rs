@@ -207,7 +207,9 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(SessionReady {
             session_id,
             initial_turn_id: None,
-            configured_model: self.shared.model().or(model),
+            // This field feeds the legacy requested-model gate. Native
+            // init.model remains identity evidence in the typed SessionReady.
+            configured_model: model,
         })
     }
 
