@@ -1208,6 +1208,68 @@ printf '%s\n' \
     assert_eq!(task.outcome, Some(TaskOutcome::Completed));
 }
 
+/// Synthetic native frames: a turn aggregate must never be replayed under m2.
+#[test]
+fn repair_same_text_messages_have_no_fabricated_terminal_wait_suffix() {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitTarget};
+    let _guard = scripted_test_guard();
+    // Fresh tasks keep scalar/list checks independent of take-on-delivery.
+    for many in [false, true] {
+        let workspace = dsh_workspace();
+        let script = format!(r#"{BOOTSTRAP_PREFIX}
+printf '%s\n' \
+ '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"SESSION","update":{{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{{"type":"text","text":"A"}}}}}}}}' \
+ '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"SESSION","update":{{"sessionUpdate":"agent_message_chunk","messageId":"m2","content":{{"type":"text","text":"A"}}}}}}}}' \
+ '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#).replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(
+            &scheduler,
+            workspace.path(),
+            Some("fixture-provider:fixture-model"),
+        );
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let request = await_pending_permission(&scheduler, &agent_id);
+        scheduler
+            .respond_request(&agent_id, &request.request_id, "allow", None)
+            .unwrap();
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.final_text, "AA");
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+        assert_eq!(activity.latest_text_tail, stored.result.final_text);
+        assert_eq!(activity.window_60s.text_delta_events, 2);
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let response = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                wait_mode: crate::rpc::WaitMode::All,
+                agent_id: if many {
+                    WaitTarget::Many(vec![agent_id.clone()])
+                } else {
+                    WaitTarget::One(agent_id.clone())
+                },
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap();
+        let body = match response {
+            RpcSuccess::TaskWait(body) => body,
+            RpcSuccess::TaskWaitMany { mut waits } => waits.bodies.remove(0).1,
+            _ => panic!("expected wait body"),
+        };
+        assert_eq!(body.result.unwrap().final_text, stored.result.final_text);
+        assert!(
+            body.activity.latest_text_tail.is_empty(),
+            "fabricated wait tail: {:?}",
+            body.activity.latest_text_tail
+        );
+    }
+}
+
 /// A native `status: failed` is a failed call, not a completed one. The tool
 /// keeps its real name (the ACP title) even though the generic category is
 /// `other`, and ending the call does not fail the turn by itself.
@@ -2736,7 +2798,6 @@ fn tool_projection_tracker() -> (
         session_id: Mutex::new(Some("s".into())),
         current_prompt: Mutex::new(None),
         last_prompt: Mutex::new(None),
-        last_message: Mutex::new(None),
         settled_turn: Mutex::new(None),
         stop_boundaries: std::sync::atomic::AtomicU64::new(0),
     };
@@ -3001,19 +3062,15 @@ fn repair1_large_prompt_result_has_explicit_limit_semantics() {
         "messageId":id,"content":{"type":"text","text":text}}}})
         .to_string()
     };
-    std::fs::write(
-        &updates,
-        format!(
-            "{}\n{}\n{}\n",
-            chunk(
-                "first",
-                "x".repeat(external_agent_dsh::acp::result::MAX_MESSAGE_BYTES)
-            ),
-            chunk("last", "done".into()),
-            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#
-        ),
-    )
-    .unwrap();
+    // Synthetic sustained output: each frame is legal and below the 16 MiB
+    // wire limit, while the stream exceeds the 2 MiB result cap sixteenfold.
+    let mut frames = (0..32)
+        .map(|_| chunk("first", "x".repeat(1024 * 1024)))
+        .collect::<Vec<_>>();
+    frames.push(chunk("last", "done".into()));
+    frames.push(r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#.into());
+    std::fs::write(&updates, frames.join("\n") + "\n").unwrap();
+    drop(frames);
     let script = format!(
         "{}\ncat {:?}\n",
         BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
@@ -3048,6 +3105,13 @@ fn repair1_large_prompt_result_has_explicit_limit_semantics() {
         stored.result.final_text.contains("ACP_RESULT_TEXT_LIMIT"),
         "missing limit reason"
     );
+    let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+    assert!(
+        activity.latest_text_tail.ends_with("done"),
+        "post-limit deltas must stay live"
+    );
+    assert!(activity.latest_text_tail.len() <= crate::MAX_LATEST_TEXT_BYTES);
+    assert!(activity.latest_text_truncated);
 }
 
 /// Backpressure holds the prompt writer in send while the peer emits its first
@@ -3264,7 +3328,6 @@ fn typed_adapter_shared(
         session_id: Mutex::new(session.map(str::to_owned)),
         current_prompt: Mutex::new(None),
         last_prompt: Mutex::new(None),
-        last_message: Mutex::new(None),
         settled_turn: Mutex::new(None),
         stop_boundaries: std::sync::atomic::AtomicU64::new(0),
     };
@@ -3385,6 +3448,71 @@ fn text_thought_and_committed_message_decode_to_typed_facts() {
             if gap.reason == LossReason::Malformed
                 && gap.impact == Impact::Known(vec![CoverageDimension::PublicReasoning])
     ));
+}
+
+#[test]
+fn repair_malformed_message_text_is_lost_but_legal_empty_content_is_ignored() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    for malformed in [
+        serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":42}}),
+        serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text"}}),
+        serde_json::json!({"sessionUpdate":"agent_message_chunk"}),
+        serde_json::json!({"sessionUpdate":"agent_message","content":[{"type":"text","text":"valid"},{"type":"text","text":false}]}),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(malformed))
+            .unwrap();
+        assert_eq!(batch.disposition().kind(), DispositionKind::InvalidLost);
+        assert!(batch.events().iter().any(|event| matches!(&event.fact,
+            EventFact::CoverageGap(gap) if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::Text]))));
+        shared.publisher.emit_typed(batch, &shared.turn_tracker);
+    }
+    for content in [
+        serde_json::json!({"type":"text","text":""}),
+        serde_json::json!({"type":"image","data":"synthetic","mimeType":"image/png"}),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(serde_json::json!({
+                "sessionUpdate":"agent_message_chunk", "content":content
+            })))
+            .unwrap();
+        assert_eq!(
+            batch.disposition(),
+            &DecodeDisposition::RecognizedIgnored(IgnoreReason::NoConsumer)
+        );
+    }
+    for event in captured.events.lock().unwrap().iter() {
+        if matches!(
+            event,
+            crate::RuntimeEvent::Normalized(NormalizedEvent {
+                fact: EventFact::CoverageGap(_),
+                ..
+            })
+        ) {
+            let projection = crate::projection::lifecycle_projection(event, None);
+            let summary: LifecycleSummary = serde_json::from_str(&projection.payload_json).unwrap();
+            assert_eq!(summary.disposition, DispositionKind::InvalidLost);
+            assert_eq!(summary.reason, Some(DiagnosticReason::Malformed));
+            assert_eq!(
+                summary.impact,
+                Some(Impact::Known(vec![CoverageDimension::Text]))
+            );
+            assert!(!projection.payload_json.contains("content"));
+        }
+    }
+    let facts = captured_facts(&captured);
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| matches!(fact, EventFact::CoverageGap(g)
+        if g.reason == LossReason::Malformed
+            && g.impact == Impact::Known(vec![CoverageDimension::Text])))
+            .count(),
+        4
+    );
 }
 
 #[test]
@@ -3598,26 +3726,20 @@ fn settlement_reduces_text_before_the_boundary_and_keeps_the_native_stop_reason(
     ));
 
     let facts = captured_facts(&captured);
-    let snapshot = facts
-        .iter()
-        .position(|fact| {
-            matches!(
-                fact,
-                EventFact::MessageUpdated(MessageUpdate {
-                    text: TextUpdate::Snapshot(_),
-                    ..
-                })
-            )
-        })
-        .expect("the final snapshot is part of the settlement batch");
+    assert!(
+        !facts.iter().any(|fact| matches!(
+            fact,
+            EventFact::MessageUpdated(MessageUpdate {
+                text: TextUpdate::Snapshot(_),
+                ..
+            })
+        )),
+        "turn-wide text must only travel on TurnSettled"
+    );
     let settled = facts
         .iter()
         .position(|fact| matches!(fact, EventFact::TurnSettled(_)))
         .expect("the turn boundary was projected");
-    assert!(
-        snapshot < settled,
-        "the verified final text must precede the boundary in the emitted order"
-    );
     let EventFact::TurnSettled(settlement) = &facts[settled] else {
         unreachable!()
     };

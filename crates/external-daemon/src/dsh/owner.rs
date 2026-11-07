@@ -85,7 +85,6 @@ impl DshRuntimeOwner {
             session_id: Mutex::new(None),
             current_prompt: Mutex::new(None),
             last_prompt: Mutex::new(None),
-            last_message: Mutex::new(None),
             settled_turn: Mutex::new(None),
             stop_boundaries: AtomicU64::new(0),
         });

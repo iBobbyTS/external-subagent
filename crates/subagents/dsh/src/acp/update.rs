@@ -132,21 +132,38 @@ fn block_text(content: &Value) -> Option<String> {
     Some(text.to_owned())
 }
 
-/// Join an ACP content array (blocks) in order; `None` when the update has no
-/// usable content array.
+/// Preserve malformed assistant text as a parse failure, distinct from a
+/// legal empty string or an explicitly non-text ACP content block.
+fn assistant_block_text(content: &Value) -> Option<String> {
+    if let Value::Object(object) = content {
+        if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "text")
+        {
+            return Some(String::new());
+        }
+        // Do not let a valid fallback delta hide a damaged text field.
+        if let Some(text) = object.get("text") {
+            return text.as_str().map(str::to_owned);
+        }
+    }
+    block_text(content)
+}
+
+/// Join assistant blocks in order. Any malformed text block invalidates the
+/// message instead of silently delivering only its usable neighbors.
 fn joined_content(update: &Value) -> Option<String> {
     let content = update.get("content")?;
     match content {
         Value::Array(blocks) => {
             let mut text = String::new();
             for block in blocks {
-                if let Some(part) = block_text(block) {
-                    text.push_str(&part);
-                }
+                text.push_str(&assistant_block_text(block)?);
             }
             Some(text)
         }
-        single => block_text(single),
+        single => assistant_block_text(single),
     }
 }
 
@@ -168,12 +185,12 @@ pub fn parse_update(params: &Value) -> Option<SessionUpdate> {
     let kind = match discriminator {
         "agent_message" => UpdateKind::AgentMessage {
             message_id: bounded_id(update.get("messageId")),
-            text: joined_content(update).unwrap_or_default(),
+            text: joined_content(update)?,
             committed: true,
         },
         "agent_message_chunk" => UpdateKind::AgentMessage {
             message_id: bounded_id(update.get("messageId")),
-            text: block_text(update.get("content").unwrap_or(&Value::Null)).unwrap_or_default(),
+            text: assistant_block_text(update.get("content")?)?,
             committed: false,
         },
         "agent_thought_chunk" | "agent_thought" | "thought" => UpdateKind::AgentThoughtChunk {

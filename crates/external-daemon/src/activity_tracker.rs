@@ -24,6 +24,10 @@ struct PassiveActivityState {
     sample_order: VecDeque<String>,
     telemetry_degraded: bool,
     typed_messages: HashMap<String, String>,
+    typed_message_bytes: usize,
+    /// Once a prefix is no longer fully tracked, snapshots cannot safely be
+    /// compared with it. Deltas still feed the bounded live tail unchanged.
+    typed_messages_limited: bool,
     typed_finished_requests: std::collections::HashSet<String>,
     typed_finished_tools: std::collections::HashSet<String>,
     observation: observation::ObservationState,
@@ -501,6 +505,152 @@ fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed_text(
+        tracker: &PassiveActivityTracker,
+        id: &str,
+        text: external_contract::events::TextUpdate,
+    ) {
+        use external_contract::events::*;
+        typed_fact(
+            tracker,
+            EventFact::MessageUpdated(MessageUpdate {
+                message_id: MessageId(id.into()),
+                text,
+            }),
+        );
+    }
+
+    fn typed_fact(tracker: &PassiveActivityTracker, fact: external_contract::events::EventFact) {
+        use external_contract::events::*;
+        let sequence = tracker.state.lock().unwrap().revision + 1;
+        tracker.observe(&RuntimeEvent::Normalized(NormalizedEvent {
+            context: EventContext {
+                task_id: TaskId("task".into()),
+                launch_id: LaunchId("launch".into()),
+                sequence,
+                turn_id: Some(TurnId::Local(1)),
+                source: NativeSource {
+                    protocol: SourceProtocol::DshAcpV1,
+                    discriminator: None,
+                    session_id: None,
+                    turn_id: None,
+                    item_id: None,
+                    call_id: None,
+                    event_id: None,
+                    timestamp: None,
+                },
+            },
+            fact,
+        }));
+    }
+
+    #[test]
+    fn repair_typed_message_cache_is_bounded_while_live_deltas_continue() {
+        use external_contract::events::TextUpdate;
+        const BOUND: usize = external_agent_dsh::acp::result::MAX_MESSAGE_BYTES;
+        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        let chunk = "x".repeat(1024 * 1024);
+        // 32 MiB of legal chunks, sixteen times the aggregate retention cap.
+        for _ in 0..32 {
+            typed_text(&tracker, "m", TextUpdate::Delta(chunk.clone()));
+            let state = tracker.state.lock().unwrap();
+            assert!(
+                state
+                    .typed_messages
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>()
+                    <= BOUND
+            );
+        }
+        let (ids, bytes) = {
+            let state = tracker.state.lock().unwrap();
+            (
+                state.typed_messages.len(),
+                state
+                    .typed_messages
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+        };
+        assert!(bytes <= BOUND, "retained {bytes} message bytes");
+        assert!(ids <= 128);
+        typed_text(&tracker, "m", TextUpdate::Delta("live end".into()));
+        let tail = tracker.peek_wait_tail();
+        assert!(tail.truncated);
+        assert!(tail.text.ends_with("live end"));
+        assert!(tail.text.len() <= MAX_LATEST_TEXT_BYTES);
+
+        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        for n in 0..1024 {
+            typed_text(&tracker, &format!("m{n}"), TextUpdate::Delta("x".into()));
+        }
+        assert!(tracker.state.lock().unwrap().typed_messages.len() <= 128);
+    }
+
+    #[test]
+    fn repair_typed_snapshot_bookkeeping_is_bounded_and_resets_with_the_turn() {
+        use external_contract::events::*;
+        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        typed_text(&tracker, "m1", TextUpdate::Delta("A".into()));
+        typed_text(&tracker, "m1", TextUpdate::Snapshot("AB".into()));
+        typed_text(&tracker, "m1", TextUpdate::Snapshot("AB".into()));
+        assert_eq!(tracker.take_wait_tail().text, "AB");
+        // The aggregate cap applies across identities, including snapshots.
+        let large = "é".repeat(MAX_TYPED_MESSAGE_BYTES / 2 - 1);
+        typed_text(&tracker, "m2", TextUpdate::Snapshot(large.clone()));
+        typed_text(&tracker, "m3", TextUpdate::Snapshot("overflow".into()));
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!(state.typed_message_bytes, MAX_TYPED_MESSAGE_BYTES);
+            assert_eq!(
+                state
+                    .typed_messages
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>(),
+                MAX_TYPED_MESSAGE_BYTES
+            );
+            assert!(state.typed_messages_limited);
+        }
+        tracker.take_wait_tail();
+        // Once tracking loses a prefix, snapshots must not replay that prefix
+        // as new text. Explicit deltas continue through the live tail.
+        typed_text(
+            &tracker,
+            "m2",
+            TextUpdate::Snapshot(format!("{large}suffix")),
+        );
+        assert!(tracker.take_wait_tail().text.is_empty());
+        typed_text(&tracker, "m2", TextUpdate::Delta("live".into()));
+        assert_eq!(tracker.take_wait_tail().text, "live");
+        typed_fact(
+            &tracker,
+            EventFact::TurnStarted {
+                turn_id: TurnId::Local(2),
+            },
+        );
+        {
+            let state = tracker.state.lock().unwrap();
+            assert_eq!(state.typed_message_bytes, 0);
+            assert!(!state.typed_messages_limited);
+            assert!(state.typed_messages.is_empty());
+        }
+        typed_text(&tracker, "m1", TextUpdate::Delta("C".into()));
+        typed_text(&tracker, "m1", TextUpdate::Snapshot("CD".into()));
+        assert_eq!(tracker.take_wait_tail().text, "CD");
+
+        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        typed_text(
+            &tracker,
+            "m",
+            TextUpdate::Snapshot("x".repeat(MAX_TYPED_MESSAGE_BYTES * 4)),
+        );
+        assert!(tracker.state.lock().unwrap().typed_messages.is_empty());
+        assert_eq!(tracker.peek_wait_tail().text.len(), MAX_LATEST_TEXT_BYTES);
+    }
 
     fn session_fixture(params: serde_json::Value) -> RuntimeEvent {
         RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
@@ -1675,6 +1825,64 @@ mod tests {
     }
 }
 
+// Match the DSH aggregation family: 2 MiB total text, hence also at most
+// 2 MiB per message, and 128 bounded native identities per open turn.
+const MAX_TYPED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TYPED_MESSAGE_IDS: usize = 128;
+
+fn typed_message_delta<'a>(
+    state: &mut PassiveActivityState,
+    message: &'a external_contract::events::MessageUpdate,
+) -> &'a str {
+    use external_contract::events::TextUpdate;
+    let id = &message.message_id.0;
+    let is_delta = matches!(message.text, TextUpdate::Delta(_));
+    let text = match &message.text {
+        TextUpdate::Delta(text) | TextUpdate::Snapshot(text) => text.as_str(),
+    };
+    if state.typed_messages_limited {
+        return if is_delta { text } else { "" };
+    }
+    if id.is_empty()
+        || id.len() > 512
+        || id.contains('\0')
+        || (!state.typed_messages.contains_key(id)
+            && state.typed_messages.len() >= MAX_TYPED_MESSAGE_IDS)
+    {
+        state.typed_messages_limited = true;
+        return if is_delta { text } else { "" };
+    }
+    let previous = state
+        .typed_messages
+        .get(id)
+        .map(String::as_str)
+        .unwrap_or("");
+    let delta = if is_delta {
+        text
+    } else {
+        text.strip_prefix(previous).unwrap_or("")
+    };
+    let retained_bytes = if is_delta {
+        state.typed_message_bytes.saturating_add(text.len())
+    } else {
+        state.typed_message_bytes - previous.len() + text.len()
+    };
+    if retained_bytes > MAX_TYPED_MESSAGE_BYTES {
+        // Keep the known prefix bounded; never compare a later snapshot to
+        // an incomplete prefix and fabricate a suffix from missing history.
+        state.typed_messages_limited = true;
+    } else {
+        let previous = state.typed_messages.entry(id.clone()).or_default();
+        if is_delta {
+            previous.push_str(text);
+        } else {
+            *previous = text.to_owned();
+        }
+        state.typed_message_bytes = retained_bytes;
+    }
+    delta
+}
+
 impl PassiveActivityTracker {
     fn observe_typed_at(
         &self,
@@ -1694,6 +1902,8 @@ impl PassiveActivityTracker {
                 state.terminal_text.clear();
                 state.terminal_text_settled = false;
                 state.typed_messages.clear();
+                state.typed_message_bytes = 0;
+                state.typed_messages_limited = false;
                 state.active_model_requests.clear();
                 state.active_tools.clear();
                 state.typed_finished_requests.clear();
@@ -1710,26 +1920,9 @@ impl PassiveActivityTracker {
                 state.telemetry_degraded = false;
             }
             EventFact::MessageUpdated(message) if !state.terminal_text_settled => {
-                let previous = state
-                    .typed_messages
-                    .entry(message.message_id.0.clone())
-                    .or_default();
-                let delta = match &message.text {
-                    TextUpdate::Delta(text) => {
-                        previous.push_str(text);
-                        text.clone()
-                    }
-                    TextUpdate::Snapshot(text) => {
-                        let delta = text
-                            .strip_prefix(previous.as_str())
-                            .unwrap_or("")
-                            .to_owned();
-                        *previous = text.clone();
-                        delta
-                    }
-                };
+                let delta = typed_message_delta(&mut state, message);
                 if !delta.is_empty() {
-                    append_latest_text(&mut state, &delta, wall_now_ms);
+                    append_latest_text(&mut state, delta, wall_now_ms);
                     state.last_model_delta_at = Some(now);
                     sample = Some((
                         format!("text:{}", event.context.sequence),

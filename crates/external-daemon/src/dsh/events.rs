@@ -67,9 +67,6 @@ pub(super) struct DshRuntimeShared {
     /// The last prompt identity this session reserved. Frames that arrive
     /// after that prompt settled belong to no open turn and are late echoes.
     pub(super) last_prompt: Mutex<Option<u64>>,
-    /// The last native assistant message identity, used to scope the final
-    /// snapshot to the same observation identity as its streamed deltas.
-    pub(super) last_message: Mutex<Option<String>>,
     pub(super) settled_turn: Mutex<Option<SettledTurn>>,
     pub(super) stop_boundaries: AtomicU64,
 }
@@ -213,9 +210,9 @@ impl DshRuntimeShared {
         );
     }
 
-    /// Emit the authoritative turn boundary as one ordered batch. The final
-    /// snapshot precedes the settlement in the same batch so the sink owns
-    /// the complete text before the tracker exposes the boundary.
+    /// Emit authoritative turn text on the settlement itself. The publisher
+    /// delivers the complete batch to the sink before notifying the tracker;
+    /// a turn aggregate must never be replayed as one native message snapshot.
     fn apply_boundary(
         &self,
         prompt: u64,
@@ -232,18 +229,6 @@ impl DshRuntimeShared {
             None,
         );
         let mut facts = Vec::new();
-        if let Some(text) = &final_text {
-            let id = self
-                .last_message
-                .lock()
-                .unwrap()
-                .clone()
-                .unwrap_or_else(|| prompt_key(prompt));
-            facts.push(EventFact::MessageUpdated(MessageUpdate {
-                message_id: MessageId(id),
-                text: TextUpdate::Snapshot(text.clone()),
-            }));
-        }
         if let Some(failure) = &failure {
             facts.push(EventFact::ErrorObserved {
                 operation: Operation::Turn,
@@ -386,7 +371,6 @@ impl DshRuntimeShared {
                             text,
                         );
                     }
-                    *self.last_message.lock().unwrap() = Some(id.0.clone());
                     facts.push(EventFact::MessageUpdated(MessageUpdate {
                         message_id: id.clone(),
                         text: TextUpdate::Delta(text.clone()),
