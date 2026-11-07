@@ -207,8 +207,14 @@ pub fn tool_name(kind: &UpdateKind) -> Option<String> {
     }
 }
 
-/// Normalize one update into canonical `session/event` payloads consumed by
-/// the shared activity and observation projections:
+/// Legacy projection of one update into canonical `session/event` payloads.
+///
+/// The production DSH pump no longer calls this: `external-daemon` decodes
+/// `session/update` into typed facts through the shared ingress, and the
+/// daemon's own canonical constructor is retired. The shape is retained only
+/// as a fixture source for the shared tracker's still-live legacy JSON parser
+/// tests; it is not a second production interpreter and nothing in the DSH
+/// path may consume it again.
 ///
 /// - message/thought text projects as `model.streaming` deltas (thoughts as
 ///   `reasoning_delta`, text as `text_delta` with the assistant message id);

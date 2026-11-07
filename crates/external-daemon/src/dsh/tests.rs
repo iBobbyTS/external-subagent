@@ -2721,18 +2721,23 @@ fn tool_projection_tracker() -> (
         }
     }
     let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter("dsh"));
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(TrackerSink(Arc::clone(
+        &tracker,
+    )))));
+    let (task, launch) = publisher.event_scope();
     let shared = super::events::DshRuntimeShared {
-        publisher: Arc::new(crate::Publisher::new(Arc::new(TrackerSink(Arc::clone(
-            &tracker,
-        ))))),
+        publisher,
         turn_tracker: Arc::new(TurnTracker::new()),
+        task,
+        launch,
         offers: Mutex::new(Default::default()),
         tool_names: Mutex::new(Default::default()),
         messages: Mutex::new(Default::default()),
         session_id: Mutex::new(Some("s".into())),
         current_prompt: Mutex::new(None),
+        last_prompt: Mutex::new(None),
+        last_message: Mutex::new(None),
         settled_turn: Mutex::new(None),
-        sequence: std::sync::atomic::AtomicU64::new(0),
         stop_boundaries: std::sync::atomic::AtomicU64::new(0),
     };
     shared.begin_turn(1);
@@ -3086,8 +3091,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId
     let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
     let saw_first_chunk = loop {
         let connection = rusqlite::Connection::open(workspace.path().join("state.sqlite")).unwrap();
+        // Typed text deltas settle as `message` facts; the store keeps one
+        // lifecycle summary row per fact, never the canonical JSON envelope.
         let projected: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND json_extract(payload_json, '$.type')='model.streaming'",
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='runtime.fact' \
+             AND json_extract(payload_json, '$.category')='message'",
             [&agent_id], |row| row.get(0)).unwrap();
         if projected == 1 {
             break true;
@@ -3216,4 +3224,532 @@ fn repair4_nul_chunk_is_preserved_in_persisted_and_paged_result() {
         "RPC must safely encode NUL as a JSON escape"
     );
     assert_eq!(reconstructed, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Typed adapter facts (S03 `external_contract::events`). These assert the
+// adapter's own output: one native `session/update` is explained once, with no
+// canonical `session/event` JSON and no invented native identity.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CapturedFacts {
+    events: Mutex<Vec<crate::RuntimeEvent>>,
+}
+
+struct CaptureSink(Arc<CapturedFacts>);
+impl LifecycleSink for CaptureSink {
+    fn emit(&self, record: crate::LifecycleRecord) {
+        self.0.events.lock().unwrap().push(record.event);
+    }
+}
+
+fn typed_adapter_shared(
+    session: Option<&str>,
+) -> (super::events::DshRuntimeShared, Arc<CapturedFacts>) {
+    use external_agent_dsh::acp::{permission::OfferCache, result::MessageAggregation};
+    let captured = Arc::new(CapturedFacts::default());
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(CaptureSink(Arc::clone(
+        &captured,
+    )))));
+    let (task, launch) = publisher.event_scope();
+    let shared = super::events::DshRuntimeShared {
+        publisher,
+        turn_tracker: Arc::new(TurnTracker::new()),
+        task,
+        launch,
+        offers: Mutex::new(OfferCache::default()),
+        tool_names: Mutex::new(Default::default()),
+        messages: Mutex::new(MessageAggregation::default()),
+        session_id: Mutex::new(session.map(str::to_owned)),
+        current_prompt: Mutex::new(None),
+        last_prompt: Mutex::new(None),
+        last_message: Mutex::new(None),
+        settled_turn: Mutex::new(None),
+        stop_boundaries: std::sync::atomic::AtomicU64::new(0),
+    };
+    (shared, captured)
+}
+
+fn captured_facts(captured: &CapturedFacts) -> Vec<external_contract::events::EventFact> {
+    use external_contract::events::NormalizedEvent;
+    captured
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            crate::RuntimeEvent::Normalized(NormalizedEvent { fact, .. }) => Some(fact.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_update(update: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"sessionId": "s", "update": update})
+}
+
+#[test]
+fn text_thought_and_committed_message_decode_to_typed_facts() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(7);
+
+    let chunk = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "hello"}
+        })))
+        .unwrap();
+    assert_eq!(chunk.disposition().kind(), DispositionKind::Consumed);
+    assert_eq!(chunk.attribution(), Attribution::Current);
+    assert_eq!(chunk.input().source.protocol, SourceProtocol::DshAcpV1);
+    assert_eq!(
+        chunk
+            .input()
+            .source
+            .discriminator
+            .as_ref()
+            .map(SafeToken::as_str),
+        Some("agent_message_chunk")
+    );
+    // DSH ACP has no native frame identity: none is invented.
+    assert_eq!(chunk.input().source.event_id, None);
+    assert_eq!(chunk.input().source.turn_id, None);
+    assert_eq!(chunk.input().turn_id, Some(TurnId::Local(7)));
+    assert_eq!(chunk.events().len(), 1);
+    assert!(matches!(
+        &chunk.events()[0].fact,
+        EventFact::MessageUpdated(MessageUpdate { message_id, text })
+            if *message_id == MessageId("m1".into()) && *text == TextUpdate::Delta("hello".into())
+    ));
+
+    let committed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "type": "agent_message", "messageId": "m2",
+            "content": [{"type": "text", "text": "done"}]
+        })))
+        .unwrap();
+    assert_eq!(committed.disposition().kind(), DispositionKind::Consumed);
+    let facts: Vec<_> = committed.events().iter().map(|e| e.fact.clone()).collect();
+    assert_eq!(facts.len(), 2);
+    assert!(matches!(
+        &facts[0],
+        EventFact::MessageUpdated(MessageUpdate { text: TextUpdate::Delta(text), .. })
+            if text == "done"
+    ));
+    assert!(matches!(
+        &facts[1],
+        EventFact::MessageFinished { message_id } if *message_id == MessageId("m2".into())
+    ));
+
+    let thought = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}
+        })))
+        .unwrap();
+    assert!(matches!(
+        &thought.events()[0].fact,
+        EventFact::PublicReasoningDelta(reasoning)
+            if reasoning.channel == PublicReasoningChannel::Thought && reasoning.delta == "hmm"
+    ));
+
+    // A legal empty chunk has no consumer, and no malformed coverage is
+    // claimed for it.
+    let empty = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": ""}
+        })))
+        .unwrap();
+    assert_eq!(
+        empty.disposition().kind(),
+        DispositionKind::RecognizedIgnored
+    );
+    assert!(empty.events().is_empty());
+
+    // A NUL-bearing public thought is not deliverable reasoning: the known
+    // shape is malformed and the affected dimension is declared.
+    let nul_thought = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "bad\0text"}
+        })))
+        .unwrap();
+    assert_eq!(
+        nul_thought.disposition().kind(),
+        DispositionKind::InvalidLost
+    );
+    assert!(matches!(
+        &nul_thought.events()[0].fact,
+        EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::PublicReasoning])
+    ));
+}
+
+#[test]
+fn tool_updates_name_from_title_and_derive_phases_from_status() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    let announced = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "probe the workspace", "kind": "other",
+            "status": "in_progress", "rawInput": {"path": "."}
+        })))
+        .unwrap();
+    assert_eq!(announced.disposition().kind(), DispositionKind::Consumed);
+    assert_eq!(announced.events().len(), 1);
+    assert!(matches!(
+        &announced.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.call_id == CallId("c1".into())
+                && tool.name.as_deref() == Some("probe the workspace")
+                && tool.category.as_ref().map(SafeToken::as_str) == Some("other")
+                && tool.phase == Some(ToolPhase::Started)
+                && tool.outcome.is_none()
+                && tool.arguments == Some(ArgumentUpdate::Snapshot(serde_json::json!({"path": "."})))
+    ));
+    assert_eq!(announced.input().source.call_id.as_deref(), Some("c1"));
+
+    // The category is never the name; a failed native status is a failed call.
+    let failed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed"
+        })))
+        .unwrap();
+    assert_eq!(failed.disposition().kind(), DispositionKind::Consumed);
+    assert!(matches!(
+        &failed.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.name.as_deref() == Some("probe the workspace")
+                && tool.phase == Some(ToolPhase::Finished)
+                && tool.outcome == Some(ToolOutcome::Failed)
+    ));
+    // The bounded correlation slot is released once the call finished.
+    assert!(shared.tool_names.lock().unwrap().is_empty());
+
+    // A terminal announcement is one fact, never an invented start, and it
+    // carries the explicit native success evidence.
+    let terminal = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c2",
+            "title": "Read", "kind": "other", "status": "completed", "rawInput": {"path": "a.ts"}
+        })))
+        .unwrap();
+    assert_eq!(terminal.events().len(), 1);
+    assert!(matches!(
+        &terminal.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.phase == Some(ToolPhase::Finished) && tool.outcome == Some(ToolOutcome::Succeeded)
+    ));
+
+    // No recognized status proves nothing about execution.
+    let unknown_status = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c3", "status": "queued"
+        })))
+        .unwrap();
+    assert_eq!(
+        unknown_status.disposition().kind(),
+        DispositionKind::RecognizedIgnored
+    );
+    assert!(unknown_status.events().is_empty());
+}
+
+#[test]
+fn update_dispositions_separate_ignored_unknown_and_lost_inputs() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    // Recognized normal traffic with no consumer here is not loss.
+    for (update, expected) in [
+        (
+            serde_json::json!({"sessionUpdate": "usage_update"}),
+            IgnoreReason::Usage,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "plan"}),
+            IgnoreReason::PlanOrDiff,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "config_option_update"}),
+            IgnoreReason::Configuration,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "available_commands_update"}),
+            IgnoreReason::Configuration,
+        ),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(update))
+            .unwrap();
+        assert_eq!(
+            batch.disposition(),
+            &DecodeDisposition::RecognizedIgnored(expected)
+        );
+        assert!(batch.events().is_empty());
+    }
+
+    // A discriminator this adapter does not know is uncertainty, retained as a
+    // safe diagnostic instead of disappearing.
+    let unknown = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "permission_stream_v2", "payload": {"secret": "x"}
+        })))
+        .unwrap();
+    assert_eq!(unknown.disposition().kind(), DispositionKind::Unknown);
+    assert!(matches!(
+        &unknown.events()[0].fact,
+        EventFact::Diagnostic(diagnostic)
+            if diagnostic.reason == DiagnosticReason::UnknownSemantics
+                && diagnostic.discriminator.as_ref().map(SafeToken::as_str)
+                    == Some("permission_stream_v2")
+    ));
+
+    // A known tool shape without its identity is damaged input with a known
+    // affected dimension.
+    let malformed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "no identity"
+        })))
+        .unwrap();
+    assert_eq!(malformed.disposition().kind(), DispositionKind::InvalidLost);
+    assert!(matches!(
+        &malformed.events()[0].fact,
+        EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::Tools])
+    ));
+}
+
+#[test]
+fn foreign_and_post_settlement_frames_never_touch_the_current_turn() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    let foreign = shared
+        .decode_session_update(&serde_json::json!({
+            "sessionId": "other-session",
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": "foreign"}}
+        }))
+        .unwrap();
+    assert_eq!(foreign.attribution(), Attribution::ForeignSession);
+    assert_eq!(
+        foreign.disposition(),
+        &DecodeDisposition::RecognizedIgnored(IgnoreReason::ForeignSession)
+    );
+    assert!(foreign.events().is_empty());
+    assert!(shared.messages.lock().unwrap().is_empty());
+
+    let chunk = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "answer"}
+        })))
+        .unwrap();
+    assert_eq!(chunk.disposition().kind(), DispositionKind::Consumed);
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "end_turn".into(),
+            message_id: None,
+        },
+    ));
+
+    let late = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "more"}
+        })))
+        .unwrap();
+    assert_eq!(late.attribution(), Attribution::Late);
+    assert_eq!(
+        late.disposition(),
+        &DecodeDisposition::RecognizedIgnored(IgnoreReason::Late)
+    );
+    assert!(late.events().is_empty());
+}
+
+#[test]
+fn settlement_reduces_text_before_the_boundary_and_keeps_the_native_stop_reason() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    for text in ["build ", "answer"] {
+        let batch = shared
+            .decode_session_update(&session_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+                "content": {"type": "text", "text": text}
+            })))
+            .unwrap();
+        assert_eq!(batch.disposition().kind(), DispositionKind::Consumed);
+    }
+    // The standard flow settles with nothing but a stop reason.
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "end_turn".into(),
+            message_id: None,
+        },
+    ));
+
+    let facts = captured_facts(&captured);
+    let snapshot = facts
+        .iter()
+        .position(|fact| {
+            matches!(
+                fact,
+                EventFact::MessageUpdated(MessageUpdate {
+                    text: TextUpdate::Snapshot(_),
+                    ..
+                })
+            )
+        })
+        .expect("the final snapshot is part of the settlement batch");
+    let settled = facts
+        .iter()
+        .position(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("the turn boundary was projected");
+    assert!(
+        snapshot < settled,
+        "the verified final text must precede the boundary in the emitted order"
+    );
+    let EventFact::TurnSettled(settlement) = &facts[settled] else {
+        unreachable!()
+    };
+    assert_eq!(settlement.turn_id, TurnId::Local(1));
+    assert_eq!(settlement.outcome, TurnOutcome::Completed);
+    assert_eq!(settlement.final_text.as_deref(), Some("build answer"));
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some("end_turn")
+    );
+    assert!(settlement.failure.is_none());
+
+    let turn = shared.turn_tracker.snapshot();
+    assert!(!turn.active);
+    assert_eq!(turn.boundary, Some(crate::TurnBoundary::Completed));
+}
+
+#[test]
+fn failed_settlements_keep_the_complete_redacted_native_error() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(3);
+    let native = serde_json::json!({
+        "code": -32000,
+        "message": "quota exhausted for the fixture account",
+        "data": {"retryAfter": 30, "limit": "daily", "apiKey": "secret"}
+    });
+    shared.apply_failed_settlement(super::events::REMOTE_ERROR_REASON, Some(&native));
+
+    let facts = captured_facts(&captured);
+    let EventFact::TurnSettled(settlement) = facts
+        .iter()
+        .find(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("failed boundary")
+    else {
+        unreachable!()
+    };
+    assert_eq!(settlement.outcome, TurnOutcome::Failed);
+    let failure = settlement.failure.as_ref().expect("native failure");
+    assert_eq!(failure.original["code"], -32000);
+    assert_eq!(
+        failure.original["message"],
+        "quota exhausted for the fixture account"
+    );
+    assert_eq!(failure.original["data"]["retryAfter"], 30);
+    assert_eq!(failure.original["data"]["limit"], "daily");
+    assert_eq!(failure.original["data"]["apiKey"], "[REDACTED]");
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some(super::events::REMOTE_ERROR_REASON)
+    );
+    let detail = shared
+        .turn_tracker
+        .failure_detail()
+        .expect("the complete native failure is retained");
+    assert!(detail.contains("quota exhausted for the fixture account"));
+    assert!(detail.contains("original_error"));
+}
+
+#[test]
+fn a_failed_stop_reason_is_a_failed_turn_with_the_reason_retained() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    let batch = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Read", "kind": "other", "status": "failed",
+            "rawInput": {"path": "a.ts"}
+        })))
+        .unwrap();
+    assert_eq!(batch.disposition().kind(), DispositionKind::Consumed);
+
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "max_tokens".into(),
+            message_id: None,
+        },
+    ));
+    let facts = captured_facts(&captured);
+    let EventFact::TurnSettled(settlement) = facts
+        .iter()
+        .find(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("failed boundary")
+    else {
+        unreachable!()
+    };
+    assert_eq!(settlement.outcome, TurnOutcome::Failed);
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some("max_tokens")
+    );
+    // The bounded ES reason keeps the delivered diagnostic stable.
+    assert_eq!(
+        settlement
+            .failure
+            .as_ref()
+            .map(|failure| failure.original.clone()),
+        Some(serde_json::json!("MAX_TOKENS"))
+    );
+    assert!(!shared.turn_tracker.snapshot().active);
+    assert_eq!(
+        shared.turn_tracker.snapshot().boundary,
+        Some(crate::TurnBoundary::Failed)
+    );
+}
+
+#[test]
+fn session_update_projection_emits_typed_facts_only() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    let event = Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/update".into(),
+        raw: serde_json::json!({"params": {"sessionId": "s", "update": {
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "typed"}
+        }}}),
+    });
+    assert!(super::events::project_dsh_inbound(&shared, &event).is_none());
+    let events = captured.events.lock().unwrap();
+    assert!(events
+        .iter()
+        .all(|event| matches!(event, crate::RuntimeEvent::Normalized(_))));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::RuntimeEvent::Normalized(normalized)
+            if matches!(
+                &normalized.fact,
+                EventFact::MessageUpdated(MessageUpdate {
+                    text: TextUpdate::Delta(text), ..
+                }) if text == "typed"
+            )
+    )));
 }

@@ -23,7 +23,7 @@ use external_runtime::{Driver, FrameCodec, SpawnModel};
 use external_store::TaskRecord;
 
 use super::events::DshRuntimeShared;
-use super::session::{dsh_session_message, remaining_time};
+use super::session::{dsh_session_detail, remaining_time};
 use super::transport::spawn_dsh_pump;
 use crate::{
     LifecycleSink, ManagedRuntime, ProcessIdentity, Publisher, RuntimeCommandError, RuntimeLoss,
@@ -73,16 +73,20 @@ impl DshRuntimeOwner {
         )?);
         AcpSession::codec_check(&driver).map_err(|error| io::Error::other(error.to_string()))?;
         let publisher = Arc::new(Publisher::new(sink));
+        let (task, launch) = publisher.event_scope();
         let shared = Arc::new(DshRuntimeShared {
             publisher: Arc::clone(&publisher),
             turn_tracker: Arc::new(TurnTracker::new()),
+            task,
+            launch,
             offers: Mutex::new(OfferCache::default()),
             tool_names: Mutex::new(HashMap::new()),
             messages: Mutex::new(MessageAggregation::default()),
             session_id: Mutex::new(None),
             current_prompt: Mutex::new(None),
+            last_prompt: Mutex::new(None),
+            last_message: Mutex::new(None),
             settled_turn: Mutex::new(None),
-            sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -224,9 +228,9 @@ impl ManagedRuntime for DshRuntimeOwner {
             .ok_or(RuntimeCommandError::Timeout)?;
         {
             let session = self.session.lock().unwrap();
-            session.cancel().map_err(|error| {
-                RuntimeCommandError::InvalidSession(dsh_session_message(&error).into())
-            })?;
+            session
+                .cancel()
+                .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_detail(&error)))?;
         }
         let boundary = self
             .shared
@@ -290,7 +294,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         let session = self.session.lock().unwrap();
         session
             .close(timeout)
-            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error).into()))
+            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_detail(&error)))
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
