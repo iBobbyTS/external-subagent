@@ -457,6 +457,10 @@ impl CodexShared {
 
         let input = self.context(method, params, None);
         if item_type.is_some_and(update::is_tool_item) {
+            let Some(turn) = self.attributable_turn(frame_turn) else {
+                return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
+            };
+            let input = self.context(method, params, Some(&turn));
             // A whitelisted tool without a usable identity can never be
             // attributed to a call.
             return self.invalid(
@@ -1124,6 +1128,29 @@ mod typed_tests {
         };
         assert_eq!(settlement.outcome, TurnOutcome::Completed);
         assert!(!trace.shared.turn_tracker.snapshot().active);
+        assert!(trace.shared.turn_tracker.failure_detail().is_none());
+    }
+
+    #[test]
+    fn failed_settlement_keeps_the_observed_native_failure() {
+        let trace = Trace::new();
+        trace.start_turn("turn-1");
+        trace.send("error", json!({"threadId": "thread-1", "turnId": "turn-1",
+            "willRetry": true, "error": {"message": "native cause", "codexErrorInfo": "serverOverloaded"}}));
+        let observed = trace
+            .shared
+            .turn_tracker
+            .failure_detail()
+            .expect("active turn failure");
+        assert!(trace.shared.turn_tracker.snapshot().active);
+        trace.send("turn/completed", json!({"threadId": "thread-1",
+            "turn": {"id": "turn-1", "status": "failed", "error": {"message": "boundary fallback"}}}));
+        assert_eq!(
+            trace.shared.turn_tracker.snapshot().boundary,
+            Some(crate::TurnBoundary::Failed)
+        );
+        assert!(!trace.shared.turn_tracker.snapshot().active);
+        assert_eq!(trace.shared.turn_tracker.failure_detail(), Some(observed));
     }
 
     #[test]
@@ -1243,6 +1270,73 @@ mod typed_tests {
                 TextUpdate::Delta("OK".into())
             ],
             "late traffic never reaches the sink"
+        );
+    }
+
+    #[test]
+    fn malformed_tool_identity_is_late_before_it_can_damage_current_telemetry() {
+        let trace = Trace::new();
+        trace.start_turn("turn-1");
+        for method in ["item/started", "item/completed"] {
+            for id in [
+                None,
+                Some(json!("")),
+                Some(json!("x".repeat(513))),
+                Some(json!("bad\0id")),
+            ] {
+                for turn in [Some("turn-0"), None] {
+                    let mut params =
+                        json!({"threadId": "thread-1", "item": {"type": "commandExecution"}});
+                    if let Some(id) = &id {
+                        params["item"]["id"] = id.clone();
+                    }
+                    if let Some(turn) = turn {
+                        params["turnId"] = json!(turn);
+                    }
+                    let batch = trace.send(method, params.clone());
+                    assert_eq!(batch.attribution(), Attribution::Late, "{method}: {params}");
+                    assert_eq!(
+                        batch.disposition(),
+                        &DecodeDisposition::RecognizedIgnored(IgnoreReason::Late)
+                    );
+                    assert!(batch.events().is_empty());
+                    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+                    assert_eq!(
+                        trace
+                            .sink
+                            .activity
+                            .observation_snapshot()
+                            .coverage
+                            .dropped_events,
+                        0
+                    );
+
+                    // The same malformed identity on the current turn still
+                    // reports lost tool coverage rather than silently dropping it.
+                    params["turnId"] = json!("turn-1");
+                    let current = trace.decode(method, params);
+                    assert_eq!(current.attribution(), Attribution::Current);
+                    assert!(
+                        matches!(current.disposition(), DecodeDisposition::InvalidLost(gap)
+                        if gap.reason == LossReason::Malformed
+                            && gap.impact == Impact::Known(vec![CoverageDimension::Tools]))
+                    );
+                }
+            }
+        }
+        assert!(trace.shared.turn_tracker.snapshot().active);
+        assert_eq!(
+            trace.sink.activity.snapshot().window_60s.tool_calls_started,
+            0
+        );
+        assert_eq!(
+            trace
+                .sink
+                .activity
+                .snapshot()
+                .window_60s
+                .tool_calls_completed,
+            0
         );
     }
 

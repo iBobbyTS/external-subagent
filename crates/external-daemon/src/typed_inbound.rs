@@ -60,7 +60,11 @@ impl TurnTracker {
                     } else {
                         TurnBoundary::Completed
                     });
-                    if let Some(failure) = &settlement.failure {
+                    if settlement.outcome == TurnOutcome::Completed {
+                        // A successful authoritative boundary retires errors
+                        // recovered within this turn, before any later exit.
+                        state.failure = None;
+                    } else if let Some(failure) = &settlement.failure {
                         state.failure = Some(scheduler::native_failure_detail(&failure.original));
                     }
                     state.model_request_started_at = None;

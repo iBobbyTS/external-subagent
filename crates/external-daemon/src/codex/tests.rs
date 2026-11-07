@@ -1723,6 +1723,116 @@ fn retry_error_does_not_settle_the_turn_and_a_later_completion_wins() {
     );
 }
 
+/// Hold the monitor in its terminal wait until the scripted process exits,
+/// so completion followed by runtime loss is a deterministic interleaving.
+#[test]
+fn recovered_error_then_completed_turn_does_not_label_a_later_runtime_loss() {
+    struct ExitFirstRuntime(Arc<dyn ManagedRuntime>);
+    impl ManagedRuntime for ExitFirstRuntime {
+        fn identity(&self) -> Option<crate::ProcessIdentity> {
+            self.0.identity()
+        }
+        fn stop(&self, grace: Duration) -> crate::RuntimeTerminal {
+            self.0.stop(grace)
+        }
+        fn wait_terminal(&self, _: Duration) -> Option<crate::RuntimeTerminal> {
+            self.0.wait_terminal(SCRIPTED_SYNC_WAIT)
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            task: &TaskRecord,
+            servers: &[external_contract::StdioMcpServer],
+            timeout: Duration,
+        ) -> Result<crate::SessionReady, crate::RuntimeCommandError> {
+            self.0.bootstrap_session_with_mcp(task, servers, timeout)
+        }
+        fn turn_snapshot(&self) -> crate::TurnSnapshot {
+            self.0.turn_snapshot()
+        }
+        fn diagnostic_failure(&self) -> Option<String> {
+            self.0.diagnostic_failure()
+        }
+        fn diagnostic_tail(&self) -> String {
+            self.0.diagnostic_tail()
+        }
+    }
+    struct ExitFirstFactory(CodexRuntimeFactory);
+    impl RuntimeFactory for ExitFirstFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Ok(Arc::new(ExitFirstRuntime(self.0.spawn(task, sink)?)))
+        }
+    }
+
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let frames = [
+        serde_json::json!({"method": "error", "params": {
+            "threadId": THREAD_ID, "turnId": "codex-turn-1", "willRetry": true,
+            "error": {"message": "RECOVERED_CAPACITY_ERROR", "codexErrorInfo": "serverOverloaded"}}}),
+        serde_json::json!({"method": "item/completed", "params": {
+            "threadId": THREAD_ID, "turnId": "codex-turn-1",
+            "item": {"type": "agentMessage", "id": "msg_1", "text": "RETRY_OK"}}}),
+        serde_json::json!({"method": "turn/completed", "params": {
+            "threadId": THREAD_ID, "turn": {"id": "codex-turn-1", "status": "completed", "error": null}}}),
+    ];
+    let script = error_turn_script(workspace.path(), &frames);
+    let script = format!(
+        "{}\nwhile [ ! -f exit-release ]; do sleep 0.01; done\nexit 1\n",
+        script.trim_end().strip_suffix("sleep 2").unwrap()
+    );
+    let store =
+        Arc::new(external_store::Store::open(workspace.path().join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-test",
+        store,
+        Arc::new(ExitFirstFactory(harness_factory(&script, workspace.path()))),
+        SchedulerConfig {
+            bootstrap_timeout: SCRIPTED_SYNC_WAIT,
+            control_timeout: SCRIPTED_SYNC_WAIT,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "recovered then exit"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id;
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    loop {
+        let (turn, _) = scheduler.active_turn_observation(&agent_id).unwrap();
+        if !turn.active && turn.boundary == Some(crate::TurnBoundary::Completed) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "recovered turn did not complete");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+    std::fs::write(workspace.path().join("exit-release"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.failure_code.as_deref(), Some("RUNTIME_TERMINAL"));
+    let failure = task.failure_message.expect("persisted runtime loss");
+    let diagnostic = scheduler
+        .last_error(&agent_id)
+        .expect("runtime loss diagnostic");
+    for record in [&failure, &diagnostic] {
+        let detail: serde_json::Value = serde_json::from_str(record).unwrap();
+        assert_eq!(detail["message"], "Exited(Exited(Some(1)))", "{record}");
+        assert!(detail.get("original_error").is_none(), "{record}");
+        // stderr_tail may retain the historical retry notification; it must
+        // not become the cause of this later process failure.
+    }
+}
+
 #[test]
 fn long_native_error_paginates_without_loss() {
     use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
