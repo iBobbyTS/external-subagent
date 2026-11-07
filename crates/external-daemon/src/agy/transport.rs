@@ -1,4 +1,4 @@
-//! The `agy` NDJSON pump thread (raw-value frame loop, canonical projection,
+//! The `agy` NDJSON pump thread (raw-value frame loop, typed projection,
 //! child-exit terminalization) and the process-group reap proof for terminal
 //! classification.
 

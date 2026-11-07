@@ -145,6 +145,8 @@ pub struct Usage {
 /// only on the `DONE` half of a tool step.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ToolInfo {
+    /// Public native failure object (documented as type/message); retained whole.
+    pub error: Option<Value>,
     pub name: Option<String>,
     pub parameters: Option<Value>,
     pub output: Option<Value>,
@@ -165,6 +167,7 @@ pub struct DeniedAction {
 /// effective permission mode.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct InitInfo {
+    pub model: Option<String>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
@@ -223,7 +226,7 @@ pub enum AgyEvent {
     StepUpdate(StepUpdate),
     Result(ResultPayload),
     /// An event name this crate does not model; the raw value is preserved so
-    /// the daemon can log it, and no state is produced from it.
+    /// the daemon can classify it explicitly without leaking its payload.
     Unknown {
         event: Option<String>,
         raw: Value,

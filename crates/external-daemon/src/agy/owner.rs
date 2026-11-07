@@ -207,7 +207,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(SessionReady {
             session_id,
             initial_turn_id: None,
-            configured_model: model,
+            configured_model: self.shared.model().or(model),
         })
     }
 
@@ -235,9 +235,12 @@ impl ManagedRuntime for AgyRuntimeOwner {
         // continuing on the wrong history.
         let observed = self.shared.wait_start(remaining_time(deadline)?)?;
         if observed != session_id {
-            return Err(RuntimeCommandError::InvalidSession(format!(
-                "agy resumed conversation {observed} does not match the persisted session id"
-            ).into()));
+            return Err(RuntimeCommandError::InvalidSession(
+                format!(
+                    "agy resumed conversation {observed} does not match the persisted session id"
+                )
+                .into(),
+            ));
         }
         // A resumed conversation never replays the pre-stop prompt: the queued
         // message delivered by the scheduler is the sole trigger for the next
@@ -245,7 +248,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(SessionReady {
             session_id: session_id.to_owned(),
             initial_turn_id: None,
-            configured_model: model,
+            configured_model: self.shared.model().or(model),
         })
     }
 

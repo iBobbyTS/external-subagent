@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::{
-    CommandRuntimeFactory, LifecycleSink, MessageDisposition, RuntimeFactory, Scheduler,
-    SchedulerConfig,
+    CommandRuntimeFactory, LifecycleSink, ManagedRuntime, MessageDisposition, RuntimeFactory,
+    Scheduler, SchedulerConfig,
 };
 use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
 use external_store::{TaskOutcome, TaskPhase, TaskRecord, TurnState};
@@ -38,9 +38,7 @@ const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
 fn agy_workspace() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("agy-")
-        .tempdir_in(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace"),
-        )
+        .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace"))
         .unwrap()
 }
 
@@ -280,7 +278,10 @@ fn agy_admission_routes_to_the_agy_factory_and_completes_the_turn() {
     let _guard = scripted_test_guard();
     let workspace = agy_workspace();
     let directory = workspace.path().to_owned();
-    let scheduler = agy_scheduler(&directory, harness_factory(&HAPPY.replace("__CONV__", CONV), &directory));
+    let scheduler = agy_scheduler(
+        &directory,
+        harness_factory(&HAPPY.replace("__CONV__", CONV), &directory),
+    );
     let agent_id = enqueue(&scheduler, &directory, PermissionMode::Build);
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let result = await_result(&scheduler, &agent_id);
@@ -573,7 +574,9 @@ fn plan_permission_is_refused_by_the_factory() {
     let agent_id = enqueue(&scheduler, &directory, PermissionMode::Plan);
     let error = scheduler.start_ready().unwrap_err();
     assert!(
-        error.to_string().contains("build and yolo permission modes"),
+        error
+            .to_string()
+            .contains("build and yolo permission modes"),
         "{error}"
     );
     let task = await_terminal_task(&scheduler, &agent_id);
@@ -767,13 +770,13 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
     }
     impl LifecycleSink for PausedSettlementSink {
         fn emit(&self, record: crate::LifecycleRecord) {
-            let crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
-                external_contract::WireMessage::Event(event),
-            )) = record.event
-            else {
+            let crate::RuntimeEvent::Normalized(event) = record.event else {
                 return;
             };
-            if event.params["type"] == "turn.completed" {
+            if matches!(
+                event.fact,
+                external_contract::events::EventFact::TurnSettled(_)
+            ) {
                 if let Some(release) = self.release.lock().unwrap().take() {
                     // 真实 result 发布正持 turn 与 publisher 锁；暂停首轮边界。
                     self.publishing.send(()).unwrap();
@@ -1008,4 +1011,346 @@ esac
         .filter(|frame| frame["event"] == "user")
         .count();
     assert_eq!(users, 1);
+}
+
+/// Typed ingress probes use observed fixtures where available; fault frames
+/// below are explicitly synthetic and never require a live model call.
+struct AgyFactSink(
+    std::sync::Mutex<Vec<crate::RuntimeEvent>>,
+    Arc<crate::PassiveActivityTracker>,
+);
+impl Default for AgyFactSink {
+    fn default() -> Self {
+        Self(
+            Default::default(),
+            Arc::new(crate::PassiveActivityTracker::for_adapter("agy")),
+        )
+    }
+}
+impl LifecycleSink for AgyFactSink {
+    fn emit(&self, record: crate::LifecycleRecord) {
+        self.1.observe(&record.event);
+        self.0.lock().unwrap().push(record.event);
+    }
+}
+impl AgyFactSink {
+    fn facts(&self) -> Vec<external_contract::events::NormalizedEvent> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                crate::RuntimeEvent::Normalized(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+fn agy_fact_probe() -> (super::events::AgyRuntimeShared, Arc<AgyFactSink>) {
+    let sink = Arc::new(AgyFactSink::default());
+    let shared = super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(sink.clone())),
+        Arc::new(crate::TurnTracker::new()),
+    );
+    shared.begin_turn();
+    (shared, sink)
+}
+fn feed_agy(shared: &super::events::AgyRuntimeShared, raw: serde_json::Value) {
+    assert!(super::events::project_agy_inbound(
+        shared,
+        &external_runtime::Inbound::Message(external_contract::WireMessage::UnknownEvent {
+            method: "ndjson".into(),
+            raw
+        })
+    )
+    .is_none());
+}
+
+#[test]
+fn observed_stream_emits_typed_facts_without_inventing_tool_success() {
+    use external_contract::events::*;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/agy-events/stream-observed.json"
+    ))
+    .unwrap();
+    let (shared, sink) = agy_fact_probe();
+    for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
+        feed_agy(&shared, frame.clone());
+        if index == 3 {
+            assert_eq!(sink.1.snapshot().active_tools.len(), 1);
+        }
+        if index == 4 {
+            assert_eq!(sink.1.snapshot().active_tools.len(), 0);
+        }
+    }
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::SessionReady(info) if info.model.as_deref() == Some("gemini-3.8-flash-low"))));
+    let tools: Vec<_> = facts
+        .iter()
+        .filter_map(|e| {
+            if let EventFact::ToolChanged(t) = &e.fact {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].call_id, tools[1].call_id);
+    assert_eq!(tools[1].phase, Some(ToolPhase::Finished));
+    assert_eq!(tools[1].outcome, Some(ToolOutcome::Unknown));
+    assert!(facts.iter().all(|e| e.context.source.turn_id.is_none()));
+    assert!(facts
+        .iter()
+        .all(|e| e.context.turn_id == Some(TurnId::Local(1))));
+    assert!(facts
+        .windows(2)
+        .all(|w| w[0].context.sequence < w[1].context.sequence));
+    assert!(
+        matches!(&facts.last().unwrap().fact, EventFact::TurnSettled(s) if s.final_text.as_deref() == Some("OK\n") && s.outcome == TurnOutcome::Completed)
+    );
+    assert!(sink.0.lock().unwrap().iter().all(|e| !matches!(
+        e,
+        crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+            external_contract::WireMessage::Event(_)
+        ))
+    )));
+}
+
+#[test]
+fn synthetic_tool_error_denial_unknown_and_malformed_are_retained() {
+    use external_contract::events::*;
+    let (shared, sink) = agy_fact_probe();
+    let error = serde_json::json!({"type":"command_error","message":"failed", "data":{"complete":"x".repeat(2000),"api_key":"secret"}});
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":CONV,"step_index":7,"state":"DONE","step_type":"tool","tool_info":{"name":"run_command","error":error}}}),
+    );
+    assert_eq!(sink.1.snapshot().window_60s.tool_calls_failed, 1);
+    assert_eq!(sink.1.snapshot().active_tools.len(), 0);
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::ToolChanged(t) if t.phase == Some(ToolPhase::Finished) && t.outcome == Some(ToolOutcome::Failed) && t.failure.as_ref().is_some_and(|f| f.original["data"]["complete"] == "x".repeat(2000) && f.original["data"]["api_key"] != "secret"))));
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"banana","payload":{"secret":"private-body"}}),
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"step_update","step_update":{"step_index":"bad"}}),
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"ok","num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}),
+    );
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics)));
+    assert!(facts.iter().any(
+        |e| matches!(&e.fact, EventFact::CoverageGap(g) if g.reason == LossReason::Malformed)
+    ));
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::PermissionDenied)));
+    assert!(shared.diagnostic_tail().contains("RunCommand"));
+    assert!(
+        matches!(&facts.last().unwrap().fact, EventFact::TurnSettled(s) if s.outcome == TurnOutcome::Completed)
+    );
+    let diagnostics = facts
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.fact,
+                EventFact::Diagnostic(_) | EventFact::CoverageGap(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!serde_json::to_string(&diagnostics)
+        .unwrap()
+        .contains("private-body"));
+}
+
+#[test]
+fn observed_result_error_is_preserved_and_acp_remains_unsupported() {
+    use external_contract::events::*;
+    let (shared, sink) = agy_fact_probe();
+    // OBSERVED 1.2.12 rejected control_request, retained by the existing corpus.
+    let raw: serde_json::Value = serde_json::from_str(
+        include_str!("../../../subagents/agy/tests/fixtures/neg-control.ndjson")
+            .lines()
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = raw["result"]["error"].clone();
+    feed_agy(&shared, raw);
+    assert!(sink.facts().iter().any(|e| matches!(&e.fact, EventFact::TurnSettled(s) if s.failure.as_ref().is_some_and(|f| f.original == expected))));
+    let acp: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/agy-events/acp-observed.json"
+    ))
+    .unwrap();
+    assert_eq!(acp["provenance"], "OBSERVED");
+    let before = sink.facts().len();
+    // The other observed protocol is evidence only. Sending one of its
+    // actual frames to stream-json must diagnose unknown, never settle.
+    feed_agy(&shared, acp["frames"].as_array().unwrap()[0].clone());
+    assert!(
+        matches!(&sink.facts()[before].fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics)
+    );
+}
+
+#[test]
+fn synthetic_admission_error_retains_complete_redacted_native_failure() {
+    let shared = super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
+        Arc::new(crate::TurnTracker::new()),
+    );
+    let reason = format!(
+        "invalid model selection {} api_key=secret-value",
+        "detail ".repeat(500)
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"status":"ERROR","error":reason}}),
+    );
+    let error = shared.wait_start(Duration::from_secs(1)).unwrap_err();
+    let crate::RuntimeCommandError::ModelRejected(detail) = error else {
+        panic!("model rejection classification lost")
+    };
+    assert!(detail.message.len() <= 512);
+    let original = detail.native_failure.unwrap().original;
+    let original = original.as_str().unwrap();
+    assert!(original.len() > 3000);
+    assert!(!original.contains("secret-value"));
+    assert!(original.contains(&"detail ".repeat(500)));
+}
+
+#[test]
+fn buffered_start_is_published_before_pending_input_is_consumed() {
+    use external_contract::events::*;
+    use std::sync::{mpsc, Mutex};
+    struct PausedStartSink {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl LifecycleSink for PausedStartSink {
+        fn emit(&self, record: crate::LifecycleRecord) {
+            if matches!(
+                record.event,
+                crate::RuntimeEvent::Normalized(NormalizedEvent {
+                    fact: EventFact::TurnStarted {
+                        turn_id: TurnId::Local(2)
+                    },
+                    ..
+                })
+            ) {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    let (started, ready) = mpsc::channel();
+    let (release, resumed) = mpsc::channel();
+    let shared = Arc::new(super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(PausedStartSink {
+            started,
+            release: Mutex::new(resumed),
+        }))),
+        Arc::new(crate::TurnTracker::new()),
+    ));
+    shared.begin_turn();
+    shared.buffer_input(|| Ok(())).unwrap();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"A","num_turns":1}}),
+    );
+    let pump_shared = shared.clone();
+    let pump = thread::spawn(move || {
+        feed_agy(
+            &pump_shared,
+            serde_json::json!({"event":"step_update","step_update":{"conversation_id":CONV,"step_index":42,"state":"DONE","step_type":"user_input"}}),
+        )
+    });
+    ready.recv_timeout(SCRIPTED_SYNC_WAIT).unwrap();
+    let snapshot = shared.turn_snapshot();
+    release.send(()).unwrap();
+    pump.join().unwrap();
+    assert!(
+        snapshot.active,
+        "pending input was consumed before started reached the tracker"
+    );
+    assert_eq!(
+        snapshot.generation, 1,
+        "paused publication should precede tracker reduction"
+    );
+    assert_eq!(shared.turn_snapshot().generation, 2);
+    assert!(shared.turn_snapshot().active);
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"B","num_turns":2}}),
+    );
+    assert!(!shared.turn_snapshot().active);
+}
+
+#[test]
+fn native_init_model_reaches_the_owner_model_view_without_changing_admission() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{"model":"native-effective-model"}}'
+"#.replace("__CONV__", CONV);
+    let child = workspace.path().join("model-view.sh");
+    write_scripted_child(&child, workspace.path(), &script);
+    let owner = AgyRuntimeOwner::spawn(Command::new(child), Arc::new(NoopSink)).unwrap();
+    let ready = owner
+        .bootstrap_session_with_mcp(&agy_task_record(workspace.path()), &[], SCRIPTED_SYNC_WAIT)
+        .unwrap();
+    assert_eq!(
+        ready.configured_model.as_deref(),
+        Some("native-effective-model")
+    );
+}
+
+#[test]
+fn synthetic_long_result_error_survives_the_real_scheduler_result_path() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let error = format!(
+        "invalid control_request {} END_OF_NATIVE_ERROR",
+        "detail ".repeat(2000)
+    );
+    let result = serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"ERROR","error":error,"num_turns":1}});
+    let script = format!("read_frame\nprintf '%s\\n' '{{\"event\":\"init\",\"conversation_id\":\"{CONV}\",\"init\":{{}}}}'\nprintf '%s\\n' '{result}'\n");
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let detail: serde_json::Value = serde_json::from_str(&result.result.final_text).unwrap();
+    // Existing result contract delivers the original itself; the wrapper
+    // named original_error belongs to the intermediate failure detail only.
+    assert_eq!(detail, serde_json::Value::String(error));
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 257,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        reconstructed.push_str(&page.final_text);
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(reconstructed, result.result.final_text);
 }
