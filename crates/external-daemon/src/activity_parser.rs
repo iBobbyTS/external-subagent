@@ -375,6 +375,8 @@ fn count_call_id(event_id: &str) -> String {
 }
 
 // codex count-event 描述符统一保留二元组：工具名按字符截断，参数按 UTF-8 字节截断。
+// 生产适配器已直接产出 typed 工具事实，现在只保留给 count 词表的回归测试。
+#[cfg(test)]
 pub(crate) fn bounded_tool_call(tool: &str, arg: &str) -> [String; 2] {
     let mut end = arg.len().min(512);
     while !arg.is_char_boundary(end) {

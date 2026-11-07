@@ -1,15 +1,12 @@
 //! Codex `item/*`, `turn/*`, `error`, and MCP-startup notification
-//! folding: pure extraction of the projection inputs, construction of the
-//! canonical `session/event` payloads and envelopes, and the bounded
+//! folding: pure extraction of the projection inputs and the bounded
 //! aggregation helpers (item text, turn-failure detail, MCP diagnostic
 //! tail, retired turns) the daemon applies to its shared state. Nothing
-//! here holds daemon state or emits; the daemon owns attribution against
-//! the live thread and turn and publishes what these functions build.
+//! here holds daemon state, builds a wire payload or emits; the daemon
+//! owns attribution against the live thread and turn and publishes typed
+//! facts.
 
 use std::collections::HashMap;
-
-use external_contract::{classify_lifecycle, EventEnvelope, WireMessage, SESSION_EVENT};
-use external_runtime::Inbound;
 
 /// Hard bound on one aggregated agent-message item.
 const MAX_ITEM_TEXT_BYTES: usize = 512 * 1024;
@@ -29,10 +26,9 @@ const MAX_TOOL_ITEM_ID_BYTES: usize = 512;
 /// Hard bound on the per-turn first-seen tool-item memory.
 const MAX_TRACKED_TOOL_ITEMS: usize = 4096;
 
-/// The Codex item types the adapter counts as one tool initiation. The
-/// whitelist is adapter-owned: the generic daemon protocol only ever receives
-/// the resulting count, never these names. Content items (agentMessage,
-/// reasoning, ...), mode switches, and output-side records stay excluded.
+/// The Codex item types the adapter projects as tool calls. The whitelist is
+/// adapter-owned: content items (agentMessage, reasoning, ...), mode switches,
+/// and output-side records stay excluded.
 pub const TOOL_ITEM_TYPES: [&str; 9] = [
     "commandExecution",
     "fileChange",
@@ -83,6 +79,103 @@ pub fn observe_tool_item(seen: &mut Vec<String>, id: &str) -> bool {
     true
 }
 
+/// The public identity and status of one whitelisted tool item. Returned only
+/// for an `item/started` or `item/completed` frame whose item type is on the
+/// adapter whitelist and whose id is a bounded, NUL-free identity.
+pub struct ToolItem<'a> {
+    pub id: &'a str,
+    pub item_type: &'a str,
+    /// Native terminal status of the item, when the protocol type declares it.
+    pub status: Option<&'a str>,
+    /// Public arguments of the call, projected per item type. Never includes
+    /// diffs, outputs, raw reasoning or encrypted content.
+    pub arguments: Option<serde_json::Value>,
+    /// The item's native error object, when the completed item carries one.
+    pub error: Option<serde_json::Value>,
+}
+
+/// Extract the tool item of an `item/started` or `item/completed` frame.
+pub fn tool_item(params: &serde_json::Value) -> Option<ToolItem<'_>> {
+    let item = params.get("item").unwrap_or(&serde_json::Value::Null);
+    let id = tool_item_id(params)?;
+    let item_type = item.get("type").and_then(|value| value.as_str())?;
+    Some(ToolItem {
+        id,
+        item_type,
+        status: item.get("status").and_then(|value| value.as_str()),
+        arguments: tool_arguments(item, item_type),
+        error: item.get("error").filter(|value| !value.is_null()).cloned(),
+    })
+}
+
+/// Project the public arguments of one tool item type. Only the fields the
+/// public app-server item declares as call inputs are retained; diffs, command
+/// output, results and opaque extension payloads never become arguments.
+fn tool_arguments(item: &serde_json::Value, item_type: &str) -> Option<serde_json::Value> {
+    let mut arguments = serde_json::Map::new();
+    match item_type {
+        "commandExecution" => {
+            copy(item, "command", &mut arguments);
+            copy(item, "cwd", &mut arguments);
+        }
+        "fileChange" => {
+            if let Some(changes) = item.get("changes").and_then(|value| value.as_array()) {
+                let changes: Vec<serde_json::Value> = changes
+                    .iter()
+                    .filter_map(|change| {
+                        let path = change.get("path")?;
+                        let mut projected = serde_json::Map::new();
+                        projected.insert("path".into(), path.clone());
+                        if let Some(kind) = change.get("kind") {
+                            projected.insert("kind".into(), kind.clone());
+                        }
+                        Some(serde_json::Value::Object(projected))
+                    })
+                    .collect();
+                arguments.insert("changes".into(), changes.into());
+            }
+        }
+        "mcpToolCall" => {
+            copy(item, "server", &mut arguments);
+            copy(item, "tool", &mut arguments);
+            copy(item, "arguments", &mut arguments);
+        }
+        "dynamicToolCall" => {
+            copy(item, "namespace", &mut arguments);
+            copy(item, "tool", &mut arguments);
+            copy(item, "arguments", &mut arguments);
+        }
+        "webSearch" => copy(item, "query", &mut arguments),
+        "collabAgentToolCall" => {
+            copy(item, "tool", &mut arguments);
+            copy(item, "prompt", &mut arguments);
+        }
+        "imageView" => copy(item, "path", &mut arguments),
+        "sleep" => copy(item, "durationMs", &mut arguments),
+        _ => {}
+    }
+    (!arguments.is_empty()).then_some(serde_json::Value::Object(arguments))
+}
+
+fn copy(
+    item: &serde_json::Value,
+    key: &str,
+    into: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(value) = item.get(key).filter(|value| !value.is_null()) {
+        into.insert(key.to_owned(), value.clone());
+    }
+}
+
+/// Extract the public summary delta of an `item/reasoning/summaryTextDelta`
+/// notification: the delta text, its item identity and summary part index.
+pub fn summary_delta(params: &serde_json::Value) -> Option<(&str, Option<&str>, Option<i64>)> {
+    let delta = params.get("delta").and_then(|value| value.as_str())?;
+    let item_id = params.get("itemId").and_then(|value| value.as_str());
+    let part = params.get("summaryIndex").and_then(|value| value.as_i64());
+    Some((delta, item_id, part))
+}
+
 /// Whether a notification method is turn-scoped: its traffic must carry
 /// the active thread id and is only ever projected onto the current turn.
 pub fn is_turn_scoped(method: &str) -> bool {
@@ -92,6 +185,10 @@ pub fn is_turn_scoped(method: &str) -> bool {
             | "item/started"
             | "item/agentMessage/delta"
             | "item/completed"
+            | "item/plan/delta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
+            | "item/reasoning/textDelta"
             | "turn/completed"
             | "error"
     )
@@ -252,108 +349,6 @@ pub fn mcp_startup_failure(params: &serde_json::Value) -> Option<(&str, &str)> {
     Some((name, error))
 }
 
-/// The canonical event id for a projection sequence number.
-pub fn event_id(sequence: u64) -> String {
-    format!("codex-event-{sequence}")
-}
-
-/// The canonical `session/event` envelope for one projected payload.
-pub fn canonical_event(params: serde_json::Value) -> Inbound {
-    Inbound::Message(WireMessage::Event(EventEnvelope {
-        method: SESSION_EVENT.into(),
-        params,
-    }))
-}
-
-/// The lifecycle observation record for a projected boundary.
-pub fn lifecycle_event(sequence: u64, method: &str) -> Inbound {
-    Inbound::Lifecycle {
-        sequence,
-        method: method.into(),
-        order: classify_lifecycle(method, false),
-    }
-}
-
-/// The canonical `turn.started` payload.
-pub fn turn_started_payload(event_id: &str, turn_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "turn.started",
-        "eventId": event_id,
-        "turnId": turn_id,
-    })
-}
-
-/// The canonical `model.streaming` payload for one agent-message delta.
-pub fn model_streaming_payload(
-    event_id: &str,
-    turn_id: &str,
-    delta: &str,
-    item_id: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "model.streaming",
-        "eventId": event_id,
-        "turnId": turn_id,
-        "payload": {
-            "kind": "text_delta",
-            "delta": delta,
-            "assistantMessageId": item_id,
-        },
-    })
-}
-
-/// The canonical `message.finished` payload for one completed
-/// agent-message item.
-pub fn message_finished_payload(event_id: &str, turn_id: &str, item_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "type": "message.finished",
-        "eventId": event_id,
-        "turnId": turn_id,
-        "payload": {"assistantMessageId": item_id},
-    })
-}
-
-/// The canonical `turn.completed` boundary payload; `response` carries the
-/// turn's final text when a verified message backs it.
-pub fn turn_completed_payload(
-    event_id: &str,
-    turn_id: &str,
-    final_text: Option<String>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({});
-    if let Some(text) = final_text {
-        payload["response"] = serde_json::Value::String(text);
-    }
-    serde_json::json!({
-        "type": "turn.completed",
-        "eventId": event_id,
-        "turnId": turn_id,
-        "payload": payload,
-    })
-}
-
-/// The canonical `turn.failed` boundary payload with the bounded ES label and,
-/// when the turn carried one, the complete native error under the shared
-/// `payload.error` slot the delivery layer already delivers through the task
-/// result.
-pub fn turn_failed_payload(
-    event_id: &str,
-    turn_id: &str,
-    reason: &str,
-    native: Option<&serde_json::Value>,
-) -> serde_json::Value {
-    let mut payload = serde_json::json!({"reason_code": reason});
-    if let Some(native) = native {
-        payload["error"] = native.clone();
-    }
-    serde_json::json!({
-        "type": "turn.failed",
-        "eventId": event_id,
-        "turnId": turn_id,
-        "payload": payload,
-    })
-}
-
 /// Append one delta to an agent-message item's tracked text. A new item is
 /// refused once the tracking cap is reached; an existing item keeps
 /// appending, and the total stays byte-bounded on char boundaries.
@@ -416,12 +411,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn turn_scoped_methods_are_the_six_projection_inputs() {
+    fn turn_scoped_methods_cover_content_tools_and_public_reasoning() {
         for method in [
             "turn/started",
             "item/started",
             "item/agentMessage/delta",
             "item/completed",
+            "item/plan/delta",
+            "item/reasoning/summaryTextDelta",
+            "item/reasoning/summaryPartAdded",
+            "item/reasoning/textDelta",
             "turn/completed",
             "error",
         ] {
@@ -429,6 +428,7 @@ mod tests {
         }
         assert!(!is_turn_scoped("mcpServer/startupStatus/updated"));
         assert!(!is_turn_scoped("thread/started"));
+        assert!(!is_turn_scoped("account/rateLimits/updated"));
     }
 
     #[test]
@@ -473,17 +473,79 @@ mod tests {
     }
 
     #[test]
-    fn shared_count_constructor_has_the_count_only_shape() {
-        // The count vocabulary lives in external-contract; this crate now
-        // emits the shared shape verbatim.
+    fn tool_items_project_only_their_public_call_arguments() {
+        let command = serde_json::json!({"item": {
+            "type": "commandExecution", "id": "c-1",
+            "command": "/bin/zsh -lc 'echo 中'", "cwd": "/workspace",
+            "aggregatedOutput": "secret output", "status": "inProgress",
+        }});
+        let item = tool_item(&command).expect("tool item");
+        assert_eq!(item.id, "c-1");
+        assert_eq!(item.item_type, "commandExecution");
+        assert_eq!(item.status, Some("inProgress"));
         assert_eq!(
-            external_contract::activity::tool_count_event("codex-event-9", "turn-1", 1, None, None),
-            serde_json::json!({
-                "type": "tool.updated",
-                "eventId": "codex-event-9",
-                "turnId": "turn-1",
-                "payload": {"kind": "count", "count": 1},
-            })
+            item.arguments,
+            Some(serde_json::json!({
+                "command": "/bin/zsh -lc 'echo 中'",
+                "cwd": "/workspace",
+            }))
+        );
+        assert_eq!(item.error, None);
+
+        let change = serde_json::json!({"item": {
+            "type": "fileChange", "id": "c-2",
+            "changes": [
+                {"path": "a.ts", "kind": {"type": "add"}, "diff": "+secret"},
+                {"path": "b.ts", "kind": {"type": "delete"}, "diff": "-secret"},
+            ],
+            "status": "completed",
+        }});
+        assert_eq!(
+            tool_item(&change).expect("tool item").arguments,
+            Some(serde_json::json!({"changes": [
+                {"path": "a.ts", "kind": {"type": "add"}},
+                {"path": "b.ts", "kind": {"type": "delete"}},
+            ]}))
+        );
+
+        let mcp = serde_json::json!({"item": {
+            "type": "mcpToolCall", "id": "c-3", "server": "search", "tool": "query",
+            "arguments": {"q": "rust"}, "result": {"content": "hidden"},
+            "error": {"message": "tool failed"},
+            "status": "failed",
+        }});
+        let item = tool_item(&mcp).expect("tool item");
+        assert_eq!(
+            item.arguments,
+            Some(serde_json::json!({
+                "server": "search", "tool": "query", "arguments": {"q": "rust"},
+            }))
+        );
+        assert_eq!(
+            item.error,
+            Some(serde_json::json!({"message": "tool failed"}))
+        );
+
+        // Non-whitelisted items never become tool items.
+        assert!(tool_item(&serde_json::json!({"item": {
+            "type": "reasoning", "id": "r-1", "content": ["raw"],
+        }}))
+        .is_none());
+    }
+
+    #[test]
+    fn summary_delta_requires_text_and_keeps_part_identity() {
+        let params = serde_json::json!({
+            "delta": "public summary", "itemId": "rs-1", "summaryIndex": 2,
+        });
+        assert_eq!(
+            summary_delta(&params),
+            Some(("public summary", Some("rs-1"), Some(2)))
+        );
+        assert_eq!(summary_delta(&serde_json::json!({"itemId": "rs-1"})), None);
+        assert_eq!(
+            summary_delta(&serde_json::json!({"delta": "x"})),
+            Some(("x", None, None))
         );
     }
 
@@ -666,109 +728,6 @@ mod tests {
         assert_eq!(
             mcp_startup_failure(&serde_json::json!({"status": "ready"})),
             None
-        );
-    }
-
-    #[test]
-    fn event_ids_and_canonical_envelopes_have_the_pinned_shapes() {
-        assert_eq!(event_id(7), "codex-event-7");
-        let params = serde_json::json!({"type": "turn.started"});
-        match canonical_event(params.clone()) {
-            Inbound::Message(WireMessage::Event(envelope)) => {
-                assert_eq!(envelope.method, SESSION_EVENT);
-                assert_eq!(envelope.params, params);
-            }
-            other => panic!("canonical event is not an event envelope: {other:?}"),
-        }
-        match lifecycle_event(3, "turn.started") {
-            Inbound::Lifecycle {
-                sequence,
-                method,
-                order,
-            } => {
-                assert_eq!(sequence, 3);
-                assert_eq!(method, "turn.started");
-                assert_eq!(order, classify_lifecycle("turn.started", false));
-            }
-            other => panic!("lifecycle record has the wrong shape: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn canonical_payloads_match_the_internal_event_shapes() {
-        assert_eq!(
-            turn_started_payload("codex-event-1", "turn-1"),
-            serde_json::json!({
-                "type": "turn.started",
-                "eventId": "codex-event-1",
-                "turnId": "turn-1",
-            })
-        );
-        assert_eq!(
-            model_streaming_payload("codex-event-2", "turn-1", "hello", "item-1"),
-            serde_json::json!({
-                "type": "model.streaming",
-                "eventId": "codex-event-2",
-                "turnId": "turn-1",
-                "payload": {
-                    "kind": "text_delta",
-                    "delta": "hello",
-                    "assistantMessageId": "item-1",
-                },
-            })
-        );
-        assert_eq!(
-            message_finished_payload("codex-event-3", "turn-1", "item-1"),
-            serde_json::json!({
-                "type": "message.finished",
-                "eventId": "codex-event-3",
-                "turnId": "turn-1",
-                "payload": {"assistantMessageId": "item-1"},
-            })
-        );
-        assert_eq!(
-            turn_completed_payload("codex-event-4", "turn-1", Some("answer".into())),
-            serde_json::json!({
-                "type": "turn.completed",
-                "eventId": "codex-event-4",
-                "turnId": "turn-1",
-                "payload": {"response": "answer"},
-            })
-        );
-        assert_eq!(
-            turn_completed_payload("codex-event-5", "turn-1", None)["payload"],
-            serde_json::json!({})
-        );
-        let native = serde_json::json!({
-            "message": "Selected model is at capacity.",
-            "codexErrorInfo": "serverOverloaded",
-            "willRetry": false,
-        });
-        assert_eq!(
-            turn_failed_payload(
-                "codex-event-6",
-                "turn-1",
-                "serverOverloaded: boom",
-                Some(&native)
-            ),
-            serde_json::json!({
-                "type": "turn.failed",
-                "eventId": "codex-event-6",
-                "turnId": "turn-1",
-                "payload": {
-                    "reason_code": "serverOverloaded: boom",
-                    "error": native,
-                },
-            })
-        );
-        assert_eq!(
-            turn_failed_payload(
-                "codex-event-7",
-                "turn-1",
-                "codex turn ended with status failed",
-                None
-            )["payload"],
-            serde_json::json!({"reason_code": "codex turn ended with status failed"})
         );
     }
 

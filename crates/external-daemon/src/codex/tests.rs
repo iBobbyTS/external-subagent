@@ -365,20 +365,20 @@ fn codex_owner_bootstrap_omits_developer_instructions_when_empty_or_none() {
 }
 
 #[test]
-fn whitelisted_tool_items_feed_wait_count_and_observe_details() {
+fn whitelisted_tool_items_feed_wait_and_observe_complete_facts() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let directory = workspace.path().to_owned();
     let echo = start_echo(&directory, PermissionMode::Plan);
-    // One turn exercises the whole count contract: call-1 is started twice
-    // and completed (must count once), call-2 is a bare whitelisted start,
-    // call-3 is a whitelisted completion whose start was missed (backfill
-    // counts once), reasoning is non-whitelisted, and the last two tool frames
-    // carry a foreign thread, respectively a foreign turn. Three distinct
-    // whitelisted calls are expected.
+    // One turn exercises the whole tool contract: call-1 is started twice and
+    // completed (the duplicate start is a replay, its completion projects
+    // once), call-2 is a bare whitelisted start, call-3 is a whitelisted
+    // completion whose start was missed (completion is the authoritative
+    // snapshot), reasoning is non-whitelisted, and the last two tool frames
+    // carry a foreign thread, respectively a foreign turn.
     //
-    // 双计数不变量：适配器不得对同一调用同时发详细 started 与 count（本适配器无详细
-    // 工具路径，此夹具锁定 count 单路径，防止回归时双重计数）。
+    // 单一事实不变量：同一调用只投影一次 started 与一次 completed；详细事实只走
+    // typed 路径，不再有 count 词表的第二份投影。
     let script = format!(
         r#"
 IFS= read -r line
@@ -417,7 +417,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     scheduler.start_ready().unwrap();
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
-    // The count path never leaks into the result text.
+    // Tool facts never leak into the result text.
     assert_eq!(result.result.final_text, "TOOL_COUNT_OK");
     await_terminal_task(&scheduler, &agent_id);
 
@@ -425,24 +425,31 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .passive_activity_snapshot(&agent_id)
         .expect("codex activity tracker is present");
     assert_eq!(
-        activity.window_60s.tool_calls_started, 3,
-        "call-1 (deduped start+complete), call-2 (started), call-3 (completion backfill) only"
+        activity.window_60s.tool_calls_started, 2,
+        "call-1 (started once; duplicate start is a replay) and call-2 only"
     );
-    assert_eq!(activity.window_60s.other_tool_calls, 3);
+    assert_eq!(activity.window_60s.other_tool_calls, 2);
+    assert_eq!(
+        activity.window_60s.tool_calls_completed, 2,
+        "call-1 and the start-less call-3 completion"
+    );
+    assert_eq!(activity.window_60s.tool_calls_failed, 0);
+    assert!(
+        activity.active_tools.is_empty(),
+        "settlement clears the active call set"
+    );
     // The wait public projection is a straight-through single line: whatever
     // the tracker counted is exactly what wait exposes on the public field.
     let projection =
         crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
-    assert_eq!(projection.tool_calls_last_60s, 3);
-    assert!(
-        serde_json::to_value(projection)
-            .unwrap()
-            .get("last_tool_calls")
-            .is_none()
-    );
+    assert_eq!(projection.tool_calls_last_60s, 2);
+    assert!(serde_json::to_value(projection)
+        .unwrap()
+        .get("last_tool_calls")
+        .is_none());
 
-    // The count-only tool descriptors now feed observe: each distinct call is
-    // visible once with its detail wrapped in the argument object.
+    // Every tool fact carries its public arguments into observe: each distinct
+    // call is visible once, with no count-event detail wrapper.
     let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(
         observation
@@ -450,35 +457,48 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
             .iter()
             .map(|tool| (tool.tool_name.as_str(), tool.call_count))
             .collect::<Vec<_>>(),
-        [("mcpToolCall", 1), ("fileChange", 1), ("commandExecution", 1)]
-    );
-    let details = observation
-        .tools
-        .iter()
-        .map(|tool| {
-            (
-                tool.tool_name.as_str(),
-                tool.recent_calls[0].arguments["detail"].clone(),
-                tool.recent_calls[0].arguments_truncated,
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        details,
         [
-            (
-                "mcpToolCall",
-                serde_json::json!("call-3"),
-                false
-            ),
-            ("fileChange", serde_json::json!("a.ts, b.ts"), false),
-            (
-                "commandExecution",
-                serde_json::json!("/bin/zsh -lc 'echo 中'"),
-                false
-            ),
+            ("mcpToolCall", 1),
+            ("fileChange", 1),
+            ("commandExecution", 1)
         ]
     );
+    let command = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "commandExecution")
+        .expect("command observation");
+    assert_eq!(
+        command.recent_calls[0].arguments,
+        serde_json::json!({"command": "/bin/zsh -lc 'echo 中'"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(!command.recent_calls[0].arguments_truncated);
+    let change = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "fileChange")
+        .expect("file change observation");
+    assert_eq!(
+        change.recent_calls[0].arguments,
+        serde_json::json!({"changes": [{"path": "a.ts"}, {"path": "b.ts"}]})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(!change.recent_calls[0].arguments_truncated);
+    let mcp = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "mcpToolCall")
+        .expect("mcp observation");
+    assert!(
+        mcp.recent_calls[0].arguments.is_empty(),
+        "a completion without public arguments records an explicit unknown"
+    );
+    assert!(mcp.recent_calls[0].arguments_truncated);
     // Codex still exposes no reasoning and its history is explicitly partial.
     assert!(observation.reasoning.text.is_empty());
     assert!(!observation.coverage.tool_history_complete);
@@ -590,9 +610,9 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .expect("codex activity tracker is present");
     assert_eq!(
         activity.window_60s.tool_calls_started, 2,
-        "the same item id counts once per turn after the boundary clears the dedupe set"
+        "the same item id projects once per turn after the boundary clears the dedupe set"
     );
-    // 计数去重按 turn 重置，observe 的调用身份同样按 turn 区分。
+    // 去重按 turn 重置，observe 的调用身份同样按 turn 区分。
     let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(observation.tools.len(), 1);
     assert_eq!(observation.tools[0].tool_name, "commandExecution");
@@ -601,7 +621,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     assert!(observation.tools[0]
         .recent_calls
         .iter()
-        .all(|call| call.arguments["detail"] == serde_json::json!("")));
+        .all(|call| call.arguments.is_empty() && call.arguments_truncated));
 }
 
 #[test]
@@ -1830,10 +1850,14 @@ fn assert_native_error_survives_exit_before_boundary(exit_code: i32) {
     let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "error then exit");
     scheduler.start_ready().unwrap();
     let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
-    // This fixture's only unprojected notification is the attributable error.
-    // Its persisted observation follows recording of the complete native value.
-    while codex_event_count(workspace.path(), &agent_id, "raw.unknown") == 0 {
-        assert!(Instant::now() < deadline, "error notification was not processed");
+    // This fixture's only error is the attributable notification. Its typed
+    // ErrorObserved fact persists only after the complete native value is
+    // recorded for the boundary/exit fallback.
+    while codex_error_fact_count(workspace.path(), &agent_id) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "error notification was not processed"
+        );
         thread::sleep(Duration::from_millis(10));
     }
     let (turn, stop_boundaries) = scheduler.active_turn_observation(&agent_id).unwrap();
@@ -3872,6 +3896,20 @@ fn codex_event_count(workspace: &Path, agent_id: &str, event_type: &str) -> i64 
         .query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type=?2",
             rusqlite::params![agent_id, event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Count persisted typed error facts: the content-free lifecycle summary is
+/// the only payload shape admitted for a `runtime.fact` row.
+fn codex_error_fact_count(workspace: &Path, agent_id: &str) -> i64 {
+    let connection = rusqlite::Connection::open(workspace.join("state.sqlite")).unwrap();
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='runtime.fact' \
+             AND payload_json LIKE '%\"category\":\"error\"%'",
+            rusqlite::params![agent_id],
             |row| row.get(0),
         )
         .unwrap()

@@ -47,9 +47,12 @@ impl CodexRuntimeOwner {
             model,
         )?);
         let publisher = Arc::new(Publisher::new(sink));
+        let (task, launch) = publisher.event_scope();
         let shared = Arc::new(CodexShared {
             publisher: Arc::clone(&publisher),
             turn_tracker: Arc::new(TurnTracker::new()),
+            task,
+            launch,
             session_id: Mutex::new(None),
             admitted_model: Mutex::new(None),
             admitted_effort: Mutex::new(None),
@@ -63,7 +66,6 @@ impl CodexRuntimeOwner {
             seen_tool_items: Mutex::new(Vec::new()),
             turn_failure: Mutex::new(None),
             mcp_tail: Mutex::new(String::new()),
-            sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
         });
         let shutdown = Arc::new(AtomicBool::new(false));

@@ -30,7 +30,8 @@ pub(super) fn spawn_codex_pump(
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
                 if let Inbound::Message(WireMessage::UnknownEvent { method, raw }) = &event {
-                    if !shared.project_notification(method, raw) {
+                    if let Some(batch) = shared.decode_notification(method, raw) {
+                        publisher.emit_typed(batch, &shared.turn_tracker);
                         continue;
                     }
                 }

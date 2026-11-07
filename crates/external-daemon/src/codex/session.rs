@@ -13,10 +13,11 @@ use external_agent_codex::session::{
     turn_start_params, turn_start_response_turn_id, validate_resume_result, CodexError,
     CodexPermissionMode,
 };
+use external_contract::ResponseEnvelope;
 use external_store::TaskRecord;
 
 use super::owner::CodexRuntimeOwner;
-use crate::{task_route, RuntimeCommandError};
+use crate::{task_route, RuntimeCommandDetail, RuntimeCommandError};
 
 /// The [`external_agent_codex::session::CodexError`] seam: every variant
 /// maps onto the daemon's [`RuntimeCommandError`] one for one, with the
@@ -29,6 +30,37 @@ fn runtime_command_error(error: CodexError) -> RuntimeCommandError {
         CodexError::Remote(value) => RuntimeCommandError::Remote(value),
         CodexError::InvalidSession(message) => RuntimeCommandError::InvalidSession(message.into()),
     }
+}
+
+/// A rejected command keeps its classification message while the complete
+/// native error response travels beside it. Remote errors already carry the
+/// original; a local validation error has no native cause of its own.
+fn rejected_command(message: &str, response: &ResponseEnvelope) -> RuntimeCommandError {
+    match response.error.as_ref() {
+        Some(original) => RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+            message.to_owned(),
+            original,
+        )),
+        None => RuntimeCommandError::InvalidSession(message.into()),
+    }
+}
+
+/// Attach the response's native error to a validation failure that lost the
+/// original while inspecting an absent/malformed result.
+fn response_error(error: CodexError, response: &ResponseEnvelope) -> RuntimeCommandError {
+    let mapped = runtime_command_error(error);
+    let (RuntimeCommandError::InvalidSession(detail), Some(original)) =
+        (&mapped, response.error.as_ref())
+    else {
+        return mapped;
+    };
+    if detail.native_failure.is_some() {
+        return mapped;
+    }
+    RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+        detail.message.clone(),
+        original,
+    ))
 }
 
 impl CodexRuntimeOwner {
@@ -45,7 +77,7 @@ impl CodexRuntimeOwner {
         // The shared handshake shapes live in the protocol crate so the
         // task-session and catalog-probe paths cannot drift apart.
         wire::validate_initialize_codex_home(response.result.as_ref())
-            .map_err(runtime_command_error)?;
+            .map_err(|error| response_error(error, &response))?;
         self.driver
             .send(&wire::initialized_notification())
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
@@ -113,9 +145,12 @@ impl CodexRuntimeOwner {
         let response = self
             .driver
             .request("thread/start", params, remaining_time(deadline)?)?;
-        let result = response.result.ok_or_else(|| {
-            RuntimeCommandError::InvalidSession("thread/start returned an error".into())
-        })?;
+        let Some(result) = response.result.clone() else {
+            return Err(rejected_command(
+                "thread/start returned an error",
+                &response,
+            ));
+        };
         start_result_thread_id(
             &result,
             model,
@@ -123,7 +158,7 @@ impl CodexRuntimeOwner {
             permission_mode,
             requested_effort,
         )
-        .map_err(runtime_command_error)
+        .map_err(|error| response_error(error, &response))
     }
 
     pub(super) fn resume_thread(
@@ -140,9 +175,12 @@ impl CodexRuntimeOwner {
         let response = self
             .driver
             .request("thread/resume", params, remaining_time(deadline)?)?;
-        let result = response.result.ok_or_else(|| {
-            RuntimeCommandError::InvalidSession("thread/resume returned an error".into())
-        })?;
+        let Some(result) = response.result.clone() else {
+            return Err(rejected_command(
+                "thread/resume returned an error",
+                &response,
+            ));
+        };
         validate_resume_result(
             &result,
             thread_id,
@@ -151,7 +189,7 @@ impl CodexRuntimeOwner {
             permission_mode,
             requested_effort,
         )
-        .map_err(runtime_command_error)
+        .map_err(|error| response_error(error, &response))
     }
 
     pub(super) fn start_turn(
@@ -189,8 +227,8 @@ impl CodexRuntimeOwner {
             turn_start_params(thread_id, model, effort, content),
             remaining_time(deadline)?,
         )?;
-        let echoed =
-            turn_start_response_turn_id(response.result.as_ref()).map_err(runtime_command_error)?;
+        let echoed = turn_start_response_turn_id(response.result.as_ref())
+            .map_err(|error| response_error(error, &response))?;
         if echoed != current_turn {
             return Err(RuntimeCommandError::InvalidSession(
                 "inject turn/start response does not match current turn".into(),
@@ -208,8 +246,8 @@ impl CodexRuntimeOwner {
         let response = self
             .driver
             .request("turn/start", params, remaining_time(deadline)?)?;
-        let turn_id =
-            turn_start_response_turn_id(response.result.as_ref()).map_err(runtime_command_error)?;
+        let turn_id = turn_start_response_turn_id(response.result.as_ref())
+            .map_err(|error| response_error(error, &response))?;
         self.shared
             .turn_tracker
             .wait_started_after(previous, remaining_time(deadline)?)?;
@@ -239,4 +277,64 @@ pub(super) struct AdmittedThread {
 
 pub(super) fn remaining_time(deadline: Instant) -> Result<Duration, RuntimeCommandError> {
     wire::remaining_time(deadline).map_err(runtime_command_error)
+}
+
+#[cfg(test)]
+mod native_command_failure_tests {
+    use super::*;
+    use external_contract::WireId;
+    use serde_json::json;
+
+    #[test]
+    fn rejected_commands_keep_the_complete_native_error_beside_the_classification() {
+        let response = ResponseEnvelope {
+            id: WireId::Integer(2),
+            result: None,
+            error: Some(json!({
+                "code": -32602,
+                "message": "model not found",
+                "data": {"detail": "complete native detail"},
+            })),
+        };
+        let error = rejected_command("thread/start returned an error", &response);
+        // The classification message is unchanged; the original rides beside it.
+        assert_eq!(
+            error.to_string(),
+            "invalid session response: thread/start returned an error"
+        );
+        let failure = error.native_failure().expect("native failure");
+        assert_eq!(failure.original, response.error.clone().unwrap());
+    }
+
+    #[test]
+    fn validation_failures_attach_the_response_error_only_when_one_exists() {
+        let malformed = ResponseEnvelope {
+            id: WireId::Integer(3),
+            result: Some(json!({"turn": {"status": "inProgress"}})),
+            error: None,
+        };
+        let error = response_error(
+            CodexError::InvalidSession("missing a bounded turn id".into()),
+            &malformed,
+        );
+        assert!(error.native_failure().is_none());
+        assert_eq!(
+            error.to_string(),
+            "invalid session response: missing a bounded turn id"
+        );
+
+        let rejected = ResponseEnvelope {
+            id: WireId::Integer(4),
+            result: None,
+            error: Some(json!({"message": "rejected", "data": {"retry": true}})),
+        };
+        let error = response_error(
+            CodexError::InvalidSession("missing a bounded turn id".into()),
+            &rejected,
+        );
+        assert_eq!(
+            error.native_failure().unwrap().original,
+            rejected.error.clone().unwrap()
+        );
+    }
 }
