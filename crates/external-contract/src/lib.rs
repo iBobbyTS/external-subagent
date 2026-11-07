@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod events;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,7 +61,27 @@ pub enum WireMessage {
     Request(RequestEnvelope),
     Response(ResponseEnvelope),
     Event(EventEnvelope),
-    UnknownEvent { method: String, raw: Value },
+    /// Transport has not assigned an envelope type. This is not the adapter
+    /// disposition: known model/tool/v4 telemetry facts can be consumed here.
+    UnknownEvent {
+        method: String,
+        raw: Value,
+    },
+}
+
+impl WireMessage {
+    /// Uniform adapter entry point for typed and untyped notifications. Keep
+    /// strict legacy Event routing unchanged until its consumers are replaced.
+    /// Envelope validity and native semantics remain separate responsibilities.
+    pub fn notification(&self) -> Option<(&str, &Value)> {
+        match self {
+            Self::Event(event) => Some((&event.method, &event.params)),
+            Self::UnknownEvent { method, raw } => {
+                Some((method, raw.get("params").unwrap_or(&Value::Null)))
+            }
+            Self::Request(_) | Self::Response(_) => None,
+        }
+    }
 }
 
 impl RequestEnvelope {

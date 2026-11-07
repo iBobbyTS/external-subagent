@@ -1,0 +1,115 @@
+[
+  {
+    "name": "chunk-one",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/deepseek-harness@fcc0ad4621:packages/acp/acp/src/updates.ts:16,52,69; src/session.ts:518; tests/fixtures/dsh-acp/fake-server.mjs",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "messageId": "message-1",
+          "content": {
+            "type": "text",
+            "text": "standard "
+          }
+        }
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "message_updated"
+    ]
+  },
+  {
+    "name": "chunk-two",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/deepseek-harness@fcc0ad4621:packages/acp/acp/src/updates.ts:16,52,69; src/session.ts:518; tests/fixtures/dsh-acp/fake-server.mjs",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": {
+            "type": "text",
+            "text": "answer"
+          }
+        }
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "message_updated"
+    ]
+  },
+  {
+    "name": "tool-start",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/deepseek-harness@fcc0ad4621:packages/acp/acp/src/updates.ts:16,52,69; src/session.ts:518; tests/fixtures/dsh-acp/fake-server.mjs",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "call-1",
+          "title": "Probe the workspace",
+          "kind": "other",
+          "status": "in_progress",
+          "rawInput": {
+            "path": "."
+          }
+        }
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "tool_changed"
+    ]
+  },
+  {
+    "name": "tool-failed",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/deepseek-harness@fcc0ad4621:packages/acp/acp/src/updates.ts:16,52,69; src/session.ts:518; tests/fixtures/dsh-acp/fake-server.mjs",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "call-1",
+          "status": "failed",
+          "content": []
+        }
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "tool_changed"
+    ]
+  },
+  {
+    "name": "settlement-no-message",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/deepseek-harness@fcc0ad4621:packages/acp/acp/src/updates.ts:16,52,69; src/session.ts:518; tests/fixtures/dsh-acp/fake-server.mjs",
+    "input": {
+      "jsonrpc": "2.0",
+      "id": 3,
+      "result": {
+        "stopReason": "end_turn"
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "message_finished",
+      "turn_settled"
+    ],
+    "note": "Command response consumed in active prompt context; response ordering/drain remains adapter-owned."
+  }
+]
