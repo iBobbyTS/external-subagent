@@ -37,9 +37,20 @@ const MAX_TRACKED_TOOLS: usize = 128;
 pub(super) enum SettledTurn {
     /// The prompt response settled the turn.
     Settled(transport::PromptSettlement),
-    /// The response never arrived or violated the settlement shape.
-    Failed(String),
+    /// The response never arrived or violated the settlement shape. `reason`
+    /// is the bounded ES label for this layer's operation; `native` is the
+    /// peer's JSON-RPC error exactly as received and travels through the
+    /// shared `payload.error` delivery slot instead of being stringified.
+    Failed {
+        reason: String,
+        native: Option<serde_json::Value>,
+    },
 }
+
+/// The ES-side label for a prompt that failed with a native JSON-RPC error.
+/// The original error is delivered whole beside it; this token never replaces
+/// it, and `requestId`/`code` that upstream no longer sends are not invented.
+pub(super) const REMOTE_ERROR_REASON: &str = "ACP_REMOTE_ERROR";
 
 pub(super) struct DshRuntimeShared {
     pub(super) publisher: Arc<Publisher>,
@@ -95,12 +106,18 @@ impl DshRuntimeShared {
     pub(super) fn apply_settled_turn(&self, settled: SettledTurn) {
         match settled {
             SettledTurn::Settled(settlement) => self.apply_settlement(&settlement),
-            SettledTurn::Failed(message) => self.apply_failed_settlement(&message),
+            SettledTurn::Failed { reason, native } => {
+                self.apply_failed_settlement(&reason, native.as_ref())
+            }
         }
     }
 
     pub(super) fn begin_turn(&self, prompt_id: u64) {
-        *self.current_prompt.lock().unwrap() = Some(format!("dsh-prompt-{prompt_id}"));
+        let turn_id = format!("dsh-prompt-{prompt_id}");
+        *self.current_prompt.lock().unwrap() = Some(turn_id.clone());
+        // The prompt is the only output boundary the standard ACP flow
+        // provides, so its aggregation bucket opens with the turn.
+        self.messages.lock().unwrap().begin_turn(&turn_id);
         let params = serde_json::json!({"type": "turn.started"});
         let started = self.canonical_event(params.clone());
         // The canonical start event opens the shared tracker's per-turn
@@ -110,8 +127,19 @@ impl DshRuntimeShared {
         self.emit_lifecycle("turn.started");
     }
 
+    /// The local turn identity of the prompt currently being settled.
+    fn open_turn_id(&self) -> Option<String> {
+        self.current_prompt.lock().unwrap().clone()
+    }
+
     /// Apply one prompt settlement as the single turn-boundary authority.
-    fn apply_boundary(&self, kind: TurnBoundary, final_text: Option<&str>, reason: Option<&str>) {
+    fn apply_boundary(
+        &self,
+        kind: TurnBoundary,
+        final_text: Option<&str>,
+        reason: Option<&str>,
+        native: Option<&serde_json::Value>,
+    ) {
         let turn_id = self.current_prompt.lock().unwrap().take();
         let event_id = self.next_event_id();
         let mut payload = serde_json::json!({});
@@ -120,6 +148,12 @@ impl DshRuntimeShared {
         }
         if let Some(reason) = reason {
             payload["reason_code"] = serde_json::Value::String(reason.to_owned());
+        }
+        // The peer's own error travels here unchanged: the shared delivery
+        // layer redacts credentials and pages it into the task result, so it
+        // is never summarized into `reason_code`.
+        if let Some(native) = native {
+            payload["error"] = native.clone();
         }
         let event_type = match kind {
             TurnBoundary::Completed => "turn.completed",
@@ -143,23 +177,41 @@ impl DshRuntimeShared {
     }
 
     pub(super) fn apply_settlement(&self, settlement: &transport::PromptSettlement) {
+        let turn_id = self.open_turn_id();
         let outcome = {
             let messages = self.messages.lock().unwrap();
-            fold_settlement(settlement, &messages)
+            fold_settlement(settlement, &messages, turn_id.as_deref().unwrap_or_default())
         };
+        // The prompt is settled: whatever arrives afterwards cannot belong to
+        // it, so the prompt's text bucket closes before the boundary lands.
+        self.messages
+            .lock()
+            .unwrap()
+            .seal_turn(turn_id.as_deref().unwrap_or_default());
         match outcome {
             SettlementOutcome::Completed { final_text } => {
-                self.apply_boundary(TurnBoundary::Completed, final_text.as_deref(), None);
+                self.apply_boundary(TurnBoundary::Completed, final_text.as_deref(), None, None);
             }
             SettlementOutcome::Failed { reason_code } => {
-                self.apply_boundary(TurnBoundary::Failed, None, Some(&reason_code));
+                self.apply_boundary(TurnBoundary::Failed, None, Some(&reason_code), None);
             }
         }
     }
 
-    pub(super) fn apply_failed_settlement(&self, message: &str) {
-        let bounded: String = message.chars().take(256).collect();
-        self.apply_boundary(TurnBoundary::Failed, None, Some(&bounded));
+    /// Apply a settlement that never produced a usable prompt response.
+    ///
+    /// `reason` is this layer's bounded label; `native` is the complete
+    /// JSON-RPC error when the peer answered with one.
+    pub(super) fn apply_failed_settlement(
+        &self,
+        reason: &str,
+        native: Option<&serde_json::Value>,
+    ) {
+        let bounded: String = reason.chars().take(256).collect();
+        if let Some(turn_id) = self.open_turn_id() {
+            self.messages.lock().unwrap().seal_turn(&turn_id);
+        }
+        self.apply_boundary(TurnBoundary::Failed, None, Some(&bounded), native);
     }
 }
 
@@ -188,23 +240,14 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                 }
             }
             if let update::UpdateKind::ToolCall { tool_call_id, .. } = &parsed.kind {
+                // The name is the ACP `title`; `kind` is a category and never
+                // becomes the name. An unnamed call keeps the stable fallback
+                // the permission correlation and observation projections share.
                 let name = update::tool_name(&parsed.kind).unwrap_or_else(|| "dsh_tool".into());
                 let mut tools = shared.tool_names.lock().unwrap();
                 if tools.len() < MAX_TRACKED_TOOLS || tools.contains_key(tool_call_id) {
                     tools.insert(tool_call_id.clone(), name);
                 }
-            }
-            if let update::UpdateKind::AgentMessage {
-                message_id: Some(message_id),
-                text,
-                committed: true,
-            } = &parsed.kind
-            {
-                shared
-                    .messages
-                    .lock()
-                    .unwrap()
-                    .observe_committed(message_id, text);
             }
             let event_id = shared.next_event_id();
             let turn_id = shared
@@ -213,6 +256,20 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| "dsh-session".into());
+            if let update::UpdateKind::AgentMessage {
+                message_id, text, ..
+            } = &parsed.kind
+            {
+                // Text is aggregated whether or not the dialect marks the
+                // message committed: the standard flow sends plain chunks and
+                // settles with a stopReason only. The prompt's local turn is
+                // the correlation that makes that settlement readable.
+                shared
+                    .messages
+                    .lock()
+                    .unwrap()
+                    .observe(&turn_id, message_id.as_deref(), text);
+            }
             for mut payload in update::canonical_event_payloads(&parsed, &event_id, &turn_id) {
                 // rawInput 在 subagents 的 UpdateKind 中已丢弃，只补给活动 started 帧。
                 // observe 的 tool_call 投影保持不变。

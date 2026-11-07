@@ -1198,12 +1198,13 @@ mod tests {
         assert_eq!(zcode_active[0].tool_call_id, "call-3");
         assert_eq!(zcode_active[0].kind, PassiveToolKind::Read);
 
-        // DSH canonical projections: named started, unnamed started, result.
+        // DSH canonical projections: named started, unnamed started, completed
+        // result — every phase derived from the native status.
         let dsh_events = || {
             let mut events = Vec::new();
             let named = parse_update(&serde_json::json!({
                 "sessionId": "s",
-                "update": {"sessionUpdate": "tool_call", "toolCallId": "call-3", "kind": "edit"}
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "call-3", "title": "edit"}
             }))
             .unwrap();
             for params in canonical_event_payloads(&named, "d1", "t1") {
@@ -1211,7 +1212,10 @@ mod tests {
             }
             let unnamed = parse_update(&serde_json::json!({
                 "sessionId": "s",
-                "update": {"sessionUpdate": "tool_call_update", "toolCallId": "call-4"}
+                "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "call-4",
+                    "status": "in_progress"
+                }
             }))
             .unwrap();
             for params in canonical_event_payloads(&unnamed, "d2", "t1") {
@@ -1221,7 +1225,7 @@ mod tests {
                 "sessionId": "s",
                 "update": {
                     "sessionUpdate": "tool_call_update", "toolCallId": "call-3",
-                    "content": [{"type": "text", "text": "done"}]
+                    "status": "completed", "content": [{"type": "text", "text": "done"}]
                 }
             }))
             .unwrap();

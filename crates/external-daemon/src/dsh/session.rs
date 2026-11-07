@@ -12,7 +12,7 @@ use std::{
 use external_agent_dsh::acp::{session::SessionError, transport};
 use external_store::TaskRecord;
 
-use super::events::SettledTurn;
+use super::events::{SettledTurn, REMOTE_ERROR_REASON};
 use super::owner::DshRuntimeOwner;
 use crate::{task_route, RuntimeCommandError, SessionReady};
 
@@ -45,13 +45,30 @@ impl DshRuntimeOwner {
                     Ok(response) => match response.result.as_ref() {
                         Some(result) => match transport::parse_prompt_settlement(result) {
                             Ok(settlement) => SettledTurn::Settled(settlement),
-                            Err(error) => SettledTurn::Failed(error.to_string()),
+                            Err(error) => SettledTurn::Failed {
+                                reason: error.to_string(),
+                                native: None,
+                            },
                         },
-                        None => {
-                            SettledTurn::Failed("session/prompt settled without a result".into())
-                        }
+                        None => SettledTurn::Failed {
+                            reason: "session/prompt settled without a result".into(),
+                            native: None,
+                        },
                     },
-                    Err(error) => SettledTurn::Failed(error.to_string()),
+                    Err(error) => match error.remote_error() {
+                        // The peer answered with a JSON-RPC error: deliver that
+                        // object whole instead of flattening it into the
+                        // runtime's generic label. Upstream sends `message`
+                        // only, so no code/status/requestId is invented.
+                        Some(native) => SettledTurn::Failed {
+                            reason: REMOTE_ERROR_REASON.into(),
+                            native: Some(native.clone()),
+                        },
+                        None => SettledTurn::Failed {
+                            reason: error.to_string(),
+                            native: None,
+                        },
+                    },
                 };
                 shared.deposit_settled_turn(settled);
             })

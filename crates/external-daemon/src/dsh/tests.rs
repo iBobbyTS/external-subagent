@@ -546,17 +546,18 @@ printf '%s\\n' \
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     // The permission request reaches the store with the correlated tool
-    // identity (X06): the toolCallId came from a prior tool update.
+    // identity (X06): the toolCallId came from a prior tool update, and the
+    // name is the ACP title, not the `edit` category.
     let request = await_pending_permission(&scheduler, &agent_id);
     let payload: serde_json::Value = serde_json::from_str(&request.payload_json).unwrap();
-    assert_eq!(payload["toolName"], "edit");
+    assert_eq!(payload["toolName"], "Edit fixture");
     assert_eq!(payload["toolCallId"], "tool-7");
     let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
     assert_eq!(activity.window_60s.tool_calls_started, 1);
     // The daemon attaches the ACP rawInput to the started frame, so observe
     // sees the real arguments instead of the empty-input fallback.
     let observation = scheduler.observation_snapshot(&agent_id);
-    assert_eq!(observation.tools[0].tool_name, "edit");
+    assert_eq!(observation.tools[0].tool_name, "Edit fixture");
     assert_eq!(observation.tools[0].call_count, 1);
     assert_eq!(
         observation.tools[0].recent_calls[0].arguments,
@@ -1113,6 +1114,164 @@ printf '%s\\n' \
             "session/set_config_option",
             "session/prompt"
         ]
+    );
+}
+
+/// The peer's JSON-RPC error is delivery evidence: a prompt rejected with an
+/// application error must surface that whole object, never the transport
+/// layer's generic label. The peer sends `message` only, so no code/status
+/// field upstream removed is fabricated; whatever it did send travels intact.
+#[test]
+fn remote_jsonrpc_error_settlement_preserves_the_complete_error() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const REMOTE_ERROR_SETTLEMENT: &str = r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"quota exhausted for the fixture account","data":{"retryAfter":30,"limit":"daily"}}}'
+"#;
+    let script = format!("{BOOTSTRAP_PREFIX}{REMOTE_ERROR_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    let delivered = &stored.result.final_text;
+    assert_ne!(
+        delivered, "runtime returned an application error",
+        "the generic transport label must not replace the native error"
+    );
+    let native: serde_json::Value = serde_json::from_str(delivered)
+        .unwrap_or_else(|_| panic!("delivered text is not the native error object: {delivered}"));
+    assert_eq!(native["code"], -32000);
+    assert_eq!(native["message"], "quota exhausted for the fixture account");
+    assert_eq!(native["data"]["retryAfter"], 30);
+    assert_eq!(native["data"]["limit"], "daily");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    // The diagnostic record keeps the runtime-terminal stage around the peer's
+    // own message instead of the generic transport label.
+    let failure = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(
+        failure.contains("quota exhausted for the fixture account"),
+        "{failure}"
+    );
+    assert!(
+        !failure.contains("runtime returned an application error"),
+        "{failure}"
+    );
+}
+
+/// The upstream standard settlement carries nothing but `stopReason`: no
+/// committed flag and no message id. The adapter must still complete the turn
+/// from its prompt-scoped text aggregation.
+#[test]
+fn standard_chunks_and_stop_reason_settle_without_a_message_id() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const STANDARD_SETTLEMENT: &str = r#"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","messageId":"native-message","content":{"type":"text","text":"standard "}}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}' \
+  '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+"#;
+    let script =
+        format!("{BOOTSTRAP_PREFIX}{STANDARD_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "standard answer");
+    assert!(!stored.result.partial);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+}
+
+/// A native `status: failed` is a failed call, not a completed one. The tool
+/// keeps its real name (the ACP title) even though the generic category is
+/// `other`, and ending the call does not fail the turn by itself.
+#[test]
+fn failed_tool_status_is_not_a_success_and_is_named_by_its_title() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const FAILED_TOOL_SETTLEMENT: &str = r#"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"tool_call","toolCallId":"tool-9","title":"probe the workspace","kind":"other","status":"in_progress","rawInput":{"path":"."}}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-9","status":"failed","content":[{"type":"text","text":"permission denied"}]}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"tool failure noted"}}}}' \
+  '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+"#;
+    let script = format!("{BOOTSTRAP_PREFIX}{FAILED_TOOL_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "tool failure noted");
+
+    let activity = scheduler
+        .passive_activity_snapshot(&agent_id)
+        .expect("activity snapshot");
+    // Bootstrap announced tool-7; this turn announced tool-9. The failed call
+    // counts as failed, never as completed.
+    assert_eq!(activity.window_60s.tool_calls_started, 2);
+    assert_eq!(activity.window_60s.tool_calls_completed, 0);
+    assert_eq!(activity.window_60s.tool_calls_failed, 1);
+    // The authoritative turn settlement clears this turn's activity residue, so
+    // nothing is left in flight once the turn completes.
+    assert!(activity.active_tools.is_empty(), "{activity:?}");
+
+    let observation = scheduler.observation_snapshot(&agent_id);
+    let names: Vec<&str> = observation
+        .tools
+        .iter()
+        .map(|tool| tool.tool_name.as_str())
+        .collect();
+    assert!(names.contains(&"probe the workspace"), "{names:?}");
+    assert!(
+        !names.contains(&"other"),
+        "the generic category must not name a tool: {names:?}"
     );
 }
 
@@ -2443,7 +2602,8 @@ fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
     let tracker = crate::PassiveActivityTracker::for_adapter("dsh");
     let update = parse_update(&serde_json::json!({
         "sessionId": "s1", "update": {
-            "sessionUpdate": "tool_call", "toolCallId": "tool-7", "kind": "edit",
+            "sessionUpdate": "tool_call", "toolCallId": "tool-7",
+            "title": "edit a.ts", "kind": "other",
             "rawInput": {"path": "a.ts", "content": "中"}
         }
     }))
@@ -2468,6 +2628,9 @@ fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
     deliver("dsh-event-1");
     let before = tracker.observation_snapshot();
     assert_eq!(before.tools[0].call_count, 1);
+    // The observation groups by the real name (the ACP title); the generic
+    // `other` category must never name the tool.
+    assert_eq!(before.tools[0].tool_name, "edit a.ts");
     assert_eq!(
         before.tools[0].recent_calls[0].arguments["path"],
         serde_json::json!("a.ts")

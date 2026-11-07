@@ -185,6 +185,22 @@ pub enum RequestError {
     Remote(serde_json::Value),
 }
 
+impl RequestError {
+    /// The complete JSON-RPC error object a peer returned, exactly as received.
+    ///
+    /// This is the only way to reach the native failure: [`Display`] stays a
+    /// bounded ES operation label (safe for diagnostics) and never carries the
+    /// peer's payload. A caller that must deliver the native error reads it
+    /// here and hands the value to the shared delivery layer, which redacts
+    /// credentials without summarizing the original.
+    pub fn remote_error(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Remote(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for RequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1986,6 +2002,28 @@ mod tests {
         ] {
             assert!(parse_jsonrpc_line(line).is_err(), "frame accepted: {line}");
         }
+    }
+
+    #[test]
+    fn remote_request_error_keeps_the_native_value_off_its_display_label() {
+        // A remote JSON-RPC error is delivery evidence: the complete value
+        // must survive, while Display stays the bounded operation label that
+        // diagnostics may print without leaking the peer's payload.
+        let native = serde_json::json!({
+            "code": -32000,
+            "message": "quota exceeded for model fixture-model",
+            "data": {"retryAfter": 109727, "requestId": "req-1"},
+        });
+        let error = RequestError::Remote(native.clone());
+        assert_eq!(error.remote_error(), Some(&native));
+        assert_eq!(error.to_string(), "runtime returned an application error");
+        assert!(!error.to_string().contains("quota"));
+        assert_eq!(RequestError::Timeout.remote_error(), None);
+        assert_eq!(RequestError::StreamClosed.remote_error(), None);
+        assert_eq!(
+            RequestError::WriteFailed("broken pipe".into()).remote_error(),
+            None
+        );
     }
 
     #[test]
