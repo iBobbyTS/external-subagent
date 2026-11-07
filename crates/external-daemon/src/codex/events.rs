@@ -1597,40 +1597,89 @@ mod typed_tests {
 
     #[test]
     fn repair_wave2_image_generation_failure_preserves_redacted_native_object() {
+        // Synthetic public fields follow the pinned image producer: revisedPrompt
+        // is args.prompt, whereas image references/background are output data.
         for with_start in [false, true] {
-            let trace = Trace::new();
-            trace.start_turn("turn-1");
-            if with_start {
-                trace.send("item/started", json!({"threadId": "thread-1", "turnId": "turn-1",
-                    "item": {"type": "imageGeneration", "id": "image-1", "status": "inProgress", "failure": null}}));
+            for status in ["failed", "completed"] {
+                let trace = Trace::new();
+                trace.start_turn("turn-1");
+                if with_start {
+                    let started = trace.send(
+                        "item/started",
+                        json!({"threadId": "thread-1", "turnId": "turn-1",
+                        "item": {"type": "imageGeneration", "id": "image-1", "status": "inProgress",
+                            "revisedPrompt": null, "result": "", "failure": null}}),
+                    );
+                    assert!(
+                        tool_fact(&started).arguments.is_none(),
+                        "no prompt has been supplied yet"
+                    );
+                }
+                // api_key is a synthetic additional field exercising the existing
+                // credential redaction of the complete native quota failure.
+                let failure = (status == "failed").then(|| json!({"type": "usageLimitExceeded",
+                    "limitId": "image-generation", "resetsAt": 1900000000, "api_key": "sk-image-secret"}));
+                let mut item = json!({"type": "imageGeneration", "id": "image-1", "status": status,
+                    "revisedPrompt": "draw a red square 中", "failure": failure,
+                    "transparentBackground": true, "savedPath": "/tmp/private-image.png", "generationId": "private-generation"});
+                if status == "failed" {
+                    item["result"] = json!("");
+                } else {
+                    item["fileId"] = json!("private-file-reference");
+                }
+                let batch = trace.send(
+                    "item/completed",
+                    json!({"threadId": "thread-1", "turnId": "turn-1", "item": item}),
+                );
+                let arguments = json!({"revisedPrompt": "draw a red square 中"});
+                let observation = trace.sink.activity.observation_snapshot();
+                assert_eq!(observation.tools.len(), 1);
+                let group = &observation.tools[0];
+                assert_eq!(group.tool_name, "imageGeneration");
+                assert_eq!(group.call_count, 1);
+                assert_eq!(group.recent_calls.len(), 1);
+                assert_eq!(group.recent_calls[0].arguments, arguments.as_object().unwrap().clone(),
+                    "{status}, with_start={with_start}: only the public input prompt belongs in arguments");
+                assert!(!group.recent_calls[0].arguments_truncated);
+                let tool = tool_fact(&batch);
+                assert_eq!(tool.arguments, Some(ArgumentUpdate::Snapshot(arguments)));
+                assert_eq!(tool.phase, Some(ToolPhase::Finished));
+                assert_eq!(
+                    tool.outcome,
+                    Some(if status == "failed" {
+                        ToolOutcome::Failed
+                    } else {
+                        ToolOutcome::Succeeded
+                    })
+                );
+                let expected = (status == "failed").then(|| {
+                    json!({"type": "usageLimitExceeded",
+                    "limitId": "image-generation", "resetsAt": 1900000000, "api_key": "[REDACTED]"})
+                });
+                assert_eq!(
+                    tool.failure.as_ref().map(|failure| &failure.original),
+                    expected.as_ref()
+                );
+                assert!(
+                    trace.shared.turn_tracker.snapshot().active,
+                    "a tool completion does not settle the turn"
+                );
+                let activity = trace.sink.activity.snapshot();
+                assert_eq!(
+                    activity.window_60s.tool_calls_started,
+                    u64::from(with_start)
+                );
+                // Failed and successful tool terminal samples have separate counters.
+                assert_eq!(
+                    activity.window_60s.tool_calls_failed,
+                    u64::from(status == "failed")
+                );
+                assert_eq!(
+                    activity.window_60s.tool_calls_completed,
+                    u64::from(status == "completed")
+                );
+                assert!(activity.active_tools.is_empty());
             }
-            // The quota fields are upstream-shaped; api_key exercises existing
-            // credential redaction on an additional native error field.
-            let failure = json!({"type": "usageLimitExceeded", "limitId": "image-generation",
-                "resetsAt": 1900000000, "api_key": "sk-image-secret"});
-            let batch = trace.send(
-                "item/completed",
-                json!({"threadId": "thread-1", "turnId": "turn-1",
-                "item": {"type": "imageGeneration", "id": "image-1", "status": "failed",
-                    "revisedPrompt": "public prompt", "result": "", "failure": failure}}),
-            );
-            let tool = tool_fact(&batch);
-            assert_eq!(tool.phase, Some(ToolPhase::Finished));
-            assert_eq!(tool.outcome, Some(ToolOutcome::Failed));
-            let expected = json!({"type": "usageLimitExceeded", "limitId": "image-generation",
-                "resetsAt": 1900000000, "api_key": "[REDACTED]"});
-            assert_eq!(
-                tool.failure.as_ref().map(|failure| &failure.original),
-                Some(&expected)
-            );
-            assert!(
-                trace.shared.turn_tracker.snapshot().active,
-                "a tool failure does not settle the turn"
-            );
-            let success = trace.send("item/completed", json!({"threadId": "thread-1", "turnId": "turn-1",
-                "item": {"type": "imageGeneration", "id": "image-2", "status": "completed", "failure": null}}));
-            assert_eq!(tool_fact(&success).outcome, Some(ToolOutcome::Succeeded));
-            assert!(tool_fact(&success).failure.is_none());
         }
     }
 

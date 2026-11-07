@@ -192,6 +192,7 @@ fn tool_arguments(item: &serde_json::Value, item_type: &str) -> Option<serde_jso
                 copy(item, "receiverThreadIds", &mut arguments);
             }
         }
+        "imageGeneration" => copy(item, "revisedPrompt", &mut arguments),
         "imageView" => copy(item, "path", &mut arguments),
         "sleep" => copy(item, "durationMs", &mut arguments),
         _ => {}
