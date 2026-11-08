@@ -7116,3 +7116,345 @@ mod observation_persistence_tests {
         assert!(!summary.contains("PRIVATE") && summary.len() < 4096);
     }
 }
+
+mod question_pending_ownership_tests {
+    use super::*;
+    use external_contract::{events::*, RequestEnvelope, WireId, WireMessage};
+    use external_runtime::{ChildExit, Inbound, StopOutcome};
+
+    struct QuestionRuntime {
+        publisher: Publisher,
+        response_calls: AtomicU64,
+    }
+    impl ManagedRuntime for QuestionRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            self.publisher
+                .publish_terminal(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                )))
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            self.publisher.wait_terminal(timeout)
+        }
+        fn terminal_latch(&self) -> Option<TerminalLatch<'_>> {
+            Some(self.publisher.decision_latch())
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            _: &TaskRecord,
+            _: &[external_contract::StdioMcpServer],
+            _: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: "question-session".into(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            self.publisher.runtime_state.turn_snapshot()
+        }
+        fn respond_request(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&external_core::ValidatedPermissionDenial>,
+            _: Instant,
+        ) -> Result<(), RuntimeCommandError> {
+            self.response_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        fn finish_turn(&self, boundary: TurnBoundary, _: Duration) -> RuntimeTerminal {
+            // Synthetic process-control result; all input reduction, durable
+            // admission/resolution and scheduler finalization are production.
+            let outcome = StopOutcome::AlreadyExited(ChildExit::Exited(Some(0)));
+            self.publisher.publish_terminal(match boundary {
+                TurnBoundary::Completed => RuntimeTerminal::Completed(outcome),
+                TurnBoundary::Failed => RuntimeTerminal::FailedTurn(outcome),
+            })
+        }
+    }
+    struct QuestionFactory(Arc<Mutex<Option<Arc<QuestionRuntime>>>>);
+    impl RuntimeFactory for QuestionFactory {
+        fn spawn(
+            &self,
+            _: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let runtime = Arc::new(QuestionRuntime {
+                publisher: Publisher::new(sink),
+                response_calls: AtomicU64::new(0),
+            });
+            *self.0.lock().unwrap() = Some(runtime.clone());
+            Ok(runtime)
+        }
+    }
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        scheduler: Scheduler,
+        runtime: Arc<QuestionRuntime>,
+        sink: Arc<StoreLifecycleSink>,
+        adapter: crate::zcode::events::ZcodeAdapter,
+        database: rusqlite::Connection,
+        id: String,
+        next_event: u64,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let slot = Arc::new(Mutex::new(None));
+            let scheduler = Scheduler::new(
+                "question-ownership",
+                store.clone(),
+                Arc::new(QuestionFactory(slot.clone())),
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let id = scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: directory.path().canonicalize().unwrap(),
+                    permission_mode: Some(external_core::PermissionMode::Plan),
+                    prompt: "synthetic question ownership".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap()
+                .agent_id;
+            scheduler.start_ready().unwrap();
+            let runtime = slot.lock().unwrap().clone().unwrap();
+            let sink = scheduler.inner.state.lock().unwrap().active[&id]
+                .sink
+                .clone();
+            let (task, launch) = runtime.publisher.event_scope();
+            let database = rusqlite::Connection::open(store.database_path()).unwrap();
+            database.execute_batch("CREATE TABLE question_transitions(old_state TEXT,new_state TEXT);
+                CREATE TRIGGER question_transition AFTER UPDATE OF state ON pending_requests WHEN OLD.state<>NEW.state
+                BEGIN INSERT INTO question_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+            let mut fixture = Self {
+                _directory: directory,
+                scheduler,
+                runtime,
+                sink,
+                adapter: crate::zcode::events::ZcodeAdapter::new(task, launch),
+                database,
+                id,
+                next_event: 0,
+            };
+            fixture.notification("turn.started", serde_json::json!({}));
+            fixture
+        }
+        fn notification(&mut self, kind: &str, payload: serde_json::Value) -> DecodedInput {
+            self.next_event += 1;
+            let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"params":{
+                    "type":kind,"payload":payload,"turnId":"question-turn","sessionId":"question-session","eventId":format!("question-event-{}",self.next_event)
+                }}),
+            });
+            let batch = self.adapter.decode(&inbound).unwrap();
+            assert_eq!(batch.attribution(), Attribution::Current);
+            assert!(matches!(batch.disposition(), DecodeDisposition::Consumed));
+            self.runtime.publisher.emit_typed(batch.clone());
+            batch
+        }
+        fn rpc(&mut self, wire_id: &str, method: &str) {
+            let inbound = Inbound::Message(WireMessage::Request(RequestEnvelope::new(
+                WireId::String(wire_id.into()),
+                method,
+                serde_json::json!({"requestId":"q","prompt":"Question"}),
+            )));
+            // Match the real pump: adapter records logical/wire association,
+            // then transport publication owns the answerable request fact.
+            assert!(self.adapter.decode(&inbound).is_none());
+            self.runtime.publisher.publish_transport(inbound, None);
+        }
+        fn all_row_count(&self) -> i64 {
+            self.database
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_requests WHERE agent_id=?1",
+                    [&self.id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.scheduler.cancel_task(&self.id);
+        }
+    }
+    fn paired_question(wire_id: &str, notification_first: bool) {
+        for user_answers_first in [false, true] {
+            let mut f = Fixture::new();
+            for is_notification in [notification_first, !notification_first] {
+                if is_notification {
+                    let batch = f.notification(
+                        "userInput.requested",
+                        serde_json::json!({"requestId":"q","prompt":"Question"}),
+                    );
+                    assert!(
+                        matches!(&batch.events()[0].fact, EventFact::InputRequested(InputRequest {
+                        kind: InputKind::Question, respondable: false, request_id: WireId::String(id), ..
+                    }) if id == "q")
+                    );
+                } else {
+                    f.rpc(wire_id, external_contract::INTERACTION_REQUEST_USER_INPUT);
+                }
+            }
+            assert!(
+                f.sink.error().is_none(),
+                "no equal-ID collision: {:?}",
+                f.sink.error()
+            );
+            assert_eq!(f.all_row_count(), 1, "one question has one durable owner");
+            let requests = f.scheduler.store().pending_requests(&f.id).unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.request_type, "user_input");
+            assert_eq!(request.state, PendingRequestState::Pending);
+            assert_eq!(
+                request.correlation_id,
+                serde_json::to_string(&WireId::String(wire_id.into())).unwrap()
+            );
+            assert_eq!(
+                f.runtime.publisher.runtime_state.snapshot().coverage.input,
+                Some(true)
+            );
+            let payloads: Vec<String> = f.database.prepare("SELECT payload_json FROM events WHERE agent_id=?1 AND json_extract(payload_json,'$.category')='input' ORDER BY seq").unwrap()
+                .query_map([&f.id], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(
+                payloads.len(),
+                2,
+                "notification and RPC both retain lifecycle roles"
+            );
+            let projected_ids: Vec<String> = payloads
+                .iter()
+                .filter_map(|payload| {
+                    serde_json::from_str::<serde_json::Value>(payload).unwrap()["request_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                projected_ids,
+                vec![request.request_id.clone()],
+                "no phantom ES request ID"
+            );
+            if user_answers_first {
+                let response = f
+                    .scheduler
+                    .respond_request(&f.id, &request.request_id, "answer", Some("user answer"))
+                    .unwrap();
+                assert_eq!(response.disposition, ResponseDisposition::Responded);
+            }
+            let resolved = f.notification(
+                "userInput.resolved",
+                serde_json::json!({"requestId":"q","value":"native answer"}),
+            );
+            assert!(
+                matches!(&resolved.events()[0].fact, EventFact::InputResolved(resolution) if resolution.request_id == WireId::String(wire_id.into()))
+            );
+            let winner = f
+                .scheduler
+                .store()
+                .pending_request(&f.id, &request.request_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(winner.state, PendingRequestState::Responded);
+            assert_eq!(winner.response_decision.as_deref(), Some("answer"));
+            assert!(f
+                .scheduler
+                .store()
+                .pending_requests(&f.id)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                f.scheduler.store().completion_blockers(&f.id).unwrap(),
+                (false, false)
+            );
+            f.notification(
+                "userInput.resolved",
+                serde_json::json!({"requestId":"q","value":"duplicate native answer"}),
+            );
+            let loser = f
+                .scheduler
+                .respond_request(&f.id, &request.request_id, "answer", Some("later answer"))
+                .unwrap();
+            assert_eq!(loser.disposition, ResponseDisposition::AlreadyResponded);
+            assert_eq!(
+                f.runtime.response_calls.load(Ordering::Acquire),
+                u64::from(user_answers_first)
+            );
+            let transitions: Vec<(String, String)> = f
+                .database
+                .prepare("SELECT old_state,new_state FROM question_transitions ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                transitions,
+                vec![
+                    ("PENDING".into(), "SENDING".into()),
+                    ("SENDING".into(), "RESPONDED".into())
+                ]
+            );
+            f.notification(
+                "turn.completed",
+                serde_json::json!({"response":"QUESTION_DONE"}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let result = loop {
+                if let Some(result) = f.scheduler.store().task_result(&f.id).unwrap() {
+                    break result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "resolved question must not block successful completion"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(result.result.outcome, TaskOutcome::Completed);
+            assert_eq!(result.result.final_text, "QUESTION_DONE");
+            assert_eq!(f.all_row_count(), 1);
+            assert!(f.sink.error().is_none());
+        }
+    }
+    #[test]
+    fn distinct_ids_notification_first_have_one_pending_owner() {
+        paired_question("wire-q", true);
+    }
+    #[test]
+    fn distinct_ids_rpc_first_have_one_pending_owner() {
+        paired_question("wire-q", false);
+    }
+    #[test]
+    fn equal_ids_notification_first_have_one_pending_owner() {
+        paired_question("q", true);
+    }
+    #[test]
+    fn equal_ids_rpc_first_have_one_pending_owner() {
+        paired_question("q", false);
+    }
+    #[test]
+    fn explicit_unsupported_rpc_retains_its_pending_sentinel() {
+        let mut f = Fixture::new();
+        f.rpc(
+            "unsupported-wire",
+            external_contract::INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+        );
+        let rows = f.scheduler.store().pending_requests(&f.id).unwrap();
+        assert_eq!(f.all_row_count(), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_type, "unsupported_input");
+        assert_eq!(rows[0].state, PendingRequestState::Pending);
+        assert!(f.sink.error().is_none());
+    }
+}

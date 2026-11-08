@@ -444,6 +444,15 @@ impl StoreLifecycleSink {
         }
         if record.diagnostic().is_none() && matches!(record.normalized().map(|event| &event.fact), Some(EventFact::Diagnostic(_) | EventFact::CoverageGap(_))) { return; }
         let pending_request_id = match record.normalized().map(|event| &event.fact) {
+            Some(EventFact::InputRequested(request))
+                if request.kind == external_contract::events::InputKind::Question
+                    && !request.respondable =>
+            {
+                // A question notification observes the RPC-owned interaction.
+                // Keep its lifecycle projection without creating durable work
+                // or an ES request id for a second, non-answerable request.
+                None
+            }
             Some(EventFact::InputRequested(request)) => {
                 let request_id = format!("{}:request:{}", self.agent_id, record.sequence());
                 let correlation_id = match serde_json::to_string(&request.request_id) {
