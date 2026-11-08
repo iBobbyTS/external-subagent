@@ -88,7 +88,6 @@ pub(crate) struct AgentPolicy {
     pub(crate) probe_depth: ProbeDepth,
     pub(crate) catalog: CatalogProbe,
     pub(crate) catalog_runtime: CatalogRuntime,
-    pub(crate) observation: ObservationSupport,
 }
 
 impl AgentPolicy {
@@ -349,24 +348,6 @@ pub(crate) enum CatalogRuntime {
     },
 }
 
-/// Per-agent observation policy: whether public reasoning activity is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ObservationSupport {
-    pub(crate) reports_reasoning: bool,
-}
-
-impl ObservationSupport {
-    /// Unknown adapters report the supported public reasoning projection.
-    pub(crate) fn for_name(name: &str) -> Self {
-        policy_for(name).map_or(
-            Self {
-                reports_reasoning: true,
-            },
-            |policy| policy.observation,
-        )
-    }
-}
-
 // The policy rows. These are the only place a per-agent admission fact is
 // written down; every consumer derives from them.
 static ALL_PERMISSION_MODES: [PermissionMode; 4] = [
@@ -400,9 +381,6 @@ static ZCODE: AgentPolicy = AgentPolicy {
     probe_depth: ProbeDepth::ZcodeHi,
     catalog: CatalogProbe::ZcodeSessionCreate,
     catalog_runtime: CatalogRuntime::Injected,
-    observation: ObservationSupport {
-        reports_reasoning: true,
-    },
 };
 
 static DSH: AgentPolicy = AgentPolicy {
@@ -430,9 +408,6 @@ static DSH: AgentPolicy = AgentPolicy {
     probe_depth: ProbeDepth::DshHi,
     catalog: CatalogProbe::DshAcpModels,
     catalog_runtime: CatalogRuntime::EnvironmentVariable("DSH_RUNTIME_PATH"),
-    observation: ObservationSupport {
-        reports_reasoning: true,
-    },
 };
 
 static CODEX: AgentPolicy = AgentPolicy {
@@ -460,9 +435,6 @@ static CODEX: AgentPolicy = AgentPolicy {
     catalog_runtime: CatalogRuntime::Discovered {
         variable: "CODEX_RUNTIME_PATH",
         binary: "codex",
-    },
-    observation: ObservationSupport {
-        reports_reasoning: false,
     },
 };
 
@@ -493,9 +465,6 @@ static AGY: AgentPolicy = AgentPolicy {
     catalog_runtime: CatalogRuntime::Discovered {
         variable: "AGY_RUNTIME_PATH",
         binary: "agy",
-    },
-    observation: ObservationSupport {
-        reports_reasoning: false,
     },
 };
 

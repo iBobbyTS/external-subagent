@@ -295,6 +295,91 @@ pub enum TelemetryStatusView {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPhaseView {
+    Started,
+    Completed,
+    Failed,
+    RetryScheduled,
+    StreamStalled,
+}
+
+/// Native retry information. Descriptive only: `will_retry` is not permission
+/// for ES or the caller to retry, and every field is absent unless the native
+/// source provided it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRetryView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub will_retry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+}
+
+impl NativeRetryView {
+    /// An adapter may carry a retry container with no native field at all. The
+    /// public view omits it rather than claiming retry information exists.
+    fn is_empty(&self) -> bool {
+        self.will_retry.is_none()
+            && self.retryable.is_none()
+            && self.attempt.is_none()
+            && self.max_attempts.is_none()
+            && self.next_attempt.is_none()
+            && self.delay_ms.is_none()
+            && self.reset_at.is_none()
+    }
+}
+
+/// The latest native model-activity fact for the current launch. The field is
+/// absent when the source never provided one; no wait age or attempt number is
+/// synthesized for a source without that capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelActivityView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub phase: ModelPhaseView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<NativeRetryView>,
+}
+
+impl From<crate::ModelActivityView> for ModelActivityView {
+    fn from(value: crate::ModelActivityView) -> Self {
+        use external_contract::events::ModelPhase;
+        Self {
+            request_id: value.request_id.map(|id| id.0),
+            phase: match value.phase {
+                ModelPhase::Started => ModelPhaseView::Started,
+                ModelPhase::Completed => ModelPhaseView::Completed,
+                ModelPhase::Failed => ModelPhaseView::Failed,
+                ModelPhase::RetryScheduled => ModelPhaseView::RetryScheduled,
+                ModelPhase::StreamStalled => ModelPhaseView::StreamStalled,
+            },
+            retry: value.retry.and_then(|retry| {
+                let view = NativeRetryView {
+                    will_retry: retry.will_retry,
+                    retryable: retry.retryable,
+                    attempt: retry.attempt,
+                    max_attempts: retry.max_attempts,
+                    next_attempt: retry.next_attempt,
+                    delay_ms: retry.delay_ms,
+                    reset_at: retry.reset_at,
+                };
+                (!view.is_empty()).then_some(view)
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskActivityView {
     pub latest_text_tail: String,
@@ -303,13 +388,16 @@ pub struct TaskActivityView {
     pub tool_calls_last_60s: u64,
     /// Number of tracked in-flight tool calls (scheduled or started without a
     /// matching result/error/permission resolution). 0 when there is no
-    /// snapshot or the adapter has no per-call lifecycle tracking.
+    /// snapshot or the source has no per-call lifecycle capability.
     pub in_flight_tool_count: u64,
     /// Age in milliseconds of the oldest tracked in-flight tool call, measured
     /// from its first insertion; null when nothing is in flight.
     pub oldest_in_flight_tool_age_ms: Option<u64>,
     pub last_activity_age_ms: Option<u64>,
     pub model_request_active: bool,
+    /// Absent unless the native source provided a model-activity fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_activity: Option<ModelActivityView>,
     pub telemetry_status: TelemetryStatusView,
 }
 
@@ -591,6 +679,7 @@ pub(crate) fn task_activity_view(
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
             telemetry_status: TelemetryStatusView::Unavailable,
         };
     };
@@ -602,6 +691,7 @@ pub(crate) fn task_activity_view(
         oldest_in_flight_tool_age_ms: snapshot.oldest_active_tool_age_ms,
         last_activity_age_ms: snapshot.last_activity_age_ms,
         model_request_active: snapshot.model_request_active,
+        model_activity: snapshot.model_activity.map(Into::into),
         telemetry_status: match snapshot.telemetry_status {
             crate::TelemetryStatus::Healthy => TelemetryStatusView::Healthy,
             crate::TelemetryStatus::Degraded => TelemetryStatusView::Degraded,
@@ -638,7 +728,6 @@ mod activity_projection_tests {
                 tool_calls_started: 4,
                 ..PassiveActivityWindow::default()
             },
-            telemetry_degraded: true,
             telemetry_status: crate::TelemetryStatus::Degraded,
             coverage: crate::RuntimeCoverage::default(), diagnostics: vec![], model_activity: None, diagnostics_truncated: false,
         }
@@ -691,6 +780,36 @@ mod activity_projection_tests {
         assert_eq!(activity.last_activity_age_ms, None);
         assert!(!activity.model_request_active);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Unavailable);
+    }
+
+    #[test]
+    fn activity_projection_forwards_native_model_activity_and_retry_detail() {
+        let mut snapshot = snapshot();
+        assert!(task_activity_view(TaskPhase::Running, Some(snapshot.clone()))
+            .model_activity
+            .is_none());
+        snapshot.model_activity = Some(crate::ModelActivityView {
+            request_id: Some(external_contract::events::RequestId("req-7".into())),
+            phase: external_contract::events::ModelPhase::RetryScheduled,
+            retry: Some(external_contract::events::NativeRetry {
+                will_retry: Some(true),
+                retryable: Some(true),
+                attempt: Some(2),
+                max_attempts: Some(4),
+                next_attempt: Some(3),
+                delay_ms: Some(1_500),
+                reset_at: Some("2026-11-07T00:00:00Z".into()),
+            }),
+        });
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        let model = activity.model_activity.unwrap();
+        assert_eq!(model.request_id.as_deref(), Some("req-7"));
+        assert_eq!(model.phase, super::ModelPhaseView::RetryScheduled);
+        let retry = model.retry.unwrap();
+        assert_eq!(retry.attempt, Some(2));
+        assert_eq!(retry.max_attempts, Some(4));
+        assert_eq!(retry.delay_ms, Some(1_500));
+        assert_eq!(retry.reset_at.as_deref(), Some("2026-11-07T00:00:00Z"));
     }
 
     #[test]
@@ -801,6 +920,7 @@ mod result_paging_tests {
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

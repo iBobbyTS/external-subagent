@@ -80,9 +80,9 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
 
 test('CLI preserves daemon error code, message, and active agent id', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-error-${process.pid}-${Date.now()}.sock`);
-  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002 } }) + '\n'); }); });
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002, native_error: { truncated: false, total_bytes: 42, limit_bytes: 262144, original: { message: 'native original', code: 'rate_limit' } } } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
-  try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000002 }), (error) => error instanceof CliError && error.code === 'not_found' && error.agentId === 10000002); }
+  try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000002 }), (error) => error instanceof CliError && error.code === 'not_found' && error.agentId === 10000002 && error.nativeError?.original?.message === 'native original' && error.nativeError?.limit_bytes === 262144); }
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 

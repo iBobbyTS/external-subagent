@@ -88,9 +88,9 @@ async function lifecycleServer(socketPath) {
         status = 'cancelling';
         result = { task: task('cancelling') };
       } else if (request.method === 'task_observe') {
-        result = { observation: { schema: 'external-subagent-observation/1.0', agent_id: String(agentId),
+        result = { observation: { schema: 'external-subagent-observation/1.1', agent_id: String(agentId),
           count_scope: 'agent_lifetime', tools: [],
-          reasoning: { text: 'bounded', truncated: false, source: { status: 'VERIFIED' } },
+          reasoning: { text: 'bounded', truncated: false, source: { protocol: 'zcode_session', channel: 'summary' } },
           coverage: { tool_history_complete: true, reasoning_complete: true, dropped_events: 0 } } };
       } else if (request.method === 'task_close') {
         status = 'closed';
@@ -156,8 +156,9 @@ test('lifecycle parity preserves queue, bounded approval, cancellation and obser
     assert.equal(cancelled.result.task.status, 'cancelling');
     await assert.rejects(() => runCli(socket, 'respond', { agent_id: agentId, request_id: 'request-2', decision: 'deny' }), /late or duplicate|REQUEST_NOT_PENDING/);
     const observed = await runCli(socket, 'observe', { agent_id: agentId });
-    assert.equal(observed.result.schema, 'external-subagent-observation/1.0');
+    assert.equal(observed.result.schema, 'external-subagent-observation/1.1');
     assert.equal(observed.result.agent_id, agentId);
+    assert.deepEqual(observed.result.reasoning.source, { protocol: 'zcode_session', channel: 'summary' });
     const closed = await runCli(socket, 'close', { agent_id: agentId });
     assert.equal(closed.result.task.status, 'closed');
     assert.equal(fixture.getRespondCount(), 3);

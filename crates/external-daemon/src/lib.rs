@@ -255,7 +255,6 @@ pub struct PassiveActivitySnapshot {
     pub active_tools: Vec<PassiveActiveTool>,
     pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,
-    pub telemetry_degraded: bool,
     pub telemetry_status: TelemetryStatus,
     pub coverage: RuntimeCoverage,
     pub diagnostics: Vec<DiagnosticSummary>,

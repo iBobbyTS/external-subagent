@@ -32,8 +32,9 @@ pub struct ObservedTool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedCall {
-    /// Retained typed outcome; the existing public serialization remains compatible.
-    #[serde(skip)]
+    /// Typed phase/outcome evidence. Missing on a frame from an older daemon
+    /// decodes as `Unknown` (no native phase evidence).
+    #[serde(default)]
     pub status: ObservedCallStatus,
     pub seq: u64,
     pub tool_call_id: String,
@@ -42,7 +43,8 @@ pub struct ObservedCall {
     pub redacted_fields: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservedCallStatus {
     #[default]
     Unknown,
@@ -56,51 +58,19 @@ pub enum ObservedCallStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedReasoning {
-    /// Protocol/channel evidence independent of the legacy wire representation.
-    #[serde(skip)]
-    pub native_source: Option<PublicReasoningSource>,
     pub text: String,
     pub truncated: bool,
-    pub source: ReasoningSource,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicReasoningSource {
-    pub protocol: external_contract::events::SourceProtocol,
-    pub channel: external_contract::events::PublicReasoningChannel,
+    /// The native protocol/channel that produced this public reasoning.
+    /// Absent when the source never observed a public reasoning delta; the
+    /// label is evidence, not a per-adapter capability promise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PublicReasoningSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReasoningSource {
-    pub status: String,
-    pub runtime_version: String,
-    pub event_type: String,
-    pub delta_pointer: String,
-}
-
-impl ReasoningSource {
-    pub fn legacy_session_projection() -> Self {
-        Self {
-            status: "PUBLIC_RUNTIME_EVENT".into(),
-            runtime_version: "unreported".into(),
-            event_type: "model.streaming".into(),
-            delta_pointer: "/params/payload/delta".into(),
-        }
-    }
-
-    /// DSH's public ACP thought contract.
-    pub fn legacy_acp_projection() -> Self {
-        Self {
-            status: "VERIFIED_PROTOCOL_PUBLIC".into(),
-            runtime_version: "acp/1".into(),
-            event_type: "agent_thought_chunk".into(),
-            delta_pointer: "/params/update/content/text".into(),
-        }
-    }
-
-    pub fn is_supported_public(&self) -> bool {
-        *self == Self::legacy_session_projection() || *self == Self::legacy_acp_projection()
-    }
+pub struct PublicReasoningSource {
+    pub protocol: external_contract::events::SourceProtocol,
+    pub channel: external_contract::events::PublicReasoningChannel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,10 +86,9 @@ impl ObservationSnapshot {
             snapshot_seq: 0,
             tools: Vec::new(),
             reasoning: ObservedReasoning {
-                native_source: None,
                 text: String::new(),
                 truncated: false,
-                source: ReasoningSource::legacy_session_projection(),
+                source: None,
             },
             coverage: ObservationCoverage {
                 tool_history_complete: false,
@@ -139,8 +108,7 @@ struct ToolGroup {
 
 #[derive(Clone)]
 pub struct ObservationState {
-    reasoning_source: ReasoningSource,
-    native_reasoning_source: Option<PublicReasoningSource>,
+    reasoning_source: Option<PublicReasoningSource>,
     snapshot_seq: u64,
     next_call_seq: u64,
     seen_calls: HashMap<String, (String, u64)>,
@@ -160,8 +128,7 @@ pub struct ObservationState {
 impl Default for ObservationState {
     fn default() -> Self {
         Self {
-            reasoning_source: ReasoningSource::legacy_session_projection(),
-            native_reasoning_source: None,
+            reasoning_source: None,
             snapshot_seq: 0,
             next_call_seq: 0,
             seen_calls: HashMap::new(),
@@ -279,9 +246,10 @@ impl ObservationState {
     /// fresh events from the new launch are compared in its own.
     /// Coverage stays honest: incomplete wins and dropped counts add up.
     pub(crate) fn merge_newer(&mut self, newer: ObservationState) {
+        if let Some(source) = &newer.reasoning_source {
+            self.reasoning_source = Some(source.clone());
+        }
         if !newer.reasoning_raw.is_empty() {
-            self.native_reasoning_source = newer.native_reasoning_source.clone();
-            self.reasoning_source = newer.reasoning_source.clone();
             // The base's raw stream is older than the incoming tracker's
             // bytes; appending applies the same rolling cap and tail.
             self.observe_reasoning(&newer.reasoning_raw);
@@ -410,7 +378,6 @@ impl ObservationState {
             snapshot_seq: self.snapshot_seq,
             tools,
             reasoning: ObservedReasoning {
-                native_source: self.native_reasoning_source.clone(),
                 text,
                 truncated: self.reasoning_truncated,
                 source: self.reasoning_source.clone(),
@@ -492,14 +459,10 @@ impl ObservationState {
         use external_contract::events::*;
         match &event.fact {
             EventFact::PublicReasoningDelta(reasoning) => {
-                self.native_reasoning_source = Some(PublicReasoningSource {
+                self.reasoning_source = Some(PublicReasoningSource {
                     protocol: event.context.source.protocol,
                     channel: reasoning.channel,
                 });
-                self.reasoning_source = match event.context.source.protocol {
-                    SourceProtocol::DshAcpV1 => ReasoningSource::legacy_acp_projection(),
-                    _ => ReasoningSource::legacy_session_projection(),
-                };
                 self.observe_reasoning(&reasoning.delta);
                 self.bump_snapshot();
             }

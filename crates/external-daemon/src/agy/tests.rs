@@ -1650,7 +1650,7 @@ fn foreign_malformed_conversation_is_excluded_before_payload_validation() {
             "foreign frame damaged current coverage: {raw}"
         );
         assert!(
-            !sink.1.snapshot().telemetry_degraded,
+            sink.1.snapshot().telemetry_status != crate::TelemetryStatus::Degraded,
             "foreign frame degraded current telemetry: {raw}"
         );
         assert_eq!(shared.turn_snapshot(), before_turn);
@@ -1697,7 +1697,7 @@ fn current_malformed_conversation_retains_dimension_damage() {
             dropped + 1
         );
         assert_eq!(
-            sink.1.snapshot().telemetry_degraded,
+            sink.1.snapshot().telemetry_status == crate::TelemetryStatus::Degraded,
             dimension != CoverageDimension::Text
         );
     }
@@ -1718,7 +1718,7 @@ fn unreadable_or_unknown_conversation_identity_retains_prior_classification() {
             matches!(&sink.facts().last().unwrap().fact, EventFact::CoverageGap(gap)
             if gap.reason == LossReason::Malformed && gap.impact == Impact::Known(vec![CoverageDimension::Tools]))
         );
-        assert!(sink.1.snapshot().telemetry_degraded);
+        assert_eq!(sink.1.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     }
     let (shared, sink) = current_conversation_probe();
     feed_agy(

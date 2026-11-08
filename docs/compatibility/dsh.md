@@ -1,5 +1,7 @@
 # DeepSeek Harness ACP compatibility
 
+> ES 的共享类型化事件模型与工具投影见 [../event-model.md](../event-model.md)；本文只记录该 native 通道的协议事实与证据边界。
+
 This document records the bounded discovery probe contract. It is not a claim that DSH is supported by the product.
 
 The probe is `tools/probes/dsh-acp/probe.mjs`. It accepts an explicit executable path and argv, speaks JSON-RPC over stdio, and never installs a provider or writes credentials. `--help` lists the only scenarios. The caller must supply the exact executable and arguments obtained from its installed DSH version; the probe does not invent `dsh app-server`, login, or profile commands.

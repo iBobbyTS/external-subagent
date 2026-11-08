@@ -31,7 +31,7 @@ mod windows;
 pub use windows::{RpcClient, RpcServer, ServerOptions};
 
 pub use config::parse_subagent_config;
-pub use errors::{RpcError, RpcErrorCode};
+pub use errors::{NativeErrorView, RpcError, RpcErrorCode, MAX_NATIVE_ERROR_BYTES};
 pub use handlers::{RpcService, RpcServiceConfigError};
 pub use types::{
     GeneralSubmitInput, MessageInput, RespondInput, ResponseDecision, RpcMethod, RpcOutcome,
@@ -46,8 +46,8 @@ pub use views::{
     AgentModelsStatusView, AgentPermissionModeView, AgentScopeStatusView, AgentStatusView,
     AgentTransportSupportView, AgentTransportView, ArtifactIdentityView, CapabilityMaturityView,
     ComponentIdentityView, ComponentStateView, DaemonIdentityView, InputIdentityView,
-    MessageDispositionView, MessageReceiptView, ModelIdentityFactView, ModelIdentityView,
-    ObservationCapabilityView, ObservationDefaultsView, PendingRequestView, QuestionView,
+    MessageDispositionView, MessageReceiptView, ModelActivityView, ModelIdentityFactView,
+    ModelIdentityView, ModelPhaseView, NativeRetryView, ObservationCapabilityView, ObservationDefaultsView, PendingRequestView, QuestionView,
     ResponseDispositionView, ResponseOutcomeView, SystemStatusView, TaskActivityView,
     TaskHeaderView, TaskObservationView, TaskResultView, TaskView, TelemetryStatusView,
     VersionMismatchView,

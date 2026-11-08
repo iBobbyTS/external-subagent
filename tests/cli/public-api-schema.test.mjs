@@ -57,6 +57,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.match(schema.properties.wait.description, /embedded question/u);
   assert.match(schema.properties.wait.description, /in_flight_tool_count/u);
   assert.match(schema.properties.wait.description, /oldest_in_flight_tool_age_ms/u);
+  assert.match(schema.properties.wait.description, /model_activity/u);
   assert.equal(schema.properties.wait.description.includes('last_tool_calls'), false);
   assert.equal(schema.properties.wait.description.includes('reasoning tail'), false);
   assert.equal(schema.properties.result.properties.offset.default, 0);
@@ -79,8 +80,13 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.deepEqual(schema.properties.error_projection.required, ['error']);
   assert.deepEqual(schema.properties.error_projection.properties.error.required, ['code', 'message']);
   assert.deepEqual(Object.keys(schema.properties.error_projection.properties.error.properties).sort(), [
-    'agent_id', 'code', 'component', 'message', 'operation', 'prompt_count', 'request_id',
+    'agent_id', 'code', 'component', 'message', 'native_error', 'operation', 'prompt_count', 'request_id',
   ]);
+  const nativeError = schema.properties.error_projection.properties.error.properties.native_error;
+  assert.deepEqual(nativeError.required, ['truncated', 'total_bytes', 'limit_bytes']);
+  assert.equal(nativeError.additionalProperties, false);
+  assert.ok(Object.hasOwn(nativeError.properties, 'original'));
+  assert.ok(Object.hasOwn(nativeError.properties, 'projection'));
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.output, ['task', 'result']);
   assert.deepEqual(schema.properties.contracts.properties.external_subagent_result.input, [
     'agent_id', 'offset', 'limit',
@@ -120,26 +126,28 @@ test('codex spawn contract exposes four postures and rejects non-empty manifests
 });
 
 
-test('observation contract preserves public tails and object-level hidden reasoning', () => {
+test('observation contract keeps public tails and typed native evidence', () => {
   const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/observation.schema.json'), 'utf8'));
   assert.deepEqual(schema.properties.reasoning.type, ['object', 'null']);
   assert.equal(schema.properties.reasoning.properties.text.maxLength, 200);
   assert.deepEqual(schema.properties.reasoning.required, ['text', 'truncated']);
-  const { subagents } = JSON.parse(fs.readFileSync(path.join(root, 'schema/public-reasoning-source.json'), 'utf8'));
-  assert.deepEqual(Object.keys(subagents), ['zcode', 'dsh', 'codex', 'agy']);
-  assert.equal(subagents.zcode.status, 'PUBLIC_RUNTIME_EVENT');
-  assert.equal(subagents.zcode.runtime_version, 'unreported');
-  assert.equal(subagents.zcode.runtime_sha256, undefined);
-  assert.equal(subagents.zcode.runtime_path, undefined);
-  assert.equal(subagents.zcode.delta_pointer, '/params/payload/delta');
-  assert.equal(subagents.dsh.public, true);
-  assert.equal(subagents.dsh.status, 'VERIFIED_PROTOCOL_PUBLIC');
-  assert.equal(subagents.codex.public, false);
-  assert.equal(subagents.codex.collected, false);
-  assert.equal(subagents.codex.reasoning, null);
-  assert.equal(subagents.agy.public, false);
-  assert.equal(subagents.agy.collected, false);
-  assert.equal(subagents.agy.reasoning, null);
+  // Reasoning identity is the observed native protocol/channel, not a
+  // per-adapter capability table or retired wire-pointer labels.
+  const source = schema.properties.reasoning.properties.source;
+  assert.equal(source.type, 'object');
+  assert.deepEqual(source.required, ['protocol', 'channel']);
+  assert.equal(source.additionalProperties, false);
+  assert.deepEqual(source.properties.channel.enum, ['summary', 'thought']);
+  assert.ok(source.properties.protocol.enum.includes('zcode_session'));
+  assert.ok(source.properties.protocol.enum.includes('dsh_acp_v1'));
+  assert.equal(schema.properties.reasoning.properties.status, undefined);
+  assert.equal(schema.properties.reasoning.properties.delta_pointer, undefined);
+
+  const call = schema.properties.tools.items.properties.recent_calls.items;
+  assert.ok(call.required.includes('status'));
+  assert.deepEqual(call.properties.status.enum, [
+    'unknown', 'pending', 'running', 'finished', 'succeeded', 'failed', 'cancelled',
+  ]);
 });
 
 test('agy spawn contract pins a bare slug, the closed effort set, build/yolo and empty manifests', () => {

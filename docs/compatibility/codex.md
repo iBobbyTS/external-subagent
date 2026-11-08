@@ -1,5 +1,7 @@
 # Codex compatibility
 
+> ES 的共享类型化事件模型与工具投影见 [../event-model.md](../event-model.md)；本文只记录该 native 通道的协议事实与证据边界。
+
 Verified interface evidence for the Codex CLI this product binds to. The
 current tested baseline is codex-cli **0.154.0**
 (`/opt/homebrew/bin/codex`, `codex --version` → `codex-cli 0.154.0`) on

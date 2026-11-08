@@ -598,10 +598,10 @@ mod tests {
             impact: Impact::Known(vec![CoverageDimension::Tools]),
             activity: ActivityScope::Tool(CallId("call".into())),
         }))]);
-        assert!(runtime.snapshot().telemetry_degraded);
+        assert_eq!(runtime.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
         runtime.reduce_batch(&[event(tool(ToolPhase::Finished))]);
         assert!(
-            !runtime.snapshot().telemetry_degraded,
+            runtime.snapshot().telemetry_status != crate::TelemetryStatus::Degraded,
             "the same tool's terminal closes its current correlation gap"
         );
         assert!(

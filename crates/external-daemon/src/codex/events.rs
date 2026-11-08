@@ -1087,7 +1087,7 @@ mod typed_tests {
         let observation = trace.sink.activity.observation_snapshot();
         assert_eq!(observation.reasoning.text, "public summary");
         assert!(observation.coverage.reasoning_complete);
-        assert_eq!(observation.reasoning.native_source.as_ref().unwrap().protocol, SourceProtocol::CodexAppServer);
+        assert_eq!(observation.reasoning.source.as_ref().unwrap().protocol, SourceProtocol::CodexAppServer);
     }
 
     #[test]
@@ -1313,7 +1313,7 @@ mod typed_tests {
                         &DecodeDisposition::RecognizedIgnored(IgnoreReason::Late)
                     );
                     assert!(batch.events().is_empty());
-                    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+                    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
                     assert_eq!(
                         trace
                             .sink
@@ -1437,7 +1437,7 @@ mod typed_tests {
             assert_eq!(activity.window_60s.tool_calls_started, 1);
             assert_eq!(activity.window_60s.tool_calls_completed, 1);
             assert!(activity.active_tools.is_empty());
-            assert!(!activity.telemetry_degraded);
+            assert_ne!(activity.telemetry_status, crate::TelemetryStatus::Degraded);
             assert_eq!(observation.coverage.dropped_events, 0);
         }
     }
@@ -1772,7 +1772,7 @@ mod typed_tests {
                 .dropped_events,
             0
         );
-        assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+        assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     }
 
     #[test]

@@ -97,7 +97,6 @@ export const IMPACT_RULES = [
   { name: 'embedded dsh inputs', match: under('profiles', 'plugins/dsh-write-guard'), blocks: ['rust:subagents', 'rust:daemon-adapters', 'node:integration', ...SLOW] },
   { name: 'public api schema', match: is('schema/external-subagent-public-api.json'), blocks: ['node:cli', 'node:contract'] },
   { name: 'observation schema (compiled in)', match: is('schema/observation.schema.json'), blocks: ['node:cli', 'rust:daemon-mcp', ...SLOW] },
-  { name: 'reasoning source schema', match: is('schema/public-reasoning-source.json'), blocks: ['node:cli'] },
   { name: 'cli', match: under('cli'), blocks: [...ALL_NODE_BLOCKS] },
   { name: 'bin entries', match: under('bin'), blocks: ['node:cli', 'node:contract', 'node:install', 'node:platform'] },
   { name: 'packaging/release scripts', match: under('scripts'), blocks: ['node:install', 'node:upgrade', 'node:platform', 'node:release'] },

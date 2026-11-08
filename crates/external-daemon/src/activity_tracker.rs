@@ -148,7 +148,6 @@ impl RuntimeState {
                 })
                 .max(),
             window_60s: window,
-            telemetry_degraded: state.health.status() == TelemetryStatus::Degraded,
             telemetry_status: state.health.status(),
             coverage: state.health.coverage.clone(),
             diagnostics: state.health.diagnostics.clone(),

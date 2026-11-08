@@ -16,7 +16,7 @@ use crate::rpc::{
 };
 use external_store::TaskOutcome;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -147,6 +147,36 @@ pub struct PublicObservedTool {
     pub recent_calls: Vec<PublicObservedCall>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicObservedCallStatus {
+    /// No native phase evidence was observed for this call.
+    Unknown,
+    Pending,
+    Running,
+    /// The native source proved the call ended without success/failure evidence.
+    Finished,
+    /// The native source supplied explicit success evidence.
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl From<crate::observation::ObservedCallStatus> for PublicObservedCallStatus {
+    fn from(value: crate::observation::ObservedCallStatus) -> Self {
+        use crate::observation::ObservedCallStatus;
+        match value {
+            ObservedCallStatus::Unknown => Self::Unknown,
+            ObservedCallStatus::Pending => Self::Pending,
+            ObservedCallStatus::Running => Self::Running,
+            ObservedCallStatus::Finished => Self::Finished,
+            ObservedCallStatus::Succeeded => Self::Succeeded,
+            ObservedCallStatus::Failed => Self::Failed,
+            ObservedCallStatus::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicObservedCall {
@@ -157,6 +187,57 @@ pub struct PublicObservedCall {
     pub arguments: serde_json::Map<String, serde_json::Value>,
     pub arguments_truncated: bool,
     pub redacted_fields: u64,
+    /// Phase/outcome evidence from the native source; `unknown` means no
+    /// phase fact was observed, `finished` means ended without success/failure
+    /// evidence, and `succeeded` only comes from an explicit native fact.
+    pub status: PublicObservedCallStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicSourceProtocol {
+    CodexAppServer,
+    ZcodeSession,
+    ZcodeTelemetryV4,
+    DshAcpV1,
+    AgyStreamJson,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicReasoningChannel {
+    Summary,
+    Thought,
+}
+
+/// The native protocol/channel that produced the exposed public reasoning.
+/// This is observation evidence, not a per-adapter capability promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicReasoningSource {
+    pub protocol: PublicSourceProtocol,
+    pub channel: PublicReasoningChannel,
+}
+
+impl From<crate::observation::PublicReasoningSource> for PublicReasoningSource {
+    fn from(value: crate::observation::PublicReasoningSource) -> Self {
+        use external_contract::events::{PublicReasoningChannel as Channel, SourceProtocol};
+        Self {
+            protocol: match value.protocol {
+                SourceProtocol::CodexAppServer => PublicSourceProtocol::CodexAppServer,
+                SourceProtocol::ZcodeSession => PublicSourceProtocol::ZcodeSession,
+                SourceProtocol::ZcodeTelemetryV4 => PublicSourceProtocol::ZcodeTelemetryV4,
+                SourceProtocol::DshAcpV1 => PublicSourceProtocol::DshAcpV1,
+                SourceProtocol::AgyStreamJson => PublicSourceProtocol::AgyStreamJson,
+                SourceProtocol::Runtime => PublicSourceProtocol::Runtime,
+            },
+            channel: match value.channel {
+                Channel::Summary => PublicReasoningChannel::Summary,
+                Channel::Thought => PublicReasoningChannel::Thought,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -165,6 +246,9 @@ pub struct PublicObservedReasoning {
     #[schemars(length(max = 200))]
     pub text: String,
     pub truncated: bool,
+    /// Present only when a public reasoning delta was actually observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PublicReasoningSource>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -181,9 +265,10 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
     fn try_from(value: TaskObservationView) -> Result<Self, Self::Error> {
         if value.schema != OBSERVATION_SCHEMA
             || value.count_scope != "agent_lifetime"
-            || value.reasoning.as_ref().is_some_and(|reasoning| {
-                !reasoning.source.is_supported_public() || reasoning.text.chars().count() > 200
-            })
+            || value
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.text.chars().count() > 200)
             || (value.reasoning.is_none() && value.coverage.reasoning_complete)
         {
             return Err(protocol_error());
@@ -204,6 +289,7 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
                             arguments: call.arguments,
                             arguments_truncated: call.arguments_truncated,
                             redacted_fields: call.redacted_fields,
+                            status: call.status.into(),
                         })
                         .collect(),
                 })
@@ -211,6 +297,7 @@ impl TryFrom<TaskObservationView> for AgentObserveOutput {
             reasoning: value.reasoning.map(|reasoning| PublicObservedReasoning {
                 text: reasoning.text,
                 truncated: reasoning.truncated,
+                source: reasoning.source.map(Into::into),
             }),
             coverage: PublicObservationCoverage {
                 tool_history_complete: value.coverage.tool_history_complete,
@@ -606,6 +693,77 @@ pub enum PublicTelemetryStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicModelPhase {
+    Started,
+    Completed,
+    Failed,
+    RetryScheduled,
+    StreamStalled,
+}
+
+/// Native retry information is descriptive only. `will_retry` is not
+/// permission for ES or the caller to retry; every field is optional and
+/// absent when the native source did not provide it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicNativeRetry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub will_retry: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+}
+
+/// The latest native model-activity fact for the current launch. Present only
+/// when the native source actually provided one; no wait age or attempt number
+/// is invented when the source has no model-activity capability.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicModelActivity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub phase: PublicModelPhase,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<PublicNativeRetry>,
+}
+
+impl From<crate::rpc::ModelActivityView> for PublicModelActivity {
+    fn from(value: crate::rpc::ModelActivityView) -> Self {
+        use crate::rpc::ModelPhaseView;
+        let retry = value.retry.map(|retry| PublicNativeRetry {
+            will_retry: retry.will_retry,
+            retryable: retry.retryable,
+            attempt: retry.attempt,
+            max_attempts: retry.max_attempts,
+            next_attempt: retry.next_attempt,
+            delay_ms: retry.delay_ms,
+            reset_at: retry.reset_at,
+        });
+        Self {
+            request_id: value.request_id,
+            phase: match value.phase {
+                ModelPhaseView::Started => PublicModelPhase::Started,
+                ModelPhaseView::Completed => PublicModelPhase::Completed,
+                ModelPhaseView::Failed => PublicModelPhase::Failed,
+                ModelPhaseView::RetryScheduled => PublicModelPhase::RetryScheduled,
+                ModelPhaseView::StreamStalled => PublicModelPhase::StreamStalled,
+            },
+            retry,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicActivity {
@@ -615,13 +773,16 @@ pub struct PublicActivity {
     pub tool_calls_last_60s: u64,
     /// Number of tracked in-flight tool calls (scheduled or started without a
     /// matching result/error/permission resolution); 0 when there is no
-    /// snapshot or the adapter has no per-call lifecycle tracking.
+    /// snapshot or the source has no per-call lifecycle capability.
     pub in_flight_tool_count: u64,
     /// Age in milliseconds of the oldest tracked in-flight tool call, measured
     /// from its first insertion; null when nothing is in flight.
     pub oldest_in_flight_tool_age_ms: Option<u64>,
     pub last_activity_age_ms: Option<u64>,
     pub model_request_active: bool,
+    /// Absent unless the native source provided a model-activity fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_activity: Option<PublicModelActivity>,
     pub telemetry_status: PublicTelemetryStatus,
 }
 
@@ -635,6 +796,7 @@ impl From<TaskActivityView> for PublicActivity {
             oldest_in_flight_tool_age_ms: value.oldest_in_flight_tool_age_ms,
             last_activity_age_ms: value.last_activity_age_ms,
             model_request_active: value.model_request_active,
+            model_activity: value.model_activity.map(Into::into),
             telemetry_status: match value.telemetry_status {
                 TelemetryStatusView::Healthy => PublicTelemetryStatus::Healthy,
                 TelemetryStatusView::Degraded => PublicTelemetryStatus::Degraded,
@@ -888,18 +1050,37 @@ mod public_result_reason_tests {
 #[cfg(test)]
 mod observation_contract_tests {
     use super::*;
-    use crate::observation::{ObservationSnapshot, ReasoningSource};
+    use crate::observation::{ObservationSnapshot, ObservedCallStatus};
+
+    fn source(
+        protocol: external_contract::events::SourceProtocol,
+        channel: external_contract::events::PublicReasoningChannel,
+    ) -> crate::observation::PublicReasoningSource {
+        crate::observation::PublicReasoningSource { protocol, channel }
+    }
 
     #[test]
-    fn three_adapter_projections_match_schema_and_reject_source_drift() {
+    fn observed_reasoning_projects_the_typed_native_source_and_matches_the_schema() {
         let schema: serde_json::Value =
             serde_json::from_str(include_str!("../../../../schema/observation.schema.json"))
                 .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
-        for source in [
-            Some(ReasoningSource::legacy_session_projection()),
-            Some(ReasoningSource::legacy_acp_projection()),
-            None,
+        for (observed, expected) in [
+            (
+                Some(source(
+                    external_contract::events::SourceProtocol::ZcodeSession,
+                    external_contract::events::PublicReasoningChannel::Summary,
+                )),
+                "zcode_session",
+            ),
+            (
+                Some(source(
+                    external_contract::events::SourceProtocol::DshAcpV1,
+                    external_contract::events::PublicReasoningChannel::Thought,
+                )),
+                "dsh_acp_v1",
+            ),
+            (None, ""),
         ] {
             let snapshot = ObservationSnapshot::unavailable();
             let mut reasoning = snapshot.reasoning;
@@ -909,15 +1090,15 @@ mod observation_contract_tests {
                 agent_id: "10000000".into(),
                 count_scope: "agent_lifetime".into(),
                 tools: snapshot.tools,
-                reasoning: source.map(|source| {
-                    reasoning.source = source;
+                reasoning: observed.map(|source| {
+                    reasoning.source = Some(source);
                     reasoning
                 }),
                 coverage: snapshot.coverage,
             };
             let output = AgentObserveOutput::try_from(view.clone()).unwrap();
             let value = serde_json::to_value(output).unwrap();
-            assert!(validator.is_valid(&value));
+            assert!(validator.is_valid(&value), "{value}");
             if view.reasoning.is_none() {
                 assert!(value["reasoning"].is_null());
                 let mut false_coverage = view;
@@ -928,17 +1109,91 @@ mod observation_contract_tests {
                     value["reasoning"]["text"].as_str().unwrap().chars().count(),
                     200
                 );
-                for field in ["status", "runtime_version", "event_type", "delta_pointer"] {
-                    let mut drifted = serde_json::to_value(&view).unwrap();
-                    drifted["reasoning"]["source"][field] = "unverified".into();
-                    let drifted: TaskObservationView = serde_json::from_value(drifted).unwrap();
-                    assert!(AgentObserveOutput::try_from(drifted).is_err());
-                }
+                assert_eq!(value["reasoning"]["source"]["protocol"], expected);
                 let mut oversized = view;
                 oversized.reasoning.as_mut().unwrap().text.push('x');
                 assert!(AgentObserveOutput::try_from(oversized).is_err());
             }
         }
+    }
+
+    #[test]
+    fn recent_call_status_distinguishes_finished_from_succeeded_and_decodes_legacy_frames() {
+        let snapshot = ObservationSnapshot::unavailable();
+        let mut call = crate::observation::ObservedCall {
+            status: ObservedCallStatus::Finished,
+            seq: 1,
+            tool_call_id: "call-1".into(),
+            arguments: serde_json::Map::new(),
+            arguments_truncated: false,
+            redacted_fields: 0,
+        };
+        let view = TaskObservationView {
+            schema: OBSERVATION_SCHEMA.into(),
+            agent_id: "10000000".into(),
+            count_scope: "agent_lifetime".into(),
+            tools: vec![crate::observation::ObservedTool {
+                tool_name: "Bash".into(),
+                call_count: 1,
+                recent_calls: vec![call.clone()],
+            }],
+            reasoning: None,
+            coverage: snapshot.coverage.clone(),
+        };
+        let output = AgentObserveOutput::try_from(view).unwrap();
+        let value = serde_json::to_value(&output).unwrap();
+        assert_eq!(value["tools"][0]["recent_calls"][0]["status"], "finished");
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../schema/observation.schema.json"))
+                .unwrap();
+        assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+
+        call.status = ObservedCallStatus::Succeeded;
+        let view = TaskObservationView {
+            schema: OBSERVATION_SCHEMA.into(),
+            agent_id: "10000000".into(),
+            count_scope: "agent_lifetime".into(),
+            tools: vec![crate::observation::ObservedTool {
+                tool_name: "Bash".into(),
+                call_count: 1,
+                recent_calls: vec![call],
+            }],
+            reasoning: None,
+            coverage: snapshot.coverage,
+        };
+        let value = serde_json::to_value(AgentObserveOutput::try_from(view).unwrap()).unwrap();
+        assert_eq!(value["tools"][0]["recent_calls"][0]["status"], "succeeded");
+
+        // A frame from an older daemon lacks both new optional fields; it still
+        // decodes with honest defaults (no phase evidence, no source).
+        let legacy = serde_json::json!({
+            "schema": OBSERVATION_SCHEMA,
+            "agent_id": "10000000",
+            "count_scope": "agent_lifetime",
+            "tools": [{
+                "tool_name": "Read",
+                "call_count": 1,
+                "recent_calls": [{
+                    "seq": 1,
+                    "tool_call_id": "call-legacy",
+                    "arguments": {},
+                    "arguments_truncated": false,
+                    "redacted_fields": 0
+                }]
+            }],
+            "reasoning": { "text": "legacy tail", "truncated": false },
+            "coverage": {
+                "tool_history_complete": false,
+                "reasoning_complete": false,
+                "dropped_events": 0
+            }
+        });
+        let decoded: TaskObservationView = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            decoded.tools[0].recent_calls[0].status,
+            ObservedCallStatus::Unknown
+        );
+        assert_eq!(decoded.reasoning.unwrap().source, None);
     }
 }
 
@@ -979,6 +1234,11 @@ mod activity_projection_tests {
         assert_eq!(value["tool_calls_last_60s"], 4);
         assert_eq!(value["last_activity_age_ms"], serde_json::json!(age));
         assert_eq!(value["model_request_active"], true);
+        // The native model phase travels as optional evidence, not a synthesized
+        // wait age or attempt count.
+        assert_eq!(value["model_activity"]["phase"], "started");
+        assert_eq!(value["model_activity"]["request_id"], "r");
+        assert!(value["model_activity"].get("retry").is_none());
         // Native finished phases close tracked calls, including unknown outcomes.
         assert_eq!(value["in_flight_tool_count"], 0);
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
@@ -1006,6 +1266,53 @@ mod activity_projection_tests {
             invalid[removed] = serde_json::json!([]);
             assert!(!validator.is_valid(&invalid));
         }
+        assert!(!required.contains(&serde_json::json!("model_activity")));
+        assert!(schema["properties"].get("model_activity").is_some());
+    }
+
+    #[test]
+    fn model_activity_presence_follows_native_evidence_and_carries_retry_detail() {
+        let rpc = |model_activity| TaskActivityView {
+            latest_text_tail: String::new(),
+            latest_text_truncated: false,
+            tool_calls_last_60s: 0,
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
+            last_activity_age_ms: None,
+            model_request_active: true,
+            model_activity,
+            telemetry_status: TelemetryStatusView::Healthy,
+        };
+        // No native model-activity fact: the key is absent, not a zeroed object.
+        let value = serde_json::to_value(PublicActivity::from(rpc(None))).unwrap();
+        assert!(value.get("model_activity").is_none());
+
+        let value = serde_json::to_value(PublicActivity::from(rpc(Some(
+            crate::rpc::views::ModelActivityView {
+                request_id: Some("req-7".into()),
+                phase: crate::rpc::views::ModelPhaseView::RetryScheduled,
+                retry: Some(crate::rpc::views::NativeRetryView {
+                    will_retry: Some(true),
+                    retryable: Some(true),
+                    attempt: Some(2),
+                    max_attempts: None,
+                    next_attempt: Some(3),
+                    delay_ms: Some(1_500),
+                    reset_at: None,
+                }),
+            },
+        ))))
+        .unwrap();
+        assert_eq!(value["model_activity"]["phase"], "retry_scheduled");
+        assert_eq!(value["model_activity"]["request_id"], "req-7");
+        assert_eq!(value["model_activity"]["retry"]["attempt"], 2);
+        assert_eq!(value["model_activity"]["retry"]["delay_ms"], 1_500);
+        // A field the source did not provide stays absent rather than null.
+        assert!(value["model_activity"]["retry"].get("max_attempts").is_none());
+        assert!(value["model_activity"]["retry"].get("reset_at").is_none());
+
+        let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
+        assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
     }
 }
 
@@ -1122,6 +1429,7 @@ mod wait_many_schema_tests {
                 model_request_active: false,
                 last_activity_age_ms: None,
                 oldest_in_flight_tool_age_ms: None,
+                model_activity: None,
                 telemetry_status: PublicTelemetryStatus::Unavailable,
             },
             result: None,

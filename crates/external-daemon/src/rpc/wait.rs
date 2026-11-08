@@ -2520,6 +2520,7 @@ pub(crate) mod wait_tests {
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

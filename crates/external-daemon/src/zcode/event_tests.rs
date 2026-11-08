@@ -84,7 +84,7 @@ fn retry_attempts_and_parallel_requests_converge_without_degradation() {
     assert!(trace.active());
     trace.model("parallel", "model_request_completed");
     assert!(!trace.active());
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     assert!(
         trace.tracker.turn_snapshot().active,
         "attempt failure is not turn failure"
@@ -223,7 +223,7 @@ fn tools_progress_permission_denial_and_dual_sources_do_not_recount_or_finish_ex
     assert_eq!(snapshot.active_tools.len(), 1);
     assert_eq!(snapshot.window_60s.tool_calls_started, 1);
     assert_eq!(snapshot.window_60s.tool_calls_completed, 0);
-    assert!(!snapshot.telemetry_degraded);
+    assert_ne!(snapshot.telemetry_status, crate::TelemetryStatus::Degraded);
     let observed = trace.sink.activity.observation_snapshot();
     assert_eq!(observed.tools[0].call_count, 1);
     assert_eq!(
@@ -281,7 +281,7 @@ fn known_ignored_and_unknown_or_damage_have_distinct_coverage() {
             DecodeDisposition::RecognizedIgnored(_)
         ));
     }
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     assert_eq!(
         trace
             .sink
@@ -299,7 +299,7 @@ fn known_ignored_and_unknown_or_damage_have_distinct_coverage() {
         unknown.disposition(),
         DecodeDisposition::Unknown(_)
     ));
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     assert_eq!(
         trace
             .sink
@@ -345,7 +345,7 @@ fn session_model_statuses_share_mapping_and_admission_is_not_request_execution()
         );
         assert_eq!(trace.active(), active);
     }
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
 }
 
 #[test]
@@ -408,7 +408,7 @@ fn malformed_and_oversized_transport_frames_keep_safe_fault_and_loss() {
             .dropped_events,
         2
     );
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let coverage = trace.sink.activity.observation_snapshot().coverage;
     assert!(!coverage.tool_history_complete);
     assert!(!coverage.reasoning_complete);
@@ -452,7 +452,7 @@ fn malformed_public_reasoning_affects_reasoning_coverage_only() {
     assert!(!snapshot.coverage.reasoning_complete);
     assert!(!snapshot.coverage.tool_history_complete);
     assert_eq!(snapshot.coverage.dropped_events, 1);
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let malformed = trace.send(
         "session/event",
         json!({"type":"model.streaming","payload":{"kind":"tool_input_delta","toolCallId":"call"}}),
@@ -538,7 +538,7 @@ fn known_session_configuration_and_recovery_do_not_degrade_model_activity() {
         recovery.disposition(),
         DecodeDisposition::RecognizedIgnored(_)
     ));
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let future = trace.send(
         "session/event",
         json!({"type":"session.updated","payload":{"type":"model_future_status"}}),
@@ -563,7 +563,7 @@ fn valid_429_fixture_converges_through_the_shared_entry() {
     assert!(trace.active());
     trace.send("v4/telemetry/event", cases[0]["input"]["params"].clone());
     assert!(!trace.active());
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     assert!(trace.tracker.turn_snapshot().active);
 }
 
@@ -903,13 +903,13 @@ fn unknown_impact_preserves_current_and_historical_state() {
     let observed = trace.sink.activity.observation_snapshot();
     assert_eq!(
         (
-            activity.telemetry_degraded,
+            activity.telemetry_status,
             observed.coverage.tool_history_complete,
             observed.coverage.reasoning_complete,
             observed.coverage.dropped_events
         ),
         (
-            false,
+            crate::TelemetryStatus::Healthy,
             before.coverage.tool_history_complete,
             before.coverage.reasoning_complete,
             0
@@ -930,7 +930,7 @@ fn unknown_impact_preserves_current_and_historical_state() {
         "v4/telemetry/event",
         json!({"kind":"model.request.status","status":"model_request_started"}),
     );
-    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    assert_eq!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let damaged = trace.sink.activity.observation_snapshot();
     assert!(damaged.coverage.tool_history_complete);
     assert!(damaged.coverage.reasoning_complete);
@@ -980,7 +980,7 @@ fn replay_window_retirement_preserves_uncertainty_without_asserting_event_loss()
     ));
     assert!(evicted.events().is_empty());
     assert!(trace.tracker.turn_snapshot().active);
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let coverage = trace.sink.activity.observation_snapshot().coverage;
     assert_eq!(coverage.dropped_events, 0);
     assert!(!coverage.tool_history_complete && !coverage.reasoning_complete);
@@ -995,7 +995,7 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
         json!({"type":"tool.updated","payload":{"kind":"future_phase","toolCallId":"call"}}),
     );
     assert!(
-        !trace.sink.activity.snapshot().telemetry_degraded,
+        trace.sink.activity.snapshot().telemetry_status != crate::TelemetryStatus::Degraded,
         "an unknown phase alone does not establish a broken correlation"
     );
     let clean = trace.sink.activity.observation_snapshot().coverage;
@@ -1007,7 +1007,7 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
         "session/event",
         json!({"type":"tool.updated","payload":{"kind":"started"}}),
     );
-    assert!(trace.sink.activity.snapshot().telemetry_degraded);
+    assert_eq!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let known_damage = trace.sink.activity.observation_snapshot().coverage;
     assert!(!known_damage.tool_history_complete);
     assert!(!known_damage.reasoning_complete);
@@ -1031,7 +1031,7 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
         })
     ));
     trace.publisher.emit_typed(batch);
-    assert!(!trace.sink.activity.snapshot().telemetry_degraded);
+    assert_ne!(trace.sink.activity.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
     let historical = trace.sink.activity.observation_snapshot().coverage;
     assert!(!historical.tool_history_complete);
     assert!(!historical.reasoning_complete);

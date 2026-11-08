@@ -2,7 +2,7 @@
 //!
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
-use super::agent_policy::{AgentKind, DeveloperInstructionsChannel, ObservationSupport};
+use super::agent_policy::{AgentKind, DeveloperInstructionsChannel};
 use super::agents::{
     configured_agent_statuses, resolve_admission_with_instructions,
     unavailable_agent_statuses, unknown_agent_name_error, validate_agent_models_input,
@@ -659,17 +659,20 @@ impl RpcService {
                 let task = self.require_task(&agent_id)?;
                 let snapshot =
                     self.scheduler.observation_snapshot(&task.agent_id);
-                let adapter = crate::task_agent(&task);
-                let observation_support = ObservationSupport::for_name(&adapter);
+                // Presence is evidence-based: expose the public reasoning tail
+                // only when a public delta was actually observed. The coverage
+                // flags already describe per-dimension support and gaps; no
+                // adapter name permanently enables or suppresses the field.
+                let reasoning = (!snapshot.reasoning.text.is_empty()
+                    || snapshot.reasoning.source.is_some())
+                .then_some(snapshot.reasoning);
                 Ok(RpcSuccess::TaskObserved {
                     observation: TaskObservationView {
                         schema: OBSERVATION_SCHEMA.into(),
                         agent_id: task.agent_id,
                         count_scope: "agent_lifetime".into(),
                         tools: snapshot.tools,
-                        reasoning: observation_support
-                            .reports_reasoning
-                            .then_some(snapshot.reasoning),
+                        reasoning,
                         coverage: snapshot.coverage,
                     },
                 })
@@ -1600,7 +1603,7 @@ mod observe_gate_tests {
     }
 
     #[test]
-    fn task_observe_active_trackers_publish_only_adapter_public_reasoning() {
+    fn task_observe_projects_observed_public_reasoning_regardless_of_configured_adapter() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
         for adapter in ["zcode", "dsh", "codex"] {
@@ -1645,17 +1648,17 @@ mod observe_gate_tests {
             assert_eq!(observation.coverage.dropped_events, 0);
             let encoded = serde_json::to_value(observation).unwrap();
             assert!(!encoded.to_string().contains("SECRET"));
-            if adapter == "codex" {
-                assert!(encoded["reasoning"].is_null());
-            } else {
-                assert_eq!(encoded["reasoning"]["text"], "中🙂".repeat(100));
-                assert_eq!(encoded["reasoning"]["truncated"], true);
-            }
+            // Presence follows the observed fact, not the configured name: the
+            // same injected public delta is projected for every adapter.
+            assert_eq!(encoded["reasoning"]["text"], "中🙂".repeat(100));
+            assert_eq!(encoded["reasoning"]["truncated"], true);
+            assert_eq!(encoded["reasoning"]["source"]["protocol"], "zcode_session");
+            assert_eq!(encoded["reasoning"]["source"]["channel"], "thought");
         }
     }
 
     #[test]
-    fn task_observe_missing_activity_preserves_adapter_policy_and_coverage() {
+    fn task_observe_missing_activity_reports_unavailable_observation_and_coverage() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         std::fs::create_dir_all(&root).unwrap();
         for adapter in ["zcode", "dsh", "codex"] {
@@ -1674,13 +1677,11 @@ mod observe_gate_tests {
             assert!(!observation.coverage.tool_history_complete);
             assert!(!observation.coverage.reasoning_complete);
             assert_eq!(observation.coverage.dropped_events, 0);
-            if adapter == "codex" {
-                assert!(serde_json::to_value(&observation).unwrap()["reasoning"].is_null());
-            } else {
-                let reasoning = observation.reasoning.as_ref().unwrap();
-                assert!(reasoning.text.is_empty());
-                assert_eq!(reasoning.source, if adapter == "dsh" { crate::observation::ReasoningSource::legacy_acp_projection() } else { crate::observation::ReasoningSource::legacy_session_projection() });
-            }
+            // No activity means no captured reasoning evidence for any
+            // adapter; a configured name never invents a source or an empty
+            // reasoning object.
+            assert!(observation.reasoning.is_none());
+            assert!(serde_json::to_value(&observation).unwrap()["reasoning"].is_null());
         }
     }
 

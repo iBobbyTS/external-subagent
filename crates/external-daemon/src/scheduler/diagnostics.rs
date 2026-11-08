@@ -605,16 +605,6 @@ impl Write for RotatingDiagnosticWriter {
     }
 }
 
-/// Retain the native error unchanged except for credential redaction. The full
-/// value is delivered through the existing paged result; diagnostic metadata may
-/// be bounded independently without destroying the original error.
-pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_json::Value> {
-    let payload = params.get("payload")?;
-    let original = payload.get("error").filter(|v| !v.is_null())
-        .or_else(|| payload.get("reason_code"))?;
-    Some(native_failure_detail(&redact_native_error(original)))
-}
-
 pub(crate) fn native_failure_detail(original: &serde_json::Value) -> serde_json::Value {
     let message = original.get("message").and_then(serde_json::Value::as_str)
         .or_else(|| original.as_str()).unwrap_or("turn.failed");
@@ -688,7 +678,7 @@ mod public_failure_tests {
             "stack":"frame 1\n  frame 2", "detail":"detail stays", "underlyingErrorDetail":"root detail stays",
             "futureField":[{"value":1},{"access_token":"private-token"}]
         });
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"error":original}})).unwrap();
+        let detail = native_failure_detail(&redact_native_error(&original));
         let mut expected = original;
         expected["data"]["apiKey"] = "[REDACTED]".into();
         expected["futureField"][1]["access_token"] = "[REDACTED]".into();
@@ -702,9 +692,12 @@ mod public_failure_tests {
     #[test]
     fn native_error_text_is_not_shortened_or_rewritten() {
         let text = format!("begin\n{}\nend", "信息 ".repeat(20000));
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":text}})).unwrap();
+        let detail = native_failure_detail(&redact_native_error(
+            &serde_json::Value::String(text.clone()),
+        ));
         assert_eq!(detail["original_error"], text);
-        assert!(turn_failure_detail(&serde_json::json!({"payload":{}})).is_none());
+        // A local failure without a native value never fabricates one.
+        assert!(native_failure_detail(&serde_json::Value::Null)["original_error"].is_null());
     }
 
     #[test]

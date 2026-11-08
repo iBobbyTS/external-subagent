@@ -355,7 +355,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             let snapshot = await_observed_content(&scheduler, &agent_id, agent);
 
             assert!(snapshot.reasoning.text.contains("ADAPTER-SCOPED reasoning tail"));
-            assert_eq!(snapshot.reasoning.native_source.as_ref().unwrap().protocol, external_contract::events::SourceProtocol::ZcodeSession);
+            assert_eq!(snapshot.reasoning.source.as_ref().unwrap().protocol, external_contract::events::SourceProtocol::ZcodeSession);
             assert!(snapshot.coverage.reasoning_complete);
             assert!(snapshot.coverage.tool_history_complete);
             let encoded = serde_json::to_string(&snapshot.tools).unwrap();
@@ -420,8 +420,10 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert_eq!(unknown.reasoning.text, queued.reasoning.text);
         assert!(queued.reasoning.text.is_empty());
         assert_eq!(unknown.reasoning.truncated, queued.reasoning.truncated);
-        assert_eq!(queued.reasoning.source, observation::ReasoningSource::legacy_acp_projection());
-        assert_ne!(unknown.reasoning.source, queued.reasoning.source);
+        // A configured adapter name never invents a native reasoning source;
+        // only an observed public delta can.
+        assert_eq!(queued.reasoning.source, None);
+        assert_eq!(unknown.reasoning.source, queued.reasoning.source);
     }
 }
 
@@ -529,6 +531,42 @@ mod failure_log_tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
         assert!(scheduler.store().get_task(&id).unwrap().unwrap().reaped_at.is_some());
         assert_eq!(scheduler.store().message("native-send-error").unwrap().unwrap().state, MessageState::Failed);
+    }
+
+    #[test]
+    fn native_send_failure_reaches_the_structured_tool_error_with_the_complete_original() {
+        use crate::rpc::{MessageInput, RpcErrorCode, RpcMethod, RpcService};
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: false });
+        scheduler.start_ready().unwrap();
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let error = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: None,
+                mode: "queue".into(),
+                content: "follow up".into(),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Unavailable);
+        assert_eq!(error.active_agent_id.as_deref(), Some(id.as_str()));
+        let native = error.native_error.as_ref().expect("native original");
+        assert!(
+            !native.truncated,
+            "a real 330 KiB native original must fit the transfer cap"
+        );
+        assert_eq!(native.total_bytes, serde_json::to_vec(&expected).unwrap().len());
+        assert_eq!(native.original, Some(expected.original.clone()));
+        assert_eq!(native.limit_bytes, crate::rpc::MAX_NATIVE_ERROR_BYTES);
+        // The MCP structured tool error carries the same complete, redacted
+        // original; ES's own message stays the bounded classification.
+        let tool = crate::mcp::errors::public_error_for_op(error, "send");
+        let projected = tool.body.native_error.expect("public native error");
+        assert_eq!(projected.original, Some(expected.original));
+        assert!(!projected.truncated);
+        assert!(!serde_json::to_string(&projected).unwrap().contains("private-command-secret"));
     }
 
     #[test]
