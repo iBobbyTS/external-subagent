@@ -1151,6 +1151,113 @@ fn synthetic_tool_error_denial_unknown_and_malformed_are_retained() {
     assert!(!serde_json::to_string(&diagnostics)
         .unwrap()
         .contains("private-body"));
+    // The successful result's denied_actions is one retained safe denial fact
+    // in the common aggregate; it does not fail the turn and carries no body.
+    let retained = sink.1.snapshot();
+    let denials = retained
+        .diagnostics
+        .iter()
+        .filter(|entry| entry.reason == "permission_denied")
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].source, SourceProtocol::AgyStreamJson);
+    assert_eq!(denials[0].impact, Impact::Known(vec![CoverageDimension::Tools]));
+    assert_eq!(denials[0].discriminator, "denied_actions");
+    assert_eq!(denials[0].count, 1);
+    assert!(denials[0].last_observed_at > 0);
+    assert!(matches!(
+        sink.facts().last().unwrap().fact,
+        EventFact::TurnSettled(ref settlement) if settlement.outcome == TurnOutcome::Completed
+    ));
+}
+
+#[test]
+fn successful_result_denied_actions_reach_wait_diagnostics_once_and_keep_success() {
+    use crate::rpc::{
+        RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget,
+    };
+    use external_contract::events::{
+        CoverageDimension, Impact, SourceProtocol,
+    };
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    // SYNTHETIC successful-result frame in the observed stream shape; no live
+    // provider call is made.
+    let result = serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"ok","num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}});
+    let script = format!(
+        "read_frame\nprintf '%s\\n' '{{\"event\":\"init\",\"conversation_id\":\"{CONV}\",\"init\":{{}}}}'\nprintf '%s\\n' '{result}'\n"
+    );
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text.trim(), "ok");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = |target| {
+        RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: target,
+            wait_time: 0,
+            message_id: None,
+            wait_mode: WaitMode::All,
+        })
+    };
+    let mut previous = None;
+    for _ in 0..3 {
+        let RpcSuccess::TaskWait(wait) = service
+            .dispatch(query(WaitTarget::One(agent_id.clone())))
+            .unwrap()
+        else {
+            panic!("wait response")
+        };
+        assert_eq!(wait.task.status, "completed");
+        assert_eq!(
+            wait.result.as_ref().unwrap().outcome,
+            TaskOutcome::Completed
+        );
+        let denials = wait
+            .activity
+            .diagnostics
+            .iter()
+            .filter(|entry| entry.reason == "permission_denied")
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 1, "one denial fact per result input");
+        let entry = denials[0];
+        assert_eq!(entry.source, SourceProtocol::AgyStreamJson);
+        assert_eq!(entry.impact, Impact::Known(vec![CoverageDimension::Tools]));
+        assert_eq!(entry.discriminator, "denied_actions");
+        assert_eq!(entry.count, 1);
+        assert!(entry.last_observed_at > 0);
+        assert!(!wait.activity.diagnostics_truncated);
+        // Repeated waits read the retained summary without recomputation or
+        // count inflation.
+        if let Some(previous) = &previous {
+            assert_eq!(&wait.activity.diagnostics, previous);
+        }
+        previous = Some(wait.activity.diagnostics.clone());
+    }
+    // List mode builds through the same projection.
+    let RpcSuccess::TaskWaitMany { waits } = service
+        .dispatch(query(WaitTarget::Many(vec![agent_id.clone()])))
+        .unwrap()
+    else {
+        panic!("many wait response")
+    };
+    let (_, body) = waits.bodies.first().expect("one awaited agent");
+    assert_eq!(body.activity.diagnostics, previous.unwrap());
+    // The denial never changes the outcome, even after the waits.
+    assert_eq!(
+        scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        Some(TaskOutcome::Completed)
+    );
 }
 
 #[test]

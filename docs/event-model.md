@@ -85,7 +85,10 @@ native stdout / RPC frame / telemetry
   保持未知，不伪造成“零工具”或“健康”。
 - 有界诊断摘要（≤32 条，含溢出聚合）记录受影响维度、处置原因、去重后的原生输入
   次数、最近发生时间与安全 discriminator。原始 payload、正文、参数、自由文本错误
-  与凭据不进入摘要。wait 通过 `activity.diagnostics` 读取同一份保留摘要及其
+  与凭据不进入摘要。一个被消费的输入若携带带类别的类型化拒绝事实（AGY result 的
+  `denied_actions`），追加一条 `permission_denied` 摘要（一个 result 输入一条，
+  discriminator `denied_actions`）；拒绝是事实而非缺失数据，不改变覆盖标志，也不
+  改变任务 outcome。wait 通过 `activity.diagnostics` 读取同一份保留摘要及其
   `diagnostics_truncated` 标志；查询只读快照，不重算、不重新持久化、不增加计数。
 - 历史完整性与当前状态分开表达：turn 权威结算收敛当前关联，但不补造历史缺口；
   跨 turn/claim 的有效摘要保留；daemon 重启不回放持久记录重建内存摘要。

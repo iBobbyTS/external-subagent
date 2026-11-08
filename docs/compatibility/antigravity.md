@@ -120,7 +120,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 **已登记缺口（documented gaps）**：
 
 - permission request/respond 交互缺失：流中无请求事件，工具被 soft-deny 自动决；被拒动作仅经失败/取消路径拼入 bounded 诊断尾部。
-- 成功路径的 `denied_actions` 作为拒绝事实进入 ES 的有界诊断记录，不把成功 turn 改判为失败；“是否被拒绝”的明细经 wait 的 `activity.diagnostics` 以有界安全摘要投影（`TaskResult` 仍无该字段）。
+- 成功路径的 `denied_actions` 作为拒绝事实进入 ES 的有界诊断记录：每个 result 输入记一条 `permission_denied` 摘要（`count=1`、安全 discriminator `denied_actions`、影响维度 tools），不把成功 turn 改判为失败，也不标记数据丢失；该摘要经 wait 的 `activity.diagnostics` 投影（`TaskResult` 仍无该字段）。
 - 无 write-manifest 守卫：无 `FS_WRITE_MANIFEST_DENIED` 等价物，故 admission 只接受空 manifest。
 - daemon 崩溃后的活跃行自动恢复仍不实现（沿用 RUNTIME_LOST 不重放语义）；终态任务的显式 send 续聊**已实现**：factory 以持久化 session id 追加 `--conversation` 重启子进程，owner 校验 `init` 回显一致后由排队消息开启下一 turn（见「可直接实现」与 docs/compatibility/agents.md 的 send 双模式投递）。
 - 运行时 set-model/set-effort/cancel 控制面缺失（`control_request` 明示 not supported yet）。

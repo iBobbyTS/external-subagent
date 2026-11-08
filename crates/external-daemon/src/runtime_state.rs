@@ -210,6 +210,22 @@ impl RuntimeState {
                 return false;
             }
             state.observation.observe_gap(&input.impact, input.lost);
+        } else if let Some(denial) = envelopes
+            .iter()
+            .filter_map(RuntimeEnvelope::normalized)
+            .find(|event| {
+                matches!(
+                    &event.fact,
+                    EventFact::Diagnostic(diagnostic)
+                        if diagnostic.reason == DiagnosticReason::PermissionDenied
+                            && diagnostic.discriminator.is_some()
+                )
+            })
+        {
+            // A consumed input may carry a typed denial fact (AGY's successful
+            // result denied_actions). Retain exactly one safe summary per input
+            // without inventing loss metadata or a durable reason row.
+            state.health.record_denial_fact(denial, wall);
         }
         for envelope in envelopes {
             if let Some(event) = envelope.normalized() {

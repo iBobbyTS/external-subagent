@@ -1499,6 +1499,54 @@ mod activity_projection_tests {
         let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
         assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
     }
+
+    #[test]
+    fn public_activity_exposes_one_safe_permission_denied_summary() {
+        let rpc = TaskActivityView {
+            latest_text_tail: String::new(),
+            latest_text_truncated: false,
+            tool_calls_last_60s: 0,
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
+            last_activity_age_ms: None,
+            model_request_active: false,
+            model_activity: None,
+            diagnostics: vec![crate::rpc::ActivityDiagnosticView {
+                source: external_contract::events::SourceProtocol::AgyStreamJson,
+                reason: "permission_denied".into(),
+                impact: external_contract::events::Impact::Known(vec![
+                    external_contract::events::CoverageDimension::Tools,
+                ]),
+                discriminator: "denied_actions".into(),
+                count: 1,
+                last_observed_at: 1_700_000_000_999,
+            }],
+            diagnostics_truncated: false,
+            telemetry_status: TelemetryStatusView::Healthy,
+        };
+        let first = serde_json::to_value(PublicActivity::from(rpc.clone())).unwrap();
+        let denials = first["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["reason"] == "permission_denied")
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 1);
+        assert_eq!(denials[0]["source"], "agy_stream_json");
+        assert_eq!(denials[0]["discriminator"], "denied_actions");
+        assert_eq!(denials[0]["count"], 1);
+        assert_eq!(denials[0]["last_observed_at"], 1_700_000_000_999_i64);
+        assert_eq!(
+            denials[0]["impact"],
+            serde_json::json!({"scope":"known","dimensions":["tools"]})
+        );
+        assert_eq!(first["diagnostics_truncated"], false);
+        // Projection is a pure read: the same retained view maps identically.
+        let second = serde_json::to_value(PublicActivity::from(rpc)).unwrap();
+        assert_eq!(first, second);
+        let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
+        assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&first));
+    }
 }
 
 #[cfg(test)]

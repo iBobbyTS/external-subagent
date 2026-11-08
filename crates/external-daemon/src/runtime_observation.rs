@@ -199,6 +199,7 @@ pub(crate) fn safe_discriminator(token: Option<&SafeToken>) -> &'static str {
         Some("session/update") => "session/update",
         Some("transport") => "transport",
         Some("runtime") => "runtime",
+        Some("denied_actions") => "denied_actions",
         _ => "unrecognized",
     }
 }
@@ -333,6 +334,37 @@ impl RuntimeObservation {
                 last_observed_at: now,
             });
         }
+    }
+
+    /// Retain one safe denial fact from an otherwise consumed input (for
+    /// example a successful AGY result that reports denied actions). A denial
+    /// is a fact, not missing data, so this never claims a coverage loss and
+    /// never changes the task outcome. A denial without an explicit safe
+    /// category keeps its lifecycle role but does not enter the summary.
+    pub(crate) fn record_denial_fact(
+        &mut self,
+        event: &NormalizedEvent,
+        now: u64,
+    ) -> bool {
+        let EventFact::Diagnostic(diagnostic) = &event.fact else {
+            return false;
+        };
+        if diagnostic.reason != DiagnosticReason::PermissionDenied {
+            return false;
+        }
+        let Some(token) = diagnostic.discriminator.as_ref() else {
+            return false;
+        };
+        self.observed = true;
+        self.aggregate(DiagnosticSummary {
+            source: event.context.source.protocol,
+            reason: reason_name(diagnostic.reason).into(),
+            impact: bounded_impact(diagnostic.impact.clone()),
+            discriminator: safe_discriminator(Some(token)).into(),
+            count: 1,
+            last_observed_at: now,
+        });
+        true
     }
 
     pub(crate) fn correlation_loss(
