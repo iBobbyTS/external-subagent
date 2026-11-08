@@ -711,6 +711,168 @@ fn session_frame(kind: &str, turn: &str, id: &str, payload: Value) -> Inbound {
 }
 
 #[test]
+fn shared_event_id_across_channels_keeps_authoritative_turn_boundaries() {
+    // OBSERVED zcode.cjs frames: the desktop UI channel repeats every turn fact
+    // under one native eventId across computer-use, v4 telemetry and
+    // session/event. Only session/event owns start and settlement.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/zcode-events/turn-lifecycle-shared-event-id.json"
+    ))
+    .unwrap();
+    assert_eq!(fixture["provenance"], "OBSERVED");
+    let frames = fixture["frames"].as_array().unwrap();
+    let id = |index: usize| frames[index]["params"]["eventId"].as_str().unwrap().to_owned();
+    assert_eq!(id(0), id(1));
+    assert_eq!(id(1), id(2), "turn.started triple shares one native identity");
+    assert_eq!(id(13), id(14));
+    assert_eq!(id(14), id(15), "terminal triple shares one native identity");
+
+    let mut trace = Trace::new();
+    let feed = |trace: &mut Trace, frame: &Value| -> DecodedInput {
+        let batch = trace
+            .adapter
+            .decode(&Inbound::Message(WireMessage::UnknownEvent {
+                method: frame["method"].as_str().unwrap().into(),
+                raw: frame.clone(),
+            }))
+            .unwrap();
+        trace.publisher.emit_typed(batch.clone());
+        batch
+    };
+    let mut batches = Vec::new();
+    for frame in &frames[..=14] {
+        batches.push(feed(&mut trace, frame));
+    }
+
+    let started: Vec<usize> = batches
+        .iter()
+        .enumerate()
+        .filter(|(_, batch)| {
+            batch
+                .events()
+                .iter()
+                .any(|event| matches!(event.fact, EventFact::TurnStarted { .. }))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(started.len(), 1, "the turn starts exactly once");
+    assert!(
+        trace.tracker.turn_snapshot().active,
+        "the turn is still running before authoritative settlement"
+    );
+    assert_eq!(batches[0].disposition().kind(), DispositionKind::Unknown);
+
+    // Intended cross-channel pairing: telemetry and session frames share the
+    // eventId but never suppress each other.
+    for (telemetry, session) in [(3, 4), (5, 6), (7, 8), (9, 10), (11, 12)] {
+        assert_eq!(id(telemetry), id(session));
+        for index in [telemetry, session] {
+            assert_ne!(
+                batches[index].attribution(),
+                Attribution::Replay,
+                "frame {index} must be processed, not replay-suppressed"
+            );
+        }
+    }
+
+    // Terminal telemetry is auxiliary: it never settles the turn itself.
+    assert_eq!(
+        batches[14].disposition().kind(),
+        DispositionKind::Consumed,
+        "turn.terminal is a consumed auxiliary terminal"
+    );
+    assert!(
+        trace.tracker.turn_snapshot().active,
+        "auxiliary terminal must not settle the turn"
+    );
+
+    let done = feed(&mut trace, &frames[15]);
+    let EventFact::TurnSettled(settled) = &done.events().last().unwrap().fact else {
+        panic!("authoritative session turn.completed must settle")
+    };
+    assert_eq!(settled.outcome, TurnOutcome::Completed);
+    assert_eq!(settled.final_text.as_deref(), Some("SMOKE-OK"));
+    assert_eq!(
+        trace.tracker.turn_snapshot().boundary,
+        Some(crate::TurnBoundary::Completed)
+    );
+    assert!(!trace.tracker.turn_snapshot().active);
+    assert_eq!(
+        trace.sink.activity.take_terminal_text(),
+        crate::TerminalText::Visible("SMOKE-OK".into())
+    );
+
+    // Genuinely duplicated session facts stay replay-suppressed.
+    for index in [2, 6, 15] {
+        let frame = &frames[index];
+        let replay = trace
+            .adapter
+            .decode(&Inbound::Message(WireMessage::UnknownEvent {
+                method: frame["method"].as_str().unwrap().into(),
+                raw: frame.clone(),
+            }))
+            .unwrap();
+        assert_eq!(
+            replay.attribution(),
+            Attribution::Replay,
+            "frame {index} duplicate must be replay-suppressed"
+        );
+        assert!(replay.events().is_empty());
+    }
+}
+
+#[test]
+fn unknown_channel_claim_does_not_suppress_session_turn_boundaries() {
+    let mut trace = Trace::new();
+    let unknown = |kind: &str, id: &str| {
+        Inbound::Message(WireMessage::UnknownEvent {
+            method: "computer-use/operation-event".into(),
+            raw: json!({"params":{
+                "eventId":id,"sessionId":"session-1","turnId":"turn-1","kind":kind
+            }}),
+        })
+    };
+    let session = |kind: &str, id: &str, payload: Value| {
+        Inbound::Message(WireMessage::UnknownEvent {
+            method: "session/event".into(),
+            raw: json!({"params":{
+                "eventId":id,"sessionId":"session-1","turnId":"turn-1",
+                "type":kind,"payload":payload
+            }}),
+        })
+    };
+
+    let ignored = trace.adapter.decode(&unknown("turn-started", "start-id")).unwrap();
+    assert_eq!(ignored.disposition().kind(), DispositionKind::Unknown);
+    assert!(
+        trace.adapter.frames.is_empty(),
+        "an unknown channel must not claim a native event identity"
+    );
+    let start = trace.adapter.decode(&session("turn.started", "start-id", json!({}))).unwrap();
+    assert_eq!(start.disposition().kind(), DispositionKind::Consumed);
+    assert!(start
+        .events()
+        .iter()
+        .any(|event| matches!(event.fact, EventFact::TurnStarted { .. })));
+
+    let ignored = trace.adapter.decode(&unknown("turn-completed", "done-id")).unwrap();
+    assert_eq!(ignored.disposition().kind(), DispositionKind::Unknown);
+    assert!(!trace.adapter.frames.iter().any(|key| key.event_id == "done-id"));
+    let done = trace
+        .adapter
+        .decode(&session("turn.completed", "done-id", json!({"response":"final text"})))
+        .unwrap();
+    let EventFact::TurnSettled(settled) = &done.events().last().unwrap().fact else {
+        panic!("authoritative session turn.completed must settle")
+    };
+    assert_eq!(settled.outcome, TurnOutcome::Completed);
+    assert_eq!(settled.final_text.as_deref(), Some("final text"));
+    trace.publisher.emit_typed(start);
+    trace.publisher.emit_typed(done);
+    assert!(!trace.tracker.turn_snapshot().active);
+}
+
+#[test]
 fn replay_window_eviction_keeps_authoritative_terminals_usable() {
     for failed in [false, true] {
         let mut trace = Trace::new();

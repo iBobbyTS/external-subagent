@@ -109,26 +109,57 @@ impl ZcodeAdapter {
             }
             self.session = Some(session.clone());
         }
-        if let Some(key) = input.frame_key() {
-            if self.frames.contains(&key) {
+        let frame_key = input.frame_key();
+        if let Some(key) = &frame_key {
+            if self.frames.contains(key) {
                 return Some(Self::ignored(
                     input,
                     Attribution::Replay,
                     IgnoreReason::Replay,
                 ));
             }
-            // Replay proof covers the latest distinct identities in receipt
-            // order; replays do not refresh that window. An evicted identity
-            // is processed under the native session/turn attribution rules.
-            // Eviction loses no received fact and asserts no coverage damage.
-            if self.frames.len() >= MAX_REPLAY_FRAMES {
-                if let Some(oldest) = self.frame_order.pop_front() {
-                    self.frames.remove(&oldest);
-                }
-            }
-            self.frame_order.push_back(key.clone());
-            self.frames.insert(key);
         }
+        let decoded = self.interpret(method, params, input, telemetry);
+        if let Some(key) = frame_key {
+            // An unrecognized channel must not claim a native event identity.
+            // One native eventId can arrive again on the authoritative
+            // session/event channel, which alone can settle the turn; a
+            // diagnostic claim from an unknown channel would replay-suppress it.
+            if !matches!(decoded.disposition(), DecodeDisposition::Unknown(_)) {
+                self.claim_frame(key);
+            }
+        }
+        Some(decoded)
+    }
+
+    /// Replay proof covers the latest distinct identities in receipt order;
+    /// replays do not refresh that window. An evicted identity is processed
+    /// under the native session/turn attribution rules. Eviction loses no
+    /// received fact and asserts no coverage damage.
+    fn claim_frame(&mut self, key: NativeFrameKey) {
+        if self.frames.len() >= MAX_REPLAY_FRAMES {
+            if let Some(oldest) = self.frame_order.pop_front() {
+                self.frames.remove(&oldest);
+            }
+        }
+        self.frame_order.push_back(key.clone());
+        self.frames.insert(key);
+    }
+
+    fn interpret(
+        &mut self,
+        method: &str,
+        params: &Value,
+        mut input: NativeInputContext,
+        telemetry: bool,
+    ) -> DecodedInput {
+        let discriminator = if telemetry {
+            string(params, "kind")
+        } else if method == "session/event" {
+            string(params, "type")
+        } else {
+            Some(method)
+        };
         let kind = discriminator.unwrap_or("");
         let payload = if telemetry {
             params
@@ -144,25 +175,18 @@ impl ZcodeAdapter {
             });
             input.turn_id = Some(turn.clone());
             if self.turn.as_ref() == Some(&turn) || self.settled.contains(&turn) {
-                return Some(Self::ignored(
-                    input,
-                    Attribution::Replay,
-                    IgnoreReason::Replay,
-                ));
+                return Self::ignored(input, Attribution::Replay, IgnoreReason::Replay);
             }
             self.turn = Some(turn.clone());
             self.message = MessageId("assistant-stream".into());
-            return Some(Self::consumed(
-                input,
-                vec![EventFact::TurnStarted { turn_id: turn }],
-            ));
+            return Self::consumed(input, vec![EventFact::TurnStarted { turn_id: turn }]);
         }
         if input
             .turn_id
             .as_ref()
             .is_some_and(|turn| self.settled.contains(turn))
         {
-            return Some(Self::ignored(input, Attribution::Late, IgnoreReason::Late));
+            return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
         }
         if matches!(self.turn, Some(TurnId::Local(_)))
             && matches!(input.turn_id, Some(TurnId::Native(_)))
@@ -171,14 +195,14 @@ impl ZcodeAdapter {
         }
         if let (Some(current), Some(incoming)) = (&self.turn, &input.turn_id) {
             if current != incoming {
-                return Some(Self::ignored(input, Attribution::Late, IgnoreReason::Late));
+                return Self::ignored(input, Attribution::Late, IgnoreReason::Late);
             }
         }
         if input.turn_id.is_none() {
             input.turn_id = self.turn.clone();
         }
         if telemetry && (!params.is_object() || params.get("version").is_some_and(|v| v != 1)) {
-            return Some(self.invalid(input, LossReason::Malformed, impact(kind)));
+            return self.invalid(input, LossReason::Malformed, impact(kind));
         }
         let result = if telemetry {
             self.telemetry(kind, payload, &input)
@@ -197,7 +221,7 @@ impl ZcodeAdapter {
         } else {
             Err(false)
         };
-        Some(match result {
+        match result {
             Ok(Ok(mut facts)) => {
                 if !facts
                     .iter()
@@ -261,7 +285,7 @@ impl ZcodeAdapter {
                     vec![EventFact::Diagnostic(diagnostic)],
                 )
             }
-        })
+        }
     }
 
     fn telemetry(&self, kind: &str, p: &Value, input: &NativeInputContext) -> Parsed {
