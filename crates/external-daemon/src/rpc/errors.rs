@@ -98,20 +98,16 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
         SchedulerError::LifecycleSink { .. } => {
             RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed")
         }
-        SchedulerError::RuntimeCommand { .. } => {
-            let message = match &error {
-                SchedulerError::RuntimeCommand { message, .. } => message.as_str(),
-                _ => unreachable!(),
+        SchedulerError::RuntimeCommand { agent_id, message, .. } => {
+            let code = match message.as_str() {
+                "steer_unsupported" => RpcErrorCode::SteerUnsupported,
+                "TERMINAL_SEND_UNSUPPORTED" => RpcErrorCode::Validation,
+                _ => RpcErrorCode::Unavailable,
             };
-            if message == "steer_unsupported" {
-                RpcError::new(RpcErrorCode::SteerUnsupported, message)
-            } else if message == "TERMINAL_SEND_UNSUPPORTED" {
-                RpcError::new(RpcErrorCode::Validation, message)
-            } else if message == "daemon_draining" {
-                RpcError::new(RpcErrorCode::Unavailable, message)
-            } else {
-                RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
-            }
+            let message = crate::scheduler::redact_native_error(&serde_json::Value::String(message));
+            let mut error = RpcError::new(code, message.as_str().expect("redacted string"));
+            error.active_agent_id = Some(agent_id);
+            error
         }
         SchedulerError::StartTimeout { agent_id, message } => {
             let mut error = RpcError::new(RpcErrorCode::Timeout, message);
@@ -130,6 +126,7 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
             agent_id,
             reason,
             message,
+            ..
         } => {
             let (code, msg) = if reason == "MODEL_REJECTED" {
                 (RpcErrorCode::Validation, format!("MODEL_REJECTED: {message}"))
@@ -181,18 +178,19 @@ mod error_classification_tests {
         ));
         assert_eq!(conflict.code, RpcErrorCode::Conflict);
         assert_eq!(conflict.message, "MESSAGE_ID_CONFLICT");
-        let rejection = map_scheduler(SchedulerError::RuntimeCommand {
+        let rejection = map_scheduler(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
             agent_id: "a".into(),
-            message: "sensitive".into(),
+            message: "session/send rejected: api_key=private-value".into(),
         });
         assert_eq!(rejection.code, RpcErrorCode::Unavailable);
-        assert_eq!(rejection.message, "RUNTIME_COMMAND_FAILED");
+        assert_eq!(rejection.message, "session/send rejected: api_key=[REDACTED]");
+        assert_eq!(rejection.active_agent_id.as_deref(), Some("a"));
     }
 
     #[test]
     fn map_scheduler_preserves_start_failed_reasons_and_active_agent_id() {
         // 1. SESSION_START_FAILED -> RuntimeLost
-        let err_session = map_scheduler(SchedulerError::StartFailed {
+        let err_session = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000001".into(),
             reason: "SESSION_START_FAILED".into(),
             message: "handshake failed".into(),
@@ -202,7 +200,7 @@ mod error_classification_tests {
         assert_eq!(err_session.active_agent_id.as_deref(), Some("10000001"));
 
         // 2. MODEL_REJECTED -> Validation
-        let err_model = map_scheduler(SchedulerError::StartFailed {
+        let err_model = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000002".into(),
             reason: "MODEL_REJECTED".into(),
             message: "unknown model".into(),
@@ -212,7 +210,7 @@ mod error_classification_tests {
         assert_eq!(err_model.active_agent_id.as_deref(), Some("10000002"));
 
         // 3. PREPARED_* -> ResultInvalid
-        let err_prepared = map_scheduler(SchedulerError::StartFailed {
+        let err_prepared = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000003".into(),
             reason: "PREPARED_LAUNCH_FAILED".into(),
             message: "invalid json".into(),
@@ -222,7 +220,7 @@ mod error_classification_tests {
         assert_eq!(err_prepared.active_agent_id.as_deref(), Some("10000003"));
 
         // 4. DRAIN_CANCELLED / CANCELLED -> Unavailable
-        let err_drain = map_scheduler(SchedulerError::StartFailed {
+        let err_drain = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000004".into(),
             reason: "DRAIN_CANCELLED".into(),
             message: "daemon draining".into(),

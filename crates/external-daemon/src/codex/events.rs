@@ -18,11 +18,11 @@ use external_agent_codex::session::{sandbox_confirmed, CodexPermissionMode};
 use external_agent_codex::update;
 use external_contract::events::*;
 
-use crate::{Publisher, RuntimeLoss, RuntimeTerminal, TurnTracker};
+use crate::{Publisher, RuntimeLoss, RuntimeTerminal, RuntimeState};
 
 pub(super) struct CodexShared {
     pub(super) publisher: Arc<Publisher>,
-    pub(super) turn_tracker: Arc<TurnTracker>,
+    pub(super) runtime_state: Arc<RuntimeState>,
     pub(super) task: TaskId,
     pub(super) launch: LaunchId,
     pub(super) session_id: Mutex<Option<String>>,
@@ -321,7 +321,7 @@ impl CodexShared {
         };
         let turn = TurnId::Native(turn_id.to_owned());
         let input = self.context("turn/started", params, Some(&turn));
-        if self.turn_tracker.snapshot().active {
+        if self.runtime_state.turn_snapshot().active {
             // A started while a turn is already active is a late replay or
             // duplicate: it must never re-open the active boundary or reset
             // this turn's recorded state.
@@ -810,13 +810,14 @@ mod typed_tests {
     use std::sync::Mutex as StdMutex;
 
     struct ViewSink {
-        activity: PassiveActivityTracker,
+        activity: Arc<PassiveActivityTracker>,
         records: StdMutex<Vec<LifecycleRecord>>,
     }
 
     impl LifecycleSink for ViewSink {
+    fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.activity.clone()) }
         fn emit(&self, record: LifecycleRecord) {
-            self.activity.observe(&record.event);
+            if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.activity.observe(&record.event); }
             self.records.lock().unwrap().push(record);
         }
     }
@@ -829,13 +830,13 @@ mod typed_tests {
     impl Trace {
         fn new() -> Self {
             let sink = Arc::new(ViewSink {
-                activity: PassiveActivityTracker::for_adapter("codex"),
+                activity: Arc::new(PassiveActivityTracker::for_adapter("codex")),
                 records: StdMutex::new(Vec::new()),
             });
             let publisher = Arc::new(Publisher::new(sink.clone()));
             let shared = Arc::new(CodexShared {
-                publisher,
-                turn_tracker: Arc::new(TurnTracker::new()),
+                publisher: Arc::clone(&publisher),
+                runtime_state: Arc::clone(&publisher.runtime_state),
                 task: TaskId("task".into()),
                 launch: LaunchId("launch".into()),
                 session_id: StdMutex::new(Some("thread-1".into())),
@@ -867,7 +868,7 @@ mod typed_tests {
             let batch = self.decode(method, params);
             self.shared
                 .publisher
-                .emit_typed(batch.clone(), &self.shared.turn_tracker);
+                .emit_typed(batch.clone());
             batch
         }
 
@@ -1107,8 +1108,8 @@ mod typed_tests {
             account.disposition(),
             &DecodeDisposition::RecognizedIgnored(IgnoreReason::NoConsumer)
         );
-        assert!(trace.shared.turn_tracker.snapshot().active);
-        assert!(trace.shared.turn_tracker.failure_detail().is_none());
+        assert!(trace.shared.runtime_state.turn_snapshot().active);
+        assert!(trace.shared.runtime_state.native_failure().is_none());
 
         // A usage-limit application error is a native failure observation,
         // never a task failure by itself.
@@ -1125,8 +1126,8 @@ mod typed_tests {
                 ..
             }
         ));
-        assert!(trace.shared.turn_tracker.snapshot().active);
-        assert_eq!(trace.shared.turn_tracker.snapshot().boundary, None);
+        assert!(trace.shared.runtime_state.turn_snapshot().active);
+        assert_eq!(trace.shared.runtime_state.turn_snapshot().boundary, None);
 
         let completed = trace.send(
             "turn/completed",
@@ -1139,8 +1140,8 @@ mod typed_tests {
             panic!("completion did not settle the turn");
         };
         assert_eq!(settlement.outcome, TurnOutcome::Completed);
-        assert!(!trace.shared.turn_tracker.snapshot().active);
-        assert!(trace.shared.turn_tracker.failure_detail().is_none());
+        assert!(!trace.shared.runtime_state.turn_snapshot().active);
+        assert!(trace.shared.runtime_state.native_failure().is_none());
     }
 
     #[test]
@@ -1151,18 +1152,18 @@ mod typed_tests {
             "willRetry": true, "error": {"message": "native cause", "codexErrorInfo": "serverOverloaded"}}));
         let observed = trace
             .shared
-            .turn_tracker
-            .failure_detail()
+            .runtime_state
+            .native_failure()
             .expect("active turn failure");
-        assert!(trace.shared.turn_tracker.snapshot().active);
+        assert!(trace.shared.runtime_state.turn_snapshot().active);
         trace.send("turn/completed", json!({"threadId": "thread-1",
             "turn": {"id": "turn-1", "status": "failed", "error": {"message": "boundary fallback"}}}));
         assert_eq!(
-            trace.shared.turn_tracker.snapshot().boundary,
+            trace.shared.runtime_state.turn_snapshot().boundary,
             Some(crate::TurnBoundary::Failed)
         );
-        assert!(!trace.shared.turn_tracker.snapshot().active);
-        assert_eq!(trace.shared.turn_tracker.failure_detail(), Some(observed));
+        assert!(!trace.shared.runtime_state.turn_snapshot().active);
+        assert_eq!(trace.shared.runtime_state.native_failure(), Some(observed));
     }
 
     #[test]
@@ -1336,7 +1337,7 @@ mod typed_tests {
                 }
             }
         }
-        assert!(trace.shared.turn_tracker.snapshot().active);
+        assert!(trace.shared.runtime_state.turn_snapshot().active);
         assert_eq!(
             trace.sink.activity.snapshot().window_60s.tool_calls_started,
             0
@@ -1661,7 +1662,7 @@ mod typed_tests {
                     expected.as_ref()
                 );
                 assert!(
-                    trace.shared.turn_tracker.snapshot().active,
+                    trace.shared.runtime_state.turn_snapshot().active,
                     "a tool completion does not settle the turn"
                 );
                 let activity = trace.sink.activity.snapshot();

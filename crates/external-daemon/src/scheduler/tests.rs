@@ -447,6 +447,182 @@ mod failure_log_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    // Synthetic command errors with the complete public JSON-RPC shape. No
+    // provider call or quota fault is manufactured by these regressions.
+    struct NativeCommandFactory { error: RuntimeCommandError, bootstrap: bool }
+    struct NativeCommandRuntime { error: RuntimeCommandError, bootstrap: bool }
+    impl RuntimeFactory for NativeCommandFactory {
+        fn spawn(&self, _: &TaskRecord, _: Arc<dyn LifecycleSink>) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Ok(Arc::new(NativeCommandRuntime { error: self.error.clone(), bootstrap: self.bootstrap }))
+        }
+    }
+    impl ManagedRuntime for NativeCommandRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> { None }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            thread::sleep(timeout.min(Duration::from_millis(10))); None
+        }
+        fn bootstrap_session(&self, _: &TaskRecord, _: Duration) -> Result<SessionReady, RuntimeCommandError> {
+            if self.bootstrap { Err(self.error.clone()) } else {
+                Ok(SessionReady { session_id: "native-command-session".into(), initial_turn_id: None, configured_model: None })
+            }
+        }
+        fn resume_session_with_mcp(&self, task: &TaskRecord, _: &[StdioMcpServer], timeout: Duration) -> Result<SessionReady, RuntimeCommandError> {
+            self.bootstrap_session(task, timeout)
+        }
+        fn send_turn(&self, _: &str, _: &str, _: Duration) -> Result<Option<String>, RuntimeCommandError> {
+            Err(self.error.clone())
+        }
+    }
+
+    fn long_command_error() -> serde_json::Value {
+        serde_json::json!({"code":-32031, "message": "native failure\n  保留 details ".repeat(6000),
+            "data":{"apiKey":"private-command-secret", "retryAfter":51, "status":429,
+                "nested":{"stack":"native frame\n".repeat(10000), "futureField":[1,true,"complete"]}}})
+    }
+
+    #[test]
+    fn native_command_bootstrap_and_model_failures_reach_result_and_sync_carrier_without_loss() {
+        let original = long_command_error();
+        for resumed in [false, true] {
+        for error in [
+            RuntimeCommandError::Remote(original.clone()),
+            RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native("invalid response", &original)),
+            RuntimeCommandError::ModelRejected(RuntimeCommandDetail::from_native("model rejected", &original)),
+        ] {
+            let expected = error.native_failure().unwrap();
+            let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+            Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: true });
+            if resumed {
+                let claim = scheduler.store().claim_next("seed-session").unwrap().unwrap();
+                scheduler.store().mark_session_running(&id, claim.owner_epoch, "seed-runtime", None, Some("persisted-session"), None).unwrap();
+                scheduler.store().transition_terminal(&id, claim.owner_epoch, &external_store::TerminalUpdate {
+                    outcome: TaskOutcome::Completed, failure_code: None, failure_message: None,
+                }).unwrap();
+                assert!(scheduler.store().requeue_task_for_resume_with_message(&id, "resume-error", "queue", "continue").unwrap());
+            }
+            let error = scheduler.start_ready().unwrap_err();
+            match error {
+                SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                    assert_eq!(agent_id, id);
+                    assert_eq!(native_failure, Some(expected.clone()));
+                }
+                other => panic!("expected native runtime command carrier, got {other:?}"),
+            }
+            let result = scheduler.store().task_result(&id).unwrap().unwrap();
+            assert_eq!(result.result.outcome, TaskOutcome::Failed);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+            assert!(!result.result.final_text.contains("private-command-secret"));
+            assert!(result.result.final_text.len() > 100_000);
+            let task = scheduler.store().get_task(&id).unwrap().unwrap();
+            assert!(task.reaped_at.is_some());
+            assert!(task.failure_message.unwrap().len() < PERSISTABLE_RECORD_BYTES);
+        }
+        }
+    }
+
+    #[test]
+    fn native_command_send_failure_reaches_failed_result_and_sync_carrier_without_loss() {
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: false });
+        scheduler.start_ready().unwrap();
+        let error = scheduler.send_message(&id, "native-send-error", "queue", "follow up").unwrap_err();
+        match error {
+            SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                assert_eq!(agent_id, id); assert_eq!(native_failure, Some(expected.clone()));
+            }
+            other => panic!("expected native runtime command carrier, got {other:?}"),
+        }
+        let result = await_result(&scheduler, &id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+        assert!(scheduler.store().get_task(&id).unwrap().unwrap().reaped_at.is_some());
+        assert_eq!(scheduler.store().message("native-send-error").unwrap().unwrap().state, MessageState::Failed);
+    }
+
+    #[test]
+    fn native_command_real_rpc_initialization_error_is_complete_in_paged_result() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+        let original = long_command_error();
+        let expected = RuntimeCommandError::Remote(original.clone()).native_failure().unwrap();
+        let replay = tempfile::NamedTempFile::new().unwrap();
+        fs::write(replay.path(), format!("{}\n", serde_json::json!({"id":1,"error":original}))).unwrap();
+        // A replay file preserves a frame larger than shell argument limits.
+        let script = format!("read request; cat '{}'; while read request; do :; done", replay.path().display());
+        let (_directory, scheduler, id) = diagnostic_scheduler(&script);
+        match scheduler.start_ready().unwrap_err() {
+            SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                assert_eq!(agent_id, id); assert_eq!(native_failure, Some(expected.clone()));
+            }
+            other => panic!("expected native error from the real dispatcher, got {other:?}"),
+        }
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let mut text = String::new();
+        let mut offset = 0;
+        let mut pages = 0;
+        loop {
+            let RpcSuccess::TaskResult { result: Some(page), .. } = service.dispatch(RpcMethod::TaskResult {
+                agent_id: id.clone(), offset, limit: 16384,
+            }).unwrap() else { panic!("missing result page") };
+            assert_eq!(page.outcome, TaskOutcome::Failed);
+            text.push_str(&page.final_text); pages += 1;
+            match page.next_offset { Some(next) => offset = next, None => break }
+        }
+        assert!(pages > 10);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), expected.original);
+        assert!(!text.contains("private-command-secret"));
+    }
+
+    #[test]
+    fn native_command_async_start_error_keeps_the_typed_original_and_agent_id() {
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (directory, mut scheduler, _) = diagnostic_scheduler("unused");
+        // The helper already queued one task; leave it queued while the public
+        // submit path claims its own task, as production starter threads do.
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: true });
+        let manifest = GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(), agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(), permission_mode: Some(external_core::PermissionMode::Plan),
+            prompt: "native async failure".into(), write_manifest: vec![],
+        };
+        match scheduler.submit_and_start_general(&manifest, None, &|| false).unwrap_err() {
+            SchedulerError::StartFailed { agent_id, native_failure, .. } => {
+                assert_eq!(native_failure, Some(expected.clone()));
+                let result = scheduler.store().task_result(&agent_id).unwrap().unwrap();
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+            }
+            other => panic!("expected typed StartFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_cooperative_stop_does_not_replace_a_later_native_turn_failure() {
+        let stop_error = serde_json::json!({"code":-32001,"message":"stop refused", "data":{"operation":"stop"}});
+        let turn_error = serde_json::json!({"message":"model failed after the refused stop", "data":{"operation":"model","retryAfter":31}});
+        let script = format!(r#"{RUNNING_PROTOCOL}
+read request
+printf '%s\n' '{}'
+printf '%s\n' '{}'
+while read request; do :; done
+"#, serde_json::json!({"id":4,"error":stop_error}), serde_json::json!({"method":"session/event","params":{"type":"turn.failed","payload":{"error":turn_error}}}));
+        let (_directory, scheduler, id) = diagnostic_scheduler(&script);
+        scheduler.start_ready().unwrap();
+        match scheduler.send_message(&id, "refused-stop", "steer", "new direction").unwrap_err() {
+            SchedulerError::RuntimeCommand { operation: Some("session/stop"), native_failure: Some(failure), .. } => {
+                assert_eq!(failure.original, stop_error);
+            }
+            other => panic!("expected native stop error, got {other:?}"),
+        }
+        let result = await_result(&scheduler, &id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), turn_error);
+    }
+
     fn diagnostic_scheduler(script: &str) -> (tempfile::TempDir, Scheduler, String) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
         fs::create_dir_all(&root).unwrap();
@@ -1667,7 +1843,7 @@ sleep 2
             .as_str()
             .unwrap()
             .contains("ZCODE_RUNTIME_MODEL_UNAVAILABLE"));
-        assert!(record.to_string().contains("secret-value"));
+        assert!(!record.to_string().contains("secret-value"));
         assert!(!record.to_string().contains("must-not-record"));
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
         assert_eq!(result.result.final_text, "completed answer");
@@ -1729,7 +1905,7 @@ sleep 2
             "data": {"api_key": "do-not-copy"}
         }));
         let mut detail: serde_json::Value =
-            serde_json::from_str(&error.diagnostic("session/send")).unwrap();
+            error.diagnostic_fields("session/send");
         detail["cleanup_result"] = "Stopped(Terminated(Signaled(15)))".into();
         let record = runtime_failure_record(
             "a",
@@ -1744,10 +1920,10 @@ sleep 2
         assert_eq!(value["operation"], "session/send");
         assert_eq!(value["cleanup_result"], "Stopped(Terminated(Signaled(15)))");
         let remote_message = value["remote_message"].as_str().unwrap();
-        assert!(remote_message.contains("abc-secret"));
-        assert!(remote_message.contains("def-secret"));
-        assert!(remote_message.contains("quoted secret words"));
-        assert!(remote_message.contains("user:pass"));
+        assert!(!remote_message.contains("abc-secret"));
+        assert!(!remote_message.contains("def-secret"));
+        assert!(!remote_message.contains("quoted secret words"));
+        assert!(!remote_message.contains("user:pass"));
         assert!(!record.contains("do-not-copy"));
         assert!(bounded_prefix(&"界".repeat(5000), 1024).len() <= 1024);
     }
@@ -3041,10 +3217,11 @@ exit 0\n",
             task: &TaskRecord,
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let publisher = Arc::new(Publisher::new(sink));
             Ok(Arc::new(InjectingRuntime {
                 agent_id: task.agent_id.clone(),
-                publisher: Arc::new(Publisher::new(sink)),
-                tracker: Arc::new(TurnTracker::new()),
+                publisher: publisher.clone(),
+                tracker: publisher.runtime_state.clone(),
                 injected: self.injected.clone(),
                 fault_terminal: self.fault_terminal.clone(),
                 calls: Arc::clone(&self.calls),
@@ -3057,7 +3234,7 @@ exit 0\n",
     struct InjectingRuntime {
         agent_id: String,
         publisher: Arc<Publisher>,
-        tracker: Arc<TurnTracker>,
+        tracker: Arc<RuntimeState>,
         injected: RuntimeTerminal,
         fault_terminal: Option<RuntimeTerminal>,
         calls: Arc<AtomicU64>,
@@ -3129,7 +3306,7 @@ exit 0\n",
             })
         }
         fn turn_snapshot(&self) -> TurnSnapshot {
-            self.tracker.snapshot()
+            self.tracker.turn_snapshot()
         }
     }
 
@@ -3269,7 +3446,7 @@ mod turn_adjudication_tests {
 
     struct HarnessRuntime {
         publisher: Arc<Publisher>,
-        tracker: Arc<TurnTracker>,
+        tracker: Arc<RuntimeState>,
         respond_fails: bool,
         response_calls: AtomicU64,
         cleanup_calls: Arc<AtomicU64>,
@@ -3377,7 +3554,7 @@ mod turn_adjudication_tests {
             }
         }
         fn turn_snapshot(&self) -> TurnSnapshot {
-            self.tracker.snapshot()
+            self.tracker.turn_snapshot()
         }
     }
 
@@ -3393,9 +3570,10 @@ mod turn_adjudication_tests {
             _task: &TaskRecord,
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let publisher = Arc::new(Publisher::new(sink));
             let runtime = Arc::new(HarnessRuntime {
-                publisher: Arc::new(Publisher::new(sink)),
-                tracker: Arc::new(TurnTracker::new()),
+                publisher: publisher.clone(),
+                tracker: publisher.runtime_state.clone(),
                 respond_fails: self.respond_fails,
                 response_calls: AtomicU64::new(0),
                 cleanup_calls: Arc::clone(&self.cleanup_calls),
@@ -3551,7 +3729,7 @@ mod turn_adjudication_tests {
                     });
                     runtime
                         .publisher
-                        .emit_typed(adapter.decode(&inbound).unwrap(), &runtime.tracker);
+                        .emit_typed(adapter.decode(&inbound).unwrap());
                 };
                 send(
                     &mut adapter,
@@ -4016,8 +4194,8 @@ mod turn_adjudication_tests {
         let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
         // Latch the fault and complete the turn with no published terminal.
         runtime.emit(Inbound::OversizedLine { bytes });
-        runtime.tracker.observe(&turn_event("turn.started"));
-        runtime.tracker.observe(&turn_event("turn.completed"));
+        runtime.tracker.test_turn(None);
+        runtime.tracker.test_turn(Some(TurnBoundary::Completed));
         release.store(true, Ordering::Release);
 
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
@@ -4074,8 +4252,8 @@ mod turn_adjudication_tests {
 
         let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
         runtime.emit(Inbound::OversizedLine { bytes });
-        runtime.tracker.observe(&turn_event("turn.started"));
-        runtime.tracker.observe(&turn_event("turn.completed"));
+        runtime.tracker.test_turn(None);
+        runtime.tracker.test_turn(Some(TurnBoundary::Completed));
         release.store(true, Ordering::Release);
 
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
@@ -6468,7 +6646,7 @@ mod stopping_settlement_ingress_tests {
         store: Arc<Store>,
         sink: Arc<StoreLifecycleSink>,
         publisher: Publisher,
-        tracker: TurnTracker,
+        tracker: Arc<RuntimeState>,
         lifecycle: Arc<RuntimeLifecycle>,
         id: String,
     }
@@ -6511,8 +6689,8 @@ mod stopping_settlement_ingress_tests {
                 _directory: directory,
                 store,
                 publisher: Publisher::new(sink.clone()),
+                tracker: sink.activity.clone(),
                 sink,
-                tracker: TurnTracker::new(),
                 lifecycle,
                 id,
             };
@@ -6565,11 +6743,11 @@ mod stopping_settlement_ingress_tests {
         }
         fn send(&self, turn: TurnId, facts: Vec<EventFact>) {
             self.publisher
-                .emit_typed(self.batch(turn, facts), &self.tracker);
+                .emit_typed(self.batch(turn, facts));
         }
         fn stop(&self, phase: RuntimeLifecyclePhase) {
             self.store.request_stop(&self.id).unwrap();
-            self.lifecycle.request_stop(&self.tracker.snapshot());
+            self.lifecycle.request_stop(&self.tracker.turn_snapshot());
             self.lifecycle.state.lock().unwrap().phase = phase;
         }
         fn seq(&self) -> u64 {
@@ -6638,7 +6816,7 @@ mod stopping_settlement_ingress_tests {
             );
             assert_eq!(f.seq(), before + 4);
             assert_eq!(f.sink.activity.snapshot().window_60s.tool_calls_failed, 1);
-            assert!(f.tracker.failure_detail().unwrap().contains("interrupted"));
+            assert!(f.tracker.native_failure().unwrap().original.to_string().contains("interrupted"));
             assert!(f.sink.error().is_none());
             assert_eq!(
                 f.lifecycle.state.lock().unwrap().phase,
@@ -6785,9 +6963,7 @@ mod stopping_settlement_ingress_tests {
                     DecodeDisposition::Consumed,
                     events,
                 )
-                .unwrap(),
-                &f.tracker,
-            );
+                .unwrap());
             assert!(
                 f.sink.activity.take_wait_tail().text.is_empty(),
                 "{mismatch}"

@@ -18,7 +18,7 @@ use external_contract::{events::*, WireMessage};
 use external_runtime::Inbound;
 use serde_json::Value;
 
-use crate::{Publisher, RuntimeCommandDetail, RuntimeCommandError, TurnTracker};
+use crate::{Publisher, RuntimeCommandDetail, RuntimeCommandError, RuntimeState};
 
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 
@@ -36,7 +36,7 @@ struct AgyTurnState {
 
 pub(super) struct AgyRuntimeShared {
     pub(super) publisher: Arc<Publisher>,
-    pub(super) turn_tracker: Arc<TurnTracker>,
+    pub(super) runtime_state: Arc<RuntimeState>,
     task: TaskId,
     launch: LaunchId,
     pub(super) session_id: Mutex<Option<String>>,
@@ -52,11 +52,12 @@ pub(super) struct AgyRuntimeShared {
 }
 
 impl AgyRuntimeShared {
-    pub(super) fn new(publisher: Arc<Publisher>, turn_tracker: Arc<TurnTracker>) -> Self {
+    pub(super) fn new(publisher: Arc<Publisher>) -> Self {
+        let runtime_state = Arc::clone(&publisher.runtime_state);
         let (task, launch) = publisher.event_scope();
         Self {
             publisher,
-            turn_tracker,
+            runtime_state,
             task,
             launch,
             session_id: Mutex::new(None),
@@ -115,7 +116,7 @@ impl AgyRuntimeShared {
         // Read pending first. Consumption publishes started before decrement,
         // so no reader can see both the old idle turn and the consumed zero.
         let pending = self.pending_inputs.load(Ordering::Acquire);
-        let mut snapshot = self.turn_tracker.snapshot();
+        let mut snapshot = self.runtime_state.turn_snapshot();
         snapshot.active |= pending > 0;
         snapshot
     }
@@ -454,7 +455,7 @@ impl AgyRuntimeShared {
             .collect();
         let batch = DecodedInput::new(input, Attribution::Current, disposition, events)
             .expect("AGY batch invariant");
-        self.publisher.emit_typed(batch, &self.turn_tracker);
+        self.publisher.emit_typed(batch);
     }
 
     fn ignored(&self, input: NativeInputContext, attribution: Attribution, reason: IgnoreReason) {
@@ -465,7 +466,7 @@ impl AgyRuntimeShared {
             vec![],
         )
         .expect("AGY ignored batch invariant");
-        self.publisher.emit_typed(batch, &self.turn_tracker);
+        self.publisher.emit_typed(batch);
     }
 
     fn invalid(&self, input: NativeInputContext, impact: Impact) {

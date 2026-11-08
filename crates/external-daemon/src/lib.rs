@@ -1,5 +1,5 @@
 use external_contract::{
-    configured_thought_level_from_result, event_type, normalized_scoped_model,
+    configured_thought_level_from_result, normalized_scoped_model,
     normalized_zai_model, offered_permission_response, provider_model_matches,
     set_model_projection_from_result, turn_id_from_result, CatalogModelEntry, CreateSessionParams,
     ResumeSessionParams, RuntimePreferences, SendParams, SessionCreateProjection, SessionParams,
@@ -58,7 +58,7 @@ pub mod rpc;
 mod runtime_owner;
 mod scheduler;
 pub mod zcode;
-mod typed_inbound;
+mod runtime_state;
 use external_core::{
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
@@ -284,7 +284,8 @@ pub struct RuntimeCommandDetail {
 impl RuntimeCommandDetail {
     pub fn from_native(message: impl Into<String>, original: &serde_json::Value) -> Self {
         Self {
-            message: message.into(),
+            message: scheduler::redact_native_error(&serde_json::Value::String(message.into()))
+                .as_str().expect("redacted string").to_owned(),
             native_failure: Some(external_contract::events::NativeFailure {
                 original: scheduler::redact_native_error(original),
                 projection: None,
@@ -365,18 +366,19 @@ impl RuntimeCommandError {
         }
     }
 
-    fn diagnostic(&self, operation: &str) -> String {
+    /// Bounded local diagnostic fields. The independent typed carrier owns
+    /// the full original and is passed to RuntimeState/results separately.
+    fn diagnostic_fields(&self, operation: &str) -> serde_json::Value {
         let mut detail = serde_json::json!({"operation": operation, "message": bounded_error(&self.to_string())});
-        if let Self::Remote(value) = self {
-            detail["remote_code"] = value.get("code").and_then(serde_json::Value::as_i64).into();
-            detail["remote_message"] = value
-                .get("message")
+        if let Some(failure) = self.native_failure() {
+            detail["remote_code"] = failure.original.get("code").cloned().unwrap_or_default();
+            detail["remote_message"] = failure.original.get("message")
                 .and_then(serde_json::Value::as_str)
-                .map(|message| bounded_prefix(message, 1024))
-                .into();
+                .map(|message| bounded_prefix(message, 1024)).into();
         }
-        detail.to_string()
+        detail
     }
+
 }
 
 // Legacy diagnostic formatting stays bounded; native_failure() retains the original separately.
@@ -392,149 +394,23 @@ impl From<RequestError> for RuntimeCommandError {
     }
 }
 
-#[derive(Debug)]
-struct TurnTrackerState {
+#[derive(Debug, Default)]
+struct TurnReduction {
+    turn_id: Option<external_contract::events::TurnId>,
     generation: u64,
     active: bool,
     boundary: Option<TurnBoundary>,
-    failure: Option<serde_json::Value>,
+    failure: Option<external_contract::events::NativeFailure>,
     model_request_started_at: Option<Instant>,
     last_stream_activity_at: Option<Instant>,
 }
 
-pub(crate) struct TurnTracker {
-    state: Mutex<TurnTrackerState>,
+/// Common in-memory reduction owner. Internal activity algorithms share this
+/// lock with turn/error state; no process, RPC or persistence callback runs here.
+pub struct RuntimeState {
+    state: Mutex<activity_tracker::RuntimeStateData>,
     changed: Condvar,
-}
-impl TurnTracker {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Mutex::new(TurnTrackerState {
-                generation: 0,
-                active: false,
-                boundary: None,
-                failure: None,
-                model_request_started_at: None,
-                last_stream_activity_at: None,
-            }),
-            changed: Condvar::new(),
-        }
-    }
-
-    pub(crate) fn observe(&self, inbound: &Inbound) {
-        let mut state = self.state.lock().unwrap();
-        if state.active {
-            state.last_stream_activity_at = Some(Instant::now());
-        }
-        let Inbound::Message(WireMessage::Event(event)) = inbound else {
-            return;
-        };
-        let Some(kind) = event_type(event) else {
-            return;
-        };
-        match kind {
-            "turn.started" => {
-                let now = Instant::now();
-                state.generation = state.generation.saturating_add(1);
-                state.active = true;
-                state.boundary = None;
-                state.failure = None;
-                state.model_request_started_at = Some(now);
-                state.last_stream_activity_at = Some(now);
-            }
-            "turn.completed" if state.active => {
-                state.active = false;
-                state.boundary = Some(TurnBoundary::Completed);
-                state.model_request_started_at = None;
-                state.last_stream_activity_at = None;
-            }
-            "turn.failed" if state.active => {
-                state.active = false;
-                state.failure = scheduler::turn_failure_detail(&event.params);
-                state.boundary = Some(TurnBoundary::Failed);
-                state.model_request_started_at = None;
-                state.last_stream_activity_at = None;
-            }
-            _ => return,
-        }
-        self.changed.notify_all();
-    }
-
-    pub(crate) fn failure_detail(&self) -> Option<String> {
-        self.state.lock().unwrap().failure.as_ref().map(ToString::to_string)
-    }
-
-    pub(crate) fn snapshot(&self) -> TurnSnapshot {
-        let state = self.state.lock().unwrap();
-        TurnSnapshot {
-            generation: state.generation,
-            active: state.active,
-            boundary: state.boundary,
-        }
-    }
-
-    pub(crate) fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        let state = self.state.lock().unwrap();
-        let now = Instant::now();
-        RuntimeActivitySnapshot {
-            turn: TurnSnapshot {
-                generation: state.generation,
-                active: state.active,
-                boundary: state.boundary,
-            },
-            model_request_elapsed: state
-                .model_request_started_at
-                .and_then(|started| now.checked_duration_since(started)),
-            transport_idle_elapsed: state
-                .last_stream_activity_at
-                .and_then(|activity| now.checked_duration_since(activity)),
-        }
-    }
-
-    fn wait_started_after(
-        &self,
-        previous_generation: u64,
-        timeout: Duration,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        self.wait_until(timeout, |state| state.generation > previous_generation)
-    }
-
-    pub(crate) fn wait_boundary_after(
-        &self,
-        generation: u64,
-        timeout: Duration,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        self.wait_until(timeout, |state| {
-            state.generation >= generation && !state.active && state.boundary.is_some()
-        })
-    }
-
-    fn wait_until(
-        &self,
-        timeout: Duration,
-        predicate: impl Fn(&TurnTrackerState) -> bool,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if predicate(&state) {
-                return Ok(TurnSnapshot {
-                    generation: state.generation,
-                    active: state.active,
-                    boundary: state.boundary,
-                });
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RuntimeCommandError::Timeout);
-            }
-            let (next, result) = self.changed.wait_timeout(state, deadline - now).unwrap();
-            state = next;
-            if result.timed_out() && !predicate(&state) {
-                return Err(RuntimeCommandError::Timeout);
-            }
-        }
-    }
+    mode: ToolActivityMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,9 +432,13 @@ pub trait LifecycleSink: Send + Sync + 'static {
     fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> { None }
     fn emit(&self, record: LifecycleRecord);
 
-    /// One native input's ordered facts. Sinks may hold their admission latch
-    /// across the complete batch; ordinary sinks retain per-record delivery.
+    /// The state created before spawn and shared with this launch's owner.
+    fn runtime_state(&self) -> Option<Arc<RuntimeState>> { None }
+
+    /// One native input's ordered facts. Sinks with admission gates override
+    /// this to reduce only accepted batches, before persistence callbacks.
     fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
+        if let Some(runtime) = self.runtime_state() { runtime.reduce_batch(events); }
         for event in events {
             self.emit(LifecycleRecord {
                 sequence: event.context.sequence,
@@ -611,6 +491,7 @@ impl TerminalLatch<'_> {
 }
 
 pub(crate) struct Publisher {
+    runtime_state: Arc<RuntimeState>,
     sink: Arc<dyn LifecycleSink>,
     state: Mutex<PublisherState>,
     changed: Condvar,
@@ -618,7 +499,9 @@ pub(crate) struct Publisher {
 
 impl Publisher {
     pub(crate) fn new(sink: Arc<dyn LifecycleSink>) -> Self {
+        let runtime_state = sink.runtime_state().unwrap_or_else(|| Arc::new(RuntimeState::new()));
         Self {
+            runtime_state,
             sink,
             state: Mutex::new(PublisherState {
                 next_sequence: 1,
@@ -641,6 +524,7 @@ impl Publisher {
     }
 
     pub(crate) fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
+        if matches!(event, Inbound::Lifecycle { .. }) { return; }
         let mut state = self.state.lock().unwrap();
         if matches!(state.owner, OwnerState::Terminal(_)) {
             return;
@@ -757,7 +641,7 @@ pub struct RuntimeOwner {
     driver: Arc<Driver>,
     publisher: Arc<Publisher>,
     shutdown_pump: Arc<AtomicBool>,
-    turn_tracker: Arc<TurnTracker>,
+    runtime_state: Arc<RuntimeState>,
     session_id: Mutex<Option<String>>,
     diagnostic_session_id: Mutex<Option<String>>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
@@ -868,20 +752,20 @@ impl RuntimeOwner {
         let driver = Arc::new(Driver::spawn_with_model(command, model)?);
         let publisher = Arc::new(Publisher::new(sink));
         let shutdown_pump = Arc::new(AtomicBool::new(false));
-        let turn_tracker = Arc::new(TurnTracker::new());
+        let runtime_state = Arc::clone(&publisher.runtime_state);
         let permission_responses = Arc::new(Mutex::new(OfferedPermissionCache::default()));
         spawn_event_pump(
             Arc::clone(&driver),
             Arc::clone(&publisher),
             Arc::clone(&shutdown_pump),
-            Arc::clone(&turn_tracker),
+            Arc::clone(&runtime_state),
             Arc::clone(&permission_responses),
         );
         Ok(Self {
             driver,
             publisher,
             shutdown_pump,
-            turn_tracker,
+            runtime_state,
             session_id: Mutex::new(None),
             diagnostic_session_id: Mutex::new(None),
             permission_responses,
@@ -1230,7 +1114,7 @@ impl RuntimeOwner {
         deadline: Instant,
     ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let previous = self.turn_tracker.snapshot().generation;
+        let previous = self.runtime_state.turn_snapshot().generation;
         let params = serde_json::to_value(SendParams {
             session_id,
             content,
@@ -1244,7 +1128,7 @@ impl RuntimeOwner {
             .as_ref()
             .and_then(turn_id_from_result)
             .map(str::to_owned);
-        self.turn_tracker
+        self.runtime_state
             .wait_started_after(previous, remaining_runtime_time(deadline)?)?;
         Ok(turn_id)
     }
@@ -1256,7 +1140,7 @@ impl RuntimeOwner {
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         let deadline = Instant::now() + timeout;
         self.validate_session(session_id)?;
-        let current = self.turn_tracker.snapshot();
+        let current = self.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -1265,7 +1149,7 @@ impl RuntimeOwner {
         self.driver
             .request(SESSION_STOP, params, remaining_runtime_time(deadline)?)?;
         let boundary = self
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_runtime_time(deadline)?)?;
         self.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -1337,7 +1221,7 @@ impl RuntimeOwner {
     }
 
     pub fn turn_snapshot(&self) -> TurnSnapshot {
-        self.turn_tracker.snapshot()
+        self.runtime_state.turn_snapshot()
     }
 
     pub fn stop_boundary_count(&self) -> u64 {
@@ -1565,7 +1449,7 @@ fn spawn_event_pump(
     driver: Arc<Driver>,
     publisher: Arc<Publisher>,
     shutdown: Arc<AtomicBool>,
-    turn_tracker: Arc<TurnTracker>,
+    runtime_state: Arc<RuntimeState>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
 ) {
     let (task_id, launch_id) = publisher.event_scope();
@@ -1597,7 +1481,7 @@ fn spawn_event_pump(
                     }
                 }
                 if let Some(batch) = adapter.decode(&event) {
-                    publisher.emit_typed(batch, &turn_tracker);
+                    publisher.emit_typed(batch);
                     continue;
                 }
                 // Transport lifecycle markers duplicate the typed native boundary.
@@ -1610,12 +1494,12 @@ fn spawn_event_pump(
                     Inbound::ChildExited(exit) => {
                         match observe_process_group(driver.identity().pgid) {
                             Ok(members) if members.is_empty()
-                                && turn_tracker.snapshot().boundary == Some(TurnBoundary::Failed) => {
+                                && runtime_state.turn_snapshot().boundary == Some(TurnBoundary::Failed) => {
                                 Some(RuntimeTerminal::FailedTurn(StopOutcome::AlreadyExited(exit.clone())))
                             }
                             Ok(members) if members.is_empty() => match exit {
                                 ChildExit::Exited(Some(0)) => {
-                                    let turn = turn_tracker.snapshot();
+                                    let turn = runtime_state.turn_snapshot();
                                     if !turn.active
                                         && turn.boundary == Some(TurnBoundary::Completed)
                                     {
@@ -2346,25 +2230,5 @@ mod task_route_tests {
             Err(message) => assert_eq!(message, "stored general preparation is invalid"),
             Ok(_) => panic!("legacy prepared launch must not route"),
         }
-    }
-}
-
-#[cfg(test)]
-mod turn_failure_continuity_tests {
-    use super::*;
-
-    #[test]
-    fn new_turn_clears_previous_public_failure() {
-        let tracker = TurnTracker::new();
-        let event = |params| Inbound::Message(WireMessage::Event(external_contract::EventEnvelope {
-            method: "session/event".into(), params,
-        }));
-        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
-        tracker.observe(&event(serde_json::json!({"type":"turn.failed","payload":{"reason_code":"network failure"}})));
-        assert!(tracker.failure_detail().unwrap().contains("network failure"));
-        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
-        assert!(tracker.failure_detail().is_none());
-        tracker.observe(&event(serde_json::json!({"type":"turn.failed"})));
-        assert!(tracker.failure_detail().is_none());
     }
 }

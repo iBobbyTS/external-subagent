@@ -69,8 +69,8 @@ pub(crate) fn lifecycle_projection(
             "redacted",
         ),
         RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { .. })) => (
-            "raw.unknown",
-            serde_json::json!({"kind": "unknown_event", "raw": "[REDACTED]"}),
+            "driver.notification",
+            serde_json::json!({"kind": "notification", "raw": "[REDACTED]"}),
             "redacted",
         ),
         RuntimeEvent::Driver(Inbound::Lifecycle {

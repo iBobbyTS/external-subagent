@@ -134,6 +134,7 @@ impl Scheduler {
                     .failure_message
                     .unwrap_or_else(|| "task terminated before establishment".into());
                 return Err(SchedulerError::StartFailed {
+                    native_failure: self.native_failure_for(&agent_id),
                     agent_id,
                     reason,
                     message,
@@ -258,6 +259,7 @@ impl Scheduler {
                         .failure_message
                         .unwrap_or_else(|| "task terminated before establishment".into());
                     return Err(SchedulerError::StartFailed {
+                    native_failure: self.native_failure_for(&agent_id),
                         agent_id,
                         reason,
                         message,

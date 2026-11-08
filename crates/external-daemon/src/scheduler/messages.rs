@@ -49,6 +49,8 @@ impl Scheduler {
         })();
         match delivery {
             Ok(turn_id) => {
+                let shared = self.inner.state.lock().unwrap().active.get(agent_id).map(|active| Arc::clone(&active.sink.activity));
+                if let Some(shared) = shared { shared.clear_command_failure(); }
                 if !self
                     .inner
                     .store
@@ -62,7 +64,13 @@ impl Scheduler {
                 Ok(self.inner.store.message(&message.message_id)?)
             }
             Err(error) => {
-                let detail = error.diagnostic(operation);
+                let detail = error.diagnostic_fields(operation).to_string();
+                let native_failure = error.native_failure();
+                if operation == "session/send" {
+                    if let Some(failure) = native_failure.clone() {
+                        self.record_command_failure(agent_id, failure);
+                    }
+                }
                 self.record_runtime_failure(
                     agent_id,
                     Some(session_id),
@@ -77,6 +85,8 @@ impl Scheduler {
                 Err(SchedulerError::RuntimeCommand {
                     agent_id: agent_id.into(),
                     message: detail,
+                    operation: Some(operation),
+                    native_failure,
                 })
             }
         }
@@ -114,7 +124,7 @@ impl Scheduler {
             )));
         }
         if self.inner.draining.load(Ordering::Acquire) {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: agent_id.into(),
                 message: "daemon_draining".into(),
             });
@@ -124,7 +134,7 @@ impl Scheduler {
         })?;
         let adapter = task_agent(&task);
         if mode == "steer" && matches!(adapter.as_str(), "dsh" | "agy") {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: agent_id.into(),
                 message: "steer_unsupported".into(),
             });
@@ -173,7 +183,7 @@ impl Scheduler {
                 },
             );
         }
-        if let Some((_, runtime, session_id, _, runtime_lifecycle)) = active {
+        if let Some((owner_epoch, runtime, session_id, _, runtime_lifecycle)) = active {
             let native_queue = matches!(adapter.as_str(), "codex" | "agy");
             if mode == "steer" || native_queue || !runtime.turn_snapshot().active {
                 // FIFO 消费 es 暂存；不得把较早消息的完成回执错认成此次请求。
@@ -186,17 +196,23 @@ impl Scheduler {
                     if !native_queue && mode == "queue" && runtime.turn_snapshot().active {
                         break;
                     }
-                    if self
-                        .deliver_next_message(
-                            agent_id,
-                            &session_id,
-                            &runtime,
-                            &runtime_lifecycle,
-                            deadline,
-                        )?
-                        .is_none()
-                    {
-                        break;
+                    match self.deliver_next_message(agent_id, &session_id, &runtime, &runtime_lifecycle, deadline) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            // A native command rejection owns a complete error
+                            // result. Local validation (for example a foreign
+                            // injected-turn echo) keeps its existing receipt-only
+                            // behavior and does not close a healthy session.
+                            // A refused cooperative stop likewise leaves the
+                            // existing turn running; only a rejected send owns
+                            // this failure-result transition.
+                            if matches!(&error, SchedulerError::RuntimeCommand { native_failure: Some(_), operation: Some("session/send"), .. }) {
+                                self.fail_closed_control(agent_id, owner_epoch, &runtime, deadline,
+                                    "SESSION_SEND_FAILED", error.to_string())?;
+                            }
+                            return Err(error);
+                        }
                     }
                 }
                 if self
@@ -245,7 +261,7 @@ impl Scheduler {
             && !task.close_requested
             && task.closed_at.is_none();
         if !eligible {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: agent_id.into(),
                 message: "TERMINAL_SEND_UNSUPPORTED".into(),
             });
@@ -255,7 +271,7 @@ impl Scheduler {
             .store
             .requeue_task_for_resume_with_message(agent_id, message_id, mode, content)?
         {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: agent_id.into(),
                 message: "TERMINAL_SEND_UNSUPPORTED".into(),
             });
@@ -327,7 +343,7 @@ impl Scheduler {
             } else {
                 "runtime is not active"
             };
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: agent_id.into(),
                 message: reason.into(),
             });
@@ -431,7 +447,9 @@ impl Scheduler {
             self.inner
                 .store
                 .release_pending_response(agent_id, request_id)?;
-            let scheduler_error = SchedulerError::RuntimeCommand {
+            let native_failure = error.native_failure();
+            if let Some(failure) = native_failure.clone() { self.record_command_failure(agent_id, failure); }
+            let scheduler_error = SchedulerError::RuntimeCommand { operation: None, native_failure,
                 agent_id: agent_id.into(),
                 message: error.to_string(),
             };

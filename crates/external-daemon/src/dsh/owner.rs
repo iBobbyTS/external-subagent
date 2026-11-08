@@ -27,7 +27,7 @@ use super::session::{dsh_session_detail, remaining_time};
 use super::transport::spawn_dsh_pump;
 use crate::{
     LifecycleSink, ManagedRuntime, ProcessIdentity, Publisher, RuntimeCommandError, RuntimeLoss,
-    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot, TurnTracker,
+    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot,
 };
 
 pub struct DshRuntimeOwner {
@@ -76,7 +76,7 @@ impl DshRuntimeOwner {
         let (task, launch) = publisher.event_scope();
         let shared = Arc::new(DshRuntimeShared {
             publisher: Arc::clone(&publisher),
-            turn_tracker: Arc::new(TurnTracker::new()),
+            runtime_state: Arc::clone(&publisher.runtime_state),
             task,
             launch,
             offers: Mutex::new(OfferCache::default()),
@@ -176,8 +176,8 @@ impl ManagedRuntime for DshRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
-    fn diagnostic_failure(&self) -> Option<String> {
-        self.shared.turn_tracker.failure_detail()
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        self.shared.runtime_state.native_failure()
     }
 
     fn diagnostic_tail(&self) -> String {
@@ -218,7 +218,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         timeout: Duration,
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let current = self.shared.turn_tracker.snapshot();
+        let current = self.shared.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -233,7 +233,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         }
         let boundary = self
             .shared
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_time(deadline)?)?;
         self.shared.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -297,11 +297,11 @@ impl ManagedRuntime for DshRuntimeOwner {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.shared.turn_tracker.snapshot()
+        self.shared.runtime_state.turn_snapshot()
     }
 
     fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.turn_tracker.activity_snapshot()
+        self.shared.runtime_state.activity_snapshot()
     }
 
     fn stop_boundary_count(&self) -> u64 {

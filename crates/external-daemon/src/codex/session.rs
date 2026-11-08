@@ -200,7 +200,7 @@ impl CodexRuntimeOwner {
         input: &str,
         deadline: Instant,
     ) -> Result<Option<String>, RuntimeCommandError> {
-        let previous = self.shared.turn_tracker.snapshot().generation;
+        let previous = self.shared.runtime_state.turn_snapshot().generation;
         let params = turn_start_params(thread_id, model, admitted_effort, input);
         // A started notification is attributable only while the start
         // request it answers is in flight; the flag closes on every exit so
@@ -249,7 +249,7 @@ impl CodexRuntimeOwner {
         let turn_id = turn_start_response_turn_id(response.result.as_ref())
             .map_err(|error| response_error(error, &response))?;
         self.shared
-            .turn_tracker
+            .runtime_state
             .wait_started_after(previous, remaining_time(deadline)?)?;
         // The turn the provider started must be the turn it acknowledged in
         // the start response; a mismatch means stale or foreign traffic won

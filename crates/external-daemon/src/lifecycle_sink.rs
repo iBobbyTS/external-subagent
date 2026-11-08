@@ -3,7 +3,7 @@ use crate::{
     LifecycleRecord, LifecycleSink, RuntimeEvent, RuntimeLifecycle, RuntimeLifecyclePhase,
     RuntimeTerminal,
 };
-use external_contract::events::{EventFact, NormalizedEvent, TurnId};
+use external_contract::events::{EventFact, NormalizedEvent};
 use crate::scheduler::RuntimeLifecycleSnapshot;
 use external_contract::{
     WireMessage, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
@@ -52,8 +52,6 @@ struct SinkWriteState {
     pending_terminal_sequence: Option<u64>,
     terminal_written: bool,
     transport_failure: Option<TransportFrameLimit>,
-    // Admission correlation only; the typed reducer still owns turn state.
-    active_typed_turn: Option<TurnId>,
 }
 
 /// The first transport fault observed by the shared sink.
@@ -358,7 +356,7 @@ impl StoreLifecycleSink {
     /// turn. A complete batch must end at its sole boundary, use this claim's
     /// identity throughout, and contain no new session/turn/input admission.
     fn accepts_stopping_settlement(&self, events: &[NormalizedEvent]) -> bool {
-        let Some(active) = self.write_state.lock().unwrap().active_typed_turn.clone() else {
+        let Some(active) = self.activity.active_turn_id() else {
             return false;
         };
         let Some(NormalizedEvent { fact: EventFact::TurnSettled(settlement), .. }) = events.last() else {
@@ -397,30 +395,14 @@ impl StoreLifecycleSink {
         if let Some(hook) = self.after_admission_hook.lock().unwrap().clone() {
             hook();
         }
-        self.activity.observe(&record.event);
+        if !matches!(record.event, RuntimeEvent::Normalized(_)) {
+            self.activity.observe(&record.event);
+        }
         let mut state = self.write_state.lock().unwrap();
         if state.first_error.is_some() {
             return;
         }
         state.last_source_sequence = state.last_source_sequence.max(record.sequence);
-        if let RuntimeEvent::Normalized(event) = &record.event {
-            let (task, launch) = self.event_scope().expect("store scope");
-            if event.context.task_id == task && event.context.launch_id == launch {
-                match &event.fact {
-                    EventFact::TurnStarted { turn_id }
-                        if event.context.turn_id.as_ref() == Some(turn_id) =>
-                    {
-                        state.active_typed_turn = Some(turn_id.clone());
-                    }
-                    EventFact::TurnSettled(settlement)
-                        if state.active_typed_turn.as_ref() == Some(&settlement.turn_id) =>
-                    {
-                        state.active_typed_turn = None;
-                    }
-                    _ => {}
-                }
-            }
-        }
         // Latch the first transport fault while its oversized-frame record is
         // persisted. Latching is a pure write under the sink's own state lock:
         // it never publishes a terminal and never re-enters stop, so the
@@ -583,6 +565,8 @@ impl StoreLifecycleSink {
 }
 
 impl LifecycleSink for StoreLifecycleSink {
+    fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(Arc::clone(&self.activity)) }
+
     fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> {
         Some((external_contract::events::TaskId(self.agent_id.clone()),
             external_contract::events::LaunchId(format!("{}:{}", self.agent_id, self.owner_epoch))))
@@ -612,6 +596,7 @@ impl LifecycleSink for StoreLifecycleSink {
             lifecycle.reject_late_event();
             return;
         }
+        self.activity.reduce_batch(events);
         // Keep one admission decision through the whole native batch. In
         // particular, neither stop nor terminalization can split its text
         // from the boundary, and accepting the boundary clears its correlation.

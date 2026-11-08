@@ -718,9 +718,7 @@ fn publisher_latched_snapshot_does_not_wait_for_native_input_write() {
     use std::sync::mpsc;
 
     let shared = Arc::new(AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
-        Arc::new(crate::TurnTracker::new()),
-    ));
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink)))));
     let (writing, write_started) = mpsc::channel();
     let (release_write, write_released) = mpsc::channel();
     let writer_shared = Arc::clone(&shared);
@@ -792,9 +790,7 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
         Arc::new(crate::Publisher::new(Arc::new(PausedSettlementSink {
             publishing,
             release: Mutex::new(Some(publication_released)),
-        }))),
-        Arc::new(crate::TurnTracker::new()),
-    ));
+        })))));
     shared.begin_turn();
     shared.buffer_input(|| Ok(())).unwrap();
     let result = |count| {
@@ -837,11 +833,9 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
 #[test]
 fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
     use super::events::AgyRuntimeShared;
-    let tracker = Arc::new(crate::TurnTracker::new());
-    let shared = AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
-        tracker.clone(),
-    );
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(NoopSink)));
+    let tracker = Arc::clone(&publisher.runtime_state);
+    let shared = AgyRuntimeShared::new(publisher);
     shared.begin_turn();
     shared.buffer_input(|| Ok(())).unwrap();
     let result = |count| {
@@ -849,10 +843,10 @@ fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
     };
     shared.project_event(&result(1));
     assert!(shared.turn_snapshot().active);
-    let first = tracker.snapshot();
+    let first = tracker.turn_snapshot();
     assert_eq!(first.boundary, Some(crate::TurnBoundary::Completed));
     shared.project_event(&result(1));
-    assert_eq!(tracker.snapshot(), first);
+    assert_eq!(tracker.turn_snapshot(), first);
     shared.project_event(&result(2));
     let second = shared.turn_snapshot();
     assert!(!second.active);
@@ -1028,8 +1022,9 @@ impl Default for AgyFactSink {
     }
 }
 impl LifecycleSink for AgyFactSink {
+    fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.1.clone()) }
     fn emit(&self, record: crate::LifecycleRecord) {
-        self.1.observe(&record.event);
+        if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.1.observe(&record.event); }
         self.0.lock().unwrap().push(record.event);
     }
 }
@@ -1049,9 +1044,7 @@ impl AgyFactSink {
 fn agy_fact_probe() -> (super::events::AgyRuntimeShared, Arc<AgyFactSink>) {
     let sink = Arc::new(AgyFactSink::default());
     let shared = super::events::AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(sink.clone())),
-        Arc::new(crate::TurnTracker::new()),
-    );
+        Arc::new(crate::Publisher::new(sink.clone())));
     shared.begin_turn();
     (shared, sink)
 }
@@ -1198,9 +1191,7 @@ fn observed_result_error_is_preserved_and_acp_remains_unsupported() {
 #[test]
 fn synthetic_admission_error_retains_complete_redacted_native_failure() {
     let shared = super::events::AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
-        Arc::new(crate::TurnTracker::new()),
-    );
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink))));
     let reason = format!(
         "invalid model selection {} api_key=secret-value",
         "detail ".repeat(500)
@@ -1251,9 +1242,7 @@ fn buffered_start_is_published_before_pending_input_is_consumed() {
         Arc::new(crate::Publisher::new(Arc::new(PausedStartSink {
             started,
             release: Mutex::new(resumed),
-        }))),
-        Arc::new(crate::TurnTracker::new()),
-    ));
+        })))));
     shared.begin_turn();
     shared.buffer_input(|| Ok(())).unwrap();
     feed_agy(
@@ -1276,8 +1265,8 @@ fn buffered_start_is_published_before_pending_input_is_consumed() {
         "pending input was consumed before started reached the tracker"
     );
     assert_eq!(
-        snapshot.generation, 1,
-        "paused publication should precede tracker reduction"
+        snapshot.generation, 2,
+        "the shared reducer applies started before sink callbacks"
     );
     assert_eq!(shared.turn_snapshot().generation, 2);
     assert!(shared.turn_snapshot().active);
@@ -1501,6 +1490,7 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
         facts: Arc<AgyFactSink>,
     }
     impl LifecycleSink for CapturedSink {
+        fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { self.delegate.runtime_state() }
         fn event_scope(
             &self,
         ) -> Option<(
@@ -1514,7 +1504,9 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
             self.delegate.emit(record);
         }
         fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
-            self.facts.emit_normalized_batch(events);
+            for event in events {
+                self.facts.0.lock().unwrap().push(crate::RuntimeEvent::Normalized(event.clone()));
+            }
             self.delegate.emit_normalized_batch(events);
         }
     }

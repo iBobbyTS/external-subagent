@@ -24,7 +24,7 @@ impl DshRuntimeOwner {
     /// which applies it strictly after every frame that preceded the
     /// response on the wire has been projected.
     pub(super) fn send_prompt(&self, prompt: &str) -> Result<(), RuntimeCommandError> {
-        let snapshot = self.shared.turn_tracker.snapshot();
+        let snapshot = self.shared.runtime_state.turn_snapshot();
         if snapshot.active {
             return Err(RuntimeCommandError::InvalidSession(
                 "a prompt is already in flight for this dsh session".into(),

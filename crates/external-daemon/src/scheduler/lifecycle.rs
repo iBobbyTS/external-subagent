@@ -135,6 +135,21 @@ impl Scheduler {
             &adapter,
             claim.owner_epoch,
         ));
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            // The wait text stream is per-task, not per-claim: a follow-up or
+            // resume replaces the tracker, so the incoming one must inherit the
+            // old window and byte cursors. Both the read of the old tracker and
+            // the map replacement happen under this one state lock, so a wait
+            // cannot advance the old cursor between them and be re-delivered by
+            // the new tracker.
+            if let Some(previous) = state.activities.get(&claim.task.agent_id).cloned() {
+                activity.inherit_wait_text(&previous);
+            }
+            state
+                .activities
+                .insert(claim.task.agent_id.clone(), Arc::clone(&activity));
+        }
         let sink = Arc::new(StoreLifecycleSink::new(
             Arc::clone(&self.inner.store),
             claim.task.agent_id.clone(),
@@ -264,6 +279,9 @@ impl Scheduler {
                     }
                 }
                 let message = error.to_string();
+                let native_failure = error.native_failure();
+                if let Some(failure) = native_failure.clone() { sink.activity.record_command_failure(failure); }
+                let result_text = native_failure.as_ref().map(|failure| failure.original.to_string()).unwrap_or_else(|| message.clone());
                 let terminal = runtime.stop(self.inner.config.stop_grace);
                 let resources_reaped = terminal_proves_process_group_reaped(&terminal);
                 let (outcome, code) = (
@@ -290,14 +308,14 @@ impl Scheduler {
                     UnstartedTerminal {
                         outcome,
                         reason_code: code,
-                        message: &message,
+                        message: &result_text,
                         failure_message: Some(failure_message),
                     },
                     resources_reaped,
                 ) {
                     self.record_failure(&claim.task.agent_id, store_error.to_string());
                 }
-                return Err(SchedulerError::RuntimeCommand {
+                return Err(SchedulerError::RuntimeCommand { operation: None, native_failure,
                     agent_id: claim.task.agent_id,
                     message,
                 });
@@ -350,7 +368,7 @@ impl Scheduler {
                 ) {
                     self.record_failure(&claim.task.agent_id, error.to_string());
                 }
-                return Err(SchedulerError::RuntimeCommand {
+                return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                     agent_id: claim.task.agent_id,
                     message: message.into(),
                 });
@@ -369,18 +387,6 @@ impl Scheduler {
         {
             let mut state = self.inner.state.lock().unwrap();
             state.starting.remove(&claim.task.agent_id);
-            // The wait text stream is per-task, not per-claim: a follow-up or
-            // resume replaces the tracker, so the incoming one must inherit the
-            // old window and byte cursors. Both the read of the old tracker and
-            // the map replacement happen under this one state lock, so a wait
-            // cannot advance the old cursor between them and be re-delivered by
-            // the new tracker.
-            if let Some(previous) = state.activities.get(&claim.task.agent_id).cloned() {
-                activity.inherit_wait_text(&previous);
-            }
-            state
-                .activities
-                .insert(claim.task.agent_id.clone(), Arc::clone(&activity));
             state.active.insert(
                 claim.task.agent_id.clone(),
                 ActiveRuntime {
@@ -748,7 +754,7 @@ impl Scheduler {
                 (active.owner_epoch == owner_epoch).then(|| Arc::clone(&active.sink))
             })
         }
-        .ok_or_else(|| SchedulerError::RuntimeCommand {
+        .ok_or_else(|| SchedulerError::RuntimeCommand { operation: None, native_failure: None,
             agent_id: agent_id.into(),
             message: "active runtime disappeared during fail-closed control cleanup".into(),
         })?;
@@ -806,15 +812,14 @@ impl Scheduler {
                     };
                     (outcome, "RUNTIME_TERMINAL".into())
                 });
-                let native_failure = runtime.diagnostic_failure()
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok());
-                let original_error = native_failure.as_ref().and_then(|value| value.get("original_error"));
+                let native_failure = sink.activity.native_failure().or_else(|| runtime.native_failure());
+                let original_error = native_failure.as_ref().map(|failure| &failure.original);
                 let routed_failure_message = if !matches!(
                     outcome,
                     CompletionOutcome::Completed | CompletionOutcome::Cancelled
                 ) {
                     let session_id = self.active_session(agent_id).map(|active| active.2);
-                    let failure_message = failure_message.or_else(|| native_failure.as_ref().map(ToString::to_string));
+                    let failure_message = failure_message.or_else(|| native_failure.as_ref().map(|failure| scheduler::native_failure_detail(&failure.original).to_string()));
                     let message = if let Some(cause) = failure_message {
                         let mut detail = serde_json::from_str::<serde_json::Value>(&cause)
                             .ok()

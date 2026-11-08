@@ -23,7 +23,7 @@ use external_contract::{
 use external_runtime::Inbound;
 use serde_json::Value;
 
-use crate::{Publisher, TurnTracker};
+use crate::{Publisher, RuntimeState};
 
 const MAX_TRACKED_TOOLS: usize = 128;
 
@@ -55,7 +55,7 @@ pub(super) const REMOTE_ERROR_REASON: &str = "ACP_REMOTE_ERROR";
 
 pub(super) struct DshRuntimeShared {
     pub(super) publisher: Arc<Publisher>,
-    pub(super) turn_tracker: Arc<TurnTracker>,
+    pub(super) runtime_state: Arc<RuntimeState>,
     pub(super) task: TaskId,
     pub(super) launch: LaunchId,
     pub(super) offers: Mutex<OfferCache>,
@@ -119,9 +119,7 @@ impl DshRuntimeShared {
         );
         drop(current);
         self.publisher.emit_typed(
-            Self::consumed(input, vec![EventFact::TurnStarted { turn_id: turn }]),
-            &self.turn_tracker,
-        );
+            Self::consumed(input, vec![EventFact::TurnStarted { turn_id: turn }]));
     }
 
     fn open_prompt(&self) -> Option<u64> {
@@ -243,7 +241,7 @@ impl DshRuntimeShared {
             failure,
         }));
         self.publisher
-            .emit_typed(Self::consumed(input, facts), &self.turn_tracker);
+            .emit_typed(Self::consumed(input, facts));
     }
 
     fn input_context(
@@ -655,7 +653,7 @@ pub(super) fn project_dsh_inbound(shared: &DshRuntimeShared, event: &Inbound) ->
         WireMessage::UnknownEvent { method, raw } if method == transport::SESSION_UPDATE => {
             let params = raw.get("params").cloned().unwrap_or(Value::Null);
             if let Some(batch) = shared.decode_session_update(&params) {
-                shared.publisher.emit_typed(batch, &shared.turn_tracker);
+                shared.publisher.emit_typed(batch);
             }
             None
         }

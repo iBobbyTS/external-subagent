@@ -31,7 +31,7 @@ pub(super) fn spawn_codex_pump(
             Ok(event) => {
                 if let Inbound::Message(WireMessage::UnknownEvent { method, raw }) = &event {
                     if let Some(batch) = shared.decode_notification(method, raw) {
-                        publisher.emit_typed(batch, &shared.turn_tracker);
+                        publisher.emit_typed(batch);
                         continue;
                     }
                 }
@@ -82,7 +82,7 @@ fn classify_child_exit(
     match observe_process_group(pgid) {
         Ok(members) if members.is_empty() => match exit {
             ChildExit::Exited(Some(0)) => {
-                let turn = shared.turn_tracker.snapshot();
+                let turn = shared.runtime_state.turn_snapshot();
                 if !turn.active && turn.boundary == Some(TurnBoundary::Completed) {
                     Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                         exit.clone(),

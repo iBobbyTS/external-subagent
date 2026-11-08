@@ -1,6 +1,16 @@
 use super::*;
 
 impl Scheduler {
+    pub(super) fn native_failure_for(&self, agent_id: &str) -> Option<external_contract::events::NativeFailure> {
+        let runtime = self.inner.state.lock().unwrap().activities.get(agent_id).cloned();
+        runtime.and_then(|runtime| runtime.native_failure())
+    }
+
+    pub(super) fn record_command_failure(&self, agent_id: &str, failure: external_contract::events::NativeFailure) {
+        let runtime = self.inner.state.lock().unwrap().active.get(agent_id).map(|active| Arc::clone(&active.sink.activity));
+        if let Some(runtime) = runtime { runtime.record_command_failure(failure); }
+    }
+
     /// Record a bounded failure diagnostic for logs and the in-memory latest
     /// map, and return the independent persistable representation so a
     /// terminal fill point can hand it to the store in the same transaction

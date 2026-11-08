@@ -3,38 +3,40 @@
 use super::*;
 use crate::{
     activity_tracker::PassiveActivityTracker, LifecycleRecord, LifecycleSink, Publisher,
-    RuntimeEvent, TurnTracker,
+    RuntimeEvent, RuntimeState,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 struct ViewSink {
-    activity: PassiveActivityTracker,
+    activity: Arc<PassiveActivityTracker>,
     records: Mutex<Vec<LifecycleRecord>>,
 }
 impl LifecycleSink for ViewSink {
+    fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.activity.clone()) }
     fn emit(&self, record: LifecycleRecord) {
-        self.activity.observe(&record.event);
+        if !matches!(record.event, RuntimeEvent::Normalized(_)) { self.activity.observe(&record.event); }
         self.records.lock().unwrap().push(record);
     }
 }
 struct Trace {
     adapter: ZcodeAdapter,
     publisher: Publisher,
-    tracker: TurnTracker,
+    tracker: Arc<RuntimeState>,
     sink: Arc<ViewSink>,
     next: u64,
 }
 impl Trace {
     fn new() -> Self {
         let sink = Arc::new(ViewSink {
-            activity: PassiveActivityTracker::for_adapter("zcode"),
+            activity: Arc::new(PassiveActivityTracker::for_adapter("zcode")),
             records: Mutex::new(vec![]),
         });
+        let publisher = Publisher::new(sink.clone());
         Self {
             adapter: ZcodeAdapter::new(TaskId("task".into()), LaunchId("launch".into())),
-            publisher: Publisher::new(sink.clone()),
-            tracker: TurnTracker::new(),
+            tracker: publisher.runtime_state.clone(),
+            publisher,
             sink,
             next: 0,
         }
@@ -52,7 +54,7 @@ impl Trace {
             raw: json!({"method":method, "params":params}),
         });
         let batch = self.adapter.decode(&inbound).unwrap();
-        self.publisher.emit_typed(batch.clone(), &self.tracker);
+        self.publisher.emit_typed(batch.clone());
         batch
     }
     fn model(&mut self, id: &str, status: &str) {
@@ -86,7 +88,7 @@ fn retry_attempts_and_parallel_requests_converge_without_degradation() {
     assert!(!trace.active());
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     assert!(
-        trace.tracker.snapshot().active,
+        trace.tracker.turn_snapshot().active,
         "attempt failure is not turn failure"
     );
 }
@@ -147,7 +149,7 @@ fn terminal_telemetry_preserves_activity_until_full_session_settlement() {
             json!({"kind":"turn.terminal","status":status,"errorMessage":"summary"}),
         );
         assert!(trace.active());
-        assert!(trace.tracker.snapshot().active);
+        assert!(trace.tracker.turn_snapshot().active);
         let failure = json!({"message":"native\noriginal", "stack":"frame".repeat(3000),"data":{"apiKey":"secret"},"unknownField":true});
         let final_params = if status == "failed" {
             json!({"type":"turn.failed","payload":{"error":failure}})
@@ -156,10 +158,10 @@ fn terminal_telemetry_preserves_activity_until_full_session_settlement() {
         };
         trace.send("session/event", final_params.clone());
         assert!(!trace.active());
-        assert!(!trace.tracker.snapshot().active);
+        assert!(!trace.tracker.turn_snapshot().active);
         if status == "failed" {
             let detail: Value =
-                serde_json::from_str(&trace.tracker.failure_detail().unwrap()).unwrap();
+                crate::scheduler::native_failure_detail(&trace.tracker.native_failure().unwrap().original);
             assert_eq!(detail["original_error"]["stack"], failure["stack"]);
             assert_eq!(detail["original_error"]["data"]["apiKey"], "[REDACTED]");
             assert_eq!(detail["original_error"]["unknownField"], true);
@@ -397,7 +399,7 @@ fn malformed_and_oversized_transport_frames_keep_safe_fault_and_loss() {
                 }
             )));
         }
-        trace.publisher.emit_typed(batch, &trace.tracker);
+        trace.publisher.emit_typed(batch);
     }
     assert_eq!(
         trace
@@ -431,7 +433,7 @@ fn empty_final_response_settles_without_inventing_visible_output() {
     );
     assert!(matches!(batch.disposition(), DecodeDisposition::Consumed));
     assert_eq!(
-        trace.tracker.snapshot().boundary,
+        trace.tracker.turn_snapshot().boundary,
         Some(crate::TurnBoundary::Completed)
     );
     assert_eq!(
@@ -507,7 +509,7 @@ fn native_error_result_type_is_a_failed_settlement_with_complete_original() {
         assert_eq!(settled.outcome, TurnOutcome::Failed);
         assert_eq!(settled.failure.as_ref().unwrap().original, payload);
         assert_eq!(
-            trace.tracker.snapshot().boundary,
+            trace.tracker.turn_snapshot().boundary,
             Some(crate::TurnBoundary::Failed)
         );
     }
@@ -564,7 +566,7 @@ fn valid_429_fixture_converges_through_the_shared_entry() {
     trace.send("v4/telemetry/event", cases[0]["input"]["params"].clone());
     assert!(!trace.active());
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
-    assert!(trace.tracker.snapshot().active);
+    assert!(trace.tracker.turn_snapshot().active);
 }
 
 #[test]
@@ -628,7 +630,7 @@ fn zcode_bootstrap_remote_conversion_keeps_complete_sanitized_native_view() {
     let mut expected = original;
     expected["data"]["apiKey"] = json!("[REDACTED]");
     assert_eq!(error.native_failure().unwrap().original, expected);
-    let diagnostic: Value = serde_json::from_str(&error.diagnostic("session/create")).unwrap();
+    let diagnostic: Value = error.diagnostic_fields("session/create");
     assert_eq!(
         diagnostic,
         json!({"operation":"session/create","message":"runtime command was rejected", "remote_code":-32001,"remote_message":"bootstrap refused"})
@@ -728,10 +730,10 @@ fn replay_window_eviction_keeps_authoritative_terminals_usable() {
                 .any(|event| matches!(event.fact, EventFact::TurnSettled(_))),
             "fresh authoritative terminal must survive replay-cache saturation"
         );
-        assert!(!trace.tracker.snapshot().active);
+        assert!(!trace.tracker.turn_snapshot().active);
         if failed {
             let original: Value =
-                serde_json::from_str(&trace.tracker.failure_detail().unwrap()).unwrap();
+                crate::scheduler::native_failure_detail(&trace.tracker.native_failure().unwrap().original);
             assert_eq!(
                 original["original_error"],
                 json!({"message":"complete native failure","futureField":true})
@@ -775,8 +777,8 @@ fn replay_window_eviction_keeps_authoritative_terminals_usable() {
                 json!({}),
             ))
             .unwrap();
-        trace.publisher.emit_typed(start, &trace.tracker);
-        assert!(trace.tracker.snapshot().active);
+        trace.publisher.emit_typed(start);
+        assert!(trace.tracker.turn_snapshot().active);
         let late = trace
             .adapter
             .decode(&session_frame(
@@ -796,9 +798,9 @@ fn replay_window_eviction_keeps_authoritative_terminals_usable() {
                 json!({"response":"next turn complete"}),
             ))
             .unwrap();
-        trace.publisher.emit_typed(done, &trace.tracker);
-        assert_eq!(trace.tracker.snapshot().generation, 2);
-        assert!(!trace.tracker.snapshot().active);
+        trace.publisher.emit_typed(done);
+        assert_eq!(trace.tracker.turn_snapshot().generation, 2);
+        assert!(!trace.tracker.turn_snapshot().active);
         assert_eq!(
             trace.sink.activity.take_terminal_text(),
             crate::TerminalText::Visible("next turn complete".into())
@@ -979,7 +981,7 @@ fn replay_window_retirement_preserves_uncertainty_without_asserting_event_loss()
         DecodeDisposition::RecognizedIgnored(_)
     ));
     assert!(evicted.events().is_empty());
-    assert!(trace.tracker.snapshot().active);
+    assert!(trace.tracker.turn_snapshot().active);
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let coverage = trace.sink.activity.observation_snapshot().coverage;
     assert_eq!(coverage.dropped_events, 0);
@@ -1027,7 +1029,7 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
             ..
         })
     ));
-    trace.publisher.emit_typed(batch, &trace.tracker);
+    trace.publisher.emit_typed(batch);
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let historical = trace.sink.activity.observation_snapshot().coverage;
     assert!(!historical.tool_history_complete);

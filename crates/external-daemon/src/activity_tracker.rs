@@ -1,7 +1,9 @@
 use super::*;
 
 #[derive(Default)]
-struct PassiveActivityState {
+pub(crate) struct RuntimeStateData {
+    pub(crate) turn: TurnReduction,
+    pub(crate) command_failure: Option<external_contract::events::NativeFailure>,
     revision: u64,
     last_runtime_event_at: Option<(Instant, u64)>,
     active_model_requests: HashMap<String, Instant>,
@@ -33,19 +35,12 @@ struct PassiveActivityState {
     observation: observation::ObservationState,
 }
 
-pub(crate) struct PassiveActivityTracker {
-    state: Mutex<PassiveActivityState>,
-    changed: Condvar,
-    /// Which tool-activity vocabularies this task's adapter may emit. Fixed at
-    /// construction: `Mixed` for [`Self::new`], inferred from the adapter name
-    /// by [`Self::for_adapter`]. See [`ToolActivityMode`].
-    mode: ToolActivityMode,
+// Transitional name for the activity projection API, retired in the next increment.
+pub(crate) type PassiveActivityTracker = RuntimeState;
 
-}
-
-impl PassiveActivityTracker {
+impl RuntimeState {
     pub(crate) fn new() -> Self {
-        let state = PassiveActivityState::default();
+        let state = RuntimeStateData::default();
         Self {
             state: Mutex::new(state),
             changed: Condvar::new(),
@@ -332,7 +327,7 @@ impl PassiveActivityTracker {
         Self::wait_tail_locked(&state)
     }
 
-    fn wait_tail_locked(state: &PassiveActivityState) -> WaitTail {
+    fn wait_tail_locked(state: &RuntimeStateData) -> WaitTail {
         let appended = state.appended_bytes;
         let window_len = state.latest_text_tail.len() as u64;
         debug_assert!(appended >= window_len);
@@ -476,7 +471,7 @@ fn duration_millis(value: Duration) -> u64 {
     value.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn activity_wall_now_millis() -> u64 {
+pub(crate) fn activity_wall_now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -485,7 +480,7 @@ fn activity_wall_now_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn append_latest_text(state: &mut PassiveActivityState, delta: &str, wall_now_ms: u64) {
+fn append_latest_text(state: &mut RuntimeStateData, delta: &str, wall_now_ms: u64) {
     if !state.terminal_text_settled {
         state.terminal_text.push_str(delta);
     }
@@ -1831,7 +1826,7 @@ const MAX_TYPED_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TYPED_MESSAGE_IDS: usize = 128;
 
 fn typed_message_delta<'a>(
-    state: &mut PassiveActivityState,
+    state: &mut RuntimeStateData,
     message: &'a external_contract::events::MessageUpdate,
 ) -> &'a str {
     use external_contract::events::TextUpdate;
@@ -1883,15 +1878,26 @@ fn typed_message_delta<'a>(
     delta
 }
 
-impl PassiveActivityTracker {
+impl RuntimeState {
     fn observe_typed_at(
         &self,
         event: &external_contract::events::NormalizedEvent,
         now: Instant,
         wall_now_ms: u64,
     ) {
-        use external_contract::events::*;
         let mut state = self.state.lock().unwrap();
+        Self::reduce_typed(&mut state, event, now, wall_now_ms);
+        self.changed.notify_all();
+    }
+
+    pub(crate) fn reduce_typed(
+        mut state: &mut RuntimeStateData,
+        event: &external_contract::events::NormalizedEvent,
+        now: Instant,
+        wall_now_ms: u64,
+    ) {
+        use external_contract::events::*;
+        Self::reduce_turn(&mut state.turn, event, now);
         state.revision = state.revision.saturating_add(1);
         state.last_runtime_event_at = Some((now, wall_now_ms));
         state.observation.observe_fact(event);
@@ -2021,6 +2027,5 @@ impl PassiveActivityTracker {
                 state.samples.remove(&key);
             }
         }
-        self.changed.notify_all();
     }
 }

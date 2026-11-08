@@ -41,7 +41,7 @@ pub trait ManagedRuntime: Send + Sync + 'static {
         String::new()
     }
     /// Public turn failure captured before process cleanup; absent if not supplied.
-    fn diagnostic_failure(&self) -> Option<String> {
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
         None
     }
     fn diagnostic_session_id(&self) -> Option<String> {
@@ -157,8 +157,8 @@ impl ManagedRuntime for RuntimeOwner {
         self.wait_terminal(timeout)
     }
 
-    fn diagnostic_failure(&self) -> Option<String> {
-        self.turn_tracker.failure_detail()
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        self.runtime_state.native_failure()
     }
 
     fn diagnostic_tail(&self) -> String {
@@ -246,7 +246,7 @@ impl ManagedRuntime for RuntimeOwner {
     }
 
     fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        self.turn_tracker.activity_snapshot()
+        self.runtime_state.activity_snapshot()
     }
 
     fn stop_boundary_count(&self) -> u64 {

@@ -8,9 +8,9 @@ use crate::{
     task_agent, terminal_proves_process_group_reaped, CommandRuntimeFactory, LifecycleSink,
     ManagedRuntime, MessageDisposition, ResponseDisposition, RuntimeCommandError, RuntimeFactory,
     RuntimeTerminal, Scheduler, SchedulerConfig, SchedulerError, SessionReady, TurnSnapshot,
-    TurnTracker,
+    RuntimeState,
 };
-use external_contract::{EventEnvelope, WireMessage, SESSION_EVENT};
+use external_contract::{EventEnvelope, WireMessage};
 use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
 use external_runtime::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase, TaskRecord};
@@ -1368,8 +1368,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
 
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(
-        stored.result.final_text,
-        "model selection was rejected: unknown model option: nope"
+        serde_json::from_str::<serde_json::Value>(&stored.result.final_text).unwrap(),
+        serde_json::json!({"code":-32602,"message":"unknown model option: nope"})
     );
     assert_eq!(
         scheduler
@@ -1412,8 +1412,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603}}}}'
 
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(
-        stored.result.final_text,
-        "model selection was rejected: {\"code\":-32603}"
+        serde_json::from_str::<serde_json::Value>(&stored.result.final_text).unwrap(),
+        serde_json::json!({"code":-32603})
     );
     assert_eq!(
         scheduler
@@ -1724,7 +1724,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32602,"message":"unkno
 /// ZCode and without touching the production factory composition.
 struct FakeProviderRuntime {
     session_id: String,
-    tracker: Arc<TurnTracker>,
+    tracker: Arc<RuntimeState>,
     terminal: Mutex<Option<RuntimeTerminal>>,
     terminal_changed: Condvar,
 }
@@ -1733,18 +1733,19 @@ impl FakeProviderRuntime {
     fn new() -> Self {
         Self {
             session_id: "fake-provider-session".into(),
-            tracker: Arc::new(TurnTracker::new()),
+            tracker: Arc::new(RuntimeState::new()),
             terminal: Mutex::new(None),
             terminal_changed: Condvar::new(),
         }
     }
 
     fn turn_event(&self, kind: &str) {
-        self.tracker
-            .observe(&Inbound::Message(WireMessage::Event(EventEnvelope {
-                method: SESSION_EVENT.into(),
-                params: serde_json::json!({"type": kind}),
-            })));
+        self.tracker.test_turn(match kind {
+            "turn.started" => None,
+            "turn.completed" => Some(crate::TurnBoundary::Completed),
+            "turn.failed" => Some(crate::TurnBoundary::Failed),
+            _ => panic!("unsupported fixture boundary"),
+        });
     }
 }
 
@@ -1830,7 +1831,7 @@ impl ManagedRuntime for FakeProviderRuntime {
                 "session id does not belong to this runtime".into(),
             ));
         }
-        let current = self.tracker.snapshot();
+        let current = self.tracker.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -1840,7 +1841,7 @@ impl ManagedRuntime for FakeProviderRuntime {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.tracker.snapshot()
+        self.tracker.turn_snapshot()
     }
 
     fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
@@ -2778,8 +2779,9 @@ fn tool_projection_tracker() -> (
 ) {
     struct TrackerSink(Arc<crate::PassiveActivityTracker>);
     impl LifecycleSink for TrackerSink {
+        fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.0.clone()) }
         fn emit(&self, record: crate::LifecycleRecord) {
-            self.0.observe(&record.event);
+            if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.0.observe(&record.event); }
         }
     }
     let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter("dsh"));
@@ -2788,8 +2790,8 @@ fn tool_projection_tracker() -> (
     )))));
     let (task, launch) = publisher.event_scope();
     let shared = super::events::DshRuntimeShared {
-        publisher,
-        turn_tracker: Arc::new(TurnTracker::new()),
+        publisher: Arc::clone(&publisher),
+        runtime_state: Arc::clone(&publisher.runtime_state),
         task,
         launch,
         offers: Mutex::new(Default::default()),
@@ -3191,7 +3193,7 @@ fn repair1_failed_prompt_write_closes_the_reserved_turn() {
     // This is only the test-owned child. No installed daemon is touched.
     owner.session.lock().unwrap().driver().stop_and_reap(Duration::from_secs(1)).unwrap();
     assert!(owner.send_prompt("cannot be written").is_err());
-    let turn = owner.shared.turn_tracker.snapshot();
+    let turn = owner.shared.runtime_state.turn_snapshot();
     assert!(!turn.active, "failed write left a phantom prompt active");
     assert_eq!(turn.boundary, Some(crate::TurnBoundary::Failed));
     assert!(owner.shared.current_prompt.lock().unwrap().is_none());
@@ -3318,8 +3320,8 @@ fn typed_adapter_shared(
     )))));
     let (task, launch) = publisher.event_scope();
     let shared = super::events::DshRuntimeShared {
-        publisher,
-        turn_tracker: Arc::new(TurnTracker::new()),
+        publisher: Arc::clone(&publisher),
+        runtime_state: Arc::clone(&publisher.runtime_state),
         task,
         launch,
         offers: Mutex::new(OfferCache::default()),
@@ -3468,7 +3470,7 @@ fn repair_malformed_message_text_is_lost_but_legal_empty_content_is_ignored() {
         assert!(batch.events().iter().any(|event| matches!(&event.fact,
             EventFact::CoverageGap(gap) if gap.reason == LossReason::Malformed
                 && gap.impact == Impact::Known(vec![CoverageDimension::Text]))));
-        shared.publisher.emit_typed(batch, &shared.turn_tracker);
+        shared.publisher.emit_typed(batch);
     }
     for content in [
         serde_json::json!({"type":"text","text":""}),
@@ -3752,7 +3754,7 @@ fn settlement_reduces_text_before_the_boundary_and_keeps_the_native_stop_reason(
     );
     assert!(settlement.failure.is_none());
 
-    let turn = shared.turn_tracker.snapshot();
+    let turn = shared.runtime_state.turn_snapshot();
     assert!(!turn.active);
     assert_eq!(turn.boundary, Some(crate::TurnBoundary::Completed));
 }
@@ -3792,11 +3794,11 @@ fn failed_settlements_keep_the_complete_redacted_native_error() {
         Some(super::events::REMOTE_ERROR_REASON)
     );
     let detail = shared
-        .turn_tracker
-        .failure_detail()
+        .runtime_state
+        .native_failure()
         .expect("the complete native failure is retained");
-    assert!(detail.contains("quota exhausted for the fixture account"));
-    assert!(detail.contains("original_error"));
+    assert!(detail.original.to_string().contains("quota exhausted for the fixture account"));
+    assert_eq!(detail.original, failure.original);
 }
 
 #[test]
@@ -3840,9 +3842,9 @@ fn a_failed_stop_reason_is_a_failed_turn_with_the_reason_retained() {
             .map(|failure| failure.original.clone()),
         Some(serde_json::json!("MAX_TOKENS"))
     );
-    assert!(!shared.turn_tracker.snapshot().active);
+    assert!(!shared.runtime_state.turn_snapshot().active);
     assert_eq!(
-        shared.turn_tracker.snapshot().boundary,
+        shared.runtime_state.turn_snapshot().boundary,
         Some(crate::TurnBoundary::Failed)
     );
 }

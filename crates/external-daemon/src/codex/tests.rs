@@ -1749,8 +1749,8 @@ fn recovered_error_then_completed_turn_does_not_label_a_later_runtime_loss() {
         fn turn_snapshot(&self) -> crate::TurnSnapshot {
             self.0.turn_snapshot()
         }
-        fn diagnostic_failure(&self) -> Option<String> {
-            self.0.diagnostic_failure()
+        fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+            self.0.native_failure()
         }
         fn diagnostic_tail(&self) -> String {
             self.0.diagnostic_tail()
