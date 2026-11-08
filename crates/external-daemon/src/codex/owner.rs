@@ -238,6 +238,11 @@ impl ManagedRuntime for CodexRuntimeOwner {
         *self.shared.admitted_posture.lock().unwrap() = Some(admitted.permission_mode);
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.initialize_before_threads(deadline)?;
+        // Resume already has a persisted thread identity. Bind it before the
+        // request so the notification pump attributes settings from its first
+        // frame, even when they precede the response. Model/effort admission
+        // below still requires a validated resume echo.
+        *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.resume_thread(
             thread_id,
             &admitted.model,
@@ -246,7 +251,6 @@ impl ManagedRuntime for CodexRuntimeOwner {
             admitted.effort.as_deref(),
             deadline,
         )?;
-        *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
         *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
         // A resumed process must keep admitting the same effort, or the
         // follow-up turn below would silently drop back to low.
@@ -381,10 +385,6 @@ impl ManagedRuntime for CodexRuntimeOwner {
 
     fn turn_snapshot(&self) -> TurnSnapshot {
         self.shared.runtime_state.turn_snapshot()
-    }
-
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.runtime_state.activity_snapshot()
     }
 
     fn stop_boundary_count(&self) -> u64 {

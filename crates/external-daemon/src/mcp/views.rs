@@ -897,8 +897,8 @@ mod observation_contract_tests {
                 .unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
         for source in [
-            Some(ReasoningSource::zcode()),
-            Some(ReasoningSource::dsh()),
+            Some(ReasoningSource::legacy_session_projection()),
+            Some(ReasoningSource::legacy_acp_projection()),
             None,
         ] {
             let snapshot = ObservationSnapshot::unavailable();
@@ -957,24 +957,14 @@ mod activity_projection_tests {
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
         assert!(value.get("last_tool_calls").is_none());
         assert!(value.get("latest_reasoning").is_none());
-        let tracker = crate::PassiveActivityTracker::for_adapter("codex");
+        let tracker = crate::RuntimeState::new();
         for n in 0..4 {
-            tracker.observe(&crate::RuntimeEvent::Driver(
-                external_runtime::Inbound::Message(external_contract::WireMessage::Event(
-                    external_contract::EventEnvelope {
-                        method: "session/event".into(),
-                        params: external_contract::activity::tool_count_event(
-                            &format!("e{n}"),
-                            "t",
-                            1,
-                            Some("commandExecution"),
-                            Some(&format!("echo {n}")),
-                        ),
-                    },
-                )),
-            ));
+            tracker.observe(&crate::RuntimeEnvelope::from(crate::test_support::typed_fact(external_contract::events::EventFact::ToolChanged(external_contract::events::ToolChange {
+                call_id: external_contract::events::CallId(format!("c{n}")), name: Some("commandExecution".into()), category: None,
+                arguments: None, phase: Some(external_contract::events::ToolPhase::Finished), outcome: Some(external_contract::events::ToolOutcome::Unknown), failure: None, denied: None,
+            }))));
         }
-        tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+        tracker.observe(&crate::test_support::fixture_event(external_runtime::Inbound::Message(
             external_contract::WireMessage::Event(external_contract::EventEnvelope {
                 method: "session/event".into(), params: serde_json::json!({"type":"session.updated","payload":{"type":"model_request_started","requestId":"r"}}),
             }),
@@ -989,8 +979,7 @@ mod activity_projection_tests {
         assert_eq!(value["tool_calls_last_60s"], 4);
         assert_eq!(value["last_activity_age_ms"], serde_json::json!(age));
         assert_eq!(value["model_request_active"], true);
-        // Codex is count-only: no per-call lifecycle, so 0 means "no tracking
-        // information", never "no command is running".
+        // Native finished phases close tracked calls, including unknown outcomes.
         assert_eq!(value["in_flight_tool_count"], 0);
         assert!(value["oldest_in_flight_tool_age_ms"].is_null());
         // Detail lives in observe now; the wait projection never carries it.

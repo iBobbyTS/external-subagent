@@ -314,8 +314,7 @@ fn codex_owner_bootstrap_sends_developer_instructions_and_verbatim_turn_prompt()
         .find(|frame| frame["method"] == "turn/start")
         .expect("turn/start frame");
     assert_eq!(
-        turn_start["params"]["input"][0]["text"],
-        prompt_text,
+        turn_start["params"]["input"][0]["text"], prompt_text,
         "Codex turn/start input must be verbatim prompt without developer_instructions splicing"
     );
 }
@@ -351,17 +350,16 @@ fn codex_owner_bootstrap_omits_developer_instructions_when_empty_or_none() {
         .find(|frame| frame["method"] == "thread/start")
         .expect("thread/start frame");
     assert!(
-        thread_start["params"].get("developerInstructions").is_none(),
+        thread_start["params"]
+            .get("developerInstructions")
+            .is_none(),
         "developerInstructions must be omitted when None"
     );
 
     let turn_start = requests
         .find(|frame| frame["method"] == "turn/start")
         .expect("turn/start frame");
-    assert_eq!(
-        turn_start["params"]["input"][0]["text"],
-        prompt_text
-    );
+    assert_eq!(turn_start["params"]["input"][0]["text"], prompt_text);
 }
 
 #[test]
@@ -425,10 +423,10 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .passive_activity_snapshot(&agent_id)
         .expect("codex activity tracker is present");
     assert_eq!(
-        activity.window_60s.tool_calls_started, 2,
-        "call-1 (started once; duplicate start is a replay) and call-2 only"
+        activity.window_60s.tool_calls_started, 3,
+        "three logical calls are observed, including start-less call-3"
     );
-    assert_eq!(activity.window_60s.other_tool_calls, 2);
+    assert_eq!(activity.window_60s.other_tool_calls, 3);
     assert_eq!(
         activity.window_60s.tool_calls_completed, 2,
         "call-1 and the start-less call-3 completion"
@@ -442,7 +440,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     // the tracker counted is exactly what wait exposes on the public field.
     let projection =
         crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
-    assert_eq!(projection.tool_calls_last_60s, 2);
+    assert_eq!(projection.tool_calls_last_60s, 3);
     assert!(serde_json::to_value(projection)
         .unwrap()
         .get("last_tool_calls")
@@ -499,43 +497,41 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         "a completion without public arguments records an explicit unknown"
     );
     assert!(mcp.recent_calls[0].arguments_truncated);
-    // Codex still exposes no reasoning and its history is explicitly partial.
+    // No public reasoning arrived in this fixture; typed tool identity is supported.
     assert!(observation.reasoning.text.is_empty());
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
     assert!(!observation.coverage.reasoning_complete);
     assert_eq!(observation.coverage.dropped_events, 0);
 }
 
 #[test]
-fn count_descriptor_feeds_observe_once_per_event_with_wrapped_detail() {
-    let tracker = crate::PassiveActivityTracker::for_adapter("codex");
-    let event = crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
-        external_contract::WireMessage::Event(external_contract::EventEnvelope {
-            method: "session/event".into(),
-            params: external_contract::activity::tool_count_event(
-                "codex-event-1",
-                "turn-1",
-                1,
-                Some("commandExecution"),
-                Some("echo 中"),
-            ),
+fn typed_call_identity_feeds_observe_once_without_the_retired_count_vocabulary() {
+    use external_contract::events::*;
+    let tracker = crate::RuntimeState::new();
+    let event = crate::RuntimeEnvelope::from(crate::test_support::typed_fact(
+        EventFact::ToolChanged(ToolChange {
+            call_id: CallId("codex-call-1".into()),
+            name: Some("commandExecution".into()),
+            category: None,
+            arguments: Some(ArgumentUpdate::Snapshot(
+                serde_json::json!({"command":"echo 中"}),
+            )),
+            phase: Some(ToolPhase::Started),
+            outcome: None,
+            failure: None,
+            denied: None,
         }),
     ));
-    // A re-delivered descriptor is the same logical call: weight and history
-    // both stay single.
     tracker.observe(&event);
     tracker.observe(&event);
     let snapshot = tracker.observation_snapshot();
     assert_eq!(snapshot.tools.len(), 1);
-    let tool = &snapshot.tools[0];
-    assert_eq!(tool.tool_name, "commandExecution");
-    assert_eq!(tool.call_count, 1);
-    assert_eq!(tool.recent_calls.len(), 1);
-    let call = &tool.recent_calls[0];
-    assert!(!call.tool_call_id.is_empty());
-    assert_eq!(call.arguments, serde_json::json!({"detail":"echo 中"}).as_object().unwrap().clone());
-    assert!(!call.arguments_truncated);
-    assert!(!snapshot.coverage.tool_history_complete);
+    assert_eq!(snapshot.tools[0].tool_name, "commandExecution");
+    assert_eq!(snapshot.tools[0].call_count, 1);
+    assert_eq!(
+        snapshot.tools[0].recent_calls[0].arguments["command"],
+        "echo 中"
+    );
     assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 1);
 }
 
@@ -1062,7 +1058,7 @@ fn closed_gate_refuses_spawn_without_a_process() {
 
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 #[test]
@@ -1260,10 +1256,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         .enqueue_general(&manifest_for(workspace.path(), "zcode terminal task"))
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
     store
         .mark_session_running(
@@ -1309,10 +1302,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, cancelled.agent_id);
     store
         .mark_session_running(
@@ -1349,10 +1339,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, sessionless.agent_id);
     store
         .mark_session_running(
@@ -1415,10 +1402,7 @@ fn terminal_send_requeues_a_zcode_task_with_a_persisted_session_id() {
         ))
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-zcode")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-zcode").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
     store
         .mark_session_running(
@@ -1971,11 +1955,19 @@ fn assert_native_error_survives_exit_before_boundary(exit_code: i32) {
         thread::sleep(Duration::from_millis(10));
     }
     let (turn, stop_boundaries) = scheduler.active_turn_observation(&agent_id).unwrap();
-    assert!(turn.active, "an error notification must not settle the turn");
+    assert!(
+        turn.active,
+        "an error notification must not settle the turn"
+    );
     assert_eq!(turn.boundary, None);
     assert_eq!(stop_boundaries, 0);
     assert_eq!(
-        scheduler.store().get_task(&agent_id).unwrap().unwrap().phase,
+        scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .phase,
         TaskPhase::Running,
     );
     assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
@@ -2021,7 +2013,10 @@ fn assert_native_error_survives_exit_before_boundary(exit_code: i32) {
     };
     let first = first.result.expect("terminal runtime-loss result");
     assert_eq!(first.outcome, TaskOutcome::RuntimeLost);
-    assert!(first.next_offset.is_some(), "the complete error must be paged");
+    assert!(
+        first.next_offset.is_some(),
+        "the complete error must be paged"
+    );
     assert!(!first.final_text.contains("sk-exit-secret"));
     let mut text = first.final_text;
     let mut offset = first.next_offset;
@@ -2700,10 +2695,7 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
         )
         .unwrap();
     let agent_id = submitted.agent_id.clone();
-    let claim = store
-        .claim_next("orphan-owner")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("orphan-owner").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, agent_id);
     store
         .mark_session_running(
@@ -3157,8 +3149,7 @@ fn yolo_resume_redeclares_and_confirms_the_danger_full_access_posture() {
             r#"{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{sandbox},"approvalPolicy":"never","cwd":"{}"}}}}"#,
             directory.to_string_lossy()
         );
-        let store =
-            Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
         let scheduler = Scheduler::new(
             "codex-resume-yolo-ok",
             store,
@@ -3167,11 +3158,7 @@ fn yolo_resume_redeclares_and_confirms_the_danger_full_access_posture() {
                     &happy_turn(&directory, PermissionMode::Yolo),
                     &directory,
                 ))),
-                second: yolo_resume_case(
-                    &directory,
-                    &resume_result,
-                    "codex-resume-yolo-ok.sh",
-                ),
+                second: yolo_resume_case(&directory, &resume_result, "codex-resume-yolo-ok.sh"),
             }),
             SchedulerConfig {
                 bootstrap_timeout: Duration::from_secs(30),
@@ -3363,6 +3350,117 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
     resume_phase_factory(directory, &script, child)
 }
 
+/// The barrier is processed by the same ordered notification pump after the
+/// downgrade, while the native resume response is still withheld. This proves
+/// attribution from the first frame without depending on thread scheduling.
+#[test]
+fn resume_settings_downgrade_precedes_response_without_admitting_work() {
+    let _guard = scripted_test_guard();
+    for valid_response in [true, false] {
+        struct BarrierSink(Mutex<Option<std::sync::mpsc::Sender<()>>>);
+        impl LifecycleSink for BarrierSink {
+            fn emit(&self, envelope: crate::RuntimeEnvelope) {
+                if matches!(envelope, crate::RuntimeEnvelope::Terminal { .. })
+                    || envelope.normalized().is_some_and(|event| {
+                        matches!(
+                            event.fact,
+                            external_contract::events::EventFact::Diagnostic(_)
+                        )
+                    })
+                {
+                    if let Some(sender) = self.0.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        }
+        let workspace = codex_workspace();
+        let directory = workspace.path();
+        let scheduler = codex_scheduler(directory, CodexRuntimeFactory::closed());
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(directory, "resume ordering", PermissionMode::Yolo),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let mut task = scheduler
+            .store()
+            .get_task(&submitted.agent_id)
+            .unwrap()
+            .unwrap();
+        task.session_id = Some(THREAD_ID.into());
+        let response = serde_json::json!({
+            "id": 2,
+            "result": {
+                "thread": {"id": if valid_response { THREAD_ID } else { "foreign-thread" }, "ephemeral": false},
+                "model": MODEL,
+                "sandbox": {"type": "dangerFullAccess"},
+                "approvalPolicy": "never",
+                "cwd": directory,
+            }
+        });
+        let script = format!(
+            r#"
+IFS= read -r line
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> resume-deliveries.jsonl
+  case "$line" in *'"method":"thread/resume"'*) break ;; esac
+done
+printf '%s\n' \
+  '{{"method":"thread/settings/updated","params":{{"threadId":"{THREAD_ID}","threadSettings":{{"sandboxPolicy":{{"type":"workspaceWrite","networkAccess":false}}}}}}}}' \
+  '{{"method":"test/resumeBarrier","params":{{}}}}'
+while [ ! -f release-resume ]; do sleep 0.01; done
+printf '%s\n' '{response}'
+while IFS= read -r line; do printf '%s\n' "$line" >> resume-deliveries.jsonl; done
+"#
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).current_dir(directory);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = Arc::new(
+            CodexRuntimeOwner::spawn(command, Arc::new(BarrierSink(Mutex::new(Some(sender)))))
+                .unwrap(),
+        );
+        let resumed_owner = Arc::clone(&owner);
+        let resumed = thread::spawn(move || {
+            resumed_owner.resume_session_with_mcp(&task, &[], SCRIPTED_SYNC_WAIT)
+        });
+        let barrier = receiver.recv_timeout(SCRIPTED_SYNC_WAIT);
+        let before_response = owner.wait_terminal(Duration::ZERO);
+        let admitted_before_response = owner.shared.admitted_model.lock().unwrap().clone();
+        // Always release and reap before asserting, including the red baseline.
+        std::fs::write(directory.join("release-resume"), b"release").unwrap();
+        let result = resumed.join().unwrap();
+        let admitted_after_response = owner.shared.admitted_model.lock().unwrap().clone();
+        owner.cleanup_for_forced_failure(Duration::from_secs(1));
+        barrier.expect("pump processed the settings terminal or the following barrier");
+        assert!(
+            matches!(before_response,
+                Some(crate::RuntimeTerminal::FailedRuntimeLost(crate::RuntimeLoss::PostureViolation(ref posture)))
+                if posture == "workspaceWrite"
+            ),
+            "downgrade must be caught before resume response: {before_response:?}"
+        );
+        assert_eq!(admitted_before_response, None);
+        assert_eq!(
+            result.is_ok(),
+            valid_response,
+            "resume echo must still be validated: {result:?}"
+        );
+        assert_eq!(
+            admitted_after_response,
+            valid_response.then(|| MODEL.to_owned())
+        );
+        let deliveries =
+            std::fs::read_to_string(directory.join("resume-deliveries.jsonl")).unwrap();
+        assert!(
+            !deliveries.contains("turn/start"),
+            "resume validation admits no turn itself"
+        );
+    }
+}
+
 #[test]
 fn posture_violating_settings_notification_fails_the_runtime() {
     let _guard = scripted_test_guard();
@@ -3435,7 +3533,10 @@ fn posture_violating_settings_notification_fails_the_runtime() {
     // own failure message; either carrier is sufficient evidence.
     let record = scheduler.last_error(&agent_id).expect("failure record");
     let evidence = format!("{record} {}", task.failure_message.unwrap_or_default());
-    assert!(evidence.contains("PostureViolation"), "evidence: {evidence}");
+    assert!(
+        evidence.contains("PostureViolation"),
+        "evidence: {evidence}"
+    );
     assert!(evidence.contains("workspaceWrite"), "evidence: {evidence}");
     let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
         .expect("the resumed process logs its own frames");

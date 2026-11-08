@@ -423,7 +423,7 @@ fn tool_step_pair_feeds_the_wait_window_and_observe_capture() {
     );
     assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
     assert!(observation.reasoning.text.is_empty());
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
     assert!(!observation.coverage.reasoning_complete);
 }
 
@@ -585,7 +585,7 @@ fn plan_permission_is_refused_by_the_factory() {
 
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 fn agy_task_record(directory: &Path) -> TaskRecord {
@@ -767,8 +767,8 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
         release: Mutex<Option<mpsc::Receiver<()>>>,
     }
     impl LifecycleSink for PausedSettlementSink {
-        fn emit(&self, record: crate::LifecycleRecord) {
-            let crate::RuntimeEvent::Normalized(event) = record.event else {
+        fn emit(&self, record: crate::RuntimeEnvelope) {
+            let crate::RuntimeEnvelope::Event { event: event, .. } = record else {
                 return;
             };
             if matches!(
@@ -1010,22 +1010,21 @@ esac
 /// Typed ingress probes use observed fixtures where available; fault frames
 /// below are explicitly synthetic and never require a live model call.
 struct AgyFactSink(
-    std::sync::Mutex<Vec<crate::RuntimeEvent>>,
-    Arc<crate::PassiveActivityTracker>,
+    std::sync::Mutex<Vec<crate::RuntimeEnvelope>>,
+    Arc<crate::RuntimeState>,
 );
 impl Default for AgyFactSink {
     fn default() -> Self {
         Self(
             Default::default(),
-            Arc::new(crate::PassiveActivityTracker::for_adapter("agy")),
+            Arc::new(crate::RuntimeState::new()),
         )
     }
 }
 impl LifecycleSink for AgyFactSink {
     fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.1.clone()) }
-    fn emit(&self, record: crate::LifecycleRecord) {
-        if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.1.observe(&record.event); }
-        self.0.lock().unwrap().push(record.event);
+    fn emit(&self, record: crate::RuntimeEnvelope) {
+        self.0.lock().unwrap().push(record);
     }
 }
 impl AgyFactSink {
@@ -1035,7 +1034,7 @@ impl AgyFactSink {
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                crate::RuntimeEvent::Normalized(event) => Some(event.clone()),
+                crate::RuntimeEnvelope::Event { event: event, .. } => Some(event.clone()),
                 _ => None,
             })
             .collect()
@@ -1102,12 +1101,7 @@ fn observed_stream_emits_typed_facts_without_inventing_tool_success() {
     assert!(
         matches!(&facts.last().unwrap().fact, EventFact::TurnSettled(s) if s.final_text.as_deref() == Some("OK\n") && s.outcome == TurnOutcome::Completed)
     );
-    assert!(sink.0.lock().unwrap().iter().all(|e| !matches!(
-        e,
-        crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
-            external_contract::WireMessage::Event(_)
-        ))
-    )));
+    assert!(sink.0.lock().unwrap().iter().all(|e| e.normalized().is_some()));
 }
 
 #[test]
@@ -1221,15 +1215,15 @@ fn buffered_start_is_published_before_pending_input_is_consumed() {
         release: Mutex<mpsc::Receiver<()>>,
     }
     impl LifecycleSink for PausedStartSink {
-        fn emit(&self, record: crate::LifecycleRecord) {
+        fn emit(&self, record: crate::RuntimeEnvelope) {
             if matches!(
-                record.event,
-                crate::RuntimeEvent::Normalized(NormalizedEvent {
+                record,
+                crate::RuntimeEnvelope::Event { event: NormalizedEvent {
                     fact: EventFact::TurnStarted {
                         turn_id: TurnId::Local(2)
                     },
                     ..
-                })
+                }, .. }
             ) {
                 self.started.send(()).unwrap();
                 self.release.lock().unwrap().recv().unwrap();
@@ -1499,15 +1493,15 @@ printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status"
         )> {
             self.delegate.event_scope()
         }
-        fn emit(&self, record: crate::LifecycleRecord) {
+        fn emit(&self, record: crate::RuntimeEnvelope) {
             self.facts.emit(record.clone());
             self.delegate.emit(record);
         }
-        fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
+        fn emit_batch(&self, events: &[crate::RuntimeEnvelope]) {
             for event in events {
-                self.facts.0.lock().unwrap().push(crate::RuntimeEvent::Normalized(event.clone()));
+                self.facts.0.lock().unwrap().push(event.clone());
             }
-            self.delegate.emit_normalized_batch(events);
+            self.delegate.emit_batch(events);
         }
     }
     impl RuntimeFactory for CapturedFactory {

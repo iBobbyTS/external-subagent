@@ -1,12 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-};
+use std::collections::{HashMap, VecDeque};
 
 pub const OBSERVATION_SCHEMA: &str = "external-subagent-observation/1.1";
-pub const PUBLIC_EVENT_TYPE: &str = "model.streaming";
-pub const PUBLIC_DELTA_POINTER: &str = "/params/payload/delta";
 const MAX_IDENTITIES: usize = 65_536;
 const MAX_TOOL_TYPES: usize = 64;
 const MAX_RECENT_CALLS: usize = 5;
@@ -36,6 +32,9 @@ pub struct ObservedTool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedCall {
+    /// Retained typed outcome; the existing public serialization remains compatible.
+    #[serde(skip)]
+    pub status: ObservedCallStatus,
     pub seq: u64,
     pub tool_call_id: String,
     pub arguments: Map<String, Value>,
@@ -43,11 +42,32 @@ pub struct ObservedCall {
     pub redacted_fields: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ObservedCallStatus {
+    #[default]
+    Unknown,
+    Pending,
+    Running,
+    Finished,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedReasoning {
+    /// Protocol/channel evidence independent of the legacy wire representation.
+    #[serde(skip)]
+    pub native_source: Option<PublicReasoningSource>,
     pub text: String,
     pub truncated: bool,
     pub source: ReasoningSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicReasoningSource {
+    pub protocol: external_contract::events::SourceProtocol,
+    pub channel: external_contract::events::PublicReasoningChannel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,17 +79,17 @@ pub struct ReasoningSource {
 }
 
 impl ReasoningSource {
-    pub fn zcode() -> Self {
+    pub fn legacy_session_projection() -> Self {
         Self {
             status: "PUBLIC_RUNTIME_EVENT".into(),
             runtime_version: "unreported".into(),
-            event_type: PUBLIC_EVENT_TYPE.into(),
-            delta_pointer: PUBLIC_DELTA_POINTER.into(),
+            event_type: "model.streaming".into(),
+            delta_pointer: "/params/payload/delta".into(),
         }
     }
 
     /// DSH's public ACP thought contract.
-    pub fn dsh() -> Self {
+    pub fn legacy_acp_projection() -> Self {
         Self {
             status: "VERIFIED_PROTOCOL_PUBLIC".into(),
             runtime_version: "acp/1".into(),
@@ -79,7 +99,7 @@ impl ReasoningSource {
     }
 
     pub fn is_supported_public(&self) -> bool {
-        *self == Self::zcode() || *self == Self::dsh()
+        *self == Self::legacy_session_projection() || *self == Self::legacy_acp_projection()
     }
 }
 
@@ -96,9 +116,10 @@ impl ObservationSnapshot {
             snapshot_seq: 0,
             tools: Vec::new(),
             reasoning: ObservedReasoning {
+                native_source: None,
                 text: String::new(),
                 truncated: false,
-                source: ReasoningSource::zcode(),
+                source: ReasoningSource::legacy_session_projection(),
             },
             coverage: ObservationCoverage {
                 tool_history_complete: false,
@@ -107,25 +128,6 @@ impl ObservationSnapshot {
             },
         }
     }
-}
-
-/// One detailed tool descriptor collected outside the supported model.streaming
-/// vocabulary: an agy/dsh `tool.updated` started frame (name + input) or a
-/// codex count event's `(tool, detail)` pair. It feeds the same identity,
-/// bound, and redaction rules as [`ObservationState::observe_message`].
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ToolDescriptor {
-    pub(crate) turn_id: String,
-    pub(crate) tool_call_id: String,
-    pub(crate) tool_name: String,
-    /// The parser-level source-frame identity (`tool:{call}:{phase}` for a
-    /// detailed started frame, turn-prefixed `tool:{event}:count` for a
-    /// count event). Replays of the same frame are rejected on this key, not
-    /// on the call identity, so the DSH streaming/started sibling pair can
-    /// still enrich one call.
-    pub(crate) source_identity: String,
-    pub(crate) input: Option<Value>,
-    pub(crate) detail: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -137,16 +139,10 @@ struct ToolGroup {
 
 #[derive(Clone)]
 pub struct ObservationState {
-    /// The claim's owner epoch: every fresh runtime launch gets its own
-    /// namespace for replay guards because adapter-local source ids (notably
-    /// DSH's `dsh-event-N`) restart at zero on each launch.
-    launch_scope: u64,
-    collect_reasoning: bool,
     reasoning_source: ReasoningSource,
+    native_reasoning_source: Option<PublicReasoningSource>,
     snapshot_seq: u64,
     next_call_seq: u64,
-    seen_source_events: HashSet<String>,
-    seen_descriptor_frames: HashSet<String>,
     seen_calls: HashMap<String, (String, u64)>,
     tools: HashMap<String, ToolGroup>,
     reasoning_raw: String,
@@ -155,122 +151,36 @@ pub struct ObservationState {
     tool_history_complete: bool,
     reasoning_complete: bool,
     dropped_events: u64,
+    tool_retention_gap: bool,
+    reasoning_retention_gap: bool,
+    argument_fragments: HashMap<String, String>,
+    limited_fragments: std::collections::HashSet<String>,
 }
 
 impl Default for ObservationState {
     fn default() -> Self {
         Self {
-            launch_scope: 0,
-            collect_reasoning: true,
-            reasoning_source: ReasoningSource::zcode(),
+            reasoning_source: ReasoningSource::legacy_session_projection(),
+            native_reasoning_source: None,
             snapshot_seq: 0,
             next_call_seq: 0,
-            seen_source_events: HashSet::new(),
-            seen_descriptor_frames: HashSet::new(),
             seen_calls: HashMap::new(),
             tools: HashMap::new(),
             reasoning_raw: String::new(),
             reasoning_text: String::new(),
             reasoning_truncated: false,
-            tool_history_complete: true,
-            reasoning_complete: true,
+            tool_history_complete: false,
+            reasoning_complete: false,
             dropped_events: 0,
+            tool_retention_gap: false,
+            reasoning_retention_gap: false,
+            argument_fragments: HashMap::new(),
+            limited_fragments: std::collections::HashSet::new(),
         }
     }
 }
 
 impl ObservationState {
-    pub fn for_adapter(adapter: &str) -> Self {
-        Self::for_launch(adapter, 0)
-    }
-
-    /// Construct state for one runtime launch. The launch scope namespaces
-    /// every source-id replay guard, so a recycled adapter-local id in a new
-    /// launch can never be mistaken for a replay from a previous claim.
-    pub(crate) fn for_launch(adapter: &str, launch_scope: u64) -> Self {
-        let public = matches!(adapter, "zcode" | "dsh");
-        Self {
-            launch_scope,
-            collect_reasoning: public,
-            reasoning_complete: public,
-            // Only ZCode exposes the supported per-call history. DSH, agy and
-            // codex contribute best-effort descriptors (no results or
-            // lifecycle), so their history stays explicitly incomplete.
-            tool_history_complete: adapter == "zcode",
-            reasoning_source: if adapter == "dsh" {
-                ReasoningSource::dsh()
-            } else {
-                ReasoningSource::zcode()
-            },
-            ..Self::default()
-        }
-    }
-
-    pub fn observe_message(&mut self, method: &str, params: &Value) {
-        if method != "session/event"
-            || params.get("type").and_then(Value::as_str) != Some(PUBLIC_EVENT_TYPE)
-        {
-            return;
-        }
-        let payload = params.get("payload").unwrap_or(&Value::Null);
-        let kind = payload.get("kind").and_then(Value::as_str);
-        match kind {
-            // Text is consumed by activity_parser / the final-text projection.
-            // Stream boundaries carry no additional reasoning/tool arguments.
-            Some("start" | "text_start" | "text_delta" | "text_end"
-                | "reasoning_start" | "reasoning_end" | "finish" | "error"
-                | "message_finished" | "message_done" | "text_done") => return,
-            // ZCode emits raw argument fragments before the normalized tool_call.
-            // Recognize their shape, but use that final input as the argument owner:
-            // fragments neither prove execution nor form safe public JSON yet.
-            Some("tool_input_start" | "tool_input_delta" | "tool_input_end") => {
-                let valid = valid_id(payload.get("toolCallId")).is_some()
-                    && match kind {
-                        Some("tool_input_start") => valid_id(payload.get("toolName")).is_some(),
-                        Some("tool_input_delta") => payload.get("delta").is_some_and(Value::is_string),
-                        _ => true,
-                    };
-                if !valid { self.drop_event(true); }
-                return;
-            }
-            Some("reasoning_delta" | "tool_call") => {}
-            _ => {
-                self.observe_loss();
-                return;
-            }
-        }
-        if kind == Some("reasoning_delta") && !self.collect_reasoning {
-            return;
-        }
-        let Some(event_id) = valid_id(params.get("eventId")) else {
-            self.drop_event(kind == Some("tool_call"));
-            return;
-        };
-        let key = launch_key(self.launch_scope, event_id);
-        if self.seen_source_events.contains(&key) {
-            return;
-        }
-        if self.seen_source_events.len() >= MAX_IDENTITIES {
-            self.drop_event(kind == Some("tool_call"));
-            return;
-        }
-        self.seen_source_events.insert(key);
-        match kind {
-            Some("reasoning_delta") => {
-                let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
-                    self.reasoning_complete = false;
-                    self.dropped_events = self.dropped_events.saturating_add(1);
-                    self.bump_snapshot();
-                    return;
-                };
-                self.observe_reasoning(delta);
-                self.bump_snapshot();
-            }
-            Some("tool_call") => self.observe_tool(params, payload),
-            _ => unreachable!("kind was filtered above"),
-        }
-    }
-
     fn observe_reasoning(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
@@ -286,101 +196,13 @@ impl ObservationState {
             self.reasoning_raw = combined[start..].to_owned();
             self.reasoning_truncated = true;
             self.reasoning_complete = false;
+            self.reasoning_retention_gap = true;
             self.dropped_events = self.dropped_events.saturating_add(1);
         } else {
             self.reasoning_raw = combined;
         }
         self.reasoning_text = reasoning_tail(&self.reasoning_raw);
         self.reasoning_truncated |= self.reasoning_raw.chars().count() > MAX_REASONING_CHARS;
-    }
-
-    fn observe_tool(&mut self, params: &Value, payload: &Value) {
-        let Some(call_id) = valid_id(payload.get("toolCallId")) else {
-            self.drop_event(true);
-            return;
-        };
-        let Some(tool_name) = valid_id(payload.get("toolName")) else {
-            self.drop_event(true);
-            return;
-        };
-        let turn_id = valid_id(params.get("turnId")).unwrap_or("");
-        let (arguments, mut arguments_truncated, redacted_fields) =
-            project_arguments(payload.get("input"));
-        if !payload.get("input").is_some_and(Value::is_object) {
-            // Missing or incompatible arguments are unknown for every adapter.
-            arguments_truncated = true;
-            // ACP's canonical tool companion intentionally omits input; its
-            // capability is already incomplete. A malformed supplied input is loss.
-            if self.reasoning_source != ReasoningSource::dsh() || payload.get("input").is_some() {
-                self.drop_event(true);
-            }
-        }
-        self.record_tool_call(
-            turn_id,
-            call_id,
-            tool_name,
-            arguments,
-            arguments_truncated,
-            redacted_fields,
-        );
-    }
-
-    /// Ingest a detailed descriptor from the same producers that feed the wait
-    /// tool window. The record path derives the ZCode-shaped
-    /// `{turn}\0{call_id}` identity, so a repeat frame or a descriptor
-    /// arriving after the same logical call's `model.streaming` event updates
-    /// the existing record instead of counting it twice.
-    pub(crate) fn observe_descriptor(&mut self, descriptor: &ToolDescriptor) {
-        if !valid_text(&descriptor.tool_call_id)
-            || !valid_text(&descriptor.tool_name)
-            || descriptor.source_identity.is_empty()
-            || descriptor.source_identity.contains('\0')
-        {
-            self.drop_event(true);
-            return;
-        }
-        let key = launch_key(self.launch_scope, &descriptor.source_identity);
-        if self.seen_descriptor_frames.contains(&key) {
-            // A verbatim re-delivery of an already consumed descriptor frame
-            // is not a refinement: it must leave the snapshot untouched.
-            return;
-        }
-        if self.seen_descriptor_frames.len() >= MAX_IDENTITIES {
-            self.drop_event(true);
-            return;
-        }
-        self.seen_descriptor_frames.insert(key);
-        let (arguments, arguments_truncated, redacted_fields) =
-            match descriptor.input.as_ref() {
-                Some(input) => {
-                    let (arguments, mut truncated, redacted_fields) =
-                        project_arguments(Some(input));
-                    // A non-object input is unknown, not an observed empty
-                    // argument object (the same rule the ACP sibling applies).
-                    if !input.is_object() {
-                        truncated = true;
-                    }
-                    (arguments, truncated, redacted_fields)
-                }
-                None => {
-                    // Count-only descriptors carry a free-form detail string;
-                    // the public argument shape is an object, so wrap it in a
-                    // single stable key instead of dropping the detail.
-                    let wrapped = Value::Object(Map::from_iter([(
-                        "detail".to_owned(),
-                        Value::String(descriptor.detail.clone().unwrap_or_default()),
-                    )]));
-                    project_arguments(Some(&wrapped))
-                }
-            };
-        self.record_tool_call(
-            &descriptor.turn_id,
-            &descriptor.tool_call_id,
-            &descriptor.tool_name,
-            arguments,
-            arguments_truncated,
-            redacted_fields,
-        );
     }
 
     fn record_tool_call(
@@ -441,6 +263,7 @@ impl ObservationState {
             arguments,
             arguments_truncated,
             redacted_fields,
+            status: ObservedCallStatus::Unknown,
         });
         group.recent_calls.truncate(MAX_RECENT_CALLS);
         self.bump_snapshot();
@@ -456,13 +279,16 @@ impl ObservationState {
     /// fresh events from the new launch are compared in its own.
     /// Coverage stays honest: incomplete wins and dropped counts add up.
     pub(crate) fn merge_newer(&mut self, newer: ObservationState) {
-        self.launch_scope = newer.launch_scope;
         if !newer.reasoning_raw.is_empty() {
+            self.native_reasoning_source = newer.native_reasoning_source.clone();
+            self.reasoning_source = newer.reasoning_source.clone();
             // The base's raw stream is older than the incoming tracker's
             // bytes; appending applies the same rolling cap and tail.
             self.observe_reasoning(&newer.reasoning_raw);
         }
         self.reasoning_truncated |= newer.reasoning_truncated;
+        self.tool_retention_gap |= newer.tool_retention_gap;
+        self.reasoning_retention_gap |= newer.reasoning_retention_gap;
         self.reasoning_complete = self.reasoning_complete && newer.reasoning_complete;
         self.tool_history_complete = self.tool_history_complete && newer.tool_history_complete;
         self.dropped_events = self.dropped_events.saturating_add(newer.dropped_events);
@@ -481,9 +307,7 @@ impl ObservationState {
             }
             // The identity format has a single NUL separator and both sides
             // are NUL-free by validation.
-            let (turn_id, call_id) = identity
-                .split_once('\0')
-                .unwrap_or(("", identity.as_str()));
+            let (turn_id, call_id) = identity.split_once('\0').unwrap_or(("", identity.as_str()));
             let detail = newer
                 .tools
                 .get(tool_name)
@@ -509,45 +333,53 @@ impl ObservationState {
                 arguments_truncated,
                 redacted_fields,
             );
+            if let Some(old) = detail {
+                if let Some((name, new_seq)) = self.seen_calls.get(identity).cloned() {
+                    if let Some(call) = self.tools.get_mut(&name).and_then(|group| {
+                        group
+                            .recent_calls
+                            .iter_mut()
+                            .find(|call| call.seq == new_seq)
+                    }) {
+                        call.status = old.status;
+                    }
+                }
+            }
         }
 
-        // A replayed source event must not be admitted again after a claim.
-        for event_id in newer.seen_source_events {
-            if self.seen_source_events.len() >= MAX_IDENTITIES {
-                self.tool_history_complete = false;
-                self.reasoning_complete = false;
-                self.dropped_events = self.dropped_events.saturating_add(1);
-                break;
-            }
-            self.seen_source_events.insert(event_id);
-        }
-        // Descriptor frames likewise stay rejected after a claim.
-        for source_identity in newer.seen_descriptor_frames {
-            if self.seen_descriptor_frames.len() >= MAX_IDENTITIES {
-                self.tool_history_complete = false;
-                self.reasoning_complete = false;
-                self.dropped_events = self.dropped_events.saturating_add(1);
-                break;
-            }
-            self.seen_descriptor_frames.insert(source_identity);
-        }
         self.snapshot_seq = self.snapshot_seq.saturating_add(newer.snapshot_seq);
     }
 
     fn drop_event(&mut self, tool: bool) {
         if tool {
             self.tool_history_complete = false;
+            self.tool_retention_gap = true;
         } else {
             self.reasoning_complete = false;
+            self.reasoning_retention_gap = true;
         }
         self.dropped_events = self.dropped_events.saturating_add(1);
         self.bump_snapshot();
     }
 
-    pub fn observe_loss(&mut self) {
-        self.tool_history_complete = false;
-        self.reasoning_complete = false;
-        self.dropped_events = self.dropped_events.saturating_add(1);
+    pub(crate) fn set_completeness(&mut self, tools: bool, reasoning: bool) {
+        self.tool_history_complete = tools && !self.tool_retention_gap;
+        self.reasoning_complete = reasoning && !self.reasoning_retention_gap;
+    }
+
+    pub(crate) fn observe_gap(&mut self, impact: &external_contract::events::Impact, lost: bool) {
+        use external_contract::events::*;
+        if let Impact::Known(dimensions) = impact {
+            if dimensions.contains(&CoverageDimension::Tools) {
+                self.tool_history_complete = false;
+            }
+            if dimensions.contains(&CoverageDimension::PublicReasoning) {
+                self.reasoning_complete = false;
+            }
+        }
+        if lost {
+            self.dropped_events = self.dropped_events.saturating_add(1);
+        }
         self.bump_snapshot();
     }
 
@@ -578,6 +410,7 @@ impl ObservationState {
             snapshot_seq: self.snapshot_seq,
             tools,
             reasoning: ObservedReasoning {
+                native_source: self.native_reasoning_source.clone(),
                 text,
                 truncated: self.reasoning_truncated,
                 source: self.reasoning_source.clone(),
@@ -589,18 +422,6 @@ impl ObservationState {
             },
         }
     }
-}
-
-fn launch_key(launch_scope: u64, source_id: &str) -> String {
-    format!("{launch_scope}\0{source_id}")
-}
-
-fn valid_text(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_ID_BYTES && !value.contains('\0')
-}
-
-fn valid_id(value: Option<&Value>) -> Option<&str> {
-    value.and_then(Value::as_str).filter(|value| valid_text(value))
 }
 
 fn reasoning_tail(value: &str) -> String {
@@ -665,94 +486,344 @@ fn project_arguments(input: Option<&Value>) -> (Map<String, Value>, bool, u64) {
     (projected, true, excluded_fields)
 }
 
+impl ObservationState {
+    /// Typed facts already passed the native adapter's replay/shape checks.
+    pub(crate) fn observe_fact(&mut self, event: &external_contract::events::NormalizedEvent) {
+        use external_contract::events::*;
+        match &event.fact {
+            EventFact::PublicReasoningDelta(reasoning) => {
+                self.native_reasoning_source = Some(PublicReasoningSource {
+                    protocol: event.context.source.protocol,
+                    channel: reasoning.channel,
+                });
+                self.reasoning_source = match event.context.source.protocol {
+                    SourceProtocol::DshAcpV1 => ReasoningSource::legacy_acp_projection(),
+                    _ => ReasoningSource::legacy_session_projection(),
+                };
+                self.observe_reasoning(&reasoning.delta);
+                self.bump_snapshot();
+            }
+            EventFact::ToolChanged(tool) => self.observe_tool_change(event, tool),
+            _ => {}
+        }
+    }
+}
+
+impl ObservationState {
+    fn observe_tool_change(
+        &mut self,
+        event: &external_contract::events::NormalizedEvent,
+        tool: &external_contract::events::ToolChange,
+    ) {
+        use external_contract::events::*;
+        let turn = crate::runtime_observation::turn_key(event);
+        let identity = format!("{turn}\0{}", tool.call_id.0);
+        let known = self.seen_calls.get(&identity).cloned();
+        if known.is_none()
+            && (tool.phase == Some(ToolPhase::Progress)
+                || (tool.phase.is_none() && tool.arguments.is_none()))
+        {
+            return;
+        }
+        // Reserve identity/group capacity before retaining argument fragments.
+        // Rejected calls cannot grow the bounded fragment-loss ledger.
+        if known.is_none() && self.seen_calls.len() >= MAX_IDENTITIES {
+            self.drop_event(true);
+            return;
+        }
+        let name = tool
+            .name
+            .clone()
+            .or_else(|| known.as_ref().map(|(name, _)| name.clone()))
+            .unwrap_or_else(|| "unknown".into());
+        if tool.call_id.0.len() > MAX_ID_BYTES
+            || name.len() > MAX_ID_BYTES
+            || tool.call_id.0.contains('\0')
+            || name.contains('\0')
+        {
+            self.drop_event(true);
+            return;
+        }
+        if known.is_none() && !self.tools.contains_key(&name) && self.tools.len() >= MAX_TOOL_TYPES
+        {
+            self.drop_event(true);
+            return;
+        }
+        if let Some((old_name, seq)) = &known {
+            if old_name == "unknown" && name != *old_name {
+                if self.tools.contains_key(&name) || self.tools.len() < MAX_TOOL_TYPES {
+                    if let Some(group) = self.tools.get_mut(old_name) {
+                        group.call_count = group.call_count.saturating_sub(1);
+                        let call = group
+                            .recent_calls
+                            .iter()
+                            .position(|call| call.seq == *seq)
+                            .and_then(|index| group.recent_calls.remove(index));
+                        let empty = group.call_count == 0;
+                        if empty {
+                            self.tools.remove(old_name);
+                        }
+                        let group = self.tools.entry(name.clone()).or_default();
+                        group.call_count = group.call_count.saturating_add(1);
+                        group.latest_seq = group.latest_seq.max(*seq);
+                        if let Some(call) = call {
+                            group.recent_calls.push_front(call);
+                            group
+                                .recent_calls
+                                .make_contiguous()
+                                .sort_by_key(|call| std::cmp::Reverse(call.seq));
+                            group.recent_calls.truncate(MAX_RECENT_CALLS);
+                        }
+                        self.seen_calls
+                            .insert(identity.clone(), (name.clone(), *seq));
+                    }
+                } else {
+                    self.drop_event(true);
+                }
+            }
+        }
+        let known = self.seen_calls.get(&identity).cloned();
+        let previous = known
+            .as_ref()
+            .and_then(|(name, seq)| {
+                self.tools
+                    .get(name)?
+                    .recent_calls
+                    .iter()
+                    .find(|call| call.seq == *seq)
+            })
+            .cloned();
+        let (arguments, truncated, redacted) = match &tool.arguments {
+            Some(ArgumentUpdate::Snapshot(value)) => {
+                self.argument_fragments.remove(&identity);
+                self.limited_fragments.remove(&identity);
+                let (args, limited, count) = project_arguments(Some(value));
+                (args, limited || !value.is_object(), count)
+            }
+            Some(ArgumentUpdate::MergePatch(patch)) => {
+                let mut value = Value::Object(
+                    previous
+                        .as_ref()
+                        .map(|call| call.arguments.clone())
+                        .unwrap_or_default(),
+                );
+                merge_patch(&mut value, patch);
+                let (args, limited, count) = project_arguments(Some(&value));
+                (
+                    args,
+                    limited
+                        || previous
+                            .as_ref()
+                            .is_none_or(|call| call.arguments_truncated),
+                    count + previous.as_ref().map_or(0, |call| call.redacted_fields),
+                )
+            }
+            Some(ArgumentUpdate::Delta(delta)) => {
+                if self.limited_fragments.contains(&identity) {
+                    (
+                        previous
+                            .as_ref()
+                            .map(|call| call.arguments.clone())
+                            .unwrap_or_default(),
+                        true,
+                        previous.as_ref().map_or(0, |call| call.redacted_fields),
+                    )
+                } else if self.argument_fragments.len() < MAX_TOOL_TYPES * MAX_RECENT_CALLS
+                    || self.argument_fragments.contains_key(&identity)
+                {
+                    let fragment = self.argument_fragments.entry(identity.clone()).or_default();
+                    if fragment.len().saturating_add(delta.len()) <= MAX_ARGUMENT_BYTES {
+                        fragment.push_str(delta);
+                    } else {
+                        fragment.clear();
+                        self.limited_fragments.insert(identity.clone());
+                    }
+                    match serde_json::from_str::<Value>(fragment) {
+                        Ok(value) if value.is_object() => project_arguments(Some(&value)),
+                        _ => (
+                            previous
+                                .as_ref()
+                                .map(|call| call.arguments.clone())
+                                .unwrap_or_default(),
+                            true,
+                            previous.as_ref().map_or(0, |call| call.redacted_fields),
+                        ),
+                    }
+                } else {
+                    self.limited_fragments.insert(identity.clone());
+                    (Map::new(), true, 0)
+                }
+            }
+            None => previous
+                .as_ref()
+                .map(|call| {
+                    (
+                        call.arguments.clone(),
+                        call.arguments_truncated,
+                        call.redacted_fields,
+                    )
+                })
+                .unwrap_or((Map::new(), true, 0)),
+        };
+        self.record_tool_call(
+            &turn,
+            &tool.call_id.0,
+            &name,
+            arguments,
+            truncated,
+            redacted,
+        );
+        let Some((name, seq)) = self.seen_calls.get(&identity).cloned() else {
+            return;
+        };
+        if let Some(call) = self
+            .tools
+            .get_mut(&name)
+            .and_then(|group| group.recent_calls.iter_mut().find(|call| call.seq == seq))
+        {
+            let terminal = matches!(
+                call.status,
+                ObservedCallStatus::Finished
+                    | ObservedCallStatus::Succeeded
+                    | ObservedCallStatus::Failed
+                    | ObservedCallStatus::Cancelled
+            );
+            let status = match tool.phase {
+                Some(ToolPhase::Finished) => match tool.outcome {
+                    Some(ToolOutcome::Succeeded) => ObservedCallStatus::Succeeded,
+                    Some(ToolOutcome::Failed) => ObservedCallStatus::Failed,
+                    Some(ToolOutcome::Cancelled) => ObservedCallStatus::Cancelled,
+                    _ => ObservedCallStatus::Finished,
+                },
+                Some(ToolPhase::Scheduled) if !terminal => ObservedCallStatus::Pending,
+                Some(ToolPhase::Started | ToolPhase::Progress) if !terminal => {
+                    ObservedCallStatus::Running
+                }
+                Some(_) => call.status,
+                None => call.status,
+            };
+            if status != call.status {
+                call.status = status;
+                self.bump_snapshot();
+            }
+        }
+        if tool.phase == Some(ToolPhase::Finished) {
+            self.argument_fragments.remove(&identity);
+        }
+    }
+
+    pub(crate) fn promote_turn(&mut self, old: &str, new: &str) {
+        let prefix = format!("{old}\0");
+        let calls = std::mem::take(&mut self.seen_calls);
+        for (key, value) in calls {
+            let key = key
+                .strip_prefix(&prefix)
+                .map(|suffix| format!("{new}\0{suffix}"))
+                .unwrap_or(key);
+            self.seen_calls.insert(key, value);
+        }
+        let fragments = std::mem::take(&mut self.argument_fragments);
+        for (key, value) in fragments {
+            let key = key
+                .strip_prefix(&prefix)
+                .map(|suffix| format!("{new}\0{suffix}"))
+                .unwrap_or(key);
+            self.argument_fragments.insert(key, value);
+        }
+        self.limited_fragments = std::mem::take(&mut self.limited_fragments)
+            .into_iter()
+            .map(|key| {
+                key.strip_prefix(&prefix)
+                    .map(|suffix| format!("{new}\0{suffix}"))
+                    .unwrap_or(key)
+            })
+            .collect();
+    }
+
+    pub(crate) fn projection_losses(&self) -> Vec<external_contract::events::CoverageDimension> {
+        use external_contract::events::CoverageDimension;
+        let mut losses = Vec::new();
+        if self.tool_retention_gap {
+            losses.push(CoverageDimension::Tools);
+        }
+        if self.reasoning_retention_gap {
+            losses.push(CoverageDimension::PublicReasoning);
+        }
+        losses
+    }
+}
+fn merge_patch(target: &mut Value, patch: &Value) {
+    if let Value::Object(fields) = patch {
+        if !target.is_object() {
+            *target = Value::Object(Map::new());
+        }
+        let object = target.as_object_mut().expect("object");
+        for (key, value) in fields {
+            if value.is_null() {
+                object.remove(key);
+            } else {
+                merge_patch(object.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+    } else {
+        *target = patch.clone();
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod typed_projection_tests {
     use super::*;
-
+    use external_contract::events::*;
+    struct ProjectionTrace {
+        inner: ObservationState,
+        adapter: crate::zcode::events::ZcodeAdapter,
+    }
+    impl Default for ProjectionTrace {
+        fn default() -> Self {
+            Self {
+                inner: ObservationState {
+                    tool_history_complete: true,
+                    reasoning_complete: true,
+                    ..ObservationState::default()
+                },
+                adapter: crate::zcode::events::ZcodeAdapter::new(
+                    TaskId("projection".into()),
+                    LaunchId("projection".into()),
+                ),
+            }
+        }
+    }
+    impl std::ops::Deref for ProjectionTrace {
+        type Target = ObservationState;
+        fn deref(&self) -> &Self::Target {
+            &self.inner
+        }
+    }
+    impl std::ops::DerefMut for ProjectionTrace {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.inner
+        }
+    }
+    impl ProjectionTrace {
+        fn ingest_fixture(&mut self, method: &str, params: &Value) {
+            let input =
+                external_runtime::Inbound::Message(external_contract::WireMessage::UnknownEvent {
+                    method: method.into(),
+                    raw: serde_json::json!({"params":params}),
+                });
+            let batch = self.adapter.decode(&input).expect("fixture notification");
+            for event in batch.events() {
+                self.inner.observe_fact(event);
+            }
+        }
+    }
     fn event(id: &str, kind: &str, payload: Value) -> Value {
-        serde_json::json!({
-            "type": "model.streaming",
-            "eventId": id,
-            "turnId": "turn-1",
-            "payload": { "kind": kind, "toolCallId": payload.get("toolCallId"), "toolName": payload.get("toolName"), "input": payload.get("input"), "delta": payload.get("delta") }
-        })
+        serde_json::json!({"type":"model.streaming","eventId":id,"turnId":"turn",
+        "payload":{"kind":kind,"toolCallId":payload.get("toolCallId"),"toolName":payload.get("toolName"),"input":payload.get("input"),"delta":payload.get("delta")}})
     }
-
-    #[test]
-    fn zcode_normal_stream_boundaries_do_not_invent_loss_or_tool_execution() {
-        let mut state = ObservationState::for_adapter("zcode");
-        let kinds = ["start", "text_start", "text_delta", "text_end", "reasoning_start",
-            "reasoning_delta", "reasoning_end", "tool_input_start", "tool_input_delta",
-            "tool_input_end", "tool_call", "finish", "error"];
-        for (i, kind) in kinds.iter().enumerate() {
-            let frame = serde_json::json!({"type":"model.streaming", "eventId":i.to_string(), "turnId":"turn",
-                "payload":{"kind":kind, "delta":"sample", "toolCallId":"call", "toolName":"Read", "input":{"path":"file"}}});
-            state.observe_message("session/event", &frame);
-        }
-        let snapshot = state.snapshot();
-        assert!(snapshot.coverage.tool_history_complete);
-        assert!(snapshot.coverage.reasoning_complete);
-        assert_eq!(snapshot.coverage.dropped_events, 0);
-        assert_eq!(snapshot.tools[0].call_count, 1);
-        assert_eq!(snapshot.tools[0].recent_calls[0].arguments["path"], "file");
-        assert_eq!(snapshot.reasoning.text, "sample");
-        state.observe_message("session/event", &serde_json::json!({"type":"model.streaming","payload":{"kind":"tool_input_delta","delta":42}}));
-        assert_eq!(state.dropped_events, 1);
-        assert!(!state.tool_history_complete);
-    }
-
-    #[test]
-    fn unknown_stream_shapes_mark_loss_without_blocking_observation() {
-        for payload in [Value::Null, serde_json::json!({"kind":"future_kind"})] {
-            let mut state = ObservationState::for_adapter("zcode");
-            state.observe_message("session/event", &serde_json::json!({"type":"model.streaming","payload":payload}));
-            assert!(!state.tool_history_complete);
-            assert!(!state.reasoning_complete);
-            assert_eq!(state.dropped_events, 1);
-        }
-        let mut state = ObservationState::for_adapter("zcode");
-        state.observe_message("session/event", &event("text", "text_delta", Value::Null));
-        assert_eq!(state.dropped_events, 0);
-        state.observe_message("session/event", &event("bad", "tool_call", serde_json::json!({"toolCallId":"call","toolName":"read","input":42})));
-        assert!(!state.tool_history_complete);
-        assert_eq!(state.dropped_events, 1);
-    }
-
-    #[test]
-    fn reasoning_uses_exact_public_selector_unicode_tail_and_event_id_dedupe() {
-        let mut state = ObservationState::default();
-        let first = event(
-            "1",
-            "reasoning_delta",
-            serde_json::json!({"delta": "中🙂".repeat(75)}),
-        );
-        let second = event(
-            "2",
-            "reasoning_delta",
-            serde_json::json!({"delta": "乙".repeat(100)}),
-        );
-        state.observe_message("session/event", &first);
-        state.observe_message("session/event", &first);
-        state.observe_message("session/event", &second);
-        state.observe_message(
-            "session/event",
-            &event("3", "other", serde_json::json!({"delta":"NO"})),
-        );
-        let snapshot = state.snapshot();
-        assert_eq!(snapshot.reasoning.text.chars().count(), 200);
-        assert_eq!(
-            snapshot.reasoning.text,
-            format!("{}{}", "中🙂".repeat(50), "乙".repeat(100))
-        );
-        assert!(snapshot.reasoning.truncated);
-        assert_eq!(snapshot.snapshot_seq, 3);
-        assert!(!snapshot.coverage.reasoning_complete);
-        assert_eq!(state.dropped_events, 1);
-    }
-
     #[test]
     fn ordinary_reasoning_remains_visible_during_streaming() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         for (index, (chunk, expected)) in [
             ("ordinary ", "ordinary "),
             ("streaming text", "ordinary streaming text"),
@@ -760,7 +831,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            state.observe_message(
+            state.ingest_fixture(
                 "session/event",
                 &event(
                     &index.to_string(),
@@ -774,8 +845,8 @@ mod tests {
 
     #[test]
     fn reasoning_budget_recovers_latest_tail_after_coverage_loss() {
-        let mut state = ObservationState::default();
-        state.observe_message(
+        let mut state = ProjectionTrace::default();
+        state.ingest_fixture(
             "session/event",
             &event(
                 "1",
@@ -783,7 +854,7 @@ mod tests {
                 serde_json::json!({"delta":"x".repeat(MAX_REASONING_BYTES)}),
             ),
         );
-        state.observe_message(
+        state.ingest_fixture(
             "session/event",
             &event(
                 "2",
@@ -805,8 +876,8 @@ mod tests {
 
     #[test]
     fn reasoning_overflow_tail_counts_chinese_and_emoji_as_unicode_scalars() {
-        let mut state = ObservationState::default();
-        state.observe_message(
+        let mut state = ProjectionTrace::default();
+        state.ingest_fixture(
             "session/event",
             &event(
                 "1",
@@ -814,7 +885,7 @@ mod tests {
                 serde_json::json!({"delta":"x".repeat(MAX_REASONING_BYTES)}),
             ),
         );
-        state.observe_message(
+        state.ingest_fixture(
             "session/event",
             &event(
                 "2",
@@ -831,9 +902,9 @@ mod tests {
 
     #[test]
     fn rolling_reasoning_window_bounds_capacity_after_repeated_oversized_deltas() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         for index in 0..4 {
-            state.observe_message(
+            state.ingest_fixture(
                 "session/event",
                 &event(
                     &index.to_string(),
@@ -848,7 +919,7 @@ mod tests {
 
     #[test]
     fn gradual_reasoning_window_growth_never_keeps_an_oversized_allocation() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         for (index, delta) in [
             "x".repeat(40 * 1024),
             "y".repeat(20 * 1024),
@@ -857,7 +928,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            state.observe_message(
+            state.ingest_fixture(
                 "session/event",
                 &event(
                     &index.to_string(),
@@ -872,8 +943,8 @@ mod tests {
 
     #[test]
     fn oversized_append_never_places_more_than_the_bound_in_observation_state() {
-        let mut state = ObservationState::default();
-        state.observe_message(
+        let mut state = ProjectionTrace::default();
+        state.ingest_fixture(
             "session/event",
             &event(
                 "1",
@@ -881,7 +952,7 @@ mod tests {
                 serde_json::json!({"delta":"seed".repeat(16 * 1024)}),
             ),
         );
-        state.observe_message(
+        state.ingest_fixture(
             "session/event",
             &event(
                 "2",
@@ -895,13 +966,13 @@ mod tests {
 
     #[test]
     fn tools_rank_by_count_then_recency_and_keep_five_recent_calls() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         let mut id = 0;
         for (name, count) in [("Read", 8), ("Bash", 6), ("Search", 4), ("Edit", 1)] {
             for call in 0..count {
                 id += 1;
                 let payload = serde_json::json!({"toolCallId": format!("call-{id}"), "toolName": name, "input": {"n": call}});
-                state.observe_message(
+                state.ingest_fixture(
                     "session/event",
                     &event(&id.to_string(), "tool_call", payload),
                 );
@@ -930,43 +1001,27 @@ mod tests {
 
     #[test]
     fn call_updates_do_not_recount_and_arguments_preserve_values_except_encrypted_content() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         let initial = serde_json::json!({"toolCallId":"call", "toolName":"Bash", "input": {}});
         let update = serde_json::json!({"toolCallId":"call", "toolName":"Bash", "input": {"command":"echo secret-value", "nested":{"encrypted_content":"NEVER"}, "token":"NEVER"}});
-        state.observe_message("session/event", &event("1", "tool_call", initial));
-        state.observe_message("session/event", &event("2", "tool_call", update));
+        state.ingest_fixture("session/event", &event("1", "tool_call", initial));
+        state.ingest_fixture("session/event", &event("2", "tool_call", update));
         let snapshot = state.snapshot();
         let tool = &snapshot.tools[0];
         assert_eq!(tool.call_count, 1);
         assert_eq!(tool.recent_calls[0].seq, 1);
         let encoded = serde_json::to_string(&tool.recent_calls[0].arguments).unwrap();
-        assert!(encoded.contains("NEVER"));
+        assert!(!encoded.contains("NEVER"));
         assert!(!encoded.contains("encrypted_content"));
         assert_eq!(tool.recent_calls[0].redacted_fields, 1);
     }
 
     #[test]
-    fn descriptor_with_non_object_input_reports_unknown_arguments() {
-        let mut state = ObservationState::for_adapter("agy");
-        state.observe_descriptor(&ToolDescriptor {
-            turn_id: "t".into(),
-            tool_call_id: "call-1".into(),
-            tool_name: "Bash".into(),
-            source_identity: "tool:call-1:started".into(),
-            input: Some(Value::String("echo hi".into())),
-            detail: None,
-        });
-        let call = &state.snapshot().tools[0].recent_calls[0];
-        assert!(call.arguments.is_empty());
-        assert!(call.arguments_truncated);
-    }
-
-    #[test]
     fn identical_arguments_with_distinct_call_ids_are_counted() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         for id in 1..=3 {
             let payload = serde_json::json!({"toolCallId":id.to_string(), "toolName":"Bash", "input":{"command":"true"}});
-            state.observe_message(
+            state.ingest_fixture(
                 "session/event",
                 &event(&id.to_string(), "tool_call", payload),
             );
@@ -976,9 +1031,9 @@ mod tests {
 
     #[test]
     fn long_arguments_are_bounded_and_marked_truncated() {
-        let mut state = ObservationState::default();
+        let mut state = ProjectionTrace::default();
         let payload = serde_json::json!({"toolCallId":"1", "toolName":"Read", "input":{"path":"x".repeat(10_000)}});
-        state.observe_message("session/event", &event("1", "tool_call", payload));
+        state.ingest_fixture("session/event", &event("1", "tool_call", payload));
         let call = &state.snapshot().tools[0].recent_calls[0];
         assert!(call.arguments_truncated);
         assert!(serde_json::to_vec(&call.arguments).unwrap().len() <= MAX_ARGUMENT_BYTES);
@@ -987,14 +1042,14 @@ mod tests {
     #[test]
     fn near_driver_limit_arguments_use_bounded_linear_projection_work() {
         for size in [256 * 1024, 900 * 1024] {
-            let mut state = ObservationState::default();
+            let mut state = ProjectionTrace::default();
             let payload = serde_json::json!({
                 "toolCallId":"1",
                 "toolName":"Bash",
                 "input":{"command":"x".repeat(size), "token":"must-not-copy"}
             });
             let started = std::time::Instant::now();
-            state.observe_message("session/event", &event("1", "tool_call", payload));
+            state.ingest_fixture("session/event", &event("1", "tool_call", payload));
             let elapsed = started.elapsed();
             let snapshot = state.snapshot();
             let call = &snapshot.tools[0].recent_calls[0];
@@ -1007,204 +1062,6 @@ mod tests {
                 elapsed < std::time::Duration::from_secs(5),
                 "{size} bytes took {elapsed:?}"
             );
-        }
-    }
-
-    #[test]
-    fn public_event_fixture_uses_only_supported_fields() {
-        let events: Vec<Value> = serde_json::from_str(include_str!(
-            "../../../tests/live-agent/non-git-based/observation-public-fixture.json"
-        ))
-        .unwrap();
-        let expected_text = events
-            .iter()
-            .filter_map(|event| {
-                event["params"]["payload"]["delta"]
-                    .as_str()
-                    .filter(|_| event["params"]["payload"]["kind"] == "reasoning_delta")
-            })
-            .collect::<String>();
-        let mut state = ObservationState::default();
-        for event in &events {
-            state.observe_message(event["method"].as_str().unwrap(), &event["params"]);
-        }
-        let snapshot = state.snapshot();
-        assert_eq!(
-            snapshot.reasoning.text,
-            expected_text
-                .chars()
-                .rev()
-                .take(200)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<String>()
-        );
-        assert_eq!(snapshot.reasoning.text.chars().count(), 200);
-        assert!(snapshot.reasoning.truncated);
-        assert_eq!(snapshot.tools.len(), 2);
-        assert_eq!(
-            snapshot
-                .tools
-                .iter()
-                .map(|tool| tool.tool_name.as_str())
-                .collect::<Vec<_>>(),
-            ["Bash", "Read"]
-        );
-        assert!(snapshot.coverage.tool_history_complete);
-        assert!(snapshot.coverage.reasoning_complete);
-    }
-
-    #[test]
-    fn malformed_public_candidates_create_honest_coverage_gaps() {
-        let mut state = ObservationState::default();
-        state.observe_message(
-            "session/event",
-            &serde_json::json!({"type":"model.streaming", "eventId":"1", "payload":{"kind":"reasoning_delta", "delta":42}}),
-        );
-        state.observe_message(
-            "session/event",
-            &serde_json::json!({"type":"model.streaming", "eventId":"2", "payload":{"kind":"tool_call", "toolName":"Read", "input":{}}}),
-        );
-        let snapshot = state.snapshot();
-        assert!(!snapshot.coverage.reasoning_complete);
-        assert!(!snapshot.coverage.tool_history_complete);
-        assert_eq!(snapshot.coverage.dropped_events, 2);
-        assert_eq!(snapshot.snapshot_seq, 2);
-    }
-
-    #[test]
-    fn ties_use_latest_call_then_name_and_empty_delta_is_valid() {
-        let mut state = ObservationState::default();
-        state.observe_message(
-            "session/event",
-            &event(
-                "1",
-                "tool_call",
-                serde_json::json!({"toolCallId":"z", "toolName":"Zed", "input":{}}),
-            ),
-        );
-        state.observe_message(
-            "session/event",
-            &event(
-                "2",
-                "tool_call",
-                serde_json::json!({"toolCallId":"a", "toolName":"Alpha", "input":{}}),
-            ),
-        );
-        state.observe_message(
-            "session/event",
-            &event("3", "reasoning_delta", serde_json::json!({"delta":""})),
-        );
-        let snapshot = state.snapshot();
-        assert_eq!(
-            snapshot
-                .tools
-                .iter()
-                .map(|tool| tool.tool_name.as_str())
-                .collect::<Vec<_>>(),
-            ["Alpha", "Zed"]
-        );
-        assert!(snapshot.reasoning.text.is_empty());
-        assert!(snapshot.coverage.reasoning_complete);
-        assert_eq!(snapshot.snapshot_seq, 3);
-    }
-
-    #[test]
-    fn empty_observation_is_available_without_runtime_file_authentication() {
-        let state = ObservationState::for_launch("zcode", 1);
-        let snapshot = state.snapshot();
-        assert!(snapshot.tools.is_empty());
-        assert!(snapshot.reasoning.text.is_empty());
-        assert_eq!(snapshot.reasoning.source, ReasoningSource::zcode());
-        assert!(snapshot.coverage.tool_history_complete);
-    }
-
-    #[test]
-    fn tool_type_and_identity_caps_stop_admission_and_report_loss() {
-        let mut types = ObservationState::default();
-        for id in 0..=MAX_TOOL_TYPES {
-            types.observe_message(
-                "session/event",
-                &event(
-                    &id.to_string(),
-                    "tool_call",
-                    serde_json::json!({"toolCallId":id.to_string(), "toolName":format!("tool-{id}"), "input":{}}),
-                ),
-            );
-        }
-        assert_eq!(types.tools.len(), MAX_TOOL_TYPES);
-        assert!(!types.snapshot().coverage.tool_history_complete);
-
-        let mut identities = ObservationState::default();
-        for id in 0..=MAX_IDENTITIES {
-            identities.observe_message(
-                "session/event",
-                &event(
-                    &id.to_string(),
-                    "tool_call",
-                    serde_json::json!({"toolCallId":id.to_string(), "toolName":"Read", "input":{}}),
-                ),
-            );
-        }
-        let snapshot = identities.snapshot();
-        assert_eq!(snapshot.tools[0].call_count, MAX_IDENTITIES as u64);
-        assert!(!snapshot.coverage.tool_history_complete);
-        assert_eq!(snapshot.coverage.dropped_events, 1);
-    }
-}
-
-impl ObservationState {
-    /// Typed facts already passed the native adapter's replay/shape checks.
-    pub(crate) fn observe_fact(&mut self, event: &external_contract::events::NormalizedEvent) {
-        use external_contract::events::*;
-        match &event.fact {
-            EventFact::PublicReasoningDelta(reasoning) if self.collect_reasoning => {
-                self.observe_reasoning(&reasoning.delta);
-                self.bump_snapshot();
-            }
-            EventFact::ToolChanged(tool) => {
-                // Progress and permission-only updates cannot invent a call.
-                if tool.phase == Some(ToolPhase::Progress)
-                    || (tool.phase.is_none() && tool.arguments.is_none())
-                {
-                    return;
-                }
-                let Some(name) = &tool.name else {
-                    return;
-                };
-                let input = match &tool.arguments {
-                    Some(ArgumentUpdate::Snapshot(value)) => Some(value),
-                    _ => None,
-                };
-                let (arguments, mut truncated, redacted) = project_arguments(input);
-                if input.is_none() {
-                    truncated = true;
-                }
-                let turn = format!("{:?}:{:?}", event.context.launch_id, event.context.turn_id);
-                self.record_tool_call(&turn, &tool.call_id.0, name, arguments, truncated, redacted);
-            }
-            EventFact::CoverageGap(gap) => {
-                let affects = |dimension| {
-                    matches!(&gap.impact, Impact::Known(dimensions) if dimensions.contains(&dimension))
-                };
-                if affects(CoverageDimension::Tools) {
-                    self.tool_history_complete = false;
-                }
-                if affects(CoverageDimension::PublicReasoning) {
-                    self.reasoning_complete = false;
-                }
-                self.dropped_events = self.dropped_events.saturating_add(1);
-                self.bump_snapshot();
-            }
-            EventFact::Diagnostic(diagnostic)
-                if diagnostic.reason == DiagnosticReason::UnknownSemantics =>
-            {
-                // Retain the diagnostic without inferring a lost history
-                // dimension from uncertainty about native semantics.
-                self.bump_snapshot();
-            }
-            _ => {}
         }
     }
 }

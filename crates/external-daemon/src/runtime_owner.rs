@@ -1,5 +1,5 @@
 use crate::{
-    task_route, LifecycleSink, RuntimeActivitySnapshot, RuntimeCommandError, RuntimeOwner,
+    task_route, LifecycleSink, RuntimeCommandError, RuntimeOwner,
     RuntimeTerminal, SessionReady, TaskRoute, TerminalLatch, TurnBoundary, TurnSnapshot,
 };
 use external_contract::StdioMcpServer;
@@ -119,14 +119,7 @@ pub trait ManagedRuntime: Send + Sync + 'static {
             boundary: None,
         }
     }
-    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        let turn = self.turn_snapshot();
-        RuntimeActivitySnapshot {
-            model_request_elapsed: turn.active.then_some(Duration::ZERO),
-            transport_idle_elapsed: turn.active.then_some(Duration::ZERO),
-            turn,
-        }
-    }
+
     fn stop_boundary_count(&self) -> u64 {
         0
     }
@@ -245,9 +238,7 @@ impl ManagedRuntime for RuntimeOwner {
         self.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        self.runtime_state.activity_snapshot()
-    }
+
 
     fn stop_boundary_count(&self) -> u64 {
         self.stop_boundary_count()

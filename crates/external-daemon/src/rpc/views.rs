@@ -602,10 +602,10 @@ pub(crate) fn task_activity_view(
         oldest_in_flight_tool_age_ms: snapshot.oldest_active_tool_age_ms,
         last_activity_age_ms: snapshot.last_activity_age_ms,
         model_request_active: snapshot.model_request_active,
-        telemetry_status: if snapshot.telemetry_degraded {
-            TelemetryStatusView::Degraded
-        } else {
-            TelemetryStatusView::Healthy
+        telemetry_status: match snapshot.telemetry_status {
+            crate::TelemetryStatus::Healthy => TelemetryStatusView::Healthy,
+            crate::TelemetryStatus::Degraded => TelemetryStatusView::Degraded,
+            crate::TelemetryStatus::Unavailable => TelemetryStatusView::Unavailable,
         },
     }
 }
@@ -639,6 +639,8 @@ mod activity_projection_tests {
                 ..PassiveActivityWindow::default()
             },
             telemetry_degraded: true,
+            telemetry_status: crate::TelemetryStatus::Degraded,
+            coverage: crate::RuntimeCoverage::default(), diagnostics: vec![], model_activity: None, diagnostics_truncated: false,
         }
     }
 

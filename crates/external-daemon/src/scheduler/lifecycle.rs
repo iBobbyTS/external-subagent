@@ -128,13 +128,8 @@ impl Scheduler {
         };
         let runtime_agent_id = format!("{}:{}", claim.task.agent_id, claim.owner_epoch);
         let runtime_lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
-        // Public event parsing follows the launched adapter: ZCode events,
-        // public DSH ACP thoughts, and no Codex reasoning collection.
-        let adapter = task_agent(&claim.task);
-        let activity = Arc::new(PassiveActivityTracker::for_launch(
-            &adapter,
-            claim.owner_epoch,
-        ));
+        // All launch identity and capability evidence comes from typed input.
+        let activity = Arc::new(RuntimeState::new());
         {
             let mut state = self.inner.state.lock().unwrap();
             // The wait text stream is per-task, not per-claim: a follow-up or

@@ -84,7 +84,7 @@ pub(super) enum ResponseClaimHookStage {
 pub(crate) struct SchedulerState {
     pub(super) active: HashMap<String, ActiveRuntime>,
     pub(super) starting: HashMap<String, StartingHandle>,
-    pub(crate) activities: HashMap<String, Arc<PassiveActivityTracker>>,
+    pub(crate) activities: HashMap<String, Arc<RuntimeState>>,
     pub(super) failures: HashMap<String, String>,
 }
 
@@ -578,7 +578,7 @@ impl Scheduler {
                     .flatten()
                     .is_some_and(|task| task_agent(&task) == "dsh")
                 {
-                    snapshot.reasoning.source = observation::ReasoningSource::dsh();
+                    snapshot.reasoning.source = observation::ReasoningSource::legacy_acp_projection();
                 }
                 snapshot
             }

@@ -1610,10 +1610,8 @@ mod observe_gate_tests {
                 .unwrap();
             let (service, task) = service_with_arbitrary_source(directory.path(), adapter);
             // Public event parsing follows the launched adapter.
-            let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter(
-                adapter,
-            ));
-            tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+            let tracker = Arc::new(crate::RuntimeState::new());
+            tracker.observe(&crate::test_support::fixture_event(external_runtime::Inbound::Message(
                 external_contract::WireMessage::UnknownEvent {
                     method: "session/event".into(),
                     raw: serde_json::json!({"params":{
@@ -1641,9 +1639,9 @@ mod observe_gate_tests {
             assert!(observation.tools.is_empty());
             assert_eq!(
                 observation.coverage.tool_history_complete,
-                adapter == "zcode"
+                false
             );
-            assert_eq!(observation.coverage.reasoning_complete, adapter != "codex");
+            assert!(observation.coverage.reasoning_complete);
             assert_eq!(observation.coverage.dropped_events, 0);
             let encoded = serde_json::to_value(observation).unwrap();
             assert!(!encoded.to_string().contains("SECRET"));
@@ -1681,7 +1679,7 @@ mod observe_gate_tests {
             } else {
                 let reasoning = observation.reasoning.as_ref().unwrap();
                 assert!(reasoning.text.is_empty());
-                assert_eq!(reasoning.source, if adapter == "dsh" { crate::observation::ReasoningSource::dsh() } else { crate::observation::ReasoningSource::zcode() });
+                assert_eq!(reasoning.source, if adapter == "dsh" { crate::observation::ReasoningSource::legacy_acp_projection() } else { crate::observation::ReasoningSource::legacy_session_projection() });
             }
         }
     }

@@ -1,12 +1,33 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ActivitySampleKind {
+    ReasoningDelta,
+    TextDelta,
+    ToolStarted { kind: PassiveToolKind, count: u64 },
+    ToolCompleted,
+    ToolFailed,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct ActivitySample {
+    pub(crate) observed_at: Instant,
+    pub(crate) kind: ActivitySampleKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveTool {
+    call_id: String,
+    kind: PassiveToolKind,
+    started_at: Option<Instant>,
+}
+
 #[derive(Default)]
 pub(crate) struct RuntimeStateData {
     pub(crate) turn: TurnReduction,
     pub(crate) command_failure: Option<external_contract::events::NativeFailure>,
     revision: u64,
     last_runtime_event_at: Option<(Instant, u64)>,
-    active_model_requests: HashMap<String, Instant>,
+    pub(crate) active_model_requests: HashMap<String, Option<Instant>>,
     last_model_delta_at: Option<Instant>,
     latest_text_tail: String,
     latest_text_updated_at: Option<u64>,
@@ -21,22 +42,19 @@ pub(crate) struct RuntimeStateData {
     /// The current turn's terminal text was set by a boundary carrying the
     /// turn's verified final text; later streaming echoes must not pollute it.
     terminal_text_settled: bool,
-    active_tools: HashMap<String, (PassiveToolKind, Instant)>,
+    pub(crate) active_tools: HashMap<String, ActiveTool>,
     samples: HashMap<String, ActivitySample>,
     sample_order: VecDeque<String>,
-    telemetry_degraded: bool,
+    pub(crate) health: runtime_observation::RuntimeObservation,
     typed_messages: HashMap<String, String>,
     typed_message_bytes: usize,
     /// Once a prefix is no longer fully tracked, snapshots cannot safely be
     /// compared with it. Deltas still feed the bounded live tail unchanged.
     typed_messages_limited: bool,
-    typed_finished_requests: std::collections::HashSet<String>,
     typed_finished_tools: std::collections::HashSet<String>,
-    observation: observation::ObservationState,
+    counted_tool_calls: std::collections::HashSet<String>,
+    pub(crate) observation: observation::ObservationState,
 }
-
-// Transitional name for the activity projection API, retired in the next increment.
-pub(crate) type PassiveActivityTracker = RuntimeState;
 
 impl RuntimeState {
     pub(crate) fn new() -> Self {
@@ -44,175 +62,12 @@ impl RuntimeState {
         Self {
             state: Mutex::new(state),
             changed: Condvar::new(),
-            // The pre-mode default: accept both vocabularies so an
-            // unregistered caller keeps its behavior.
-            mode: ToolActivityMode::Mixed,
         }
     }
 
-    pub(crate) fn for_adapter(adapter: &str) -> Self {
-        Self::for_launch(adapter, 0)
-    }
-
-    /// Construct a tracker for one fresh runtime launch. `launch_scope` is the
-    /// claim's owner epoch and namespaces the observation replay guards so a
-    /// new launch's adapter-local ids (DSH restarts at zero) never collide
-    /// with inherited ids from a previous claim.
-    pub(crate) fn for_launch(
-        adapter: &str,
-        launch_scope: u64,
-    ) -> Self {
-        let mut tracker = Self::new();
-        tracker.state.lock().unwrap().observation =
-            observation::ObservationState::for_launch(adapter, launch_scope);
-        tracker.mode = match adapter {
-            "codex" => ToolActivityMode::CountOnly,
-            "zcode" | "dsh" | "agy" => ToolActivityMode::Detailed,
-            _ => ToolActivityMode::Mixed,
-        };
-        tracker
-    }
-
-    pub(crate) fn observe(&self, event: &RuntimeEvent) {
-        self.observe_at(event, Instant::now(), activity_wall_now_millis());
-    }
-
-    fn observe_at(&self, event: &RuntimeEvent, now: Instant, wall_now_ms: u64) {
-        if let RuntimeEvent::Normalized(event) = event {
-            self.observe_typed_at(event, now, wall_now_ms);
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        match event {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(event))) => {
-                state
-                    .observation
-                    .observe_message(&event.method, &event.params);
-            }
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent { method, raw })) => {
-                let params = raw.get("params").unwrap_or(&serde_json::Value::Null);
-                state.observation.observe_message(method, params);
-            }
-            RuntimeEvent::Driver(Inbound::Malformed(_) | Inbound::OversizedLine { .. }) => {
-                state.observation.observe_loss();
-            }
-            _ => {}
-        }
-        state.revision = state.revision.saturating_add(1);
-        state.last_runtime_event_at = Some((now, wall_now_ms));
-        let parsed = parse_passive_activity(event, self.mode);
-        if parsed.source == ActivitySource::Telemetry && !parsed.telemetry_known {
-            state.telemetry_degraded = true;
-        }
-
-        let mut admitted = true;
-        if admitted {
-            if let (Some(identity), Some(sample)) = (parsed.identity.as_ref(), parsed.sample) {
-                let replace = match state.samples.get(identity) {
-                    Some(existing) => {
-                        existing.source == ActivitySource::Telemetry
-                            && parsed.source == ActivitySource::Session
-                    }
-                    None => true,
-                };
-                if replace {
-                    if !state.samples.contains_key(identity) {
-                        state.sample_order.push_back(identity.clone());
-                    }
-                    state.samples.insert(
-                        identity.clone(),
-                        ActivitySample {
-                            source: parsed.source,
-                            observed_at: now,
-                            kind: sample,
-                        },
-                    );
-                } else {
-                    admitted = false;
-                }
-            }
-        }
-
-        while state.sample_order.len() > MAX_ACTIVITY_IDENTITIES {
-            if let Some(identity) = state.sample_order.pop_front() {
-                state.samples.remove(&identity);
-            }
-        }
-
-        if admitted
-            && matches!(
-                parsed.sample,
-                Some(ActivitySampleKind::ReasoningDelta | ActivitySampleKind::TextDelta)
-            )
-        {
-            state.last_model_delta_at = Some(now);
-        }
-        if admitted {
-            if let Some(delta) = parsed.text_delta.as_deref() {
-                append_latest_text(&mut state, delta, wall_now_ms);
-            }
-            if let Some(response) = parsed.terminal_response.as_deref() {
-                // A boundary that carries the turn's verified final text
-                // settles it: streaming deltas racing past the boundary are
-                // echoes of a message the settlement already folded.
-                state.terminal_text = response.to_owned();
-                state.terminal_text_settled = true;
-            }
-        }
-
-        if let Some(descriptor) = parsed.tool_descriptor.as_ref() {
-            // Descriptor ingestion owns its own identity dedup, so repeated
-            // frames update rather than recount the same logical call.
-            state.observation.observe_descriptor(descriptor);
-        }
-
-        match parsed.transition {
-            Some(ActivityTransition::ModelStarted) => {
-                let request_id = parsed.request_id.unwrap_or_else(|| "model-request".into());
-                if let std::collections::hash_map::Entry::Vacant(entry) =
-                    state.active_model_requests.entry(request_id)
-                {
-                    entry.insert(now);
-                    state.last_model_delta_at = Some(now);
-                }
-            }
-            Some(ActivityTransition::ModelCompleted) => {
-                if let Some(request_id) = parsed.request_id.as_deref() {
-                    state.active_model_requests.remove(request_id);
-                } else {
-                    state.active_model_requests.clear();
-                }
-            }
-            Some(ActivityTransition::ToolScheduled | ActivityTransition::ToolStarted) => {
-                if let Some(tool_call_id) = parsed.tool_call_id {
-                    state
-                        .active_tools
-                        .entry(tool_call_id)
-                        .or_insert((parsed.tool_kind, now));
-                }
-            }
-            Some(
-                ActivityTransition::ToolCompleted
-                | ActivityTransition::ToolFailed
-                | ActivityTransition::PermissionResolved,
-            ) => {
-                if let Some(tool_call_id) = parsed.tool_call_id {
-                    state.active_tools.remove(&tool_call_id);
-                }
-            }
-            Some(ActivityTransition::TurnCompleted | ActivityTransition::TurnFailed) => {
-                state.active_model_requests.clear();
-                state.active_tools.clear();
-            }
-            Some(ActivityTransition::TurnStarted) => {
-                // Terminal text is scoped to one turn: a later turn's result
-                // must never inherit an earlier turn's text.
-                state.terminal_text.clear();
-                state.terminal_text_settled = false;
-            }
-            Some(ActivityTransition::PermissionRequested) | None => {}
-        }
-        self.changed.notify_all();
+    pub(crate) fn observe(&self, event: &RuntimeEnvelope) {
+        self.reduce_envelopes(std::slice::from_ref(event));
+        self.notify_reduced();
     }
 
     pub(crate) fn snapshot(&self) -> PassiveActivitySnapshot {
@@ -258,9 +113,9 @@ impl RuntimeState {
         let mut active_tools = state
             .active_tools
             .iter()
-            .map(|(tool_call_id, (kind, _))| PassiveActiveTool {
-                tool_call_id: tool_call_id.clone(),
-                kind: *kind,
+            .map(|(_, tool)| PassiveActiveTool {
+                tool_call_id: tool.call_id.clone(),
+                kind: tool.kind,
             })
             .collect::<Vec<_>>();
         active_tools.sort_by(|left, right| left.tool_call_id.cmp(&right.tool_call_id));
@@ -274,6 +129,7 @@ impl RuntimeState {
             model_request_age_ms: state
                 .active_model_requests
                 .values()
+                .filter_map(Option::as_ref)
                 .min()
                 .map(|at| duration_millis(now.saturating_duration_since(*at))),
             model_last_delta_age_ms: state
@@ -286,10 +142,18 @@ impl RuntimeState {
             oldest_active_tool_age_ms: state
                 .active_tools
                 .values()
-                .map(|(_, at)| duration_millis(now.saturating_duration_since(*at)))
+                .filter_map(|tool| {
+                    tool.started_at
+                        .map(|at| duration_millis(now.saturating_duration_since(at)))
+                })
                 .max(),
             window_60s: window,
-            telemetry_degraded: state.telemetry_degraded,
+            telemetry_degraded: state.health.status() == TelemetryStatus::Degraded,
+            telemetry_status: state.health.status(),
+            coverage: state.health.coverage.clone(),
+            diagnostics: state.health.diagnostics.clone(),
+            model_activity: state.health.model_activity.clone(),
+            diagnostics_truncated: state.health.diagnostics_truncated,
         }
     }
 
@@ -364,8 +228,8 @@ impl RuntimeState {
     /// 工具观测历史与文本流一样跨 claim 保留：旧 tracker 的 ObservationState
     /// 作为基底，新 tracker 在替换前已采集的调用按序重放（身份去重）。
     /// terminal text 仍只属于当前 turn。
-    pub(crate) fn inherit_wait_text(&self, old: &PassiveActivityTracker) {
-        let (old_tail, old_appended, old_delivered, old_updated, old_observation) = {
+    pub(crate) fn inherit_wait_text(&self, old: &RuntimeState) {
+        let (old_tail, old_appended, old_delivered, old_updated, old_observation, old_health) = {
             let old_state = old.state.lock().unwrap();
             (
                 old_state.latest_text_tail.clone(),
@@ -376,6 +240,7 @@ impl RuntimeState {
                 // this outgoing tracker's Arc until the map swap, and must
                 // keep seeing its real observation state.
                 old_state.observation.clone(),
+                old_state.health.clone(),
             )
         };
         let mut state = self.state.lock().unwrap();
@@ -406,15 +271,20 @@ impl RuntimeState {
         debug_assert!(state.appended_bytes >= state.latest_text_tail.len() as u64);
         let newer_observation = std::mem::replace(&mut state.observation, old_observation);
         state.observation.merge_newer(newer_observation);
+        state.health.inherit_history(&old_health);
+        let tools = state
+            .health
+            .coverage
+            .complete(external_contract::events::CoverageDimension::Tools);
+        let reasoning = state
+            .health
+            .coverage
+            .complete(external_contract::events::CoverageDimension::PublicReasoning);
+        state.observation.set_completeness(tools, reasoning);
     }
 
     pub(crate) fn observation_snapshot(&self) -> observation::ObservationSnapshot {
         self.state.lock().unwrap().observation.snapshot()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn activity_mode(&self) -> ToolActivityMode {
-        self.mode
     }
 
     #[cfg(test)]
@@ -425,13 +295,17 @@ impl RuntimeState {
         state.appended_bytes = state.latest_text_tail.len() as u64;
         state.delivered_bytes = 0;
         state.last_model_delta_at = Some(now);
-        state
-            .active_tools
-            .insert("tool".into(), (PassiveToolKind::Bash, now));
+        state.active_tools.insert(
+            "tool".into(),
+            ActiveTool {
+                call_id: "tool".into(),
+                kind: PassiveToolKind::Bash,
+                started_at: Some(now),
+            },
+        );
         state.samples.insert(
             "tool".into(),
             ActivitySample {
-                source: ActivitySource::Session,
                 observed_at: now,
                 kind: ActivitySampleKind::ToolStarted {
                     kind: PassiveToolKind::Bash,
@@ -501,11 +375,7 @@ fn append_latest_text(state: &mut RuntimeStateData, delta: &str, wall_now_ms: u6
 mod tests {
     use super::*;
 
-    fn typed_text(
-        tracker: &PassiveActivityTracker,
-        id: &str,
-        text: external_contract::events::TextUpdate,
-    ) {
+    fn typed_text(tracker: &RuntimeState, id: &str, text: external_contract::events::TextUpdate) {
         use external_contract::events::*;
         typed_fact(
             tracker,
@@ -516,10 +386,10 @@ mod tests {
         );
     }
 
-    fn typed_fact(tracker: &PassiveActivityTracker, fact: external_contract::events::EventFact) {
+    fn typed_fact(tracker: &RuntimeState, fact: external_contract::events::EventFact) {
         use external_contract::events::*;
         let sequence = tracker.state.lock().unwrap().revision + 1;
-        tracker.observe(&RuntimeEvent::Normalized(NormalizedEvent {
+        tracker.observe(&RuntimeEnvelope::from(NormalizedEvent {
             context: EventContext {
                 task_id: TaskId("task".into()),
                 launch_id: LaunchId("launch".into()),
@@ -544,7 +414,7 @@ mod tests {
     fn repair_typed_message_cache_is_bounded_while_live_deltas_continue() {
         use external_contract::events::TextUpdate;
         const BOUND: usize = external_agent_dsh::acp::result::MAX_MESSAGE_BYTES;
-        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        let tracker = RuntimeState::new();
         let chunk = "x".repeat(1024 * 1024);
         // 32 MiB of legal chunks, sixteen times the aggregate retention cap.
         for _ in 0..32 {
@@ -578,7 +448,7 @@ mod tests {
         assert!(tail.text.ends_with("live end"));
         assert!(tail.text.len() <= MAX_LATEST_TEXT_BYTES);
 
-        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        let tracker = RuntimeState::new();
         for n in 0..1024 {
             typed_text(&tracker, &format!("m{n}"), TextUpdate::Delta("x".into()));
         }
@@ -588,7 +458,7 @@ mod tests {
     #[test]
     fn repair_typed_snapshot_bookkeeping_is_bounded_and_resets_with_the_turn() {
         use external_contract::events::*;
-        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        let tracker = RuntimeState::new();
         typed_text(&tracker, "m1", TextUpdate::Delta("A".into()));
         typed_text(&tracker, "m1", TextUpdate::Snapshot("AB".into()));
         typed_text(&tracker, "m1", TextUpdate::Snapshot("AB".into()));
@@ -637,7 +507,7 @@ mod tests {
         typed_text(&tracker, "m1", TextUpdate::Snapshot("CD".into()));
         assert_eq!(tracker.take_wait_tail().text, "CD");
 
-        let tracker = PassiveActivityTracker::for_adapter("dsh");
+        let tracker = RuntimeState::new();
         typed_text(
             &tracker,
             "m",
@@ -647,932 +517,90 @@ mod tests {
         assert_eq!(tracker.peek_wait_tail().text.len(), MAX_LATEST_TEXT_BYTES);
     }
 
-    fn session_fixture(params: serde_json::Value) -> RuntimeEvent {
-        RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
-            external_contract::EventEnvelope {
-                method: "session/event".into(),
-                params,
+    #[test]
+    fn active_tool_retention_loss_is_atomic_and_scoped_to_its_terminal() {
+        use external_contract::events::*;
+        let tracker = RuntimeState::new();
+        typed_fact(
+            &tracker,
+            EventFact::TurnStarted {
+                turn_id: TurnId::Local(1),
             },
-        )))
-    }
-
-    #[test]
-    fn tool_descriptors_feed_observation_without_duplicate_counts_across_turns() {
-        let tracker = PassiveActivityTracker::for_adapter("codex");
-        let now = Instant::now();
-        assert!(tracker.observation_snapshot().tools.is_empty());
-        for n in 0..4 {
-            let event = session_fixture(external_contract::activity::tool_count_event(
-                &format!("e{n}"),
-                "t1",
-                1,
-                Some(&format!("tool{n}")),
-                Some(&format!("arg{n}")),
-            ));
-            tracker.observe_at(&event, now + Duration::from_millis(n), n);
-            tracker.observe_at(&event, now + Duration::from_millis(n + 1), n + 1);
-        }
-        // Repeated frames update nothing and never double-count.
-        let observation = tracker.observation_snapshot();
-        assert_eq!(
-            observation
-                .tools
-                .iter()
-                .map(|tool| (tool.tool_name.as_str(), tool.call_count))
-                .collect::<Vec<_>>(),
-            [("tool3", 1), ("tool2", 1), ("tool1", 1)]
         );
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({"type":"turn.completed"})),
-            now + Duration::from_secs(1),
-            1000,
-        );
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({"type":"turn.started"})),
-            now + Duration::from_secs(2),
-            2000,
-        );
-        assert_eq!(
-            tracker
-                .snapshot_at(now + Duration::from_secs(2))
-                .window_60s
-                .tool_calls_started,
-            4
-        );
-        // Observation is lifetime-scoped: it survives the 60-second window and
-        // tracker replacement across claims.
-        let expired = tracker.snapshot_at(now + Duration::from_secs(61));
-        assert_eq!(expired.window_60s.tool_calls_started, 0);
-        assert_eq!(tracker.observation_snapshot().tools.len(), 3);
-    }
-
-    #[test]
-    fn observation_history_survives_tracker_replacement_with_new_activity() {
-        fn tool_call(event_id: &str, call_id: &str, n: u64) -> RuntimeEvent {
-            session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":event_id, "turnId":"t",
-                "payload":{"kind":"tool_call","toolCallId":call_id,"toolName":"Bash","input":{"n":n}}
-            }))
-        }
-        fn reasoning(event_id: &str, delta: &str) -> RuntimeEvent {
-            session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":event_id, "turnId":"t",
-                "payload":{"kind":"reasoning_delta","delta":delta}
-            }))
-        }
-
-        let old = PassiveActivityTracker::for_launch("zcode", 1);
-        let new = PassiveActivityTracker::for_launch("zcode", 2);
-        let now = Instant::now();
-        old.observe_at(&reasoning("r-old", "old "), now, 0);
-        old.observe_at(&tool_call("e1", "c1", 1), now, 0);
-        old.observe_at(&tool_call("e2", "c2", 2), now, 0);
-        // The pre-claim tracker ingested a started descriptor and then a
-        // streaming refinement of the same call.
-        let old_started = session_fixture(serde_json::json!({
-            "type":"tool.updated", "eventId":"start-old", "turnId":"t",
-            "payload":{"kind":"started","toolCallId":"d1","toolName":"Read","input":{}}
-        }));
-        let old_refined = session_fixture(serde_json::json!({
-            "type":"model.streaming", "eventId":"refine-old", "turnId":"t",
-            "payload":{"kind":"tool_call","toolCallId":"d1","toolName":"Read","input":{"path":"a.ts"}}
-        }));
-        old.observe_at(&old_started, now, 0);
-        old.observe_at(&old_refined, now, 0);
-        // The incoming tracker already saw c1 before the map swap: the merge
-        // must not count it twice.
-        new.observe_at(&reasoning("r-new", "new"), now, 0);
-        new.observe_at(&tool_call("e1", "c1", 1), now, 0);
-        new.observe_at(&tool_call("e3", "c3", 3), now, 0);
-        // A stale pre-swap replay of the old started descriptor reaches the
-        // incoming tracker and records the obsolete empty arguments there.
-        new.observe_at(&old_started, now, 0);
-        let outgoing_before = old.observation_snapshot();
-        new.inherit_wait_text(&old);
-        // The outgoing tracker must keep serving its real observation to
-        // readers racing the map swap, not an emptied default state.
-        assert_eq!(old.observation_snapshot(), outgoing_before);
-
-        let snapshot = new.observation_snapshot();
-        assert_eq!(snapshot.tools.len(), 2);
-        assert_eq!(snapshot.tools[0].tool_name, "Bash");
-        assert_eq!(snapshot.tools[0].call_count, 3);
-        assert_eq!(
-            snapshot.tools[0]
-                .recent_calls
-                .iter()
-                .map(|call| call.tool_call_id.as_str())
-                .collect::<Vec<_>>(),
-            ["c3", "c2", "c1"]
-        );
-        assert_eq!(
-            snapshot.tools[0]
-                .recent_calls
-                .iter()
-                .map(|call| call.arguments["n"].clone())
-                .collect::<Vec<_>>(),
-            [serde_json::json!(3), serde_json::json!(2), serde_json::json!(1)]
-        );
-        // Reasoning is concatenated oldest→newest across the replacement.
-        assert_eq!(snapshot.reasoning.text, "old new");
-        let read = snapshot
-            .tools
-            .iter()
-            .find(|tool| tool.tool_name == "Read")
-            .unwrap();
-        assert_eq!(read.call_count, 1);
-        assert_eq!(
-            read.recent_calls[0].arguments["path"],
-            serde_json::json!("a.ts")
-        );
-
-        // Replaying a pre-claim event after inheritance is refused by the
-        // merged source-event set and the call identity.
-        new.observe(&tool_call("e1", "c1", 1));
-        new.observe(&tool_call("e1", "c1", 1));
-        let replayed = new.observation_snapshot();
-        assert_eq!(replayed.tools[0].call_count, 3);
-        assert_eq!(replayed.tools[0].recent_calls.len(), 3);
-
-        // A pre-claim descriptor re-delivered verbatim is rejected by the
-        // inherited descriptor-frame set: it must not restore the obsolete
-        // empty arguments over the streaming refinement.
-        new.observe(&old_started);
-        assert_eq!(new.observation_snapshot(), replayed);
-
-        // A new post-claim descriptor still lands normally.
-        new.observe(&session_fixture(serde_json::json!({
-            "type":"tool.updated", "eventId":"start-new", "turnId":"t",
-            "payload":{"kind":"started","toolCallId":"d2","toolName":"Read","input":{"path":"b.ts"}}
-        })));
-        let landed = new.observation_snapshot();
-        let read = landed
-            .tools
-            .iter()
-            .find(|tool| tool.tool_name == "Read")
-            .unwrap();
-        assert_eq!(read.call_count, 2);
-        assert!(read.recent_calls.iter().any(|call| {
-            call.tool_call_id == "d2" && call.arguments["path"] == serde_json::json!("b.ts")
-        }));
-    }
-
-    #[test]
-    fn launch_scoped_guards_accept_recycled_event_ids_after_reclaim() {
-        let old = PassiveActivityTracker::for_launch("dsh", 1);
-        let new = PassiveActivityTracker::for_launch("dsh", 2);
-        let now = Instant::now();
-        old.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":"dsh-event-1", "turnId":"old-turn",
-                "payload":{"kind":"reasoning_delta","delta":"old "}
-            })),
-            now,
-            0,
-        );
-        old.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":"dsh-event-2", "turnId":"old-turn",
-                "payload":{"kind":"tool_call","toolCallId":"old-call","toolName":"read","input":{"path":"old.ts"}}
-            })),
-            now,
-            0,
-        );
-        new.inherit_wait_text(&old);
-
-        // The restarted DSH owner starts its launch-local sequence at zero, so
-        // the new claim reuses the same source ids for genuinely new events.
-        new.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":"dsh-event-1", "turnId":"new-turn",
-                "payload":{"kind":"reasoning_delta","delta":"new"}
-            })),
-            now,
-            0,
-        );
-        new.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"model.streaming", "eventId":"dsh-event-2", "turnId":"new-turn",
-                "payload":{"kind":"tool_call","toolCallId":"new-call","toolName":"edit","input":{"path":"new.ts"}}
-            })),
-            now,
-            0,
-        );
-        let snapshot = new.observation_snapshot();
-        assert_eq!(snapshot.reasoning.text, "old new");
-        assert!(snapshot.coverage.reasoning_complete);
-        assert!(!snapshot.coverage.tool_history_complete);
-        assert_eq!(snapshot.coverage.dropped_events, 0);
-        let tool = |name: &str| {
-            snapshot
-                .tools
-                .iter()
-                .find(|tool| tool.tool_name == name)
-                .unwrap_or_else(|| panic!("{name} must be captured"))
-        };
-        assert_eq!(tool("read").call_count, 1);
-        let edit = tool("edit");
-        assert_eq!(edit.call_count, 1);
-        assert_eq!(
-            edit.recent_calls[0].arguments["path"],
-            serde_json::json!("new.ts")
-        );
-    }
-
-    #[test]
-    fn zcode_wire_tool_call_retains_compact_parameters_without_extra_counts() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let frame = session_fixture(serde_json::json!({
-            "type":"model.streaming", "eventId":"e", "turnId":"t",
-            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"echo 中","timeout":10}}
-        }));
-        tracker.observe(&frame);
-        tracker.observe(&frame);
-        let mut started =
-            external_contract::activity::tool_started_event("start", "t", "c", Some("Bash"));
-        started["payload"]["inputOmitted"] = true.into();
-        tracker.observe(&session_fixture(started));
-        let snapshot = tracker.snapshot();
-        assert_eq!(snapshot.window_60s.tool_calls_started, 1);
-        let observation = tracker.observation_snapshot();
-        assert_eq!(observation.tools[0].call_count, 1);
-        assert_eq!(
-            observation.tools[0].recent_calls[0].arguments,
-            serde_json::json!({"command":"echo 中","timeout":10})
-                .as_object()
-                .unwrap()
-                .clone()
-        );
-    }
-
-    #[test]
-    fn replayed_streaming_tool_frame_keeps_the_newer_arguments() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let empty = session_fixture(serde_json::json!({
-            "type":"model.streaming", "eventId":"e1", "turnId":"t",
-            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{}}
-        }));
-        let refined = session_fixture(serde_json::json!({
-            "type":"model.streaming", "eventId":"e2", "turnId":"t",
-            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"sleep 300"}}
-        }));
-        tracker.observe(&empty);
-        tracker.observe(&refined);
-        let before = tracker.observation_snapshot();
-        assert_eq!(before.tools[0].call_count, 1);
-        assert_eq!(
-            before.tools[0].recent_calls[0].arguments["command"],
-            serde_json::json!("sleep 300")
-        );
-
-        // A re-delivered older frame is rejected by the canonical source-event
-        // guard; it must not restore the obsolete empty arguments.
-        tracker.observe(&empty);
-        assert_eq!(tracker.observation_snapshot(), before);
-    }
-
-    #[test]
-    fn replayed_started_descriptor_keeps_the_newer_streaming_arguments() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let started = session_fixture(serde_json::json!({
-            "type":"tool.updated", "eventId":"start-1", "turnId":"t",
-            "payload":{"kind":"started","toolCallId":"c","toolName":"Bash","input":{}}
-        }));
-        let refined = session_fixture(serde_json::json!({
-            "type":"model.streaming", "eventId":"refine-2", "turnId":"t",
-            "payload":{"kind":"tool_call","toolCallId":"c","toolName":"Bash","input":{"command":"sleep 300"}}
-        }));
-        tracker.observe(&started);
-        tracker.observe(&refined);
-        let before = tracker.observation_snapshot();
-        assert_eq!(before.tools[0].call_count, 1);
-        assert_eq!(
-            before.tools[0].recent_calls[0].arguments["command"],
-            serde_json::json!("sleep 300")
-        );
-
-        // The repeated started descriptor is rejected by its source-frame
-        // identity even though the sample admission guard also rejects it;
-        // the newer streaming arguments must survive.
-        tracker.observe(&started);
-        let replayed = tracker.observation_snapshot();
-        assert_eq!(replayed, before);
-        assert_eq!(replayed.tools[0].call_count, 1);
-        assert_eq!(
-            replayed.tools[0].recent_calls[0].arguments["command"],
-            serde_json::json!("sleep 300")
-        );
-    }
-
-    #[test]
-    fn descriptors_respect_modes_and_old_events_do_not_invent_calls() {
-        let now = Instant::now();
-        let old = session_fixture(external_contract::activity::tool_count_event(
-            "old", "t", 2, None, None,
-        ));
-        let detailed = session_fixture(
-            serde_json::json!({"type":"tool.updated", "turnId":"t", "payload":{"kind":"started","toolCallId":"c","toolName":"Bash","input":{"command":"true"}}}),
-        );
-        let count = session_fixture(external_contract::activity::tool_count_event(
-            "new",
-            "t",
-            1,
-            Some("commandExecution"),
-            Some("true"),
-        ));
-        let codex = PassiveActivityTracker::for_adapter("codex");
-        codex.observe_at(&old, now, 0);
-        assert!(codex.observation_snapshot().tools.is_empty());
-        assert_eq!(codex.snapshot().window_60s.tool_calls_started, 2);
-        codex.observe_at(&detailed, now, 0);
-        assert!(codex.observation_snapshot().tools.is_empty());
-        codex.observe_at(&count, now, 0);
-        let observed = codex.observation_snapshot();
-        assert_eq!(observed.tools[0].tool_name, "commandExecution");
-        assert_eq!(
-            observed.tools[0].recent_calls[0].arguments,
-            serde_json::json!({"detail":"true"}).as_object().unwrap().clone()
-        );
-        let zcode = PassiveActivityTracker::for_adapter("zcode");
-        zcode.observe_at(&count, now, 0);
-        assert!(zcode.observation_snapshot().tools.is_empty());
-        assert_eq!(zcode.snapshot().window_60s.tool_calls_started, 0);
-    }
-
-    #[test]
-    fn bounded_tool_call_truncates_unicode_on_character_boundaries() {
-        let tool = "工🙂".repeat(40);
-        let detail = format!("{}🙂tail", "a".repeat(511));
-        let bounded =
-            crate::activity_parser::bounded_tool_call(&tool, &detail);
-        assert_eq!(bounded[0].chars().count(), 64);
-        assert_eq!(bounded[0], "工🙂".repeat(32));
-        assert_eq!(bounded[1], "a".repeat(511));
-        let bounded = crate::activity_parser::bounded_tool_call("Bash", &"🙂".repeat(200));
-        assert_eq!(bounded[1].len(), 512);
-    }
-
-    #[test]
-    fn count_samples_weight_the_window_and_expire_without_refresh() {
-        fn count_event(event_id: &str, count: u64) -> RuntimeEvent {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
-                external_contract::EventEnvelope {
-                    method: "session/event".into(),
-                    params: serde_json::json!({
-                        "type": "tool.updated",
-                        "eventId": event_id,
-                        "turnId": "t1",
-                        "payload": {"kind": "count", "count": count},
-                    }),
-                },
-            )))
-        }
-        let tracker = PassiveActivityTracker::new();
-        let base = Instant::now();
-        tracker.observe_at(&count_event("a", 3), base, 1_000);
-        tracker.observe_at(&count_event("b", 2), base, 1_000);
-        let window = tracker.snapshot_at(base).window_60s;
-        assert_eq!(window.tool_calls_started, 5);
-        // The count-only path carries no tool name, so every unit lands in the
-        // internal Other bucket; read/bash stay zero.
-        assert_eq!(window.other_tool_calls, 5);
-        assert_eq!(window.read_calls, 0);
-        assert_eq!(window.bash_calls, 0);
-
-        // A re-delivery of an already-admitted identity is refused: no extra
-        // weight and the original sample time is not refreshed.
-        tracker.observe_at(&count_event("a", 3), base + Duration::from_secs(30), 2_000);
-        assert_eq!(
-            tracker
-                .snapshot_at(base + Duration::from_secs(30))
-                .window_60s
-                .tool_calls_started,
-            5
-        );
-
-        // Past the 60-second window measured from first receipt, both samples
-        // fall out even though "a" was re-delivered at t=30.
-        assert_eq!(
-            tracker
-                .snapshot_at(base + Duration::from_secs(61))
-                .window_60s
-                .tool_calls_started,
-            0
-        );
-    }
-
-    #[test]
-    fn in_flight_projection_counts_tracked_calls_and_ages_them_from_first_insertion() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let base = Instant::now();
-        let scheduled = |id: &str| {
-            session_fixture(serde_json::json!({
-                "type":"tool.updated","turnId":"t",
-                "payload":{"kind":"scheduled","toolCallId":id,"toolName":"Bash","input":{"command":"sleep 60"}}
-            }))
-        };
-        tracker.observe_at(&scheduled("c1"), base, 0);
-        let snap = tracker.snapshot_at(base);
-        assert_eq!(snap.active_tools.len(), 1);
-        assert_eq!(snap.oldest_active_tool_age_ms, Some(0));
-        // A second started call lengthens the count but not the oldest age.
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"tool.updated","turnId":"t",
-                "payload":{"kind":"started","toolCallId":"c2","toolName":"Read","input":{"path":"x"}}
-            })),
-            base + Duration::from_secs(10),
-            10_000,
-        );
-        let snap = tracker.snapshot_at(base + Duration::from_secs(10));
-        assert_eq!(snap.active_tools.len(), 2);
-        assert_eq!(snap.oldest_active_tool_age_ms, Some(10_000));
-        // Age is measured from first insertion and grows with time.
-        assert_eq!(
-            tracker
-                .snapshot_at(base + Duration::from_secs(25))
-                .oldest_active_tool_age_ms,
-            Some(25_000)
-        );
-        // Resolving the oldest call leaves the younger one, aged from its own
-        // start rather than the resolved call's.
-        tracker.observe_at(
-            &session_fixture(external_contract::activity::tool_result_event(
-                "e1", "t", "c1",
-            )),
-            base + Duration::from_secs(30),
-            30_000,
-        );
-        let snap = tracker.snapshot_at(base + Duration::from_secs(30));
-        assert_eq!(snap.active_tools.len(), 1);
-        assert_eq!(snap.active_tools[0].tool_call_id, "c2");
-        assert_eq!(snap.oldest_active_tool_age_ms, Some(20_000));
-    }
-
-    #[test]
-    fn in_flight_projection_removes_on_settlement_and_clears_at_turn_edges() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let base = Instant::now();
-        let started = |id: &str| {
-            session_fixture(serde_json::json!({
-                "type":"tool.updated","turnId":"t",
-                "payload":{"kind":"started","toolCallId":id,"toolName":"Bash","input":{"command":"true"}}
-            }))
-        };
-        tracker.observe_at(&started("c1"), base, 0);
-        tracker.observe_at(&started("c2"), base, 0);
-        assert_eq!(tracker.snapshot_at(base).active_tools.len(), 2);
-        // A failure settles one call.
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"tool.updated","turnId":"t",
-                "payload":{"kind":"error","toolCallId":"c1","toolName":"Bash"}
-            })),
-            base + Duration::from_secs(1),
-            1_000,
-        );
-        assert_eq!(tracker.snapshot_at(base).active_tools.len(), 1);
-        // A permission resolution settles the other.
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"permission.resolved",
-                "payload":{"requestId":"r1","toolCallId":"c2","toolName":"Bash"}
-            })),
-            base + Duration::from_secs(2),
-            2_000,
-        );
-        let snap = tracker.snapshot_at(base + Duration::from_secs(2));
-        assert!(snap.active_tools.is_empty());
-        assert_eq!(snap.oldest_active_tool_age_ms, None);
-        // Turn boundaries clear everything in flight.
-        tracker.observe_at(&started("c3"), base + Duration::from_secs(3), 3_000);
-        tracker.observe_at(&started("c4"), base + Duration::from_secs(3), 3_000);
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({"type":"turn.completed"})),
-            base + Duration::from_secs(4),
-            4_000,
-        );
-        let snap = tracker.snapshot_at(base + Duration::from_secs(4));
-        assert!(snap.active_tools.is_empty());
-        assert_eq!(snap.oldest_active_tool_age_ms, None);
-        tracker.observe_at(&started("c5"), base + Duration::from_secs(5), 5_000);
-        tracker.observe_at(
-            &session_fixture(serde_json::json!({"type":"turn.failed"})),
-            base + Duration::from_secs(6),
-            6_000,
-        );
-        let snap = tracker.snapshot_at(base + Duration::from_secs(6));
-        assert!(snap.active_tools.is_empty());
-        assert_eq!(snap.oldest_active_tool_age_ms, None);
-    }
-
-    #[test]
-    fn in_flight_projection_stays_empty_for_count_only_adapters() {
-        let codex = PassiveActivityTracker::for_adapter("codex");
-        let now = Instant::now();
-        codex.observe_at(
-            &session_fixture(external_contract::activity::tool_count_event(
-                "e",
-                "t",
-                3,
-                Some("commandExecution"),
-                Some("echo hi"),
-            )),
-            now,
-            0,
-        );
-        // Detailed frames are a foreign vocabulary for codex: they never
-        // manufacture a per-call lifecycle.
-        codex.observe_at(
-            &session_fixture(serde_json::json!({
-                "type":"tool.updated","turnId":"t",
-                "payload":{"kind":"started","toolCallId":"c1","toolName":"Bash"}
-            })),
-            now,
-            0,
-        );
-        let snap = codex.snapshot_at(now);
-        assert!(snap.active_tools.is_empty());
-        assert_eq!(snap.oldest_active_tool_age_ms, None);
-        assert_eq!(snap.window_60s.tool_calls_started, 3);
-    }
-
-    #[test]
-    fn in_flight_aggregate_is_independent_of_the_observation_call_window() {
-        let tracker = PassiveActivityTracker::for_adapter("zcode");
-        let base = Instant::now();
-        for n in 0..5 {
-            tracker.observe_at(
-                &session_fixture(serde_json::json!({
-                    "type":"tool.updated","turnId":"t",
-                    "payload":{"kind":"started","toolCallId":format!("c{n}"),"toolName":"Bash","input":{"n":n}}
-                })),
-                base + Duration::from_secs(n),
-                n,
-            );
-        }
-        let snap = tracker.snapshot_at(base + Duration::from_secs(4));
-        // The aggregate counts every tracked call even though observe only
-        // returns the five most recent calls per tool.
-        assert_eq!(snap.active_tools.len(), 5);
-        let observation = tracker.observation_snapshot();
-        assert_eq!(observation.tools[0].call_count, 5);
-        assert_eq!(observation.tools[0].recent_calls.len(), 5);
-        assert_eq!(snap.oldest_active_tool_age_ms, Some(4_000));
-        assert_eq!(
-            crate::rpc::views::task_activity_view(external_store::TaskPhase::Running, Some(snap))
-                .in_flight_tool_count,
-            5
-        );
-    }
-
-    #[test]
-    fn for_adapter_infers_the_activity_mode() {
-        assert_eq!(
-            PassiveActivityTracker::new().activity_mode(),
-            ToolActivityMode::Mixed,
-            "the bare constructor stays on the safe Mixed default"
-        );
-        assert_eq!(
-            PassiveActivityTracker::for_adapter("codex").activity_mode(),
-            ToolActivityMode::CountOnly
-        );
-        assert_eq!(
-            PassiveActivityTracker::for_adapter("zcode").activity_mode(),
-            ToolActivityMode::Detailed
-        );
-        assert_eq!(
-            PassiveActivityTracker::for_adapter("dsh").activity_mode(),
-            ToolActivityMode::Detailed
-        );
-        assert_eq!(
-            PassiveActivityTracker::for_adapter("future-agent").activity_mode(),
-            ToolActivityMode::Mixed
-        );
-    }
-
-    #[test]
-    fn strict_modes_match_mixed_for_each_adapters_production_shapes() {
-        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-
-        fn typed_session(params: serde_json::Value) -> RuntimeEvent {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
-                external_contract::EventEnvelope {
-                    method: "session/event".into(),
-                    params,
-                },
-            )))
-        }
-        fn unknown_session(params: serde_json::Value) -> RuntimeEvent {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
-                method: "session/event".into(),
-                raw: serde_json::json!({"method": "session/event", "params": params}),
-            }))
-        }
-        fn assert_strict_matches_mixed(
-            strict: &PassiveActivityTracker,
-            mixed: &PassiveActivityTracker,
-            now: Instant,
-        ) {
-            let strict_snapshot = strict.snapshot_at(now);
-            let mixed_snapshot = mixed.snapshot_at(now);
-            assert_eq!(strict_snapshot.window_60s, mixed_snapshot.window_60s);
-            assert_eq!(strict_snapshot.active_tools, mixed_snapshot.active_tools);
-            assert_eq!(strict_snapshot.revision, mixed_snapshot.revision);
-        }
-
-        let now = Instant::now();
-
-        // ZCode native detailed events: named started (with toolName) + result.
-        let zcode_events = || {
-            vec![
-                typed_session(external_contract::activity::tool_started_event(
-                    "z1",
-                    "t1",
-                    "call-1",
-                    Some("Read"),
-                )),
-                typed_session(external_contract::activity::tool_started_event(
-                    "z2",
-                    "t1",
-                    "call-2",
-                    Some("Bash"),
-                )),
-                typed_session(external_contract::activity::tool_result_event(
-                    "z3", "t1", "call-1",
-                )),
-            ]
-        };
-        let zcode = PassiveActivityTracker::for_adapter("zcode");
-        let zcode_mixed = PassiveActivityTracker::new();
-        for event in zcode_events() {
-            zcode.observe_at(&event, now, 1_000);
-            zcode_mixed.observe_at(&event, now, 1_000);
-        }
-        assert_strict_matches_mixed(&zcode, &zcode_mixed, now);
-        let zcode_window = zcode.snapshot_at(now).window_60s;
-        assert_eq!(zcode_window.tool_calls_started, 2);
-        assert_eq!(zcode_window.read_calls, 1);
-        assert_eq!(zcode_window.bash_calls, 1);
-        assert_eq!(zcode_window.tool_calls_completed, 1);
-
-        // Hand-written native frames (no shared constructor) so the ZCode
-        // assertion stays independent of the contract builders: a
-        // streamRecovery.updated started plus a result for an earlier call.
-        let zcode_native_events = || {
-            vec![
-                typed_session(serde_json::json!({
-                    "type": "streamRecovery.updated",
-                    "eventId": "z4",
-                    "turnId": "t1",
-                    "payload": {"kind": "started", "toolCallId": "call-3", "toolName": "Read"},
-                })),
-                typed_session(serde_json::json!({
-                    "type": "streamRecovery.updated",
-                    "eventId": "z5",
-                    "turnId": "t1",
-                    "payload": {"kind": "result", "toolCallId": "call-2"},
-                })),
-            ]
-        };
-        for event in zcode_native_events() {
-            zcode.observe_at(&event, now, 1_000);
-            zcode_mixed.observe_at(&event, now, 1_000);
-        }
-        assert_strict_matches_mixed(&zcode, &zcode_mixed, now);
-        let zcode_window = zcode.snapshot_at(now).window_60s;
-        assert_eq!(zcode_window.tool_calls_started, 3);
-        assert_eq!(zcode_window.read_calls, 2);
-        assert_eq!(zcode_window.bash_calls, 1);
-        assert_eq!(zcode_window.tool_calls_completed, 2);
-        let zcode_active = zcode.snapshot_at(now).active_tools;
-        assert_eq!(zcode_active.len(), 1);
-        assert_eq!(zcode_active[0].tool_call_id, "call-3");
-        assert_eq!(zcode_active[0].kind, PassiveToolKind::Read);
-
-        // DSH canonical projections: named started, unnamed started, completed
-        // result — every phase derived from the native status.
-        let dsh_events = || {
-            let mut events = Vec::new();
-            let named = parse_update(&serde_json::json!({
-                "sessionId": "s",
-                "update": {"sessionUpdate": "tool_call", "toolCallId": "call-3", "title": "edit"}
-            }))
-            .unwrap();
-            for params in canonical_event_payloads(&named, "d1", "t1") {
-                events.push(unknown_session(params));
+        // Synthetic occupancy isolates the common state's retention boundary.
+        {
+            let mut state = tracker.state.lock().unwrap();
+            for index in 0..MAX_ACTIVITY_IDENTITIES {
+                state.active_tools.insert(
+                    index.to_string(),
+                    ActiveTool {
+                        call_id: index.to_string(),
+                        kind: PassiveToolKind::Other,
+                        started_at: None,
+                    },
+                );
             }
-            let unnamed = parse_update(&serde_json::json!({
-                "sessionId": "s",
-                "update": {
-                    "sessionUpdate": "tool_call_update", "toolCallId": "call-4",
-                    "status": "in_progress"
-                }
-            }))
-            .unwrap();
-            for params in canonical_event_payloads(&unnamed, "d2", "t1") {
-                events.push(unknown_session(params));
-            }
-            let result = parse_update(&serde_json::json!({
-                "sessionId": "s",
-                "update": {
-                    "sessionUpdate": "tool_call_update", "toolCallId": "call-3",
-                    "status": "completed", "content": [{"type": "text", "text": "done"}]
-                }
-            }))
-            .unwrap();
-            for params in canonical_event_payloads(&result, "d3", "t1") {
-                events.push(unknown_session(params));
-            }
-            events
+        }
+        let change = |id: &str, phase| {
+            EventFact::ToolChanged(ToolChange {
+                call_id: CallId(id.into()),
+                name: Some("Bash".into()),
+                category: None,
+                arguments: None,
+                phase: Some(phase),
+                outcome: None,
+                failure: None,
+                denied: None,
+            })
         };
-        let dsh = PassiveActivityTracker::for_adapter("dsh");
-        let dsh_mixed = PassiveActivityTracker::new();
-        for event in dsh_events() {
-            dsh.observe_at(&event, now, 1_000);
-            dsh_mixed.observe_at(&event, now, 1_000);
-        }
-        assert_strict_matches_mixed(&dsh, &dsh_mixed, now);
-        let dsh_window = dsh.snapshot_at(now).window_60s;
-        assert_eq!(dsh_window.tool_calls_started, 2);
-        assert_eq!(dsh_window.tool_calls_completed, 1);
-
-        // Codex count-only events.
-        let codex_events = || {
-            vec![
-                typed_session(external_contract::activity::tool_count_event(
-                    "c1", "t1", 1, None, None,
-                )),
-                typed_session(external_contract::activity::tool_count_event(
-                    "c2", "t1", 3, None, None,
-                )),
-            ]
-        };
-        let codex = PassiveActivityTracker::for_adapter("codex");
-        let codex_mixed = PassiveActivityTracker::new();
-        for event in codex_events() {
-            codex.observe_at(&event, now, 1_000);
-            codex_mixed.observe_at(&event, now, 1_000);
-        }
-        assert_strict_matches_mixed(&codex, &codex_mixed, now);
-        assert_eq!(codex.snapshot_at(now).window_60s.tool_calls_started, 4);
-
-        // Both strict modes reject the foreign vocabulary.
-        let count_for_detailed = typed_session(external_contract::activity::tool_count_event(
-            "x1", "t1", 7, None, None,
-        ));
-        zcode.observe_at(&count_for_detailed, now, 2_000);
+        typed_fact(&tracker, change("over-capacity", ToolPhase::Started));
+        tracker.state.lock().unwrap().active_tools.clear();
         assert_eq!(
-            zcode.snapshot_at(now).window_60s.tool_calls_started,
-            3,
-            "Detailed must ignore the count vocabulary"
-        );
-        for event in zcode_events() {
-            codex.observe_at(&event, now, 2_000);
-        }
-        assert_eq!(
-            codex.snapshot_at(now).window_60s.tool_calls_started,
-            4,
-            "CountOnly must ignore the detailed vocabulary"
+            tracker.snapshot().telemetry_status,
+            TelemetryStatus::Degraded
         );
         assert!(
-            codex.snapshot_at(now).active_tools.is_empty(),
-            "ignored detailed events must not enter active_tools"
+            !tracker
+                .observation_snapshot()
+                .coverage
+                .tool_history_complete,
+            "the same reduction exposes retention loss in the public coverage projection"
         );
-    }
-
-    #[test]
-    fn dsh_acp_invalid_thoughts_report_loss_but_empty_text_does_not() {
-        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-
-        for content in [
-            None,
-            Some(serde_json::json!({"type": "text"})),
-            Some(serde_json::json!({"type": "text", "text": 42})),
-            Some(serde_json::json!({"type": "text", "text": "bad\0text"})),
-            Some(serde_json::json!({"type": "text", "text": ""})),
-        ] {
-            let valid_empty =
-                content.as_ref().and_then(|c| c.get("text")) == Some(&serde_json::json!(""));
-            let dsh = PassiveActivityTracker::for_adapter("dsh");
-            let codex = PassiveActivityTracker::for_adapter("codex");
-            let mut params = serde_json::json!({
-                "sessionId": "s1", "update": {"sessionUpdate": "agent_thought_chunk"}
-            });
-            if let Some(content) = content {
-                params["update"]["content"] = content;
-            }
-            let update = parse_update(&params).unwrap();
-            for payload in canonical_event_payloads(&update, "e1", "t1") {
-                let event = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
-                    method: "session/event".into(),
-                    raw: serde_json::json!({"method": "session/event", "params": payload}),
-                }));
-                // Re-delivery must not count the same lost chunk twice.
-                dsh.observe(&event);
-                dsh.observe(&event);
-                codex.observe(&event);
-            }
-            let snapshot = dsh.observation_snapshot();
-            assert_eq!(
-                snapshot.coverage.reasoning_complete, valid_empty,
-                "{params}"
-            );
-            assert_eq!(snapshot.coverage.dropped_events, u64::from(!valid_empty));
-            assert!(snapshot.reasoning.text.is_empty());
-            let hidden = codex.observation_snapshot();
-            assert_eq!(hidden.coverage.dropped_events, 0);
-            assert_eq!(hidden.snapshot_seq, 0);
-        }
-    }
-
-    #[test]
-    fn dsh_public_acp_thoughts_reach_observe_but_codex_never_collects() {
-        use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-        let dsh = PassiveActivityTracker::for_adapter("dsh");
-        let codex = PassiveActivityTracker::for_adapter("codex");
-        let delta = format!("prefix{}", "中🙂".repeat(110));
-        let update = parse_update(&serde_json::json!({
-            "sessionId": "s1", "update": {
-                "sessionUpdate": "agent_thought_chunk",
-                "content": {"type": "text", "text": delta, "encrypted_content": "SECRET"}
-            }
-        }))
-        .unwrap();
-        for params in canonical_event_payloads(&update, "e1", "t1") {
-            let event = RuntimeEvent::Driver(Inbound::Message(WireMessage::UnknownEvent {
-                method: "session/event".into(),
-                raw: serde_json::json!({"method":"session/event", "params":params}),
-            }));
-            dsh.observe(&event);
-            codex.observe(&event);
-        }
-        let tool = parse_update(&serde_json::json!({
-            "sessionId": "s1", "update": {
-                "sessionUpdate": "tool_call", "toolCallId": "call-1", "kind": "read",
-                "rawInput": {"path":"not currently projected", "encrypted_content":"SECRET"}
-            }
-        }))
-        .unwrap();
-        for params in canonical_event_payloads(&tool, "e2", "t1") {
-            dsh.observe(&RuntimeEvent::Driver(Inbound::Message(
-                WireMessage::UnknownEvent {
-                    method: "session/event".into(),
-                    raw: serde_json::json!({"method":"session/event", "params":params}),
-                },
-            )));
-        }
-        let snapshot = dsh.observation_snapshot();
-        assert_eq!(snapshot.tools.len(), 1);
-        assert_eq!(snapshot.tools[0].call_count, 1);
-        assert!(snapshot.tools[0].recent_calls[0].arguments.is_empty());
-        assert!(snapshot.tools[0].recent_calls[0].arguments_truncated);
-        assert!(!serde_json::to_string(&snapshot).unwrap().contains("SECRET"));
-        assert_eq!(snapshot.reasoning.text, "中🙂".repeat(100));
-        assert!(snapshot.reasoning.truncated);
+        typed_fact(&tracker, change("unrelated", ToolPhase::Finished));
         assert_eq!(
-            snapshot.reasoning.source,
-            observation::ReasoningSource::dsh()
+            tracker.snapshot().telemetry_status,
+            TelemetryStatus::Degraded
         );
-        assert!(snapshot.coverage.reasoning_complete);
-        assert!(!snapshot.coverage.tool_history_complete);
-        assert_eq!(snapshot.coverage.dropped_events, 0);
-        let hidden = codex.observation_snapshot();
-        assert!(hidden.reasoning.text.is_empty());
+        typed_fact(&tracker, change("over-capacity", ToolPhase::Finished));
         assert_eq!(
-            hidden.snapshot_seq, 0,
-            "hidden reasoning never enters observation state"
+            tracker.snapshot().telemetry_status,
+            TelemetryStatus::Healthy
         );
-        assert!(!hidden.coverage.reasoning_complete);
-        assert!(!hidden.coverage.tool_history_complete);
+        assert!(
+            !tracker
+                .observation_snapshot()
+                .coverage
+                .tool_history_complete
+        );
     }
 
-    fn append_delta(tracker: &PassiveActivityTracker, delta: &str) {
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
-            external_contract::EventEnvelope {
-                method: "session/event".into(),
-                params: serde_json::json!({
-                    "type": "model.streaming",
-                    "eventId": format!("delta-{delta}"),
-                    "payload": {
-                        "kind": "text_delta",
-                        "delta": delta,
-                        "assistantMessageId": "m1"
-                    }
-                }),
-            },
-        ))));
+    fn append_delta(tracker: &RuntimeState, delta: &str) {
+        typed_text(
+            tracker,
+            "m1",
+            external_contract::events::TextUpdate::Delta(delta.into()),
+        );
     }
 
     #[test]
     fn inherit_wait_text_merges_text_appended_before_the_swap() {
         // Old window "AB" with "A" delivered; the incoming tracker already
         // collected "N" from the runtime sink before the map swap.
-        let old = PassiveActivityTracker::new();
+        let old = RuntimeState::new();
         append_delta(&old, "A");
         assert_eq!(old.take_wait_tail().text, "A");
         append_delta(&old, "B");
-        let new = PassiveActivityTracker::new();
+        let new = RuntimeState::new();
         append_delta(&new, "N");
 
         new.inherit_wait_text(&old);
@@ -1588,11 +616,11 @@ mod tests {
 
     #[test]
     fn inherit_wait_text_trims_the_merged_window_to_the_cap() {
-        let old = PassiveActivityTracker::new();
+        let old = RuntimeState::new();
         // 3000 * 3 = 9000 bytes; append drains to the largest char-aligned
         // suffix <= 8192, i.e. 810 bytes are dropped, leaving 2730 "界" (8190).
         append_delta(&old, &"界".repeat(3000));
-        let new = PassiveActivityTracker::new();
+        let new = RuntimeState::new();
         append_delta(&new, "尾");
 
         new.inherit_wait_text(&old);
@@ -1613,7 +641,7 @@ mod tests {
 
     #[test]
     fn take_wait_tail_delivers_only_the_new_suffix() {
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         append_delta(&tracker, "hello");
         assert_eq!(
             tracker.take_wait_tail(),
@@ -1642,7 +670,7 @@ mod tests {
     fn take_wait_tail_rolls_the_window_with_per_call_truncation() {
         // (a) A caller that falls behind the rolling window gets the whole
         // window plus a truncation flag, and the cursor catches up.
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         append_delta(&tracker, "中");
         let first = tracker.take_wait_tail();
         assert_eq!(first.text, "中");
@@ -1667,7 +695,7 @@ mod tests {
 
         // (b) Delivered up to the full window, then roll it and append a small
         // multibyte delta: only the delta, no truncation.
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         append_delta(&tracker, &"x".repeat(MAX_LATEST_TEXT_BYTES));
         let full = tracker.take_wait_tail();
         assert_eq!(full.text.len(), MAX_LATEST_TEXT_BYTES);
@@ -1683,7 +711,7 @@ mod tests {
 
         // (c) delivered == window_start exactly is NOT degradation: the whole
         // window is returned without a truncation flag.
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         append_delta(&tracker, &"a".repeat(1808));
         assert_eq!(tracker.take_wait_tail().text.len(), 1808);
         append_delta(&tracker, &"b".repeat(MAX_LATEST_TEXT_BYTES));
@@ -1705,7 +733,7 @@ mod tests {
         const DELTAS: usize = 200;
         const TOKEN_BYTES: usize = 8;
         const CONSUMERS: usize = 4;
-        let tracker = Arc::new(PassiveActivityTracker::new());
+        let tracker = Arc::new(RuntimeState::new());
         let token = |index: usize| format!("d{index:07}");
         let produced: String = (0..DELTAS).map(token).collect();
         assert!(produced.len() < MAX_LATEST_TEXT_BYTES, "no window roll");
@@ -1724,7 +752,9 @@ mod tests {
             let done = Arc::clone(&done);
             handles.push(std::thread::spawn(move || {
                 let mut chunks = Vec::new();
-                go_rx.recv().expect("appender must release the pinned consumer");
+                go_rx
+                    .recv()
+                    .expect("appender must release the pinned consumer");
                 let first = tracker.take_wait_tail();
                 taken_tx
                     .send((first.text.clone(), first.truncated))
@@ -1794,7 +824,7 @@ mod tests {
     }
 
     fn drain_until_done(
-        tracker: &PassiveActivityTracker,
+        tracker: &RuntimeState,
         done: &std::sync::atomic::AtomicBool,
         chunks: &mut Vec<String>,
     ) {
@@ -1879,17 +909,6 @@ fn typed_message_delta<'a>(
 }
 
 impl RuntimeState {
-    fn observe_typed_at(
-        &self,
-        event: &external_contract::events::NormalizedEvent,
-        now: Instant,
-        wall_now_ms: u64,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        Self::reduce_typed(&mut state, event, now, wall_now_ms);
-        self.changed.notify_all();
-    }
-
     pub(crate) fn reduce_typed(
         mut state: &mut RuntimeStateData,
         event: &external_contract::events::NormalizedEvent,
@@ -1897,11 +916,63 @@ impl RuntimeState {
         wall_now_ms: u64,
     ) {
         use external_contract::events::*;
+        if state.turn.active
+            && matches!(state.turn.turn_id, Some(TurnId::Local(_)))
+            && matches!(event.context.turn_id, Some(TurnId::Native(_)))
+        {
+            let mut old_event = event.clone();
+            old_event.context.turn_id = state.turn.turn_id.clone();
+            let old = runtime_observation::turn_key(&old_event);
+            let new = runtime_observation::turn_key(event);
+            let prefix = format!("{old}\0");
+            let models = std::mem::take(&mut state.active_model_requests);
+            for (key, value) in models {
+                let key = key
+                    .strip_prefix(&prefix)
+                    .map(|suffix| format!("{new}\0{suffix}"))
+                    .unwrap_or(key);
+                state.active_model_requests.insert(key, value);
+            }
+            let tools = std::mem::take(&mut state.active_tools);
+            for (key, value) in tools {
+                let key = key
+                    .strip_prefix(&prefix)
+                    .map(|suffix| format!("{new}\0{suffix}"))
+                    .unwrap_or(key);
+                state.active_tools.insert(key, value);
+            }
+            let finished = std::mem::take(&mut state.typed_finished_tools);
+            state.typed_finished_tools = finished
+                .into_iter()
+                .map(|key| {
+                    key.strip_prefix(&prefix)
+                        .map(|suffix| format!("{new}\0{suffix}"))
+                        .unwrap_or(key)
+                })
+                .collect();
+            let counted = std::mem::take(&mut state.counted_tool_calls);
+            state.counted_tool_calls = counted
+                .into_iter()
+                .map(|key| {
+                    key.strip_prefix(&prefix)
+                        .map(|suffix| format!("{new}\0{suffix}"))
+                        .unwrap_or(key)
+                })
+                .collect();
+            state.health.promote_turn(&old, &new);
+            state.observation.promote_turn(&old, &new);
+        }
         Self::reduce_turn(&mut state.turn, event, now);
         state.revision = state.revision.saturating_add(1);
         state.last_runtime_event_at = Some((now, wall_now_ms));
+        state.health.observe(event);
         state.observation.observe_fact(event);
-        let turn = format!("{:?}", event.context.turn_id);
+        for dimension in state.observation.projection_losses() {
+            state
+                .health
+                .projection_loss(dimension, event.context.source.protocol, wall_now_ms);
+        }
+        let turn = runtime_observation::turn_key(event);
         let mut sample = None;
         match &event.fact {
             EventFact::TurnStarted { .. } => {
@@ -1910,20 +981,19 @@ impl RuntimeState {
                 state.typed_messages.clear();
                 state.typed_message_bytes = 0;
                 state.typed_messages_limited = false;
-                state.active_model_requests.clear();
-                state.active_tools.clear();
-                state.typed_finished_requests.clear();
-                state.typed_finished_tools.clear();
-                state.telemetry_degraded = false;
             }
             EventFact::TurnSettled(settlement) => {
                 if let Some(text) = &settlement.final_text {
                     state.terminal_text = text.clone();
                 }
                 state.terminal_text_settled = true;
-                state.active_model_requests.clear();
-                state.active_tools.clear();
-                state.telemetry_degraded = false;
+                let prefix = format!("{turn}\0");
+                state
+                    .active_model_requests
+                    .retain(|key, _| !key.starts_with(&prefix));
+                state
+                    .active_tools
+                    .retain(|key, _| !key.starts_with(&prefix));
             }
             EventFact::MessageUpdated(message) if !state.terminal_text_settled => {
                 let delta = typed_message_delta(&mut state, message);
@@ -1945,46 +1015,106 @@ impl RuntimeState {
             }
             EventFact::ModelActivityChanged(model) => {
                 if let Some(request) = &model.request_id {
-                    let key = format!("{turn}:{}", request.0);
+                    let key = runtime_observation::correlation_key(event, &request.0);
                     match model.phase {
-                        ModelPhase::Started | ModelPhase::StreamStalled => {
-                            if !state.typed_finished_requests.contains(&key) {
-                                state.active_model_requests.entry(key).or_insert(now);
+                        ModelPhase::Started => {
+                            if state.active_model_requests.len() < MAX_ACTIVITY_IDENTITIES
+                                || state.active_model_requests.contains_key(&key)
+                            {
+                                state
+                                    .active_model_requests
+                                    .entry(key)
+                                    .or_insert(None)
+                                    .get_or_insert(now);
+                            } else {
+                                state.health.correlation_loss(
+                                    event,
+                                    CoverageDimension::ModelActivity,
+                                    ActivityScope::ModelRequest(request.clone()),
+                                    wall_now_ms,
+                                );
+                            }
+                        }
+                        ModelPhase::StreamStalled => {
+                            if state.active_model_requests.len() < MAX_ACTIVITY_IDENTITIES
+                                || state.active_model_requests.contains_key(&key)
+                            {
+                                state.active_model_requests.entry(key).or_insert(None);
+                            } else {
+                                state.health.correlation_loss(
+                                    event,
+                                    CoverageDimension::ModelActivity,
+                                    ActivityScope::ModelRequest(request.clone()),
+                                    wall_now_ms,
+                                );
                             }
                         }
                         ModelPhase::Completed | ModelPhase::Failed | ModelPhase::RetryScheduled => {
                             state.active_model_requests.remove(&key);
-                            if state.typed_finished_requests.len() < MAX_ACTIVITY_IDENTITIES {
-                                state.typed_finished_requests.insert(key);
-                            }
                         }
                     }
                 }
             }
             EventFact::ToolChanged(tool) => {
-                let key = format!("{turn}:{}", tool.call_id.0);
+                let key = runtime_observation::correlation_key(event, &tool.call_id.0);
                 let kind = match tool.name.as_deref() {
                     Some("Read" | "read") => PassiveToolKind::Read,
                     Some("Bash" | "bash") => PassiveToolKind::Bash,
                     _ => PassiveToolKind::Other,
                 };
+                if matches!(tool.phase, Some(ToolPhase::Started | ToolPhase::Finished))
+                    && !state.counted_tool_calls.contains(&key)
+                {
+                    if state.counted_tool_calls.len() < MAX_ACTIVITY_IDENTITIES {
+                        state.counted_tool_calls.insert(key.clone());
+                        let sample_key = format!("{key}:started");
+                        state.sample_order.push_back(sample_key.clone());
+                        state.samples.insert(
+                            sample_key,
+                            ActivitySample {
+                                observed_at: now,
+                                kind: ActivitySampleKind::ToolStarted { kind, count: 1 },
+                            },
+                        );
+                    } else {
+                        state.health.projection_loss(
+                            CoverageDimension::Tools,
+                            event.context.source.protocol,
+                            wall_now_ms,
+                        );
+                    }
+                }
                 match tool.phase {
                     Some(ToolPhase::Scheduled | ToolPhase::Started) => {
-                        if !state.typed_finished_tools.contains(&key) {
-                            state
-                                .active_tools
-                                .entry(tool.call_id.0.clone())
-                                .or_insert((kind, now));
-                        }
-                        if tool.phase == Some(ToolPhase::Started) {
-                            sample = Some((
-                                format!("{key}:started"),
-                                ActivitySampleKind::ToolStarted { kind, count: 1 },
-                            ));
+                        if !state.typed_finished_tools.contains(&key)
+                            && tool.call_id.0.len() <= MAX_ACTIVITY_ID_BYTES
+                            && (state.active_tools.len() < MAX_ACTIVITY_IDENTITIES
+                                || state.active_tools.contains_key(&key))
+                        {
+                            state.active_tools.entry(key.clone()).or_insert(ActiveTool {
+                                call_id: tool.call_id.0.clone(),
+                                kind,
+                                started_at: None,
+                            });
+                            if tool.phase == Some(ToolPhase::Started) {
+                                state
+                                    .active_tools
+                                    .get_mut(&key)
+                                    .expect("tool")
+                                    .started_at
+                                    .get_or_insert(now);
+                            }
+                        } else if !state.typed_finished_tools.contains(&key) {
+                            state.health.correlation_loss(
+                                event,
+                                CoverageDimension::Tools,
+                                ActivityScope::Tool(tool.call_id.clone()),
+                                wall_now_ms,
+                            );
                         }
                     }
                     Some(ToolPhase::Finished) => {
-                        state.active_tools.remove(&tool.call_id.0);
+                        state.active_tools.remove(&key);
                         if state.typed_finished_tools.len() < MAX_ACTIVITY_IDENTITIES {
                             state.typed_finished_tools.insert(key.clone());
                         }
@@ -2000,13 +1130,6 @@ impl RuntimeState {
                     _ => {} // progress/permission denial do not end execution
                 }
             }
-            EventFact::CoverageGap(g) => {
-                if !matches!(g.activity, ActivityScope::None)
-                    && matches!(&g.impact, Impact::Known(dimensions) if dimensions.iter().any(|d| matches!(d, CoverageDimension::ModelActivity | CoverageDimension::Tools | CoverageDimension::Turn)))
-                {
-                    state.telemetry_degraded = true;
-                }
-            }
             _ => {}
         }
         if let Some((key, kind)) = sample {
@@ -2015,7 +1138,6 @@ impl RuntimeState {
                 state.samples.insert(
                     key,
                     ActivitySample {
-                        source: ActivitySource::Runtime,
                         observed_at: now,
                         kind,
                     },
@@ -2027,5 +1149,15 @@ impl RuntimeState {
                 state.samples.remove(&key);
             }
         }
+        state.observation.set_completeness(
+            state
+                .health
+                .coverage
+                .complete(external_contract::events::CoverageDimension::Tools),
+            state
+                .health
+                .coverage
+                .complete(external_contract::events::CoverageDimension::PublicReasoning),
+        );
     }
 }

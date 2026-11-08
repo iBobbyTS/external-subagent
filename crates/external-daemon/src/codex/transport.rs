@@ -50,16 +50,16 @@ pub(super) fn spawn_codex_pump(
                         }),
                     );
                     publisher
-                        .emit_driver(Inbound::Message(WireMessage::Request(unsupported)), None);
+                        .publish_transport(Inbound::Message(WireMessage::Request(unsupported)), None);
                     continue;
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     driver.wait_diagnostics(Duration::from_secs(1));
                     let terminal = classify_child_exit(driver.identity().pgid, &shared, exit);
-                    publisher.emit_driver(event, terminal);
+                    publisher.publish_transport(event, terminal);
                     return;
                 }
-                publisher.emit_driver(event, None);
+                publisher.publish_transport(event, None);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

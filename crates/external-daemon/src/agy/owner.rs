@@ -316,9 +316,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         self.shared.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.runtime_state.activity_snapshot()
-    }
+
 
     fn stop_boundary_count(&self) -> u64 {
         self.shared.stop_boundaries.load(Ordering::Acquire)

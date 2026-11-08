@@ -1,16 +1,11 @@
 use crate::{
-    activity_tracker::PassiveActivityTracker, projection, terminal_proves_process_group_reaped,
-    LifecycleRecord, LifecycleSink, RuntimeEvent, RuntimeLifecycle, RuntimeLifecyclePhase,
+    RuntimeState, projection, terminal_proves_process_group_reaped,
+    RuntimeEnvelope, LifecycleSink, RuntimeLifecycle, RuntimeLifecyclePhase,
     RuntimeTerminal,
 };
 use external_contract::events::{EventFact, NormalizedEvent};
 use crate::scheduler::RuntimeLifecycleSnapshot;
-use external_contract::{
-    WireMessage, INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
-    INTERACTION_REQUEST_USER_INPUT,
-};
 use external_core::{CompletionOutcome, GeneralCompletion, GeneralFinalizer, PreparedGeneralTask};
-use external_runtime::Inbound;
 use external_store::{
     LifecycleWrite, Store, StoreError, TaskOutcome, TaskPhase, TaskResult, TurnState,
 };
@@ -28,7 +23,7 @@ pub(crate) struct StoreLifecycleSink {
     runtime_agent_id: String,
     owner_epoch: u64,
     pub(crate) runtime_lifecycle: Arc<RuntimeLifecycle>,
-    pub(crate) activity: Arc<PassiveActivityTracker>,
+    pub(crate) activity: Arc<RuntimeState>,
     write_state: Mutex<SinkWriteState>,
     #[cfg(test)]
     after_admission_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -76,7 +71,7 @@ impl StoreLifecycleSink {
         runtime_agent_id: String,
         owner_epoch: u64,
         runtime_lifecycle: Arc<RuntimeLifecycle>,
-        activity: Arc<PassiveActivityTracker>,
+        activity: Arc<RuntimeState>,
     ) -> Self {
         Self {
             store,
@@ -150,7 +145,7 @@ impl StoreLifecycleSink {
             .pending_terminal_sequence
             .unwrap_or_else(|| state.last_source_sequence.saturating_add(1));
         let projection =
-            projection::lifecycle_projection(&RuntimeEvent::Terminal(terminal.clone()), None);
+            projection::lifecycle_projection(&RuntimeEnvelope::terminal(source_sequence, terminal.clone()), None);
         self.store.append_lifecycle(&LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
@@ -355,11 +350,13 @@ impl StoreLifecycleSink {
     /// Stopping does not discard an already-received settlement for the open
     /// turn. A complete batch must end at its sole boundary, use this claim's
     /// identity throughout, and contain no new session/turn/input admission.
-    fn accepts_stopping_settlement(&self, events: &[NormalizedEvent]) -> bool {
+    fn accepts_stopping_settlement(&self, envelopes: &[RuntimeEnvelope]) -> bool {
+        let events: Vec<_> = envelopes.iter().filter_map(RuntimeEnvelope::normalized).collect();
+        if events.len() != envelopes.len() { return false; }
         let Some(active) = self.activity.active_turn_id() else {
             return false;
         };
-        let Some(NormalizedEvent { fact: EventFact::TurnSettled(settlement), .. }) = events.last() else {
+        let Some(NormalizedEvent { fact: EventFact::TurnSettled(settlement), .. }) = events.last().copied() else {
             return false;
         };
         if settlement.turn_id != active {
@@ -388,28 +385,24 @@ impl StoreLifecycleSink {
 
     fn emit_admitted<'a>(
         &'a self,
-        record: LifecycleRecord,
+        record: RuntimeEnvelope,
         admission: &mut Option<MutexGuard<'a, RuntimeLifecycleSnapshot>>,
     ) {
         #[cfg(test)]
         if let Some(hook) = self.after_admission_hook.lock().unwrap().clone() {
             hook();
         }
-        if !matches!(record.event, RuntimeEvent::Normalized(_)) {
-            self.activity.observe(&record.event);
-        }
         let mut state = self.write_state.lock().unwrap();
         if state.first_error.is_some() {
             return;
         }
-        state.last_source_sequence = state.last_source_sequence.max(record.sequence);
+        state.last_source_sequence = state.last_source_sequence.max(record.sequence());
         // Latch the first transport fault while its oversized-frame record is
         // persisted. Latching is a pure write under the sink's own state lock:
         // it never publishes a terminal and never re-enters stop, so the
         // shared `Publisher` callback lock is never re-entered.
-        let frame_bytes = match &record.event {
-            RuntimeEvent::Driver(Inbound::OversizedLine { bytes }) => Some(*bytes),
-            RuntimeEvent::Normalized(external_contract::events::NormalizedEvent { fact: external_contract::events::EventFact::TransportFault { kind: external_contract::events::TransportFaultKind::FrameLimit, .. }, .. }) => Some(external_runtime::MAX_NDJSON_LINE_BYTES + 1),
+        let frame_bytes = match record.normalized().map(|event| &event.fact) {
+            Some(EventFact::TransportFault { kind: external_contract::events::TransportFaultKind::FrameLimit, .. }) => Some(external_runtime::MAX_NDJSON_LINE_BYTES + 1),
             _ => None,
         };
         if let Some(bytes) = frame_bytes {
@@ -422,11 +415,11 @@ impl StoreLifecycleSink {
                 });
             }
         }
-        if matches!(record.event, RuntimeEvent::Terminal(_)) {
-            state.pending_terminal_sequence = Some(record.sequence);
+        if matches!(record, RuntimeEnvelope::Terminal { .. }) {
+            state.pending_terminal_sequence = Some(record.sequence());
             return;
         }
-        if let RuntimeEvent::Normalized(event) = &record.event {
+        if let Some(event) = record.normalized() {
             if let external_contract::events::EventFact::InputResolved(resolution) = &event.fact {
                 let resolved = (|| -> Result<(), StoreError> {
                     let correlation = serde_json::to_string(&resolution.request_id).expect("wire id");
@@ -449,17 +442,11 @@ impl StoreLifecycleSink {
                 if let Err(error) = resolved { state.first_error = Some(error.to_string()); return; }
             }
         }
-        let pending_request_id = match &record.event {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(request)))
-                if matches!(
-                    request.method.as_str(),
-                    INTERACTION_REQUEST_PERMISSION
-                        | INTERACTION_REQUEST_USER_INPUT
-                        | INTERACTION_REQUEST_UNSUPPORTED_INPUT
-                ) =>
-            {
-                let request_id = format!("{}:request:{}", self.agent_id, record.sequence);
-                let correlation_id = match serde_json::to_string(&request.id) {
+        if record.diagnostic().is_none() && matches!(record.normalized().map(|event| &event.fact), Some(EventFact::Diagnostic(_) | EventFact::CoverageGap(_))) { return; }
+        let pending_request_id = match record.normalized().map(|event| &event.fact) {
+            Some(EventFact::InputRequested(request)) => {
+                let request_id = format!("{}:request:{}", self.agent_id, record.sequence());
+                let correlation_id = match serde_json::to_string(&request.request_id) {
                     Ok(value) => value,
                     Err(error) => {
                         state.first_error = Some(error.to_string());
@@ -469,9 +456,9 @@ impl StoreLifecycleSink {
                 // Only real producers become answerable user input; the
                 // unsupported sentinel stays an observable, non-respondable
                 // record no caller capability can act on.
-                let request_type = match request.method.as_str() {
-                    INTERACTION_REQUEST_PERMISSION => "permission",
-                    INTERACTION_REQUEST_USER_INPUT => "user_input",
+                let request_type = match (request.kind, request.respondable) {
+                    (external_contract::events::InputKind::Permission, true) => "permission",
+                    (external_contract::events::InputKind::Question, true) => "user_input",
                     _ => "unsupported_input",
                 };
                 // A provider may emit a respondable request between
@@ -496,7 +483,7 @@ impl StoreLifecycleSink {
                         &self.agent_id,
                         &correlation_id,
                         request_type,
-                        &request.params.to_string(),
+                        &request.question.to_string(),
                     ) {
                         Ok(_) => break true,
                         Err(error @ StoreError::Conflict(_)) => {
@@ -531,30 +518,21 @@ impl StoreLifecycleSink {
             _ => None,
         };
         let projection =
-            projection::lifecycle_projection(&record.event, pending_request_id.as_deref());
+            projection::lifecycle_projection(&record, pending_request_id.as_deref());
         let write = LifecycleWrite {
             agent_id: self.agent_id.clone(),
             runtime_agent_id: self.runtime_agent_id.clone(),
             owner_epoch: self.owner_epoch,
-            source_sequence: record.sequence,
+            source_sequence: record.sequence(),
             event_type: projection.event_type.into(),
             turn_id: None,
             payload_json: projection.payload_json,
             redaction_level: projection.redaction_level.into(),
             terminal: None,
-            turn_state: match &record.event {
-                RuntimeEvent::Normalized(event) => match &event.fact {
-                    external_contract::events::EventFact::TurnStarted { .. } => Some(TurnState::Active),
-                    external_contract::events::EventFact::TurnSettled(settlement) => Some(
-                        if matches!(settlement.outcome, external_contract::events::TurnOutcome::Failed | external_contract::events::TurnOutcome::Cancelled) { TurnState::Failed } else { TurnState::Idle }),
-                    _ => None,
-                },
-                RuntimeEvent::Driver(Inbound::Lifecycle { method, .. }) => match method.as_str() {
-                    "turn.started" => Some(TurnState::Active),
-                    "turn.completed" => Some(TurnState::Idle),
-                    "turn.failed" => Some(TurnState::Failed),
-                    _ => None,
-                },
+            turn_state: match record.normalized().map(|event| &event.fact) {
+                Some(EventFact::TurnStarted { .. }) => Some(TurnState::Active),
+                Some(EventFact::TurnSettled(settlement)) => Some(if matches!(settlement.outcome,
+                    external_contract::events::TurnOutcome::Failed | external_contract::events::TurnOutcome::Cancelled) { TurnState::Failed } else { TurnState::Idle }),
                 _ => None,
             },
         };
@@ -572,15 +550,16 @@ impl LifecycleSink for StoreLifecycleSink {
             external_contract::events::LaunchId(format!("{}:{}", self.agent_id, self.owner_epoch))))
     }
 
-    fn emit(&self, record: LifecycleRecord) {
+    fn emit(&self, record: RuntimeEnvelope) {
         let mut admission = self.runtime_lifecycle.admit_event();
         if admission.is_none() {
             return;
         }
+        if record.normalized().is_some() && !self.activity.reduce_envelopes(std::slice::from_ref(&record)) { return; }
         self.emit_admitted(record, &mut admission);
     }
 
-    fn emit_normalized_batch(&self, events: &[NormalizedEvent]) {
+    fn emit_batch(&self, events: &[RuntimeEnvelope]) {
         if events.is_empty() {
             return;
         }
@@ -596,16 +575,11 @@ impl LifecycleSink for StoreLifecycleSink {
             lifecycle.reject_late_event();
             return;
         }
-        self.activity.reduce_batch(events);
+        if !self.activity.reduce_envelopes(events) { return; }
         // Keep one admission decision through the whole native batch. In
         // particular, neither stop nor terminalization can split its text
         // from the boundary, and accepting the boundary clears its correlation.
-        for event in events {
-            self.emit_admitted(LifecycleRecord {
-                sequence: event.context.sequence,
-                event: RuntimeEvent::Normalized(event.clone()),
-            }, &mut admission);
-        }
+        for envelope in events { self.emit_admitted(envelope.clone(), &mut admission); }
 
     }
 }

@@ -13,35 +13,217 @@ impl Publisher {
     }
 
     pub(crate) fn emit_typed(&self, batch: DecodedInput) {
-        // Lock order: publisher -> sink admission -> RuntimeState. Reduction
-        // never calls owners/sinks. Persistence happens after releasing state.
+        let mut state = self.state.lock().unwrap();
+        self.publish_batch_locked(&mut state, batch);
+    }
+
+    fn publish_batch_locked(&self, state: &mut PublisherState, batch: DecodedInput) {
+        if matches!(state.owner, OwnerState::Terminal(_)) {
+            return;
+        }
+        let reason = runtime_observation::InputDiagnostic::from_disposition(
+            batch.input(),
+            batch.disposition(),
+        );
+        let mut facts = batch.events().to_vec();
+        if facts.is_empty() {
+            if let Some(reason) = &reason {
+                facts.push(NormalizedEvent {
+                    context: EventContext {
+                        task_id: batch.input().task_id.clone(),
+                        launch_id: batch.input().launch_id.clone(),
+                        turn_id: batch.input().turn_id.clone(),
+                        source: batch.input().source.clone(),
+                        sequence: 0,
+                    },
+                    fact: EventFact::Diagnostic(Diagnostic {
+                        reason: reason.reason,
+                        impact: reason.impact.clone(),
+                        discriminator: None,
+                    }),
+                });
+            }
+        }
+        let envelopes: Vec<_> = facts
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut event)| {
+                event.context.sequence = state.next_sequence;
+                state.next_sequence = state.next_sequence.saturating_add(1);
+                RuntimeEnvelope::Event {
+                    event,
+                    diagnostic: if index == 0 { reason.clone() } else { None },
+                }
+            })
+            .collect();
+        // publisher -> sink admission -> reducer. State reduction completes
+        // before persistence callbacks; notification follows sink delivery.
+        if self.sink.runtime_state().is_none() && !self.runtime_state.reduce_envelopes(&envelopes) {
+            return;
+        }
+        self.sink.emit_batch(&envelopes);
+        self.runtime_state.notify_reduced();
+    }
+
+    /// Wire/control normalization only. Native notification semantics remain
+    /// in the four adapters; no raw Inbound value crosses the sink boundary.
+    pub(crate) fn publish_transport(
+        &self,
+        inbound: Inbound,
+        exit_terminal: Option<RuntimeTerminal>,
+    ) {
+        let is_exit = matches!(inbound, Inbound::ChildExited(_));
+        let (task_id, launch_id) = self.event_scope();
+        let input = NativeInputContext {
+            task_id,
+            launch_id,
+            turn_id: self.runtime_state.active_turn_id(),
+            source: NativeSource {
+                protocol: SourceProtocol::Runtime,
+                discriminator: SafeToken::new("transport"),
+                session_id: None,
+                turn_id: None,
+                item_id: None,
+                call_id: None,
+                event_id: None,
+                timestamp: None,
+            },
+        };
+        let mut disposition = DecodeDisposition::Consumed;
+        let facts = match inbound {
+            Inbound::Lifecycle { .. }
+            | Inbound::Message(WireMessage::Response(_))
+            | Inbound::UnmatchedResponse { .. } => return,
+            Inbound::Message(WireMessage::Request(request)) => {
+                let kind = match request.method.as_str() {
+                    INTERACTION_REQUEST_PERMISSION => InputKind::Permission,
+                    INTERACTION_REQUEST_USER_INPUT => InputKind::Question,
+                    INTERACTION_REQUEST_UNSUPPORTED_INPUT => InputKind::Unsupported,
+                    _ => return,
+                };
+                vec![EventFact::InputRequested(InputRequest {
+                    request_id: request.id,
+                    kind,
+                    respondable: kind != InputKind::Unsupported,
+                    question: scheduler::redact_native_error(&request.params),
+                })]
+            }
+            Inbound::ChildExited(exit) => {
+                let (exit_code, signal) = match exit {
+                    ChildExit::Exited(code) => (code, None),
+                    ChildExit::Signaled(signal) => (None, Some(signal)),
+                    ChildExit::Unknown => (None, None),
+                };
+                vec![EventFact::RuntimeExited {
+                    exit_code,
+                    signal,
+                    stderr_ref: None,
+                }]
+            }
+            Inbound::Malformed(_) | Inbound::OversizedLine { .. } => {
+                let frame_limit = matches!(inbound, Inbound::OversizedLine { .. });
+                let gap = CoverageGap {
+                    reason: if frame_limit {
+                        LossReason::Truncated
+                    } else {
+                        LossReason::Malformed
+                    },
+                    impact: Impact::Unknown,
+                    activity: ActivityScope::None,
+                };
+                disposition = DecodeDisposition::InvalidLost(gap.clone());
+                let mut facts = vec![EventFact::CoverageGap(gap)];
+                if frame_limit {
+                    facts.push(EventFact::TransportFault {
+                        kind: TransportFaultKind::FrameLimit,
+                        failure: None,
+                        stderr_ref: None,
+                    });
+                }
+                facts
+            }
+            Inbound::Message(_) => {
+                let diagnostic = Diagnostic {
+                    reason: DiagnosticReason::UnknownSemantics,
+                    impact: Impact::Unknown,
+                    discriminator: None,
+                };
+                disposition = DecodeDisposition::Unknown(diagnostic.clone());
+                vec![EventFact::Diagnostic(diagnostic)]
+            }
+        };
+        let events = facts
+            .into_iter()
+            .enumerate()
+            .map(|(index, fact)| NormalizedEvent {
+                context: EventContext {
+                    task_id: input.task_id.clone(),
+                    launch_id: input.launch_id.clone(),
+                    sequence: index as u64 + 1,
+                    turn_id: input.turn_id.clone(),
+                    source: input.source.clone(),
+                },
+                fact,
+            })
+            .collect();
+        let batch = DecodedInput::new(input, Attribution::Current, disposition, events)
+            .expect("typed transport batch");
         let mut state = self.state.lock().unwrap();
         if matches!(state.owner, OwnerState::Terminal(_)) {
             return;
         }
-        let mut applied = batch.into_events();
-        for event in &mut applied {
-            event.context.sequence = state.next_sequence;
-            state.next_sequence = state.next_sequence.saturating_add(1);
+        self.publish_batch_locked(&mut state, batch);
+        if is_exit {
+            state.exit_boundary_delivered = true;
+            self.changed.notify_all();
         }
-        // Production sinks reduce under their admission latch. Standalone sinks
-        // have no admission gate and use the publisher's state directly.
-        if self.sink.runtime_state().is_none() {
-            self.runtime_state.reduce_batch(&applied);
+        if let Some(terminal) = exit_terminal {
+            if matches!(state.owner, OwnerState::Running) {
+                self.publish_terminal_locked(&mut state, terminal);
+            }
         }
-        self.sink.emit_normalized_batch(&applied);
-        self.runtime_state.notify_reduced();
     }
 }
 
 impl RuntimeState {
     pub(crate) fn reduce_batch(&self, events: &[NormalizedEvent]) {
+        let reason = events
+            .iter()
+            .find_map(runtime_observation::InputDiagnostic::from_event);
+        let envelopes: Vec<_> = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| RuntimeEnvelope::Event {
+                event: event.clone(),
+                diagnostic: if index == 0 { reason.clone() } else { None },
+            })
+            .collect();
+        self.reduce_envelopes(&envelopes);
+    }
+
+    pub(crate) fn reduce_envelopes(&self, envelopes: &[RuntimeEnvelope]) -> bool {
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
         let wall = activity_tracker::activity_wall_now_millis();
-        for event in events {
-            Self::reduce_typed(&mut state, event, now, wall);
+        if let Some(input) = envelopes.iter().find_map(RuntimeEnvelope::diagnostic) {
+            if !state.health.record_input(input, wall) {
+                return false;
+            }
+            state.observation.observe_gap(&input.impact, input.lost);
         }
+        for envelope in envelopes {
+            if let Some(event) = envelope.normalized() {
+                Self::reduce_typed(&mut state, event, now, wall);
+            }
+        }
+        true
+    }
+
+    pub(crate) fn reduce_terminal(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.health.end_launch();
+        state.active_model_requests.clear();
+        state.active_tools.clear();
     }
 
     pub(crate) fn notify_reduced(&self) {
@@ -73,9 +255,8 @@ impl RuntimeState {
         self.state.lock().unwrap().command_failure = None;
     }
 
-    pub(crate) fn reduce_turn(state: &mut TurnReduction, event: &NormalizedEvent, now: Instant) {
+    pub(crate) fn reduce_turn(state: &mut TurnReduction, event: &NormalizedEvent, _now: Instant) {
         if state.active {
-            state.last_stream_activity_at = Some(now);
             if let Some(turn_id) = &event.context.turn_id {
                 state.turn_id = Some(turn_id.clone());
             }
@@ -89,8 +270,6 @@ impl RuntimeState {
                 state.active = true;
                 state.boundary = None;
                 state.failure = None;
-                state.model_request_started_at = Some(now);
-                state.last_stream_activity_at = Some(now);
             }
             EventFact::ErrorObserved {
                 operation: Operation::Turn,
@@ -115,8 +294,6 @@ impl RuntimeState {
                 } else if let Some(failure) = &settlement.failure {
                     state.failure = Some(failure.clone());
                 }
-                state.model_request_started_at = None;
-                state.last_stream_activity_at = None;
             }
             _ => {}
         }
@@ -127,26 +304,6 @@ impl RuntimeState {
             generation: state.turn.generation,
             active: state.turn.active,
             boundary: state.turn.boundary,
-        }
-    }
-
-    pub(crate) fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        let state = self.state.lock().unwrap();
-        let now = Instant::now();
-        RuntimeActivitySnapshot {
-            turn: TurnSnapshot {
-                generation: state.turn.generation,
-                active: state.turn.active,
-                boundary: state.turn.boundary,
-            },
-            model_request_elapsed: state
-                .turn
-                .model_request_started_at
-                .and_then(|started| now.checked_duration_since(started)),
-            transport_idle_elapsed: state
-                .turn
-                .last_stream_activity_at
-                .and_then(|activity| now.checked_duration_since(activity)),
         }
     }
 
@@ -322,7 +479,7 @@ mod tests {
             fn runtime_state(&self) -> Option<Arc<RuntimeState>> {
                 Some(self.runtime.clone())
             }
-            fn emit(&self, record: LifecycleRecord) {
+            fn emit(&self, record: RuntimeEnvelope) {
                 // Snapshotting from a persistence callback cannot deadlock the
                 // reducer and cannot observe a partially applied settlement.
                 assert!(!self.runtime.turn_snapshot().active);
@@ -333,7 +490,7 @@ mod tests {
                     self.runtime.native_failure().unwrap().original["data"]["complete"],
                     true
                 );
-                self.records.lock().unwrap().push(record.sequence);
+                self.records.lock().unwrap().push(record.sequence());
                 self.persisted.send(()).unwrap();
             }
         }
@@ -410,16 +567,62 @@ mod tests {
     }
 
     #[test]
+    fn model_attempt_can_restart_with_the_same_native_request_identity() {
+        let runtime = RuntimeState::new();
+        runtime.test_turn(None);
+        for phase in [
+            ModelPhase::Started,
+            ModelPhase::Failed,
+            ModelPhase::RetryScheduled,
+            ModelPhase::Started,
+        ] {
+            runtime.reduce_batch(&[event(EventFact::ModelActivityChanged(ModelActivity {
+                request_id: Some(RequestId("request".into())),
+                phase,
+                retry: None,
+                failure: None,
+            }))]);
+        }
+        assert!(
+            runtime.snapshot().model_request_active,
+            "a new native started retires the prior finished attempt guard"
+        );
+    }
+
+    #[test]
+    fn tool_terminal_converges_only_its_current_gap_and_preserves_historical_coverage() {
+        let runtime = RuntimeState::new();
+        runtime.test_turn(None);
+        runtime.reduce_batch(&[event(EventFact::CoverageGap(CoverageGap {
+            reason: LossReason::Malformed,
+            impact: Impact::Known(vec![CoverageDimension::Tools]),
+            activity: ActivityScope::Tool(CallId("call".into())),
+        }))]);
+        assert!(runtime.snapshot().telemetry_degraded);
+        runtime.reduce_batch(&[event(tool(ToolPhase::Finished))]);
+        assert!(
+            !runtime.snapshot().telemetry_degraded,
+            "the same tool's terminal closes its current correlation gap"
+        );
+        assert!(
+            !runtime
+                .observation_snapshot()
+                .coverage
+                .tool_history_complete
+        );
+    }
+
+    #[test]
     fn publisher_drops_transport_lifecycle_mirrors_without_consuming_sequence() {
-        struct Sink(Mutex<Vec<LifecycleRecord>>);
+        struct Sink(Mutex<Vec<RuntimeEnvelope>>);
         impl LifecycleSink for Sink {
-            fn emit(&self, record: LifecycleRecord) {
+            fn emit(&self, record: RuntimeEnvelope) {
                 self.0.lock().unwrap().push(record);
             }
         }
         let sink = Arc::new(Sink(Mutex::new(vec![])));
         let publisher = Publisher::new(sink.clone());
-        publisher.emit_driver(
+        publisher.publish_transport(
             Inbound::Lifecycle {
                 sequence: 77,
                 method: "turn.started".into(),
@@ -432,7 +635,7 @@ mod tests {
         }]));
         let records = sink.0.lock().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].sequence, 1);
-        assert!(matches!(records[0].event, RuntimeEvent::Normalized(_)));
+        assert_eq!(records[0].sequence(), 1);
+        assert!(matches!(records[0], RuntimeEnvelope::Event { .. }));
     }
 }

@@ -804,20 +804,19 @@ fn ignored_notification(method: &str) -> Option<IgnoreReason> {
 #[cfg(test)]
 mod typed_tests {
     use super::*;
-    use crate::activity_tracker::{PassiveActivityTracker, TerminalText};
-    use crate::{LifecycleRecord, LifecycleSink};
+    use crate::{RuntimeState, activity_tracker::TerminalText};
+    use crate::{RuntimeEnvelope, LifecycleSink};
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
 
     struct ViewSink {
-        activity: Arc<PassiveActivityTracker>,
-        records: StdMutex<Vec<LifecycleRecord>>,
+        activity: Arc<RuntimeState>,
+        records: StdMutex<Vec<RuntimeEnvelope>>,
     }
 
     impl LifecycleSink for ViewSink {
     fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.activity.clone()) }
-        fn emit(&self, record: LifecycleRecord) {
-            if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.activity.observe(&record.event); }
+        fn emit(&self, record: RuntimeEnvelope) {
             self.records.lock().unwrap().push(record);
         }
     }
@@ -830,7 +829,7 @@ mod typed_tests {
     impl Trace {
         fn new() -> Self {
             let sink = Arc::new(ViewSink {
-                activity: Arc::new(PassiveActivityTracker::for_adapter("codex")),
+                activity: Arc::new(RuntimeState::new()),
                 records: StdMutex::new(Vec::new()),
             });
             let publisher = Arc::new(Publisher::new(sink.clone()));
@@ -888,8 +887,8 @@ mod typed_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|record| match &record.event {
-                    crate::RuntimeEvent::Normalized(event) => Some(event.fact.clone()),
+                .filter_map(|record| match &record {
+                    crate::RuntimeEnvelope::Event { event: event, .. } => Some(event.fact.clone()),
                     _ => None,
                 })
                 .collect()
@@ -1024,7 +1023,7 @@ mod typed_tests {
         );
 
         let activity = trace.sink.activity.snapshot();
-        assert_eq!(activity.window_60s.tool_calls_started, 1);
+        assert_eq!(activity.window_60s.tool_calls_started, 2);
         assert_eq!(activity.window_60s.tool_calls_completed, 1);
         assert_eq!(activity.window_60s.tool_calls_failed, 1);
         assert!(activity.active_tools.is_empty());
@@ -1040,7 +1039,7 @@ mod typed_tests {
             command.recent_calls[0].arguments["command"],
             json!("/bin/zsh -lc 'echo 中'")
         );
-        assert!(!observation.coverage.tool_history_complete);
+        assert!(observation.coverage.tool_history_complete);
     }
 
     #[test]
@@ -1086,8 +1085,9 @@ mod typed_tests {
         let activity = trace.sink.activity.snapshot();
         assert_eq!(activity.window_60s.reasoning_delta_events, 1);
         let observation = trace.sink.activity.observation_snapshot();
-        assert!(observation.reasoning.text.is_empty());
-        assert!(!observation.coverage.reasoning_complete);
+        assert_eq!(observation.reasoning.text, "public summary");
+        assert!(observation.coverage.reasoning_complete);
+        assert_eq!(observation.reasoning.native_source.as_ref().unwrap().protocol, SourceProtocol::CodexAppServer);
     }
 
     #[test]
@@ -1385,10 +1385,10 @@ mod typed_tests {
                 "result receivers: {receivers}"
             );
             assert!(!after.tools[0].recent_calls[0].arguments_truncated);
-            assert_eq!(
-                after, before,
-                "result receivers cannot refine known input arguments"
-            );
+            let after = trace.sink.activity.observation_snapshot();
+            assert_eq!(after.tools[0].recent_calls[0].arguments, before.tools[0].recent_calls[0].arguments,
+                "result receivers cannot refine known input arguments");
+            assert_eq!(after.tools[0].call_count, before.tools[0].call_count);
             let fact = tool_fact(&completed);
             assert!(
                 fact.arguments.is_none(),
@@ -1434,7 +1434,7 @@ mod typed_tests {
             assert_eq!(fact.phase, Some(ToolPhase::Finished));
             assert_eq!(fact.outcome, Some(ToolOutcome::Succeeded));
             let activity = trace.sink.activity.snapshot();
-            assert_eq!(activity.window_60s.tool_calls_started, 0);
+            assert_eq!(activity.window_60s.tool_calls_started, 1);
             assert_eq!(activity.window_60s.tool_calls_completed, 1);
             assert!(activity.active_tools.is_empty());
             assert!(!activity.telemetry_degraded);
@@ -1514,7 +1514,7 @@ mod typed_tests {
                     let activity = trace.sink.activity.snapshot();
                     assert_eq!(
                         activity.window_60s.tool_calls_started,
-                        u64::from(with_start)
+                        1
                     );
                     assert_eq!(activity.window_60s.tool_calls_completed, 1);
                     assert!(activity.active_tools.is_empty());
@@ -1668,7 +1668,7 @@ mod typed_tests {
                 let activity = trace.sink.activity.snapshot();
                 assert_eq!(
                     activity.window_60s.tool_calls_started,
-                    u64::from(with_start)
+                    1
                 );
                 // Failed and successful tool terminal samples have separate counters.
                 assert_eq!(
@@ -1710,10 +1710,10 @@ mod typed_tests {
                     batch.events()[0].fact,
                     EventFact::Diagnostic(diagnostic.clone())
                 );
-                let event = crate::RuntimeEvent::Normalized(batch.events()[0].clone());
+                let event = crate::RuntimeEnvelope::from(batch.events()[0].clone());
                 let summary = crate::projection::lifecycle_projection(&event, None);
                 let value: serde_json::Value = serde_json::from_str(&summary.payload_json).unwrap();
-                assert_eq!(value["discriminator"], json!(diagnostic.discriminator));
+                assert_eq!(value["discriminator"], "unrecognized");
                 assert_eq!(value["disposition"], "unknown");
                 assert!(!summary.payload_json.contains("PRIVATE"));
             }

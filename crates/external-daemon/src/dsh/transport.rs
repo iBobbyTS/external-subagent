@@ -35,7 +35,7 @@ pub(super) fn spawn_dsh_pump(
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
                 if let Some(projected) = project_dsh_inbound(&shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     finish_on_child_exit(&driver, &publisher, &shared, &event, exit);
@@ -73,7 +73,7 @@ fn fold_settled_turn(driver: &Driver, publisher: &Publisher, shared: &DshRuntime
         match driver.recv_timeout(Duration::ZERO) {
             Ok(event) => {
                 if let Some(projected) = project_dsh_inbound(shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     shared.apply_settled_turn(settled);
@@ -109,7 +109,7 @@ fn finish_on_child_exit(
         }
     }
     let terminal = classify_child_exit(driver.identity().pgid, shared, exit);
-    publisher.emit_driver(event.clone(), terminal);
+    publisher.publish_transport(event.clone(), terminal);
     shared.offers.lock().unwrap().clear();
 }
 

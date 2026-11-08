@@ -33,12 +33,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-mod activity_parser;
 mod activity_tracker;
-use activity_parser::{
-    parse_passive_activity, ActivitySample, ActivitySampleKind, ActivitySource, ActivityTransition,
-    ToolActivityMode,
-};
+mod runtime_observation;
+#[cfg(test)]
+mod observation_tests;
+use runtime_observation::{TelemetryStatus, RuntimeCoverage, DiagnosticSummary, ModelActivityView};
+#[cfg(test)]
+mod test_support;
 pub mod agent_status;
 pub mod agy;
 pub mod codex;
@@ -48,7 +49,7 @@ mod lifecycle_sink;
 pub mod mcp;
 pub mod observation;
 mod projection;
-use activity_tracker::{PassiveActivityTracker, TerminalText, WaitTail};
+use activity_tracker::{TerminalText, WaitTail};
 use lifecycle_sink::{
     bounded_result_invalid_task_result, finalized_general, minimal_task_result,
     persist_general_result, store_result_with_cancel_precedence, unreaped_general,
@@ -210,13 +211,6 @@ pub struct TurnSnapshot {
     pub boundary: Option<TurnBoundary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeActivitySnapshot {
-    pub turn: TurnSnapshot,
-    pub model_request_elapsed: Option<Duration>,
-    pub transport_idle_elapsed: Option<Duration>,
-}
-
 const PASSIVE_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 const MAX_ACTIVITY_IDENTITIES: usize = 65_536;
 const MAX_LATEST_TEXT_BYTES: usize = 8 * 1024;
@@ -262,6 +256,11 @@ pub struct PassiveActivitySnapshot {
     pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,
     pub telemetry_degraded: bool,
+    pub telemetry_status: TelemetryStatus,
+    pub coverage: RuntimeCoverage,
+    pub diagnostics: Vec<DiagnosticSummary>,
+    pub diagnostics_truncated: bool,
+    pub model_activity: Option<ModelActivityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,8 +400,6 @@ struct TurnReduction {
     active: bool,
     boundary: Option<TurnBoundary>,
     failure: Option<external_contract::events::NativeFailure>,
-    model_request_started_at: Option<Instant>,
-    last_stream_activity_at: Option<Instant>,
 }
 
 /// Common in-memory reduction owner. Internal activity algorithms share this
@@ -410,42 +407,47 @@ struct TurnReduction {
 pub struct RuntimeState {
     state: Mutex<activity_tracker::RuntimeStateData>,
     changed: Condvar,
-    mode: ToolActivityMode,
 }
 
+/// One receipt-ordered typed envelope. Facts keep their sole sequence in
+/// EventContext; process-control terminals use that same publisher sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeEvent {
-    Driver(Inbound),
-    Normalized(external_contract::events::NormalizedEvent),
-    Terminal(RuntimeTerminal),
+pub enum RuntimeEnvelope {
+    Event { event: external_contract::events::NormalizedEvent, diagnostic: Option<runtime_observation::InputDiagnostic> },
+    Terminal { sequence: u64, terminal: RuntimeTerminal },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LifecycleRecord {
-    pub sequence: u64,
-    pub event: RuntimeEvent,
+impl RuntimeEnvelope {
+    pub fn sequence(&self) -> u64 { match self { Self::Event { event, .. } => event.context.sequence, Self::Terminal { sequence, .. } => *sequence } }
+    pub fn normalized(&self) -> Option<&external_contract::events::NormalizedEvent> { match self { Self::Event { event, .. } => Some(event), _ => None } }
+    pub fn terminal(sequence: u64, terminal: RuntimeTerminal) -> Self { Self::Terminal { sequence, terminal } }
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        match &mut self { Self::Event { event, .. } => event.context.sequence = sequence, Self::Terminal { sequence: current, .. } => *current = sequence } self
+    }
+    pub(crate) fn diagnostic(&self) -> Option<&runtime_observation::InputDiagnostic> { match self { Self::Event { diagnostic, .. } => diagnostic.as_ref(), _ => None } }
+}
+impl From<external_contract::events::NormalizedEvent> for RuntimeEnvelope {
+    fn from(event: external_contract::events::NormalizedEvent) -> Self {
+        let diagnostic = runtime_observation::InputDiagnostic::from_event(&event);
+        Self::Event { event, diagnostic }
+    }
 }
 
 pub trait LifecycleSink: Send + Sync + 'static {
     /// Production sinks supply the durable task and claim identity. Test sinks
     /// may use the publisher's unique process-local launch scope.
     fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> { None }
-    fn emit(&self, record: LifecycleRecord);
+    fn emit(&self, envelope: RuntimeEnvelope);
 
     /// The state created before spawn and shared with this launch's owner.
     fn runtime_state(&self) -> Option<Arc<RuntimeState>> { None }
 
     /// One native input's ordered facts. Sinks with admission gates override
     /// this to reduce only accepted batches, before persistence callbacks.
-    fn emit_normalized_batch(&self, events: &[external_contract::events::NormalizedEvent]) {
-        if let Some(runtime) = self.runtime_state() { runtime.reduce_batch(events); }
-        for event in events {
-            self.emit(LifecycleRecord {
-                sequence: event.context.sequence,
-                event: RuntimeEvent::Normalized(event.clone()),
-            });
-        }
+    fn emit_batch(&self, envelopes: &[RuntimeEnvelope]) {
+        if let Some(runtime) = self.runtime_state() { if !runtime.reduce_envelopes(envelopes) { return; } }
+        for envelope in envelopes { self.emit(envelope.clone()); }
     }
+
 }
 
 #[derive(Debug)]
@@ -523,25 +525,6 @@ impl Publisher {
         TerminalLatch(self.state.lock().unwrap())
     }
 
-    pub(crate) fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
-        if matches!(event, Inbound::Lifecycle { .. }) { return; }
-        let mut state = self.state.lock().unwrap();
-        if matches!(state.owner, OwnerState::Terminal(_)) {
-            return;
-        }
-        let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
-        self.emit_locked(&mut state, RuntimeEvent::Driver(event));
-        if is_exit_boundary {
-            state.exit_boundary_delivered = true;
-            self.changed.notify_all();
-        }
-        if let Some(terminal) = exit_terminal {
-            if matches!(state.owner, OwnerState::Running) {
-                self.publish_terminal_locked(&mut state, terminal);
-            }
-        }
-    }
-
     pub(crate) fn begin_stopping(&self) -> Option<RuntimeTerminal> {
         let mut state = self.state.lock().unwrap();
         match &state.owner {
@@ -604,17 +587,11 @@ impl Publisher {
 
     fn publish_terminal_locked(&self, state: &mut PublisherState, terminal: RuntimeTerminal) {
         state.owner = OwnerState::Terminal(terminal.clone());
-        self.emit_locked(state, RuntimeEvent::Terminal(terminal));
-        self.changed.notify_all();
-    }
-
-    fn emit_locked(&self, state: &mut PublisherState, event: RuntimeEvent) {
-        let record = LifecycleRecord {
-            sequence: state.next_sequence,
-            event,
-        };
+        let envelope = RuntimeEnvelope::terminal(state.next_sequence, terminal);
         state.next_sequence = state.next_sequence.saturating_add(1);
-        self.sink.emit(record);
+        self.runtime_state.reduce_terminal();
+        self.sink.emit(envelope);
+        self.changed.notify_all();
     }
 
     pub(crate) fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
@@ -1521,7 +1498,7 @@ fn spawn_event_pump(
                     }
                     _ => None,
                 };
-                publisher.emit_driver(event, terminal);
+                publisher.publish_transport(event, terminal);
                 if is_exit_boundary {
                     permission_responses.lock().unwrap().clear();
                     return;
@@ -1669,7 +1646,7 @@ mod zcode_effort_tests {
 
     struct NoopSink;
     impl crate::LifecycleSink for NoopSink {
-        fn emit(&self, _record: crate::LifecycleRecord) {}
+        fn emit(&self, _record: crate::RuntimeEnvelope) {}
     }
 
     fn workspace(prefix: &str) -> tempfile::TempDir {

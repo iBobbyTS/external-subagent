@@ -354,23 +354,10 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             scheduler.start_ready().unwrap();
             let snapshot = await_observed_content(&scheduler, &agent_id, agent);
 
-            // DSH's public ACP evidence is independent of the ZCode pin.
-            // Codex and unknown adapters never collect reasoning.
-            if agent == "dsh" {
-                assert!(snapshot
-                    .reasoning
-                    .text
-                    .contains("ADAPTER-SCOPED reasoning tail"));
-                assert_eq!(
-                    snapshot.reasoning.source,
-                    observation::ReasoningSource::dsh()
-                );
-                assert!(snapshot.coverage.reasoning_complete);
-            } else {
-                assert!(snapshot.reasoning.text.is_empty());
-                assert!(!snapshot.coverage.reasoning_complete);
-            }
-            assert!(!snapshot.coverage.tool_history_complete);
+            assert!(snapshot.reasoning.text.contains("ADAPTER-SCOPED reasoning tail"));
+            assert_eq!(snapshot.reasoning.native_source.as_ref().unwrap().protocol, external_contract::events::SourceProtocol::ZcodeSession);
+            assert!(snapshot.coverage.reasoning_complete);
+            assert!(snapshot.coverage.tool_history_complete);
             let encoded = serde_json::to_string(&snapshot.tools).unwrap();
             assert!(!encoded.contains("encrypted_content"));
             assert!(!encoded.contains("NEVER-SECRET"));
@@ -433,7 +420,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert_eq!(unknown.reasoning.text, queued.reasoning.text);
         assert!(queued.reasoning.text.is_empty());
         assert_eq!(unknown.reasoning.truncated, queued.reasoning.truncated);
-        assert_eq!(queued.reasoning.source, observation::ReasoningSource::dsh());
+        assert_eq!(queued.reasoning.source, observation::ReasoningSource::legacy_acp_projection());
         assert_ne!(unknown.reasoning.source, queued.reasoning.source);
     }
 }
@@ -1816,10 +1803,7 @@ sleep 2
                     serde_json::json!({"type":"model.streaming", "payload":{"kind":"text_delta", "delta":"completed answer", "assistantMessageId":"m1"}}),
                     serde_json::json!({"type":"message.finished", "payload":{"assistantMessageId":"m1"}}),
                 ].into_iter().enumerate() {
-                    sink.emit(LifecycleRecord {
-                        sequence: index as u64 + 1,
-                        event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(external_contract::EventEnvelope { method: "session/event".into(), params }))),
-                    });
+                    sink.emit((crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(external_contract::EventEnvelope { method: "session/event".into(), params })))).with_sequence(index as u64 + 1));
                 }
                 Ok(Arc::new(CompletedRuntime))
             }
@@ -1930,8 +1914,8 @@ sleep 2
 
     #[test]
     fn known_driver_loss_marks_observation_coverage_without_query_side_effects() {
-        let tracker = PassiveActivityTracker::new();
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+        let tracker = RuntimeState::new();
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
                 method: "session/event".into(),
                 params: serde_json::json!({
@@ -1943,29 +1927,30 @@ sleep 2
             },
         ))));
         let before = tracker.observation_snapshot();
-        assert!(before.coverage.tool_history_complete);
+        assert!(!before.coverage.tool_history_complete);
         assert!(before.coverage.reasoning_complete);
 
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Malformed(
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Malformed(
             "invalid JSON".into(),
         )));
-        tracker.observe(&RuntimeEvent::Driver(Inbound::OversizedLine {
+        tracker.observe(&crate::test_support::fixture_event(Inbound::OversizedLine {
             bytes: 1024 * 1024 + 1,
         }));
         let after = tracker.observation_snapshot();
         assert!(!after.coverage.tool_history_complete);
-        assert!(!after.coverage.reasoning_complete);
+        assert!(after.coverage.reasoning_complete);
         assert_eq!(after.coverage.dropped_events, 2);
-        assert_eq!(after.snapshot_seq, before.snapshot_seq + 2);
+        assert!(after.snapshot_seq > before.snapshot_seq);
+        assert_eq!(tracker.snapshot().diagnostics.iter().map(|d| d.count).sum::<u64>(), 2);
         assert_eq!(tracker.observation_snapshot(), after);
         assert_eq!(tracker.observation_snapshot(), after);
     }
 
     #[test]
     fn terminal_text_is_scoped_to_the_settling_turn() {
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         let session_event = |params: serde_json::Value| {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                 external_contract::EventEnvelope {
                     method: "session/event".into(),
                     params,
@@ -2033,7 +2018,7 @@ sleep 2
     #[test]
     fn near_limit_observation_does_not_starve_the_shared_cancel_lifecycle_lock() {
         let lifecycle = Arc::new(RuntimeLifecycle::new(1));
-        let tracker = Arc::new(PassiveActivityTracker::new());
+        let tracker = Arc::new(RuntimeState::new());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let worker_lifecycle = Arc::clone(&lifecycle);
         let worker_tracker = Arc::clone(&tracker);
@@ -2041,7 +2026,7 @@ sleep 2
         let worker = thread::spawn(move || {
             let _admission = worker_lifecycle.admit_event().unwrap();
             worker_barrier.wait();
-            worker_tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            worker_tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                 external_contract::EventEnvelope {
                     method: "session/event".into(),
                     params: serde_json::json!({
@@ -3287,7 +3272,7 @@ exit 0\n",
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
-                publisher.emit_driver(
+                publisher.publish_transport(
                     Inbound::OversizedLine {
                         bytes: FRAME_LIMIT + 1,
                     },
@@ -3454,7 +3439,7 @@ mod turn_adjudication_tests {
 
     impl HarnessRuntime {
         fn emit(&self, event: Inbound) {
-            self.publisher.emit_driver(event, None);
+            self.publisher.publish_transport(event, None);
         }
 
         fn emit_activity(&self) {
@@ -3757,6 +3742,9 @@ mod turn_adjudication_tests {
                 connection.execute_batch("CREATE TABLE pending_race_transitions(old_state TEXT,new_state TEXT);
                         CREATE TRIGGER record_pending_race AFTER UPDATE OF state ON pending_requests
                         WHEN OLD.state<>NEW.state BEGIN INSERT INTO pending_race_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+                // Service construction hashes the test executable. Finish that
+                // unrelated I/O/CPU work before holding the response-claim gate.
+                let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
                 let (entered_tx, entered_rx) = mpsc::sync_channel(1);
                 let (release_tx, release_rx) = mpsc::sync_channel(1);
                 let release_rx = Mutex::new(release_rx);
@@ -3798,7 +3786,6 @@ mod turn_adjudication_tests {
                         PendingRequestState::Pending
                     }
                 );
-                let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
                 let query = || {
                     RpcMethod::TaskWait(TaskWaitQuery {
                         agent_id: WaitTarget::One(agent_id.clone()),
@@ -4413,18 +4400,15 @@ mod turn_adjudication_tests {
             "sink-race-runtime".into(),
             claim.owner_epoch,
             Arc::clone(&lifecycle),
-            Arc::new(crate::activity_tracker::PassiveActivityTracker::new()),
+            Arc::new(crate::RuntimeState::new()),
         ));
-        let record = crate::LifecycleRecord {
-            sequence: 7,
-            event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(
+        let record = (crate::test_support::fixture_event(Inbound::Message(WireMessage::Request(
                 external_contract::RequestEnvelope::new(
                     WireId::String("srv-early".into()),
                     external_contract::INTERACTION_REQUEST_PERMISSION,
                     serde_json::json!({"options": []}),
                 ),
-            ))),
-        };
+            )))).with_sequence(7);
         let emitter = {
             let sink = Arc::clone(&sink);
             thread::spawn(move || sink.emit(record))
@@ -4510,9 +4494,7 @@ mod wait_tail_inheritance_tests {
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
             if let Some(delta) = &self.inject_before_replacement {
-                sink.emit(LifecycleRecord {
-                    sequence: 1,
-                    event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                sink.emit((crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                         external_contract::EventEnvelope {
                             method: "session/event".into(),
                             params: serde_json::json!({
@@ -4525,8 +4507,7 @@ mod wait_tail_inheritance_tests {
                                 }
                             }),
                         },
-                    ))),
-                });
+                    )))).with_sequence(1));
             }
             if let (Some(ready), Some(release)) = (&self.ready, &self.release) {
                 ready.store(true, Ordering::Release);
@@ -4592,8 +4573,8 @@ mod wait_tail_inheritance_tests {
         )
     }
 
-    fn inject_text(tracker: &PassiveActivityTracker, delta: &str) {
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+    fn inject_text(tracker: &RuntimeState, delta: &str) {
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
                 method: "session/event".into(),
                 params: serde_json::json!({
@@ -4609,7 +4590,7 @@ mod wait_tail_inheritance_tests {
         ))));
     }
 
-    fn tracker_for(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
+    fn tracker_for(scheduler: &Scheduler, agent_id: &str) -> Arc<RuntimeState> {
         scheduler
             .inner
             .state
@@ -4622,8 +4603,8 @@ mod wait_tail_inheritance_tests {
     }
 
     /// Install an outgoing tracker whose window is "AB" with "A" delivered.
-    fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
-        let old = Arc::new(PassiveActivityTracker::new());
+    fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<RuntimeState> {
+        let old = Arc::new(RuntimeState::new());
         old.set_wait_tail_fixture("A");
         assert_eq!(old.take_wait_tail().text, "A");
         inject_text(&old, "B");
@@ -5530,6 +5511,18 @@ mod spawn_established_return_tests {
             }
         })));
 
+        // Ensure the fixture reaches the intended pre-publication boundary
+        // even if the submit thread's deadline expires before its starter is
+        // scheduled. Cancellation must then commit while that boundary holds.
+        let reached_before_cancel = Arc::clone(&starter_reached);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !reached_before_cancel.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "starter never reached the publication gate");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
         scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
         scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(100)));
 
@@ -5541,14 +5534,22 @@ mod spawn_established_return_tests {
             scheduler_clone.submit_and_start_general(&manifest, admission, &|| false)
         });
 
-        while !starter_reached.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        std::thread::sleep(Duration::from_millis(80));
+        // Joining the bounded submit wait proves its cancellation transaction
+        // has finished; an 80 ms sleep cannot establish that ordering under
+        // contention. Always release the starter before asserting the result.
+        let result = join_handle.join();
+        let cancellation_committed = match &result {
+            Ok(Err(SchedulerError::StartTimeout { agent_id, .. })) => store
+                .get_task(agent_id)
+                .ok()
+                .flatten()
+                .is_some_and(|task| task.stop_requested),
+            _ => false,
+        };
         pause_gate.store(true, Ordering::Release);
-
-        let err = join_handle.join().unwrap().unwrap_err();
+        let err = result.unwrap().unwrap_err();
+        assert!(starter_reached.load(Ordering::Acquire));
+        assert!(cancellation_committed, "cancellation must commit before publishing the starting handle");
         match err {
             SchedulerError::StartTimeout { agent_id, .. } => {
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -6081,11 +6082,16 @@ mod spawn_established_return_tests {
                 );
                 transition_applied_clone.store(true, Ordering::Release);
             }
-            if transition_applied_clone.load(Ordering::Acquire)
-                && task.phase == TaskPhase::Queued
-                && task.session_id.as_deref() == Some("session-budget-shared")
-            {
-                saw_resume_transient_clone.store(true, Ordering::Release);
+            if transition_applied_clone.load(Ordering::Acquire) {
+                // This hook's input predates its transition. Read the committed
+                // row instead of requiring another poll: the remaining deadline
+                // may expire during the real terminal/reap/requeue writes.
+                let persisted = store_for_poll.get_task(&task.agent_id).unwrap().unwrap();
+                if persisted.phase == TaskPhase::Queued
+                    && persisted.session_id.as_deref() == Some("session-budget-shared")
+                {
+                    saw_resume_transient_clone.store(true, Ordering::Release);
+                }
             }
         })));
 
@@ -6683,7 +6689,7 @@ mod stopping_settlement_ingress_tests {
                 "runtime".into(),
                 claim.owner_epoch,
                 lifecycle.clone(),
-                Arc::new(PassiveActivityTracker::for_adapter("agy")),
+                Arc::new(RuntimeState::new()),
             ));
             let fixture = Self {
                 _directory: directory,
@@ -6970,5 +6976,143 @@ mod stopping_settlement_ingress_tests {
             );
             assert_eq!(f.seq(), before, "{mismatch}");
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_persistence_tests {
+    use super::*;
+    use external_contract::events::*;
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget};
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        store: Arc<Store>, state: Arc<RuntimeState>, publisher: Publisher,
+        id: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::Builder::new().prefix("observation-persistence-").tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let bootstrap = Scheduler::new("fixture-enqueue", store.clone(), Arc::new(CommandRuntimeFactory::new(|_: &TaskRecord| -> io::Result<Command> {
+                panic!("fixture setup never spawns")
+            })), SchedulerConfig::default()).unwrap();
+            let task = bootstrap.enqueue_general(&GeneralTaskManifest { schema: external_core::GENERAL_TASK_SCHEMA.into(), agent_id: String::new(),
+                repository: directory.path().canonicalize().unwrap(), permission_mode: Some(external_core::PermissionMode::Plan),
+                prompt: "synthetic observation evidence".into(), write_manifest: vec![] }).unwrap();
+            let id = task.agent_id;
+            let claim = store.claim_next("observation-test").unwrap().unwrap();
+            store.mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None).unwrap();
+            let state = Arc::new(RuntimeState::new());
+            let sink = Arc::new(StoreLifecycleSink::new(store.clone(), id.clone(), "runtime".into(), claim.owner_epoch,
+                Arc::new(RuntimeLifecycle::new(claim.owner_epoch)), state.clone()));
+            Self { directory, store, state, publisher: Publisher::new(sink), id }
+        }
+        fn reason_rows(&self) -> Vec<String> {
+            let connection = rusqlite::Connection::open(self.directory.path().join("state.sqlite")).unwrap();
+            let mut query = connection.prepare("SELECT payload_json FROM events WHERE agent_id=?1 AND json_extract(payload_json,'$.reason') IS NOT NULL ORDER BY seq").unwrap();
+            query.query_map([&self.id], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        }
+        fn anomalous_batch(&self) -> DecodedInput {
+            let (task_id, launch_id) = self.publisher.event_scope();
+            let input = NativeInputContext { task_id, launch_id, turn_id: Some(TurnId::Local(1)), source: NativeSource {
+                protocol: SourceProtocol::ZcodeSession, discriminator: SafeToken::new("api_key.PRIVATE_CREDENTIAL"),
+                session_id: Some(SessionId("session".into())), turn_id: None, item_id: None, call_id: None,
+                event_id: Some("one-native-input".into()), timestamp: None } };
+            let gap = CoverageGap { reason: LossReason::Malformed, impact: Impact::Known(vec![CoverageDimension::Tools]), activity: ActivityScope::Turn(TurnId::Local(1)) };
+            let facts = [EventFact::CoverageGap(gap.clone()), EventFact::Diagnostic(Diagnostic { reason: DiagnosticReason::Malformed,
+                impact: gap.impact.clone(), discriminator: SafeToken::new("PRIVATE_PAYLOAD") })];
+            let events = facts.into_iter().enumerate().map(|(index, fact)| NormalizedEvent { context: EventContext {
+                task_id: input.task_id.clone(), launch_id: input.launch_id.clone(), sequence: index as u64 + 1,
+                turn_id: input.turn_id.clone(), source: input.source.clone() }, fact }).collect();
+            DecodedInput::new(input, Attribution::Current, DecodeDisposition::InvalidLost(gap), events).unwrap()
+        }
+        fn scheduler(&self) -> Scheduler {
+            Scheduler::new("query-only", self.store.clone(), Arc::new(CommandRuntimeFactory::new(|_: &TaskRecord| -> io::Result<Command> {
+                panic!("observation queries must never spawn a runtime")
+            })), SchedulerConfig::default()).unwrap()
+        }
+    }
+
+    #[test]
+    fn one_native_anomaly_has_one_safe_reason_record_and_repeated_wait_never_repersists() {
+        let fixture = Fixture::new();
+        let batch = fixture.anomalous_batch();
+        fixture.publisher.emit_typed(batch.clone());
+        let before = fixture.state.snapshot();
+        assert_eq!(before.diagnostics.iter().map(|d| d.count).sum::<u64>(), 1);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 1);
+        let rows = fixture.reason_rows(); assert_eq!(rows.len(), 1);
+        let reason: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(reason["reason"], "malformed");
+        assert_eq!(reason["discriminator"], "unrecognized");
+        assert!(!rows[0].contains("PRIVATE"));
+        assert!(!rows[0].contains("one-native-input"));
+        let seq = fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq;
+        fixture.publisher.emit_typed(batch);
+        let scheduler = fixture.scheduler();
+        scheduler.inner.state.lock().unwrap().activities.insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        for _ in 0..4 {
+            let response = service.dispatch(RpcMethod::TaskWait(TaskWaitQuery { agent_id: WaitTarget::One(fixture.id.clone()), wait_time: 0,
+                message_id: None, wait_mode: WaitMode::All })).unwrap();
+            assert!(matches!(response, RpcSuccess::TaskWait(_)));
+        }
+        assert_eq!(fixture.reason_rows(), rows);
+        assert_eq!(fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq, seq);
+        assert_eq!(fixture.state.snapshot().diagnostics, before.diagnostics);
+    }
+
+    #[test]
+    fn restarted_scheduler_reports_unavailable_without_replaying_persisted_reasons() {
+        let fixture = Fixture::new(); fixture.publisher.emit_typed(fixture.anomalous_batch());
+        let reasons = fixture.reason_rows(); let seq = fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq;
+        let scheduler = fixture.scheduler();
+        assert!(scheduler.passive_activity_snapshot(&fixture.id).is_none());
+        let observation = scheduler.observation_snapshot(&fixture.id);
+        assert_eq!(observation.snapshot_seq, 0);
+        assert!(observation.tools.is_empty());
+        assert!(observation.reasoning.text.is_empty());
+        assert!(!observation.coverage.tool_history_complete);
+        assert!(!observation.coverage.reasoning_complete);
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let RpcSuccess::TaskWait(view) = service.dispatch(RpcMethod::TaskWait(TaskWaitQuery { agent_id: WaitTarget::One(fixture.id.clone()),
+            wait_time: 0, message_id: None, wait_mode: WaitMode::All })).unwrap() else { panic!("wait view") };
+        assert_eq!(view.activity.telemetry_status, crate::rpc::TelemetryStatusView::Unavailable);
+        assert_eq!(fixture.reason_rows(), reasons);
+        assert_eq!(fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq, seq);
+    }
+
+    #[test]
+    fn real_adapter_ignored_unknown_and_malformed_inputs_have_distinct_persisted_effects() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope(); let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let mut send = |method: &str, params: serde_json::Value| {
+            let inbound = Inbound::Message(WireMessage::UnknownEvent { method: method.into(), raw: serde_json::json!({"params":params}) });
+            let batch = adapter.decode(&inbound).unwrap(); fixture.publisher.emit_typed(batch.clone()); batch
+        };
+        let ignored = send("v4/telemetry/event", serde_json::json!({"version":1,"kind":"usage.delta","eventId":"usage"}));
+        assert!(matches!(ignored.disposition(), DecodeDisposition::RecognizedIgnored(_)));
+        assert!(fixture.reason_rows().is_empty());
+        send("session/event", serde_json::json!({"type":"turn.started","turnId":"turn"}));
+        send("session/event", serde_json::json!({"type":"model.streaming","turnId":"turn","eventId":"thought",
+            "payload":{"kind":"reasoning_delta","delta":"public summary"}}));
+        let unknown = send("api_key.PRIVATE_CREDENTIAL", serde_json::json!({"eventId":"unknown","turnId":"turn"}));
+        assert!(matches!(unknown.disposition(), DecodeDisposition::Unknown(_)));
+        assert_eq!(fixture.state.snapshot().telemetry_status, TelemetryStatus::Healthy);
+        assert!(fixture.state.observation_snapshot().coverage.reasoning_complete);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 0);
+        let malformed = send("session/event", serde_json::json!({"type":"tool.updated","turnId":"turn","eventId":"bad-tool","payload":{"kind":"started","toolCallId":false}}));
+        assert!(matches!(malformed.disposition(), DecodeDisposition::InvalidLost(_)));
+        assert!(!fixture.state.observation_snapshot().coverage.tool_history_complete);
+        assert!(fixture.state.observation_snapshot().coverage.reasoning_complete);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 1);
+        let oversized_discriminator = format!("PRIVATE_{}", "x".repeat(2048));
+        let oversized = send(&oversized_discriminator, serde_json::json!({"eventId":"oversized-discriminator","turnId":"turn","payload":"PRIVATE_PAYLOAD"}));
+        assert!(matches!(oversized.disposition(), DecodeDisposition::Unknown(_)));
+        let rows = fixture.reason_rows(); assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| !row.contains("PRIVATE") && row.len() < 1024));
+        let summary = serde_json::to_string(&fixture.state.snapshot().diagnostics).unwrap();
+        assert!(!summary.contains("PRIVATE") && summary.len() < 4096);
     }
 }

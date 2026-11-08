@@ -2,20 +2,18 @@
 //! retain their OBSERVED/SOURCE_INSPECTED/SYNTHETIC provenance in tests/fixtures.
 use super::*;
 use crate::{
-    activity_tracker::PassiveActivityTracker, LifecycleRecord, LifecycleSink, Publisher,
-    RuntimeEvent, RuntimeState,
+    RuntimeState, RuntimeEnvelope, LifecycleSink, Publisher,
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 struct ViewSink {
-    activity: Arc<PassiveActivityTracker>,
-    records: Mutex<Vec<LifecycleRecord>>,
+    activity: Arc<RuntimeState>,
+    records: Mutex<Vec<RuntimeEnvelope>>,
 }
 impl LifecycleSink for ViewSink {
     fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.activity.clone()) }
-    fn emit(&self, record: LifecycleRecord) {
-        if !matches!(record.event, RuntimeEvent::Normalized(_)) { self.activity.observe(&record.event); }
+    fn emit(&self, record: RuntimeEnvelope) {
         self.records.lock().unwrap().push(record);
     }
 }
@@ -29,7 +27,7 @@ struct Trace {
 impl Trace {
     fn new() -> Self {
         let sink = Arc::new(ViewSink {
-            activity: Arc::new(PassiveActivityTracker::for_adapter("zcode")),
+            activity: Arc::new(RuntimeState::new()),
             records: Mutex::new(vec![]),
         });
         let publisher = Publisher::new(sink.clone());
@@ -178,11 +176,11 @@ fn terminal_telemetry_preserves_activity_until_full_session_settlement() {
         assert_eq!(trace.sink.records.lock().unwrap().len(), before);
         let records = trace.sink.records.lock().unwrap();
         for (index, record) in records.iter().enumerate() {
-            assert_eq!(record.sequence, index as u64 + 1);
-            let RuntimeEvent::Normalized(event) = &record.event else {
+            assert_eq!(record.sequence(), index as u64 + 1);
+            let RuntimeEnvelope::Event { event: event, .. } = &record else {
                 panic!("typed only")
             };
-            assert_eq!(record.sequence, event.context.sequence);
+            assert_eq!(record.sequence(), event.context.sequence);
         }
     }
 }
@@ -235,7 +233,7 @@ fn tools_progress_permission_denial_and_dual_sources_do_not_recount_or_finish_ex
     assert!(!serde_json::to_string(&observed).unwrap().contains("hidden"));
     assert_eq!(observed.tools[0].recent_calls[0].redacted_fields, 1);
     for record in trace.sink.records.lock().unwrap().iter() {
-        if let RuntimeEvent::Normalized(event) = &record.event {
+        if let RuntimeEnvelope::Event { event: event, .. } = &record {
             assert!(!serde_json::to_string(event).unwrap().contains("hidden"));
         }
     }
@@ -319,7 +317,7 @@ fn known_ignored_and_unknown_or_damage_have_distinct_coverage() {
         matches!(malformed.disposition(), DecodeDisposition::InvalidLost(CoverageGap { impact: Impact::Known(dimensions), .. }) if dimensions == &vec![CoverageDimension::ModelActivity])
     );
     for record in trace.sink.records.lock().unwrap().iter() {
-        let projection = crate::projection::lifecycle_projection(&record.event, None);
+        let projection = crate::projection::lifecycle_projection(&record, None);
         assert!(!projection.payload_json.contains("private payload"));
     }
 }
@@ -412,11 +410,11 @@ fn malformed_and_oversized_transport_frames_keep_safe_fault_and_loss() {
     );
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let coverage = trace.sink.activity.observation_snapshot().coverage;
-    assert!(coverage.tool_history_complete);
-    assert!(coverage.reasoning_complete);
+    assert!(!coverage.tool_history_complete);
+    assert!(!coverage.reasoning_complete);
     for record in trace.sink.records.lock().unwrap().iter() {
         assert!(
-            !crate::projection::lifecycle_projection(&record.event, None)
+            !crate::projection::lifecycle_projection(&record, None)
                 .payload_json
                 .contains("private broken data")
         );
@@ -452,7 +450,7 @@ fn malformed_public_reasoning_affects_reasoning_coverage_only() {
     );
     let snapshot = trace.sink.activity.observation_snapshot();
     assert!(!snapshot.coverage.reasoning_complete);
-    assert!(snapshot.coverage.tool_history_complete);
+    assert!(!snapshot.coverage.tool_history_complete);
     assert_eq!(snapshot.coverage.dropped_events, 1);
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let malformed = trace.send(
@@ -923,7 +921,7 @@ fn unknown_impact_preserves_current_and_historical_state() {
     assert_eq!(observed.tools, before.tools);
     assert_eq!(observed.reasoning, before.reasoning);
     let projection = crate::projection::lifecycle_projection(
-        &trace.sink.records.lock().unwrap().last().unwrap().event,
+        &trace.sink.records.lock().unwrap().last().unwrap(),
         None,
     );
     assert!(projection.payload_json.contains("unknown"));
@@ -985,7 +983,7 @@ fn replay_window_retirement_preserves_uncertainty_without_asserting_event_loss()
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let coverage = trace.sink.activity.observation_snapshot().coverage;
     assert_eq!(coverage.dropped_events, 0);
-    assert!(coverage.tool_history_complete && coverage.reasoning_complete);
+    assert!(!coverage.tool_history_complete && !coverage.reasoning_complete);
 }
 
 #[test]
@@ -1002,7 +1000,9 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
     );
     let clean = trace.sink.activity.observation_snapshot().coverage;
     assert_eq!(clean.dropped_events, 0);
-    assert!(clean.tool_history_complete && clean.reasoning_complete);
+    assert!(!clean.tool_history_complete && !clean.reasoning_complete);
+    assert_eq!(trace.sink.activity.snapshot().coverage.tools, Some(false));
+    assert_eq!(trace.sink.activity.snapshot().coverage.public_reasoning, None);
     trace.send(
         "session/event",
         json!({"type":"tool.updated","payload":{"kind":"started"}}),
@@ -1010,7 +1010,8 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
     assert!(trace.sink.activity.snapshot().telemetry_degraded);
     let known_damage = trace.sink.activity.observation_snapshot().coverage;
     assert!(!known_damage.tool_history_complete);
-    assert!(known_damage.reasoning_complete);
+    assert!(!known_damage.reasoning_complete);
+    assert_eq!(trace.sink.activity.snapshot().coverage.public_reasoning, None);
     assert_eq!(known_damage.dropped_events, 1);
     // A known damaged tool frame outside any observed turn affects tool history,
     // with no evidence of a current correlation to mark degraded.
@@ -1033,6 +1034,6 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
     assert!(!trace.sink.activity.snapshot().telemetry_degraded);
     let historical = trace.sink.activity.observation_snapshot().coverage;
     assert!(!historical.tool_history_complete);
-    assert!(historical.reasoning_complete);
+    assert!(!historical.reasoning_complete);
     assert_eq!(historical.dropped_events, 1);
 }

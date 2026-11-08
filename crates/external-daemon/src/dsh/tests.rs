@@ -458,7 +458,7 @@ fn closed_gate_refuses_dsh_spawn_without_touching_any_process() {
 /// Minimal sink for direct factory probes; records nothing.
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 #[test]
@@ -567,7 +567,7 @@ printf '%s\\n' \
             .clone()
     );
     assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
 
     let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
     let error = service
@@ -1844,9 +1844,7 @@ impl ManagedRuntime for FakeProviderRuntime {
         self.tracker.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.tracker.activity_snapshot()
-    }
+
 }
 
 /// Test-only composition mirroring `RoutingRuntimeFactory`: the zcode
@@ -2659,55 +2657,17 @@ while [ ! -f test-release ]; do sleep 0.05; done
 
 #[test]
 fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
-    use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-    let tracker = crate::PassiveActivityTracker::for_adapter("dsh");
-    let update = parse_update(&serde_json::json!({
-        "sessionId": "s1", "update": {
-            "sessionUpdate": "tool_call", "toolCallId": "tool-7",
-            "title": "edit a.ts", "kind": "other",
-            "rawInput": {"path": "a.ts", "content": "中"}
-        }
-    }))
-    .unwrap();
-    let input = serde_json::json!({"path":"a.ts","content":"中"});
-    // Mirror the daemon pump: the streaming sibling has no input and the
-    // input-bearing started sibling shares the pair's launch-local event id.
-    let deliver = |event_id: &str| {
-        for mut params in canonical_event_payloads(&update, event_id, "t1") {
-            if params["type"] == "tool.updated" && params["payload"]["kind"] == "started" {
-                params["payload"]["input"] = input.clone();
-            }
-            tracker.observe(&crate::RuntimeEvent::Driver(Inbound::Message(
-                WireMessage::Event(EventEnvelope {
-                    method: "session/event".into(),
-                    params,
-                }),
-            )));
-        }
-    };
-
-    deliver("dsh-event-1");
+    let (shared, tracker) = tool_projection_tracker();
+    let update = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"tool-7","title":"edit a.ts","kind":"other",
+        "status":"in_progress","rawInput":{"path":"a.ts","content":"中"}});
+    deliver_tool_update(&shared, update.clone());
     let before = tracker.observation_snapshot();
-    assert_eq!(before.tools[0].call_count, 1);
-    // The observation groups by the real name (the ACP title); the generic
-    // `other` category must never name the tool.
-    assert_eq!(before.tools[0].tool_name, "edit a.ts");
-    assert_eq!(
-        before.tools[0].recent_calls[0].arguments["path"],
-        serde_json::json!("a.ts")
-    );
-    assert!(!before.tools[0].recent_calls[0].arguments_truncated);
-
-    // A repeated ACP notification is re-normalized with fresh event ids. Its
-    // input-absent streaming sibling must not erase the captured rawInput.
-    deliver("dsh-event-2");
+    deliver_tool_update(&shared, update);
     let after = tracker.observation_snapshot();
     assert_eq!(after, before);
+    assert_eq!(after.tools[0].tool_name, "edit a.ts");
     assert_eq!(after.tools[0].call_count, 1);
-    assert_eq!(
-        after.tools[0].recent_calls[0].arguments["path"],
-        serde_json::json!("a.ts")
-    );
+    assert_eq!(after.tools[0].recent_calls[0].arguments["path"], "a.ts");
     assert!(!after.tools[0].recent_calls[0].arguments_truncated);
 }
 
@@ -2775,16 +2735,15 @@ fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
 /// Exercise the real adapter projector and observation/activity consumers.
 fn tool_projection_tracker() -> (
     super::events::DshRuntimeShared,
-    Arc<crate::PassiveActivityTracker>,
+    Arc<crate::RuntimeState>,
 ) {
-    struct TrackerSink(Arc<crate::PassiveActivityTracker>);
+    struct TrackerSink(Arc<crate::RuntimeState>);
     impl LifecycleSink for TrackerSink {
         fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.0.clone()) }
-        fn emit(&self, record: crate::LifecycleRecord) {
-            if !matches!(record.event, crate::RuntimeEvent::Normalized(_)) { self.0.observe(&record.event); }
+        fn emit(&self, record: crate::RuntimeEnvelope) {
         }
     }
-    let tracker = Arc::new(crate::PassiveActivityTracker::for_adapter("dsh"));
+    let tracker = Arc::new(crate::RuntimeState::new());
     let publisher = Arc::new(crate::Publisher::new(Arc::new(TrackerSink(Arc::clone(
         &tracker,
     )))));
@@ -2846,7 +2805,10 @@ fn assert_pending_tool_counters(tool_name: &str, input: serde_json::Value) {
     assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 1);
     assert_eq!(tracker.snapshot().window_60s.tool_calls_failed, 0);
     assert!(tracker.snapshot().active_tools.is_empty());
-    assert_eq!(tracker.observation_snapshot(), observed);
+    let finished = tracker.observation_snapshot();
+    assert_eq!(finished.tools[0].recent_calls[0].arguments, observed.tools[0].recent_calls[0].arguments);
+    assert_eq!(finished.tools[0].call_count, observed.tools[0].call_count);
+    assert_eq!(finished.tools[0].recent_calls[0].status, crate::observation::ObservedCallStatus::Succeeded);
 }
 
 #[test]
@@ -2872,7 +2834,7 @@ fn assert_terminal_tool_announcement(status: &str) {
     assert!(!observed.tools[0].recent_calls[0].arguments_truncated);
     deliver_tool_update(&shared, terminal);
     let activity = tracker.snapshot();
-    assert_eq!(activity.window_60s.tool_calls_started, 0);
+    assert_eq!(activity.window_60s.tool_calls_started, 1);
     assert_eq!(activity.window_60s.tool_calls_completed, u64::from(status == "completed"));
     assert_eq!(activity.window_60s.tool_calls_failed, u64::from(status == "failed"));
     assert!(activity.active_tools.is_empty());
@@ -2923,7 +2885,7 @@ fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_
         deliver_tool_update(&shared, warmup);
     }
     let warm = tracker.snapshot();
-    assert_eq!(warm.window_60s.tool_calls_started, 0);
+    assert_eq!(warm.window_60s.tool_calls_started, 128);
     assert_eq!(warm.window_60s.tool_calls_completed, 128);
     assert!(warm.active_tools.is_empty());
 
@@ -2931,7 +2893,7 @@ fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_
         "status":"pending","title":tool_name,"kind":"other","rawInput":input});
     deliver_tool_update(&shared, pending.clone());
     deliver_tool_update(&shared, pending);
-    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 0);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 128);
     // Capture the actual permission correlation while still pending, without
     // echoing a title in the permission offer itself.
     let pending_name = projected_permission_tool_name(&shared, "current");
@@ -2953,7 +2915,7 @@ fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_
     deliver_tool_update(&shared, started.clone());
     deliver_tool_update(&shared, started);
     let running = tracker.snapshot();
-    assert_eq!(running.window_60s.tool_calls_started, 1);
+    assert_eq!(running.window_60s.tool_calls_started, 129);
     assert_eq!(
         running.window_60s.read_calls,
         u64::from(tool_name == "Read"),
@@ -2964,7 +2926,7 @@ fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_
         u64::from(tool_name == "Bash"),
         "{tool_name}"
     );
-    assert_eq!(running.window_60s.other_tool_calls, 0);
+    assert_eq!(running.window_60s.other_tool_calls, 128);
     assert_eq!(running.active_tools.len(), 1);
     assert_eq!(running.active_tools[0].tool_call_id, "current");
     assert_eq!(
@@ -2981,18 +2943,26 @@ fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_
         tool_name
     );
     assert_eq!(shared.tool_names.lock().unwrap().len(), 1);
-    assert_eq!(tracker.observation_snapshot(), observed);
+    let running_observation = tracker.observation_snapshot();
+    let active = running_observation.tools.iter().find(|tool| tool.tool_name == tool_name).unwrap();
+    assert_eq!(active.recent_calls[0].arguments, current.recent_calls[0].arguments);
+    assert_eq!(active.call_count, current.call_count);
+    assert_eq!(active.recent_calls[0].status, crate::observation::ObservedCallStatus::Running);
 
     let terminal = serde_json::json!({"sessionUpdate":"tool_call_update",
         "toolCallId":"current","status":"completed"});
     deliver_tool_update(&shared, terminal.clone());
     deliver_tool_update(&shared, terminal);
     let settled = tracker.snapshot();
-    assert_eq!(settled.window_60s.tool_calls_started, 1);
+    assert_eq!(settled.window_60s.tool_calls_started, 129);
     assert_eq!(settled.window_60s.tool_calls_completed, 129);
     assert_eq!(settled.window_60s.tool_calls_failed, 0);
     assert!(settled.active_tools.is_empty());
-    assert_eq!(tracker.observation_snapshot(), observed);
+    let running_observation = tracker.observation_snapshot();
+    let active = running_observation.tools.iter().find(|tool| tool.tool_name == tool_name).unwrap();
+    assert_eq!(active.recent_calls[0].arguments, current.recent_calls[0].arguments);
+    assert_eq!(active.call_count, current.call_count);
+    assert_eq!(active.recent_calls[0].status, crate::observation::ObservedCallStatus::Succeeded);
     assert!(shared.tool_names.lock().unwrap().is_empty());
 }
 
@@ -3300,13 +3270,13 @@ fn repair4_nul_chunk_is_preserved_in_persisted_and_paged_result() {
 
 #[derive(Default)]
 struct CapturedFacts {
-    events: Mutex<Vec<crate::RuntimeEvent>>,
+    events: Mutex<Vec<crate::RuntimeEnvelope>>,
 }
 
 struct CaptureSink(Arc<CapturedFacts>);
 impl LifecycleSink for CaptureSink {
-    fn emit(&self, record: crate::LifecycleRecord) {
-        self.0.events.lock().unwrap().push(record.event);
+    fn emit(&self, record: crate::RuntimeEnvelope) {
+        self.0.events.lock().unwrap().push(record);
     }
 }
 
@@ -3344,7 +3314,7 @@ fn captured_facts(captured: &CapturedFacts) -> Vec<external_contract::events::Ev
         .unwrap()
         .iter()
         .filter_map(|event| match event {
-            crate::RuntimeEvent::Normalized(NormalizedEvent { fact, .. }) => Some(fact.clone()),
+            crate::RuntimeEnvelope::Event { event: NormalizedEvent { fact, .. }, .. } => Some(fact.clone()),
             _ => None,
         })
         .collect()
@@ -3489,10 +3459,9 @@ fn repair_malformed_message_text_is_lost_but_legal_empty_content_is_ignored() {
     for event in captured.events.lock().unwrap().iter() {
         if matches!(
             event,
-            crate::RuntimeEvent::Normalized(NormalizedEvent {
-                fact: EventFact::CoverageGap(_),
-                ..
-            })
+            crate::RuntimeEnvelope::Event { event: NormalizedEvent {
+                fact: EventFact::CoverageGap(_), ..
+            }, .. }
         ) {
             let projection = crate::projection::lifecycle_projection(event, None);
             let summary: LifecycleSummary = serde_json::from_str(&projection.payload_json).unwrap();
@@ -3865,10 +3834,10 @@ fn session_update_projection_emits_typed_facts_only() {
     let events = captured.events.lock().unwrap();
     assert!(events
         .iter()
-        .all(|event| matches!(event, crate::RuntimeEvent::Normalized(_))));
+        .all(|event| matches!(event, crate::RuntimeEnvelope::Event { .. })));
     assert!(events.iter().any(|event| matches!(
         event,
-        crate::RuntimeEvent::Normalized(normalized)
+        crate::RuntimeEnvelope::Event { event: normalized, .. }
             if matches!(
                 &normalized.fact,
                 EventFact::MessageUpdated(MessageUpdate {

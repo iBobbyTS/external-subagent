@@ -31,11 +31,11 @@ pub(super) fn spawn_agy_pump(
                 if let Inbound::ChildExited(exit) = &event {
                     driver.wait_diagnostics(Duration::from_secs(1));
                     let terminal = classify_child_exit(driver.identity().pgid, &shared, exit);
-                    publisher.emit_driver(event, terminal);
+                    publisher.publish_transport(event, terminal);
                     return;
                 }
                 if let Some(projected) = project_agy_inbound(&shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
