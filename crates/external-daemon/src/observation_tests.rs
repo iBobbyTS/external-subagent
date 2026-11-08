@@ -116,11 +116,10 @@ fn unrelated_frames_and_one_tool_terminal_do_not_repair_other_correlations() {
 }
 
 #[test]
-fn settlement_converges_only_its_turn_and_launch_without_repairing_history() {
+fn settlement_converges_only_its_correlation_gaps_without_repairing_history() {
     let state = RuntimeState::new();
     start(&state);
     for (launch, turn, id) in [("launch", 1, "a"), ("launch", 2, "b"), ("other", 1, "c")] {
-        state.reduce_batch(&[scoped(model(Some(id), ModelPhase::Started), launch, turn)]);
         state.reduce_batch(&[scoped(
             gap(
                 ActivityScope::ModelRequest(RequestId(id.into())),
@@ -131,13 +130,11 @@ fn settlement_converges_only_its_turn_and_launch_without_repairing_history() {
         )]);
     }
     state.reduce_batch(&[event(settled(1))]);
-    assert!(state.snapshot().model_request_active);
+    // Correlation-gap trust and historical coverage retain their own scopes;
+    // they do not imply several simultaneously open activity-ledger turns.
     assert_eq!(state.snapshot().telemetry_status, TelemetryStatus::Degraded);
     state.reduce_batch(&[scoped(settled(2), "launch", 2)]);
-    assert!(
-        state.snapshot().model_request_active,
-        "another launch is still active"
-    );
+    assert_eq!(state.snapshot().telemetry_status, TelemetryStatus::Degraded);
     state.reduce_batch(&[scoped(settled(1), "other", 1)]);
     let snapshot = state.snapshot();
     assert!(!snapshot.model_request_active);
@@ -535,4 +532,147 @@ fn model_retention_limit_is_current_uncertainty_until_its_own_terminal() {
     state.reduce_batch(&[event(model(Some("over-capacity"), ModelPhase::Completed))]);
     assert_eq!(state.snapshot().telemetry_status, TelemetryStatus::Healthy);
     assert_eq!(state.snapshot().coverage.model_activity, Some(false));
+}
+
+// Reviewer R03-F01 interleavings, ported as permanent reducer regressions.
+mod settled_scope_residue {
+    use crate::*;
+    use external_contract::events::*;
+
+    fn ev(turn: Option<TurnId>, fact: EventFact) -> NormalizedEvent {
+        NormalizedEvent {
+            context: EventContext {
+                task_id: TaskId("task".into()),
+                launch_id: LaunchId("launch".into()),
+                sequence: 0,
+                turn_id: turn,
+                source: NativeSource {
+                    protocol: SourceProtocol::ZcodeTelemetryV4,
+                    discriminator: None,
+                    session_id: None,
+                    turn_id: None,
+                    item_id: None,
+                    call_id: None,
+                    event_id: None,
+                    timestamp: None,
+                },
+            },
+            fact,
+        }
+    }
+
+    fn turn_started(id: &str) -> EventFact {
+        EventFact::TurnStarted {
+            turn_id: TurnId::Native(id.into()),
+        }
+    }
+    fn settled(id: &str) -> EventFact {
+        EventFact::TurnSettled(TurnSettlement {
+            turn_id: TurnId::Native(id.into()),
+            outcome: TurnOutcome::Completed,
+            stop_reason: None,
+            final_text: Some("done".into()),
+            failure: None,
+        })
+    }
+    fn model(id: &str, phase: ModelPhase) -> EventFact {
+        EventFact::ModelActivityChanged(ModelActivity {
+            request_id: Some(RequestId(id.into())),
+            phase,
+            retry: None,
+            failure: None,
+        })
+    }
+    fn tool(id: &str, phase: ToolPhase) -> EventFact {
+        EventFact::ToolChanged(ToolChange {
+            call_id: CallId(id.into()),
+            name: Some("Read".into()),
+            category: None,
+            arguments: None,
+            phase: Some(phase),
+            outcome: None,
+            failure: None,
+            denied: None,
+        })
+    }
+
+    /// Telemetry `started` attributed to the just-settled turn (adapter keeps
+    /// `self.turn` after settlement; telemetry has no turnId of its own), then a
+    /// later turn starts, the request completes under the NEW turn scope, and the
+    /// new turn settles. Does the stale correlation survive every boundary?
+    #[test]
+    fn settlement_clears_model_residue_from_previously_settled_turn() {
+        let rt = RuntimeState::new();
+        let t1 = Some(TurnId::Native("t1".into()));
+        let t2 = Some(TurnId::Native("t2".into()));
+        rt.reduce_batch(&[ev(t1.clone(), turn_started("t1"))]);
+        rt.reduce_batch(&[ev(t1.clone(), settled("t1"))]);
+        // started lands after t1's settlement, before t2 starts: attributed to t1.
+        rt.reduce_batch(&[ev(t1.clone(), model("r", ModelPhase::Started))]);
+        rt.reduce_batch(&[ev(t2.clone(), turn_started("t2"))]);
+        // the request finishes while the adapter current turn is t2.
+        rt.reduce_batch(&[ev(t2.clone(), model("r", ModelPhase::Completed))]);
+        rt.reduce_batch(&[ev(t2.clone(), settled("t2"))]);
+        let snap = rt.snapshot();
+        assert!(rt.state.lock().unwrap().active_model_requests.is_empty());
+        assert!(
+            !snap.model_request_active,
+            "stale model request survived t2 start+settle"
+        );
+        assert_eq!(snap.model_request_age_ms, None);
+    }
+
+    /// Same window for a tool started frame attributed to the settled turn.
+    #[test]
+    fn settlement_clears_tool_residue_from_previously_settled_turn() {
+        let rt = RuntimeState::new();
+        let t1 = Some(TurnId::Native("t1".into()));
+        let t2 = Some(TurnId::Native("t2".into()));
+        rt.reduce_batch(&[ev(t1.clone(), turn_started("t1"))]);
+        rt.reduce_batch(&[ev(t1.clone(), settled("t1"))]);
+        rt.reduce_batch(&[ev(t1.clone(), tool("c", ToolPhase::Started))]);
+        rt.reduce_batch(&[ev(t2.clone(), turn_started("t2"))]);
+        rt.reduce_batch(&[ev(t2.clone(), tool("c", ToolPhase::Finished))]);
+        rt.reduce_batch(&[ev(t2.clone(), settled("t2"))]);
+        let snap = rt.snapshot();
+        assert!(rt.state.lock().unwrap().active_tools.is_empty());
+        assert!(
+            snap.active_tools.is_empty(),
+            "stale in-flight tool survived t2 start+settle"
+        );
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+    }
+
+    /// Control: the same request started INSIDE t1 is cleared by t1's settlement.
+    #[test]
+    fn settlement_clears_model_started_in_live_scope() {
+        let rt = RuntimeState::new();
+        let t1 = Some(TurnId::Native("t1".into()));
+        rt.reduce_batch(&[ev(t1.clone(), turn_started("t1"))]);
+        rt.reduce_batch(&[ev(t1.clone(), model("r", ModelPhase::Started))]);
+        rt.reduce_batch(&[ev(t1.clone(), settled("t1"))]);
+        assert!(!rt.snapshot().model_request_active);
+    }
+
+    #[test]
+    fn settlement_clears_correlations_started_before_first_turn() {
+        let rt = RuntimeState::new();
+        rt.reduce_batch(&[
+            ev(None, model("r", ModelPhase::Started)),
+            ev(None, tool("c", ToolPhase::Started)),
+        ]);
+        assert!(rt.snapshot().model_request_active);
+        assert_eq!(rt.snapshot().active_tools.len(), 1);
+        let turn = Some(TurnId::Native("first".into()));
+        rt.reduce_batch(&[ev(turn.clone(), turn_started("first"))]);
+        rt.reduce_batch(&[ev(turn.clone(), settled("first"))]);
+        let snap = rt.snapshot();
+        let state = rt.state.lock().unwrap();
+        assert!(state.active_model_requests.is_empty());
+        assert!(state.active_tools.is_empty());
+        assert!(!snap.model_request_active);
+        assert_eq!(snap.model_request_age_ms, None);
+        assert!(snap.active_tools.is_empty());
+        assert_eq!(snap.oldest_active_tool_age_ms, None);
+    }
 }

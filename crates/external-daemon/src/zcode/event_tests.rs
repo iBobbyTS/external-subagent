@@ -1037,3 +1037,115 @@ fn unknown_semantics_and_known_damage_keep_their_supported_scope() {
     assert!(!historical.reasoning_complete);
     assert_eq!(historical.dropped_events, 1);
 }
+
+
+mod settled_scope_residue {
+    use super::*;
+
+    // Unlike Trace::send, this preserves the native optional turnId field.
+    fn send(trace: &mut Trace, method: &str, mut params: Value) -> DecodedInput {
+        trace.next += 1;
+        params["eventId"] = json!(format!("input-{}", trace.next));
+        params["sessionId"] = json!("session-1");
+        if method == "v4/telemetry/event" {
+            params["version"] = json!(1);
+        }
+        let inbound = Inbound::Message(WireMessage::UnknownEvent {
+            method: method.into(),
+            raw: json!({"method":method,"params":params}),
+        });
+        let batch = trace.adapter.decode(&inbound).unwrap();
+        assert_eq!(batch.attribution(), Attribution::Current);
+        assert!(matches!(batch.disposition(), DecodeDisposition::Consumed));
+        trace.publisher.emit_typed(batch.clone());
+        batch
+    }
+
+    fn assert_turnless_telemetry_residue_cleared(previously_settled: bool) {
+        for complete_under_new_turn in [true, false] {
+            let mut trace = Trace::new();
+            if previously_settled {
+                send(
+                    &mut trace,
+                    "session/event",
+                    json!({"type":"turn.started","turnId":"previous"}),
+                );
+                send(
+                    &mut trace,
+                    "session/event",
+                    json!({"type":"turn.completed","turnId":"previous","payload":{"response":"previous done"}}),
+                );
+            }
+            let model = send(
+                &mut trace,
+                "v4/telemetry/event",
+                json!({"kind":"model.request.status","requestId":"request","status":"model_request_started"}),
+            );
+            let tool = send(
+                &mut trace,
+                "v4/telemetry/event",
+                json!({"kind":"tool.lifecycle","toolCallId":"call","toolName":"Read","phase":"started"}),
+            );
+            let expected_scope = previously_settled.then(|| TurnId::Native("previous".into()));
+            assert_eq!(model.events()[0].context.turn_id, expected_scope);
+            assert_eq!(tool.events()[0].context.turn_id, expected_scope);
+            let active = trace.tracker.snapshot();
+            assert!(active.model_request_active);
+            assert!(active.model_request_age_ms.is_some());
+            assert_eq!(active.active_tools.len(), 1);
+            assert!(active.oldest_active_tool_age_ms.is_some());
+            send(
+                &mut trace,
+                "session/event",
+                json!({"type":"turn.started","turnId":"next"}),
+            );
+            if complete_under_new_turn {
+                send(
+                    &mut trace,
+                    "v4/telemetry/event",
+                    json!({"kind":"model.request.status","requestId":"request","status":"model_request_completed"}),
+                );
+                send(
+                    &mut trace,
+                    "v4/telemetry/event",
+                    json!({"kind":"tool.lifecycle","toolCallId":"call","phase":"completed"}),
+                );
+            }
+            send(
+                &mut trace,
+                "session/event",
+                json!({"type":"model.streaming","payload":{"kind":"text_delta","delta":"next ","assistantMessageId":"next-message"}}),
+            );
+            let history = trace.tracker.observation_snapshot();
+            let coverage = trace.tracker.snapshot().coverage;
+            let diagnostics = trace.tracker.snapshot().diagnostics;
+            send(
+                &mut trace,
+                "session/event",
+                json!({"type":"turn.completed","turnId":"next","payload":{"response":"next done"}}),
+            );
+            let snapshot = trace.tracker.snapshot();
+            assert!(!snapshot.model_request_active, "turnless model residue: previous={previously_settled}, completed={complete_under_new_turn}");
+            assert_eq!(snapshot.model_request_age_ms, None);
+            assert!(snapshot.active_tools.is_empty(), "turnless tool residue: previous={previously_settled}, completed={complete_under_new_turn}");
+            assert_eq!(snapshot.oldest_active_tool_age_ms, None);
+            let state = trace.tracker.state.lock().unwrap();
+            assert!(state.active_model_requests.is_empty());
+            assert!(state.active_tools.is_empty());
+            drop(state);
+            assert_eq!(trace.tracker.observation_snapshot(), history);
+            assert_eq!(snapshot.coverage, coverage);
+            assert_eq!(snapshot.diagnostics, diagnostics);
+        }
+    }
+
+    #[test]
+    fn settlement_clears_turnless_telemetry_from_previously_settled_turn() {
+        assert_turnless_telemetry_residue_cleared(true);
+    }
+
+    #[test]
+    fn settlement_clears_turnless_telemetry_from_before_first_turn() {
+        assert_turnless_telemetry_residue_cleared(false);
+    }
+}

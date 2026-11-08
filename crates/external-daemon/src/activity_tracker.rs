@@ -972,7 +972,6 @@ impl RuntimeState {
                 .health
                 .projection_loss(dimension, event.context.source.protocol, wall_now_ms);
         }
-        let turn = runtime_observation::turn_key(event);
         let mut sample = None;
         match &event.fact {
             EventFact::TurnStarted { .. } => {
@@ -987,13 +986,11 @@ impl RuntimeState {
                     state.terminal_text = text.clone();
                 }
                 state.terminal_text_settled = true;
-                let prefix = format!("{turn}\0");
-                state
-                    .active_model_requests
-                    .retain(|key, _| !key.starts_with(&prefix));
-                state
-                    .active_tools
-                    .retain(|key, _| !key.starts_with(&prefix));
+                // This launch owns one open turn. Settlement closes its live
+                // correlations and any residue attributed before it (including
+                // turnless telemetry attributed to an already-settled turn).
+                state.active_model_requests.clear();
+                state.active_tools.clear();
             }
             EventFact::MessageUpdated(message) if !state.terminal_text_settled => {
                 let delta = typed_message_delta(&mut state, message);
