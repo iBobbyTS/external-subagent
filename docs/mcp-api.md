@@ -242,7 +242,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 |---|---|---|---|
 | `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance 与 session_id（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
-| `activity` | PublicActivity | 查看文本尾部、近期工具频度、未决工具调用与遥测可信度 | 难以判断运行中是在工作还是停滞 |
+| `activity` | PublicActivity | 查看文本尾部、近期工具频度、未决工具调用、模型活动、有界诊断摘要与遥测可信度 | 难以判断运行中是在工作还是停滞 |
 | `result` | PublicResult/null | 内嵌结果，避免再请求首段；`next_offset` 为 null 即已取完全文，否则按其继续分页 | 必须额外调用 result，长结果仍需分页 |
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
@@ -481,7 +481,9 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `last_activity_age_ms` | integer/null | 最近一次被采纳活动事件距快照的毫秒数；直接透出已有快照，尚无活动时为 null | 看不出活动新鲜程度 |
 | `model_request_active` | boolean | 直接透出已有快照中的模型请求活跃状态；无快照时为 false | 无法区分等待模型与其他阶段 |
 | `model_activity` | object/省略 | 仅当 native 来源确实提供模型活动事实时出现：`request_id`（可选）、原生 `phase`（`started/completed/failed/retry_scheduled/stream_stalled`）与已提供的 `retry` 详情（`will_retry`/`retryable`/`attempt`/`max_attempts`/`next_attempt`/`delay_ms`/`reset_at`，缺项省略）。不生成等待时间或尝试数；重试等待不是降级，也不触发 ES 自动重试。并发请求时表示最近一条原生事实（自带 request_id），整体活跃度看 `model_request_active` | 只能靠 `model_request_active` 判断，无法区分正常重试等待与没有有效模型活动 |
-| `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
+| `diagnostics` | array，最多 32 条 | 共同状态保留的已脱敏异常摘要（去重后的原生输入）：`source`（原生协议）、`reason`（受控处置原因：unknown_semantics/malformed/truncated/dropped/permission_denied/auxiliary_terminal/retention_limit/summary_limit）、`impact`（`{scope:"known",dimensions:[...]}` 或 `{scope:"unknown"}`）、`discriminator`（安全 method/type token，不含 payload）、`count`（去重后的原生输入次数）、`last_observed_at`（epoch 毫秒）。空数组表示没有已知异常，不是完整性的证明；重复 wait 只读取同一份保留摘要，不重算、不重新持久化、不增加计数 | 只能看到 `telemetry_status=degraded`，无法知道哪条关联受损、原因、影响维度与次数；unknown-impact 异常可能完全不可见 |
+| `diagnostics_truncated` | boolean | 为 true 表示摘要达到上限，超出条目折叠进 `summary_limit` 记录 | 易把有界摘要当作完整异常历史 |
+| `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠；与 `diagnostics` 独立，degraded 不保证一定有条目 | “没有观测”容易被误判为“没有活动” |
 
 计数不能证明产生了有效任务进展。逐工具调用参数、reasoning 尾部与覆盖率缺口不在 wait 中传输：需要这些深度诊断时调用 observe（见 §7）。
 

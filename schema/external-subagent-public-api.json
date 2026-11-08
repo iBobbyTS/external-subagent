@@ -390,7 +390,7 @@
     },
     "wait": {
       "type": "object",
-      "description": "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..299 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. activity.model_activity is present only when the native source provided a model-activity fact: it carries that native phase (started/completed/failed/retry_scheduled/stream_stalled) and any native retry detail; no wait age or attempt count is invented, and a retry wait is not a degraded task. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
+      "description": "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..299 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. activity.model_activity is present only when the native source provided a model-activity fact: it carries that native phase (started/completed/failed/retry_scheduled/stream_stalled) and any native retry detail; no wait age or attempt count is invented, and a retry wait is not a degraded task. activity.diagnostics is a bounded summary (at most 32 entries) of deduplicated anomalous native inputs: source protocol, closed disposition reason, affected dimensions (known or unknown scope), safe discriminator, occurrence count, and last-observed epoch milliseconds; activity.diagnostics_truncated marks entries folded into a summary_limit record. An empty list means no known anomaly, not that observation is complete; repeated waits neither recompute nor increment counts. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
       "required": [
         "agent_id"
       ],
@@ -814,6 +814,90 @@
           ]
         }
       }
+    },
+    "activity_diagnostic_projection": {
+      "type": "object",
+      "description": "One bounded, already-sanitized diagnostic summary entry from the retained common state. `reason` is the closed disposition vocabulary (unknown_semantics, malformed, truncated, dropped, permission_denied, auxiliary_terminal, retention_limit, summary_limit); `discriminator` is a safe native method/type token, never a payload. `count` counts deduplicated native inputs, not derived facts or wait repetitions.",
+      "required": [
+        "source",
+        "reason",
+        "impact",
+        "discriminator",
+        "count",
+        "last_observed_at"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "codex_app_server",
+            "zcode_session",
+            "zcode_telemetry_v4",
+            "dsh_acp_v1",
+            "agy_stream_json",
+            "runtime"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "impact": {
+          "description": "known lists the affected coverage dimensions; unknown asserts uncertainty rather than loss in any specific dimension.",
+          "oneOf": [
+            {
+              "type": "object",
+              "required": [
+                "scope"
+              ],
+              "properties": {
+                "scope": {
+                  "const": "unknown"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": [
+                "scope",
+                "dimensions"
+              ],
+              "properties": {
+                "scope": {
+                  "const": "known"
+                },
+                "dimensions": {
+                  "type": "array",
+                  "items": {
+                    "enum": [
+                      "text",
+                      "tools",
+                      "public_reasoning",
+                      "model_activity",
+                      "input",
+                      "turn"
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "discriminator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "last_observed_at": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": false

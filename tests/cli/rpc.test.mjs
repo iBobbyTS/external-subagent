@@ -57,7 +57,7 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
           kind: 'task_wait',
           task: { agent_id: '10000001', status: 'running' },
           pending_requests: [{ request_id: 'read-1', kind: 'permission', tool_name: 'Read', operation: 'read', summary: 'target input.txt' }],
-          activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'healthy' },
+          activity: { latest_text_tail: '', latest_text_truncated: false, tool_calls_last_60s: 0, telemetry_status: 'degraded', diagnostics: [{ source: 'zcode_session', reason: 'malformed', impact: { scope: 'known', dimensions: ['tools'] }, discriminator: 'tool.updated', count: 1, last_observed_at: 1700000000123 }], diagnostics_truncated: false },
           result: null,
           timed_out: false,
         },
@@ -72,6 +72,9 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
     assert.equal(result.result, null);
     assert.equal(result.pending_requests[0].tool_name, 'Read');
     assert.equal(Object.hasOwn(result.activity, 'latest_reasoning'), false);
+    assert.equal(result.activity.telemetry_status, 'degraded');
+    assert.deepEqual(result.activity.diagnostics, [{ source: 'zcode_session', reason: 'malformed', impact: { scope: 'known', dimensions: ['tools'] }, discriminator: 'tool.updated', count: 1, last_observed_at: 1700000000123 }]);
+    assert.equal(result.activity.diagnostics_truncated, false);
     assert.equal(result.timed_out, false);
     assert.equal(result.kind, undefined);
   }
@@ -80,9 +83,9 @@ test('CLI sends daemon RPC and preserves success result', { skip: win32Sockets }
 
 test('CLI preserves daemon error code, message, and active agent id', { skip: win32Sockets }, async () => {
   const socketPath = path.join(os.tmpdir(), `zcode-cli-rpc-error-${process.pid}-${Date.now()}.sock`);
-  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002, native_error: { truncated: false, total_bytes: 42, limit_bytes: 262144, original: { message: 'native original', code: 'rate_limit' } } } }) + '\n'); }); });
+  const server = net.createServer((socket) => { socket.once('data', (chunk) => { const request = JSON.parse(chunk); socket.end(JSON.stringify({ request_id: request.request_id, outcome: 'error', error: { code: 'not_found', message: 'task was not found', active_agent_id: 10000002, native_error: { truncated: false, total_bytes: 42, limit_bytes: 1048576, original: { message: 'native original', code: 'rate_limit' } } } }) + '\n'); }); });
   await new Promise((resolve) => server.listen(socketPath, resolve));
-  try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000002 }), (error) => error instanceof CliError && error.code === 'not_found' && error.agentId === 10000002 && error.nativeError?.original?.message === 'native original' && error.nativeError?.limit_bytes === 262144); }
+  try { await assert.rejects(() => callDaemon(socketPath, 'result', { agent_id: 10000002 }), (error) => error instanceof CliError && error.code === 'not_found' && error.agentId === 10000002 && error.nativeError?.original?.message === 'native original' && error.nativeError?.limit_bytes === 1048576); }
   finally { await new Promise((resolve) => server.close(resolve)); }
 });
 

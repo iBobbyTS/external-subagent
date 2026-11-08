@@ -85,7 +85,8 @@ native stdout / RPC frame / telemetry
   保持未知，不伪造成“零工具”或“健康”。
 - 有界诊断摘要（≤32 条，含溢出聚合）记录受影响维度、处置原因、去重后的原生输入
   次数、最近发生时间与安全 discriminator。原始 payload、正文、参数、自由文本错误
-  与凭据不进入摘要。
+  与凭据不进入摘要。wait 通过 `activity.diagnostics` 读取同一份保留摘要及其
+  `diagnostics_truncated` 标志；查询只读快照，不重算、不重新持久化、不增加计数。
 - 历史完整性与当前状态分开表达：turn 权威结算收敛当前关联，但不补造历史缺口；
   跨 turn/claim 的有效摘要保留；daemon 重启不回放持久记录重建内存摘要。
 
@@ -99,6 +100,8 @@ native stdout / RPC frame / telemetry
 | wait `activity.model_activity` | 省略或对象 | 仅当 native 来源确实提供模型活动事实；携带 `request_id`（可选）、原生 `phase`（`started/completed/failed/retry_scheduled/stream_stalled`）与已提供的 `retry` 详情。不生成等待时间或尝试数；重试等待不是降级，也不触发 ES 自动重试。并发请求时该字段表示**最近一条**原生模型事实（带自己的 request_id），整体活跃度仍由 `model_request_active` 聚合表达；它不宣称其他请求不存在。 |
 | observe `tools[].recent_calls[].status` | 枚举 | `unknown`=无原生 phase 证据；`pending/running`=执行中；`finished`=已结束但无成功/失败证据；`succeeded` 仅来自原生明确事实；`failed/cancelled` 按原生终态。 |
 | observe `reasoning.source` | 省略或对象 | 实际观察到公开推理时为 `{protocol, channel}`（如 `zcode_session/summary`、`dsh_acp_v1/thought`）；从未观察到公开推理时整个 `reasoning` 为 `null`。不再按 adapter 名称固定能力，也不使用已退役的 wire 指针词汇。 |
+| wait `activity.diagnostics` | array | 共同状态保留的有界、去重、已脱敏异常摘要：来源协议、受控处置原因、影响维度（`known` 列表或 `unknown` 范围）、安全 discriminator、去重后的原生输入次数与最近观察时间（epoch 毫秒）。空数组表示没有已知异常，不是完整性证明；`telemetry_status=degraded` 与摘要相互独立，不强制存在条目。 |
+| wait `activity.diagnostics_truncated` | boolean | 为 true 表示有界摘要把超出上限的条目折叠进 `summary_limit` 记录。 |
 | observe `coverage.*` | boolean/integer | 按实际能力与缺口生成；`dropped_events` 只统计已知丢弃，0 不证明完整。 |
 | `error.native_error` | 省略或对象 | 见 §3；只在完整脱敏原件仍可用时出现。 |
 

@@ -41,7 +41,7 @@ pub use types::{
     MAX_RESULT_CHUNK_BYTES, MAX_WAIT, MAX_WAIT_AGENTS, MCP_VERSION, RPC_TRANSPORT_SUPPORTED,
 };
 pub use views::{
-    running_component_identity, AgentCapabilitiesView, AgentEffortSelectionCapabilityView,
+    running_component_identity, ActivityDiagnosticView, AgentCapabilitiesView, AgentEffortSelectionCapabilityView,
     AgentEffortSelectionModeView, AgentModelSelectionCapabilityView, AgentModelSelectionModeView,
     AgentModelsStatusView, AgentPermissionModeView, AgentScopeStatusView, AgentStatusView,
     AgentTransportSupportView, AgentTransportView, ArtifactIdentityView, CapabilityMaturityView,

@@ -7117,8 +7117,158 @@ mod observation_persistence_tests {
         let RpcSuccess::TaskWait(view) = service.dispatch(RpcMethod::TaskWait(TaskWaitQuery { agent_id: WaitTarget::One(fixture.id.clone()),
             wait_time: 0, message_id: None, wait_mode: WaitMode::All })).unwrap() else { panic!("wait view") };
         assert_eq!(view.activity.telemetry_status, crate::rpc::TelemetryStatusView::Unavailable);
+        // A restart replays no persisted reason into an in-memory summary; the
+        // bounded diagnostics fields are honestly empty.
+        assert!(view.activity.diagnostics.is_empty());
+        assert!(!view.activity.diagnostics_truncated);
         assert_eq!(fixture.reason_rows(), reasons);
         assert_eq!(fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq, seq);
+    }
+
+    #[test]
+    fn real_adapter_malformed_tool_start_is_explained_in_repeated_wait_activity() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope();
+        let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let mut send = |params: serde_json::Value| {
+            let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"params": params}),
+            });
+            let batch = adapter.decode(&inbound).unwrap();
+            fixture.publisher.emit_typed(batch.clone());
+            batch
+        };
+        send(serde_json::json!({"type":"turn.started","turnId":"turn"}));
+        let malformed = send(serde_json::json!({
+            "type":"tool.updated","turnId":"turn","eventId":"bad-tool",
+            "payload":{"kind":"started"}
+        }));
+        assert!(matches!(malformed.disposition(), DecodeDisposition::InvalidLost(_)));
+        let scheduler = fixture.scheduler();
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let mut previous = None;
+        for _ in 0..3 {
+            let RpcSuccess::TaskWait(view) = service
+                .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                    agent_id: WaitTarget::One(fixture.id.clone()),
+                    wait_time: 0,
+                    message_id: None,
+                    wait_mode: WaitMode::All,
+                }))
+                .unwrap()
+            else {
+                panic!("wait view");
+            };
+            // Degraded is only useful when the same response explains it.
+            assert_eq!(
+                view.activity.telemetry_status,
+                crate::rpc::TelemetryStatusView::Degraded
+            );
+            let entry = view
+                .activity
+                .diagnostics
+                .iter()
+                .find(|entry| entry.reason == "malformed")
+                .expect("wait must deliver the malformed tool-start summary");
+            assert_eq!(entry.source, SourceProtocol::ZcodeSession);
+            assert_eq!(entry.impact, Impact::Known(vec![CoverageDimension::Tools]));
+            assert_eq!(entry.discriminator, "tool.updated");
+            assert_eq!(entry.count, 1);
+            assert!(entry.last_observed_at > 0);
+            assert!(!view.activity.diagnostics_truncated);
+            // Repeated waits read the same retained summary: no recompute, no
+            // count inflation.
+            if let Some(previous) = &previous {
+                assert_eq!(&view.activity.diagnostics, previous);
+            }
+            previous = Some(view.activity.diagnostics.clone());
+        }
+        // List-mode wait builds each entry through the same projection, so it
+        // carries the identical bounded summary.
+        let RpcSuccess::TaskWaitMany { waits } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: WaitTarget::Many(vec![fixture.id.clone()]),
+                wait_time: 0,
+                message_id: None,
+                wait_mode: WaitMode::All,
+            }))
+            .unwrap()
+        else {
+            panic!("many wait view");
+        };
+        let (_, body) = waits.bodies.first().expect("one awaited agent");
+        assert_eq!(body.activity.diagnostics, previous.unwrap());
+        assert_eq!(body.activity.telemetry_status, crate::rpc::TelemetryStatusView::Degraded);
+        assert_eq!(
+            fixture
+                .state
+                .snapshot()
+                .diagnostics
+                .iter()
+                .map(|entry| entry.count)
+                .sum::<u64>(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_adapter_unknown_semantics_is_visible_without_claiming_a_dimension() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope();
+        let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let inbound = Inbound::Message(WireMessage::UnknownEvent {
+            method: "api_key.PRIVATE_CREDENTIAL".into(),
+            raw: serde_json::json!({"params":{"eventId":"unknown","turnId":"turn"}}),
+        });
+        let unknown = adapter.decode(&inbound).unwrap();
+        assert!(matches!(unknown.disposition(), DecodeDisposition::Unknown(_)));
+        fixture.publisher.emit_typed(unknown);
+        let scheduler = fixture.scheduler();
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let RpcSuccess::TaskWait(view) = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: WaitTarget::One(fixture.id.clone()),
+                wait_time: 0,
+                message_id: None,
+                wait_mode: WaitMode::All,
+            }))
+            .unwrap()
+        else {
+            panic!("wait view");
+        };
+        // Unknown semantics need not degrade telemetry, but must still be
+        // explainable through the bounded summary with unknown scope.
+        assert_ne!(
+            view.activity.telemetry_status,
+            crate::rpc::TelemetryStatusView::Degraded
+        );
+        let entry = view
+            .activity
+            .diagnostics
+            .iter()
+            .find(|entry| entry.reason == "unknown_semantics")
+            .expect("unknown semantics must stay diagnosable");
+        assert_eq!(entry.source, SourceProtocol::ZcodeSession);
+        assert_eq!(entry.impact, Impact::Unknown);
+        assert_eq!(entry.discriminator, "unrecognized");
+        assert_eq!(entry.count, 1);
+        let encoded = serde_json::to_string(&view.activity.diagnostics).unwrap();
+        assert!(!encoded.contains("PRIVATE") && encoded.len() < 2048);
     }
 
     #[test]

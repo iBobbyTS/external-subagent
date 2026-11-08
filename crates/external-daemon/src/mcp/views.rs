@@ -220,18 +220,25 @@ pub struct PublicReasoningSource {
     pub channel: PublicReasoningChannel,
 }
 
+impl From<external_contract::events::SourceProtocol> for PublicSourceProtocol {
+    fn from(value: external_contract::events::SourceProtocol) -> Self {
+        use external_contract::events::SourceProtocol;
+        match value {
+            SourceProtocol::CodexAppServer => Self::CodexAppServer,
+            SourceProtocol::ZcodeSession => Self::ZcodeSession,
+            SourceProtocol::ZcodeTelemetryV4 => Self::ZcodeTelemetryV4,
+            SourceProtocol::DshAcpV1 => Self::DshAcpV1,
+            SourceProtocol::AgyStreamJson => Self::AgyStreamJson,
+            SourceProtocol::Runtime => Self::Runtime,
+        }
+    }
+}
+
 impl From<crate::observation::PublicReasoningSource> for PublicReasoningSource {
     fn from(value: crate::observation::PublicReasoningSource) -> Self {
-        use external_contract::events::{PublicReasoningChannel as Channel, SourceProtocol};
+        use external_contract::events::PublicReasoningChannel as Channel;
         Self {
-            protocol: match value.protocol {
-                SourceProtocol::CodexAppServer => PublicSourceProtocol::CodexAppServer,
-                SourceProtocol::ZcodeSession => PublicSourceProtocol::ZcodeSession,
-                SourceProtocol::ZcodeTelemetryV4 => PublicSourceProtocol::ZcodeTelemetryV4,
-                SourceProtocol::DshAcpV1 => PublicSourceProtocol::DshAcpV1,
-                SourceProtocol::AgyStreamJson => PublicSourceProtocol::AgyStreamJson,
-                SourceProtocol::Runtime => PublicSourceProtocol::Runtime,
-            },
+            protocol: value.protocol.into(),
             channel: match value.channel {
                 Channel::Summary => PublicReasoningChannel::Summary,
                 Channel::Thought => PublicReasoningChannel::Thought,
@@ -764,6 +771,82 @@ impl From<crate::rpc::ModelActivityView> for PublicModelActivity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicCoverageDimension {
+    Text,
+    Tools,
+    PublicReasoning,
+    ModelActivity,
+    Input,
+    Turn,
+}
+
+/// A known affected dimension list, or an explicitly unknown scope. Unknown
+/// never asserts loss in any specific dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "scope", content = "dimensions", rename_all = "snake_case")]
+pub enum PublicDiagnosticImpact {
+    Unknown,
+    Known(Vec<PublicCoverageDimension>),
+}
+
+impl From<external_contract::events::Impact> for PublicDiagnosticImpact {
+    fn from(value: external_contract::events::Impact) -> Self {
+        use external_contract::events::{CoverageDimension, Impact};
+        match value {
+            Impact::Unknown => Self::Unknown,
+            Impact::Known(dimensions) => Self::Known(
+                dimensions
+                    .into_iter()
+                    .map(|dimension| match dimension {
+                        CoverageDimension::Text => PublicCoverageDimension::Text,
+                        CoverageDimension::Tools => PublicCoverageDimension::Tools,
+                        CoverageDimension::PublicReasoning => {
+                            PublicCoverageDimension::PublicReasoning
+                        }
+                        CoverageDimension::ModelActivity => {
+                            PublicCoverageDimension::ModelActivity
+                        }
+                        CoverageDimension::Input => PublicCoverageDimension::Input,
+                        CoverageDimension::Turn => PublicCoverageDimension::Turn,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One bounded, already-sanitized diagnostic summary entry. `reason` is the
+/// closed common-state disposition vocabulary, `discriminator` a safe native
+/// method/type token (never a payload), and `count` counts deduplicated native
+/// inputs rather than derived facts or query repetition.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicActivityDiagnostic {
+    pub source: PublicSourceProtocol,
+    pub reason: String,
+    pub impact: PublicDiagnosticImpact,
+    pub discriminator: String,
+    #[schemars(range(min = 1))]
+    pub count: u64,
+    /// Epoch milliseconds when this reason was last observed.
+    pub last_observed_at: u64,
+}
+
+impl From<crate::rpc::ActivityDiagnosticView> for PublicActivityDiagnostic {
+    fn from(value: crate::rpc::ActivityDiagnosticView) -> Self {
+        Self {
+            source: value.source.into(),
+            reason: value.reason,
+            impact: value.impact.into(),
+            discriminator: value.discriminator,
+            count: value.count,
+            last_observed_at: value.last_observed_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicActivity {
@@ -783,6 +866,16 @@ pub struct PublicActivity {
     /// Absent unless the native source provided a model-activity fact.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_activity: Option<PublicModelActivity>,
+    /// Bounded, deduplicated anomaly explanation behind `telemetry_status`.
+    /// Empty means no known anomaly, never that observation is complete.
+    /// Optional in the declared schema so a legacy daemon frame that predates
+    /// this field still validates; this daemon always serializes it.
+    #[serde(default)]
+    pub diagnostics: Vec<PublicActivityDiagnostic>,
+    /// True when entries beyond the bounded cap were folded into a
+    /// `summary_limit` record. Optional in the schema for legacy frames only.
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
     pub telemetry_status: PublicTelemetryStatus,
 }
 
@@ -797,6 +890,8 @@ impl From<TaskActivityView> for PublicActivity {
             last_activity_age_ms: value.last_activity_age_ms,
             model_request_active: value.model_request_active,
             model_activity: value.model_activity.map(Into::into),
+            diagnostics: value.diagnostics.into_iter().map(Into::into).collect(),
+            diagnostics_truncated: value.diagnostics_truncated,
             telemetry_status: match value.telemetry_status {
                 TelemetryStatusView::Healthy => PublicTelemetryStatus::Healthy,
                 TelemetryStatusView::Degraded => PublicTelemetryStatus::Degraded,
@@ -1268,6 +1363,94 @@ mod activity_projection_tests {
         }
         assert!(!required.contains(&serde_json::json!("model_activity")));
         assert!(schema["properties"].get("model_activity").is_some());
+        // The diagnostic summary is always present; empty means "no known
+        // anomaly", never "observation complete".
+        assert_eq!(value["diagnostics"], serde_json::json!([]));
+        assert_eq!(value["diagnostics_truncated"], false);
+        // The declared schema keeps both fields optional so a legacy daemon
+        // frame that predates them still validates; this daemon always emits
+        // them, as the serialized value above proves.
+        assert!(schema["properties"].get("diagnostics").is_some());
+        assert!(schema["properties"].get("diagnostics_truncated").is_some());
+        assert!(!required.contains(&serde_json::json!("diagnostics")));
+        assert!(!required.contains(&serde_json::json!("diagnostics_truncated")));
+    }
+
+    #[test]
+    fn public_activity_delivers_bounded_diagnostics_with_known_and_unknown_impact() {
+        let rpc = TaskActivityView {
+            latest_text_tail: String::new(),
+            latest_text_truncated: false,
+            tool_calls_last_60s: 0,
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
+            last_activity_age_ms: None,
+            model_request_active: false,
+            model_activity: None,
+            diagnostics: vec![
+                crate::rpc::ActivityDiagnosticView {
+                    source: external_contract::events::SourceProtocol::ZcodeSession,
+                    reason: "malformed".into(),
+                    impact: external_contract::events::Impact::Known(vec![
+                        external_contract::events::CoverageDimension::Tools,
+                    ]),
+                    discriminator: "tool.updated".into(),
+                    count: 2,
+                    last_observed_at: 1_700_000_000_123,
+                },
+                crate::rpc::ActivityDiagnosticView {
+                    source: external_contract::events::SourceProtocol::ZcodeSession,
+                    reason: "unknown_semantics".into(),
+                    impact: external_contract::events::Impact::Unknown,
+                    discriminator: "unrecognized".into(),
+                    count: 1,
+                    last_observed_at: 1_700_000_000_456,
+                },
+            ],
+            diagnostics_truncated: true,
+            telemetry_status: TelemetryStatusView::Degraded,
+        };
+        let value = serde_json::to_value(PublicActivity::from(rpc)).unwrap();
+        assert_eq!(value["telemetry_status"], "degraded");
+        assert_eq!(value["diagnostics"][0]["source"], "zcode_session");
+        assert_eq!(value["diagnostics"][0]["reason"], "malformed");
+        assert_eq!(
+            value["diagnostics"][0]["impact"],
+            serde_json::json!({"scope":"known","dimensions":["tools"]})
+        );
+        assert_eq!(value["diagnostics"][0]["discriminator"], "tool.updated");
+        assert_eq!(value["diagnostics"][0]["count"], 2);
+        assert_eq!(value["diagnostics"][0]["last_observed_at"], 1_700_000_000_123_i64);
+        // Unknown impact never claims a dimension.
+        assert_eq!(
+            value["diagnostics"][1]["impact"],
+            serde_json::json!({"scope":"unknown"})
+        );
+        assert_eq!(value["diagnostics_truncated"], true);
+        let schema = serde_json::to_value(schemars::schema_for!(PublicActivity)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&value), "{value}");
+
+        // A degraded state without retained entries stays visible as degraded
+        // with an empty summary; the projection fabricates nothing.
+        let rpc = TaskActivityView {
+            latest_text_tail: String::new(),
+            latest_text_truncated: false,
+            tool_calls_last_60s: 0,
+            in_flight_tool_count: 0,
+            oldest_in_flight_tool_age_ms: None,
+            last_activity_age_ms: None,
+            model_request_active: false,
+            model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
+            telemetry_status: TelemetryStatusView::Degraded,
+        };
+        let value = serde_json::to_value(PublicActivity::from(rpc)).unwrap();
+        assert_eq!(value["telemetry_status"], "degraded");
+        assert_eq!(value["diagnostics"], serde_json::json!([]));
+        assert_eq!(value["diagnostics_truncated"], false);
+        assert!(validator.is_valid(&value));
     }
 
     #[test]
@@ -1281,6 +1464,8 @@ mod activity_projection_tests {
             last_activity_age_ms: None,
             model_request_active: true,
             model_activity,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Healthy,
         };
         // No native model-activity fact: the key is absent, not a zeroed object.
@@ -1430,6 +1615,8 @@ mod wait_many_schema_tests {
                 last_activity_age_ms: None,
                 oldest_in_flight_tool_age_ms: None,
                 model_activity: None,
+                diagnostics: Vec::new(),
+                diagnostics_truncated: false,
                 telemetry_status: PublicTelemetryStatus::Unavailable,
             },
             result: None,

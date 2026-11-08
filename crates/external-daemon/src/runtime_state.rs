@@ -638,4 +638,56 @@ mod tests {
         assert_eq!(records[0].sequence(), 1);
         assert!(matches!(records[0], RuntimeEnvelope::Event { .. }));
     }
+
+    #[test]
+    fn capped_diagnostic_summary_projects_truncation_without_query_mutation() {
+        let runtime = RuntimeState::new();
+        for index in 0..40_u64 {
+            let mut normalized = event(EventFact::TurnStarted {
+                turn_id: TurnId::Local(1),
+            });
+            normalized.context.sequence = index + 1;
+            runtime.observe(&RuntimeEnvelope::Event {
+                event: normalized,
+                diagnostic: Some(crate::runtime_observation::InputDiagnostic {
+                    source: SourceProtocol::ZcodeSession,
+                    reason: DiagnosticReason::UnknownSemantics,
+                    impact: Impact::Unknown,
+                    discriminator: format!("token-{index}"),
+                    frame: None,
+                    lost: false,
+                }),
+            });
+        }
+        let snapshot = runtime.snapshot();
+        assert_eq!(
+            snapshot.diagnostics.len(),
+            crate::runtime_observation::MAX_DIAGNOSTICS
+        );
+        assert!(snapshot.diagnostics_truncated);
+        assert!(snapshot
+            .diagnostics
+            .iter()
+            .any(|entry| entry.reason == "summary_limit"));
+        let activity = crate::rpc::views::task_activity_view(
+            external_store::TaskPhase::Running,
+            Some(snapshot),
+        );
+        assert_eq!(
+            activity.diagnostics.len(),
+            crate::runtime_observation::MAX_DIAGNOSTICS
+        );
+        assert!(activity.diagnostics_truncated);
+        assert_eq!(
+            activity.diagnostics.last().unwrap().reason,
+            "summary_limit"
+        );
+        // Reading the view never mutates or re-derives the retained aggregate.
+        let again = crate::rpc::views::task_activity_view(
+            external_store::TaskPhase::Running,
+            Some(runtime.snapshot()),
+        );
+        assert_eq!(again.diagnostics, activity.diagnostics);
+        assert!(again.diagnostics_truncated);
+    }
 }

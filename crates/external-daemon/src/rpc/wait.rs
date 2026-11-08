@@ -2521,6 +2521,8 @@ pub(crate) mod wait_tests {
             last_activity_age_ms: None,
             model_request_active: false,
             model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

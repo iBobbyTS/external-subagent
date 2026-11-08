@@ -58,6 +58,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.match(schema.properties.wait.description, /in_flight_tool_count/u);
   assert.match(schema.properties.wait.description, /oldest_in_flight_tool_age_ms/u);
   assert.match(schema.properties.wait.description, /model_activity/u);
+  assert.match(schema.properties.wait.description, /diagnostics_truncated/u);
+  assert.match(schema.properties.wait.description, /summary_limit/u);
   assert.equal(schema.properties.wait.description.includes('last_tool_calls'), false);
   assert.equal(schema.properties.wait.description.includes('reasoning tail'), false);
   assert.equal(schema.properties.result.properties.offset.default, 0);
@@ -83,6 +85,17 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
     'agent_id', 'code', 'component', 'message', 'native_error', 'operation', 'prompt_count', 'request_id',
   ]);
   const nativeError = schema.properties.error_projection.properties.error.properties.native_error;
+  const diagnostic = schema.properties.activity_diagnostic_projection;
+  assert.deepEqual(diagnostic.required, [
+    'source', 'reason', 'impact', 'discriminator', 'count', 'last_observed_at',
+  ]);
+  assert.equal(diagnostic.additionalProperties, false);
+  assert.ok(diagnostic.properties.source.enum.includes('zcode_session'));
+  assert.deepEqual(diagnostic.properties.impact.oneOf[0].properties.scope.const, 'unknown');
+  assert.deepEqual(diagnostic.properties.impact.oneOf[1].properties.dimensions.items.enum, [
+    'text', 'tools', 'public_reasoning', 'model_activity', 'input', 'turn',
+  ]);
+  assert.equal(diagnostic.properties.count.minimum, 1);
   assert.deepEqual(nativeError.required, ['truncated', 'total_bytes', 'limit_bytes']);
   assert.equal(nativeError.additionalProperties, false);
   assert.ok(Object.hasOwn(nativeError.properties, 'original'));

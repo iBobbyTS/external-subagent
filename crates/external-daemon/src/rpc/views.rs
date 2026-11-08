@@ -380,6 +380,20 @@ impl From<crate::ModelActivityView> for ModelActivityView {
     }
 }
 
+/// One bounded, already-sanitized diagnostic summary entry from the common
+/// state. The reason vocabulary is closed upstream; `impact` distinguishes a
+/// known affected dimension from an unknown scope, and `discriminator` is a
+/// safe native method/type token, never a payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityDiagnosticView {
+    pub source: external_contract::events::SourceProtocol,
+    pub reason: String,
+    pub impact: external_contract::events::Impact,
+    pub discriminator: String,
+    pub count: u64,
+    pub last_observed_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskActivityView {
     pub latest_text_tail: String,
@@ -398,6 +412,15 @@ pub struct TaskActivityView {
     /// Absent unless the native source provided a model-activity fact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_activity: Option<ModelActivityView>,
+    /// Bounded, deduplicated anomaly summary from the common state. Empty means
+    /// no known anomaly (never a completeness claim); it is not recomputed by
+    /// this query.
+    #[serde(default)]
+    pub diagnostics: Vec<ActivityDiagnosticView>,
+    /// True when the bounded summary folded entries beyond its cap into the
+    /// `summary_limit` record.
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
     pub telemetry_status: TelemetryStatusView,
 }
 
@@ -680,6 +703,8 @@ pub(crate) fn task_activity_view(
             last_activity_age_ms: None,
             model_request_active: false,
             model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Unavailable,
         };
     };
@@ -692,6 +717,19 @@ pub(crate) fn task_activity_view(
         last_activity_age_ms: snapshot.last_activity_age_ms,
         model_request_active: snapshot.model_request_active,
         model_activity: snapshot.model_activity.map(Into::into),
+        diagnostics: snapshot
+            .diagnostics
+            .into_iter()
+            .map(|entry| ActivityDiagnosticView {
+                source: entry.source,
+                reason: entry.reason,
+                impact: entry.impact,
+                discriminator: entry.discriminator,
+                count: entry.count,
+                last_observed_at: entry.last_observed_at,
+            })
+            .collect(),
+        diagnostics_truncated: snapshot.diagnostics_truncated,
         telemetry_status: match snapshot.telemetry_status {
             crate::TelemetryStatus::Healthy => TelemetryStatusView::Healthy,
             crate::TelemetryStatus::Degraded => TelemetryStatusView::Degraded,
@@ -813,6 +851,67 @@ mod activity_projection_tests {
     }
 
     #[test]
+    fn activity_projection_delivers_the_bounded_diagnostic_summary_and_truncation_flag() {
+        // No snapshot: the summary is honestly empty, not a fabricated health
+        // claim, and the unavailable status is unchanged.
+        let missing = task_activity_view(TaskPhase::Queued, None);
+        assert!(missing.diagnostics.is_empty());
+        assert!(!missing.diagnostics_truncated);
+
+        let mut snapshot = snapshot();
+        snapshot.diagnostics = (0..32)
+            .map(|index| crate::runtime_observation::DiagnosticSummary {
+                source: external_contract::events::SourceProtocol::ZcodeSession,
+                reason: if index == 31 {
+                    "summary_limit".into()
+                } else if index % 2 == 0 {
+                    "malformed".into()
+                } else {
+                    "unknown_semantics".into()
+                },
+                impact: if index % 2 == 0 {
+                    external_contract::events::Impact::Known(vec![
+                        external_contract::events::CoverageDimension::Tools,
+                    ])
+                } else {
+                    external_contract::events::Impact::Unknown
+                },
+                discriminator: format!("token-{index}"),
+                count: index as u64 + 1,
+                last_observed_at: 1_700_000_000_000 + index as u64,
+            })
+            .collect();
+        snapshot.diagnostics_truncated = true;
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        assert_eq!(activity.diagnostics.len(), 32);
+        assert!(activity.diagnostics_truncated);
+        assert_eq!(activity.diagnostics[0].reason, "malformed");
+        assert_eq!(
+            activity.diagnostics[0].impact,
+            external_contract::events::Impact::Known(vec![
+                external_contract::events::CoverageDimension::Tools
+            ])
+        );
+        assert_eq!(activity.diagnostics[0].count, 1);
+        assert_eq!(activity.diagnostics[0].last_observed_at, 1_700_000_000_000);
+        assert_eq!(activity.diagnostics[1].impact, external_contract::events::Impact::Unknown);
+        assert_eq!(activity.diagnostics[31].reason, "summary_limit");
+        assert_eq!(activity.diagnostics[31].count, 32);
+    }
+
+    #[test]
+    fn degraded_without_a_summary_does_not_invent_an_entry() {
+        let mut snapshot = snapshot();
+        snapshot.telemetry_status = crate::TelemetryStatus::Degraded;
+        snapshot.diagnostics.clear();
+        snapshot.diagnostics_truncated = false;
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        assert_eq!(activity.telemetry_status, TelemetryStatusView::Degraded);
+        assert!(activity.diagnostics.is_empty());
+        assert!(!activity.diagnostics_truncated);
+    }
+
+    #[test]
     fn status_reports_the_observation_contract_defaults() {
         let observation = agent_capabilities().observation;
         assert!(observation.public_reasoning_default);
@@ -921,6 +1020,8 @@ mod result_paging_tests {
             last_activity_age_ms: None,
             model_request_active: false,
             model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }
