@@ -105,7 +105,7 @@ test('install stages the plugin tree and registers one inline dirs entry, preser
     assert.equal(server.command, zcodeMcpBinding(paths.zcodePlugin).command, 'the staged MCP command is the installing node, not the native facade (ZCode kills ad-hoc native binaries)');
     assert.deepEqual(server.args, [path.join(paths.zcodePlugin, 'scripts', 'mcp-stdio-bridge.mjs')], 'the staged MCP args run the node stdio bridge from the staged tree');
     assert.ok(fs.existsSync(server.args[0]), 'the pinned bridge script exists in the staged tree');
-    assert.equal(server.timeoutMs, 300000, 'the staged MCP entry pins timeoutMs=300000 because the zcode host default tool timeout is 30000ms, below the 299s wait ceiling');
+    assert.equal(server.timeoutMs, 610000, 'the staged MCP timeout covers the 600s wait ceiling and 5s transport margin');
     assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket, 'the staged MCP env pins the product daemon socket');
 
     const config = readConfig(paths);

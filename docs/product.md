@@ -115,7 +115,7 @@ marketplace/cache/安装记录状态；配置合并原子并保留全部无关�
 内置 `dsh` host 的安装入口是 `install-plugin dsh --profile <name>`：向
 `$DSH_HOME/profiles/<name>/cordis.patch.yml` 追加一个带哨兵的受管块（一条
 `@deepseek-ai/dsh-mcp-client` stdio 条目，指向 MCP facade 与 daemon socket，
-`toolCallTimeoutMs: 300000` 覆盖 dsh 默认 60s），并把 SKILL.md 装载到
+`toolCallTimeoutMs: 610000` 覆盖 dsh 默认 60s），并把 SKILL.md 装载到
 `$DSH_HOME/skills/external-subagent/`（dsh-skill-filesystem 默认扫描的 user
 root）。写入后以 `dsh --profile <name> --dump-config` 验证组合（stderr 的
 `patch: ... not found` 即 fail-closed），失败整体回滚。绑定声明持久化于 `$DATA/dsh-bindings.json`，reconcile 取注册表 ∪ 哨兵扫描

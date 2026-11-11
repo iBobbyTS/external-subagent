@@ -93,8 +93,8 @@ DSH 除作为 subagent 外也可作为 host 调用本产品。内置绑定命令
   哨兵注释的受管块，内容是一条 `@deepseek-ai/dsh-mcp-client` stdio 条目
   （固定 `id: mcp-external-subagent`、`serverName: external_subagent`，command
   为 native MCP facade 绝对路径，`EXTERNAL_SUBAGENT_SOCKET` 钉死 daemon
-  socket，`toolCallTimeoutMs: 300000` 覆盖 dsh 默认 60s ——
-  `external_subagent_wait` 上限 299s，与 zcode 绑定的 timeoutMs 同理）。
+  socket，`toolCallTimeoutMs: 610000` 覆盖 dsh 默认 60s ——
+  `external_subagent_wait` 上限 600s，另覆盖 facade 的 5s 传输余量，与 zcode 绑定的 timeoutMs 同理）。
   id 是 dsh 插件管理的前提：insert 行的 `id` 在 dsh 语法里可省，但省略时
   loader 每次启动生成随机 8 位 hex 且不落盘，dsh 自己的 plugin manager 会把
   该行标为 `unaddressable`（只读、无法开关）；钉死 id 后 GUI 插件页与本产品

@@ -517,7 +517,7 @@ impl RpcService {
                 if query.wait_time > MAX_WAIT.as_secs() {
                     return Err(RpcError::new(
                         RpcErrorCode::Validation,
-                        "wait_time must be between 0 and 299 seconds",
+                        "wait_time must be between 0 and 600 seconds",
                     ));
                 }
                 if let WaitTarget::Many(ids) = &query.agent_id {

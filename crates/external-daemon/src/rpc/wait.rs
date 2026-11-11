@@ -1501,8 +1501,8 @@ pub(crate) mod wait_tests {
         let parsed: TaskWaitQuery =
             serde_json::from_value(serde_json::json!({"agent_id":id})).unwrap();
         assert_eq!(parsed.wait_time, 290);
-        assert_eq!(agent_capabilities().max_wait_ms, 299000);
-        for value in [-1, 300] {
+        assert_eq!(agent_capabilities().max_wait_ms, 600000);
+        for value in [-1, 601] {
             let response = service.handle_bytes(
                 &serde_json::to_vec(&serde_json::json!({
                     "request_id":"limits","method":"task_wait",
@@ -1569,7 +1569,7 @@ pub(crate) mod wait_tests {
             result: Some(result),
             ..
         }) = service
-            .dispatch(RpcMethod::TaskWait(query(&id, 299)))
+            .dispatch(RpcMethod::TaskWait(query(&id, 600)))
             .unwrap()
         else {
             panic!("expected terminal wait response")

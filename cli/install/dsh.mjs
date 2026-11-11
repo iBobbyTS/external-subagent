@@ -53,11 +53,11 @@ export const ELECTRON_DSH_CLI = {
   darwin: '/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh',
   win32: `${process.env.LOCALAPPDATA || '~/AppData/Local/Programs'}\\DeepSeek Harness\\resources\\runtime\\cli\\bin\\dsh.cmd`,
 };
-// `external_subagent_wait` defaults to 290s with a 299s ceiling; dsh's
+// `external_subagent_wait` defaults to 290s with a 600s ceiling; dsh's
 // mcp-client caps tool calls at 60s unless overridden, which would cut
-// every long wait.  300000ms covers the ceiling with margin (the same
+// every long wait.  610000ms also covers the facade's 5s transport margin (the same
 // posture as the zcode binding's timeoutMs).
-const MCP_TOOL_CALL_TIMEOUT_MS = 300000;
+const MCP_TOOL_CALL_TIMEOUT_MS = 610000;
 // The sentinel comment marking the managed block.  ASCII-only on purpose:
 // the patch file is user-facing YAML and must survive any editor.
 const SENTINEL = '# @managed-by: external-subagent (install-plugin dsh) — this block is rewritten by the product; keep manual edits outside it';

@@ -118,9 +118,12 @@ The launchd/GUI and systemd user-manager environments do not inherit the
 interactive shell PATH, so every managed entry is absolute: the service
 definition pins the daemon binary, and the staged plugin `.mcp.json` pins the
 MCP facade inside the installed package. That staged `.mcp.json` also sets
-`timeoutMs: 300000` on the zcode-side server entry, because the zcode host
-caps MCP tool calls at a default 30000ms — below the product's 299s
-`external_subagent_wait` ceiling. The daemon itself runs with a
+`timeoutMs: 610000` on the zcode-side server entry, because the zcode host
+caps MCP tool calls at a default 30000ms — below the product's 600s
+`external_subagent_wait` ceiling plus the facade's 5s transport margin. Codex
+plugin and direct MCP bindings set `tool_timeout_sec: 610`; the DSH binding
+sets `toolCallTimeoutMs: 610000`. Custom hosts need an equivalent call budget.
+The daemon itself runs with a
 platform-owned PATH. On macOS it is the fixed
 `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`. On Linux it is
 the fixed system-tool set

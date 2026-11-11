@@ -431,7 +431,7 @@ impl SystemStatusOutput {
 /// Fixed advisory guidance in every spawn output: the task exists now, so
 /// the caller's next tool is wait.
 pub(crate) const SPAWN_INSTRUCTION: &str =
-    "Use mcp__external_subagent.wait tool to wait for a response";
+    "Use external_subagent_wait to wait for the response; do not schedule automatic wake-up and end the turn instead.";
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]

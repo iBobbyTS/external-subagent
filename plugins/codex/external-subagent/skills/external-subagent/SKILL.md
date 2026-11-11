@@ -5,85 +5,43 @@ description: Manage bounded repository-scoped tasks through external-subagent.
 
 # external-subagent
 
-Use the `external_subagent_*` tools to inspect status, spawn with a named `profile`
-or explicit `subagent`, wait for progress, retrieve the complete result, and close
-the task. A profile supplies the runtime settings; do not also pass its settings
-as spawn overrides.
-Execution targets are `zcode`, `dsh`, `codex`, and `agy`; each name currently has one
-runtime instance and no instance selector is supported. Without a profile, omitting `subagent` uses
-`default_subagent` or returns `subagent_required`; unknown targets return
-`subagent_unknown`, and unknown spawn fields are rejected before dispatch.
+Spawn with an absolute `repository`, a complete bounded `prompt` and a named
+`profile` or explicit runtime settings. A profile supplies subagent, permissions,
+model, effort and developer instructions; do not also pass these as overrides.
+Use the tool parameter descriptions for target-specific values. Status exposes
+runtime readiness when a capability needs checking; it is not a mandatory preflight.
 
-Spawn is intentionally non-idempotent: every successful call creates a fresh task
-and returns `{agent_id, status}`; it never reuses an existing task.
-`status` carries only routing,
-capability, and readiness facts (`subagents[]` with `configured`, `enabled`,
-`spawn_supported`, permission modes, model selection, and per-scope states);
-deployment identity, config revisions, adapter transport detail, and probe
-evidence are operator diagnostics — read them with the CLI `diagnose` command
-instead of the MCP status tool.
+Every successful spawn creates a new task and returns `agent_id`, `session_id`
+and `status`. Preserve these actual identities. If the response fails, read the
+complete error and any returned identity before deciding on another launch. Use
+`list` with the required `repository` when locating existing tasks; never guess IDs.
 
-For task progress, use `wait` with `agent_id` (one number or an array). Use
-`wait_mode: "any"` for rolling replacement, omitting already-terminal IDs from
-the next wait; the default `"all"` waits for the whole batch. Read the complete
-output, including failure details, before taking the next action. `result: null`
-means no final result yet. Only `outcome: "COMPLETED"` is successful; consume
-`final_text` and follow `next_offset` until null. On failure, inspect
-`failure_message` and the complete `final_text` before choosing continuation,
-retry, or user input. For native turn failures, `final_text` carries the original
-error as JSON with credentials redacted; `failure_message` is bounded ES diagnostics. A quota
-or authentication failure needs the blocking condition resolved before retry.
-Use `send` to continue a recoverable task rather than automatically spawning
-another one; keep its assignment and any caller-owned retry count across calls.
-When listing tasks, provide `repository`, not a `scope` field.
+Use `wait` in the current turn until the assignment completes or needs an answer;
+do not schedule automatic wake-up and end the turn instead. `wait_time` is 0..600
+seconds (default 290). Scalar `agent_id` returns one wait body; an array of 1..16
+IDs returns a flat map keyed by ID. `wait_mode: "all"` waits for the batch;
+`"any"` supports rolling replacement. Remove completed IDs from later waits.
 
-Spawn accepts an optional `effort` token that steers the task's reasoning
-effort. Omit it to keep each agent's current default (codex and agy keep their
-existing wire default; zcode and dsh send no effort field or call at all).
-`codex` admits only the closed set
-`low | medium | high | xhigh | max` — `minimal` and `ultra` are rejected;
-`agy` admits only the measured closed set `low | medium | high | max`;
-`zcode` and `dsh` accept any bounded token (1..24 bytes of `[a-z0-9_]`) and
-pass it through to the runtime, because the supported set is only known at
-runtime. A malformed or unsupported token is rejected before dispatch, so no
-task is created. Example: spawn with
-`{"subagent": "zcode", "model": "provider/model", "repository": "/absolute/path", "prompt": "...", "effort": "high"}`.
+Read the entire response. `result: null` means no final result yet;
+`timed_out` describes the wait deadline, not task failure. A wait already
+containing a result does not need another call to confirm completion. Consume
+its `final_text`; call `result` with `next_offset` only for remaining pages
+(or for a deliberate reread). Only `outcome: "COMPLETED"` is successful.
+On native turn failure, `final_text` contains the original error as JSON with
+credentials redacted; `failure_message` contains bounded ES diagnostics.
+Resolve persistent quota/authentication failures before retrying. Handle the
+full pending question or permission request before waiting again. Cancelling a
+wait does not cancel the task.
 
-The caller is a `host`. Any unregistered local MCP client can act as `custom` and
-call status or spawn without a host record or Codex home. Built-in `host.codex`
-exists for installation and automatic-upgrade coordination, supports multiple
-Codex home instances, and offers plugin or direct MCP bindings; built-in
-`host.zcode` binds this same plugin through the ZCode config's inline plugin
-dirs with a single per-user instance. This is separate
-from `subagent.codex`. Protocol implementations are adapters.
+Use `send` for a bounded follow-up to the actual actor. `queue` does not interrupt
+and may wait for the current turn to end. For an urgent correction use supported
+`steer` (codex/zcode), or cancel and collect termination before deciding on a
+replacement. `delivered` means receipt, not completion. Keep the returned
+`message_id` and use scalar wait to collect the receipt and result. Terminal
+continuation uses resume where supported; dsh returns
+`TERMINAL_SEND_UNSUPPORTED`. Preserve the assignment and caller-owned retry
+count across continuations.
 
-All four subagents (`zcode`, `dsh`, `codex`, `agy`) are disabled by default; enable one
-with `external-subagent agents enable <name>`, which runs a local probe and writes
-the configuration only on success (a daemon restart is required for `dsh`/`codex`/`agy`).
-Actual per-subagent limitations (from the accepted code):
-
-- `zcode` — disabled until explicitly enabled; all four permission modes
-  (build/edit/plan/yolo); spawn requires an explicit `{provider}/{model}`
-  token from the spawn request or a named profile. A bare token and an
-  omitted model are rejected at admission, and `agents.zcode.default_model`
-  is rejected with `model_selection_unsupported`.
-- `dsh` — disabled until explicitly enabled and configured
-  (`runtime_path`/`home`/`profile`/`version`); admits only `build` and strict
-  `plan`.
-- `codex` — disabled until explicitly enabled; all four permission modes:
-  `build`/`edit` map to sandbox=workspace-write, `plan` to sandbox=read-only,
-  and `yolo` to sandbox=danger-full-access, all pinning approvalPolicy=never.
-  A non-empty spawn `write_manifest` is rejected before task creation with
-  `codex_write_manifest_unsupported`.
-- `agy` (Google Antigravity) — disabled until explicitly enabled with an
-  absolute executable `AGY_RUNTIME_PATH`; only `build` (`--mode accept-edits`)
-  and `yolo` (`--dangerously-skip-permissions`) are admitted (plan/edit are
-  rejected with `agy_permission_mode_unsupported`); `model` is a bare slug
-  validated against the `agy models` catalog; a non-empty spawn
-  `write_manifest` is rejected before task creation with
-  `agy_write_manifest_unsupported`; there is no permission-respond interaction
-  (tools are soft-denied).
-- `observe` — available for all four subagents; `zcode` and `dsh` return the
-  public reasoning tail (at most 200 characters), while `codex` and `agy` do not
-  collect reasoning and return `reasoning: null`. Tool history and coverage are
-  reported truthfully per adapter capability.
+Use `observe` only to investigate suspected stalled or looping work. Activity
+and coverage are evidence of liveness, not acceptance. Close the task when its
+results are received and no further continuation is needed.

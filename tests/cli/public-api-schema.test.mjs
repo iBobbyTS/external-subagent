@@ -48,6 +48,7 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.equal(schema.properties.spawn.properties.developer_instructions.maxLength, 1048576);
   assert.equal(schema.properties.list.properties.limit.default, 100);
   assert.equal(schema.properties.wait.properties.wait_time.default, 290);
+  assert.equal(schema.properties.wait.properties.wait_time.maximum, 600);
   assert.equal(schema.properties.wait.properties.wait_mode.default, 'all');
   assert.deepEqual(schema.properties.wait.properties.wait_mode.enum, ['all', 'any']);
   assert.ok(schema.properties.list.required.includes('repository'));

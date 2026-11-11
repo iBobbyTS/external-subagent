@@ -180,6 +180,7 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   const mcp = JSON.parse(fs.readFileSync(path.join(staging, '.mcp.json'), 'utf8'));
   const server = mcp.mcpServers.external_subagent;
   assert.equal(server.command, nativeBinary('external-subagent-mcp'));
+  assert.equal(server.tool_timeout_sec, 610);
   assert.ok(path.isAbsolute(server.command), 'MCP entry must be an absolute stable path');
   assert.ok(!server.command.includes('~') && !server.command.includes('nvm'), 'MCP entry must not depend on user PATH fragments');
   assert.equal(server.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
@@ -203,6 +204,7 @@ test('managed plugin install stages a PATH-independent MCP binding via the offic
   assert.ok(result.cache.startsWith(path.join(home, '.codex')));
   const cacheMcp = JSON.parse(fs.readFileSync(path.join(result.cache, '.mcp.json'), 'utf8'));
   assert.equal(cacheMcp.mcpServers.external_subagent.command, nativeBinary('external-subagent-mcp'));
+  assert.equal(cacheMcp.mcpServers.external_subagent.tool_timeout_sec, 610);
   assert.equal(cacheMcp.mcpServers.external_subagent.env.EXTERNAL_SUBAGENT_SOCKET, paths.socket);
   fs.rmSync(home, { recursive: true, force: true });
 });
@@ -861,6 +863,7 @@ test('direct MCP TOML binding covers all ten tools and removes only its own sect
   assert.equal(CODEX_TOOLS.length, 10, 'the product exposes exactly ten MCP tools');
   for (const tool of CODEX_TOOLS) assert.ok(text.includes(`"${tool}"`), `enabled_tools must include ${tool}`);
   assert.ok(text.includes('external_subagent_observe'), 'observe must be advertised');
+  assert.match(text, /tool_timeout_sec = 610/u, 'host timeout covers the 600s wait and transport margin');
   assert.match(text, /\[mcp_servers\.user_owned\]/u, 'unrelated MCP servers must survive');
   assert.match(text, /command = "\/usr\/local\/bin\/keep"/u);
   const removed = installMcp(paths, { configPath: config, dryRun: false, uninstall: true, skipNativeProbe: true });

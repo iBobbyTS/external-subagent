@@ -32,7 +32,7 @@ pub const MAX_WAIT_AGENTS: usize = 16;
 /// worst-case JSON escaping (one input byte becoming a six-byte `\\u00XX`
 /// escape), the response envelope, and the trailing newline fit in one frame.
 pub const MAX_RESULT_CHUNK_BYTES: usize = 256 * 1024;
-pub const MAX_WAIT: Duration = Duration::from_secs(299);
+pub const MAX_WAIT: Duration = Duration::from_secs(600);
 pub const DEFAULT_WAIT_TIME: u64 = 290;
 pub const RPC_TRANSPORT_SUPPORTED: bool = cfg!(unix);
 

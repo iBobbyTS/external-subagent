@@ -206,7 +206,7 @@ dsh 的 `model` 契约：接受 `provider:model`，按字符串中**第一个** 
 | `agent_id` | integer | 保存后用于 wait/send/respond/result/cancel/close/observe | 无法可靠操作刚创建的任务 |
 | `status` | string | 获取会话建立后的单一生命周期状态（通常为 running，亦可为建立后已完成/失败/等待输入等状态，不再返回内部 queued/preparing 瞬态） | 必须额外查询才能知道会话建立后状态；属于便利信息 |
 | `session_id` | string/null | 获取已建立的目标 subagent 会话 ID | 无法直接识别已建立的底层会话标识 |
-| `instruction` | string | 固定的下一步提示（`Use mcp__external_subagent.wait tool to wait for a response`）：任务已建立，下一步用 wait 等待响应 | 客户端需自行知道下一步应等待；纯提示字段，可从契约推导 |
+| `instruction` | string | 固定的下一步提示：任务已建立，使用 wait 等待响应；不得设置自动唤醒后结束回合来替代等待 | 客户端需自行知道下一步应等待；纯提示字段，可从契约推导 |
 
 spawn 是有意非幂等的：每次成功提交都是新建任务（agent id 冲突或活动 workspace 冲突返回 `conflict` 错误，而不是复用已有任务），因此不再输出提交 disposition 字段。曾经存在的 `submission_disposition`（`created / existing`）的 `existing` 分支没有生产者，已随死表面一并移除。
 
@@ -224,7 +224,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 |---|---|---|---|
 | `agent_id` | integer 或 integer[]（1–16 个）；必填 | 选择要等待的持久任务；数组形态一次等待多个 subagent（组合等待），推荐并行模式：先逐个 spawn，全部 spawn 完成后再调用一次 `wait([id...])` | 缺少报错；无目标无法等待 |
 | `wait_mode` | `all` / `any`；默认 `all` | `all` 等整批；`any` 在任一任务终态时返回，用于滚动补位；标量输入两者行为相同 | 保持原有整批等待 |
-| `wait_time` | integer，0–299 秒；默认 290 | 适配调用方超时预算；0 用于立即取快照 | 省略仍可能等 290 秒；移除后客户端不能调整等待预算 |
+| `wait_time` | integer，0–600 秒；默认 290 | 适配调用方超时预算；0 用于立即取快照 | 省略仍可能等 290 秒；移除后客户端不能调整等待预算 |
 | `message_id` | string/null；默认无 | 需要一起查看某条 send 消息回执时使用；**仅标量 agent_id 支持**（列表形态同时给出则整体校验拒绝） | 省略不请求该回执；移除后失去按消息关联反馈的入口 |
 
 数组形态按 `wait_mode` 等待全部或任一已知 agent 终态；任一 agent 出现可响应 pending（permission/user_input）时，两种模式都提前返回。共享同一个 `wait_time` deadline。`any` 因终态提前唤醒时返回所有目标的快照，仍运行的项不标记超时；已终态 ID 会立即唤醒，后续等待应移除它们。未知 ID 不构成终态唤醒。数组上限 16 个 id；空数组、元素非 8 位数字、超上限、列表同时携带 `message_id` 均整体校验拒绝。宽容处理集中在返回对象的单一 `error` 键：输入中重复出现的 id 标记 `duplicated`（该 id 本身仍照常等待并返回 wait 内容），格式合法但不存在的 id 标记 `unknown_agent`（不占用等待）；其余 id 不被错误 id 阻塞。
@@ -325,7 +325,7 @@ zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道，
 
 ## 9. external_subagent_send
 
-发送补充指令，必须指定 `mode: "queue" | "steer"`。旧调用缺少 mode 或值非法均以 `validation` 拒绝，MCP 与 CLI 输入一致。终态任务默认经现有 resume 路径接续（codex `thread/resume`、zcode `session/resume`、agy `--conversation`；dsh 无 ACP 会话重入，保持 `TERMINAL_SEND_UNSUPPORTED` 干净拒绝）；保存请求的 mode，queue/steer 的恢复动作相同（agy 的 steer 仍按适配层返回 `steer_unsupported`）。新接入的 subagent 默认进入接续集合，其 owner 未实现 resume 合同的必须加入 scheduler 的显式排除集。
+发送补充指令，必须指定 `mode: "queue" | "steer"`。 `queue` 可能等当前轮结束才投递，不是立即替换任务；紧急纠正使用受支持的 `steer`，或取消并确认终止后再决定是否替换。旧调用缺少 mode 或值非法均以 `validation` 拒绝，MCP 与 CLI 输入一致。终态任务默认经现有 resume 路径接续（codex `thread/resume`、zcode `session/resume`、agy `--conversation`；dsh 无 ACP 会话重入，保持 `TERMINAL_SEND_UNSUPPORTED` 干净拒绝）；保存请求的 mode，queue/steer 的恢复动作相同（agy 的 steer 仍按适配层返回 `steer_unsupported`）。新接入的 subagent 默认进入接续集合，其 owner 未实现 resume 合同的必须加入 scheduler 的显式排除集。
 
 | 输入参数 | 类型／要求 | 什么时候用、为什么有 | 省略行为／移除影响 |
 |---|---|---|---|

@@ -30,8 +30,8 @@ function taskId(value) {
 function daemonTaskId(value) { return String(taskId(value)); }
 
 export function waitTransportTimeoutMs(waitTime = 290) {
-  if (!Number.isInteger(waitTime) || waitTime < 0 || waitTime > 299) {
-    throw new CliError('INVALID_ARGUMENT', 'wait_time must be an integer between 0 and 299', 2);
+  if (!Number.isInteger(waitTime) || waitTime < 0 || waitTime > 600) {
+    throw new CliError('INVALID_ARGUMENT', 'wait_time must be an integer between 0 and 600', 2);
   }
   return waitTime * 1000 + 5000;
 }

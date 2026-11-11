@@ -309,7 +309,7 @@ export function uninstallPlugin(paths, options = {}) {
 function codexMcpConfig(paths) {
   const command = nativeBinary(MCP_BIN_NAME);
   const tools = CODEX_TOOLS.map((tool) => `  "${tool}",`).join('\n');
-  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 304\nenabled_tools = [\n${tools}\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nEXTERNAL_SUBAGENT_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
+  return `[${CODEX_MCP_SECTION}]\ncommand = ${JSON.stringify(command)}\nenabled = true\nrequired = true\nstartup_timeout_sec = 10\ntool_timeout_sec = 610\nenabled_tools = [\n${tools}\n]\ndefault_tools_approval_mode = "prompt"\n\n[${CODEX_MCP_SECTION}.env]\nEXTERNAL_SUBAGENT_SOCKET = ${JSON.stringify(paths.socket)}\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_status]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_list]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_wait]\napproval_mode = "auto"\n\n[${CODEX_MCP_SECTION}.tools.external_subagent_result]\napproval_mode = "auto"\n`;
 }
 
 function removeTomlSection(text, section) {

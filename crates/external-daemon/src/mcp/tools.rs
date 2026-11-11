@@ -385,7 +385,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_spawn",
     output_schema = tool_output_schema::<AgentSpawnOutput>(),
-    description = "Start one durable subagent in an absolute repository workspace, returning after establishing the new session. Use profile to load reusable preset configurations (subagent, permission_mode, model, effort, developer_instructions) from global profiles; when profile is set, subagent, permission_mode, model, effort, and developer_instructions cannot be specified. developer_instructions (also settable per-spawn) routes to the codex-native developerInstructions channel on thread/start and is spliced as a Developer Instructions prefix block for every other subagent. Specify subagent unless default_subagent is configured. ZCode requires an explicit provider/model token from the spawn request or a named profile; a bare token, an omitted model, and agents.zcode.default_model are rejected at admission. dsh spawns when its enabled + spawn_supported + profile=acp + absolute executable runtime_path configuration admits it (the runtime version is advisory only: a difference never blocks a spawn and surfaces in status and failure instructions). A dsh model is provider:model, split at the first colon (the model side may contain further colons; empty sides are rejected before any task). permission_mode defaults to build. Codex supports build/edit (workspace-write), plan (read-only), and yolo (danger-full-access), always with approvalPolicy=never; codex rejects non-empty write_manifest before task creation (codex_write_manifest_unsupported). dsh admits a non-empty write_manifest in build through the guarded manifest-build composition (workspace-write sandbox, only tool-fs writable, out-of-manifest paths rejected by the write-guard as FS_WRITE_MANIFEST_DENIED), bounded to 256 entries and 64 KiB serialized; an explicit [\".\"] keeps the legacy build composition and plan still requires an empty manifest. agy spawns when its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable admit it; it supports build (--mode accept-edits) and yolo (--dangerously-skip-permissions) only, takes a bare model slug whose shape admission validates (the daemon does not check catalog membership; an unknown slug fails loudly at session start when the agy CLI rejects it), admits effort only from low/medium/high/max, and rejects any non-empty write_manifest (agy_write_manifest_unsupported); agy has no permission-respond interaction, so tools are soft-denied and denied actions surface on failure diagnostics. For other subagents an omitted write_manifest uses the protected workspace scope. The optional effort token (1..24 bytes of [a-z0-9_]) steers reasoning effort: codex admits only low, medium, high, xhigh or max, zcode and dsh pass a bounded token through to the runtime. The returned session_id identifies the established subagent session. Use wait with the returned agent_id for progress and terminal diagnostics.",
+    description = "Start one new durable subagent in an absolute repository with a complete bounded prompt. A successful call establishes a session and returns agent_id, session_id and status; it does not mean the assignment is finished. Use a named profile or explicit runtime settings, never both. Every successful spawn creates a new task. Read the complete response before continuing; preserve any returned actor identity on failure instead of blindly spawning again. Use external_subagent_wait with the actual agent_id to collect completion in this turn; do not replace waiting with automatic wake-up and ending the turn.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -449,7 +449,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_wait",
     output_schema = tool_output_schema::<AgentWaitAnyOutput>(),
-    description = "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..299 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
+    description = "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..600 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -497,8 +497,8 @@ impl SubagentMcp {
                 (WaitTarget::Many(internal), ids[0])
             }
         };
-        if input.wait_time > 299 {
-            return Err(validation_error("wait_time must be between 0 and 299")
+        if input.wait_time > crate::rpc::MAX_WAIT.as_secs() {
+            return Err(validation_error("wait_time must be between 0 and 600")
                 .with_operation("wait")
                 .with_agent_id(Some(
                     internal_task_id(context_id).unwrap_or_else(|_| context_id.to_string()),
@@ -626,7 +626,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_send",
     output_schema = tool_output_schema::<AgentSendOutput>(),
-    description = "发送有界消息，必须指定 mode：queue 优先原生非破坏投递，必要时由 es 暂存；steer 中断后启动新 turn（仅 codex/zcode 支持）。终态任务默认经 resume 接续（dsh 返回 TERMINAL_SEND_UNSUPPORTED）。省略 message_id 时 daemon 生成并返回有效 id",
+    description = "Send a bounded continuation or correction to the actual actor. Specify mode: queue delivers without interrupting and may wait until the current turn ends; it is not an immediate replacement. steer interrupts the current turn and starts the correction (codex/zcode only). For an urgent correction choose supported steer or cancel and await termination before deciding on replacement. A delivered receipt means runtime receipt, not completed work. Terminal tasks resume when supported; dsh returns TERMINAL_SEND_UNSUPPORTED. Omitted message_id is generated and returned; use it with scalar wait to collect its receipt and completion.",
     annotations(
         read_only_hint = false,
         destructive_hint = false,
@@ -878,8 +878,10 @@ mod contract_default_tests {
             assert_eq!(parsed.wait_mode == crate::rpc::WaitMode::Any, mode == "any");
         }
         assert!(!validator.is_valid(&serde_json::json!({"agent_id":10000001,"wait_mode":"invalid"})));
+        assert!(validator.is_valid(&serde_json::json!({"agent_id":10000001,"wait_time":600})));
+        assert!(!validator.is_valid(&serde_json::json!({"agent_id":10000001,"wait_time":601})));
         let packaged: serde_json::Value = serde_json::from_str(include_str!("../../../../schema/external-subagent-public-api.json")).unwrap();
-        for name in ["wait", "list", "result"] {
+        for name in ["spawn", "wait", "list", "result"] {
             let tool = tools.iter().find(|t| t.name == format!("external_subagent_{name}")).unwrap();
             assert_eq!(packaged["properties"][name]["description"].as_str(), tool.description.as_deref());
         }
@@ -1068,7 +1070,7 @@ mod contract_default_tests {
         let call = serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "external_subagent_wait", "arguments": {
-                "agent_id": public_task_id(&id).unwrap(), "wait_time": 299
+                "agent_id": public_task_id(&id).unwrap(), "wait_time": 600
             }}
         });
         writer
@@ -1111,7 +1113,7 @@ mod contract_default_tests {
         let facade = SubagentMcp::from_service(service);
         let waiting = tokio::spawn(async move {
             facade
-                .rpc_wait(crate::rpc::wait_tests::query(&id, 299), || false)
+                .rpc_wait(crate::rpc::wait_tests::query(&id, 600), || false)
                 .await
         });
         tokio::task::yield_now().await;
@@ -1159,7 +1161,7 @@ mod contract_default_tests {
         let call = serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": {"name": "external_subagent_wait", "arguments": {
-                "agent_id": public_task_id(&id).unwrap(), "wait_time": 299
+                "agent_id": public_task_id(&id).unwrap(), "wait_time": 600
             }}
         });
         writer
@@ -1665,7 +1667,7 @@ mod contract_default_tests {
             capabilities: AgentCapabilitiesView {
                 max_rpc_request_frame_bytes: 512 * 1024,
                 max_rpc_response_frame_bytes: 2 * 1024 * 1024,
-                max_wait_ms: 299000,
+                max_wait_ms: 600000,
                 maturity: BTreeMap::from([("spawn".into(), CapabilityMaturityView::BetaReady)]),
                 observation: ObservationCapabilityView {
                     public_reasoning_default: true,
@@ -1705,194 +1707,70 @@ mod contract_default_tests {
     }
 
     #[test]
-    fn spawn_description_states_the_config_gated_dsh_reality() {
-        let facade = SubagentMcp::new(
-            PathBuf::from("/tmp/spawn-desc.sock"),
-            Duration::from_secs(1),
-        );
-        let spawn = facade
-            .tool_router
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "external_subagent_spawn")
-            .unwrap();
+    fn spawn_description_explains_receipt_and_wait_without_operator_configuration() {
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/spawn-desc.sock"), Duration::from_secs(1));
+        let spawn = facade.tool_router.list_all().into_iter()
+            .find(|tool| tool.name == "external_subagent_spawn").unwrap();
         let description = spawn.description.as_deref().unwrap();
-        assert!(
-            !description.contains("remains unsupported"),
-            "stale pre-admission dsh claim still exposed to MCP consumers: {description}"
-        );
-        assert!(
-            description.contains("spawn_supported"),
-            "the configured dsh admission gate is not documented: {description}"
-        );
-        assert!(
-            !description.contains("pinned-runtime"),
-            "the removed version gate is still exposed to MCP consumers: {description}"
-        );
-        assert!(
-            description.contains("version is advisory only"),
-            "the advisory version semantics are not documented: {description}"
-        );
+        for fact in ["complete bounded prompt", "agent_id, session_id and status",
+            "does not mean the assignment is finished", "external_subagent_wait"] {
+            assert!(description.contains(fact), "missing caller handoff: {fact}");
+        }
+        for removed in ["remains unsupported", "pinned-runtime", "AGY_RUNTIME_PATH", "profile=acp"] {
+            assert!(!description.contains(removed), "operator detail or stale claim: {removed}");
+        }
     }
 
-    /// The spawn description must carry prose (the MCP contract is text), so
-    /// its factual admission claims are locked to the single policy table
-    /// rather than to a second hand-maintained copy. Every expected sentence
-    /// below is rebuilt from `AgentPolicy`: flipping one table fact (a mode, an
-    /// effort value, a manifest rule, a gate term, a model shape) changes the
-    /// expected sentence and turns this test red until the description is
-    /// updated with it.
+    // Backend values belong to the input fields where callers select them.
+    // Keep their factual claims tied to the actual policy, without requiring
+    // a second copy of every admission rule in the top-level description.
     #[test]
-    fn spawn_description_admission_claims_match_the_agent_policy_table() {
-        use crate::rpc::agent_policy::{
-            permission_mode_name, AgentKind, EffortPolicy, ModelShape, SpawnGate,
-            WriteManifestPolicy,
-        };
-        use external_core::{PermissionMode, MAX_WRITE_MANIFEST_BYTES, MAX_WRITE_MANIFEST_ENTRIES};
-
-        fn mode(
-            policy: &crate::rpc::agent_policy::AgentPolicy,
-            mode: PermissionMode,
-        ) -> &'static str {
-            assert!(
-                policy.permission_modes.contains(&mode),
-                "{} does not admit {mode:?} in the policy table",
-                policy.kind.name()
-            );
-            permission_mode_name(mode)
+    fn spawn_parameter_descriptions_match_the_agent_policy_table() {
+        use crate::rpc::agent_policy::{AgentKind, EffortPolicy, ModelShape, WriteManifestPolicy};
+        use external_core::{MAX_WRITE_MANIFEST_BYTES, MAX_WRITE_MANIFEST_ENTRIES};
+        let facade = SubagentMcp::new(PathBuf::from("/tmp/spawn-policy.sock"), Duration::from_secs(1));
+        let spawn = facade.tool_router.list_all().into_iter()
+            .find(|tool| tool.name == "external_subagent_spawn").unwrap();
+        let schema = serde_json::to_value(&spawn.input_schema).unwrap();
+        let description = |field: &str| schema["properties"][field]["description"]
+            .as_str().unwrap().split_whitespace().collect::<Vec<_>>().join(" ");
+        let effort = description("effort");
+        for (kind, label) in [(AgentKind::Codex, "Codex accepts"), (AgentKind::Agy, "agy")] {
+            let EffortPolicy::Closed(values) = kind.policy().effort else { panic!("expected closed efforts") };
+            assert!(effort.contains(&format!("{label} {}", values.join("/"))));
         }
-
-        fn oxford(items: &[&str]) -> String {
-            match items.split_last() {
-                None => String::new(),
-                Some((last, [])) => (*last).to_string(),
-                Some((last, init)) => format!("{} or {last}", init.join(", ")),
-            }
+        for kind in [AgentKind::Zcode, AgentKind::Dsh] {
+            assert!(matches!(kind.policy().effort, EffortPolicy::Passthrough));
         }
-
-        let facade = SubagentMcp::new(
-            PathBuf::from("/tmp/spawn-policy.sock"),
-            Duration::from_secs(1),
-        );
-        let spawn = facade
-            .tool_router
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "external_subagent_spawn")
-            .unwrap();
-        let description = spawn.description.as_deref().unwrap();
-
-        // Permission mode sets.
-        let codex = AgentKind::Codex.policy();
-        assert_eq!(
-            codex.permission_modes.len(),
-            4,
-            "the codex prose names exactly four modes"
-        );
-        assert!(description.contains(&format!(
-            "Codex supports {}/{} (workspace-write), {} (read-only), and {} (danger-full-access)",
-            mode(codex, PermissionMode::Build),
-            mode(codex, PermissionMode::Edit),
-            mode(codex, PermissionMode::Plan),
-            mode(codex, PermissionMode::Yolo),
-        )));
-        let agy = AgentKind::Agy.policy();
-        assert_eq!(
-            agy.permission_modes.len(),
-            2,
-            "the agy prose names exactly two modes"
-        );
-        assert!(description.contains(&format!(
-            "it supports {} (--mode accept-edits) and {} (--dangerously-skip-permissions) only",
-            mode(agy, PermissionMode::Build),
-            mode(agy, PermissionMode::Yolo),
-        )));
-
-        // Effort sets and passthrough rows.
-        let closed = |kind: AgentKind| match kind.policy().effort {
-            EffortPolicy::Closed(set) => set,
-            EffortPolicy::Passthrough => panic!("{} must be a closed-set row", kind.name()),
-        };
-        assert!(description.contains(&format!(
-            "codex admits only {}",
-            oxford(closed(AgentKind::Codex))
-        )));
-        assert!(description.contains(&format!(
-            "admits effort only from {}",
-            closed(AgentKind::Agy).join("/")
-        )));
-        let passthrough: Vec<&str> = AgentKind::ALL
-            .iter()
-            .filter(|kind| matches!(kind.policy().effort, EffortPolicy::Passthrough))
-            .map(|kind| kind.name())
-            .collect();
-        assert_eq!(passthrough, ["zcode", "dsh"]);
-        assert!(description.contains(&format!(
-            "{} pass a bounded token through to the runtime",
-            passthrough.join(" and ")
-        )));
-
-        // Write-manifest support.
-        assert!(matches!(
-            AgentKind::Dsh.policy().write_manifest,
-            WriteManifestPolicy::GuardedBuildComposition
-        ));
-        assert!(description.contains("dsh admits a non-empty write_manifest in build"));
-        assert!(description.contains(&format!(
-            "bounded to {MAX_WRITE_MANIFEST_ENTRIES} entries and {} KiB serialized",
-            MAX_WRITE_MANIFEST_BYTES / 1024
-        )));
+        assert!(effort.contains("zcode/dsh pass through"));
+        let modes = description("permission_mode");
+        for (kind, label) in [(AgentKind::Dsh, "dsh"), (AgentKind::Agy, "agy")] {
+            let names = kind.policy().permission_modes.iter()
+                .map(|mode| crate::rpc::agent_policy::permission_mode_name(*mode))
+                .collect::<Vec<_>>().join("/");
+            assert!(modes.contains(&format!("{label} supports {names}")));
+        }
+        assert_eq!(AgentKind::Codex.policy().permission_modes.len(), 4);
+        assert_eq!(AgentKind::Zcode.policy().permission_modes.len(), 4);
+        assert!(modes.contains("Codex build/edit use workspace-write, plan read-only"));
+        assert!(modes.contains("yolo danger-full-access"));
+        assert!(modes.contains("approvalPolicy=never"));
+        let manifest = description("write_manifest");
+        assert!(matches!(AgentKind::Dsh.policy().write_manifest, WriteManifestPolicy::GuardedBuildComposition));
+        assert!(manifest.contains(&format!("at most {MAX_WRITE_MANIFEST_ENTRIES} entries and {} KiB", MAX_WRITE_MANIFEST_BYTES / 1024)));
         for kind in [AgentKind::Codex, AgentKind::Agy] {
-            let marker = match kind.policy().write_manifest {
-                WriteManifestPolicy::Refused(message) => message.to_ascii_lowercase(),
-                other => panic!("{} must refuse write manifests: {other:?}", kind.name()),
-            };
-            assert!(
-                description.contains(&format!("({marker})")),
-                "{}'s published manifest refusal marker is not documented",
-                kind.name()
-            );
+            let WriteManifestPolicy::Refused(marker) = kind.policy().write_manifest else { panic!("expected refusal") };
+            assert!(manifest.contains(&marker.to_ascii_lowercase()));
         }
-        assert!(description.contains("codex rejects non-empty write_manifest before task creation"));
-        assert!(description.contains("rejects any non-empty write_manifest"));
-        assert!(matches!(
-            AgentKind::Zcode.policy().write_manifest,
-            WriteManifestPolicy::Unrestricted
-        ));
-        assert!(description.contains(
-            "For other subagents an omitted write_manifest uses the protected workspace scope."
-        ));
-
-        // Spawn-gate and model-shape facts named by the prose.
-        assert!(matches!(
-            AgentKind::Dsh.policy().spawn_gate,
-            SpawnGate::AcpProfileRuntime
-        ));
-        assert!(
-            description.contains("profile=acp + absolute executable runtime_path configuration")
-        );
-        assert!(matches!(
-            AgentKind::Agy.policy().spawn_gate,
-            SpawnGate::ExecutableRuntime
-        ));
-        assert!(description.contains(
-            "its enabled + spawn_supported gate and an absolute AGY_RUNTIME_PATH executable"
-        ));
-        assert!(description.contains("ZCode requires an explicit provider/model token"));
-        assert!(matches!(
-            AgentKind::Zcode.policy().model_shape,
-            ModelShape::ZcodeProviderModel
-        ));
-        assert!(matches!(
-            AgentKind::Dsh.policy().model_shape,
-            ModelShape::DshColonToken
-        ));
-        assert!(description.contains("A dsh model is provider:model, split at the first colon"));
-        assert!(matches!(
-            AgentKind::Agy.policy().model_shape,
-            ModelShape::AgyBareSlug
-        ));
-        assert!(description.contains("takes a bare model slug whose shape admission validates"));
+        let model = description("model");
+        for (kind, shape, text) in [
+            (AgentKind::Zcode, ModelShape::ZcodeProviderModel, "zcode requires explicit provider/model"),
+            (AgentKind::Dsh, ModelShape::DshColonToken, "dsh uses provider:model"),
+            (AgentKind::Agy, ModelShape::AgyBareSlug, "agy uses a bare slug"),
+        ] {
+            assert_eq!(kind.policy().model_shape, shape);
+            assert!(model.contains(text));
+        }
     }
 
     #[test]
@@ -1974,7 +1852,7 @@ mod contract_default_tests {
         });
         let status = serde_json::json!({
             "mcp_version":"0.1.0",
-            "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
+            "components":{},"capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":600000,
                 "maturity":{},"observation":{"public_reasoning_default":true,
                     "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
             "subagents":[]
@@ -2092,7 +1970,7 @@ mod contract_default_tests {
         let passive = serde_json::json!({
             "mcp_version":"0.1.0",
             "components":{},
-            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
+            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":600000,
                 "maturity":{},"observation":{"public_reasoning_default":true,
                     "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
             "subagents":[{
@@ -2114,7 +1992,7 @@ mod contract_default_tests {
         let with_models = serde_json::json!({
             "mcp_version":"0.1.0",
             "components":{},
-            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":299000,
+            "capabilities":{"max_rpc_request_frame_bytes":524288,"max_rpc_response_frame_bytes":2097152,"max_wait_ms":600000,
                 "maturity":{},"observation":{"public_reasoning_default":true,
                     "defaults":{"top_tools":3,"recent_calls_per_tool":5,"reasoning_chars":200}}},
             "subagents":[

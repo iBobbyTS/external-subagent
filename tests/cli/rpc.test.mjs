@@ -7,8 +7,10 @@ import { AGENT_PROBE_TRANSPORT_TIMEOUT_MS, SPAWN_TRANSPORT_TIMEOUT_MS, callDaemo
 
 test('wait transport timeout covers maximum wait without sleeping', () => {
   assert.equal(waitTransportTimeoutMs(0), 5000);
+  assert.equal(waitTransportTimeoutMs(), 295000);
   assert.equal(waitTransportTimeoutMs(299), 304000);
-  assert.throws(() => waitTransportTimeoutMs(300), /wait_time/);
+  assert.equal(waitTransportTimeoutMs(600), 605000);
+  assert.throws(() => waitTransportTimeoutMs(601), /wait_time/);
 });
 
 test('spawn transport timeout is 150s with margin over daemon bound', () => {

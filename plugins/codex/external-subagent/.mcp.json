@@ -3,6 +3,7 @@
     "external_subagent": {
       "command": "__EXTERNAL_SUBAGENT_MCP_EXECUTABLE__",
       "args": [],
+      "tool_timeout_sec": 610,
       "env": { "EXTERNAL_SUBAGENT_SOCKET": "__EXTERNAL_SUBAGENT_SOCKET__" }
     }
   }

@@ -93,17 +93,26 @@ pub(super) fn tool_output_schema<T: JsonSchema + 'static>() -> Arc<JsonObject> {
 #[serde(deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentSpawnInput {
+    /// Named runtime preset. Mutually exclusive with subagent, permission_mode,
+    /// model, effort and developer_instructions.
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
     pub profile: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
     #[serde(rename = "subagent")]
+    /// Execution target: zcode, dsh, codex or agy. Omission uses the configured
+    /// default_subagent; a named profile supplies this field.
     pub agent: Option<String>,
     pub repository: String,
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "PublicPermissionMode")]
+    /// Defaults to build. Codex build/edit use workspace-write, plan read-only,
+    /// yolo danger-full-access, all with approvalPolicy=never. ZCode supports
+    /// all four modes; dsh supports build/plan; agy supports build/yolo.
     pub permission_mode: Option<PublicPermissionMode>,
+    /// Complete assignment: intended outcome, relevant inputs and paths,
+    /// scope and any required deliverable. Do not use a placeholder to probe spawn.
     pub prompt: String,
     /// Caller write scope for the task. codex and agy reject a non-empty
     /// manifest before task creation (codex_write_manifest_unsupported /
@@ -116,9 +125,17 @@ pub struct AgentSpawnInput {
     pub write_manifest: Vec<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
+    /// Runtime model token: zcode requires explicit provider/model; dsh uses
+    /// provider:model; codex uses its model id; agy uses a bare slug validated
+    /// for shape, not catalog membership; an unknown agy slug fails at runtime.
+    /// A profile may supply the model; codex also accepts its configured default.
+    /// Only dsh/agy may fall back to a provider-native default.
     pub model: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
+    /// Optional reasoning effort, 1..24 bytes of [a-z0-9_]. Codex accepts
+    /// low/medium/high/xhigh/max; agy low/medium/high/max; zcode/dsh pass through.
+    /// Omission preserves the runtime default.
     pub effort: Option<String>,
     /// Per-task developer instructions. codex routes them through the native
     /// `developerInstructions` channel on thread/start (prompt stays
@@ -224,7 +241,7 @@ pub struct AgentWaitInput {
     /// object keyed by agent id.
     pub agent_id: AgentIdOrList,
     #[serde(default = "default_wait_time")]
-    #[schemars(range(min = 0, max = 299))]
+    #[schemars(range(min = 0, max = 600))]
     pub wait_time: u64,
     #[serde(default)]
     pub message_id: Option<String>,

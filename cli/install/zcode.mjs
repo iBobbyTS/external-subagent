@@ -31,8 +31,8 @@ const MANIFEST_PROBES = ['.zcode-plugin/plugin.json', '.claude-plugin/plugin.jso
 // pins `timeoutMs` on the server entry: the zcode host's MCP client caps
 // every tool call at a default 30000ms unless the server config overrides
 // it, which would cut `external_subagent_wait` (default 290s, ceiling
-// 299s) at 30s; 300000ms covers that ceiling with margin.
-const ZCODE_MCP_TIMEOUT_MS = 300000;
+// 600s) at 30s; 610000ms also covers the facade's 5s transport margin.
+const ZCODE_MCP_TIMEOUT_MS = 610000;
 
 export function zcodeMcpBinding(staging) {
   return { command: stableNodeExecutable(), args: [path.join(staging, 'scripts', 'mcp-stdio-bridge.mjs')], timeoutMs: ZCODE_MCP_TIMEOUT_MS };

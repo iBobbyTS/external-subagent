@@ -67,7 +67,7 @@ const okVerify = () => '0.2.0-rc.2';
 const readPatch = (file) => fs.readFileSync(file, 'utf8');
 
 test('composePatchText appends to the shipped template by removing the bare empty root', () => {
-  const binding = { command: '/payload/external-subagent-mcp', args: [], toolCallTimeoutMs: 300000 };
+  const binding = { command: '/payload/external-subagent-mcp', args: [], toolCallTimeoutMs: 610000 };
   const text = composePatchText(SHIPPED_TEMPLATE, binding, '/tmp/product.sock');
   assert.ok(text.split('\n').every((line) => line.trim() !== '[]'), 'the bare empty-root line must not survive');
   assert.ok(text.startsWith('# Your patch layer'), 'user header comments survive');
@@ -75,7 +75,7 @@ test('composePatchText appends to the shipped template by removing the bare empt
   assert.ok(text.includes("name: '@deepseek-ai/dsh-mcp-client'"));
   assert.ok(text.includes("serverName: 'external_subagent'"));
   assert.ok(text.includes("EXTERNAL_SUBAGENT_SOCKET: '/tmp/product.sock'"));
-  assert.ok(text.includes("toolCallTimeoutMs: 300000"));
+  assert.ok(text.includes("toolCallTimeoutMs: 610000"));
   // Prove the composed text is valid YAML with the real parser when the
   // installed dsh CLI provides one (the `@` reserved-character class is
   // exactly what a naive plain-scalar writer would break).
@@ -86,18 +86,18 @@ test('composePatchText appends to the shipped template by removing the bare empt
     assert.equal(entry?.config?.serverName, 'external_subagent');
     assert.equal(entry?.config?.transport, 'stdio');
     assert.equal(entry?.config?.env?.EXTERNAL_SUBAGENT_SOCKET, '/tmp/product.sock');
-    assert.equal(entry?.config?.toolCallTimeoutMs, 300000);
+    assert.equal(entry?.config?.toolCallTimeoutMs, 610000);
   }
 });
 
 test('composePatchText creates a fresh file when the patch is absent', () => {
-  const text = composePatchText(null, { command: '/x/external-subagent-mcp', args: [], toolCallTimeoutMs: 300000 }, '/s.sock');
+  const text = composePatchText(null, { command: '/x/external-subagent-mcp', args: [], toolCallTimeoutMs: 610000 }, '/s.sock');
   assert.ok(text.startsWith(SENTINEL));
   assert.ok(text.endsWith('\n'));
 });
 
 test('composePatchText replaces an existing managed block and preserves surrounding user entries', () => {
-  const binding = { command: '/payload/external-subagent-mcp', args: [], toolCallTimeoutMs: 300000 };
+  const binding = { command: '/payload/external-subagent-mcp', args: [], toolCallTimeoutMs: 610000 };
   const first = composePatchText(SHIPPED_TEMPLATE, binding, '/old.sock');
   // A user entry follows the managed block.
   const withUser = `${first}- id: timer\n  disabled: true\n`;
@@ -120,6 +120,8 @@ test('install appends the managed block, stages the skill, and verifies via the 
     assert.equal(result.host, 'dsh');
     assert.equal(result.config_verified, true);
     assert.equal(result.binding.socket, paths.socket);
+    assert.equal(dshMcpBinding(paths).toolCallTimeoutMs, 610000);
+    assert.match(readPatch(patchFile), /toolCallTimeoutMs: 610000/u);
     const text = readPatch(patchFile);
     assert.ok(text.includes(SENTINEL));
     assert.ok(text.includes(`command: '${dshMcpBinding(paths).command}'`));
