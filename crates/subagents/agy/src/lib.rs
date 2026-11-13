@@ -5,8 +5,8 @@
 //! three stdout events (`init`/`step_update`/`result`) emitted by a long-lived
 //! `agy --input-format stream-json --output-format stream-json` process, the
 //! pure turn-terminal classifier (a turn settles on the last `result` event it
-//! saw; the classifier never depends on process liveness), the canonical
-//! tool-activity derivation, the launch-argv assembly, and the `agy models` /
+//! saw; the classifier never depends on process liveness), the pure
+//! tool-activity data helper, the launch-argv assembly, and the `agy models` /
 //! `agy --version` output parsers. Task lifecycle, the NDJSON pump, process
 //! gating/reaping, and scheduling stay with the daemon (`external-daemon`),
 //! which feeds parsed events in and consumes the settlements and activity

@@ -3,8 +3,51 @@
 //! Extracted mechanically from the former single-file `rpc` module; the
 //! facade at `crate::rpc` keeps every historical path importable.
 use crate::SchedulerError;
+use external_contract::events::NativeFailure;
 use external_store::StoreError;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Hard transfer cap for the complete redacted native error carried by one
+/// structured error. It stays well below `MAX_RESPONSE_FRAME_BYTES` so the
+/// surrounding envelope (and MCP structured content) can never be silently
+/// rejected as an oversized frame, which would drop the original entirely.
+pub const MAX_NATIVE_ERROR_BYTES: usize = 1024 * 1024;
+
+/// The complete credential-redacted native error, or an explicit statement
+/// that it exceeded the hard transfer cap. `original` is the authoritative
+/// value; the optional `projection` only carries meaning the native source
+/// stated explicitly and never replaces it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeErrorView {
+    /// Complete redacted native value. `None` only when `truncated` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<external_contract::events::FailureProjection>,
+    /// True when the complete native payload exceeded `limit_bytes`; this
+    /// layer did not deliver it completely and does not claim to have done so.
+    pub truncated: bool,
+    pub total_bytes: usize,
+    pub limit_bytes: usize,
+}
+
+fn native_error_view(failure: Option<NativeFailure>) -> Option<NativeErrorView> {
+    let failure = failure?;
+    // Account for the whole native payload (original plus any projection), not
+    // just `original`, so the cap bounds what the frame actually carries.
+    let total_bytes = serde_json::to_vec(&failure)
+        .map(|encoded| encoded.len())
+        .unwrap_or(0);
+    let truncated = total_bytes > MAX_NATIVE_ERROR_BYTES;
+    Some(NativeErrorView {
+        original: (!truncated).then_some(failure.original),
+        projection: failure.projection,
+        truncated,
+        total_bytes,
+        limit_bytes: MAX_NATIVE_ERROR_BYTES,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +78,11 @@ pub struct RpcError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_agent_id: Option<String>,
+    /// Complete redacted native original when this error is a synchronous
+    /// command failure. Absent for local validation/store/transport errors,
+    /// which have no native value to retain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_error: Option<NativeErrorView>,
 }
 
 pub(crate) fn truncate_utf8(s: &mut String, max_bytes: usize) {
@@ -55,6 +103,7 @@ impl RpcError {
             code,
             message,
             active_agent_id: None,
+            native_error: None,
         }
     }
 
@@ -68,6 +117,7 @@ impl RpcError {
             code,
             message,
             active_agent_id: None,
+            native_error: None,
         }
     }
 }
@@ -95,23 +145,27 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
             error.active_agent_id = Some(agent_id);
             error
         }
-        SchedulerError::LifecycleSink { .. } => {
-            RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed")
+        SchedulerError::LifecycleSink { agent_id, .. } => {
+            let mut error = RpcError::new(RpcErrorCode::RuntimeLost, "runtime operation failed");
+            error.active_agent_id = Some(agent_id);
+            error
         }
-        SchedulerError::RuntimeCommand { .. } => {
-            let message = match &error {
-                SchedulerError::RuntimeCommand { message, .. } => message.as_str(),
-                _ => unreachable!(),
+        SchedulerError::RuntimeCommand {
+            agent_id,
+            message,
+            native_failure,
+            ..
+        } => {
+            let code = match message.as_str() {
+                "steer_unsupported" => RpcErrorCode::SteerUnsupported,
+                "TERMINAL_SEND_UNSUPPORTED" => RpcErrorCode::Validation,
+                _ => RpcErrorCode::Unavailable,
             };
-            if message == "steer_unsupported" {
-                RpcError::new(RpcErrorCode::SteerUnsupported, message)
-            } else if message == "TERMINAL_SEND_UNSUPPORTED" {
-                RpcError::new(RpcErrorCode::Validation, message)
-            } else if message == "daemon_draining" {
-                RpcError::new(RpcErrorCode::Unavailable, message)
-            } else {
-                RpcError::new(RpcErrorCode::Unavailable, "RUNTIME_COMMAND_FAILED")
-            }
+            let message = crate::scheduler::redact_native_error(&serde_json::Value::String(message));
+            let mut error = RpcError::new(code, message.as_str().expect("redacted string"));
+            error.active_agent_id = Some(agent_id);
+            error.native_error = native_error_view(native_failure);
+            error
         }
         SchedulerError::StartTimeout { agent_id, message } => {
             let mut error = RpcError::new(RpcErrorCode::Timeout, message);
@@ -130,6 +184,7 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
             agent_id,
             reason,
             message,
+            native_failure,
         } => {
             let (code, msg) = if reason == "MODEL_REJECTED" {
                 (RpcErrorCode::Validation, format!("MODEL_REJECTED: {message}"))
@@ -142,6 +197,7 @@ pub(super) fn map_scheduler(error: SchedulerError) -> RpcError {
             };
             let mut error = RpcError::new(code, msg);
             error.active_agent_id = Some(agent_id);
+            error.native_error = native_error_view(native_failure);
             error
         }
     }
@@ -181,18 +237,119 @@ mod error_classification_tests {
         ));
         assert_eq!(conflict.code, RpcErrorCode::Conflict);
         assert_eq!(conflict.message, "MESSAGE_ID_CONFLICT");
-        let rejection = map_scheduler(SchedulerError::RuntimeCommand {
+        let rejection = map_scheduler(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
             agent_id: "a".into(),
-            message: "sensitive".into(),
+            message: "session/send rejected: api_key=private-value".into(),
         });
         assert_eq!(rejection.code, RpcErrorCode::Unavailable);
-        assert_eq!(rejection.message, "RUNTIME_COMMAND_FAILED");
+        assert_eq!(rejection.message, "session/send rejected: api_key=[REDACTED]");
+        assert_eq!(rejection.active_agent_id.as_deref(), Some("a"));
+    }
+
+    fn native(original: Value) -> NativeFailure {
+        NativeFailure {
+            original,
+            projection: Some(external_contract::events::FailureProjection {
+                code: Some(Value::String("rate_limit".into())),
+                status: Some(429),
+                retry: Some(external_contract::events::NativeRetry {
+                    will_retry: Some(true),
+                    ..Default::default()
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn synchronous_command_failure_keeps_the_complete_native_original_and_agent_id() {
+        let original = serde_json::json!({
+            "message": "model request failed.
+  keep whitespace	and details",
+            "code": "rate_limit",
+            "attribution": {"statusCode": 429, "retryable": true},
+            "stack": "frame 1
+  frame 2",
+            "data": {"retryAfter": 109727, "apiKey": "[REDACTED]"}
+        });
+        let failure = native(original.clone());
+        let expected_bytes = serde_json::to_vec(&failure).unwrap().len();
+        let mapped = map_scheduler(SchedulerError::RuntimeCommand {
+            operation: Some("session/send"),
+            native_failure: Some(failure),
+            agent_id: "10000001".into(),
+            message: "session/send rejected: api_key=[REDACTED]".into(),
+        });
+        assert_eq!(mapped.code, RpcErrorCode::Unavailable);
+        assert_eq!(mapped.active_agent_id.as_deref(), Some("10000001"));
+        let error = mapped.native_error.expect("native original");
+        assert!(!error.truncated);
+        assert_eq!(error.limit_bytes, MAX_NATIVE_ERROR_BYTES);
+        assert_eq!(error.total_bytes, expected_bytes);
+        // The original is authoritative and complete, not a summary.
+        assert_eq!(error.original, Some(original));
+        let projection = error.projection.expect("adapter projection");
+        assert_eq!(projection.status, Some(429));
+        assert_eq!(projection.code, Some(Value::String("rate_limit".into())));
+        assert_eq!(projection.retry.unwrap().will_retry, Some(true));
+    }
+
+    #[test]
+    fn start_failed_projection_also_carries_the_native_original() {
+        let original = serde_json::json!({"error": {"message": "quota exhausted"}});
+        let mapped = map_scheduler(SchedulerError::StartFailed {
+            native_failure: Some(NativeFailure {
+                original: original.clone(),
+                projection: None,
+            }),
+            agent_id: "10000002".into(),
+            reason: "MODEL_REJECTED".into(),
+            message: "unknown model".into(),
+        });
+        let error = mapped.native_error.expect("native original");
+        assert_eq!(error.original, Some(original));
+        assert!(!error.truncated);
+    }
+
+    #[test]
+    fn over_cap_native_error_reports_the_limit_instead_of_claiming_delivery() {
+        let oversized = Value::String("x".repeat(MAX_NATIVE_ERROR_BYTES + 1));
+        let mapped = map_scheduler(SchedulerError::RuntimeCommand {
+            operation: Some("session/send"),
+            native_failure: Some(NativeFailure {
+                original: oversized,
+                projection: None,
+            }),
+            agent_id: "10000003".into(),
+            message: "session/send rejected".into(),
+        });
+        let error = mapped.native_error.expect("native original");
+        assert!(error.truncated);
+        assert_eq!(error.original, None);
+        assert_eq!(error.limit_bytes, MAX_NATIVE_ERROR_BYTES);
+        assert!(error.total_bytes > MAX_NATIVE_ERROR_BYTES);
+    }
+
+    #[test]
+    fn local_errors_have_no_native_original_and_lifecycle_failures_keep_the_agent_id() {
+        let local = map_scheduler(SchedulerError::RuntimeCommand {
+            operation: None,
+            native_failure: None,
+            agent_id: "10000004".into(),
+            message: "TERMINAL_SEND_UNSUPPORTED".into(),
+        });
+        assert!(local.native_error.is_none());
+        let sink = map_scheduler(SchedulerError::LifecycleSink {
+            agent_id: "10000009".into(),
+            message: "sink failed".into(),
+        });
+        assert_eq!(sink.active_agent_id.as_deref(), Some("10000009"));
+        assert!(sink.native_error.is_none());
     }
 
     #[test]
     fn map_scheduler_preserves_start_failed_reasons_and_active_agent_id() {
         // 1. SESSION_START_FAILED -> RuntimeLost
-        let err_session = map_scheduler(SchedulerError::StartFailed {
+        let err_session = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000001".into(),
             reason: "SESSION_START_FAILED".into(),
             message: "handshake failed".into(),
@@ -202,7 +359,7 @@ mod error_classification_tests {
         assert_eq!(err_session.active_agent_id.as_deref(), Some("10000001"));
 
         // 2. MODEL_REJECTED -> Validation
-        let err_model = map_scheduler(SchedulerError::StartFailed {
+        let err_model = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000002".into(),
             reason: "MODEL_REJECTED".into(),
             message: "unknown model".into(),
@@ -212,7 +369,7 @@ mod error_classification_tests {
         assert_eq!(err_model.active_agent_id.as_deref(), Some("10000002"));
 
         // 3. PREPARED_* -> ResultInvalid
-        let err_prepared = map_scheduler(SchedulerError::StartFailed {
+        let err_prepared = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000003".into(),
             reason: "PREPARED_LAUNCH_FAILED".into(),
             message: "invalid json".into(),
@@ -222,7 +379,7 @@ mod error_classification_tests {
         assert_eq!(err_prepared.active_agent_id.as_deref(), Some("10000003"));
 
         // 4. DRAIN_CANCELLED / CANCELLED -> Unavailable
-        let err_drain = map_scheduler(SchedulerError::StartFailed {
+        let err_drain = map_scheduler(SchedulerError::StartFailed { native_failure: None,
             agent_id: "10000004".into(),
             reason: "DRAIN_CANCELLED".into(),
             message: "daemon draining".into(),

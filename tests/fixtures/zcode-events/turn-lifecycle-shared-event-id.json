@@ -1,0 +1,504 @@
+{
+  "provenance": "OBSERVED",
+  "source": "zcode-real-frames.log lines 29-31,45-57 (real zcode.cjs app-server notification capture)",
+  "role": "captured_wire_frames",
+  "redactions": [],
+  "selection": "one turn lifecycle: computer-use/telemetry/session turn.started sharing one eventId, three telemetry+session pairs sharing one eventId each, then computer-use/telemetry/session terminal sharing one eventId",
+  "frames": [
+    {
+      "method": "computer-use/operation-event",
+      "params": {
+        "eventId": "0eca4c39-ccc4-495e-afde-c7b99da716a9",
+        "sequenceNumber": 2,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130567617,
+        "kind": "turn-started",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "0eca4c39-ccc4-495e-afde-c7b99da716a9",
+        "eventSeq": 2,
+        "occurredAt": 1794130567617,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "turn.started",
+        "modelName": "glm-5.3-flash",
+        "modelProvider": "new-provider-3"
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "0eca4c39-ccc4-495e-afde-c7b99da716a9",
+        "payload": {
+          "executionStartedAt": 1794130567452.6982,
+          "turnNumber": 0,
+          "input": "Reply with exactly: SMOKE-OK",
+          "messageId": "msg_mw7n0lvl_4ecab537-89b4-4763-907b-9e8876d82c1c",
+          "foregroundExecutionId": "runtime_command_1",
+          "queryId": "query_857770d2-3b8e-4281-b580-89a9aed957bf"
+        },
+        "seq": 2,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130567617,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "turn.started"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "1377f10b-e3c5-4e53-84eb-20943b995335",
+        "eventSeq": 4,
+        "occurredAt": 1794130582253,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "model.request.status",
+        "requestId": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+        "status": "model_request_started",
+        "providerId": "new-provider-3",
+        "modelId": "glm-5.3-flash",
+        "providerKind": "anthropic",
+        "providerHostname": "api.ai-pixel.online",
+        "transport": "sse",
+        "querySource": "main_turn",
+        "queryId": "query_857770d2-3b8e-4281-b580-89a9aed957bf",
+        "attempt": 1,
+        "maxAttempts": 11
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "1377f10b-e3c5-4e53-84eb-20943b995335",
+        "payload": {
+          "baseURL": "https://api.ai-pixel.online/v1",
+          "maxAttempts": 11,
+          "providerId": "new-provider-3",
+          "modelId": "glm-5.3-flash",
+          "modelRequestSessionType": "main",
+          "requestId": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+          "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+          "spanId": "2a4ae4c9-3011-45",
+          "parentSpanId": "022c4a58-4185-40",
+          "querySource": "main_turn",
+          "queryId": "query_857770d2-3b8e-4281-b580-89a9aed957bf",
+          "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+          "providerKind": "anthropic",
+          "transport": "sse",
+          "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+          "modelCall": {
+            "operation": "agent_step",
+            "actorKind": "main",
+            "operationId": "2a4ae4c9-3011-45",
+            "reasoning": {
+              "capability": "unknown",
+              "requestedControl": "provider_default",
+              "requestedState": "provider_default",
+              "requestedLevel": "max",
+              "effectiveControl": "unknown",
+              "effectiveState": "unknown",
+              "effectiveLevel": "unknown"
+            },
+            "logicalCallId": "406aa0c7-120c-433f-8559-d199cc09f573",
+            "stepIndex": 0
+          },
+          "attempt": 1,
+          "requestHeaderCount": 17,
+          "requestHeaders": {
+            "http-referer": "https://zcode.z.ai",
+            "user-agent": "ZCode/0.17.1",
+            "x-zcode-app-version": "0.17.1",
+            "x-title": "Z Code@electron",
+            "x-release-channel": "production",
+            "x-client-language": "en-US",
+            "x-client-timezone": "America/Edmonton",
+            "x-zcode-agent": "glm",
+            "x-platform": "darwin-arm64",
+            "x-os-category": "macos",
+            "x-os-version": "27.0.0",
+            "x-request-id": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+            "x-zcode-session-type": "main",
+            "x-zcode-trace-id": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+            "x-query-id": "857770d2-3b8e-4281-b580-89a9aed957bf",
+            "x-zcode-query-source": "main_turn",
+            "x-session-id": "8bf695f6-cf87-4875-bbcb-6539ec9e6d1f"
+          },
+          "timestamp": "2026-11-08T09:36:22.251Z",
+          "type": "model_request_started",
+          "_meta": {
+            "zcode": {
+              "apiRetry": null
+            }
+          }
+        },
+        "seq": 4,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130582253,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "session.updated"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "83fcdafc-9f93-49da-9f85-7c3d8f9d5532",
+        "eventSeq": 7,
+        "occurredAt": 1794130592634,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "stream.chunk",
+        "channel": "text",
+        "chunkLength": 2,
+        "firstChunk": true,
+        "assistantMessageId": "msg_mw7n0x5v_9786a8d8-7d54-48a1-b3f6-7b385a9d7804"
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "83fcdafc-9f93-49da-9f85-7c3d8f9d5532",
+        "payload": {
+          "assistantMessageId": "msg_mw7n0x5v_9786a8d8-7d54-48a1-b3f6-7b385a9d7804",
+          "delta": "SM",
+          "done": false,
+          "kind": "text_delta"
+        },
+        "seq": 5,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592634,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "model.streaming"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "e2a543cc-0103-40a5-8a97-07fa5f718eb2",
+        "eventSeq": 8,
+        "occurredAt": 1794130592636,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "stream.chunk",
+        "channel": "text",
+        "chunkLength": 6,
+        "firstChunk": false,
+        "assistantMessageId": "msg_mw7n0x5v_9786a8d8-7d54-48a1-b3f6-7b385a9d7804"
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "e2a543cc-0103-40a5-8a97-07fa5f718eb2",
+        "payload": {
+          "assistantMessageId": "msg_mw7n0x5v_9786a8d8-7d54-48a1-b3f6-7b385a9d7804",
+          "delta": "OKE-OK",
+          "done": false,
+          "kind": "text_delta"
+        },
+        "seq": 6,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592636,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "model.streaming"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "9205d558-9e9b-4f35-bf93-4a4b28529d58",
+        "eventSeq": 11,
+        "occurredAt": 1794130592659,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "model.request.status",
+        "requestId": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+        "status": "model_request_completed",
+        "providerId": "new-provider-3",
+        "modelId": "glm-5.3-flash",
+        "providerKind": "anthropic",
+        "providerHostname": "api.ai-pixel.online",
+        "transport": "sse",
+        "querySource": "main_turn",
+        "queryId": "query_857770d2-3b8e-4281-b580-89a9aed957bf",
+        "attempt": 1,
+        "maxAttempts": 11,
+        "durationMs": 10407
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "9205d558-9e9b-4f35-bf93-4a4b28529d58",
+        "payload": {
+          "baseURL": "https://api.ai-pixel.online/v1",
+          "maxAttempts": 11,
+          "providerId": "new-provider-3",
+          "modelId": "glm-5.3-flash",
+          "modelRequestSessionType": "main",
+          "requestId": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+          "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+          "spanId": "2a4ae4c9-3011-45",
+          "parentSpanId": "022c4a58-4185-40",
+          "querySource": "main_turn",
+          "queryId": "query_857770d2-3b8e-4281-b580-89a9aed957bf",
+          "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+          "providerKind": "anthropic",
+          "transport": "sse",
+          "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+          "modelCall": {
+            "operation": "agent_step",
+            "actorKind": "main",
+            "operationId": "2a4ae4c9-3011-45",
+            "reasoning": {
+              "capability": "unknown",
+              "requestedControl": "provider_default",
+              "requestedState": "provider_default",
+              "requestedLevel": "max",
+              "effectiveControl": "unknown",
+              "effectiveState": "unknown",
+              "effectiveLevel": "unknown"
+            },
+            "logicalCallId": "406aa0c7-120c-433f-8559-d199cc09f573",
+            "stepIndex": 0
+          },
+          "attempt": 1,
+          "durationMs": 10407,
+          "requestHeaderCount": 17,
+          "requestHeaders": {
+            "http-referer": "https://zcode.z.ai",
+            "user-agent": "ZCode/0.17.1",
+            "x-zcode-app-version": "0.17.1",
+            "x-title": "Z Code@electron",
+            "x-release-channel": "production",
+            "x-client-language": "en-US",
+            "x-client-timezone": "America/Edmonton",
+            "x-zcode-agent": "glm",
+            "x-platform": "darwin-arm64",
+            "x-os-category": "macos",
+            "x-os-version": "27.0.0",
+            "x-request-id": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+            "x-zcode-session-type": "main",
+            "x-zcode-trace-id": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+            "x-query-id": "857770d2-3b8e-4281-b580-89a9aed957bf",
+            "x-zcode-query-source": "main_turn",
+            "x-session-id": "8bf695f6-cf87-4875-bbcb-6539ec9e6d1f"
+          },
+          "responseHeaderCount": 7,
+          "responseHeaders": {
+            "access-control-expose-headers": "X-Request-ID",
+            "cache-control": "no-cache",
+            "content-type": "text/event-stream",
+            "date": "Sun, 08 Nov 2026 09:36:23 GMT",
+            "server": "nginx/1.18.0 (Ubuntu)",
+            "x-new-api-version": "20261104-v54-c8e0079f4",
+            "x-oneapi-request-id": "202611080936232334237288268d9d6JC470UFg"
+          },
+          "finishReason": "stop",
+          "usage": {
+            "inputTokens": 98078,
+            "outputTokens": 7,
+            "totalTokens": 98085,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0
+          },
+          "timeToFirstProviderEventMs": 9,
+          "timeToFirstContentMs": 10331,
+          "timeToFirstTextMs": 10382,
+          "streamStallCount": 0,
+          "streamOutputCommitted": true,
+          "timestamp": "2026-11-08T09:36:32.658Z",
+          "type": "model_request_completed",
+          "_meta": {
+            "zcode": {
+              "apiRetry": null
+            }
+          }
+        },
+        "seq": 7,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592659,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "session.updated"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "09ecff3d-3f51-4eca-b5a7-a4b665fe1f42",
+        "eventSeq": 12,
+        "occurredAt": 1794130592667,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "usage.delta",
+        "requestId": "c050a82c-dc2c-478c-819c-822ef18cc3b7",
+        "providerId": "new-provider-3",
+        "modelId": "glm-5.3-flash",
+        "providerKind": "anthropic",
+        "providerHostname": "api.ai-pixel.online",
+        "inputTokens": 98078,
+        "outputTokens": 7,
+        "totalTokens": 98085,
+        "reasoningTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheWriteTokens": 0
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "09ecff3d-3f51-4eca-b5a7-a4b665fe1f42",
+        "payload": {
+          "content": "SMOKE-OK",
+          "contextWindow": 1000000,
+          "querySource": "main_turn",
+          "stopReason": "stop",
+          "usage": {
+            "inputTokens": 98078,
+            "outputTokens": 7,
+            "totalTokens": 98085,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0
+          },
+          "cacheHit": {
+            "inputTokens": 98078,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "latestHitRate": 0,
+            "hitRate": 0,
+            "hitRateRequestCount": 1,
+            "totalInputTokens": 98078,
+            "totalCacheReadTokens": 0,
+            "totalCacheWriteTokens": 0
+          },
+          "contextUsageBreakdown": [
+            {
+              "source": "system_prompt",
+              "chars": 2903
+            },
+            {
+              "source": "meta_user_context",
+              "chars": 8888
+            },
+            {
+              "source": "skills",
+              "chars": 9289
+            },
+            {
+              "source": "system_tool_schemas",
+              "chars": 83608
+            },
+            {
+              "source": "mcp_tool_schemas",
+              "chars": 566405
+            },
+            {
+              "source": "messages",
+              "chars": 56
+            }
+          ],
+          "toolCallCount": 0
+        },
+        "seq": 8,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592667,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "session.updated"
+      }
+    },
+    {
+      "method": "computer-use/operation-event",
+      "params": {
+        "eventId": "b9ce89f6-8f59-43c2-90b6-eb1ce4ffcdbc",
+        "sequenceNumber": 13,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592678,
+        "kind": "turn-completed",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6"
+      }
+    },
+    {
+      "method": "v4/telemetry/event",
+      "params": {
+        "memoryEnabled": false,
+        "version": 1,
+        "eventId": "b9ce89f6-8f59-43c2-90b6-eb1ce4ffcdbc",
+        "eventSeq": 13,
+        "occurredAt": 1794130592678,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "kind": "turn.terminal",
+        "status": "success",
+        "resultType": "success",
+        "durationMs": 25227,
+        "tokenCount": 98085,
+        "toolCallCount": 0
+      }
+    },
+    {
+      "method": "session/event",
+      "params": {
+        "deliveryKind": "desktop-continuous",
+        "eventId": "b9ce89f6-8f59-43c2-90b6-eb1ce4ffcdbc",
+        "payload": {
+          "response": "SMOKE-OK",
+          "tokenCount": 98085,
+          "usage": {
+            "source": "provider",
+            "modelRequestCount": 1,
+            "inputTokens": 98078,
+            "outputTokens": 7,
+            "totalTokens": 98085,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "webFetchRequests": 0,
+            "webSearchRequests": 0
+          },
+          "toolCallCount": 0,
+          "historyRoundCount": 1,
+          "duration": 25227,
+          "resultType": "success",
+          "cacheStats": {
+            "totalMessages": 12,
+            "cachedMessages": 3,
+            "lastCacheHit": false
+          }
+        },
+        "seq": 9,
+        "sessionId": "sess_8bf695f6-cf87-4875-bbcb-6539ec9e6d1f",
+        "timestamp": 1794130592678,
+        "traceId": "bd73e56b-7214-44ac-82f6-865be515bdb1",
+        "turnId": "turn_a5178d8b-fb74-4313-960d-717d084e97e6",
+        "type": "turn.completed"
+      }
+    }
+  ]
+}

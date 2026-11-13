@@ -314,8 +314,7 @@ fn codex_owner_bootstrap_sends_developer_instructions_and_verbatim_turn_prompt()
         .find(|frame| frame["method"] == "turn/start")
         .expect("turn/start frame");
     assert_eq!(
-        turn_start["params"]["input"][0]["text"],
-        prompt_text,
+        turn_start["params"]["input"][0]["text"], prompt_text,
         "Codex turn/start input must be verbatim prompt without developer_instructions splicing"
     );
 }
@@ -351,34 +350,33 @@ fn codex_owner_bootstrap_omits_developer_instructions_when_empty_or_none() {
         .find(|frame| frame["method"] == "thread/start")
         .expect("thread/start frame");
     assert!(
-        thread_start["params"].get("developerInstructions").is_none(),
+        thread_start["params"]
+            .get("developerInstructions")
+            .is_none(),
         "developerInstructions must be omitted when None"
     );
 
     let turn_start = requests
         .find(|frame| frame["method"] == "turn/start")
         .expect("turn/start frame");
-    assert_eq!(
-        turn_start["params"]["input"][0]["text"],
-        prompt_text
-    );
+    assert_eq!(turn_start["params"]["input"][0]["text"], prompt_text);
 }
 
 #[test]
-fn whitelisted_tool_items_feed_wait_count_and_observe_details() {
+fn whitelisted_tool_items_feed_wait_and_observe_complete_facts() {
     let _guard = scripted_test_guard();
     let workspace = codex_workspace();
     let directory = workspace.path().to_owned();
     let echo = start_echo(&directory, PermissionMode::Plan);
-    // One turn exercises the whole count contract: call-1 is started twice
-    // and completed (must count once), call-2 is a bare whitelisted start,
-    // call-3 is a whitelisted completion whose start was missed (backfill
-    // counts once), reasoning is non-whitelisted, and the last two tool frames
-    // carry a foreign thread, respectively a foreign turn. Three distinct
-    // whitelisted calls are expected.
+    // One turn exercises the whole tool contract: call-1 is started twice and
+    // completed (the duplicate start is a replay, its completion projects
+    // once), call-2 is a bare whitelisted start, call-3 is a whitelisted
+    // completion whose start was missed (completion is the authoritative
+    // snapshot), reasoning is non-whitelisted, and the last two tool frames
+    // carry a foreign thread, respectively a foreign turn.
     //
-    // 双计数不变量：适配器不得对同一调用同时发详细 started 与 count（本适配器无详细
-    // 工具路径，此夹具锁定 count 单路径，防止回归时双重计数）。
+    // 单一事实不变量：同一调用只投影一次 started 与一次 completed；详细事实只走
+    // typed 路径，不再有 count 词表的第二份投影。
     let script = format!(
         r#"
 IFS= read -r line
@@ -417,7 +415,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     scheduler.start_ready().unwrap();
     let result = await_result(&scheduler, &agent_id);
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
-    // The count path never leaks into the result text.
+    // Tool facts never leak into the result text.
     assert_eq!(result.result.final_text, "TOOL_COUNT_OK");
     await_terminal_task(&scheduler, &agent_id);
 
@@ -426,23 +424,30 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .expect("codex activity tracker is present");
     assert_eq!(
         activity.window_60s.tool_calls_started, 3,
-        "call-1 (deduped start+complete), call-2 (started), call-3 (completion backfill) only"
+        "three logical calls are observed, including start-less call-3"
     );
     assert_eq!(activity.window_60s.other_tool_calls, 3);
+    assert_eq!(
+        activity.window_60s.tool_calls_completed, 2,
+        "call-1 and the start-less call-3 completion"
+    );
+    assert_eq!(activity.window_60s.tool_calls_failed, 0);
+    assert!(
+        activity.active_tools.is_empty(),
+        "settlement clears the active call set"
+    );
     // The wait public projection is a straight-through single line: whatever
     // the tracker counted is exactly what wait exposes on the public field.
     let projection =
         crate::rpc::views::task_activity_view(TaskPhase::Terminal, Some(activity.clone()));
     assert_eq!(projection.tool_calls_last_60s, 3);
-    assert!(
-        serde_json::to_value(projection)
-            .unwrap()
-            .get("last_tool_calls")
-            .is_none()
-    );
+    assert!(serde_json::to_value(projection)
+        .unwrap()
+        .get("last_tool_calls")
+        .is_none());
 
-    // The count-only tool descriptors now feed observe: each distinct call is
-    // visible once with its detail wrapped in the argument object.
+    // Every tool fact carries its public arguments into observe: each distinct
+    // call is visible once, with no count-event detail wrapper.
     let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(
         observation
@@ -450,72 +455,83 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
             .iter()
             .map(|tool| (tool.tool_name.as_str(), tool.call_count))
             .collect::<Vec<_>>(),
-        [("mcpToolCall", 1), ("fileChange", 1), ("commandExecution", 1)]
-    );
-    let details = observation
-        .tools
-        .iter()
-        .map(|tool| {
-            (
-                tool.tool_name.as_str(),
-                tool.recent_calls[0].arguments["detail"].clone(),
-                tool.recent_calls[0].arguments_truncated,
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        details,
         [
-            (
-                "mcpToolCall",
-                serde_json::json!("call-3"),
-                false
-            ),
-            ("fileChange", serde_json::json!("a.ts, b.ts"), false),
-            (
-                "commandExecution",
-                serde_json::json!("/bin/zsh -lc 'echo 中'"),
-                false
-            ),
+            ("mcpToolCall", 1),
+            ("fileChange", 1),
+            ("commandExecution", 1)
         ]
     );
-    // Codex still exposes no reasoning and its history is explicitly partial.
+    let command = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "commandExecution")
+        .expect("command observation");
+    assert_eq!(
+        command.recent_calls[0].arguments,
+        serde_json::json!({"command": "/bin/zsh -lc 'echo 中'"})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(!command.recent_calls[0].arguments_truncated);
+    let change = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "fileChange")
+        .expect("file change observation");
+    assert_eq!(
+        change.recent_calls[0].arguments,
+        serde_json::json!({"changes": [{"path": "a.ts"}, {"path": "b.ts"}]})
+            .as_object()
+            .unwrap()
+            .clone()
+    );
+    assert!(!change.recent_calls[0].arguments_truncated);
+    let mcp = observation
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == "mcpToolCall")
+        .expect("mcp observation");
+    assert!(
+        mcp.recent_calls[0].arguments.is_empty(),
+        "a completion without public arguments records an explicit unknown"
+    );
+    assert!(mcp.recent_calls[0].arguments_truncated);
+    // No public reasoning arrived in this fixture; typed tool identity is supported.
     assert!(observation.reasoning.text.is_empty());
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
     assert!(!observation.coverage.reasoning_complete);
     assert_eq!(observation.coverage.dropped_events, 0);
 }
 
 #[test]
-fn count_descriptor_feeds_observe_once_per_event_with_wrapped_detail() {
-    let tracker = crate::PassiveActivityTracker::for_adapter("codex");
-    let event = crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
-        external_contract::WireMessage::Event(external_contract::EventEnvelope {
-            method: "session/event".into(),
-            params: external_contract::activity::tool_count_event(
-                "codex-event-1",
-                "turn-1",
-                1,
-                Some("commandExecution"),
-                Some("echo 中"),
-            ),
+fn typed_call_identity_feeds_observe_once_without_the_retired_count_vocabulary() {
+    use external_contract::events::*;
+    let tracker = crate::RuntimeState::new();
+    let event = crate::RuntimeEnvelope::from(crate::test_support::typed_fact(
+        EventFact::ToolChanged(ToolChange {
+            call_id: CallId("codex-call-1".into()),
+            name: Some("commandExecution".into()),
+            category: None,
+            arguments: Some(ArgumentUpdate::Snapshot(
+                serde_json::json!({"command":"echo 中"}),
+            )),
+            phase: Some(ToolPhase::Started),
+            outcome: None,
+            failure: None,
+            denied: None,
         }),
     ));
-    // A re-delivered descriptor is the same logical call: weight and history
-    // both stay single.
     tracker.observe(&event);
     tracker.observe(&event);
     let snapshot = tracker.observation_snapshot();
     assert_eq!(snapshot.tools.len(), 1);
-    let tool = &snapshot.tools[0];
-    assert_eq!(tool.tool_name, "commandExecution");
-    assert_eq!(tool.call_count, 1);
-    assert_eq!(tool.recent_calls.len(), 1);
-    let call = &tool.recent_calls[0];
-    assert!(!call.tool_call_id.is_empty());
-    assert_eq!(call.arguments, serde_json::json!({"detail":"echo 中"}).as_object().unwrap().clone());
-    assert!(!call.arguments_truncated);
-    assert!(!snapshot.coverage.tool_history_complete);
+    assert_eq!(snapshot.tools[0].tool_name, "commandExecution");
+    assert_eq!(snapshot.tools[0].call_count, 1);
+    assert_eq!(
+        snapshot.tools[0].recent_calls[0].arguments["command"],
+        "echo 中"
+    );
     assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 1);
 }
 
@@ -590,9 +606,9 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
         .expect("codex activity tracker is present");
     assert_eq!(
         activity.window_60s.tool_calls_started, 2,
-        "the same item id counts once per turn after the boundary clears the dedupe set"
+        "the same item id projects once per turn after the boundary clears the dedupe set"
     );
-    // 计数去重按 turn 重置，observe 的调用身份同样按 turn 区分。
+    // 去重按 turn 重置，observe 的调用身份同样按 turn 区分。
     let observation = scheduler.observation_snapshot(&agent_id);
     assert_eq!(observation.tools.len(), 1);
     assert_eq!(observation.tools[0].tool_name, "commandExecution");
@@ -601,7 +617,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
     assert!(observation.tools[0]
         .recent_calls
         .iter()
-        .all(|call| call.arguments["detail"] == serde_json::json!("")));
+        .all(|call| call.arguments.is_empty() && call.arguments_truncated));
 }
 
 #[test]
@@ -1042,7 +1058,7 @@ fn closed_gate_refuses_spawn_without_a_process() {
 
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 #[test]
@@ -1240,10 +1256,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         .enqueue_general(&manifest_for(workspace.path(), "zcode terminal task"))
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
     store
         .mark_session_running(
@@ -1289,10 +1302,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, cancelled.agent_id);
     store
         .mark_session_running(
@@ -1329,10 +1339,7 @@ fn terminal_send_rejects_non_codex_cancelled_and_sessionless_tasks() {
         )
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-reject")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-reject").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, sessionless.agent_id);
     store
         .mark_session_running(
@@ -1395,10 +1402,7 @@ fn terminal_send_requeues_a_zcode_task_with_a_persisted_session_id() {
         ))
         .unwrap();
     let store = scheduler.store();
-    let claim = store
-        .claim_next("terminal-zcode")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("terminal-zcode").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, zcode_task.agent_id);
     store
         .mark_session_running(
@@ -1493,6 +1497,563 @@ sleep 1
         .expect("correlated failure record");
     assert!(record.contains("serverOverloaded"), "record: {record}");
     assert!(record.contains("cloudflare-api"), "record: {record}");
+}
+
+/// A scripted fresh task whose first turn replays `frames` after
+/// `turn/started`, in one NDJSON burst. The frames travel through a file so a
+/// fixture's own text (quotes, apostrophes, megabytes) needs no shell
+/// escaping at all.
+fn error_turn_script(workspace: &Path, frames: &[serde_json::Value]) -> String {
+    let echo = start_echo(workspace, PermissionMode::Plan);
+    let replay = frame_replay(workspace, frames);
+    format!(
+        r#"
+IFS= read -r line
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home","userAgent":"fake"}}}}'
+IFS= read -r line
+printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"{THREAD_ID}","ephemeral":false}},"model":"{MODEL}",{echo}}}}}'
+IFS= read -r line
+IFS= read -r line
+printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}' '{{"method":"turn/started","params":{{"threadId":"{THREAD_ID}","turn":{{"id":"codex-turn-1","status":"inProgress"}}}}}}'
+{replay}
+sleep 2
+"#
+    )
+}
+
+/// Write the native frames to one NDJSON file and return the shell line that
+/// replays them.
+fn frame_replay(workspace: &Path, frames: &[serde_json::Value]) -> String {
+    let mut body = String::new();
+    for frame in frames {
+        body.push_str(&frame.to_string());
+        body.push('\n');
+    }
+    std::fs::write(workspace.join("native-frames.jsonl"), body).unwrap();
+    "cat native-frames.jsonl".to_owned()
+}
+
+/// Submit one probe task against a scripted child and return the scheduler and
+/// its agent id once the task is ready to start.
+fn scripted_probe(workspace: &Path, script: &str, prompt: &str) -> (Scheduler, String) {
+    let scheduler = codex_scheduler(workspace, harness_factory(script, workspace));
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace, prompt),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    (scheduler, submitted.agent_id)
+}
+
+#[test]
+fn usage_limit_failure_delivers_the_complete_native_error() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // Synthetic composition of the documented `TurnError` fields
+    // (app-server-protocol v2 `thread_data.rs`) and the `error`
+    // notification's `willRetry` sibling (`notification.rs`): terminal
+    // usage-limit errors are exercised as a fixture, never by exhausting a
+    // real quota.
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "You've hit your usage limit.",
+                "codexErrorInfo": "usageLimitExceeded",
+            },
+            "willRetry": false,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    // The settling boundary names the same cause with a shorter message: the
+    // earlier complete native object is what the delivered result must carry.
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {
+                "id": "codex-turn-1",
+                "status": "failed",
+                "error": {
+                    "message": "usage limit reached",
+                    "codexErrorInfo": "usageLimitExceeded",
+                },
+            },
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "usage limit probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let delivered: serde_json::Value = serde_json::from_str(&result.result.final_text)
+        .expect("the failed turn delivers the structured native error");
+    assert_eq!(
+        delivered,
+        serde_json::json!({
+            "message": "You've hit your usage limit.",
+            "codexErrorInfo": "usageLimitExceeded",
+            "willRetry": false,
+        })
+    );
+    await_terminal_task(&scheduler, &agent_id);
+}
+
+#[test]
+fn http_object_error_delivers_the_status_details_and_retry_flag() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    // The reference app-server reports a retrying stream error as an `error`
+    // notification with `willRetry: true` and the surface-specific
+    // `additionalDetails` (bespoke_event_handling `EventMsg::StreamError`).
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "upstream response stream closed",
+                "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+                "additionalDetails": "The upstream proxy closed the stream mid-response.",
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    // The turn still fails, but the boundary carries no error object of its
+    // own, so the recorded notification error is all the native cause there is.
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "failed"},
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "http error probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let delivered: serde_json::Value = serde_json::from_str(&result.result.final_text)
+        .expect("the failed turn delivers the structured native error");
+    assert_eq!(
+        delivered,
+        serde_json::json!({
+            "message": "upstream response stream closed",
+            "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+            "additionalDetails": "The upstream proxy closed the stream mid-response.",
+            "willRetry": true,
+        })
+    );
+    await_terminal_task(&scheduler, &agent_id);
+}
+
+#[test]
+fn retry_error_does_not_settle_the_turn_and_a_later_completion_wins() {
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Selected model is at capacity.",
+                "codexErrorInfo": "serverOverloaded",
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let delta = serde_json::json!({
+        "method": "item/agentMessage/delta",
+        "params": {
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+            "itemId": "msg_1",
+            "delta": "RETRY_OK",
+        },
+    });
+    let finished = serde_json::json!({
+        "method": "item/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+            "item": {"type": "agentMessage", "id": "msg_1", "text": "RETRY_OK"},
+        },
+    });
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "completed", "error": null},
+        },
+    });
+    let script = error_turn_script(workspace.path(), &[error, delta, finished, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "retry probe");
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        result.result.outcome,
+        TaskOutcome::Completed,
+        "a retryable error notification must not settle the task as a failure"
+    );
+    assert_eq!(result.result.final_text, "RETRY_OK");
+    await_terminal_task(&scheduler, &agent_id);
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "a retried error must not be recorded as this task's cause: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+}
+
+/// Hold the monitor in its terminal wait until the scripted process exits,
+/// so completion followed by runtime loss is a deterministic interleaving.
+#[test]
+fn recovered_error_then_completed_turn_does_not_label_a_later_runtime_loss() {
+    struct ExitFirstRuntime(Arc<dyn ManagedRuntime>);
+    impl ManagedRuntime for ExitFirstRuntime {
+        fn identity(&self) -> Option<crate::ProcessIdentity> {
+            self.0.identity()
+        }
+        fn stop(&self, grace: Duration) -> crate::RuntimeTerminal {
+            self.0.stop(grace)
+        }
+        fn wait_terminal(&self, _: Duration) -> Option<crate::RuntimeTerminal> {
+            self.0.wait_terminal(SCRIPTED_SYNC_WAIT)
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            task: &TaskRecord,
+            servers: &[external_contract::StdioMcpServer],
+            timeout: Duration,
+        ) -> Result<crate::SessionReady, crate::RuntimeCommandError> {
+            self.0.bootstrap_session_with_mcp(task, servers, timeout)
+        }
+        fn turn_snapshot(&self) -> crate::TurnSnapshot {
+            self.0.turn_snapshot()
+        }
+        fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+            self.0.native_failure()
+        }
+        fn diagnostic_tail(&self) -> String {
+            self.0.diagnostic_tail()
+        }
+    }
+    struct ExitFirstFactory(CodexRuntimeFactory);
+    impl RuntimeFactory for ExitFirstFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Ok(Arc::new(ExitFirstRuntime(self.0.spawn(task, sink)?)))
+        }
+    }
+
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let frames = [
+        serde_json::json!({"method": "error", "params": {
+            "threadId": THREAD_ID, "turnId": "codex-turn-1", "willRetry": true,
+            "error": {"message": "RECOVERED_CAPACITY_ERROR", "codexErrorInfo": "serverOverloaded"}}}),
+        serde_json::json!({"method": "item/completed", "params": {
+            "threadId": THREAD_ID, "turnId": "codex-turn-1",
+            "item": {"type": "agentMessage", "id": "msg_1", "text": "RETRY_OK"}}}),
+        serde_json::json!({"method": "turn/completed", "params": {
+            "threadId": THREAD_ID, "turn": {"id": "codex-turn-1", "status": "completed", "error": null}}}),
+    ];
+    let script = error_turn_script(workspace.path(), &frames);
+    let script = format!(
+        "{}\nwhile [ ! -f exit-release ]; do sleep 0.01; done\nexit 1\n",
+        script.trim_end().strip_suffix("sleep 2").unwrap()
+    );
+    let store =
+        Arc::new(external_store::Store::open(workspace.path().join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "codex-test",
+        store,
+        Arc::new(ExitFirstFactory(harness_factory(&script, workspace.path()))),
+        SchedulerConfig {
+            bootstrap_timeout: SCRIPTED_SYNC_WAIT,
+            control_timeout: SCRIPTED_SYNC_WAIT,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let submitted = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), "recovered then exit"),
+            Some(codex_admission(Some(MODEL))),
+        )
+        .unwrap();
+    let agent_id = submitted.agent_id;
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    loop {
+        let (turn, _) = scheduler.active_turn_observation(&agent_id).unwrap();
+        if !turn.active && turn.boundary == Some(crate::TurnBoundary::Completed) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "recovered turn did not complete");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+    std::fs::write(workspace.path().join("exit-release"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::RuntimeLost);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.failure_code.as_deref(), Some("RUNTIME_TERMINAL"));
+    let failure = task.failure_message.expect("persisted runtime loss");
+    let diagnostic = scheduler
+        .last_error(&agent_id)
+        .expect("runtime loss diagnostic");
+    for record in [&failure, &diagnostic] {
+        let detail: serde_json::Value = serde_json::from_str(record).unwrap();
+        assert_eq!(detail["message"], "Exited(Exited(Some(1)))", "{record}");
+        assert!(detail.get("original_error").is_none(), "{record}");
+        // stderr_tail may retain the historical retry notification; it must
+        // not become the cause of this later process failure.
+    }
+}
+
+#[test]
+fn long_native_error_paginates_without_loss() {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let details = format!(
+        "Authorization: Bearer sk-test-secret\n{}",
+        "detail 信息 ".repeat(50_000)
+    );
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": {
+                "message": "Model request failed.",
+                "codexErrorInfo": "internalServerError",
+                "additionalDetails": details,
+            },
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let boundary = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": THREAD_ID,
+            "turn": {"id": "codex-turn-1", "status": "failed"},
+        },
+    });
+    // The error frame is far above any shell argument bound: the replay file
+    // carries it the way a real app-server replays a large terminal frame.
+    let script = error_turn_script(workspace.path(), &[error, boundary]);
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "long error probe");
+    scheduler.start_ready().unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    assert!(
+        !stored.result.final_text.contains("sk-test-secret"),
+        "the delivered native error must be redacted"
+    );
+    assert!(stored.result.final_text.contains("[REDACTED]"));
+    let delivered: serde_json::Value = serde_json::from_str(&stored.result.final_text).unwrap();
+    assert_eq!(delivered["message"], "Model request failed.");
+    assert_eq!(delivered["codexErrorInfo"], "internalServerError");
+    assert_eq!(delivered["willRetry"], true);
+    let delivered_details = delivered["additionalDetails"].as_str().unwrap();
+    assert!(
+        delivered_details.ends_with("detail 信息 "),
+        "the full additionalDetails must survive instead of being truncated"
+    );
+    assert!(delivered_details.len() > 400_000);
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let first = service
+        .dispatch(RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+            wait_mode: crate::rpc::WaitMode::All,
+        }))
+        .unwrap();
+    let RpcSuccess::TaskWait(first) = first else {
+        panic!("wait response")
+    };
+    let first = first.result.expect("terminal result view");
+    assert!(
+        first.next_offset.is_some(),
+        "a long native error must be paged, not discarded"
+    );
+    let mut text = first.final_text;
+    let mut offset = first.next_offset;
+    while let Some(next) = offset {
+        let response = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: next,
+                limit: 16384,
+            })
+            .unwrap();
+        let RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::Failed);
+        text.push_str(&page.final_text);
+        offset = page.next_offset;
+    }
+    assert_eq!(text, stored.result.final_text);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        delivered
+    );
+    assert!(!text.contains("sk-test-secret"));
+}
+
+/// Synthetic app-server error followed by a process exit, with no settling
+/// turn boundary. The release gate lets the test observe the processed error
+/// while the task is still running, independently of child scheduling.
+fn assert_native_error_survives_exit_before_boundary(exit_code: i32) {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+    let _guard = scripted_test_guard();
+    let workspace = codex_workspace();
+    let detail = "native detail 信息 ";
+    let body = detail.repeat(crate::rpc::MAX_RESULT_CHUNK_BYTES / detail.len() + 1);
+    let native = serde_json::json!({
+        "message": "upstream response stream closed",
+        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 502}},
+        "additionalDetails": format!("api_key=sk-exit-secret；上下文：{body}"),
+    });
+    let error = serde_json::json!({
+        "method": "error",
+        "params": {
+            "error": native,
+            "willRetry": true,
+            "threadId": THREAD_ID,
+            "turnId": "codex-turn-1",
+        },
+    });
+    let script = format!(
+        "{}\nwhile [ ! -f exit-release ]; do sleep 0.01; done\nexit {exit_code}\n",
+        error_turn_script(workspace.path(), &[error]),
+    );
+    let (scheduler, agent_id) = scripted_probe(workspace.path(), &script, "error then exit");
+    scheduler.start_ready().unwrap();
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    // This fixture's only error is the attributable notification. Its typed
+    // ErrorObserved fact persists only after the complete native value is
+    // recorded for the boundary/exit fallback.
+    while codex_error_fact_count(workspace.path(), &agent_id) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "error notification was not processed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (turn, stop_boundaries) = scheduler.active_turn_observation(&agent_id).unwrap();
+    assert!(
+        turn.active,
+        "an error notification must not settle the turn"
+    );
+    assert_eq!(turn.boundary, None);
+    assert_eq!(stop_boundaries, 0);
+    assert_eq!(
+        scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .phase,
+        TaskPhase::Running,
+    );
+    assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+    std::fs::write(workspace.path().join("exit-release"), "").unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::RuntimeLost);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::RuntimeLost));
+    assert_eq!(task.failure_code.as_deref(), Some("RUNTIME_TERMINAL"));
+    assert_eq!(
+        codex_event_count(workspace.path(), &agent_id, "runtime.turn_failed"),
+        0,
+    );
+    let diagnostic = scheduler.last_error(&agent_id).unwrap();
+    assert!(!diagnostic.contains("sk-exit-secret"));
+    assert!(!diagnostic.contains("additionalDetails"));
+    assert!(diagnostic.len() <= 16 * 1024, "diagnostics remain bounded");
+
+    let mut expected = native;
+    expected["additionalDetails"] = format!("api_key=[REDACTED]；上下文：{body}").into();
+    expected["willRetry"] = true.into();
+    let delivered: serde_json::Value = serde_json::from_str(&stored.result.final_text)
+        .unwrap_or_else(|error| {
+            panic!(
+                "runtime loss must deliver the already received native error: {error}; final_text prefix: {:?}",
+                stored.result.final_text.chars().take(160).collect::<String>(),
+            )
+        });
+    assert_eq!(delivered, expected);
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let first = service
+        .dispatch(RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+            wait_mode: crate::rpc::WaitMode::All,
+        }))
+        .unwrap();
+    let RpcSuccess::TaskWait(first) = first else {
+        panic!("wait response")
+    };
+    let first = first.result.expect("terminal runtime-loss result");
+    assert_eq!(first.outcome, TaskOutcome::RuntimeLost);
+    assert!(
+        first.next_offset.is_some(),
+        "the complete error must be paged"
+    );
+    assert!(!first.final_text.contains("sk-exit-secret"));
+    let mut text = first.final_text;
+    let mut offset = first.next_offset;
+    while let Some(next) = offset {
+        let response = service
+            .dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset: next,
+                limit: 16384,
+            })
+            .unwrap();
+        let RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::RuntimeLost);
+        assert!(!page.final_text.contains("sk-exit-secret"));
+        text.push_str(&page.final_text);
+        offset = page.next_offset;
+    }
+    assert_eq!(text, stored.result.final_text);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        expected,
+    );
+}
+
+#[test]
+fn native_error_survives_exit_before_boundary_with_exit_zero() {
+    assert_native_error_survives_exit_before_boundary(0);
+}
+
+#[test]
+fn native_error_survives_exit_before_boundary_with_exit_one() {
+    assert_native_error_survives_exit_before_boundary(1);
 }
 
 #[test]
@@ -2134,10 +2695,7 @@ fn terminal_send_keeps_old_process_identity_when_reap_is_unproven() {
         )
         .unwrap();
     let agent_id = submitted.agent_id.clone();
-    let claim = store
-        .claim_next("orphan-owner")
-        .unwrap()
-        .unwrap();
+    let claim = store.claim_next("orphan-owner").unwrap().unwrap();
     assert_eq!(claim.task.agent_id, agent_id);
     store
         .mark_session_running(
@@ -2591,8 +3149,7 @@ fn yolo_resume_redeclares_and_confirms_the_danger_full_access_posture() {
             r#"{{"id":2,"result":{{"thread":{{"id":"codex-thread-1","ephemeral":false}},"model":"gpt-5.6-terra",{sandbox},"approvalPolicy":"never","cwd":"{}"}}}}"#,
             directory.to_string_lossy()
         );
-        let store =
-            Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
+        let store = Arc::new(external_store::Store::open(directory.join("state.sqlite")).unwrap());
         let scheduler = Scheduler::new(
             "codex-resume-yolo-ok",
             store,
@@ -2601,11 +3158,7 @@ fn yolo_resume_redeclares_and_confirms_the_danger_full_access_posture() {
                     &happy_turn(&directory, PermissionMode::Yolo),
                     &directory,
                 ))),
-                second: yolo_resume_case(
-                    &directory,
-                    &resume_result,
-                    "codex-resume-yolo-ok.sh",
-                ),
+                second: yolo_resume_case(&directory, &resume_result, "codex-resume-yolo-ok.sh"),
             }),
             SchedulerConfig {
                 bootstrap_timeout: Duration::from_secs(30),
@@ -2797,6 +3350,117 @@ while IFS= read -r line; do printf '%s\n' "$line" >> deliveries-resume.jsonl; do
     resume_phase_factory(directory, &script, child)
 }
 
+/// The barrier is processed by the same ordered notification pump after the
+/// downgrade, while the native resume response is still withheld. This proves
+/// attribution from the first frame without depending on thread scheduling.
+#[test]
+fn resume_settings_downgrade_precedes_response_without_admitting_work() {
+    let _guard = scripted_test_guard();
+    for valid_response in [true, false] {
+        struct BarrierSink(Mutex<Option<std::sync::mpsc::Sender<()>>>);
+        impl LifecycleSink for BarrierSink {
+            fn emit(&self, envelope: crate::RuntimeEnvelope) {
+                if matches!(envelope, crate::RuntimeEnvelope::Terminal { .. })
+                    || envelope.normalized().is_some_and(|event| {
+                        matches!(
+                            event.fact,
+                            external_contract::events::EventFact::Diagnostic(_)
+                        )
+                    })
+                {
+                    if let Some(sender) = self.0.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        }
+        let workspace = codex_workspace();
+        let directory = workspace.path();
+        let scheduler = codex_scheduler(directory, CodexRuntimeFactory::closed());
+        let submitted = scheduler
+            .enqueue_general_with_admission(
+                &manifest_for_mode(directory, "resume ordering", PermissionMode::Yolo),
+                Some(codex_admission(Some(MODEL))),
+            )
+            .unwrap();
+        let mut task = scheduler
+            .store()
+            .get_task(&submitted.agent_id)
+            .unwrap()
+            .unwrap();
+        task.session_id = Some(THREAD_ID.into());
+        let response = serde_json::json!({
+            "id": 2,
+            "result": {
+                "thread": {"id": if valid_response { THREAD_ID } else { "foreign-thread" }, "ephemeral": false},
+                "model": MODEL,
+                "sandbox": {"type": "dangerFullAccess"},
+                "approvalPolicy": "never",
+                "cwd": directory,
+            }
+        });
+        let script = format!(
+            r#"
+IFS= read -r line
+printf '%s\n' '{{"id":1,"result":{{"codexHome":"/tmp/codex-home"}}}}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> resume-deliveries.jsonl
+  case "$line" in *'"method":"thread/resume"'*) break ;; esac
+done
+printf '%s\n' \
+  '{{"method":"thread/settings/updated","params":{{"threadId":"{THREAD_ID}","threadSettings":{{"sandboxPolicy":{{"type":"workspaceWrite","networkAccess":false}}}}}}}}' \
+  '{{"method":"test/resumeBarrier","params":{{}}}}'
+while [ ! -f release-resume ]; do sleep 0.01; done
+printf '%s\n' '{response}'
+while IFS= read -r line; do printf '%s\n' "$line" >> resume-deliveries.jsonl; done
+"#
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(script).current_dir(directory);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let owner = Arc::new(
+            CodexRuntimeOwner::spawn(command, Arc::new(BarrierSink(Mutex::new(Some(sender)))))
+                .unwrap(),
+        );
+        let resumed_owner = Arc::clone(&owner);
+        let resumed = thread::spawn(move || {
+            resumed_owner.resume_session_with_mcp(&task, &[], SCRIPTED_SYNC_WAIT)
+        });
+        let barrier = receiver.recv_timeout(SCRIPTED_SYNC_WAIT);
+        let before_response = owner.wait_terminal(Duration::ZERO);
+        let admitted_before_response = owner.shared.admitted_model.lock().unwrap().clone();
+        // Always release and reap before asserting, including the red baseline.
+        std::fs::write(directory.join("release-resume"), b"release").unwrap();
+        let result = resumed.join().unwrap();
+        let admitted_after_response = owner.shared.admitted_model.lock().unwrap().clone();
+        owner.cleanup_for_forced_failure(Duration::from_secs(1));
+        barrier.expect("pump processed the settings terminal or the following barrier");
+        assert!(
+            matches!(before_response,
+                Some(crate::RuntimeTerminal::FailedRuntimeLost(crate::RuntimeLoss::PostureViolation(ref posture)))
+                if posture == "workspaceWrite"
+            ),
+            "downgrade must be caught before resume response: {before_response:?}"
+        );
+        assert_eq!(admitted_before_response, None);
+        assert_eq!(
+            result.is_ok(),
+            valid_response,
+            "resume echo must still be validated: {result:?}"
+        );
+        assert_eq!(
+            admitted_after_response,
+            valid_response.then(|| MODEL.to_owned())
+        );
+        let deliveries =
+            std::fs::read_to_string(directory.join("resume-deliveries.jsonl")).unwrap();
+        assert!(
+            !deliveries.contains("turn/start"),
+            "resume validation admits no turn itself"
+        );
+    }
+}
+
 #[test]
 fn posture_violating_settings_notification_fails_the_runtime() {
     let _guard = scripted_test_guard();
@@ -2869,7 +3533,10 @@ fn posture_violating_settings_notification_fails_the_runtime() {
     // own failure message; either carrier is sufficient evidence.
     let record = scheduler.last_error(&agent_id).expect("failure record");
     let evidence = format!("{record} {}", task.failure_message.unwrap_or_default());
-    assert!(evidence.contains("PostureViolation"), "evidence: {evidence}");
+    assert!(
+        evidence.contains("PostureViolation"),
+        "evidence: {evidence}"
+    );
     assert!(evidence.contains("workspaceWrite"), "evidence: {evidence}");
     let deliveries = std::fs::read_to_string(directory.join("deliveries-resume.jsonl"))
         .expect("the resumed process logs its own frames");
@@ -3440,6 +4107,20 @@ fn codex_event_count(workspace: &Path, agent_id: &str, event_type: &str) -> i64 
         .query_row(
             "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type=?2",
             rusqlite::params![agent_id, event_type],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Count persisted typed error facts: the content-free lifecycle summary is
+/// the only payload shape admitted for a `runtime.fact` row.
+fn codex_error_fact_count(workspace: &Path, agent_id: &str) -> i64 {
+    let connection = rusqlite::Connection::open(workspace.join("state.sqlite")).unwrap();
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='runtime.fact' \
+             AND payload_json LIKE '%\"category\":\"error\"%'",
+            rusqlite::params![agent_id],
             |row| row.get(0),
         )
         .unwrap()

@@ -295,6 +295,105 @@ pub enum TelemetryStatusView {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPhaseView {
+    Started,
+    Completed,
+    Failed,
+    RetryScheduled,
+    StreamStalled,
+}
+
+/// Native retry information. Descriptive only: `will_retry` is not permission
+/// for ES or the caller to retry, and every field is absent unless the native
+/// source provided it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeRetryView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub will_retry: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+}
+
+impl NativeRetryView {
+    /// An adapter may carry a retry container with no native field at all. The
+    /// public view omits it rather than claiming retry information exists.
+    fn is_empty(&self) -> bool {
+        self.will_retry.is_none()
+            && self.retryable.is_none()
+            && self.attempt.is_none()
+            && self.max_attempts.is_none()
+            && self.next_attempt.is_none()
+            && self.delay_ms.is_none()
+            && self.reset_at.is_none()
+    }
+}
+
+/// The latest native model-activity fact for the current launch. The field is
+/// absent when the source never provided one; no wait age or attempt number is
+/// synthesized for a source without that capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelActivityView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    pub phase: ModelPhaseView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<NativeRetryView>,
+}
+
+impl From<crate::ModelActivityView> for ModelActivityView {
+    fn from(value: crate::ModelActivityView) -> Self {
+        use external_contract::events::ModelPhase;
+        Self {
+            request_id: value.request_id.map(|id| id.0),
+            phase: match value.phase {
+                ModelPhase::Started => ModelPhaseView::Started,
+                ModelPhase::Completed => ModelPhaseView::Completed,
+                ModelPhase::Failed => ModelPhaseView::Failed,
+                ModelPhase::RetryScheduled => ModelPhaseView::RetryScheduled,
+                ModelPhase::StreamStalled => ModelPhaseView::StreamStalled,
+            },
+            retry: value.retry.and_then(|retry| {
+                let view = NativeRetryView {
+                    will_retry: retry.will_retry,
+                    retryable: retry.retryable,
+                    attempt: retry.attempt,
+                    max_attempts: retry.max_attempts,
+                    next_attempt: retry.next_attempt,
+                    delay_ms: retry.delay_ms,
+                    reset_at: retry.reset_at,
+                };
+                (!view.is_empty()).then_some(view)
+            }),
+        }
+    }
+}
+
+/// One bounded, already-sanitized diagnostic summary entry from the common
+/// state. The reason vocabulary is closed upstream; `impact` distinguishes a
+/// known affected dimension from an unknown scope, and `discriminator` is a
+/// safe native method/type token, never a payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityDiagnosticView {
+    pub source: external_contract::events::SourceProtocol,
+    pub reason: String,
+    pub impact: external_contract::events::Impact,
+    pub discriminator: String,
+    pub count: u64,
+    pub last_observed_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskActivityView {
     pub latest_text_tail: String,
@@ -303,13 +402,25 @@ pub struct TaskActivityView {
     pub tool_calls_last_60s: u64,
     /// Number of tracked in-flight tool calls (scheduled or started without a
     /// matching result/error/permission resolution). 0 when there is no
-    /// snapshot or the adapter has no per-call lifecycle tracking.
+    /// snapshot or the source has no per-call lifecycle capability.
     pub in_flight_tool_count: u64,
     /// Age in milliseconds of the oldest tracked in-flight tool call, measured
     /// from its first insertion; null when nothing is in flight.
     pub oldest_in_flight_tool_age_ms: Option<u64>,
     pub last_activity_age_ms: Option<u64>,
     pub model_request_active: bool,
+    /// Absent unless the native source provided a model-activity fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_activity: Option<ModelActivityView>,
+    /// Bounded, deduplicated anomaly summary from the common state. Empty means
+    /// no known anomaly (never a completeness claim); it is not recomputed by
+    /// this query.
+    #[serde(default)]
+    pub diagnostics: Vec<ActivityDiagnosticView>,
+    /// True when the bounded summary folded entries beyond its cap into the
+    /// `summary_limit` record.
+    #[serde(default)]
+    pub diagnostics_truncated: bool,
     pub telemetry_status: TelemetryStatusView,
 }
 
@@ -591,6 +702,9 @@ pub(crate) fn task_activity_view(
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Unavailable,
         };
     };
@@ -602,10 +716,24 @@ pub(crate) fn task_activity_view(
         oldest_in_flight_tool_age_ms: snapshot.oldest_active_tool_age_ms,
         last_activity_age_ms: snapshot.last_activity_age_ms,
         model_request_active: snapshot.model_request_active,
-        telemetry_status: if snapshot.telemetry_degraded {
-            TelemetryStatusView::Degraded
-        } else {
-            TelemetryStatusView::Healthy
+        model_activity: snapshot.model_activity.map(Into::into),
+        diagnostics: snapshot
+            .diagnostics
+            .into_iter()
+            .map(|entry| ActivityDiagnosticView {
+                source: entry.source,
+                reason: entry.reason,
+                impact: entry.impact,
+                discriminator: entry.discriminator,
+                count: entry.count,
+                last_observed_at: entry.last_observed_at,
+            })
+            .collect(),
+        diagnostics_truncated: snapshot.diagnostics_truncated,
+        telemetry_status: match snapshot.telemetry_status {
+            crate::TelemetryStatus::Healthy => TelemetryStatusView::Healthy,
+            crate::TelemetryStatus::Degraded => TelemetryStatusView::Degraded,
+            crate::TelemetryStatus::Unavailable => TelemetryStatusView::Unavailable,
         },
     }
 }
@@ -638,7 +766,8 @@ mod activity_projection_tests {
                 tool_calls_started: 4,
                 ..PassiveActivityWindow::default()
             },
-            telemetry_degraded: true,
+            telemetry_status: crate::TelemetryStatus::Degraded,
+            coverage: crate::RuntimeCoverage::default(), diagnostics: vec![], model_activity: None, diagnostics_truncated: false,
         }
     }
 
@@ -689,6 +818,97 @@ mod activity_projection_tests {
         assert_eq!(activity.last_activity_age_ms, None);
         assert!(!activity.model_request_active);
         assert_eq!(activity.telemetry_status, TelemetryStatusView::Unavailable);
+    }
+
+    #[test]
+    fn activity_projection_forwards_native_model_activity_and_retry_detail() {
+        let mut snapshot = snapshot();
+        assert!(task_activity_view(TaskPhase::Running, Some(snapshot.clone()))
+            .model_activity
+            .is_none());
+        snapshot.model_activity = Some(crate::ModelActivityView {
+            request_id: Some(external_contract::events::RequestId("req-7".into())),
+            phase: external_contract::events::ModelPhase::RetryScheduled,
+            retry: Some(external_contract::events::NativeRetry {
+                will_retry: Some(true),
+                retryable: Some(true),
+                attempt: Some(2),
+                max_attempts: Some(4),
+                next_attempt: Some(3),
+                delay_ms: Some(1_500),
+                reset_at: Some("2026-11-07T00:00:00Z".into()),
+            }),
+        });
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        let model = activity.model_activity.unwrap();
+        assert_eq!(model.request_id.as_deref(), Some("req-7"));
+        assert_eq!(model.phase, super::ModelPhaseView::RetryScheduled);
+        let retry = model.retry.unwrap();
+        assert_eq!(retry.attempt, Some(2));
+        assert_eq!(retry.max_attempts, Some(4));
+        assert_eq!(retry.delay_ms, Some(1_500));
+        assert_eq!(retry.reset_at.as_deref(), Some("2026-11-07T00:00:00Z"));
+    }
+
+    #[test]
+    fn activity_projection_delivers_the_bounded_diagnostic_summary_and_truncation_flag() {
+        // No snapshot: the summary is honestly empty, not a fabricated health
+        // claim, and the unavailable status is unchanged.
+        let missing = task_activity_view(TaskPhase::Queued, None);
+        assert!(missing.diagnostics.is_empty());
+        assert!(!missing.diagnostics_truncated);
+
+        let mut snapshot = snapshot();
+        snapshot.diagnostics = (0..32)
+            .map(|index| crate::runtime_observation::DiagnosticSummary {
+                source: external_contract::events::SourceProtocol::ZcodeSession,
+                reason: if index == 31 {
+                    "summary_limit".into()
+                } else if index % 2 == 0 {
+                    "malformed".into()
+                } else {
+                    "unknown_semantics".into()
+                },
+                impact: if index % 2 == 0 {
+                    external_contract::events::Impact::Known(vec![
+                        external_contract::events::CoverageDimension::Tools,
+                    ])
+                } else {
+                    external_contract::events::Impact::Unknown
+                },
+                discriminator: format!("token-{index}"),
+                count: index as u64 + 1,
+                last_observed_at: 1_700_000_000_000 + index as u64,
+            })
+            .collect();
+        snapshot.diagnostics_truncated = true;
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        assert_eq!(activity.diagnostics.len(), 32);
+        assert!(activity.diagnostics_truncated);
+        assert_eq!(activity.diagnostics[0].reason, "malformed");
+        assert_eq!(
+            activity.diagnostics[0].impact,
+            external_contract::events::Impact::Known(vec![
+                external_contract::events::CoverageDimension::Tools
+            ])
+        );
+        assert_eq!(activity.diagnostics[0].count, 1);
+        assert_eq!(activity.diagnostics[0].last_observed_at, 1_700_000_000_000);
+        assert_eq!(activity.diagnostics[1].impact, external_contract::events::Impact::Unknown);
+        assert_eq!(activity.diagnostics[31].reason, "summary_limit");
+        assert_eq!(activity.diagnostics[31].count, 32);
+    }
+
+    #[test]
+    fn degraded_without_a_summary_does_not_invent_an_entry() {
+        let mut snapshot = snapshot();
+        snapshot.telemetry_status = crate::TelemetryStatus::Degraded;
+        snapshot.diagnostics.clear();
+        snapshot.diagnostics_truncated = false;
+        let activity = task_activity_view(TaskPhase::Running, Some(snapshot));
+        assert_eq!(activity.telemetry_status, TelemetryStatusView::Degraded);
+        assert!(activity.diagnostics.is_empty());
+        assert!(!activity.diagnostics_truncated);
     }
 
     #[test]
@@ -799,6 +1019,9 @@ mod result_paging_tests {
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }

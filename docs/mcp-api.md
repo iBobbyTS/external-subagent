@@ -40,6 +40,7 @@ Codex 支持 plugin 和直接 MCP 两种安装方式。host 注册只服务于�
 | 工具清单、输入、输出、注册和错误映射 | [mcp.rs](../crates/external-daemon/src/mcp.rs)：`PUBLIC_TOOLS`、`SubagentMcp`、各 `Agent*Input/Output` |
 | 分页、等待、消息、请求响应的实际语义 | [rpc.rs](../crates/external-daemon/src/rpc.rs)：`RpcService`、`paged_text_bounds` |
 | 仓库和写入范围约束 | [general.rs](../crates/external-core/src/general.rs)：`canonical_general_repository`、`validate_manifest`、`validate_write_scope` |
+| 共享类型化事件模型、错误与覆盖合同 | [event-model.md](event-model.md) |
 | 静态公共契约摘要 | [external-subagent-public-api.json](../schema/external-subagent-public-api.json) |
 | observe 的完整输出 schema | [observation.schema.json](../schema/observation.schema.json) |
 
@@ -241,7 +242,7 @@ spawn 标注非幂等；返回超时按变体如实处理：
 |---|---|---|---|
 | `task` | PublicTaskHeader（§13.1） | 检查单一生命周期状态；wait 不重复携带不可变的准入 provenance 与 session_id（input_identity 由 list/result/cancel/close 的 PublicTask 提供） | 无法从等待响应直接判断任务生命周期 |
 | `pending_requests` | PublicPendingRequest[] | 找出需要 respond 的权限或用户问题 | 任务等待输入时缺少可操作的请求 ID 和语义 |
-| `activity` | PublicActivity | 查看文本尾部、近期工具频度、未决工具调用与遥测可信度 | 难以判断运行中是在工作还是停滞 |
+| `activity` | PublicActivity | 查看文本尾部、近期工具频度、未决工具调用、模型活动、有界诊断摘要与遥测可信度 | 难以判断运行中是在工作还是停滞 |
 | `result` | PublicResult/null | 内嵌结果，避免再请求首段；`next_offset` 为 null 即已取完全文，否则按其继续分页 | 必须额外调用 result，长结果仍需分页 |
 | `timed_out` | boolean | 区分本次等待到期与事件唤醒 | 容易把等待到期误判为任务失败；不等于 status=timed_out |
 | `message_receipt` | MessageReceipt/null | 关联输入 message_id 的投递反馈 | 不能获知所发消息的投递状态；不保证模型已经执行消息要求 |
@@ -287,15 +288,17 @@ spawn 标注非幂等；返回超时按变体如实处理：
 | `recent_calls[].arguments` | object | 判断是否重复相同输入、是否在探索新路径 | 只有名称无法判断动作是否等价 |
 | `recent_calls[].arguments_truncated` | boolean | 判断参数是否完整 | 易把被截断参数误当作完整输入 |
 | `recent_calls[].redacted_fields` | integer | 说明字段脱敏数量 | 易把缺失数据误当作没有提供 |
-| `reasoning` | object 或 null | zcode/dsh 公开推理尾部的容器；codex 与 agy 整个字段为 null | 缺少动作上下文 |
+| `recent_calls[].status` | `unknown` / `pending` / `running` / `finished` / `succeeded` / `failed` / `cancelled` | 判断该调用当前阶段与终态：`unknown`=没有原生 phase 证据；`finished`=已结束但无成功/失败证据；`succeeded` 仅来自原生明确事实。字段始终在场，旧客户端可忽略 | 只能靠名称/参数猜测调用是否仍在执行或已失败 |
+| `reasoning` | object 或 null | 公开推理尾部的容器；仅在确实观察到公开 summary/thought delta 时出现，否则整个字段为 null | 缺少动作上下文 |
 | `reasoning.text` | string，最多 200 Unicode 字符 | 理解最近公开思路 | 判断上下文减少；不含加密内容或私有推理 |
 | `reasoning.truncated` | boolean | 提醒只看到了尾部片段 | 易把片段当作完整解释 |
+| `reasoning.source` | object/省略 | 实际观察到公开推理时标明原生来源 `{protocol, channel}`（`protocol` 如 `zcode_session`、`dsh_acp_v1`；`channel` 为 `summary`/`thought`）；未观察到时省略。产物是观测证据，不是按 adapter 名称固定的能力声明 | 无法区分推理来自哪条原生公开通道 |
 | `coverage` | object | 描述采集完整性 | 无法评估观测证据的局限 |
 | `coverage.tool_history_complete` | boolean | 判断工具历史采集是否完整 | 易把未观测到当作没发生；不意味着有限窗口返回所有调用 |
 | `coverage.reasoning_complete` | boolean | 判断推理采集覆盖 | 易对缺失片段过度推断 |
 | `coverage.dropped_events` | integer | 量化丢弃事件 | 无法衡量证据缺口 |
 
-zcode 保留固定运行时来源校验；dsh 使用公开 ACP thought 管道，工具调用来自 `tool_call` 公开事件，daemon 在 started 帧附加 `rawInput` 时返回真实参数，缺失时返回空参数对象并标记 `arguments_truncated: true`；agy 的 `tool.updated` started 帧同样携带工具名与参数。codex 的 count-only 描述符（`tool` + `detail`）也进入 `recent_calls`，`detail` 以单键 `arguments.detail` 呈现并遵循既有截断/脱敏规则。除 zcode 外，dsh/agy/codex 的工具历史都不完整，`coverage.tool_history_complete: false`。codex 与 agy 不采集推理，`reasoning: null`，`coverage.reasoning_complete: false`。尚未启动或 daemon 重启后缺失活动记录时，dsh/codex/agy 返回空工具列表和不完整 coverage（dsh 推理文本为空）；缺失 zcode 来源证据时仍返回 `unavailable`。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。
+工具调用详情来自各通道 adapter 已解释的公开事件：DSH 的 `tool_call`/`tool_call_update` 在提供 `rawInput` 时返回真实参数，缺失时返回空参数对象并标记 `arguments_truncated: true`；AGY 的 `tool.updated` started 帧携带工具名与参数；Codex 的受限描述符以单键 `arguments.detail` 呈现并遵循既有截断/脱敏规则。工具历史与推理覆盖按实际能力与实际缺口生成，不按 subagent 名称固定：没有逐调用生命周期能力的来源其 `in_flight_tool_count` 保持 0（表示无跟踪信息，不是“无命令运行”），未观察到公开推理的来源 `reasoning` 为 `null` 且 `coverage` 如实反映缺口。尚未启动或 daemon 重启后缺失活动记录时返回空工具列表与诚实 coverage，不补造历史。`dropped_events` 只统计已知丢弃事件，0 不证明 coverage 完整。完整合同见 [event-model.md](event-model.md)。
 
 不返回工具结果，因而不能据此证明执行成功、文件没有变化或任务失败。公开描述中的 `PROGRESSING / EXPECTED_WAIT / NEEDS_CLARIFICATION / NO_PROGRESS_LOOP / INSUFFICIENT_OBSERVABILITY` 是调用方判断用语，**不是返回字段或服务端分类结果**。
 
@@ -472,12 +475,15 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 |---|---|---|---|
 | `latest_text_tail` | string | 增量投递：仅返回自上次任意 wait 之后新增的公开文本；空串表示无新增。每个字节最多经 wait 投递一次（后到的 wait 只见新内容）；终态响应里与内嵌 result 页逐字节重复的后缀会被剥除，不重复传输 | 缺少人可读活动线索 |
 | `latest_text_truncated` | boolean | 为 true 表示本次返回相对上次投递存在缺口：尚未投递的字节已滚出 8 KiB 窗口，本次返回退化为整个窗口 | 易把片段当完整输出 |
-| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数（来源：zcode 原生 `tool.updated`、dsh ACP 归一化、agy stream-json 工具 step 归一化、codex 适配器白名单 count-only 投影；codex 错过 item/started 的回填按完成通知的接收时间计入窗口，发起可能早于窗口） | 看不出近期是否有工具活动 |
-| `in_flight_tool_count` | integer | 已跟踪的未决工具调用数：Detailed 事件 scheduled **或** started 起算，result/错误/权限落定移除，turn 完成或失败清零；codex（count-only）无逐调用生命周期跟踪，恒为 0——0 表示无跟踪信息而非"无命令运行"；无快照（daemon 重启后）为 0 | 无法判断是否仍有已跟踪的工具调用尚未返回 |
-| `oldest_in_flight_tool_age_ms` | integer/null | 最久的未决工具调用自首次插入起算的毫秒数；无未决调用、无快照或 count-only adapter 时为 null | 无法判断那条未决调用已未返回多久 |
+| `tool_calls_last_60s` | integer | 最近60秒内所有工具的发起计数，来源为该通道已解释的公开工具事件；没有逐调用生命周期的来源只统计其真正提供的发起事实，错过开始的完成回填按完成通知接收时间计入窗口，发起可能早于窗口 | 看不出近期是否有工具活动 |
+| `in_flight_tool_count` | integer | 已跟踪的未决工具调用数：原生 scheduled **或** started 起算，result/错误/权限落定移除，turn 完成或失败清零；没有逐调用生命周期能力的来源恒为 0——0 表示无跟踪信息而非"无命令运行"；无快照（daemon 重启后）为 0 | 无法判断是否仍有已跟踪的工具调用尚未返回 |
+| `oldest_in_flight_tool_age_ms` | integer/null | 最久的未决工具调用自首次插入起算的毫秒数；无未决调用、无快照或来源不提供逐调用生命周期时为 null | 无法判断那条未决调用已未返回多久 |
 | `last_activity_age_ms` | integer/null | 最近一次被采纳活动事件距快照的毫秒数；直接透出已有快照，尚无活动时为 null | 看不出活动新鲜程度 |
 | `model_request_active` | boolean | 直接透出已有快照中的模型请求活跃状态；无快照时为 false | 无法区分等待模型与其他阶段 |
-| `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠 | “没有观测”容易被误判为“没有活动” |
+| `model_activity` | object/省略 | 仅当 native 来源确实提供模型活动事实时出现：`request_id`（可选）、原生 `phase`（`started/completed/failed/retry_scheduled/stream_stalled`）与已提供的 `retry` 详情（`will_retry`/`retryable`/`attempt`/`max_attempts`/`next_attempt`/`delay_ms`/`reset_at`，缺项省略）。不生成等待时间或尝试数；重试等待不是降级，也不触发 ES 自动重试。并发请求时表示最近一条原生事实（自带 request_id），整体活跃度看 `model_request_active` | 只能靠 `model_request_active` 判断，无法区分正常重试等待与没有有效模型活动 |
+| `diagnostics` | array，最多 32 条 | 共同状态保留的已脱敏异常摘要（去重后的原生输入）：`source`（原生协议）、`reason`（受控处置原因：unknown_semantics/malformed/truncated/dropped/permission_denied/auxiliary_terminal/retention_limit/summary_limit；AGY 成功 result 的 denied_actions 记一条 permission_denied，拒绝不是丢包，不改变 outcome）、`impact`（`{scope:"known",dimensions:[...]}` 或 `{scope:"unknown"}`）、`discriminator`（安全 method/type token，不含 payload）、`count`（去重后的原生输入次数）、`last_observed_at`（epoch 毫秒）。空数组表示没有已知异常，不是完整性的证明；重复 wait 只读取同一份保留摘要，不重算、不重新持久化、不增加计数 | 只能看到 `telemetry_status=degraded`，无法知道哪条关联受损、原因、影响维度与次数；unknown-impact 异常可能完全不可见 |
+| `diagnostics_truncated` | boolean | 为 true 表示摘要达到上限，超出条目折叠进 `summary_limit` 记录 | 易把有界摘要当作完整异常历史 |
+| `telemetry_status` | `healthy / degraded / unavailable` | 判断其他遥测字段是否可靠；与 `diagnostics` 独立，degraded 不保证一定有条目 | “没有观测”容易被误判为“没有活动” |
 
 计数不能证明产生了有效任务进展。逐工具调用参数、reasoning 尾部与覆盖率缺口不在 wait 中传输：需要这些深度诊断时调用 observe（见 §7）。
 
@@ -499,7 +505,13 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
     "component": "daemon",
     "operation": "result",
     "request_id": "subagent-mcp-12",
-    "agent_id": 12345678
+    "agent_id": 12345678,
+    "native_error": {
+      "truncated": false,
+      "total_bytes": 812,
+      "limit_bytes": 1048576,
+      "original": { "message": "native failure text", "code": "rate_limit" }
+    }
   }
 }
 ```
@@ -514,6 +526,7 @@ offset 是 UTF-8 **字节偏移**，须是合法字符边界；使用服务端 n
 | `error.request_id` | string/省略 | 关联 facade 发起的 RPC 请求 | 无法从错误定位具体 RPC；不是待回答问题的 ID |
 | `error.agent_id` | integer/省略 | 关联任务或冲突的活动任务 | 难以查找受影响任务 |
 | `error.prompt_count` | integer/省略 | subagent 路由／能力拒绝及 Validation/Malformed 准入拒绝时记录0，说明未送出 prompt | 缺少拒绝发生在模型调用前的显式证据；不是通用 token 计费统计 |
+| `error.native_error` | object/省略 | 同步原生控制失败的完整脱敏原件：`original` 为权威值，`projection` 仅含原生明确语义；`truncated=true` 时 `original` 为 null 并报告 `total_bytes`/`limit_bytes`（硬上限 1 MiB）。ES 自己的 code/message 仍描述本层操作 | 调用方只能拿到 ES 摘要，无法获得原生错误原文与错误链 |
 
 当前公开映射的错误码：
 
@@ -526,7 +539,7 @@ timeout, runtime_lost, result_invalid, persistence, internal,
 unavailable, daemon_unavailable
 ```
 
-`conflict` 的 message 可为 `MESSAGE_ID_CONFLICT` 或通用 `durable state conflict`。结构化 message 可能是有意收敛后的说明，文本 content 可能包含有界校验细节；不要假设两者完全相同。错误不保证都能附带 operation、request_id、agent_id，例如在请求派发前失败时。
+`conflict` 的 message 可为 `MESSAGE_ID_CONFLICT` 或通用 `durable state conflict`。结构化 message 可能是有意收敛后的说明，文本 content 可能包含有界校验细节；不要假设两者完全相同。错误不保证都能附带 operation、request_id、agent_id 或 native_error，例如在请求派发前失败或本地校验失败时；`native_error` 只出现在仍持有完整脱敏原件的同步原生控制失败上。CLI 的错误信封（`stderr` 中的 `{ok:false,error:{...}}`）同样透传 `native_error`。
 
 dsh 的 build + 非空 `write_manifest` 已不再出现在错误表中：清单在上限内（≤256 条且序列化 ≤64 KiB）即放行进入 manifest-build 组合，显式 `["."]` 走现行 build 组合；只有超上限或 plan + 非空清单才拒绝，且都以 `validation` 返回（plan + 非空清单此前由 daemon 侧报 `agent_unsupported`，现由 core 以 `validation` 拒绝并同样不产生任务）；`agent_unsupported` 继续描述 dsh 的 edit/yolo 等未证明模式。
 

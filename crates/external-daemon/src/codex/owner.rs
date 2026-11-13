@@ -21,7 +21,7 @@ use super::session::remaining_time;
 use super::transport::spawn_codex_pump;
 use crate::{
     LifecycleSink, ManagedRuntime, ProcessIdentity, Publisher, RuntimeCommandError, RuntimeLoss,
-    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot, TurnTracker,
+    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot,
 };
 
 pub struct CodexRuntimeOwner {
@@ -47,9 +47,12 @@ impl CodexRuntimeOwner {
             model,
         )?);
         let publisher = Arc::new(Publisher::new(sink));
+        let (task, launch) = publisher.event_scope();
         let shared = Arc::new(CodexShared {
             publisher: Arc::clone(&publisher),
-            turn_tracker: Arc::new(TurnTracker::new()),
+            runtime_state: Arc::clone(&publisher.runtime_state),
+            task,
+            launch,
             session_id: Mutex::new(None),
             admitted_model: Mutex::new(None),
             admitted_effort: Mutex::new(None),
@@ -63,7 +66,6 @@ impl CodexRuntimeOwner {
             seen_tool_items: Mutex::new(Vec::new()),
             turn_failure: Mutex::new(None),
             mcp_tail: Mutex::new(String::new()),
-            sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -149,8 +151,8 @@ impl ManagedRuntime for CodexRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
-    fn diagnostic_failure(&self) -> Option<String> {
-        self.shared.turn_tracker.failure_detail()
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        self.shared.runtime_state.native_failure()
     }
 
     fn diagnostic_tail(&self) -> String {
@@ -236,6 +238,11 @@ impl ManagedRuntime for CodexRuntimeOwner {
         *self.shared.admitted_posture.lock().unwrap() = Some(admitted.permission_mode);
         *self.shared.diagnostic_session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.initialize_before_threads(deadline)?;
+        // Resume already has a persisted thread identity. Bind it before the
+        // request so the notification pump attributes settings from its first
+        // frame, even when they precede the response. Model/effort admission
+        // below still requires a validated resume echo.
+        *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
         self.resume_thread(
             thread_id,
             &admitted.model,
@@ -244,7 +251,6 @@ impl ManagedRuntime for CodexRuntimeOwner {
             admitted.effort.as_deref(),
             deadline,
         )?;
-        *self.shared.session_id.lock().unwrap() = Some(thread_id.to_owned());
         *self.shared.admitted_model.lock().unwrap() = Some(admitted.model.clone());
         // A resumed process must keep admitting the same effort, or the
         // follow-up turn below would silently drop back to low.
@@ -265,7 +271,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
         timeout: Duration,
     ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        if self.shared.turn_tracker.snapshot().active {
+        if self.shared.runtime_state.turn_snapshot().active {
             return Err(RuntimeCommandError::InvalidSession(
                 "a turn is already in flight for this codex thread".into(),
             ));
@@ -341,7 +347,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
         timeout: Duration,
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let current = self.shared.turn_tracker.snapshot();
+        let current = self.shared.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -359,7 +365,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
             .request("turn/interrupt", params, remaining_time(deadline)?)?;
         let boundary = self
             .shared
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_time(deadline)?)?;
         self.shared.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -378,11 +384,7 @@ impl ManagedRuntime for CodexRuntimeOwner {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.shared.turn_tracker.snapshot()
-    }
-
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.turn_tracker.activity_snapshot()
+        self.shared.runtime_state.turn_snapshot()
     }
 
     fn stop_boundary_count(&self) -> u64 {

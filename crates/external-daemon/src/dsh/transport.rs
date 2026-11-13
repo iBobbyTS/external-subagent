@@ -35,7 +35,7 @@ pub(super) fn spawn_dsh_pump(
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
                 if let Some(projected) = project_dsh_inbound(&shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     finish_on_child_exit(&driver, &publisher, &shared, &event, exit);
@@ -73,7 +73,7 @@ fn fold_settled_turn(driver: &Driver, publisher: &Publisher, shared: &DshRuntime
         match driver.recv_timeout(Duration::ZERO) {
             Ok(event) => {
                 if let Some(projected) = project_dsh_inbound(shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     shared.apply_settled_turn(settled);
@@ -103,13 +103,13 @@ fn finish_on_child_exit(
     exit: &ChildExit,
 ) {
     driver.wait_diagnostics(Duration::from_secs(1));
-    if shared.turn_tracker.snapshot().active {
+    if shared.runtime_state.turn_snapshot().active {
         if let Some(settled) = take_settled_turn_within(shared, SETTLEMENT_EXIT_GRACE) {
             shared.apply_settled_turn(settled);
         }
     }
     let terminal = classify_child_exit(driver.identity().pgid, shared, exit);
-    publisher.emit_driver(event.clone(), terminal);
+    publisher.publish_transport(event.clone(), terminal);
     shared.offers.lock().unwrap().clear();
 }
 
@@ -117,7 +117,7 @@ fn finish_on_child_exit(
 /// the exit path, a resolved-but-undeposited settlement of an active turn
 /// folds before the runtime-loss terminal so its boundary still lands.
 fn finish_on_lost_stream(publisher: &Publisher, shared: &DshRuntimeShared) {
-    if shared.turn_tracker.snapshot().active {
+    if shared.runtime_state.turn_snapshot().active {
         if let Some(settled) = take_settled_turn_within(shared, SETTLEMENT_EXIT_GRACE) {
             shared.apply_settled_turn(settled);
         }
@@ -154,7 +154,7 @@ fn classify_child_exit(
     match observe_process_group(pgid) {
         Ok(members) if members.is_empty() => match exit {
             ChildExit::Exited(Some(0)) => {
-                let turn = shared.turn_tracker.snapshot();
+                let turn = shared.runtime_state.turn_snapshot();
                 if !turn.active && turn.boundary == Some(TurnBoundary::Completed) {
                     Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                         exit.clone(),

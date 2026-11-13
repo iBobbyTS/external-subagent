@@ -449,7 +449,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_wait",
     output_schema = tool_output_schema::<AgentWaitAnyOutput>(),
-    description = "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..600 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
+    description = "Wait for persistent task progress. agent_id accepts one number or an array of 1..16 ids; wait_time is seconds, 0..600 (default 290). wait_mode=all (default) waits for all known targets to become terminal; any wakes when one is terminal, enabling rolling replacement. An actionable pending request also wakes either mode. Scalar waits behave identically in both modes. Remove already-terminal ids from subsequent any waits. Unknown ids do not count as terminal. Waiting or cancelling the wait does not cancel tasks. Scalar input returns one wait object; array input returns a flat object keyed by agent id, plus error markers for duplicated or unknown_agent ids. Repeated ids are awaited once. message_id is supported only with scalar input. Read the complete output in the caller context; do not truncate or select fields in a wrapper. result=null means no final result yet. timed_out means this wait's deadline expired, not that the task failed; early any wakes leave still-running peers timed_out=false. Only outcome=COMPLETED is success. Read final_text, preserve failure_message, and follow next_offset with result until null; for a native turn failure, final_text contains the complete original error as JSON with credentials redacted, while failure_message carries bounded ES diagnostics, the embedded page is complete when next_offset=null. failure_message is a bounded diagnostic string, usually JSON: parse defensively, read the original cause separately from cleanup_result, and decide continuation or retry from the actual failure. Do not immediately retry persistent quota/authentication failures. Handle permission requests with allow/deny and user-input requests by answering their full embedded question. Activity provides incremental latest_text_tail, latest_text_truncated, tool_calls_last_60s, telemetry_status, last_activity_age_ms, model_request_active, in_flight_tool_count and oldest_in_flight_tool_age_ms. activity.model_activity is present only when the native source provided a model-activity fact: it carries that native phase (started/completed/failed/retry_scheduled/stream_stalled) and any native retry detail; no wait age or attempt count is invented, and a retry wait is not a degraded task. activity.diagnostics is a bounded summary (at most 32 entries) of deduplicated anomalous native inputs: source protocol, closed disposition reason, affected dimensions (known or unknown scope), safe discriminator, occurrence count, and last-observed epoch milliseconds; activity.diagnostics_truncated marks entries folded into a summary_limit record. An empty list means no known anomaly, not that observation is complete; repeated waits neither recompute nor increment counts. These are liveness evidence, not proof of success; zero tracked tools can also mean unsupported tracking. Ordinary progress and message receipts do not wake a wait. Use observe only when the activity suggests a stuck task or meaningless loop.",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -556,7 +556,7 @@ impl SubagentMcp {
     #[tool(
     name = "external_subagent_observe",
     output_schema = tool_output_schema::<AgentObserveOutput>(),
-    description = "仅在怀疑 subagent 陷入无意义循环时才调用，检查最近公开推理和工具调用过程；不要用于健康任务的例行轮询。只读已捕获的本 Agent 数据，不启动模型或工具。默认按本 Agent 任务生命周期内的调用次数选最多的 3 类工具，每类返回最近最多 5 次调用（名称、ID、参数，不含结果）；工具详情来自 zcode/dsh 的公开事件以及 agy/codex 的受限描述符（codex 的 detail 位于 arguments.detail）；dsh/agy/codex 的工具历史均不完整并由 coverage.tool_history_complete=false 标注。zcode/dsh 返回已验证公开 reasoning delta 合并后的最新 200 个 Unicode 字符；codex 与 agy 不采集推理，整个 reasoning 字段为 null，coverage 如实标记未采集能力。encrypted_content 始终排除。本工具不判断循环、不返回进展标签、不自动取消。调用方结合当前任务与这些事实判断：PROGRESSING（新增事实或有效推进）；EXPECTED_WAIT（有目的的计算、权限或外部等待）；NEEDS_CLARIFICATION（具体输入或决定缺失）；NO_PROGRESS_LOOP（无新信息的等价行动循环，且合理重读、等待、状态变化等解释已排除）；INSUFFICIENT_OBSERVABILITY（截断、缺口或缺少上下文，不能断言循环）。相同文本、重复 read 或 true/echo 本身不是循环；没有工具结果也不能推断工具成功、文件未变化或任务失败。判断和取消由调用方独立决定。",
+    description = "仅在怀疑 subagent 陷入无意义循环时才调用，检查最近公开推理和工具调用过程；不要用于健康任务的例行轮询。只读已捕获的本 Agent 数据，不启动模型或工具。默认按本 Agent 任务生命周期内的调用次数选最多的 3 类工具，每类返回最近最多 5 次调用（名称、ID、参数，不含结果）；工具详情来自各通道已解释的公开事件；codex 的受限描述符（detail 位于 arguments.detail）同样进入 recent_calls。coverage 按实际能力与实际缺口生成，不按 subagent 名称固定。recent_calls[].status 区分 unknown/pending/running/finished/succeeded/failed/cancelled：unknown 表示没有原生 phase 证据，finished 表示已结束但无成败证据，succeeded 仅来自原生明确事实。reasoning 仅在观察到公开 summary/thought delta 时出现，并由 source.protocol/channel 标明原生协议与通道；从未观察到公开推理时为 null。encrypted_content 始终排除。本工具不判断循环、不返回进展标签、不自动取消。调用方结合当前任务与这些事实判断：PROGRESSING（新增事实或有效推进）；EXPECTED_WAIT（有目的的计算、权限或外部等待）；NEEDS_CLARIFICATION（具体输入或决定缺失）；NO_PROGRESS_LOOP（无新信息的等价行动循环，且合理重读、等待、状态变化等解释已排除）；INSUFFICIENT_OBSERVABILITY（截断、缺口或缺少上下文，不能断言循环）。相同文本、重复 read 或 true/echo 本身不是循环；没有工具结果也不能推断工具成功、文件未变化或任务失败。判断和取消由调用方独立决定。",
     annotations(
         read_only_hint = true,
         destructive_hint = false,
@@ -1789,10 +1789,10 @@ mod contract_default_tests {
             .find(|tool| tool.name == "external_subagent_observe")
             .unwrap();
         let description = observe.description.as_deref().unwrap();
-        // Frozen description, re-derived for the three-adapter observation contract.
+        // Frozen description, re-derived for the typed-evidence observation contract.
         assert_eq!(
             format!("{:x}", Sha256::digest(description.as_bytes())),
-            "c4d0ccf3a9a2e1c437787e7880af087977b452d6bfd87bac6df75f60a4181f54"
+            "57c13cf265022cbd1b827243ee49754df1780421ae9995d040cebc8c4aececea"
         );
         let input = serde_json::to_value(&observe.input_schema).unwrap();
         assert_eq!(input["additionalProperties"], false);
@@ -1806,20 +1806,34 @@ mod contract_default_tests {
     }
 
     #[test]
-    fn observation_projection_rejects_source_contract_drift() {
+    fn observation_projection_serializes_the_typed_source_and_rejects_schema_drift() {
         let snapshot = ObservationSnapshot::unavailable();
+        let mut reasoning = snapshot.reasoning;
+        reasoning.source = Some(crate::observation::PublicReasoningSource {
+            protocol: external_contract::events::SourceProtocol::ZcodeSession,
+            channel: external_contract::events::PublicReasoningChannel::Summary,
+        });
         let view = TaskObservationView {
             schema: OBSERVATION_SCHEMA.into(),
             agent_id: "10000000".into(),
             count_scope: "agent_lifetime".into(),
             tools: snapshot.tools,
-            reasoning: Some(snapshot.reasoning),
+            reasoning: Some(reasoning),
             coverage: snapshot.coverage,
         };
-        assert!(AgentObserveOutput::try_from(view.clone()).is_ok());
-        let mut drifted = view;
-        drifted.reasoning.as_mut().unwrap().source.delta_pointer = "/private/field".into();
-        assert!(AgentObserveOutput::try_from(drifted).is_err());
+        let output = AgentObserveOutput::try_from(view).unwrap();
+        let mut value = serde_json::to_value(output).unwrap();
+        assert_eq!(value["reasoning"]["source"]["protocol"], "zcode_session");
+        assert_eq!(value["reasoning"]["source"]["channel"], "summary");
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../schema/observation.schema.json"))
+                .unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&value));
+        // The retired wire-pointer vocabulary cannot reappear through the
+        // closed public schema.
+        value["reasoning"]["source"]["delta_pointer"] = "/private/field".into();
+        assert!(!validator.is_valid(&value));
     }
 
     #[test]

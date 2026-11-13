@@ -30,7 +30,8 @@ pub(super) fn spawn_codex_pump(
         match driver.recv_timeout(Duration::from_millis(20)) {
             Ok(event) => {
                 if let Inbound::Message(WireMessage::UnknownEvent { method, raw }) = &event {
-                    if !shared.project_notification(method, raw) {
+                    if let Some(batch) = shared.decode_notification(method, raw) {
+                        publisher.emit_typed(batch);
                         continue;
                     }
                 }
@@ -49,16 +50,16 @@ pub(super) fn spawn_codex_pump(
                         }),
                     );
                     publisher
-                        .emit_driver(Inbound::Message(WireMessage::Request(unsupported)), None);
+                        .publish_transport(Inbound::Message(WireMessage::Request(unsupported)), None);
                     continue;
                 }
                 if let Inbound::ChildExited(exit) = &event {
                     driver.wait_diagnostics(Duration::from_secs(1));
                     let terminal = classify_child_exit(driver.identity().pgid, &shared, exit);
-                    publisher.emit_driver(event, terminal);
+                    publisher.publish_transport(event, terminal);
                     return;
                 }
-                publisher.emit_driver(event, None);
+                publisher.publish_transport(event, None);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -81,7 +82,7 @@ fn classify_child_exit(
     match observe_process_group(pgid) {
         Ok(members) if members.is_empty() => match exit {
             ChildExit::Exited(Some(0)) => {
-                let turn = shared.turn_tracker.snapshot();
+                let turn = shared.runtime_state.turn_snapshot();
                 if !turn.active && turn.boundary == Some(TurnBoundary::Completed) {
                     Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                         exit.clone(),

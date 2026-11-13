@@ -62,14 +62,14 @@ impl Scheduler {
                     },
                     self.inner.config.stop_grace,
                 )
-                .map_err(|error| SchedulerError::RuntimeCommand {
+                .map_err(|error| SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                     agent_id: task.agent_id.clone(),
                     message: format!("startup process-group recovery failed: {error}"),
                 })?;
             }
             (None, None) if matches!(task.phase, TaskPhase::Preparing | TaskPhase::Terminal) => {}
             _ => {
-                return Err(SchedulerError::RuntimeCommand {
+                return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                     agent_id: task.agent_id.clone(),
                     message: "startup runtime identity is incomplete; refusing unverified reap"
                         .into(),
@@ -117,7 +117,7 @@ impl Scheduler {
         let completion =
             finalized_general(&prepared, outcome, reason_code, message, failure_message);
         if !completion.cleaned {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: task.agent_id.clone(),
                 message: "startup worktree recovery did not prove cleanup".into(),
             });
@@ -139,14 +139,14 @@ impl Scheduler {
         validate_task_route(Some(task), &route).map_err(SchedulerError::InvalidConfig)?;
         let TaskRoute::General(prepared) = route;
         if self.inner.store.task_result(&task.agent_id)?.is_none() {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: task.agent_id.clone(),
                 message: "terminal task has no immutable result".into(),
             });
         }
         let cleanup = GeneralFinalizer::finalize(&prepared, CompletionOutcome::RuntimeLost);
         if !cleanup.cleaned {
-            return Err(SchedulerError::RuntimeCommand {
+            return Err(SchedulerError::RuntimeCommand { operation: None, native_failure: None,
                 agent_id: task.agent_id.clone(),
                 message: "terminal worktree recovery did not prove cleanup".into(),
             });

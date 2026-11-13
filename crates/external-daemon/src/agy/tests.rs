@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::{
-    CommandRuntimeFactory, LifecycleSink, MessageDisposition, RuntimeFactory, Scheduler,
-    SchedulerConfig,
+    CommandRuntimeFactory, LifecycleSink, ManagedRuntime, MessageDisposition, RuntimeFactory,
+    Scheduler, SchedulerConfig,
 };
 use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
 use external_store::{TaskOutcome, TaskPhase, TaskRecord, TurnState};
@@ -38,9 +38,7 @@ const SCRIPTED_SYNC_WAIT: Duration = Duration::from_secs(30);
 fn agy_workspace() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("agy-")
-        .tempdir_in(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace"),
-        )
+        .tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace"))
         .unwrap()
 }
 
@@ -280,7 +278,10 @@ fn agy_admission_routes_to_the_agy_factory_and_completes_the_turn() {
     let _guard = scripted_test_guard();
     let workspace = agy_workspace();
     let directory = workspace.path().to_owned();
-    let scheduler = agy_scheduler(&directory, harness_factory(&HAPPY.replace("__CONV__", CONV), &directory));
+    let scheduler = agy_scheduler(
+        &directory,
+        harness_factory(&HAPPY.replace("__CONV__", CONV), &directory),
+    );
     let agent_id = enqueue(&scheduler, &directory, PermissionMode::Build);
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
     let result = await_result(&scheduler, &agent_id);
@@ -422,7 +423,7 @@ fn tool_step_pair_feeds_the_wait_window_and_observe_capture() {
     );
     assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
     assert!(observation.reasoning.text.is_empty());
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
     assert!(!observation.coverage.reasoning_complete);
 }
 
@@ -573,7 +574,9 @@ fn plan_permission_is_refused_by_the_factory() {
     let agent_id = enqueue(&scheduler, &directory, PermissionMode::Plan);
     let error = scheduler.start_ready().unwrap_err();
     assert!(
-        error.to_string().contains("build and yolo permission modes"),
+        error
+            .to_string()
+            .contains("build and yolo permission modes"),
         "{error}"
     );
     let task = await_terminal_task(&scheduler, &agent_id);
@@ -582,7 +585,7 @@ fn plan_permission_is_refused_by_the_factory() {
 
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 fn agy_task_record(directory: &Path) -> TaskRecord {
@@ -715,9 +718,7 @@ fn publisher_latched_snapshot_does_not_wait_for_native_input_write() {
     use std::sync::mpsc;
 
     let shared = Arc::new(AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
-        Arc::new(crate::TurnTracker::new()),
-    ));
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink)))));
     let (writing, write_started) = mpsc::channel();
     let (release_write, write_released) = mpsc::channel();
     let writer_shared = Arc::clone(&shared);
@@ -766,14 +767,14 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
         release: Mutex<Option<mpsc::Receiver<()>>>,
     }
     impl LifecycleSink for PausedSettlementSink {
-        fn emit(&self, record: crate::LifecycleRecord) {
-            let crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
-                external_contract::WireMessage::Event(event),
-            )) = record.event
-            else {
+        fn emit(&self, record: crate::RuntimeEnvelope) {
+            let crate::RuntimeEnvelope::Event { event: event, .. } = record else {
                 return;
             };
-            if event.params["type"] == "turn.completed" {
+            if matches!(
+                event.fact,
+                external_contract::events::EventFact::TurnSettled(_)
+            ) {
                 if let Some(release) = self.release.lock().unwrap().take() {
                     // 真实 result 发布正持 turn 与 publisher 锁；暂停首轮边界。
                     self.publishing.send(()).unwrap();
@@ -789,9 +790,7 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
         Arc::new(crate::Publisher::new(Arc::new(PausedSettlementSink {
             publishing,
             release: Mutex::new(Some(publication_released)),
-        }))),
-        Arc::new(crate::TurnTracker::new()),
-    ));
+        })))));
     shared.begin_turn();
     shared.buffer_input(|| Ok(())).unwrap();
     let result = |count| {
@@ -834,11 +833,9 @@ fn result_publication_keeps_snapshot_nonblocking_and_pending_input_active() {
 #[test]
 fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
     use super::events::AgyRuntimeShared;
-    let tracker = Arc::new(crate::TurnTracker::new());
-    let shared = AgyRuntimeShared::new(
-        Arc::new(crate::Publisher::new(Arc::new(NoopSink))),
-        tracker.clone(),
-    );
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(NoopSink)));
+    let tracker = Arc::clone(&publisher.runtime_state);
+    let shared = AgyRuntimeShared::new(publisher);
     shared.begin_turn();
     shared.buffer_input(|| Ok(())).unwrap();
     let result = |count| {
@@ -846,10 +843,10 @@ fn pending_native_input_starts_on_result_and_idle_duplicates_stay_noise() {
     };
     shared.project_event(&result(1));
     assert!(shared.turn_snapshot().active);
-    let first = tracker.snapshot();
+    let first = tracker.turn_snapshot();
     assert_eq!(first.boundary, Some(crate::TurnBoundary::Completed));
     shared.project_event(&result(1));
-    assert_eq!(tracker.snapshot(), first);
+    assert_eq!(tracker.turn_snapshot(), first);
     shared.project_event(&result(2));
     let second = shared.turn_snapshot();
     assert!(!second.active);
@@ -1008,4 +1005,835 @@ esac
         .filter(|frame| frame["event"] == "user")
         .count();
     assert_eq!(users, 1);
+}
+
+/// Typed ingress probes use observed fixtures where available; fault frames
+/// below are explicitly synthetic and never require a live model call.
+struct AgyFactSink(
+    std::sync::Mutex<Vec<crate::RuntimeEnvelope>>,
+    Arc<crate::RuntimeState>,
+);
+impl Default for AgyFactSink {
+    fn default() -> Self {
+        Self(
+            Default::default(),
+            Arc::new(crate::RuntimeState::new()),
+        )
+    }
+}
+impl LifecycleSink for AgyFactSink {
+    fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.1.clone()) }
+    fn emit(&self, record: crate::RuntimeEnvelope) {
+        self.0.lock().unwrap().push(record);
+    }
+}
+impl AgyFactSink {
+    fn facts(&self) -> Vec<external_contract::events::NormalizedEvent> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                crate::RuntimeEnvelope::Event { event: event, .. } => Some(event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+fn agy_fact_probe() -> (super::events::AgyRuntimeShared, Arc<AgyFactSink>) {
+    let sink = Arc::new(AgyFactSink::default());
+    let shared = super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(sink.clone())));
+    shared.begin_turn();
+    (shared, sink)
+}
+fn feed_agy(shared: &super::events::AgyRuntimeShared, raw: serde_json::Value) {
+    assert!(super::events::project_agy_inbound(
+        shared,
+        &external_runtime::Inbound::Message(external_contract::WireMessage::UnknownEvent {
+            method: "ndjson".into(),
+            raw
+        })
+    )
+    .is_none());
+}
+
+#[test]
+fn observed_stream_emits_typed_facts_without_inventing_tool_success() {
+    use external_contract::events::*;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/agy-events/stream-observed.json"
+    ))
+    .unwrap();
+    let (shared, sink) = agy_fact_probe();
+    for (index, frame) in fixture["frames"].as_array().unwrap().iter().enumerate() {
+        feed_agy(&shared, frame.clone());
+        if index == 3 {
+            assert_eq!(sink.1.snapshot().active_tools.len(), 1);
+        }
+        if index == 4 {
+            assert_eq!(sink.1.snapshot().active_tools.len(), 0);
+        }
+    }
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::SessionReady(info) if info.model.as_deref() == Some("gemini-3.8-flash-low"))));
+    let tools: Vec<_> = facts
+        .iter()
+        .filter_map(|e| {
+            if let EventFact::ToolChanged(t) = &e.fact {
+                Some(t)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].call_id, tools[1].call_id);
+    assert_eq!(tools[1].phase, Some(ToolPhase::Finished));
+    assert_eq!(tools[1].outcome, Some(ToolOutcome::Unknown));
+    assert!(facts.iter().all(|e| e.context.source.turn_id.is_none()));
+    assert!(facts
+        .iter()
+        .all(|e| e.context.turn_id == Some(TurnId::Local(1))));
+    assert!(facts
+        .windows(2)
+        .all(|w| w[0].context.sequence < w[1].context.sequence));
+    assert!(
+        matches!(&facts.last().unwrap().fact, EventFact::TurnSettled(s) if s.final_text.as_deref() == Some("OK\n") && s.outcome == TurnOutcome::Completed)
+    );
+    assert!(sink.0.lock().unwrap().iter().all(|e| e.normalized().is_some()));
+}
+
+#[test]
+fn synthetic_tool_error_denial_unknown_and_malformed_are_retained() {
+    use external_contract::events::*;
+    let (shared, sink) = agy_fact_probe();
+    let error = serde_json::json!({"type":"command_error","message":"failed", "data":{"complete":"x".repeat(2000),"api_key":"secret"}});
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":CONV,"step_index":7,"state":"DONE","step_type":"tool","tool_info":{"name":"run_command","error":error}}}),
+    );
+    assert_eq!(sink.1.snapshot().window_60s.tool_calls_failed, 1);
+    assert_eq!(sink.1.snapshot().active_tools.len(), 0);
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::ToolChanged(t) if t.phase == Some(ToolPhase::Finished) && t.outcome == Some(ToolOutcome::Failed) && t.failure.as_ref().is_some_and(|f| f.original["data"]["complete"] == "x".repeat(2000) && f.original["data"]["api_key"] != "secret"))));
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"banana","payload":{"secret":"private-body"}}),
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"step_update","step_update":{"step_index":"bad"}}),
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"ok","num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}),
+    );
+    let facts = sink.facts();
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics)));
+    assert!(facts.iter().any(
+        |e| matches!(&e.fact, EventFact::CoverageGap(g) if g.reason == LossReason::Malformed)
+    ));
+    assert!(facts.iter().any(|e| matches!(&e.fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::PermissionDenied)));
+    assert!(shared.diagnostic_tail().contains("RunCommand"));
+    assert!(
+        matches!(&facts.last().unwrap().fact, EventFact::TurnSettled(s) if s.outcome == TurnOutcome::Completed)
+    );
+    let diagnostics = facts
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.fact,
+                EventFact::Diagnostic(_) | EventFact::CoverageGap(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(!serde_json::to_string(&diagnostics)
+        .unwrap()
+        .contains("private-body"));
+    // The successful result's denied_actions is one retained safe denial fact
+    // in the common aggregate; it does not fail the turn and carries no body.
+    let retained = sink.1.snapshot();
+    let denials = retained
+        .diagnostics
+        .iter()
+        .filter(|entry| entry.reason == "permission_denied")
+        .collect::<Vec<_>>();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].source, SourceProtocol::AgyStreamJson);
+    assert_eq!(denials[0].impact, Impact::Known(vec![CoverageDimension::Tools]));
+    assert_eq!(denials[0].discriminator, "denied_actions");
+    assert_eq!(denials[0].count, 1);
+    assert!(denials[0].last_observed_at > 0);
+    assert!(matches!(
+        sink.facts().last().unwrap().fact,
+        EventFact::TurnSettled(ref settlement) if settlement.outcome == TurnOutcome::Completed
+    ));
+}
+
+#[test]
+fn successful_result_denied_actions_reach_wait_diagnostics_once_and_keep_success() {
+    use crate::rpc::{
+        RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget,
+    };
+    use external_contract::events::{
+        CoverageDimension, Impact, SourceProtocol,
+    };
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    // SYNTHETIC successful-result frame in the observed stream shape; no live
+    // provider call is made.
+    let result = serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"ok","num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}]}});
+    let script = format!(
+        "read_frame\nprintf '%s\\n' '{{\"event\":\"init\",\"conversation_id\":\"{CONV}\",\"init\":{{}}}}'\nprintf '%s\\n' '{result}'\n"
+    );
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text.trim(), "ok");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+
+    let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = |target| {
+        RpcMethod::TaskWait(TaskWaitQuery {
+            agent_id: target,
+            wait_time: 0,
+            message_id: None,
+            wait_mode: WaitMode::All,
+        })
+    };
+    let mut previous = None;
+    for _ in 0..3 {
+        let RpcSuccess::TaskWait(wait) = service
+            .dispatch(query(WaitTarget::One(agent_id.clone())))
+            .unwrap()
+        else {
+            panic!("wait response")
+        };
+        assert_eq!(wait.task.status, "completed");
+        assert_eq!(
+            wait.result.as_ref().unwrap().outcome,
+            TaskOutcome::Completed
+        );
+        let denials = wait
+            .activity
+            .diagnostics
+            .iter()
+            .filter(|entry| entry.reason == "permission_denied")
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 1, "one denial fact per result input");
+        let entry = denials[0];
+        assert_eq!(entry.source, SourceProtocol::AgyStreamJson);
+        assert_eq!(entry.impact, Impact::Known(vec![CoverageDimension::Tools]));
+        assert_eq!(entry.discriminator, "denied_actions");
+        assert_eq!(entry.count, 1);
+        assert!(entry.last_observed_at > 0);
+        assert!(!wait.activity.diagnostics_truncated);
+        // Repeated waits read the retained summary without recomputation or
+        // count inflation.
+        if let Some(previous) = &previous {
+            assert_eq!(&wait.activity.diagnostics, previous);
+        }
+        previous = Some(wait.activity.diagnostics.clone());
+    }
+    // List mode builds through the same projection.
+    let RpcSuccess::TaskWaitMany { waits } = service
+        .dispatch(query(WaitTarget::Many(vec![agent_id.clone()])))
+        .unwrap()
+    else {
+        panic!("many wait response")
+    };
+    let (_, body) = waits.bodies.first().expect("one awaited agent");
+    assert_eq!(body.activity.diagnostics, previous.unwrap());
+    // The denial never changes the outcome, even after the waits.
+    assert_eq!(
+        scheduler
+            .store()
+            .get_task(&agent_id)
+            .unwrap()
+            .unwrap()
+            .outcome,
+        Some(TaskOutcome::Completed)
+    );
+}
+
+#[test]
+fn observed_result_error_is_preserved_and_acp_remains_unsupported() {
+    use external_contract::events::*;
+    let (shared, sink) = agy_fact_probe();
+    // OBSERVED 1.2.12 rejected control_request, retained by the existing corpus.
+    let raw: serde_json::Value = serde_json::from_str(
+        include_str!("../../../subagents/agy/tests/fixtures/neg-control.ndjson")
+            .lines()
+            .nth(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = raw["result"]["error"].clone();
+    feed_agy(&shared, raw);
+    assert!(sink.facts().iter().any(|e| matches!(&e.fact, EventFact::TurnSettled(s) if s.failure.as_ref().is_some_and(|f| f.original == expected))));
+    let acp: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/agy-events/acp-observed.json"
+    ))
+    .unwrap();
+    assert_eq!(acp["provenance"], "OBSERVED");
+    let before = sink.facts().len();
+    // The other observed protocol is evidence only. Sending one of its
+    // actual frames to stream-json must diagnose unknown, never settle.
+    feed_agy(&shared, acp["frames"].as_array().unwrap()[0].clone());
+    assert!(
+        matches!(&sink.facts()[before].fact, EventFact::Diagnostic(d) if d.reason == DiagnosticReason::UnknownSemantics)
+    );
+}
+
+#[test]
+fn synthetic_admission_error_retains_complete_redacted_native_failure() {
+    let shared = super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(NoopSink))));
+    let reason = format!(
+        "invalid model selection {} api_key=secret-value",
+        "detail ".repeat(500)
+    );
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"status":"ERROR","error":reason}}),
+    );
+    let error = shared.wait_start(Duration::from_secs(1)).unwrap_err();
+    let crate::RuntimeCommandError::ModelRejected(detail) = error else {
+        panic!("model rejection classification lost")
+    };
+    assert!(detail.message.len() <= 512);
+    let original = detail.native_failure.unwrap().original;
+    let original = original.as_str().unwrap();
+    assert!(original.len() > 3000);
+    assert!(!original.contains("secret-value"));
+    assert!(original.contains(&"detail ".repeat(500)));
+}
+
+#[test]
+fn buffered_start_is_published_before_pending_input_is_consumed() {
+    use external_contract::events::*;
+    use std::sync::{mpsc, Mutex};
+    struct PausedStartSink {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl LifecycleSink for PausedStartSink {
+        fn emit(&self, record: crate::RuntimeEnvelope) {
+            if matches!(
+                record,
+                crate::RuntimeEnvelope::Event { event: NormalizedEvent {
+                    fact: EventFact::TurnStarted {
+                        turn_id: TurnId::Local(2)
+                    },
+                    ..
+                }, .. }
+            ) {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+    }
+    let (started, ready) = mpsc::channel();
+    let (release, resumed) = mpsc::channel();
+    let shared = Arc::new(super::events::AgyRuntimeShared::new(
+        Arc::new(crate::Publisher::new(Arc::new(PausedStartSink {
+            started,
+            release: Mutex::new(resumed),
+        })))));
+    shared.begin_turn();
+    shared.buffer_input(|| Ok(())).unwrap();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"A","num_turns":1}}),
+    );
+    let pump_shared = shared.clone();
+    let pump = thread::spawn(move || {
+        feed_agy(
+            &pump_shared,
+            serde_json::json!({"event":"step_update","step_update":{"conversation_id":CONV,"step_index":42,"state":"DONE","step_type":"user_input"}}),
+        )
+    });
+    ready.recv_timeout(SCRIPTED_SYNC_WAIT).unwrap();
+    let snapshot = shared.turn_snapshot();
+    release.send(()).unwrap();
+    pump.join().unwrap();
+    assert!(
+        snapshot.active,
+        "pending input was consumed before started reached the tracker"
+    );
+    assert_eq!(
+        snapshot.generation, 2,
+        "the shared reducer applies started before sink callbacks"
+    );
+    assert_eq!(shared.turn_snapshot().generation, 2);
+    assert!(shared.turn_snapshot().active);
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"SUCCESS","response":"B","num_turns":2}}),
+    );
+    assert!(!shared.turn_snapshot().active);
+}
+
+#[test]
+fn native_init_model_reaches_the_owner_model_view_without_changing_admission() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{"model":"native-effective-model"}}'
+"#.replace("__CONV__", CONV);
+    let child = workspace.path().join("model-view.sh");
+    write_scripted_child(&child, workspace.path(), &script);
+    let sink = Arc::new(AgyFactSink::default());
+    let owner = AgyRuntimeOwner::spawn(Command::new(child), sink.clone()).unwrap();
+    let ready = owner
+        .bootstrap_session_with_mcp(&agy_task_record(workspace.path()), &[], SCRIPTED_SYNC_WAIT)
+        .unwrap();
+    assert_eq!(ready.configured_model.as_deref(), Some(MODEL));
+    assert!(sink.facts().iter().any(|event| matches!(
+        &event.fact,
+        external_contract::events::EventFact::SessionReady(info)
+            if info.model.as_deref() == Some("native-effective-model")
+    )));
+}
+
+#[test]
+fn synthetic_long_result_error_survives_the_real_scheduler_result_path() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    let error = format!(
+        "invalid control_request {} END_OF_NATIVE_ERROR",
+        "detail ".repeat(2000)
+    );
+    let result = serde_json::json!({"event":"result","result":{"conversation_id":CONV,"status":"ERROR","error":error,"num_turns":1}});
+    let script = format!("read_frame\nprintf '%s\\n' '{{\"event\":\"init\",\"conversation_id\":\"{CONV}\",\"init\":{{}}}}'\nprintf '%s\\n' '{result}'\n");
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Failed);
+    let detail: serde_json::Value = serde_json::from_str(&result.result.final_text).unwrap();
+    // Existing result contract delivers the original itself; the wrapper
+    // named original_error belongs to the intermediate failure detail only.
+    assert_eq!(detail, serde_json::Value::String(error));
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 257,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        reconstructed.push_str(&page.final_text);
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(reconstructed, result.result.final_text);
+}
+
+#[test]
+fn interruption_only_observed_response_matches_wait_tail_before_boundary() {
+    use external_contract::events::*;
+    let raw: serde_json::Value = serde_json::from_str(
+        include_str!("../../../subagents/agy/tests/fixtures/interrupted.ndjson")
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = raw["result"]["response"].as_str().unwrap();
+    let (shared, sink) = agy_fact_probe();
+    feed_agy(&shared, raw.clone());
+    assert_eq!(sink.1.take_wait_tail().text, expected);
+    assert!(
+        sink.1.take_wait_tail().text.is_empty(),
+        "wait cursor must consume the appended response once"
+    );
+    let facts = sink.facts();
+    let text = facts.iter().position(|e| matches!(&e.fact, EventFact::MessageUpdated(m) if matches!(&m.text, TextUpdate::Delta(t) | TextUpdate::Snapshot(t) if t == expected))).expect("partial response text fact");
+    let boundary = facts.iter().position(|e| matches!(&e.fact, EventFact::TurnSettled(s) if s.outcome == TurnOutcome::Cancelled && s.final_text.as_deref() == Some(expected))).expect("original cancellation settlement");
+    assert!(
+        text < boundary,
+        "text must be published before the settling boundary"
+    );
+    assert_eq!(facts[text].context.turn_id, facts[boundary].context.turn_id);
+    assert_eq!(
+        shared.turn_snapshot().boundary,
+        Some(crate::TurnBoundary::Failed),
+        "typed cancellation must not authorize legacy successful completion"
+    );
+}
+
+#[test]
+fn interruption_only_response_reaches_wait_and_preserves_cancellation_result() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    const PARTIAL: &str = "ONLY_IN_INTERRUPTED_RESPONSE_结束";
+    // SYNTHETIC signal harness using the observed interrupted-result shape.
+    // Install the trap before init opens the bootstrap gate; no response delta
+    // is emitted before cancellation, so only the result can supply the text.
+    let script = r#"
+read_frame
+trap 'printf "%s\n" "{\"event\":\"result\",\"result\":{\"conversation_id\":\"__CONV__\",\"status\":\"ERROR\",\"response\":\"ONLY_IN_INTERRUPTED_RESPONSE_结束\",\"error\":\"interrupted\",\"num_turns\":1}}"; exit 1' TERM
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+printf '%s\n' '{"event":"step_update","step_update":{"conversation_id":"__CONV__","step_index":0,"state":"DONE","step_type":"user_input"}}'
+"#.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    scheduler.start_ready().unwrap();
+    await_turn_active(&scheduler, &agent_id);
+    assert!(scheduler
+        .passive_activity_snapshot(&agent_id)
+        .unwrap()
+        .latest_text_tail
+        .is_empty());
+    scheduler.cancel_task(&agent_id).unwrap();
+    assert_eq!(
+        await_terminal_task(&scheduler, &agent_id).outcome,
+        Some(TaskOutcome::Cancelled)
+    );
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Cancelled);
+    assert!(stored.result.partial);
+    assert!(
+        scheduler.last_error(&agent_id).is_none(),
+        "native stop must reach its boundary: {:?}",
+        scheduler.last_error(&agent_id)
+    );
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = || {
+        crate::rpc::RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+        })
+    };
+    let crate::rpc::RpcSuccess::TaskWait(wait) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert_eq!(wait.activity.latest_text_tail, PARTIAL);
+    assert_eq!(
+        wait.result.as_ref().unwrap().outcome,
+        TaskOutcome::Cancelled
+    );
+    assert!(wait.result.as_ref().unwrap().partial);
+    let crate::rpc::RpcSuccess::TaskWait(second) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert!(second.activity.latest_text_tail.is_empty());
+    // Cancellation's existing result format remains independent of its live
+    // text tail; result pagination must still reconstruct that stored result.
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 7,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page")
+        };
+        assert_eq!(page.outcome, TaskOutcome::Cancelled);
+        reconstructed.push_str(&page.final_text);
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(reconstructed, stored.result.final_text);
+    assert_eq!(wait.result.unwrap().final_text, reconstructed);
+}
+
+#[test]
+fn native_init_model_identity_does_not_reject_the_admitted_scheduler_task() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    // SYNTHETIC valid init whose observed model differs from the admission.
+    // Hold settlement until after the real fresh-session model gate has run.
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{"model":"native-effective-model"}}'
+while [ ! -f release-model-response ]; do sleep 0.01; done
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"SUCCESS","response":"MODEL_IDENTITY_PRESERVED","num_turns":1}}'
+"#.replace("__CONV__", CONV);
+    struct CapturedFactory {
+        inner: AgyRuntimeFactory,
+        facts: Arc<AgyFactSink>,
+    }
+    struct CapturedSink {
+        delegate: Arc<dyn LifecycleSink>,
+        facts: Arc<AgyFactSink>,
+    }
+    impl LifecycleSink for CapturedSink {
+        fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { self.delegate.runtime_state() }
+        fn event_scope(
+            &self,
+        ) -> Option<(
+            external_contract::events::TaskId,
+            external_contract::events::LaunchId,
+        )> {
+            self.delegate.event_scope()
+        }
+        fn emit(&self, record: crate::RuntimeEnvelope) {
+            self.facts.emit(record.clone());
+            self.delegate.emit(record);
+        }
+        fn emit_batch(&self, events: &[crate::RuntimeEnvelope]) {
+            for event in events {
+                self.facts.0.lock().unwrap().push(event.clone());
+            }
+            self.delegate.emit_batch(events);
+        }
+    }
+    impl RuntimeFactory for CapturedFactory {
+        fn spawn(
+            &self,
+            task: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            self.inner.spawn(
+                task,
+                Arc::new(CapturedSink {
+                    delegate: sink,
+                    facts: self.facts.clone(),
+                }),
+            )
+        }
+    }
+    let facts = Arc::new(AgyFactSink::default());
+    let store =
+        Arc::new(external_store::Store::open(workspace.path().join("state.sqlite")).unwrap());
+    let scheduler = Scheduler::new(
+        "agy-model-identity-test",
+        store,
+        Arc::new(CapturedFactory {
+            inner: harness_factory(&script, workspace.path()),
+            facts: facts.clone(),
+        }),
+        SchedulerConfig {
+            bootstrap_timeout: SCRIPTED_SYNC_WAIT,
+            control_timeout: SCRIPTED_SYNC_WAIT,
+            ..SchedulerConfig::default()
+        },
+    )
+    .unwrap();
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    let started = scheduler.start_ready();
+    assert!(
+        facts.facts().iter().any(|event| matches!(
+            &event.fact,
+            external_contract::events::EventFact::SessionReady(info)
+                if info.model.as_deref() == Some("native-effective-model")
+        )),
+        "the actual typed identity must preserve init.model"
+    );
+    assert_eq!(started.unwrap(), vec![agent_id.clone()]);
+    let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+    assert_eq!(task.phase, TaskPhase::Running);
+    assert_eq!(
+        crate::admitted_model_from_task(&task).as_deref(),
+        Some(MODEL)
+    );
+    assert!(scheduler.last_error(&agent_id).is_none());
+    std::fs::write(workspace.path().join("release-model-response"), "").unwrap();
+    let result = await_result(&scheduler, &agent_id);
+    assert_eq!(result.result.outcome, TaskOutcome::Completed);
+    assert_eq!(result.result.final_text, "MODEL_IDENTITY_PRESERVED");
+}
+
+#[test]
+fn native_interruption_without_es_stop_cannot_succeed_in_the_scheduler() {
+    let _guard = scripted_test_guard();
+    let workspace = agy_workspace();
+    const PARTIAL: &str = "NATIVE_INTERRUPTED_PARTIAL_结束";
+    // SYNTHETIC observed interrupted-result shape, with no ES stop/close.
+    // Keep the child alive after the result so the real monitor must adjudicate
+    // the turn boundary before any child-exit terminal can hide its projection.
+    let script = r#"
+read_frame
+printf '%s\n' '{"event":"init","conversation_id":"__CONV__","init":{}}'
+while [ ! -f release-native-interruption ]; do sleep 0.01; done
+printf '%s\n' '{"event":"result","result":{"conversation_id":"__CONV__","status":"ERROR","response":"NATIVE_INTERRUPTED_PARTIAL_结束","error":"interrupted","num_turns":1}}'
+"#.replace("__CONV__", CONV);
+    let scheduler = agy_scheduler(workspace.path(), harness_factory(&script, workspace.path()));
+    let agent_id = enqueue(&scheduler, workspace.path(), PermissionMode::Build);
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    await_turn_active(&scheduler, &agent_id);
+    let before = scheduler.store().get_task(&agent_id).unwrap().unwrap();
+    assert!(!before.stop_requested && !before.close_requested);
+    std::fs::write(workspace.path().join("release-native-interruption"), "").unwrap();
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert!(
+        !task.stop_requested && !task.close_requested,
+        "no ES cancellation may rescue this oracle"
+    );
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let query = || {
+        crate::rpc::RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            wait_mode: crate::rpc::WaitMode::All,
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()),
+            wait_time: 0,
+            message_id: None,
+        })
+    };
+    let crate::rpc::RpcSuccess::TaskWait(wait) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert_eq!(wait.activity.latest_text_tail, PARTIAL);
+    assert_eq!(wait.result.unwrap().outcome, TaskOutcome::Failed);
+    let crate::rpc::RpcSuccess::TaskWait(second) = service.dispatch(query()).unwrap() else {
+        panic!("wait response")
+    };
+    assert!(second.activity.latest_text_tail.is_empty());
+}
+
+fn current_conversation_probe() -> (super::events::AgyRuntimeShared, Arc<AgyFactSink>) {
+    let (shared, sink) = agy_fact_probe();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"init","conversation_id":"current","init":{}}),
+    );
+    (shared, sink)
+}
+
+#[test]
+fn foreign_malformed_conversation_is_excluded_before_payload_validation() {
+    // SYNTHETIC known envelopes: nested identity wins; missing/empty nested
+    // identity falls back to the top-level field, as in the native parser.
+    let cases = [
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":"foreign","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":"","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"conversation_id":"foreign","step_index":"bad","state":"DONE","step_type":"tool"}}),
+        serde_json::json!({"event":"result","result":{"conversation_id":"foreign","status":7}}),
+        serde_json::json!({"event":"result","conversation_id":"foreign","result":{"status":7}}),
+        serde_json::json!({"event":"init","conversation_id":"foreign","init":{"model":7}}),
+        // Preserve the existing valid-foreign-frame exclusion too.
+        serde_json::json!({"event":"step_update","step_update":{"conversation_id":"foreign","step_index":7,"state":"DONE","step_type":"tool"}}),
+    ];
+    for raw in cases {
+        let (shared, sink) = current_conversation_probe();
+        let before = sink.1.observation_snapshot();
+        let before_facts = sink.facts();
+        let before_turn = shared.turn_snapshot();
+        feed_agy(&shared, raw.clone());
+        assert_eq!(
+            sink.facts(),
+            before_facts,
+            "foreign frame emitted current facts: {raw}"
+        );
+        assert_eq!(
+            sink.1.observation_snapshot(),
+            before,
+            "foreign frame damaged current coverage: {raw}"
+        );
+        assert!(
+            sink.1.snapshot().telemetry_status != crate::TelemetryStatus::Degraded,
+            "foreign frame degraded current telemetry: {raw}"
+        );
+        assert_eq!(shared.turn_snapshot(), before_turn);
+        assert_eq!(shared.session_id().as_deref(), Some("current"));
+    }
+}
+
+#[test]
+fn current_malformed_conversation_retains_dimension_damage() {
+    use external_contract::events::*;
+    let cases = [
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":"current","step_index":"bad","state":"DONE","step_type":"tool"}}),
+            CoverageDimension::Tools,
+        ),
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"conversation_id":"","step_index":"bad","state":"DONE","step_type":"tool"}}),
+            CoverageDimension::Tools,
+        ),
+        (
+            serde_json::json!({"event":"step_update","conversation_id":"current","step_update":{"step_index":"bad","state":"DONE","step_type":"agent_response"}}),
+            CoverageDimension::Text,
+        ),
+        (
+            serde_json::json!({"event":"result","result":{"conversation_id":"current","status":7}}),
+            CoverageDimension::Turn,
+        ),
+    ];
+    for (raw, dimension) in cases {
+        let (shared, sink) = current_conversation_probe();
+        let dropped = sink.1.observation_snapshot().coverage.dropped_events;
+        feed_agy(&shared, raw);
+        let facts = sink.facts();
+        let event = facts.last().unwrap();
+        assert!(matches!(&event.fact, EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed && gap.impact == Impact::Known(vec![dimension])
+            && gap.activity == ActivityScope::Turn(TurnId::Local(1))));
+        assert_eq!(
+            event.context.source.session_id,
+            Some(SessionId("current".into()))
+        );
+        assert_eq!(
+            sink.1.observation_snapshot().coverage.dropped_events,
+            dropped + 1
+        );
+        assert_eq!(
+            sink.1.snapshot().telemetry_status == crate::TelemetryStatus::Degraded,
+            dimension != CoverageDimension::Text
+        );
+    }
+}
+
+#[test]
+fn unreadable_or_unknown_conversation_identity_retains_prior_classification() {
+    use external_contract::events::*;
+    // SYNTHETIC malformed identities must not acquire a foreign attribution
+    // from a fallback the parser cannot apply to a non-string nested field.
+    for identity in [serde_json::Value::Null, serde_json::json!(7)] {
+        let (shared, sink) = current_conversation_probe();
+        feed_agy(
+            &shared,
+            serde_json::json!({"event":"step_update","conversation_id":"foreign","step_update":{"conversation_id":identity,"step_index":"bad","state":"DONE","step_type":"tool"}}),
+        );
+        assert!(
+            matches!(&sink.facts().last().unwrap().fact, EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed && gap.impact == Impact::Known(vec![CoverageDimension::Tools]))
+        );
+        assert_eq!(sink.1.snapshot().telemetry_status, crate::TelemetryStatus::Degraded);
+    }
+    let (shared, sink) = current_conversation_probe();
+    feed_agy(
+        &shared,
+        serde_json::json!({"event":"banana","conversation_id":"foreign","payload":{"private":"not diagnostic content"}}),
+    );
+    assert!(
+        matches!(&sink.facts().last().unwrap().fact, EventFact::Diagnostic(diagnostic)
+        if diagnostic.reason == DiagnosticReason::UnknownSemantics)
+    );
 }

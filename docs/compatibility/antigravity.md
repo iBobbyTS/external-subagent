@@ -1,5 +1,7 @@
 # Google Antigravity (`agy`) stream-json compatibility probe
 
+> ES 的共享类型化事件模型与工具投影见 [../event-model.md](../event-model.md)；本文只记录该 native 通道的协议事实与证据边界。
+
 本文记录 2026-09-28 对 Google Antigravity CLI（`agy` 1.2.12，长驻 `--input-format stream-json` 模式）的真实机器探测结果，评估其作为本产品 subagent 的接入面。**Antigravity (`agy`) 现已作为第四个 subagent 注册，但全部 spawn 入口默认关闭、由 `enabled + spawn_supported + AGY_RUNTIME_PATH` 门控；live smoke 证据仍待「集成与完成」阶段回填（见 §10「接入状态」）。** 全部原始证据（stdout/stderr/事件流）保存在 `.agent-work/tmp/antigravity-probe/logs/`（未跟踪目录）。
 
 探测环境：macOS darwin 25.6.0 arm64；`agy 1.2.12`（`~/.local/bin/agy`，home `~/.gemini/antigravity-cli/`）；已认证（缓存凭据有效，未登录时 headless 直接报错不挂起）；settings.json 仅含 `trustedWorkspaces: ["/Users/ibobby"]`（探测期间曾临时注入 permissions 规则，已恢复原样并核对）。官方 headless 文档：`antigravity.google/docs/cli/headless/`。
@@ -118,7 +120,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 **已登记缺口（documented gaps）**：
 
 - permission request/respond 交互缺失：流中无请求事件，工具被 soft-deny 自动决；被拒动作仅经失败/取消路径拼入 bounded 诊断尾部。
-- 成功路径的 `denied_actions` 无公共投影面：`TaskResult` 无该字段、Completed 不携带 diagnostics，成功 turn 的 soft-deny 明细不上报。
+- 成功路径的 `denied_actions` 作为拒绝事实进入 ES 的有界诊断记录：每个 result 输入记一条 `permission_denied` 摘要（`count=1`、安全 discriminator `denied_actions`、影响维度 tools），不把成功 turn 改判为失败，也不标记数据丢失；该摘要经 wait 的 `activity.diagnostics` 投影（`TaskResult` 仍无该字段）。
 - 无 write-manifest 守卫：无 `FS_WRITE_MANIFEST_DENIED` 等价物，故 admission 只接受空 manifest。
 - daemon 崩溃后的活跃行自动恢复仍不实现（沿用 RUNTIME_LOST 不重放语义）；终态任务的显式 send 续聊**已实现**：factory 以持久化 session id 追加 `--conversation` 重启子进程，owner 校验 `init` 回显一致后由排队消息开启下一 turn（见「可直接实现」与 docs/compatibility/agents.md 的 send 双模式投递）。
 - 运行时 set-model/set-effort/cancel 控制面缺失（`control_request` 明示 not supported yet）。

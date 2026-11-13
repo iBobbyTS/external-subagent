@@ -1,6 +1,16 @@
 use super::*;
 
 impl Scheduler {
+    pub(super) fn native_failure_for(&self, agent_id: &str) -> Option<external_contract::events::NativeFailure> {
+        let runtime = self.inner.state.lock().unwrap().activities.get(agent_id).cloned();
+        runtime.and_then(|runtime| runtime.native_failure())
+    }
+
+    pub(super) fn record_command_failure(&self, agent_id: &str, failure: external_contract::events::NativeFailure) {
+        let runtime = self.inner.state.lock().unwrap().active.get(agent_id).map(|active| Arc::clone(&active.sink.activity));
+        if let Some(runtime) = runtime { runtime.record_command_failure(failure); }
+    }
+
     /// Record a bounded failure diagnostic for logs and the in-memory latest
     /// map, and return the independent persistable representation so a
     /// terminal fill point can hand it to the store in the same transaction
@@ -595,14 +605,7 @@ impl Write for RotatingDiagnosticWriter {
     }
 }
 
-/// Retain the native error unchanged except for credential redaction. The full
-/// value is delivered through the existing paged result; diagnostic metadata may
-/// be bounded independently without destroying the original error.
-pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_json::Value> {
-    let payload = params.get("payload")?;
-    let original = payload.get("error").filter(|v| !v.is_null())
-        .or_else(|| payload.get("reason_code"))?;
-    let original = redact_native_error(original);
+pub(crate) fn native_failure_detail(original: &serde_json::Value) -> serde_json::Value {
     let message = original.get("message").and_then(serde_json::Value::as_str)
         .or_else(|| original.as_str()).unwrap_or("turn.failed");
     let mut detail = serde_json::json!({"message": message});
@@ -618,8 +621,8 @@ pub(crate) fn turn_failure_detail(params: &serde_json::Value) -> Option<serde_js
     if let Some(status) = attribution.get("statusCode").and_then(serde_json::Value::as_u64) {
         detail["status_code"] = status.into();
     }
-    detail["original_error"] = original;
-    Some(detail)
+    detail["original_error"] = original.clone();
+    detail
 }
 
 fn sensitive_error_key(key: &str) -> bool {
@@ -630,7 +633,7 @@ fn sensitive_error_key(key: &str) -> bool {
         | "password" | "passwd" | "secret" | "clientsecret" | "privatekey")
 }
 
-fn redact_native_error(value: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn redact_native_error(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(fields) => serde_json::Value::Object(fields.iter().map(|(key, value)| {
             (key.clone(), if sensitive_error_key(key) && !value.is_null() && value.as_str() != Some("") { "[REDACTED]".into() } else { redact_native_error(value) })
@@ -645,7 +648,7 @@ fn redact_error_text(text: &str) -> String {
     static PATTERNS: OnceLock<[regex::Regex; 4]> = OnceLock::new();
     let patterns = PATTERNS.get_or_init(|| [
         regex::Regex::new(r#"(?i)((?:bearer|basic)[ \t]+)[^\s,;"']+"#).unwrap(),
-        regex::Regex::new(r#"(?i)(["']?(?:authorization|proxy-authorization|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|client[_-]?secret|secret|private[_-]?key|(?:set-)?cookie)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&]+)"#).unwrap(),
+        regex::Regex::new(r#"(?i)(["']?(?:authorization|proxy-authorization|api[_-]?key|x-api-key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|password|passwd|client[_-]?secret|secret|private[_-]?key|(?:set-)?cookie)["']?\s*[:=：＝]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&；，：、]+)"#).unwrap(),
         regex::Regex::new(r#"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@"#).unwrap(),
         regex::Regex::new(r#"(?im)^([ \t]*(?:authorization|proxy-authorization|cookie|set-cookie)[ \t]*:[ \t]*)[^\r\n]*"#).unwrap(),
     ]);
@@ -675,7 +678,7 @@ mod public_failure_tests {
             "stack":"frame 1\n  frame 2", "detail":"detail stays", "underlyingErrorDetail":"root detail stays",
             "futureField":[{"value":1},{"access_token":"private-token"}]
         });
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"error":original}})).unwrap();
+        let detail = native_failure_detail(&redact_native_error(&original));
         let mut expected = original;
         expected["data"]["apiKey"] = "[REDACTED]".into();
         expected["futureField"][1]["access_token"] = "[REDACTED]".into();
@@ -689,9 +692,40 @@ mod public_failure_tests {
     #[test]
     fn native_error_text_is_not_shortened_or_rewritten() {
         let text = format!("begin\n{}\nend", "信息 ".repeat(20000));
-        let detail = turn_failure_detail(&serde_json::json!({"payload":{"reason_code":text}})).unwrap();
+        let detail = native_failure_detail(&redact_native_error(
+            &serde_json::Value::String(text.clone()),
+        ));
         assert_eq!(detail["original_error"], text);
-        assert!(turn_failure_detail(&serde_json::json!({"payload":{}})).is_none());
+        // A local failure without a native value never fabricates one.
+        assert!(native_failure_detail(&serde_json::Value::Null)["original_error"].is_null());
+    }
+
+    #[test]
+    fn native_error_redaction_covers_full_width_credential_boundaries() {
+        let cases = [
+            (
+                "API-KEY=sk-dash-key；api_key: sk-underscore-key，X-Api-Key: sk-x-key",
+                "API-KEY=[REDACTED]；api_key: [REDACTED]，X-Api-Key: [REDACTED]",
+            ),
+            ("api_key：sk-fullwidth-colon", "api_key：[REDACTED]"),
+            (
+                "api_key=sk-a；password=sk-b",
+                "api_key=[REDACTED]；password=[REDACTED]",
+            ),
+            ("api_key＝sk-fullwidth-equals", "api_key＝[REDACTED]"),
+            ("api_key=sk-a：详情保留", "api_key=[REDACTED]：详情保留"),
+            (
+                "api_key=sk-a、password=sk-b",
+                "api_key=[REDACTED]、password=[REDACTED]",
+            ),
+            (
+                "请求失败：api_key=private-key，请稍后重试；错误码：429、网络正常。",
+                "请求失败：api_key=[REDACTED]，请稍后重试；错误码：429、网络正常。",
+            ),
+        ];
+        let actual: Vec<_> = cases.iter().map(|(text, _)| redact_error_text(text)).collect();
+        let expected: Vec<_> = cases.iter().map(|(_, expected)| *expected).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

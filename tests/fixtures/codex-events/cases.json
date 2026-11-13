@@ -1,0 +1,58 @@
+[
+  {
+    "name": "retry-error-object",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/codex@23934d31b1:codex-rs/app-server-protocol/src/protocol/v2/notification.rs:62; thread_data.rs:439; shared.rs:76",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "error",
+      "params": {
+        "threadId": "thread-1",
+        "turnId": "turn-1",
+        "error": {
+          "message": "provider stream disconnected",
+          "codexErrorInfo": {
+            "responseStreamDisconnected": {
+              "httpStatusCode": 502
+            }
+          },
+          "additionalDetails": "complete native detail"
+        },
+        "willRetry": true
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "error_observed"
+    ]
+  },
+  {
+    "name": "failed-turn",
+    "provenance": "SOURCE_INSPECTED",
+    "source": "reference/codex@23934d31b1:codex-rs/app-server-protocol/src/protocol/v2/notification.rs:62; thread_data.rs:439; shared.rs:76",
+    "input": {
+      "jsonrpc": "2.0",
+      "method": "turn/completed",
+      "params": {
+        "threadId": "thread-1",
+        "turn": {
+          "id": "turn-1",
+          "status": "failed",
+          "error": {
+            "message": "provider stream disconnected",
+            "codexErrorInfo": {
+              "responseStreamDisconnected": {
+                "httpStatusCode": 502
+              }
+            },
+            "additionalDetails": "complete native detail"
+          }
+        }
+      }
+    },
+    "expected_disposition": "consumed",
+    "expected_facts": [
+      "turn_settled"
+    ]
+  }
+]

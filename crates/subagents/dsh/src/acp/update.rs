@@ -2,11 +2,19 @@
 //! canonical event envelope.
 //!
 //! Progress, thought, and tool updates are kept separate from the final
-//! message (P06): thought chunks and uncommitted message chunks only ever
-//! project as progress/reasoning; only a committed agent message with a real
-//! `messageId` is eligible as final text. Two observed discriminator
-//! dialects are accepted: the pinned fixture shape (`update.type`) and
-//! the upstream standard shape (`update.sessionUpdate`).
+//! message (P06): thought chunks project only as reasoning, and assistant
+//! text always projects as a text delta. The prompt settlement is the only
+//! authority that promotes aggregated text into a result — the standard ACP
+//! flow provides neither a committed flag nor a settlement `messageId`, so
+//! this module must not require either. Two observed discriminator dialects
+//! are accepted: the pinned fixture shape (`update.type`) and the upstream
+//! standard shape (`update.sessionUpdate`).
+//!
+//! Tool facts follow the upstream public contract: `title` is the tool's real
+//! name and `kind` is only its category (`other` for a generic lifecycle), so
+//! a tool is never named after its category. A call's execution phase comes
+//! from its native `status`; the presence of a `content` array is not
+//! completion or success evidence.
 
 use external_contract::activity::{tool_result_event, tool_started_event};
 use serde_json::{json, Value};
@@ -18,10 +26,72 @@ pub struct SessionUpdate {
     pub kind: UpdateKind,
 }
 
+/// Native tool execution status (the ACP `status` field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl ToolStatus {
+    fn parse(value: Option<&Value>) -> Option<Self> {
+        match value.and_then(Value::as_str)? {
+            "pending" => Some(Self::Pending),
+            "in_progress" => Some(Self::InProgress),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            // An unrecognized status proves nothing, so it maps to no phase
+            // instead of being guessed into one.
+            _ => None,
+        }
+    }
+}
+
+/// The detailed tool-activity phase a native status projects onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPhase {
+    Scheduled,
+    Started,
+    Completed,
+    Failed,
+}
+
+impl ToolPhase {
+    fn activity_kind(self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Started => "started",
+            Self::Completed => "result",
+            Self::Failed => "error",
+        }
+    }
+}
+
+/// Project a native status onto an activity phase.
+///
+/// `announcement` marks the initial `tool_call`: it declares that the tool is
+/// being used even when the frame omits `status`. A `tool_call_update` without
+/// a recognized status carries no phase at all — in particular a content array
+/// never becomes completion evidence.
+fn tool_phase(announcement: bool, status: Option<ToolStatus>) -> Option<ToolPhase> {
+    match status {
+        Some(ToolStatus::Pending) => Some(ToolPhase::Scheduled),
+        Some(ToolStatus::InProgress) => Some(ToolPhase::Started),
+        Some(ToolStatus::Completed) => Some(ToolPhase::Completed),
+        Some(ToolStatus::Failed) => Some(ToolPhase::Failed),
+        None if announcement => Some(ToolPhase::Started),
+        None => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateKind {
     /// Assistant message text. `committed` is true only for the pinned
-    /// `agent_message` shape that carries a verified `messageId`.
+    /// `agent_message` shape that carries a verified `messageId`; it only
+    /// marks that the pinned dialect closed the message, and settlement stays
+    /// the result authority either way.
     AgentMessage {
         message_id: Option<String>,
         text: String,
@@ -33,12 +103,15 @@ pub enum UpdateKind {
     },
     ToolCall {
         tool_call_id: String,
+        /// The real tool name (the ACP `title`).
         title: Option<String>,
+        /// The tool category only — never used as the name.
         tool_kind: Option<String>,
+        status: Option<ToolStatus>,
     },
     ToolCallUpdate {
         tool_call_id: String,
-        has_result: bool,
+        status: Option<ToolStatus>,
     },
     /// Observed but untracked update (usage, config option, unknown kind).
     Untracked,
@@ -54,27 +127,43 @@ fn block_text(content: &Value) -> Option<String> {
             .or_else(|| object.get("delta").and_then(Value::as_str)),
         _ => None,
     }?;
-    if text.contains('\0') {
-        return None;
-    }
+    // U+0000 is legal JSON body text. Preserve it through assistant output
+    // instead of silently discarding the entire containing block.
     Some(text.to_owned())
 }
 
-/// Join an ACP content array (blocks) in order; `None` when the update has no
-/// usable content array.
+/// Preserve malformed assistant text as a parse failure, distinct from a
+/// legal empty string or an explicitly non-text ACP content block.
+fn assistant_block_text(content: &Value) -> Option<String> {
+    if let Value::Object(object) = content {
+        if object
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "text")
+        {
+            return Some(String::new());
+        }
+        // Do not let a valid fallback delta hide a damaged text field.
+        if let Some(text) = object.get("text") {
+            return text.as_str().map(str::to_owned);
+        }
+    }
+    block_text(content)
+}
+
+/// Join assistant blocks in order. Any malformed text block invalidates the
+/// message instead of silently delivering only its usable neighbors.
 fn joined_content(update: &Value) -> Option<String> {
     let content = update.get("content")?;
     match content {
         Value::Array(blocks) => {
             let mut text = String::new();
             for block in blocks {
-                if let Some(part) = block_text(block) {
-                    text.push_str(&part);
-                }
+                text.push_str(&assistant_block_text(block)?);
             }
             Some(text)
         }
-        single => block_text(single),
+        single => assistant_block_text(single),
     }
 }
 
@@ -96,54 +185,61 @@ pub fn parse_update(params: &Value) -> Option<SessionUpdate> {
     let kind = match discriminator {
         "agent_message" => UpdateKind::AgentMessage {
             message_id: bounded_id(update.get("messageId")),
-            text: joined_content(update).unwrap_or_default(),
+            text: joined_content(update)?,
             committed: true,
         },
         "agent_message_chunk" => UpdateKind::AgentMessage {
             message_id: bounded_id(update.get("messageId")),
-            text: block_text(update.get("content").unwrap_or(&Value::Null)).unwrap_or_default(),
+            text: assistant_block_text(update.get("content")?)?,
             committed: false,
         },
         "agent_thought_chunk" | "agent_thought" | "thought" => UpdateKind::AgentThoughtChunk {
-            text: block_text(update.get("content").unwrap_or(&Value::Null)),
+            text: block_text(update.get("content").unwrap_or(&Value::Null))
+                .filter(|text| !text.contains('\0')),
         },
         "tool_call" => UpdateKind::ToolCall {
             tool_call_id: bounded_id(update.get("toolCallId"))?,
             title: bounded_id(update.get("title")),
             tool_kind: bounded_id(update.get("kind")),
+            status: ToolStatus::parse(update.get("status")),
         },
         "tool_call_update" => UpdateKind::ToolCallUpdate {
             tool_call_id: bounded_id(update.get("toolCallId"))?,
-            has_result: update.get("content").is_some_and(Value::is_array),
+            status: ToolStatus::parse(update.get("status")),
         },
         _ => UpdateKind::Untracked,
     };
     Some(SessionUpdate { session_id, kind })
 }
 
-/// Name used for tool grouping in projections: the DSH tool kind when
-/// present, otherwise the bounded human title.
+/// Name used for tool grouping in projections: the real tool name from the
+/// ACP `title`. The category (`kind`) is not a name, so it is never used here.
 pub fn tool_name(kind: &UpdateKind) -> Option<String> {
     match kind {
-        UpdateKind::ToolCall {
-            tool_kind, title, ..
-        } => tool_kind
+        UpdateKind::ToolCall { title, .. } => title
             .clone()
-            .or_else(|| title.clone())
             .map(|name| name.chars().take(64).collect::<String>()),
         UpdateKind::ToolCallUpdate { .. } => None,
         _ => None,
     }
 }
 
-/// Normalize one update into canonical `session/event` payloads consumed by
-/// the shared activity and observation projections:
+/// Legacy projection of one update into canonical `session/event` payloads.
+///
+/// The production DSH pump no longer calls this: `external-daemon` decodes
+/// `session/update` into typed facts through the shared ingress, and the
+/// daemon's own canonical constructor is retired. The shape is retained only
+/// as a fixture source for the shared tracker's still-live legacy JSON parser
+/// tests; it is not a second production interpreter and nothing in the DSH
+/// path may consume it again.
 ///
 /// - message/thought text projects as `model.streaming` deltas (thoughts as
 ///   `reasoning_delta`, text as `text_delta` with the assistant message id);
-/// - tool activity projects both as the observation-verified
+/// - an announced tool projects both as the observation-verified
 ///   `model.streaming`/`tool_call` shape and the activity `tool.updated`
-///   shape, because the two projections listen on different types.
+///   shape, because the two projections listen on different types;
+/// - later tool progress carries only the activity phase, derived from the
+///   native status.
 ///
 /// Terminal settlement is deliberately not represented here: only the prompt
 /// settlement can promote text into a result.
@@ -189,36 +285,78 @@ pub fn canonical_event_payloads(
         }
         UpdateKind::ToolCall {
             tool_call_id,
-            title,
-            tool_kind,
+            status,
+            ..
         } => {
-            let name = tool_kind
-                .clone()
-                .or_else(|| title.clone())
-                .map(|name| name.chars().take(64).collect::<String>())
-                .unwrap_or_else(|| "dsh_tool".into());
-            vec![
-                base(json!({
-                    "kind": "tool_call",
-                    "toolCallId": tool_call_id,
-                    "toolName": name,
-                })),
-                // The activity vocabulary is shared with the daemon parser; the
-                // "dsh_tool" fallback and 64-char truncation stay caller-side.
-                tool_started_event(event_id, turn_id, tool_call_id, Some(&name)),
-            ]
+            let name = tool_name(&update.kind);
+            let Some(phase) = tool_phase(true, *status) else {
+                return Vec::new();
+            };
+            let mut events = Vec::new();
+            // Observation retains the announcement independently of execution.
+            // Even a terminal announcement records identity/name; only
+            // tool.updated carries the activity phase, without inventing start.
+            events.push(base(json!({
+                "kind": "tool_call",
+                "toolCallId": tool_call_id,
+                "toolName": name.clone().unwrap_or_else(|| "dsh_tool".into()),
+            })));
+            events.push(tool_activity_payload(
+                event_id,
+                turn_id,
+                tool_call_id,
+                phase,
+                name.as_deref(),
+            ));
+            events
         }
         UpdateKind::ToolCallUpdate {
             tool_call_id,
-            has_result,
-        } => {
-            if *has_result {
-                vec![tool_result_event(event_id, turn_id, tool_call_id)]
-            } else {
-                vec![tool_started_event(event_id, turn_id, tool_call_id, None)]
-            }
-        }
+            status,
+        } => match tool_phase(false, *status) {
+            Some(phase) => vec![tool_activity_payload(
+                event_id,
+                turn_id,
+                tool_call_id,
+                phase,
+                None,
+            )],
+            // No recognized status: the call's end is not proven, so nothing
+            // is claimed about its phase.
+            None => Vec::new(),
+        },
         _ => Vec::new(),
+    }
+}
+
+/// One detailed `tool.updated` payload in the shared activity vocabulary.
+fn tool_activity_payload(
+    event_id: &str,
+    turn_id: &str,
+    tool_call_id: &str,
+    phase: ToolPhase,
+    name: Option<&str>,
+) -> Value {
+    match phase {
+        ToolPhase::Completed => tool_result_event(event_id, turn_id, tool_call_id),
+        ToolPhase::Started => tool_started_event(event_id, turn_id, tool_call_id, name),
+        // The shared vocabulary has no constructor for the remaining phases;
+        // these are its exact documented shapes.
+        other => {
+            let mut payload = json!({
+                "kind": other.activity_kind(),
+                "toolCallId": tool_call_id,
+            });
+            if let Some(name) = name {
+                payload["toolName"] = Value::String(name.to_owned());
+            }
+            json!({
+                "type": "tool.updated",
+                "eventId": event_id,
+                "turnId": turn_id,
+                "payload": payload,
+            })
+        }
     }
 }
 
@@ -259,6 +397,40 @@ mod tests {
     }
 
     #[test]
+    fn repair4_assistant_text_preserves_nul_without_changing_empty_or_thought_rules() {
+        let nul_text = "important\0suffix";
+        for update in [
+            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":nul_text}}),
+            json!({"type":"agent_message","messageId":"native","content":[
+                {"type":"text","text":""},{"type":"image","data":"ignored"},
+                {"type":"text","text":nul_text}]}),
+        ] {
+            let parsed = parse_update(&json!({"sessionId":"s","update":update})).unwrap();
+            let UpdateKind::AgentMessage { text, .. } = &parsed.kind else {
+                panic!("assistant text");
+            };
+            assert_eq!(text, nul_text);
+            let payloads = canonical_event_payloads(&parsed, "event", "turn");
+            assert_eq!(payloads[0]["payload"]["delta"], nul_text);
+        }
+        for content in [
+            json!({"type":"text","text":""}),
+            json!({"type":"image","data":"ignored"}),
+        ] {
+            let parsed = parse_update(
+                &json!({"update":{"sessionUpdate":"agent_message_chunk","content":content}}),
+            )
+            .unwrap();
+            assert!(matches!(&parsed.kind, UpdateKind::AgentMessage { text, .. } if text.is_empty()));
+            assert!(canonical_event_payloads(&parsed, "empty", "turn").is_empty());
+        }
+        let thought = parse_update(&json!({"update":{"sessionUpdate":"agent_thought_chunk",
+            "content":{"type":"text","text":nul_text}}}))
+        .unwrap();
+        assert_eq!(thought.kind, UpdateKind::AgentThoughtChunk { text: None });
+    }
+
+    #[test]
     fn both_dialects_parse_and_keep_message_identity() {
         let tool = parse_update(&fixture_tool()).unwrap();
         assert_eq!(
@@ -267,6 +439,7 @@ mod tests {
                 tool_call_id: "tool-1".into(),
                 title: Some("read-only probe".into()),
                 tool_kind: None,
+                status: None,
             }
         );
         let message = parse_update(&fixture_message()).unwrap();
@@ -332,6 +505,7 @@ mod tests {
         assert_eq!(payloads[0]["payload"]["toolName"], "read-only probe");
         assert_eq!(payloads[1]["type"], "tool.updated");
         assert_eq!(payloads[1]["payload"]["kind"], "started");
+        assert_eq!(payloads[1]["payload"]["toolName"], "read-only probe");
 
         // Uncommitted chunks never emit a finished boundary.
         let chunk = parse_update(&upstream_chunk()).unwrap();
@@ -347,7 +521,7 @@ mod tests {
         // hand-written JSON (never generated from the constructors).
         let named = parse_update(&json!({
             "sessionId": "s",
-            "update": {"sessionUpdate": "tool_call", "toolCallId": "call-1", "kind": "read"}
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "read"}
         }))
         .unwrap();
         assert_eq!(
@@ -364,32 +538,40 @@ mod tests {
             ]
         );
 
-        // Unnamed started: a tool_call_update without a result array carries no
-        // toolName field at all (omitted, not null).
+        // Unnamed announced started: no toolName field at all (omitted, not
+        // null) on the activity event; the observation sibling keeps its
+        // stable grouping fallback.
         let unnamed = parse_update(&json!({
             "sessionId": "s",
-            "update": {"sessionUpdate": "tool_call_update", "toolCallId": "call-2"}
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "call-2"}
         }))
         .unwrap();
         assert_eq!(
             canonical_event_payloads(&unnamed, "evt-2", "turn-1"),
-            vec![json!({
-                "type": "tool.updated", "eventId": "evt-2", "turnId": "turn-1",
-                "payload": {"kind": "started", "toolCallId": "call-2"},
-            })]
+            vec![
+                json!({
+                    "type": "model.streaming", "eventId": "evt-2", "turnId": "turn-1",
+                    "payload": {"kind": "tool_call", "toolCallId": "call-2", "toolName": "dsh_tool"},
+                }),
+                json!({
+                    "type": "tool.updated", "eventId": "evt-2", "turnId": "turn-1",
+                    "payload": {"kind": "started", "toolCallId": "call-2"},
+                }),
+            ]
         );
 
-        // Result: a tool_call_update carrying a content array.
-        let result = parse_update(&json!({
+        // Completed: the native status is the only completion evidence, and
+        // the detailed result vocabulary carries no toolName.
+        let completed = parse_update(&json!({
             "sessionId": "s",
             "update": {
                 "sessionUpdate": "tool_call_update", "toolCallId": "call-3",
-                "content": [{"type": "text", "text": "ok"}]
+                "status": "completed", "content": [{"type": "text", "text": "ok"}]
             }
         }))
         .unwrap();
         assert_eq!(
-            canonical_event_payloads(&result, "evt-3", "turn-1"),
+            canonical_event_payloads(&completed, "evt-3", "turn-1"),
             vec![json!({
                 "type": "tool.updated", "eventId": "evt-3", "turnId": "turn-1",
                 "payload": {"kind": "result", "toolCallId": "call-3"},
@@ -398,16 +580,91 @@ mod tests {
     }
 
     #[test]
-    fn tool_names_prefer_kind_over_title() {
+    fn tool_status_drives_the_phase_and_content_is_never_success_evidence() {
+        let phases = |update: Value| {
+            let parsed = parse_update(&update).unwrap();
+            canonical_event_payloads(&parsed, "evt", "turn-1")
+                .iter()
+                .filter(|event| event["type"] == "tool.updated")
+                .map(|event| event["payload"]["kind"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let update = |status: &str| {
+            json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "call-1",
+                    "status": status
+                }
+            })
+        };
+        assert_eq!(phases(update("pending")), vec!["scheduled"]);
+        assert_eq!(phases(update("in_progress")), vec!["started"]);
+        assert_eq!(phases(update("completed")), vec!["result"]);
+        // A failed tool is a failure, never a completed call.
+        assert_eq!(phases(update("failed")), vec!["error"]);
+
+        // A content array without a terminal status proves nothing: no phase
+        // is invented, so the call is never reported as completed.
+        let content_only = json!({
+            "sessionId": "s",
+            "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "call-2",
+                "content": [{"type": "text", "text": "looks finished"}]
+            }
+        });
+        assert!(phases(content_only).is_empty());
+        // An unknown status is not guessed into a phase either.
+        assert!(phases(update("queued")).is_empty());
+    }
+
+    #[test]
+    fn announced_tool_status_projects_onto_the_matching_phase() {
+        let phases = |status: Value| {
+            let parsed = parse_update(&json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": "tool_call", "toolCallId": "call-1",
+                    "title": "read a file", "kind": "other", "status": status
+                }
+            }))
+            .unwrap();
+            canonical_event_payloads(&parsed, "evt", "turn-1")
+                .iter()
+                .filter(|event| event["type"] == "tool.updated")
+                .map(|event| event["payload"]["kind"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(phases(json!("pending")), vec!["scheduled"]);
+        assert_eq!(phases(json!("in_progress")), vec!["started"]);
+        assert_eq!(phases(json!("completed")), vec!["result"]);
+        assert_eq!(phases(json!("failed")), vec!["error"]);
+    }
+
+    #[test]
+    fn tool_names_come_from_the_title_never_from_the_category() {
+        // The upstream generic lifecycle always sends kind="other"; naming the
+        // tool after it would collapse every call into "other".
         let kind = parse_update(&json!({
-            "update": {"type": "tool_call", "toolCallId": "t", "kind": "edit", "title": "Edit file"}
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "t", "kind": "other", "title": "Edit file"}
         }))
         .unwrap();
-        assert_eq!(tool_name(&kind.kind).as_deref(), Some("edit"));
+        assert_eq!(tool_name(&kind.kind).as_deref(), Some("Edit file"));
         let title_only = parse_update(&fixture_tool()).unwrap();
         assert_eq!(
             tool_name(&title_only.kind).as_deref(),
             Some("read-only probe")
+        );
+        // A category alone is not a name; the announced event still keeps the
+        // stable grouping fallback instead of claiming the category.
+        let category_only = parse_update(&json!({
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "t", "kind": "other"}
+        }))
+        .unwrap();
+        assert_eq!(tool_name(&category_only.kind), None);
+        assert_eq!(
+            canonical_event_payloads(&category_only, "evt", "turn-1")[0]["payload"]["toolName"],
+            "dsh_tool"
         );
     }
 }

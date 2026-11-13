@@ -1,5 +1,7 @@
 # ZCode compatibility
 
+> ES 的共享类型化事件模型与工具投影见 [../event-model.md](../event-model.md)；本文只记录该 native 通道的协议事实与证据边界。
+
 Verified interface evidence for the ZCode client this product binds to as
 a host (`install-plugin zcode`). All evidence below was gathered on macOS
 arm64 against ZCode **25.6.0** (`/Applications/ZCode.app`,

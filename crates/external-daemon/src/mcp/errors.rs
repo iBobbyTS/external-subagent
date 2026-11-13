@@ -3,13 +3,66 @@
 //! Extracted mechanically from the former single-file `mcp` module; the
 //! facade at `crate::mcp` keeps every historical path importable.
 use super::types::public_task_id;
-use crate::rpc::{RpcError, RpcErrorCode};
+use super::views::PublicNativeRetry;
+use crate::rpc::{NativeErrorView, RpcError, RpcErrorCode};
 use rmcp::{
     handler::server::tool::IntoCallToolResult,
     model::{CallToolResponse, CallToolResult, ContentBlock},
 };
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// Optional native meaning extracted only where the source stated it. The
+/// complete original remains authoritative and is never replaced by it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicNativeFailureProjection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<PublicNativeRetry>,
+}
+
+/// Complete credential-redacted native error, or an explicit statement that it
+/// exceeded the hard transfer cap. `original` is absent only when `truncated`
+/// is true; this envelope never claims complete delivery in that case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct PublicNativeError {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<PublicNativeFailureProjection>,
+    pub truncated: bool,
+    pub total_bytes: u64,
+    pub limit_bytes: u64,
+}
+
+impl From<NativeErrorView> for PublicNativeError {
+    fn from(value: NativeErrorView) -> Self {
+        Self {
+            original: value.original,
+            projection: value.projection.map(|projection| PublicNativeFailureProjection {
+                code: projection.code,
+                status: projection.status,
+                retry: projection.retry.map(|retry| PublicNativeRetry {
+                    will_retry: retry.will_retry,
+                    retryable: retry.retryable,
+                    attempt: retry.attempt,
+                    max_attempts: retry.max_attempts,
+                    next_attempt: retry.next_attempt,
+                    delay_ms: retry.delay_ms,
+                    reset_at: retry.reset_at,
+                }),
+            }),
+            truncated: value.truncated,
+            total_bytes: value.total_bytes as u64,
+            limit_bytes: value.limit_bytes as u64,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -17,7 +70,7 @@ pub struct PublicErrorEnvelope {
     pub error: PublicToolErrorBody,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct PublicToolErrorBody {
     pub code: String,
@@ -32,6 +85,11 @@ pub struct PublicToolErrorBody {
     pub agent_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_count: Option<u64>,
+    /// Present only for a synchronous native command failure whose complete
+    /// redacted original is still available. ES's own code/message describe
+    /// this layer's operation and never substitute for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_error: Option<PublicNativeError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +114,7 @@ impl ToolError {
                 request_id: None,
                 agent_id: None,
                 prompt_count: None,
+                native_error: None,
             },
             legacy_text: legacy_text.into(),
         }
@@ -124,6 +183,7 @@ pub(crate) fn public_error(error: RpcError) -> ToolError {
 
 pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError {
     let detail = error.message.clone();
+    let native_error = error.native_error.map(Into::into);
     // Admission sites compose the full public message and ship it as the RPC
     // detail (same Design B as the AgentUnknown roster branch below); project
     // a recognized prefix verbatim instead of the static sentence. The list is
@@ -249,7 +309,8 @@ pub(crate) fn public_error_for_op(error: RpcError, operation: &str) -> ToolError
     } else {
         format!("{code}: {message}")
     };
-    let projected = ToolError::new(code, message, legacy_text, "daemon").with_agent_id(agent_id);
+    let mut projected = ToolError::new(code, message, legacy_text, "daemon").with_agent_id(agent_id);
+    projected.body.native_error = native_error;
     if matches!(
         error.code,
         RpcErrorCode::Validation
@@ -300,6 +361,94 @@ pub(crate) fn protocol_error() -> ToolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rpc_error_with_native(native: crate::rpc::NativeErrorView) -> RpcError {
+        let mut error = RpcError::new(
+            RpcErrorCode::Unavailable,
+            "session/send rejected: api_key=[REDACTED]",
+        );
+        error.active_agent_id = Some("10000001".into());
+        error.native_error = Some(native);
+        error
+    }
+
+    #[test]
+    fn public_error_forwards_the_complete_native_original_without_summarizing() {
+        let original = serde_json::json!({
+            "message": "model request failed.
+  keep whitespace	and details",
+            "code": "rate_limit",
+            "stack": "frame 1
+  frame 2",
+            "data": {"retryAfter": 109727, "apiKey": "[REDACTED]"}
+        });
+        let projected = public_error_for_op(
+            rpc_error_with_native(crate::rpc::NativeErrorView {
+                original: Some(original.clone()),
+                projection: Some(external_contract::events::FailureProjection {
+                    code: Some(serde_json::Value::String("rate_limit".into())),
+                    status: Some(429),
+                    retry: None,
+                }),
+                truncated: false,
+                total_bytes: serde_json::to_vec(&original).unwrap().len(),
+                limit_bytes: crate::rpc::MAX_NATIVE_ERROR_BYTES,
+            }),
+            "send",
+        );
+        assert_eq!(projected.body.agent_id, Some(10_000_001));
+        let native = projected.body.native_error.clone().expect("native error");
+        assert_eq!(native.original, Some(original));
+        assert!(!native.truncated);
+        assert_eq!(native.projection.unwrap().status, Some(429));
+        let encoded = serde_json::to_value(PublicErrorEnvelope {
+            error: projected.body,
+        })
+        .unwrap();
+        assert_eq!(
+            encoded["error"]["native_error"]["original"]["message"],
+            "model request failed.\n  keep whitespace\tand details"
+        );
+        assert_eq!(
+            encoded["error"]["native_error"]["limit_bytes"],
+            crate::rpc::MAX_NATIVE_ERROR_BYTES
+        );
+    }
+
+    #[test]
+    fn over_cap_native_error_projects_an_explicit_limit_not_a_complete_claim() {
+        let projected = public_error_for_op(
+            rpc_error_with_native(crate::rpc::NativeErrorView {
+                original: None,
+                projection: None,
+                truncated: true,
+                total_bytes: crate::rpc::MAX_NATIVE_ERROR_BYTES + 1,
+                limit_bytes: crate::rpc::MAX_NATIVE_ERROR_BYTES,
+            }),
+            "send",
+        );
+        let native = projected.body.native_error.clone().expect("native error");
+        assert!(native.truncated);
+        assert_eq!(native.original, None);
+        let encoded = serde_json::to_value(PublicErrorEnvelope {
+            error: projected.body,
+        })
+        .unwrap();
+        assert!(encoded["error"]["native_error"]["original"].is_null());
+        assert_eq!(encoded["error"]["native_error"]["truncated"], true);
+    }
+
+    #[test]
+    fn local_errors_omit_native_error_and_legacy_error_frames_still_decode() {
+        let projected = public_error(RpcError::new(RpcErrorCode::NotFound, "missing"));
+        assert!(projected.body.native_error.is_none());
+        let legacy: PublicToolErrorBody = serde_json::from_value(serde_json::json!({
+            "code": "not_found",
+            "message": "agent task was not found"
+        }))
+        .unwrap();
+        assert!(legacy.native_error.is_none());
+    }
 
     #[test]
     fn steer_unsupported_has_a_distinct_public_code_and_zero_prompts() {

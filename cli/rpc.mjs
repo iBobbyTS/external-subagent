@@ -319,7 +319,7 @@ export function callDaemon(socketPath, command, input, timeoutMs) {
       try {
         const response = JSON.parse(line);
         if (response.request_id !== request_id) finish(reject, new CliError('PROTOCOL_ERROR', 'daemon returned an RPC response for a different request'));
-        else if (response.outcome === 'error') { const daemon = response.error || {}; const error = new CliError(daemon.code || 'DAEMON_ERROR', daemon.message || 'daemon request failed'); error.agentId = daemon.active_agent_id == null ? undefined : publicTaskId(daemon.active_agent_id); error.daemonResponded = true; finish(reject, error); }
+        else if (response.outcome === 'error') { const daemon = response.error || {}; const error = new CliError(daemon.code || 'DAEMON_ERROR', daemon.message || 'daemon request failed'); error.agentId = daemon.active_agent_id == null ? undefined : publicTaskId(daemon.active_agent_id); error.nativeError = daemon.native_error; error.daemonResponded = true; finish(reject, error); }
         else if (response.outcome === 'success') {
           try {
             const projected = projectDaemonResult(command, response.result);

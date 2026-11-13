@@ -1,16 +1,9 @@
-//! Canonical tool-activity derivation for `agy` `tool` steps.
+//! Legacy tool-activity data derivation for `agy` `tool` steps.
 //!
 //! A measured tool step is an `ACTIVE`/`DONE` pair sharing one `step_index`:
 //! the `ACTIVE` half carries `tool_info.name`, the `DONE` half additionally
 //! carries `tool_info.output` (`docs/compatibility/antigravity.md` §1). This
-//! module turns such a step into plain [`ToolActivity`] data whose identity is
-//! `{conversation_id}:{step_index}`, and can serialize it with the shared
-//! `external-contract` constructors the daemon's 60-second activity window
-//! consumes. Nothing here holds state or emits; the daemon stamps the
-//! monotonic `event_id` and the conversation-derived `turn_id`.
-
-use external_contract::activity::{tool_result_event, tool_started_event};
-use serde_json::Value;
+//! module retains a pure data helper; the daemon owns typed interpretation.
 
 use crate::event::{AgyEvent, StepState, StepType};
 
@@ -35,19 +28,6 @@ impl ToolActivity {
     /// The stable call identity `{conversation_id}:{step_index}`.
     pub fn tool_call_id(&self) -> String {
         format!("{}:{}", self.conversation_id, self.step_index)
-    }
-
-    /// Serialize this record with the shared detailed activity vocabulary. The
-    /// `event_id` is the daemon's monotonic sequence and `turn_id` its
-    /// conversation-scoped turn label; both are supplied by the caller.
-    pub fn canonical_event(&self, event_id: &str, turn_id: &str) -> Value {
-        let tool_call_id = self.tool_call_id();
-        match self.phase {
-            ToolPhase::Started => {
-                tool_started_event(event_id, turn_id, &tool_call_id, self.tool_name.as_deref())
-            }
-            ToolPhase::Result => tool_result_event(event_id, turn_id, &tool_call_id),
-        }
     }
 }
 
@@ -77,12 +57,6 @@ pub fn tool_activity(event: &AgyEvent) -> Option<ToolActivity> {
         tool_name,
         phase,
     })
-}
-
-/// Derive and serialize one canonical activity event, if the input is a tool
-/// step.
-pub fn canonical_activity(event: &AgyEvent, event_id: &str, turn_id: &str) -> Option<Value> {
-    tool_activity(event).map(|activity| activity.canonical_event(event_id, turn_id))
 }
 
 #[cfg(test)]
@@ -120,38 +94,6 @@ mod tests {
         assert_eq!(result.phase, ToolPhase::Result);
         assert_eq!(result.tool_call_id(), started.tool_call_id());
         assert_eq!(result.tool_name.as_deref(), Some("run_command"));
-
-        let turn_id = started.conversation_id.as_str();
-        assert_eq!(
-            started.canonical_event("agy-event-1", turn_id),
-            serde_json::json!({
-                "type": "tool.updated",
-                "eventId": "agy-event-1",
-                "turnId": turn_id,
-                "payload": {
-                    "kind": "started",
-                    "toolCallId": "7e37ef63-9547-4ae1-b3fd-0e7a8c125f73:2",
-                    "toolName": "run_command",
-                },
-            })
-        );
-        assert_eq!(
-            result.canonical_event("agy-event-2", turn_id),
-            serde_json::json!({
-                "type": "tool.updated",
-                "eventId": "agy-event-2",
-                "turnId": turn_id,
-                "payload": {
-                    "kind": "result",
-                    "toolCallId": "7e37ef63-9547-4ae1-b3fd-0e7a8c125f73:2",
-                },
-            })
-        );
-        // The convenience wrapper builds the same record from the raw event.
-        assert_eq!(
-            canonical_activity(&steps[0], "agy-event-1", turn_id),
-            Some(started.canonical_event("agy-event-1", turn_id))
-        );
     }
 
     #[test]
@@ -177,11 +119,6 @@ mod tests {
         );
         let activity = tool_activity(&parse_line(unnamed).unwrap()).unwrap();
         assert_eq!(activity.tool_name, None);
-        // An unnamed started event omits `toolName` rather than emitting null.
-        assert!(activity
-            .canonical_event("e", "t")
-            .pointer("/payload/toolName")
-            .is_none());
     }
 
     #[test]

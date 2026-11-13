@@ -1,4 +1,4 @@
-//! The `agy` NDJSON pump thread (raw-value frame loop, canonical projection,
+//! The `agy` NDJSON pump thread (raw-value frame loop, typed projection,
 //! child-exit terminalization) and the process-group reap proof for terminal
 //! classification.
 
@@ -31,11 +31,11 @@ pub(super) fn spawn_agy_pump(
                 if let Inbound::ChildExited(exit) = &event {
                     driver.wait_diagnostics(Duration::from_secs(1));
                     let terminal = classify_child_exit(driver.identity().pgid, &shared, exit);
-                    publisher.emit_driver(event, terminal);
+                    publisher.publish_transport(event, terminal);
                     return;
                 }
                 if let Some(projected) = project_agy_inbound(&shared, &event) {
-                    publisher.emit_driver(projected, None);
+                    publisher.publish_transport(projected, None);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -59,7 +59,7 @@ fn classify_child_exit(
     match observe_process_group(pgid) {
         Ok(members) if members.is_empty() => match exit {
             ChildExit::Exited(Some(0)) => {
-                let turn = shared.turn_tracker.snapshot();
+                let turn = shared.runtime_state.turn_snapshot();
                 if !turn.active && turn.boundary == Some(TurnBoundary::Completed) {
                     Some(RuntimeTerminal::Completed(StopOutcome::AlreadyExited(
                         exit.clone(),

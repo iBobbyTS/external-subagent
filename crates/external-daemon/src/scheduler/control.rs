@@ -3,7 +3,7 @@ use external_store::StoreError;
 
 impl Scheduler {
     pub(super) fn late_ingress_error(agent_id: &str, reason: &'static str) -> SchedulerError {
-        SchedulerError::RuntimeCommand {
+        SchedulerError::RuntimeCommand { operation: None, native_failure: None,
             agent_id: agent_id.into(),
             message: reason.into(),
         }
@@ -52,7 +52,7 @@ impl Scheduler {
     }
 
     pub(super) fn control_timeout_error(agent_id: &str) -> SchedulerError {
-        SchedulerError::RuntimeCommand {
+        SchedulerError::RuntimeCommand { operation: None, native_failure: None,
             agent_id: agent_id.into(),
             message: "control operation deadline elapsed".into(),
         }

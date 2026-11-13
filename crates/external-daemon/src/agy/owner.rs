@@ -20,7 +20,7 @@ use super::events::AgyRuntimeShared;
 use super::transport::spawn_agy_pump;
 use crate::{
     LifecycleSink, ManagedRuntime, ProcessIdentity, Publisher, RuntimeCommandError, RuntimeLoss,
-    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot, TurnTracker,
+    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot,
 };
 
 pub struct AgyRuntimeOwner {
@@ -47,9 +47,7 @@ impl AgyRuntimeOwner {
         )?);
         let publisher = Arc::new(Publisher::new(sink));
         let shared = Arc::new(AgyRuntimeShared::new(
-            Arc::clone(&publisher),
-            Arc::new(TurnTracker::new()),
-        ));
+            Arc::clone(&publisher)));
         let shutdown = Arc::new(AtomicBool::new(false));
         spawn_agy_pump(
             Arc::clone(&driver),
@@ -124,7 +122,7 @@ impl AgyRuntimeOwner {
                 }
                 Ok(admission.model.clone().filter(|model| !model.is_empty()))
             }
-            Err(message) => Err(RuntimeCommandError::InvalidSession(message)),
+            Err(message) => Err(RuntimeCommandError::InvalidSession(message.into())),
         }
     }
 
@@ -167,8 +165,8 @@ impl ManagedRuntime for AgyRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
-    fn diagnostic_failure(&self) -> Option<String> {
-        self.shared.turn_tracker.failure_detail()
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        self.shared.runtime_state.native_failure()
     }
 
     fn diagnostic_tail(&self) -> String {
@@ -207,6 +205,8 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(SessionReady {
             session_id,
             initial_turn_id: None,
+            // This field feeds the legacy requested-model gate. Native
+            // init.model remains identity evidence in the typed SessionReady.
             configured_model: model,
         })
     }
@@ -235,9 +235,12 @@ impl ManagedRuntime for AgyRuntimeOwner {
         // continuing on the wrong history.
         let observed = self.shared.wait_start(remaining_time(deadline)?)?;
         if observed != session_id {
-            return Err(RuntimeCommandError::InvalidSession(format!(
-                "agy resumed conversation {observed} does not match the persisted session id"
-            )));
+            return Err(RuntimeCommandError::InvalidSession(
+                format!(
+                    "agy resumed conversation {observed} does not match the persisted session id"
+                )
+                .into(),
+            ));
         }
         // A resumed conversation never replays the pre-stop prompt: the queued
         // message delivered by the scheduler is the sole trigger for the next
@@ -245,7 +248,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         Ok(SessionReady {
             session_id: session_id.to_owned(),
             initial_turn_id: None,
-            configured_model: model,
+            configured_model: self.shared.model().or(model),
         })
     }
 
@@ -256,7 +259,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         _timeout: Duration,
     ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        if self.shared.turn_tracker.snapshot().active {
+        if self.shared.runtime_state.turn_snapshot().active {
             return Err(RuntimeCommandError::InvalidSession(
                 "a turn is already in flight for this agy session".into(),
             ));
@@ -284,7 +287,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         timeout: Duration,
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let current = self.shared.turn_tracker.snapshot();
+        let current = self.shared.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -296,14 +299,14 @@ impl ManagedRuntime for AgyRuntimeOwner {
         // of the stop first so the pump's child-exit classification cannot
         // publish a terminal ahead of the scheduler's real reap.
         if self.shared.publisher.begin_stopping().is_some() {
-            return Ok(self.shared.turn_tracker.snapshot());
+            return Ok(self.shared.runtime_state.turn_snapshot());
         }
         self.driver
             .stop_and_reap(remaining_time(deadline)?)
             .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
         let boundary = self
             .shared
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_time(deadline)?)?;
         self.shared.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -313,9 +316,7 @@ impl ManagedRuntime for AgyRuntimeOwner {
         self.shared.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.turn_tracker.activity_snapshot()
-    }
+
 
     fn stop_boundary_count(&self) -> u64 {
         self.shared.stop_boundaries.load(Ordering::Acquire)

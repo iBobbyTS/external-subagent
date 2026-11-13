@@ -1,5 +1,5 @@
 use external_contract::{
-    configured_thought_level_from_result, event_type, normalized_scoped_model,
+    configured_thought_level_from_result, normalized_scoped_model,
     normalized_zai_model, offered_permission_response, provider_model_matches,
     set_model_projection_from_result, turn_id_from_result, CatalogModelEntry, CreateSessionParams,
     ResumeSessionParams, RuntimePreferences, SendParams, SessionCreateProjection, SessionParams,
@@ -33,12 +33,13 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-mod activity_parser;
 mod activity_tracker;
-use activity_parser::{
-    parse_passive_activity, ActivitySample, ActivitySampleKind, ActivitySource, ActivityTransition,
-    ToolActivityMode,
-};
+mod runtime_observation;
+#[cfg(test)]
+mod observation_tests;
+use runtime_observation::{TelemetryStatus, RuntimeCoverage, DiagnosticSummary, ModelActivityView};
+#[cfg(test)]
+mod test_support;
 pub mod agent_status;
 pub mod agy;
 pub mod codex;
@@ -48,7 +49,7 @@ mod lifecycle_sink;
 pub mod mcp;
 pub mod observation;
 mod projection;
-use activity_tracker::{PassiveActivityTracker, TerminalText, WaitTail};
+use activity_tracker::{TerminalText, WaitTail};
 use lifecycle_sink::{
     bounded_result_invalid_task_result, finalized_general, minimal_task_result,
     persist_general_result, store_result_with_cancel_precedence, unreaped_general,
@@ -58,6 +59,7 @@ pub mod rpc;
 mod runtime_owner;
 mod scheduler;
 pub mod zcode;
+mod runtime_state;
 use external_core::{
     CompletionOutcome, GeneralCompletion, GeneralFinalizer, GeneralTaskManifest,
     GeneralTaskPreparer, PolicyLauncher, PreparedGeneralTask, ValidatedPermissionDenial,
@@ -209,13 +211,6 @@ pub struct TurnSnapshot {
     pub boundary: Option<TurnBoundary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RuntimeActivitySnapshot {
-    pub turn: TurnSnapshot,
-    pub model_request_elapsed: Option<Duration>,
-    pub transport_idle_elapsed: Option<Duration>,
-}
-
 const PASSIVE_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 const MAX_ACTIVITY_IDENTITIES: usize = 65_536;
 const MAX_LATEST_TEXT_BYTES: usize = 8 * 1024;
@@ -260,7 +255,11 @@ pub struct PassiveActivitySnapshot {
     pub active_tools: Vec<PassiveActiveTool>,
     pub(crate) oldest_active_tool_age_ms: Option<u64>,
     pub window_60s: PassiveActivityWindow,
-    pub telemetry_degraded: bool,
+    pub telemetry_status: TelemetryStatus,
+    pub coverage: RuntimeCoverage,
+    pub diagnostics: Vec<DiagnosticSummary>,
+    pub diagnostics_truncated: bool,
+    pub model_activity: Option<ModelActivityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,14 +271,69 @@ pub struct SessionReady {
     pub configured_model: Option<String>,
 }
 
+/// Existing classification text with an optional complete native error.
+/// String conversions preserve local validation constructors and their Display.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeCommandDetail {
+    pub message: String,
+    pub native_failure: Option<external_contract::events::NativeFailure>,
+}
+
+impl RuntimeCommandDetail {
+    pub fn from_native(message: impl Into<String>, original: &serde_json::Value) -> Self {
+        Self {
+            message: scheduler::redact_native_error(&serde_json::Value::String(message.into()))
+                .as_str().expect("redacted string").to_owned(),
+            native_failure: Some(external_contract::events::NativeFailure {
+                original: scheduler::redact_native_error(original),
+                projection: None,
+            }),
+        }
+    }
+}
+impl From<String> for RuntimeCommandDetail {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            native_failure: None,
+        }
+    }
+}
+impl From<&str> for RuntimeCommandDetail {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl std::ops::Deref for RuntimeCommandDetail {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+impl fmt::Display for RuntimeCommandDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl fmt::Debug for RuntimeCommandDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.message, f)
+    }
+}
+impl PartialEq<&str> for RuntimeCommandDetail {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeCommandError {
     Unsupported,
     Timeout,
     Transport(String),
     Remote(serde_json::Value),
-    ModelRejected(String),
-    InvalidSession(String),
+    ModelRejected(RuntimeCommandDetail),
+    InvalidSession(RuntimeCommandDetail),
 }
 
 impl fmt::Display for RuntimeCommandError {
@@ -298,21 +352,34 @@ impl fmt::Display for RuntimeCommandError {
 }
 
 impl RuntimeCommandError {
-    fn diagnostic(&self, operation: &str) -> String {
-        let mut detail = serde_json::json!({"operation": operation, "message": bounded_error(&self.to_string())});
-        if let Self::Remote(value) = self {
-            detail["remote_code"] = value.get("code").and_then(serde_json::Value::as_i64).into();
-            detail["remote_message"] = value
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(|message| bounded_prefix(message, 1024))
-                .into();
+    /// Complete received error, credential-redacted, for the common error
+    /// consumer. Local validation errors have no native original.
+    pub fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        match self {
+            Self::Remote(original) => Some(external_contract::events::NativeFailure {
+                original: scheduler::redact_native_error(original), projection: None,
+            }),
+            Self::ModelRejected(detail) | Self::InvalidSession(detail) => detail.native_failure.clone(),
+            _ => None,
         }
-        detail.to_string()
     }
+
+    /// Bounded local diagnostic fields. The independent typed carrier owns
+    /// the full original and is passed to RuntimeState/results separately.
+    fn diagnostic_fields(&self, operation: &str) -> serde_json::Value {
+        let mut detail = serde_json::json!({"operation": operation, "message": bounded_error(&self.to_string())});
+        if let Some(failure) = self.native_failure() {
+            detail["remote_code"] = failure.original.get("code").cloned().unwrap_or_default();
+            detail["remote_message"] = failure.original.get("message")
+                .and_then(serde_json::Value::as_str)
+                .map(|message| bounded_prefix(message, 1024)).into();
+        }
+        detail
+    }
+
 }
 
-// Keep only the remote code/message, never error.data or provider configuration.
+// Legacy diagnostic formatting stays bounded; native_failure() retains the original separately.
 impl std::error::Error for RuntimeCommandError {}
 
 impl From<RequestError> for RuntimeCommandError {
@@ -325,165 +392,61 @@ impl From<RequestError> for RuntimeCommandError {
     }
 }
 
-#[derive(Debug)]
-struct TurnTrackerState {
+#[derive(Debug, Default)]
+struct TurnReduction {
+    turn_id: Option<external_contract::events::TurnId>,
     generation: u64,
     active: bool,
     boundary: Option<TurnBoundary>,
-    failure: Option<serde_json::Value>,
-    model_request_started_at: Option<Instant>,
-    last_stream_activity_at: Option<Instant>,
+    failure: Option<external_contract::events::NativeFailure>,
 }
 
-pub(crate) struct TurnTracker {
-    state: Mutex<TurnTrackerState>,
+/// Common in-memory reduction owner. Internal activity algorithms share this
+/// lock with turn/error state; no process, RPC or persistence callback runs here.
+pub struct RuntimeState {
+    state: Mutex<activity_tracker::RuntimeStateData>,
     changed: Condvar,
 }
-impl TurnTracker {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: Mutex::new(TurnTrackerState {
-                generation: 0,
-                active: false,
-                boundary: None,
-                failure: None,
-                model_request_started_at: None,
-                last_stream_activity_at: None,
-            }),
-            changed: Condvar::new(),
-        }
-    }
 
-    pub(crate) fn observe(&self, inbound: &Inbound) {
-        let mut state = self.state.lock().unwrap();
-        if state.active {
-            state.last_stream_activity_at = Some(Instant::now());
-        }
-        let Inbound::Message(WireMessage::Event(event)) = inbound else {
-            return;
-        };
-        let Some(kind) = event_type(event) else {
-            return;
-        };
-        match kind {
-            "turn.started" => {
-                let now = Instant::now();
-                state.generation = state.generation.saturating_add(1);
-                state.active = true;
-                state.boundary = None;
-                state.failure = None;
-                state.model_request_started_at = Some(now);
-                state.last_stream_activity_at = Some(now);
-            }
-            "turn.completed" if state.active => {
-                state.active = false;
-                state.boundary = Some(TurnBoundary::Completed);
-                state.model_request_started_at = None;
-                state.last_stream_activity_at = None;
-            }
-            "turn.failed" if state.active => {
-                state.active = false;
-                state.failure = scheduler::turn_failure_detail(&event.params);
-                state.boundary = Some(TurnBoundary::Failed);
-                state.model_request_started_at = None;
-                state.last_stream_activity_at = None;
-            }
-            _ => return,
-        }
-        self.changed.notify_all();
-    }
-
-    pub(crate) fn failure_detail(&self) -> Option<String> {
-        self.state.lock().unwrap().failure.as_ref().map(ToString::to_string)
-    }
-
-    pub(crate) fn snapshot(&self) -> TurnSnapshot {
-        let state = self.state.lock().unwrap();
-        TurnSnapshot {
-            generation: state.generation,
-            active: state.active,
-            boundary: state.boundary,
-        }
-    }
-
-    pub(crate) fn activity_snapshot(&self) -> RuntimeActivitySnapshot {
-        let state = self.state.lock().unwrap();
-        let now = Instant::now();
-        RuntimeActivitySnapshot {
-            turn: TurnSnapshot {
-                generation: state.generation,
-                active: state.active,
-                boundary: state.boundary,
-            },
-            model_request_elapsed: state
-                .model_request_started_at
-                .and_then(|started| now.checked_duration_since(started)),
-            transport_idle_elapsed: state
-                .last_stream_activity_at
-                .and_then(|activity| now.checked_duration_since(activity)),
-        }
-    }
-
-    fn wait_started_after(
-        &self,
-        previous_generation: u64,
-        timeout: Duration,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        self.wait_until(timeout, |state| state.generation > previous_generation)
-    }
-
-    pub(crate) fn wait_boundary_after(
-        &self,
-        generation: u64,
-        timeout: Duration,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        self.wait_until(timeout, |state| {
-            state.generation >= generation && !state.active && state.boundary.is_some()
-        })
-    }
-
-    fn wait_until(
-        &self,
-        timeout: Duration,
-        predicate: impl Fn(&TurnTrackerState) -> bool,
-    ) -> Result<TurnSnapshot, RuntimeCommandError> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock().unwrap();
-        loop {
-            if predicate(&state) {
-                return Ok(TurnSnapshot {
-                    generation: state.generation,
-                    active: state.active,
-                    boundary: state.boundary,
-                });
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RuntimeCommandError::Timeout);
-            }
-            let (next, result) = self.changed.wait_timeout(state, deadline - now).unwrap();
-            state = next;
-            if result.timed_out() && !predicate(&state) {
-                return Err(RuntimeCommandError::Timeout);
-            }
-        }
-    }
-}
-
+/// One receipt-ordered typed envelope. Facts keep their sole sequence in
+/// EventContext; process-control terminals use that same publisher sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeEvent {
-    Driver(Inbound),
-    Terminal(RuntimeTerminal),
+pub enum RuntimeEnvelope {
+    Event { event: external_contract::events::NormalizedEvent, diagnostic: Option<runtime_observation::InputDiagnostic> },
+    Terminal { sequence: u64, terminal: RuntimeTerminal },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LifecycleRecord {
-    pub sequence: u64,
-    pub event: RuntimeEvent,
+impl RuntimeEnvelope {
+    pub fn sequence(&self) -> u64 { match self { Self::Event { event, .. } => event.context.sequence, Self::Terminal { sequence, .. } => *sequence } }
+    pub fn normalized(&self) -> Option<&external_contract::events::NormalizedEvent> { match self { Self::Event { event, .. } => Some(event), _ => None } }
+    pub fn terminal(sequence: u64, terminal: RuntimeTerminal) -> Self { Self::Terminal { sequence, terminal } }
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        match &mut self { Self::Event { event, .. } => event.context.sequence = sequence, Self::Terminal { sequence: current, .. } => *current = sequence } self
+    }
+    pub(crate) fn diagnostic(&self) -> Option<&runtime_observation::InputDiagnostic> { match self { Self::Event { diagnostic, .. } => diagnostic.as_ref(), _ => None } }
+}
+impl From<external_contract::events::NormalizedEvent> for RuntimeEnvelope {
+    fn from(event: external_contract::events::NormalizedEvent) -> Self {
+        let diagnostic = runtime_observation::InputDiagnostic::from_event(&event);
+        Self::Event { event, diagnostic }
+    }
 }
 
 pub trait LifecycleSink: Send + Sync + 'static {
-    fn emit(&self, record: LifecycleRecord);
+    /// Production sinks supply the durable task and claim identity. Test sinks
+    /// may use the publisher's unique process-local launch scope.
+    fn event_scope(&self) -> Option<(external_contract::events::TaskId, external_contract::events::LaunchId)> { None }
+    fn emit(&self, envelope: RuntimeEnvelope);
+
+    /// The state created before spawn and shared with this launch's owner.
+    fn runtime_state(&self) -> Option<Arc<RuntimeState>> { None }
+
+    /// One native input's ordered facts. Sinks with admission gates override
+    /// this to reduce only accepted batches, before persistence callbacks.
+    fn emit_batch(&self, envelopes: &[RuntimeEnvelope]) {
+        if let Some(runtime) = self.runtime_state() { if !runtime.reduce_envelopes(envelopes) { return; } }
+        for envelope in envelopes { self.emit(envelope.clone()); }
+    }
+
 }
 
 #[derive(Debug)]
@@ -529,6 +492,7 @@ impl TerminalLatch<'_> {
 }
 
 pub(crate) struct Publisher {
+    runtime_state: Arc<RuntimeState>,
     sink: Arc<dyn LifecycleSink>,
     state: Mutex<PublisherState>,
     changed: Condvar,
@@ -536,7 +500,9 @@ pub(crate) struct Publisher {
 
 impl Publisher {
     pub(crate) fn new(sink: Arc<dyn LifecycleSink>) -> Self {
+        let runtime_state = sink.runtime_state().unwrap_or_else(|| Arc::new(RuntimeState::new()));
         Self {
+            runtime_state,
             sink,
             state: Mutex::new(PublisherState {
                 next_sequence: 1,
@@ -556,24 +522,6 @@ impl Publisher {
     /// publisher while holding it.
     pub(crate) fn decision_latch(&self) -> TerminalLatch<'_> {
         TerminalLatch(self.state.lock().unwrap())
-    }
-
-    pub(crate) fn emit_driver(&self, event: Inbound, exit_terminal: Option<RuntimeTerminal>) {
-        let mut state = self.state.lock().unwrap();
-        if matches!(state.owner, OwnerState::Terminal(_)) {
-            return;
-        }
-        let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
-        self.emit_locked(&mut state, RuntimeEvent::Driver(event));
-        if is_exit_boundary {
-            state.exit_boundary_delivered = true;
-            self.changed.notify_all();
-        }
-        if let Some(terminal) = exit_terminal {
-            if matches!(state.owner, OwnerState::Running) {
-                self.publish_terminal_locked(&mut state, terminal);
-            }
-        }
     }
 
     pub(crate) fn begin_stopping(&self) -> Option<RuntimeTerminal> {
@@ -638,17 +586,11 @@ impl Publisher {
 
     fn publish_terminal_locked(&self, state: &mut PublisherState, terminal: RuntimeTerminal) {
         state.owner = OwnerState::Terminal(terminal.clone());
-        self.emit_locked(state, RuntimeEvent::Terminal(terminal));
-        self.changed.notify_all();
-    }
-
-    fn emit_locked(&self, state: &mut PublisherState, event: RuntimeEvent) {
-        let record = LifecycleRecord {
-            sequence: state.next_sequence,
-            event,
-        };
+        let envelope = RuntimeEnvelope::terminal(state.next_sequence, terminal);
         state.next_sequence = state.next_sequence.saturating_add(1);
-        self.sink.emit(record);
+        self.runtime_state.reduce_terminal();
+        self.sink.emit(envelope);
+        self.changed.notify_all();
     }
 
     pub(crate) fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
@@ -675,7 +617,7 @@ pub struct RuntimeOwner {
     driver: Arc<Driver>,
     publisher: Arc<Publisher>,
     shutdown_pump: Arc<AtomicBool>,
-    turn_tracker: Arc<TurnTracker>,
+    runtime_state: Arc<RuntimeState>,
     session_id: Mutex<Option<String>>,
     diagnostic_session_id: Mutex<Option<String>>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
@@ -786,20 +728,20 @@ impl RuntimeOwner {
         let driver = Arc::new(Driver::spawn_with_model(command, model)?);
         let publisher = Arc::new(Publisher::new(sink));
         let shutdown_pump = Arc::new(AtomicBool::new(false));
-        let turn_tracker = Arc::new(TurnTracker::new());
+        let runtime_state = Arc::clone(&publisher.runtime_state);
         let permission_responses = Arc::new(Mutex::new(OfferedPermissionCache::default()));
         spawn_event_pump(
             Arc::clone(&driver),
             Arc::clone(&publisher),
             Arc::clone(&shutdown_pump),
-            Arc::clone(&turn_tracker),
+            Arc::clone(&runtime_state),
             Arc::clone(&permission_responses),
         );
         Ok(Self {
             driver,
             publisher,
             shutdown_pump,
-            turn_tracker,
+            runtime_state,
             session_id: Mutex::new(None),
             diagnostic_session_id: Mutex::new(None),
             permission_responses,
@@ -880,7 +822,7 @@ impl RuntimeOwner {
             let observed = configured_thought_level_from_result(result).map_err(|error| {
                 RuntimeCommandError::InvalidSession(format!(
                     "session/resume projection is invalid: {error}"
-                ))
+                ).into())
             })?;
             validate_requested_effort(
                 SESSION_RESUME,
@@ -961,7 +903,7 @@ impl RuntimeOwner {
         let projection = SessionCreateProjection::from_result(result).map_err(|error| {
             RuntimeCommandError::InvalidSession(format!(
                 "session/create projection is invalid: {error}"
-            ))
+            ).into())
         })?;
         let session_id = projection.session_id.clone();
         // Correlation only: the command-plane session is still registered only
@@ -1035,7 +977,7 @@ impl RuntimeOwner {
             return Err(RuntimeCommandError::InvalidSession(format!(
                 "MODEL_REQUEST_INVALID: {}",
                 bounded_prefix(requested, 128)
-            )));
+            ).into()));
         }
         let entry = projection
             .available_models
@@ -1051,7 +993,7 @@ impl RuntimeOwner {
                 RuntimeCommandError::InvalidSession(model_not_offered_message(
                     requested,
                     &projection.available_models,
-                ))
+                ).into())
             })?;
         let (Some(provider), Some(model)) =
             (entry.provider_id.as_deref(), entry.model_id.as_deref())
@@ -1070,7 +1012,7 @@ impl RuntimeOwner {
                             "MODEL_NOT_OFFERED: effort {} not in levels [{}]",
                             bounded_prefix(effort, 128),
                             bounded_prefix(&entry.reasoning_levels.join(", "), 512)
-                        ))
+                        ).into())
                     })?,
             ),
             None => entry.default_level.as_deref(),
@@ -1101,7 +1043,7 @@ impl RuntimeOwner {
         let echo = set_model_projection_from_result(result).map_err(|error| {
             RuntimeCommandError::InvalidSession(format!(
                 "session/setModel projection is invalid: {error}"
-            ))
+            ).into())
         })?;
         let (Some(observed_provider), Some(observed_model)) =
             (echo.provider_id.as_deref(), echo.model_id.as_deref())
@@ -1148,7 +1090,7 @@ impl RuntimeOwner {
         deadline: Instant,
     ) -> Result<Option<String>, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let previous = self.turn_tracker.snapshot().generation;
+        let previous = self.runtime_state.turn_snapshot().generation;
         let params = serde_json::to_value(SendParams {
             session_id,
             content,
@@ -1162,7 +1104,7 @@ impl RuntimeOwner {
             .as_ref()
             .and_then(turn_id_from_result)
             .map(str::to_owned);
-        self.turn_tracker
+        self.runtime_state
             .wait_started_after(previous, remaining_runtime_time(deadline)?)?;
         Ok(turn_id)
     }
@@ -1174,7 +1116,7 @@ impl RuntimeOwner {
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         let deadline = Instant::now() + timeout;
         self.validate_session(session_id)?;
-        let current = self.turn_tracker.snapshot();
+        let current = self.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -1183,7 +1125,7 @@ impl RuntimeOwner {
         self.driver
             .request(SESSION_STOP, params, remaining_runtime_time(deadline)?)?;
         let boundary = self
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_runtime_time(deadline)?)?;
         self.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -1255,7 +1197,7 @@ impl RuntimeOwner {
     }
 
     pub fn turn_snapshot(&self) -> TurnSnapshot {
-        self.turn_tracker.snapshot()
+        self.runtime_state.turn_snapshot()
     }
 
     pub fn stop_boundary_count(&self) -> u64 {
@@ -1433,21 +1375,14 @@ fn model_not_offered_message(requested: &str, available: &[CatalogModelEntry]) -
 /// is an unrecognized bootstrap failure and stays `InvalidSession` (scheduler
 /// `SESSION_START_FAILED`) instead of mislabeling the model as rejected.
 fn remote_set_model_error(error: &serde_json::Value) -> RuntimeCommandError {
-    let code = error
-        .get("data")
-        .and_then(|data| data.get("code"))
-        .and_then(serde_json::Value::as_str);
+    let code = error.get("data").and_then(|data| data.get("code")).and_then(serde_json::Value::as_str);
     match code {
-        Some("invalid_model_request" | "model_not_found") => {
-            RuntimeCommandError::ModelRejected(model_rejection_message(error))
-        }
-        Some(code) => RuntimeCommandError::InvalidSession(format!(
-            "session/setModel was rejected: {}",
-            bounded_prefix(code, 128)
-        )),
-        None => {
-            RuntimeCommandError::InvalidSession("session/setModel was rejected: unknown".into())
-        }
+        Some("invalid_model_request" | "model_not_found") => RuntimeCommandError::ModelRejected(
+            RuntimeCommandDetail::from_native(model_rejection_message(error), error)),
+        Some(code) => RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+            format!("session/setModel was rejected: {}", bounded_prefix(code, 128)), error)),
+        None => RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native(
+            "session/setModel was rejected: unknown", error)),
     }
 }
 
@@ -1490,10 +1425,13 @@ fn spawn_event_pump(
     driver: Arc<Driver>,
     publisher: Arc<Publisher>,
     shutdown: Arc<AtomicBool>,
-    turn_tracker: Arc<TurnTracker>,
+    runtime_state: Arc<RuntimeState>,
     permission_responses: Arc<Mutex<OfferedPermissionCache>>,
 ) {
-    thread::spawn(move || loop {
+    let (task_id, launch_id) = publisher.event_scope();
+    thread::spawn(move || {
+      let mut adapter = zcode::events::ZcodeAdapter::new(task_id, launch_id);
+      loop {
         if shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -1518,7 +1456,12 @@ fn spawn_event_pump(
                         }
                     }
                 }
-                turn_tracker.observe(&event);
+                if let Some(batch) = adapter.decode(&event) {
+                    publisher.emit_typed(batch);
+                    continue;
+                }
+                // Transport lifecycle markers duplicate the typed native boundary.
+                if matches!(event, Inbound::Lifecycle { .. }) { continue; }
                 let is_exit_boundary = matches!(event, Inbound::ChildExited(_));
                 if is_exit_boundary {
                     driver.wait_diagnostics(Duration::from_secs(1));
@@ -1527,12 +1470,12 @@ fn spawn_event_pump(
                     Inbound::ChildExited(exit) => {
                         match observe_process_group(driver.identity().pgid) {
                             Ok(members) if members.is_empty()
-                                && turn_tracker.snapshot().boundary == Some(TurnBoundary::Failed) => {
+                                && runtime_state.turn_snapshot().boundary == Some(TurnBoundary::Failed) => {
                                 Some(RuntimeTerminal::FailedTurn(StopOutcome::AlreadyExited(exit.clone())))
                             }
                             Ok(members) if members.is_empty() => match exit {
                                 ChildExit::Exited(Some(0)) => {
-                                    let turn = turn_tracker.snapshot();
+                                    let turn = runtime_state.turn_snapshot();
                                     if !turn.active
                                         && turn.boundary == Some(TurnBoundary::Completed)
                                     {
@@ -1554,7 +1497,7 @@ fn spawn_event_pump(
                     }
                     _ => None,
                 };
-                publisher.emit_driver(event, terminal);
+                publisher.publish_transport(event, terminal);
                 if is_exit_boundary {
                     permission_responses.lock().unwrap().clear();
                     return;
@@ -1569,6 +1512,7 @@ fn spawn_event_pump(
                 return;
             }
         }
+      }
     });
 }
 
@@ -1701,7 +1645,7 @@ mod zcode_effort_tests {
 
     struct NoopSink;
     impl crate::LifecycleSink for NoopSink {
-        fn emit(&self, _record: crate::LifecycleRecord) {}
+        fn emit(&self, _record: crate::RuntimeEnvelope) {}
     }
 
     fn workspace(prefix: &str) -> tempfile::TempDir {
@@ -1794,7 +1738,7 @@ printf '%s\n' '{{"id":2,"result":{{}}}}'
 IFS= read -r line
 printf '%s\n' "$line" >> deliveries.jsonl
 printf '%s\n' '{{"id":3,"result":{{"turnId":"t1"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"effort ok","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"effort ok","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"effort ok"}}}}}}'
 while IFS= read -r line; do printf '%s\n' "$line" >> deliveries.jsonl; done
 "#
         )
@@ -2262,25 +2206,5 @@ mod task_route_tests {
             Err(message) => assert_eq!(message, "stored general preparation is invalid"),
             Ok(_) => panic!("legacy prepared launch must not route"),
         }
-    }
-}
-
-#[cfg(test)]
-mod turn_failure_continuity_tests {
-    use super::*;
-
-    #[test]
-    fn new_turn_clears_previous_public_failure() {
-        let tracker = TurnTracker::new();
-        let event = |params| Inbound::Message(WireMessage::Event(external_contract::EventEnvelope {
-            method: "session/event".into(), params,
-        }));
-        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
-        tracker.observe(&event(serde_json::json!({"type":"turn.failed","payload":{"reason_code":"network failure"}})));
-        assert!(tracker.failure_detail().unwrap().contains("network failure"));
-        tracker.observe(&event(serde_json::json!({"type":"turn.started"})));
-        assert!(tracker.failure_detail().is_none());
-        tracker.observe(&event(serde_json::json!({"type":"turn.failed"})));
-        assert!(tracker.failure_detail().is_none());
     }
 }

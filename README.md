@@ -57,9 +57,11 @@ executable admit it, runs with `build` (`--mode accept-edits`) or `yolo`
 slug, admits effort from `low|medium|high|max`, and rejects a non-empty
 `write_manifest` with `agy_write_manifest_unsupported` (it has no
 permission-respond interaction — tools are soft-denied and denied actions
-surface on failure diagnostics). `observe` works on all four: ZCode
-and DSH expose the public reasoning tail (at most 200 characters) and Codex
-and agy report `reasoning: null`.
+surface on failure diagnostics). `observe` works on all four: it exposes at
+most 200 characters of public reasoning only when a public summary/thought
+delta was actually observed, labels its native `{protocol, channel}` source,
+and reports `reasoning: null` otherwise; tool history and coverage follow the
+actual per-channel evidence, not the configured subagent name.
 
 The daemon socket environment variable is now the neutral
 `EXTERNAL_SUBAGENT_SOCKET`, with no fallback to the retired name. An existing

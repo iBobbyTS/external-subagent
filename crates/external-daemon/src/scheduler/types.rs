@@ -66,10 +66,10 @@ pub enum SchedulerError {
     InvalidConfig(String),
     RuntimeSpawn { agent_id: String, message: String },
     LifecycleSink { agent_id: String, message: String },
-    RuntimeCommand { agent_id: String, message: String },
+    RuntimeCommand { agent_id: String, message: String, operation: Option<&'static str>, native_failure: Option<external_contract::events::NativeFailure> },
     StartTimeout { agent_id: String, message: String },
     Interrupted { agent_id: String },
-    StartFailed { agent_id: String, reason: String, message: String },
+    StartFailed { agent_id: String, reason: String, message: String, native_failure: Option<external_contract::events::NativeFailure> },
 }
 impl fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,7 +82,7 @@ impl fmt::Display for SchedulerError {
             Self::LifecycleSink { agent_id, message } => {
                 write!(f, "lifecycle sink failed for {agent_id}: {message}")
             }
-            Self::RuntimeCommand { agent_id, message } => {
+            Self::RuntimeCommand { agent_id, message, .. } => {
                 write!(f, "runtime command failed for {agent_id}: {message}")
             }
             Self::StartTimeout { agent_id, message } => {
@@ -91,7 +91,7 @@ impl fmt::Display for SchedulerError {
             Self::Interrupted { agent_id } => {
                 write!(f, "start interrupted for {agent_id}")
             }
-            Self::StartFailed { agent_id, reason, message } => {
+            Self::StartFailed { agent_id, reason, message, .. } => {
                 write!(f, "start failed for {agent_id} ({reason}): {message}")
             }
         }

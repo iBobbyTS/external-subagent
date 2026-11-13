@@ -84,7 +84,7 @@ pub(super) enum ResponseClaimHookStage {
 pub(crate) struct SchedulerState {
     pub(super) active: HashMap<String, ActiveRuntime>,
     pub(super) starting: HashMap<String, StartingHandle>,
-    pub(crate) activities: HashMap<String, Arc<PassiveActivityTracker>>,
+    pub(crate) activities: HashMap<String, Arc<RuntimeState>>,
     pub(super) failures: HashMap<String, String>,
 }
 
@@ -106,6 +106,15 @@ pub(crate) struct RuntimeLifecycleSnapshot {
     observed_boundary: Option<TurnBoundary>,
     force_termination_count: u64,
     late_event_count: u64,
+}
+
+impl RuntimeLifecycleSnapshot {
+    pub(crate) fn reject_late_event(&mut self) {
+        self.late_event_count = self
+            .late_event_count
+            .saturating_add(1)
+            .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
+    }
 }
 
 pub(crate) struct RuntimeLifecycle {
@@ -235,10 +244,7 @@ impl RuntimeLifecycle {
         if state.phase == RuntimeLifecyclePhase::Running {
             return Some(state);
         }
-        state.late_event_count = state
-            .late_event_count
-            .saturating_add(1)
-            .min(MAX_BOUNDED_LATE_EVENT_DIAGNOSTICS);
+        state.reject_late_event();
         None
     }
 
@@ -561,20 +567,9 @@ impl Scheduler {
         match activity {
             Some(activity) => activity.observation_snapshot(),
             None => {
-                // No activity means no captured history, even when the adapter
-                // has a public protocol. Never borrow a global runtime proof.
-                let mut snapshot = observation::ObservationSnapshot::unavailable();
-                if self
-                    .inner
-                    .store
-                    .get_task(agent_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|task| task_agent(&task) == "dsh")
-                {
-                    snapshot.reasoning.source = observation::ReasoningSource::dsh();
-                }
-                snapshot
+                // No activity means no captured history. Never borrow a global
+                // runtime or configured-adapter proof.
+                observation::ObservationSnapshot::unavailable()
             }
         }
     }

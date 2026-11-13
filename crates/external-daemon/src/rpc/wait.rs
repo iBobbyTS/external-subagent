@@ -1584,7 +1584,7 @@ pub(crate) mod wait_tests {
             .store
             .insert_message("message-1", &id, "queue", "continue")
             .unwrap();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -1653,7 +1653,7 @@ pub(crate) mod wait_tests {
     #[test]
     fn terminal_wait_dedups_activity_tail_against_embedded_result() {
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker = Arc::new(crate::RuntimeState::new());
         tracker.set_wait_tail_fixture("我会按只读方式检查。HEAD 为 4cd6c57，总结……");
         service
             .scheduler
@@ -2520,6 +2520,9 @@ pub(crate) mod wait_tests {
             oldest_in_flight_tool_age_ms: None,
             last_activity_age_ms: None,
             model_request_active: false,
+            model_activity: None,
+            diagnostics: Vec::new(),
+            diagnostics_truncated: false,
             telemetry_status: TelemetryStatusView::Healthy,
         }
     }
@@ -3091,8 +3094,8 @@ pub(crate) mod wait_tests {
         }
     }
 
-    fn inject_wait_delta(tracker: &crate::PassiveActivityTracker, delta: &str) {
-        tracker.observe(&crate::RuntimeEvent::Driver(external_runtime::Inbound::Message(
+    fn inject_wait_delta(tracker: &crate::RuntimeState, delta: &str) {
+        tracker.observe(&crate::test_support::fixture_event(external_runtime::Inbound::Message(
             external_contract::WireMessage::Event(external_contract::EventEnvelope {
                 method: "session/event".into(),
                 params: serde_json::json!({
@@ -3113,7 +3116,7 @@ pub(crate) mod wait_tests {
         // Timeout and actionable-wake exits over one tracker; the terminal exit
         // uses a second fixture because a pending request blocks completion.
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -3176,7 +3179,7 @@ pub(crate) mod wait_tests {
         // Terminal exit: a fresh fixture (a pending request blocks completion)
         // proves the terminal response also advances the cursor.
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -3220,7 +3223,7 @@ pub(crate) mod wait_tests {
         // Nothing appended is an empty tail, verified on the non-terminal path
         // (a second wait over the same tracker).
         let (_, service, id) = fixture();
-        let tracker = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -3633,7 +3636,7 @@ pub(crate) mod wait_tests {
         // Both agents have undelivered activity text. The interrupted
         // list-mode wait must leave the delivery cursors untouched, so a
         // later wait still sees the text.
-        let tracker1 = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker1 = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -3642,7 +3645,7 @@ pub(crate) mod wait_tests {
             .unwrap()
             .activities
             .insert(id1.clone(), tracker1.clone());
-        let tracker2 = Arc::new(crate::PassiveActivityTracker::new());
+        let tracker2 = Arc::new(crate::RuntimeState::new());
         service
             .scheduler
             .inner
@@ -3946,7 +3949,7 @@ pub(crate) mod wait_tests {
         let trackers: Vec<_> = ids
             .iter()
             .map(|id| {
-                let tracker = Arc::new(crate::PassiveActivityTracker::new());
+                let tracker = Arc::new(crate::RuntimeState::new());
                 service
                     .scheduler
                     .inner

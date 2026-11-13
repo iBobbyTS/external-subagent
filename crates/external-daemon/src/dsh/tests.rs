@@ -8,9 +8,9 @@ use crate::{
     task_agent, terminal_proves_process_group_reaped, CommandRuntimeFactory, LifecycleSink,
     ManagedRuntime, MessageDisposition, ResponseDisposition, RuntimeCommandError, RuntimeFactory,
     RuntimeTerminal, Scheduler, SchedulerConfig, SchedulerError, SessionReady, TurnSnapshot,
-    TurnTracker,
+    RuntimeState,
 };
-use external_contract::{EventEnvelope, WireMessage, SESSION_EVENT};
+use external_contract::{EventEnvelope, WireMessage};
 use external_core::{AdmissionIdentity, GeneralTaskManifest, PermissionMode, GENERAL_TASK_SCHEMA};
 use external_runtime::{ChildExit, Inbound, ProcessIdentity, StopOutcome};
 use external_store::{MessageState, PendingRequestState, TaskOutcome, TaskPhase, TaskRecord};
@@ -458,7 +458,7 @@ fn closed_gate_refuses_dsh_spawn_without_touching_any_process() {
 /// Minimal sink for direct factory probes; records nothing.
 struct NoopSink;
 impl crate::LifecycleSink for NoopSink {
-    fn emit(&self, _record: crate::LifecycleRecord) {}
+    fn emit(&self, _record: crate::RuntimeEnvelope) {}
 }
 
 #[test]
@@ -546,17 +546,18 @@ printf '%s\\n' \
     assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
 
     // The permission request reaches the store with the correlated tool
-    // identity (X06): the toolCallId came from a prior tool update.
+    // identity (X06): the toolCallId came from a prior tool update, and the
+    // name is the ACP title, not the `edit` category.
     let request = await_pending_permission(&scheduler, &agent_id);
     let payload: serde_json::Value = serde_json::from_str(&request.payload_json).unwrap();
-    assert_eq!(payload["toolName"], "edit");
+    assert_eq!(payload["toolName"], "Edit fixture");
     assert_eq!(payload["toolCallId"], "tool-7");
     let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
     assert_eq!(activity.window_60s.tool_calls_started, 1);
     // The daemon attaches the ACP rawInput to the started frame, so observe
     // sees the real arguments instead of the empty-input fallback.
     let observation = scheduler.observation_snapshot(&agent_id);
-    assert_eq!(observation.tools[0].tool_name, "edit");
+    assert_eq!(observation.tools[0].tool_name, "Edit fixture");
     assert_eq!(observation.tools[0].call_count, 1);
     assert_eq!(
         observation.tools[0].recent_calls[0].arguments,
@@ -566,7 +567,7 @@ printf '%s\\n' \
             .clone()
     );
     assert!(!observation.tools[0].recent_calls[0].arguments_truncated);
-    assert!(!observation.coverage.tool_history_complete);
+    assert!(observation.coverage.tool_history_complete);
 
     let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
     let error = service
@@ -733,9 +734,7 @@ printf '%s\\n' \
 
 #[test]
 fn answerable_server_request_wakes_declared_waits_and_answers_over_acp() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child parks the turn on a NON-permission server request, which
@@ -850,9 +849,7 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn unsupported_dsh_requests_stay_non_respondable_even_for_answering_callers() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // One unknown interaction method and one malformed input request
@@ -948,9 +945,7 @@ while IFS= read -r line; do :; done
 
 #[test]
 fn answerable_request_among_unsupported_noise_is_returned_and_answerable() {
-    use crate::rpc::{
-        RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget,
-    };
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitBody, TaskWaitQuery, WaitTarget};
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     // The child holds its input request back until the test has planted
@@ -1116,6 +1111,226 @@ printf '%s\\n' \
     );
 }
 
+/// The peer's JSON-RPC error is delivery evidence: a prompt rejected with an
+/// application error must surface that whole object, never the transport
+/// layer's generic label. The peer sends `message` only, so no code/status
+/// field upstream removed is fabricated; whatever it did send travels intact.
+#[test]
+fn remote_jsonrpc_error_settlement_preserves_the_complete_error() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const REMOTE_ERROR_SETTLEMENT: &str = r#"
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"quota exhausted for the fixture account","data":{"retryAfter":30,"limit":"daily"}}}'
+"#;
+    let script = format!("{BOOTSTRAP_PREFIX}{REMOTE_ERROR_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Failed);
+    let delivered = &stored.result.final_text;
+    assert_ne!(
+        delivered, "runtime returned an application error",
+        "the generic transport label must not replace the native error"
+    );
+    let native: serde_json::Value = serde_json::from_str(delivered)
+        .unwrap_or_else(|_| panic!("delivered text is not the native error object: {delivered}"));
+    assert_eq!(native["code"], -32000);
+    assert_eq!(native["message"], "quota exhausted for the fixture account");
+    assert_eq!(native["data"]["retryAfter"], 30);
+    assert_eq!(native["data"]["limit"], "daily");
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Failed));
+    // The diagnostic record keeps the runtime-terminal stage around the peer's
+    // own message instead of the generic transport label.
+    let failure = scheduler.last_error(&agent_id).expect("failure record");
+    assert!(
+        failure.contains("quota exhausted for the fixture account"),
+        "{failure}"
+    );
+    assert!(
+        !failure.contains("runtime returned an application error"),
+        "{failure}"
+    );
+}
+
+/// The upstream standard settlement carries nothing but `stopReason`: no
+/// committed flag and no message id. The adapter must still complete the turn
+/// from its prompt-scoped text aggregation.
+#[test]
+fn standard_chunks_and_stop_reason_settle_without_a_message_id() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const STANDARD_SETTLEMENT: &str = r#"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","messageId":"native-message","content":{"type":"text","text":"standard "}}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answer"}}}}' \
+  '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+"#;
+    let script =
+        format!("{BOOTSTRAP_PREFIX}{STANDARD_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "standard answer");
+    assert!(!stored.result.partial);
+    let task = await_terminal_task(&scheduler, &agent_id);
+    assert_eq!(task.outcome, Some(TaskOutcome::Completed));
+}
+
+/// Synthetic native frames: a turn aggregate must never be replayed under m2.
+#[test]
+fn repair_same_text_messages_have_no_fabricated_terminal_wait_suffix() {
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitTarget};
+    let _guard = scripted_test_guard();
+    // Fresh tasks keep scalar/list checks independent of take-on-delivery.
+    for many in [false, true] {
+        let workspace = dsh_workspace();
+        let script = format!(r#"{BOOTSTRAP_PREFIX}
+printf '%s\n' \
+ '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"SESSION","update":{{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{{"type":"text","text":"A"}}}}}}}}' \
+ '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"SESSION","update":{{"sessionUpdate":"agent_message_chunk","messageId":"m2","content":{{"type":"text","text":"A"}}}}}}}}' \
+ '{{"jsonrpc":"2.0","id":4,"result":{{"stopReason":"end_turn"}}}}'
+"#).replace("SESSION", SESSION_ID);
+        let child = scripted_child(workspace.path(), &script);
+        let scheduler = dsh_scheduler(
+            workspace.path(),
+            DshRuntimeFactory::test_harness(Some(child)),
+        );
+        let agent_id = enqueue_dsh(
+            &scheduler,
+            workspace.path(),
+            Some("fixture-provider:fixture-model"),
+        );
+        assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+        let request = await_pending_permission(&scheduler, &agent_id);
+        scheduler
+            .respond_request(&agent_id, &request.request_id, "allow", None)
+            .unwrap();
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.final_text, "AA");
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+        assert_eq!(activity.latest_text_tail, stored.result.final_text);
+        assert_eq!(activity.window_60s.text_delta_events, 2);
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let response = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                wait_mode: crate::rpc::WaitMode::All,
+                agent_id: if many {
+                    WaitTarget::Many(vec![agent_id.clone()])
+                } else {
+                    WaitTarget::One(agent_id.clone())
+                },
+                wait_time: 0,
+                message_id: None,
+            }))
+            .unwrap();
+        let body = match response {
+            RpcSuccess::TaskWait(body) => body,
+            RpcSuccess::TaskWaitMany { mut waits } => waits.bodies.remove(0).1,
+            _ => panic!("expected wait body"),
+        };
+        assert_eq!(body.result.unwrap().final_text, stored.result.final_text);
+        assert!(
+            body.activity.latest_text_tail.is_empty(),
+            "fabricated wait tail: {:?}",
+            body.activity.latest_text_tail
+        );
+    }
+}
+
+/// A native `status: failed` is a failed call, not a completed one. The tool
+/// keeps its real name (the ACP title) even though the generic category is
+/// `other`, and ending the call does not fail the turn by itself.
+#[test]
+fn failed_tool_status_is_not_a_success_and_is_named_by_its_title() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    const FAILED_TOOL_SETTLEMENT: &str = r#"
+printf '%s\n' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"tool_call","toolCallId":"tool-9","title":"probe the workspace","kind":"other","status":"in_progress","rawInput":{"path":"."}}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"tool_call_update","toolCallId":"tool-9","status":"failed","content":[{"type":"text","text":"permission denied"}]}}}' \
+  '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"SESSION","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"tool failure noted"}}}}' \
+  '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+"#;
+    let script = format!("{BOOTSTRAP_PREFIX}{FAILED_TOOL_SETTLEMENT}").replace("SESSION", SESSION_ID);
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "tool failure noted");
+
+    let activity = scheduler
+        .passive_activity_snapshot(&agent_id)
+        .expect("activity snapshot");
+    // Bootstrap announced tool-7; this turn announced tool-9. The failed call
+    // counts as failed, never as completed.
+    assert_eq!(activity.window_60s.tool_calls_started, 2);
+    assert_eq!(activity.window_60s.tool_calls_completed, 0);
+    assert_eq!(activity.window_60s.tool_calls_failed, 1);
+    // The authoritative turn settlement clears this turn's activity residue, so
+    // nothing is left in flight once the turn completes.
+    assert!(activity.active_tools.is_empty(), "{activity:?}");
+
+    let observation = scheduler.observation_snapshot(&agent_id);
+    let names: Vec<&str> = observation
+        .tools
+        .iter()
+        .map(|tool| tool.tool_name.as_str())
+        .collect();
+    assert!(names.contains(&"probe the workspace"), "{names:?}");
+    assert!(
+        !names.contains(&"other"),
+        "the generic category must not name a tool: {names:?}"
+    );
+}
+
 #[test]
 fn rejected_model_selection_fails_before_any_prompt_is_sent() {
     let _guard = scripted_test_guard();
@@ -1153,8 +1368,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32602,"message":"unkno
 
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(
-        stored.result.final_text,
-        "model selection was rejected: unknown model option: nope"
+        serde_json::from_str::<serde_json::Value>(&stored.result.final_text).unwrap(),
+        serde_json::json!({"code":-32602,"message":"unknown model option: nope"})
     );
     assert_eq!(
         scheduler
@@ -1197,8 +1412,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603}}}}'
 
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(
-        stored.result.final_text,
-        "model selection was rejected: {\"code\":-32603}"
+        serde_json::from_str::<serde_json::Value>(&stored.result.final_text).unwrap(),
+        serde_json::json!({"code":-32603})
     );
     assert_eq!(
         scheduler
@@ -1509,7 +1724,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32602,"message":"unkno
 /// ZCode and without touching the production factory composition.
 struct FakeProviderRuntime {
     session_id: String,
-    tracker: Arc<TurnTracker>,
+    tracker: Arc<RuntimeState>,
     terminal: Mutex<Option<RuntimeTerminal>>,
     terminal_changed: Condvar,
 }
@@ -1518,18 +1733,19 @@ impl FakeProviderRuntime {
     fn new() -> Self {
         Self {
             session_id: "fake-provider-session".into(),
-            tracker: Arc::new(TurnTracker::new()),
+            tracker: Arc::new(RuntimeState::new()),
             terminal: Mutex::new(None),
             terminal_changed: Condvar::new(),
         }
     }
 
     fn turn_event(&self, kind: &str) {
-        self.tracker
-            .observe(&Inbound::Message(WireMessage::Event(EventEnvelope {
-                method: SESSION_EVENT.into(),
-                params: serde_json::json!({"type": kind}),
-            })));
+        self.tracker.test_turn(match kind {
+            "turn.started" => None,
+            "turn.completed" => Some(crate::TurnBoundary::Completed),
+            "turn.failed" => Some(crate::TurnBoundary::Failed),
+            _ => panic!("unsupported fixture boundary"),
+        });
     }
 }
 
@@ -1615,7 +1831,7 @@ impl ManagedRuntime for FakeProviderRuntime {
                 "session id does not belong to this runtime".into(),
             ));
         }
-        let current = self.tracker.snapshot();
+        let current = self.tracker.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -1625,12 +1841,10 @@ impl ManagedRuntime for FakeProviderRuntime {
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.tracker.snapshot()
+        self.tracker.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.tracker.activity_snapshot()
-    }
+
 }
 
 /// Test-only composition mirroring `RoutingRuntimeFactory`: the zcode
@@ -1696,7 +1910,11 @@ fn cross_provider_shared_scheduler_contract() {
     assert_eq!(fake.spawns.load(Ordering::Acquire), 1);
 
     // A second provider is admitted while the first remains active.
-    let second = enqueue_dsh(&scheduler, workspace.path(), Some("fixture-provider:fixture-model"));
+    let second = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
     assert_eq!(scheduler.start_ready().unwrap(), vec![second.clone()]);
     let _request = await_pending_permission(&scheduler, &second);
     assert_eq!(scheduler.active_count(), 2);
@@ -2439,51 +2657,17 @@ while [ ! -f test-release ]; do sleep 0.05; done
 
 #[test]
 fn repeated_acp_tool_call_notification_keeps_captured_raw_input() {
-    use external_agent_dsh::acp::update::{canonical_event_payloads, parse_update};
-    let tracker = crate::PassiveActivityTracker::for_adapter("dsh");
-    let update = parse_update(&serde_json::json!({
-        "sessionId": "s1", "update": {
-            "sessionUpdate": "tool_call", "toolCallId": "tool-7", "kind": "edit",
-            "rawInput": {"path": "a.ts", "content": "中"}
-        }
-    }))
-    .unwrap();
-    let input = serde_json::json!({"path":"a.ts","content":"中"});
-    // Mirror the daemon pump: the streaming sibling has no input and the
-    // input-bearing started sibling shares the pair's launch-local event id.
-    let deliver = |event_id: &str| {
-        for mut params in canonical_event_payloads(&update, event_id, "t1") {
-            if params["type"] == "tool.updated" && params["payload"]["kind"] == "started" {
-                params["payload"]["input"] = input.clone();
-            }
-            tracker.observe(&crate::RuntimeEvent::Driver(Inbound::Message(
-                WireMessage::Event(EventEnvelope {
-                    method: "session/event".into(),
-                    params,
-                }),
-            )));
-        }
-    };
-
-    deliver("dsh-event-1");
+    let (shared, tracker) = tool_projection_tracker();
+    let update = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"tool-7","title":"edit a.ts","kind":"other",
+        "status":"in_progress","rawInput":{"path":"a.ts","content":"中"}});
+    deliver_tool_update(&shared, update.clone());
     let before = tracker.observation_snapshot();
-    assert_eq!(before.tools[0].call_count, 1);
-    assert_eq!(
-        before.tools[0].recent_calls[0].arguments["path"],
-        serde_json::json!("a.ts")
-    );
-    assert!(!before.tools[0].recent_calls[0].arguments_truncated);
-
-    // A repeated ACP notification is re-normalized with fresh event ids. Its
-    // input-absent streaming sibling must not erase the captured rawInput.
-    deliver("dsh-event-2");
+    deliver_tool_update(&shared, update);
     let after = tracker.observation_snapshot();
     assert_eq!(after, before);
+    assert_eq!(after.tools[0].tool_name, "edit a.ts");
     assert_eq!(after.tools[0].call_count, 1);
-    assert_eq!(
-        after.tools[0].recent_calls[0].arguments["path"],
-        serde_json::json!("a.ts")
-    );
+    assert_eq!(after.tools[0].recent_calls[0].arguments["path"], "a.ts");
     assert!(!after.tools[0].recent_calls[0].arguments_truncated);
 }
 
@@ -2546,4 +2730,1119 @@ fn terminal_send_keeps_rejecting_dsh_even_with_a_persisted_session_id() {
     // The terminal row was not requeued.
     let task = store.get_task(&agent_id).unwrap().unwrap();
     assert_eq!(task.phase, TaskPhase::Terminal);
+}
+
+/// Exercise the real adapter projector and observation/activity consumers.
+fn tool_projection_tracker() -> (
+    super::events::DshRuntimeShared,
+    Arc<crate::RuntimeState>,
+) {
+    struct TrackerSink(Arc<crate::RuntimeState>);
+    impl LifecycleSink for TrackerSink {
+        fn runtime_state(&self) -> Option<Arc<crate::RuntimeState>> { Some(self.0.clone()) }
+        fn emit(&self, record: crate::RuntimeEnvelope) {
+        }
+    }
+    let tracker = Arc::new(crate::RuntimeState::new());
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(TrackerSink(Arc::clone(
+        &tracker,
+    )))));
+    let (task, launch) = publisher.event_scope();
+    let shared = super::events::DshRuntimeShared {
+        publisher: Arc::clone(&publisher),
+        runtime_state: Arc::clone(&publisher.runtime_state),
+        task,
+        launch,
+        offers: Mutex::new(Default::default()),
+        tool_names: Mutex::new(Default::default()),
+        messages: Mutex::new(Default::default()),
+        session_id: Mutex::new(Some("s".into())),
+        current_prompt: Mutex::new(None),
+        last_prompt: Mutex::new(None),
+        settled_turn: Mutex::new(None),
+        stop_boundaries: std::sync::atomic::AtomicU64::new(0),
+    };
+    shared.begin_turn(1);
+    (shared, tracker)
+}
+
+fn deliver_tool_update(shared: &super::events::DshRuntimeShared, update: serde_json::Value) {
+    let event = Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/update".into(),
+        raw: serde_json::json!({"params":{"sessionId":"s","update":update}}),
+    });
+    assert!(super::events::project_dsh_inbound(shared, &event).is_none());
+}
+
+fn assert_pending_tool_counters(tool_name: &str, input: serde_json::Value) {
+    let (shared, tracker) = tool_projection_tracker();
+    let pending = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"c",
+        "status":"pending","title":tool_name,"kind":"other","rawInput":input});
+    deliver_tool_update(&shared, pending.clone());
+    deliver_tool_update(&shared, pending); // Fresh envelopes, same call.
+    let scheduled = tracker.snapshot();
+    assert_eq!(scheduled.window_60s.tool_calls_started, 0);
+    assert_eq!(scheduled.window_60s.read_calls, 0);
+    assert_eq!(scheduled.window_60s.bash_calls, 0);
+    assert_eq!(scheduled.window_60s.other_tool_calls, 0);
+    let observed = tracker.observation_snapshot();
+    assert_eq!(observed.tools.len(), 1, "pending descriptor was lost");
+    assert_eq!(observed.tools[0].tool_name, tool_name);
+    assert_eq!(observed.tools[0].call_count, 1);
+    assert_eq!(&observed.tools[0].recent_calls[0].arguments, input.as_object().unwrap());
+    let started = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"in_progress"});
+    deliver_tool_update(&shared, started.clone());
+    deliver_tool_update(&shared, started);
+    let running = tracker.snapshot();
+    assert_eq!(running.window_60s.tool_calls_started, 1);
+    assert_eq!(running.window_60s.tool_calls_completed, 0);
+    assert_eq!(running.window_60s.read_calls, u64::from(tool_name == "Read"), "{tool_name}");
+    assert_eq!(running.window_60s.bash_calls, u64::from(tool_name == "Bash"), "{tool_name}");
+    assert_eq!(running.window_60s.other_tool_calls, 0, "{tool_name}");
+    let completed = serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed"});
+    deliver_tool_update(&shared, completed.clone());
+    deliver_tool_update(&shared, completed);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_completed, 1);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_failed, 0);
+    assert!(tracker.snapshot().active_tools.is_empty());
+    let finished = tracker.observation_snapshot();
+    assert_eq!(finished.tools[0].recent_calls[0].arguments, observed.tools[0].recent_calls[0].arguments);
+    assert_eq!(finished.tools[0].call_count, observed.tools[0].call_count);
+    assert_eq!(finished.tools[0].recent_calls[0].status, crate::observation::ObservedCallStatus::Succeeded);
+}
+
+#[test]
+fn repair1_pending_tool_preserves_descriptor_without_premature_execution() {
+    assert_pending_tool_counters("Read", serde_json::json!({"path":"a.ts"}));
+}
+
+#[test]
+fn repair2_pending_bash_preserves_descriptor_and_activity_counters() {
+    assert_pending_tool_counters("Bash", serde_json::json!({"command":"pwd"}));
+}
+
+fn assert_terminal_tool_announcement(status: &str) {
+    let (shared, tracker) = tool_projection_tracker();
+    let terminal = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"terminal",
+        "status":status,"title":"Read","kind":"other","rawInput":{"path":"a.ts"}});
+    deliver_tool_update(&shared, terminal.clone());
+    let observed = tracker.observation_snapshot();
+    assert_eq!(observed.tools.len(), 1, "{status} announcement descriptor was lost");
+    assert_eq!(observed.tools[0].tool_name, "Read");
+    assert_eq!(observed.tools[0].call_count, 1);
+    assert_eq!(&observed.tools[0].recent_calls[0].arguments, serde_json::json!({"path":"a.ts"}).as_object().unwrap());
+    assert!(!observed.tools[0].recent_calls[0].arguments_truncated);
+    deliver_tool_update(&shared, terminal);
+    let activity = tracker.snapshot();
+    assert_eq!(activity.window_60s.tool_calls_started, 1);
+    assert_eq!(activity.window_60s.tool_calls_completed, u64::from(status == "completed"));
+    assert_eq!(activity.window_60s.tool_calls_failed, u64::from(status == "failed"));
+    assert!(activity.active_tools.is_empty());
+    assert_eq!(tracker.observation_snapshot(), observed, "replay must not recount");
+}
+
+#[test]
+fn repair2_completed_announcement_preserves_observation_without_start() {
+    assert_terminal_tool_announcement("completed");
+}
+
+#[test]
+fn repair2_failed_announcement_preserves_observation_without_start() {
+    assert_terminal_tool_announcement("failed");
+}
+
+fn projected_permission_tool_name(
+    shared: &super::events::DshRuntimeShared,
+    call_id: &str,
+) -> String {
+    let request = Inbound::Message(WireMessage::Request(
+        external_contract::RequestEnvelope::new(
+            external_contract::WireId::String(format!("permission-{call_id}")),
+            "session/request_permission",
+            serde_json::json!({"sessionId":"s","toolCallId":call_id,
+            "options":[{"optionId":"allow-once","kind":"allow_once"}]}),
+        ),
+    ));
+    let Some(Inbound::Message(WireMessage::Request(projected))) =
+        super::events::project_dsh_inbound(shared, &request)
+    else {
+        panic!("permission request must be projected");
+    };
+    assert_eq!(
+        projected.method,
+        external_contract::INTERACTION_REQUEST_PERMISSION
+    );
+    projected.params["toolName"].as_str().unwrap().to_owned()
+}
+
+fn assert_finished_history_preserves_current_tool(tool_name: &str, input: serde_json::Value) {
+    let (shared, tracker) = tool_projection_tracker();
+    for index in 0..128 {
+        let warmup = serde_json::json!({"sessionUpdate":"tool_call",
+            "toolCallId":format!("warmup-{index}"),"status":"completed",
+            "title":"Warmup","kind":"other","rawInput":{}});
+        deliver_tool_update(&shared, warmup.clone());
+        deliver_tool_update(&shared, warmup);
+    }
+    let warm = tracker.snapshot();
+    assert_eq!(warm.window_60s.tool_calls_started, 128);
+    assert_eq!(warm.window_60s.tool_calls_completed, 128);
+    assert!(warm.active_tools.is_empty());
+
+    let pending = serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"current",
+        "status":"pending","title":tool_name,"kind":"other","rawInput":input});
+    deliver_tool_update(&shared, pending.clone());
+    deliver_tool_update(&shared, pending);
+    assert_eq!(tracker.snapshot().window_60s.tool_calls_started, 128);
+    // Capture the actual permission correlation while still pending, without
+    // echoing a title in the permission offer itself.
+    let pending_name = projected_permission_tool_name(&shared, "current");
+    let observed = tracker.observation_snapshot();
+    let current = observed
+        .tools
+        .iter()
+        .find(|tool| tool.tool_name == tool_name)
+        .unwrap();
+    assert_eq!(current.call_count, 1);
+    assert_eq!(
+        &current.recent_calls[0].arguments,
+        input.as_object().unwrap()
+    );
+    assert!(!current.recent_calls[0].arguments_truncated);
+
+    let started = serde_json::json!({"sessionUpdate":"tool_call_update",
+        "toolCallId":"current","status":"in_progress"});
+    deliver_tool_update(&shared, started.clone());
+    deliver_tool_update(&shared, started);
+    let running = tracker.snapshot();
+    assert_eq!(running.window_60s.tool_calls_started, 129);
+    assert_eq!(
+        running.window_60s.read_calls,
+        u64::from(tool_name == "Read"),
+        "{tool_name}"
+    );
+    assert_eq!(
+        running.window_60s.bash_calls,
+        u64::from(tool_name == "Bash"),
+        "{tool_name}"
+    );
+    assert_eq!(running.window_60s.other_tool_calls, 128);
+    assert_eq!(running.active_tools.len(), 1);
+    assert_eq!(running.active_tools[0].tool_call_id, "current");
+    assert_eq!(
+        running.active_tools[0].kind,
+        if tool_name == "Read" {
+            crate::PassiveToolKind::Read
+        } else {
+            crate::PassiveToolKind::Bash
+        }
+    );
+    assert_eq!(pending_name, tool_name);
+    assert_eq!(
+        projected_permission_tool_name(&shared, "current"),
+        tool_name
+    );
+    assert_eq!(shared.tool_names.lock().unwrap().len(), 1);
+    let running_observation = tracker.observation_snapshot();
+    let active = running_observation.tools.iter().find(|tool| tool.tool_name == tool_name).unwrap();
+    assert_eq!(active.recent_calls[0].arguments, current.recent_calls[0].arguments);
+    assert_eq!(active.call_count, current.call_count);
+    assert_eq!(active.recent_calls[0].status, crate::observation::ObservedCallStatus::Running);
+
+    let terminal = serde_json::json!({"sessionUpdate":"tool_call_update",
+        "toolCallId":"current","status":"completed"});
+    deliver_tool_update(&shared, terminal.clone());
+    deliver_tool_update(&shared, terminal);
+    let settled = tracker.snapshot();
+    assert_eq!(settled.window_60s.tool_calls_started, 129);
+    assert_eq!(settled.window_60s.tool_calls_completed, 129);
+    assert_eq!(settled.window_60s.tool_calls_failed, 0);
+    assert!(settled.active_tools.is_empty());
+    let running_observation = tracker.observation_snapshot();
+    let active = running_observation.tools.iter().find(|tool| tool.tool_name == tool_name).unwrap();
+    assert_eq!(active.recent_calls[0].arguments, current.recent_calls[0].arguments);
+    assert_eq!(active.call_count, current.call_count);
+    assert_eq!(active.recent_calls[0].status, crate::observation::ObservedCallStatus::Succeeded);
+    assert!(shared.tool_names.lock().unwrap().is_empty());
+}
+
+#[test]
+fn repair3_completed_history_preserves_new_pending_read() {
+    assert_finished_history_preserves_current_tool("Read", serde_json::json!({"path":"a.ts"}));
+}
+
+#[test]
+fn repair3_completed_history_preserves_new_pending_bash() {
+    assert_finished_history_preserves_current_tool("Bash", serde_json::json!({"command":"pwd"}));
+}
+
+#[test]
+fn repair3_terminal_phases_release_only_finished_names() {
+    let (shared, tracker) = tool_projection_tracker();
+    deliver_tool_update(
+        &shared,
+        serde_json::json!({"sessionUpdate":"tool_call",
+        "toolCallId":"keep-pending","status":"pending","title":"Read","rawInput":{"path":"a.ts"}}),
+    );
+    for kind in ["tool_call", "tool_call_update"] {
+        for status in ["completed", "failed"] {
+            let id = format!("{kind}-{status}");
+            if kind == "tool_call_update" {
+                deliver_tool_update(
+                    &shared,
+                    serde_json::json!({"sessionUpdate":"tool_call",
+                    "toolCallId":id,"status":"pending","title":"Bash","rawInput":{"command":"pwd"}}),
+                );
+                assert_eq!(projected_permission_tool_name(&shared, &id), "Bash");
+                deliver_tool_update(
+                    &shared,
+                    serde_json::json!({"sessionUpdate":"tool_call_update",
+                    "toolCallId":id,"status":"in_progress"}),
+                );
+                assert_eq!(projected_permission_tool_name(&shared, &id), "Bash");
+            }
+            let terminal = serde_json::json!({"sessionUpdate":kind,"toolCallId":id,
+                "status":status,"title":"Bash","rawInput":{"command":"pwd"}});
+            deliver_tool_update(&shared, terminal.clone());
+            let before_replay = tracker.snapshot().window_60s;
+            deliver_tool_update(&shared, terminal);
+            assert_eq!(tracker.snapshot().window_60s, before_replay);
+            let names = shared.tool_names.lock().unwrap();
+            assert!(
+                !names.contains_key(&id),
+                "{kind}/{status} retained finished history"
+            );
+            assert_eq!(names.get("keep-pending").map(String::as_str), Some("Read"));
+            assert_eq!(names.len(), 1);
+            drop(names);
+            assert_eq!(
+                projected_permission_tool_name(&shared, "keep-pending"),
+                "Read"
+            );
+        }
+    }
+}
+
+#[test]
+fn repair1_large_prompt_result_has_explicit_limit_semantics() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let updates = workspace.path().join("large-updates.jsonl");
+    let chunk = |id: &str, text: String| {
+        serde_json::json!({"jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk",
+        "messageId":id,"content":{"type":"text","text":text}}}})
+        .to_string()
+    };
+    // Synthetic sustained output: each frame is legal and below the 16 MiB
+    // wire limit, while the stream exceeds the 2 MiB result cap sixteenfold.
+    let mut frames = (0..32)
+        .map(|_| chunk("first", "x".repeat(1024 * 1024)))
+        .collect::<Vec<_>>();
+    frames.push(chunk("last", "done".into()));
+    frames.push(r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#.into());
+    std::fs::write(&updates, frames.join("\n") + "\n").unwrap();
+    drop(frames);
+    let script = format!(
+        "{}\ncat {:?}\n",
+        BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        updates
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(
+        stored.result.outcome,
+        TaskOutcome::Failed,
+        "capped text must not be completed"
+    );
+    assert!(
+        stored.result.partial,
+        "the text limit must be visible as a partial result"
+    );
+    assert!(
+        stored.result.final_text.contains("ACP_RESULT_TEXT_LIMIT"),
+        "missing limit reason"
+    );
+    let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+    assert!(
+        activity.latest_text_tail.ends_with("done"),
+        "post-limit deltas must stay live"
+    );
+    assert!(activity.latest_text_tail.len() <= crate::MAX_LATEST_TEXT_BYTES);
+    assert!(activity.latest_text_truncated);
+}
+
+/// Backpressure holds the prompt writer in send while the peer emits its first
+/// chunk. The peer drains the request only after the tracker has seen that
+/// chunk, forcing the write-before-begin interleaving without timing guesses.
+#[test]
+fn repair1_fast_peer_first_chunk_precedes_prompt_write_completion() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let release = workspace.path().join("release-prompt-reader");
+    let script = format!(
+        r#"
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}"}}}}'
+# Read a single byte, leaving a legal prompt larger than the pipe capacity.
+dd bs=1 count=1 >/dev/null 2>/dev/null
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"sessionUpdate":"agent_message_chunk","messageId":"first","content":{{"type":"text","text":"immediate "}}}}}}}}'
+while [ ! -f {release:?} ]; do sleep 0.01; done
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"{SESSION_ID}","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"answer"}}}}}}}}' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}'
+"#
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = Arc::new(dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    ));
+    let agent_id = scheduler
+        .enqueue_general_with_admission(
+            &manifest_for(workspace.path(), &"p".repeat(240 * 1024)),
+            Some(dsh_admission(None)),
+        )
+        .unwrap()
+        .agent_id;
+    let starter = {
+        let scheduler = Arc::clone(&scheduler);
+        thread::spawn(move || scheduler.start_ready())
+    };
+    let deadline = Instant::now() + SCRIPTED_SYNC_WAIT;
+    let saw_first_chunk = loop {
+        let connection = rusqlite::Connection::open(workspace.path().join("state.sqlite")).unwrap();
+        // Typed text deltas settle as `message` facts; the store keeps one
+        // lifecycle summary row per fact, never the canonical JSON envelope.
+        let projected: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='runtime.fact' \
+             AND json_extract(payload_json, '$.category')='message'",
+            [&agent_id], |row| row.get(0)).unwrap();
+        if projected == 1 {
+            break true;
+        }
+        if Instant::now() >= deadline || starter.is_finished() {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let writer_was_blocked = !starter.is_finished();
+    // Always release the peer before asserting, including a failed barrier.
+    std::fs::write(release, "release").unwrap();
+    let started = starter.join().unwrap().unwrap();
+    assert!(saw_first_chunk && writer_was_blocked,
+        "first chunk must be projected while the prompt writer is blocked");
+    assert_eq!(started, vec![agent_id.clone()]);
+    let stored = await_result(&scheduler, &agent_id);
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert_eq!(stored.result.final_text, "immediate answer");
+    assert!(!stored.result.partial);
+}
+
+#[test]
+fn repair1_failed_prompt_write_closes_the_reserved_turn() {
+    let _guard = scripted_test_guard();
+    let mut command = Command::new("sh");
+    command.args(["-c", "cat >/dev/null"]);
+    let owner = DshRuntimeOwner::spawn(command, Arc::new(NoopSink)).unwrap();
+    // This is only the test-owned child. No installed daemon is touched.
+    owner.session.lock().unwrap().driver().stop_and_reap(Duration::from_secs(1)).unwrap();
+    assert!(owner.send_prompt("cannot be written").is_err());
+    let turn = owner.shared.runtime_state.turn_snapshot();
+    assert!(!turn.active, "failed write left a phantom prompt active");
+    assert_eq!(turn.boundary, Some(crate::TurnBoundary::Failed));
+    assert!(owner.shared.current_prompt.lock().unwrap().is_none());
+    let messages = owner.shared.messages.lock().unwrap();
+    assert!(messages.is_empty());
+    assert_eq!(messages.turn_text("dsh-prompt-1"), None);
+}
+
+#[test]
+fn repair4_nul_chunk_is_preserved_in_persisted_and_paged_result() {
+    let _guard = scripted_test_guard();
+    let workspace = dsh_workspace();
+    let updates = workspace.path().join("nul-updates.jsonl");
+    let chunk = |text: &str| {
+        serde_json::json!({"jsonrpc":"2.0","method":"session/update",
+        "params":{"sessionId":SESSION_ID,"update":{"sessionUpdate":"agent_message_chunk",
+            "messageId":"native-nul","content":{"type":"text","text":text}}}})
+        .to_string()
+    };
+    std::fs::write(
+        &updates,
+        format!(
+            "{}\n{}\n{}\n",
+            chunk("prefix "),
+            chunk("important\0suffix"),
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#
+        ),
+    )
+    .unwrap();
+    let script = format!(
+        "{}\ncat {:?}\n",
+        BOOTSTRAP_PREFIX.replace("SESSION", SESSION_ID),
+        updates
+    );
+    let child = scripted_child(workspace.path(), &script);
+    let scheduler = dsh_scheduler(
+        workspace.path(),
+        DshRuntimeFactory::test_harness(Some(child)),
+    );
+    let agent_id = enqueue_dsh(
+        &scheduler,
+        workspace.path(),
+        Some("fixture-provider:fixture-model"),
+    );
+    assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
+    let request = await_pending_permission(&scheduler, &agent_id);
+    scheduler
+        .respond_request(&agent_id, &request.request_id, "allow", None)
+        .unwrap();
+    let stored = await_result(&scheduler, &agent_id);
+    let expected = "prefix important\0suffix";
+    assert_eq!(
+        stored.result.final_text, expected,
+        "complete success must retain the entire received text"
+    );
+    assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+    assert!(!stored.result.partial);
+
+    let service = crate::rpc::RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+    let mut offset = 0;
+    let mut reconstructed = String::new();
+    let mut saw_nul_escape = false;
+    loop {
+        let response = service
+            .dispatch(crate::rpc::RpcMethod::TaskResult {
+                agent_id: agent_id.clone(),
+                offset,
+                limit: 8,
+            })
+            .unwrap();
+        let crate::rpc::RpcSuccess::TaskResult {
+            result: Some(page), ..
+        } = response
+        else {
+            panic!("result page");
+        };
+        assert_eq!(page.outcome, TaskOutcome::Completed);
+        assert!(!page.partial);
+        assert_eq!(page.total_bytes, expected.len());
+        assert_eq!(page.offset, offset);
+        let encoded = serde_json::to_string(&page).unwrap();
+        saw_nul_escape |= encoded.contains("\\u0000");
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        reconstructed.push_str(decoded["final_text"].as_str().unwrap());
+        if let Some(next) = page.next_offset {
+            assert!(next > offset);
+            offset = next;
+        } else {
+            break;
+        }
+    }
+    assert!(
+        saw_nul_escape,
+        "RPC must safely encode NUL as a JSON escape"
+    );
+    assert_eq!(reconstructed, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Typed adapter facts (S03 `external_contract::events`). These assert the
+// adapter's own output: one native `session/update` is explained once, with no
+// canonical `session/event` JSON and no invented native identity.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CapturedFacts {
+    events: Mutex<Vec<crate::RuntimeEnvelope>>,
+}
+
+struct CaptureSink(Arc<CapturedFacts>);
+impl LifecycleSink for CaptureSink {
+    fn emit(&self, record: crate::RuntimeEnvelope) {
+        self.0.events.lock().unwrap().push(record);
+    }
+}
+
+fn typed_adapter_shared(
+    session: Option<&str>,
+) -> (super::events::DshRuntimeShared, Arc<CapturedFacts>) {
+    use external_agent_dsh::acp::{permission::OfferCache, result::MessageAggregation};
+    let captured = Arc::new(CapturedFacts::default());
+    let publisher = Arc::new(crate::Publisher::new(Arc::new(CaptureSink(Arc::clone(
+        &captured,
+    )))));
+    let (task, launch) = publisher.event_scope();
+    let shared = super::events::DshRuntimeShared {
+        publisher: Arc::clone(&publisher),
+        runtime_state: Arc::clone(&publisher.runtime_state),
+        task,
+        launch,
+        offers: Mutex::new(OfferCache::default()),
+        tool_names: Mutex::new(Default::default()),
+        messages: Mutex::new(MessageAggregation::default()),
+        session_id: Mutex::new(session.map(str::to_owned)),
+        current_prompt: Mutex::new(None),
+        last_prompt: Mutex::new(None),
+        settled_turn: Mutex::new(None),
+        stop_boundaries: std::sync::atomic::AtomicU64::new(0),
+    };
+    (shared, captured)
+}
+
+fn captured_facts(captured: &CapturedFacts) -> Vec<external_contract::events::EventFact> {
+    use external_contract::events::NormalizedEvent;
+    captured
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            crate::RuntimeEnvelope::Event { event: NormalizedEvent { fact, .. }, .. } => Some(fact.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn session_update(update: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"sessionId": "s", "update": update})
+}
+
+#[test]
+fn text_thought_and_committed_message_decode_to_typed_facts() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(7);
+
+    let chunk = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "hello"}
+        })))
+        .unwrap();
+    assert_eq!(chunk.disposition().kind(), DispositionKind::Consumed);
+    assert_eq!(chunk.attribution(), Attribution::Current);
+    assert_eq!(chunk.input().source.protocol, SourceProtocol::DshAcpV1);
+    assert_eq!(
+        chunk
+            .input()
+            .source
+            .discriminator
+            .as_ref()
+            .map(SafeToken::as_str),
+        Some("agent_message_chunk")
+    );
+    // DSH ACP has no native frame identity: none is invented.
+    assert_eq!(chunk.input().source.event_id, None);
+    assert_eq!(chunk.input().source.turn_id, None);
+    assert_eq!(chunk.input().turn_id, Some(TurnId::Local(7)));
+    assert_eq!(chunk.events().len(), 1);
+    assert!(matches!(
+        &chunk.events()[0].fact,
+        EventFact::MessageUpdated(MessageUpdate { message_id, text })
+            if *message_id == MessageId("m1".into()) && *text == TextUpdate::Delta("hello".into())
+    ));
+
+    let committed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "type": "agent_message", "messageId": "m2",
+            "content": [{"type": "text", "text": "done"}]
+        })))
+        .unwrap();
+    assert_eq!(committed.disposition().kind(), DispositionKind::Consumed);
+    let facts: Vec<_> = committed.events().iter().map(|e| e.fact.clone()).collect();
+    assert_eq!(facts.len(), 2);
+    assert!(matches!(
+        &facts[0],
+        EventFact::MessageUpdated(MessageUpdate { text: TextUpdate::Delta(text), .. })
+            if text == "done"
+    ));
+    assert!(matches!(
+        &facts[1],
+        EventFact::MessageFinished { message_id } if *message_id == MessageId("m2".into())
+    ));
+
+    let thought = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}
+        })))
+        .unwrap();
+    assert!(matches!(
+        &thought.events()[0].fact,
+        EventFact::PublicReasoningDelta(reasoning)
+            if reasoning.channel == PublicReasoningChannel::Thought && reasoning.delta == "hmm"
+    ));
+
+    // A legal empty chunk has no consumer, and no malformed coverage is
+    // claimed for it.
+    let empty = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": ""}
+        })))
+        .unwrap();
+    assert_eq!(
+        empty.disposition().kind(),
+        DispositionKind::RecognizedIgnored
+    );
+    assert!(empty.events().is_empty());
+
+    // A NUL-bearing public thought is not deliverable reasoning: the known
+    // shape is malformed and the affected dimension is declared.
+    let nul_thought = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "bad\0text"}
+        })))
+        .unwrap();
+    assert_eq!(
+        nul_thought.disposition().kind(),
+        DispositionKind::InvalidLost
+    );
+    assert!(matches!(
+        &nul_thought.events()[0].fact,
+        EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::PublicReasoning])
+    ));
+}
+
+#[test]
+fn repair_malformed_message_text_is_lost_but_legal_empty_content_is_ignored() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    for malformed in [
+        serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":42}}),
+        serde_json::json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text"}}),
+        serde_json::json!({"sessionUpdate":"agent_message_chunk"}),
+        serde_json::json!({"sessionUpdate":"agent_message","content":[{"type":"text","text":"valid"},{"type":"text","text":false}]}),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(malformed))
+            .unwrap();
+        assert_eq!(batch.disposition().kind(), DispositionKind::InvalidLost);
+        assert!(batch.events().iter().any(|event| matches!(&event.fact,
+            EventFact::CoverageGap(gap) if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::Text]))));
+        shared.publisher.emit_typed(batch);
+    }
+    for content in [
+        serde_json::json!({"type":"text","text":""}),
+        serde_json::json!({"type":"image","data":"synthetic","mimeType":"image/png"}),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(serde_json::json!({
+                "sessionUpdate":"agent_message_chunk", "content":content
+            })))
+            .unwrap();
+        assert_eq!(
+            batch.disposition(),
+            &DecodeDisposition::RecognizedIgnored(IgnoreReason::NoConsumer)
+        );
+    }
+    for event in captured.events.lock().unwrap().iter() {
+        if matches!(
+            event,
+            crate::RuntimeEnvelope::Event { event: NormalizedEvent {
+                fact: EventFact::CoverageGap(_), ..
+            }, .. }
+        ) {
+            let projection = crate::projection::lifecycle_projection(event, None);
+            let summary: LifecycleSummary = serde_json::from_str(&projection.payload_json).unwrap();
+            assert_eq!(summary.disposition, DispositionKind::InvalidLost);
+            assert_eq!(summary.reason, Some(DiagnosticReason::Malformed));
+            assert_eq!(
+                summary.impact,
+                Some(Impact::Known(vec![CoverageDimension::Text]))
+            );
+            assert!(!projection.payload_json.contains("content"));
+        }
+    }
+    let facts = captured_facts(&captured);
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| matches!(fact, EventFact::CoverageGap(g)
+        if g.reason == LossReason::Malformed
+            && g.impact == Impact::Known(vec![CoverageDimension::Text])))
+            .count(),
+        4
+    );
+}
+
+#[test]
+fn tool_updates_name_from_title_and_derive_phases_from_status() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    let announced = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "probe the workspace", "kind": "other",
+            "status": "in_progress", "rawInput": {"path": "."}
+        })))
+        .unwrap();
+    assert_eq!(announced.disposition().kind(), DispositionKind::Consumed);
+    assert_eq!(announced.events().len(), 1);
+    assert!(matches!(
+        &announced.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.call_id == CallId("c1".into())
+                && tool.name.as_deref() == Some("probe the workspace")
+                && tool.category.as_ref().map(SafeToken::as_str) == Some("other")
+                && tool.phase == Some(ToolPhase::Started)
+                && tool.outcome.is_none()
+                && tool.arguments == Some(ArgumentUpdate::Snapshot(serde_json::json!({"path": "."})))
+    ));
+    assert_eq!(announced.input().source.call_id.as_deref(), Some("c1"));
+
+    // The category is never the name; a failed native status is a failed call.
+    let failed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "failed"
+        })))
+        .unwrap();
+    assert_eq!(failed.disposition().kind(), DispositionKind::Consumed);
+    assert!(matches!(
+        &failed.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.name.as_deref() == Some("probe the workspace")
+                && tool.phase == Some(ToolPhase::Finished)
+                && tool.outcome == Some(ToolOutcome::Failed)
+    ));
+    // The bounded correlation slot is released once the call finished.
+    assert!(shared.tool_names.lock().unwrap().is_empty());
+
+    // A terminal announcement is one fact, never an invented start, and it
+    // carries the explicit native success evidence.
+    let terminal = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c2",
+            "title": "Read", "kind": "other", "status": "completed", "rawInput": {"path": "a.ts"}
+        })))
+        .unwrap();
+    assert_eq!(terminal.events().len(), 1);
+    assert!(matches!(
+        &terminal.events()[0].fact,
+        EventFact::ToolChanged(tool)
+            if tool.phase == Some(ToolPhase::Finished) && tool.outcome == Some(ToolOutcome::Succeeded)
+    ));
+
+    // No recognized status proves nothing about execution.
+    let unknown_status = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "c3", "status": "queued"
+        })))
+        .unwrap();
+    assert_eq!(
+        unknown_status.disposition().kind(),
+        DispositionKind::RecognizedIgnored
+    );
+    assert!(unknown_status.events().is_empty());
+}
+
+#[test]
+fn update_dispositions_separate_ignored_unknown_and_lost_inputs() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    // Recognized normal traffic with no consumer here is not loss.
+    for (update, expected) in [
+        (
+            serde_json::json!({"sessionUpdate": "usage_update"}),
+            IgnoreReason::Usage,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "plan"}),
+            IgnoreReason::PlanOrDiff,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "config_option_update"}),
+            IgnoreReason::Configuration,
+        ),
+        (
+            serde_json::json!({"sessionUpdate": "available_commands_update"}),
+            IgnoreReason::Configuration,
+        ),
+    ] {
+        let batch = shared
+            .decode_session_update(&session_update(update))
+            .unwrap();
+        assert_eq!(
+            batch.disposition(),
+            &DecodeDisposition::RecognizedIgnored(expected)
+        );
+        assert!(batch.events().is_empty());
+    }
+
+    // A discriminator this adapter does not know is uncertainty, retained as a
+    // safe diagnostic instead of disappearing.
+    let unknown = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "permission_stream_v2", "payload": {"secret": "x"}
+        })))
+        .unwrap();
+    assert_eq!(unknown.disposition().kind(), DispositionKind::Unknown);
+    assert!(matches!(
+        &unknown.events()[0].fact,
+        EventFact::Diagnostic(diagnostic)
+            if diagnostic.reason == DiagnosticReason::UnknownSemantics
+                && diagnostic.discriminator.as_ref().map(SafeToken::as_str)
+                    == Some("permission_stream_v2")
+    ));
+
+    // A known tool shape without its identity is damaged input with a known
+    // affected dimension.
+    let malformed = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "title": "no identity"
+        })))
+        .unwrap();
+    assert_eq!(malformed.disposition().kind(), DispositionKind::InvalidLost);
+    assert!(matches!(
+        &malformed.events()[0].fact,
+        EventFact::CoverageGap(gap)
+            if gap.reason == LossReason::Malformed
+                && gap.impact == Impact::Known(vec![CoverageDimension::Tools])
+    ));
+}
+
+#[test]
+fn foreign_and_post_settlement_frames_never_touch_the_current_turn() {
+    use external_contract::events::*;
+    let (shared, _captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+
+    let foreign = shared
+        .decode_session_update(&serde_json::json!({
+            "sessionId": "other-session",
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": "foreign"}}
+        }))
+        .unwrap();
+    assert_eq!(foreign.attribution(), Attribution::ForeignSession);
+    assert_eq!(
+        foreign.disposition(),
+        &DecodeDisposition::RecognizedIgnored(IgnoreReason::ForeignSession)
+    );
+    assert!(foreign.events().is_empty());
+    assert!(shared.messages.lock().unwrap().is_empty());
+
+    let chunk = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "answer"}
+        })))
+        .unwrap();
+    assert_eq!(chunk.disposition().kind(), DispositionKind::Consumed);
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "end_turn".into(),
+            message_id: None,
+        },
+    ));
+
+    let late = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "more"}
+        })))
+        .unwrap();
+    assert_eq!(late.attribution(), Attribution::Late);
+    assert_eq!(
+        late.disposition(),
+        &DecodeDisposition::RecognizedIgnored(IgnoreReason::Late)
+    );
+    assert!(late.events().is_empty());
+}
+
+#[test]
+fn settlement_reduces_text_before_the_boundary_and_keeps_the_native_stop_reason() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    for text in ["build ", "answer"] {
+        let batch = shared
+            .decode_session_update(&session_update(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+                "content": {"type": "text", "text": text}
+            })))
+            .unwrap();
+        assert_eq!(batch.disposition().kind(), DispositionKind::Consumed);
+    }
+    // The standard flow settles with nothing but a stop reason.
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "end_turn".into(),
+            message_id: None,
+        },
+    ));
+
+    let facts = captured_facts(&captured);
+    assert!(
+        !facts.iter().any(|fact| matches!(
+            fact,
+            EventFact::MessageUpdated(MessageUpdate {
+                text: TextUpdate::Snapshot(_),
+                ..
+            })
+        )),
+        "turn-wide text must only travel on TurnSettled"
+    );
+    let settled = facts
+        .iter()
+        .position(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("the turn boundary was projected");
+    let EventFact::TurnSettled(settlement) = &facts[settled] else {
+        unreachable!()
+    };
+    assert_eq!(settlement.turn_id, TurnId::Local(1));
+    assert_eq!(settlement.outcome, TurnOutcome::Completed);
+    assert_eq!(settlement.final_text.as_deref(), Some("build answer"));
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some("end_turn")
+    );
+    assert!(settlement.failure.is_none());
+
+    let turn = shared.runtime_state.turn_snapshot();
+    assert!(!turn.active);
+    assert_eq!(turn.boundary, Some(crate::TurnBoundary::Completed));
+}
+
+#[test]
+fn failed_settlements_keep_the_complete_redacted_native_error() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(3);
+    let native = serde_json::json!({
+        "code": -32000,
+        "message": "quota exhausted for the fixture account",
+        "data": {"retryAfter": 30, "limit": "daily", "apiKey": "secret"}
+    });
+    shared.apply_failed_settlement(super::events::REMOTE_ERROR_REASON, Some(&native));
+
+    let facts = captured_facts(&captured);
+    let EventFact::TurnSettled(settlement) = facts
+        .iter()
+        .find(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("failed boundary")
+    else {
+        unreachable!()
+    };
+    assert_eq!(settlement.outcome, TurnOutcome::Failed);
+    let failure = settlement.failure.as_ref().expect("native failure");
+    assert_eq!(failure.original["code"], -32000);
+    assert_eq!(
+        failure.original["message"],
+        "quota exhausted for the fixture account"
+    );
+    assert_eq!(failure.original["data"]["retryAfter"], 30);
+    assert_eq!(failure.original["data"]["limit"], "daily");
+    assert_eq!(failure.original["data"]["apiKey"], "[REDACTED]");
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some(super::events::REMOTE_ERROR_REASON)
+    );
+    let detail = shared
+        .runtime_state
+        .native_failure()
+        .expect("the complete native failure is retained");
+    assert!(detail.original.to_string().contains("quota exhausted for the fixture account"));
+    assert_eq!(detail.original, failure.original);
+}
+
+#[test]
+fn a_failed_stop_reason_is_a_failed_turn_with_the_reason_retained() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    let batch = shared
+        .decode_session_update(&session_update(serde_json::json!({
+            "sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Read", "kind": "other", "status": "failed",
+            "rawInput": {"path": "a.ts"}
+        })))
+        .unwrap();
+    assert_eq!(batch.disposition().kind(), DispositionKind::Consumed);
+
+    shared.apply_settled_turn(super::events::SettledTurn::Settled(
+        external_agent_dsh::acp::transport::PromptSettlement {
+            stop_reason: "max_tokens".into(),
+            message_id: None,
+        },
+    ));
+    let facts = captured_facts(&captured);
+    let EventFact::TurnSettled(settlement) = facts
+        .iter()
+        .find(|fact| matches!(fact, EventFact::TurnSettled(_)))
+        .expect("failed boundary")
+    else {
+        unreachable!()
+    };
+    assert_eq!(settlement.outcome, TurnOutcome::Failed);
+    assert_eq!(
+        settlement.stop_reason.as_ref().map(SafeToken::as_str),
+        Some("max_tokens")
+    );
+    // The bounded ES reason keeps the delivered diagnostic stable.
+    assert_eq!(
+        settlement
+            .failure
+            .as_ref()
+            .map(|failure| failure.original.clone()),
+        Some(serde_json::json!("MAX_TOKENS"))
+    );
+    assert!(!shared.runtime_state.turn_snapshot().active);
+    assert_eq!(
+        shared.runtime_state.turn_snapshot().boundary,
+        Some(crate::TurnBoundary::Failed)
+    );
+}
+
+#[test]
+fn session_update_projection_emits_typed_facts_only() {
+    use external_contract::events::*;
+    let (shared, captured) = typed_adapter_shared(Some("s"));
+    shared.begin_turn(1);
+    let event = Inbound::Message(WireMessage::UnknownEvent {
+        method: "session/update".into(),
+        raw: serde_json::json!({"params": {"sessionId": "s", "update": {
+            "sessionUpdate": "agent_message_chunk", "messageId": "m1",
+            "content": {"type": "text", "text": "typed"}
+        }}}),
+    });
+    assert!(super::events::project_dsh_inbound(&shared, &event).is_none());
+    let events = captured.events.lock().unwrap();
+    assert!(events
+        .iter()
+        .all(|event| matches!(event, crate::RuntimeEnvelope::Event { .. })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        crate::RuntimeEnvelope::Event { event: normalized, .. }
+            if matches!(
+                &normalized.fact,
+                EventFact::MessageUpdated(MessageUpdate {
+                    text: TextUpdate::Delta(text), ..
+                }) if text == "typed"
+            )
+    )));
 }

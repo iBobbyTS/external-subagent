@@ -23,11 +23,11 @@ use external_runtime::{Driver, FrameCodec, SpawnModel};
 use external_store::TaskRecord;
 
 use super::events::DshRuntimeShared;
-use super::session::{dsh_session_message, remaining_time};
+use super::session::{dsh_session_detail, remaining_time};
 use super::transport::spawn_dsh_pump;
 use crate::{
     LifecycleSink, ManagedRuntime, ProcessIdentity, Publisher, RuntimeCommandError, RuntimeLoss,
-    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot, TurnTracker,
+    RuntimeTerminal, SessionReady, TurnBoundary, TurnSnapshot,
 };
 
 pub struct DshRuntimeOwner {
@@ -73,16 +73,19 @@ impl DshRuntimeOwner {
         )?);
         AcpSession::codec_check(&driver).map_err(|error| io::Error::other(error.to_string()))?;
         let publisher = Arc::new(Publisher::new(sink));
+        let (task, launch) = publisher.event_scope();
         let shared = Arc::new(DshRuntimeShared {
             publisher: Arc::clone(&publisher),
-            turn_tracker: Arc::new(TurnTracker::new()),
+            runtime_state: Arc::clone(&publisher.runtime_state),
+            task,
+            launch,
             offers: Mutex::new(OfferCache::default()),
             tool_names: Mutex::new(HashMap::new()),
             messages: Mutex::new(MessageAggregation::default()),
             session_id: Mutex::new(None),
             current_prompt: Mutex::new(None),
+            last_prompt: Mutex::new(None),
             settled_turn: Mutex::new(None),
-            sequence: AtomicU64::new(0),
             stop_boundaries: AtomicU64::new(0),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -173,8 +176,8 @@ impl ManagedRuntime for DshRuntimeOwner {
         self.shared.publisher.wait_terminal(timeout)
     }
 
-    fn diagnostic_failure(&self) -> Option<String> {
-        self.shared.turn_tracker.failure_detail()
+    fn native_failure(&self) -> Option<external_contract::events::NativeFailure> {
+        self.shared.runtime_state.native_failure()
     }
 
     fn diagnostic_tail(&self) -> String {
@@ -215,7 +218,7 @@ impl ManagedRuntime for DshRuntimeOwner {
         timeout: Duration,
     ) -> Result<TurnSnapshot, RuntimeCommandError> {
         self.validate_session(session_id)?;
-        let current = self.shared.turn_tracker.snapshot();
+        let current = self.shared.runtime_state.turn_snapshot();
         if !current.active {
             return Ok(current);
         }
@@ -224,13 +227,13 @@ impl ManagedRuntime for DshRuntimeOwner {
             .ok_or(RuntimeCommandError::Timeout)?;
         {
             let session = self.session.lock().unwrap();
-            session.cancel().map_err(|error| {
-                RuntimeCommandError::InvalidSession(dsh_session_message(&error))
-            })?;
+            session
+                .cancel()
+                .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_detail(&error)))?;
         }
         let boundary = self
             .shared
-            .turn_tracker
+            .runtime_state
             .wait_boundary_after(current.generation, remaining_time(deadline)?)?;
         self.shared.stop_boundaries.fetch_add(1, Ordering::AcqRel);
         Ok(boundary)
@@ -290,16 +293,14 @@ impl ManagedRuntime for DshRuntimeOwner {
         let session = self.session.lock().unwrap();
         session
             .close(timeout)
-            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_message(&error)))
+            .map_err(|error| RuntimeCommandError::InvalidSession(dsh_session_detail(&error)))
     }
 
     fn turn_snapshot(&self) -> TurnSnapshot {
-        self.shared.turn_tracker.snapshot()
+        self.shared.runtime_state.turn_snapshot()
     }
 
-    fn activity_snapshot(&self) -> crate::RuntimeActivitySnapshot {
-        self.shared.turn_tracker.activity_snapshot()
-    }
+
 
     fn stop_boundary_count(&self) -> u64 {
         self.shared.stop_boundaries.load(Ordering::Acquire)

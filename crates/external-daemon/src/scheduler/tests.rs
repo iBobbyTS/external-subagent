@@ -304,7 +304,7 @@ printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","eve
 pad=$(awk 'BEGIN{for(i=0;i<12000;i++)printf "x"}')
 printf '%s\n' "{\"method\":\"session/event\",\"params\":{\"type\":\"model.streaming\",\"eventId\":\"e-big\",\"turnId\":\"t1\",\"payload\":{\"kind\":\"tool_call\",\"toolCallId\":\"c-big\",\"toolName\":\"Read\",\"input\":{\"path\":\"$pad\"}}}}"
 while [ ! -f release-observe ]; do sleep 0.01; done
-printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","payload":{"kind":"text_delta","delta":"final answer","assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"message.finished","payload":{"assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"turn.completed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"model.streaming","payload":{"kind":"text_delta","delta":"final answer","assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"message.finished","payload":{"assistantMessageId":"m1"}}}' '{"method":"session/event","params":{"type":"turn.completed","payload":{"response":"final answer"}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#;
 
@@ -354,23 +354,10 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
             scheduler.start_ready().unwrap();
             let snapshot = await_observed_content(&scheduler, &agent_id, agent);
 
-            // DSH's public ACP evidence is independent of the ZCode pin.
-            // Codex and unknown adapters never collect reasoning.
-            if agent == "dsh" {
-                assert!(snapshot
-                    .reasoning
-                    .text
-                    .contains("ADAPTER-SCOPED reasoning tail"));
-                assert_eq!(
-                    snapshot.reasoning.source,
-                    observation::ReasoningSource::dsh()
-                );
-                assert!(snapshot.coverage.reasoning_complete);
-            } else {
-                assert!(snapshot.reasoning.text.is_empty());
-                assert!(!snapshot.coverage.reasoning_complete);
-            }
-            assert!(!snapshot.coverage.tool_history_complete);
+            assert!(snapshot.reasoning.text.contains("ADAPTER-SCOPED reasoning tail"));
+            assert_eq!(snapshot.reasoning.source.as_ref().unwrap().protocol, external_contract::events::SourceProtocol::ZcodeSession);
+            assert!(snapshot.coverage.reasoning_complete);
+            assert!(snapshot.coverage.tool_history_complete);
             let encoded = serde_json::to_string(&snapshot.tools).unwrap();
             assert!(!encoded.contains("encrypted_content"));
             assert!(!encoded.contains("NEVER-SECRET"));
@@ -433,8 +420,10 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         assert_eq!(unknown.reasoning.text, queued.reasoning.text);
         assert!(queued.reasoning.text.is_empty());
         assert_eq!(unknown.reasoning.truncated, queued.reasoning.truncated);
-        assert_eq!(queued.reasoning.source, observation::ReasoningSource::dsh());
-        assert_ne!(unknown.reasoning.source, queued.reasoning.source);
+        // A configured adapter name never invents a native reasoning source;
+        // only an observed public delta can.
+        assert_eq!(queued.reasoning.source, None);
+        assert_eq!(unknown.reasoning.source, queued.reasoning.source);
     }
 }
 
@@ -446,6 +435,218 @@ mod failure_log_tests {
     use std::io::{self, Write};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    // Synthetic command errors with the complete public JSON-RPC shape. No
+    // provider call or quota fault is manufactured by these regressions.
+    struct NativeCommandFactory { error: RuntimeCommandError, bootstrap: bool }
+    struct NativeCommandRuntime { error: RuntimeCommandError, bootstrap: bool }
+    impl RuntimeFactory for NativeCommandFactory {
+        fn spawn(&self, _: &TaskRecord, _: Arc<dyn LifecycleSink>) -> io::Result<Arc<dyn ManagedRuntime>> {
+            Ok(Arc::new(NativeCommandRuntime { error: self.error.clone(), bootstrap: self.bootstrap }))
+        }
+    }
+    impl ManagedRuntime for NativeCommandRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> { None }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(ChildExit::Exited(Some(0))))
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            thread::sleep(timeout.min(Duration::from_millis(10))); None
+        }
+        fn bootstrap_session(&self, _: &TaskRecord, _: Duration) -> Result<SessionReady, RuntimeCommandError> {
+            if self.bootstrap { Err(self.error.clone()) } else {
+                Ok(SessionReady { session_id: "native-command-session".into(), initial_turn_id: None, configured_model: None })
+            }
+        }
+        fn resume_session_with_mcp(&self, task: &TaskRecord, _: &[StdioMcpServer], timeout: Duration) -> Result<SessionReady, RuntimeCommandError> {
+            self.bootstrap_session(task, timeout)
+        }
+        fn send_turn(&self, _: &str, _: &str, _: Duration) -> Result<Option<String>, RuntimeCommandError> {
+            Err(self.error.clone())
+        }
+    }
+
+    fn long_command_error() -> serde_json::Value {
+        serde_json::json!({"code":-32031, "message": "native failure\n  保留 details ".repeat(6000),
+            "data":{"apiKey":"private-command-secret", "retryAfter":51, "status":429,
+                "nested":{"stack":"native frame\n".repeat(10000), "futureField":[1,true,"complete"]}}})
+    }
+
+    #[test]
+    fn native_command_bootstrap_and_model_failures_reach_result_and_sync_carrier_without_loss() {
+        let original = long_command_error();
+        for resumed in [false, true] {
+        for error in [
+            RuntimeCommandError::Remote(original.clone()),
+            RuntimeCommandError::InvalidSession(RuntimeCommandDetail::from_native("invalid response", &original)),
+            RuntimeCommandError::ModelRejected(RuntimeCommandDetail::from_native("model rejected", &original)),
+        ] {
+            let expected = error.native_failure().unwrap();
+            let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+            Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: true });
+            if resumed {
+                let claim = scheduler.store().claim_next("seed-session").unwrap().unwrap();
+                scheduler.store().mark_session_running(&id, claim.owner_epoch, "seed-runtime", None, Some("persisted-session"), None).unwrap();
+                scheduler.store().transition_terminal(&id, claim.owner_epoch, &external_store::TerminalUpdate {
+                    outcome: TaskOutcome::Completed, failure_code: None, failure_message: None,
+                }).unwrap();
+                assert!(scheduler.store().requeue_task_for_resume_with_message(&id, "resume-error", "queue", "continue").unwrap());
+            }
+            let error = scheduler.start_ready().unwrap_err();
+            match error {
+                SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                    assert_eq!(agent_id, id);
+                    assert_eq!(native_failure, Some(expected.clone()));
+                }
+                other => panic!("expected native runtime command carrier, got {other:?}"),
+            }
+            let result = scheduler.store().task_result(&id).unwrap().unwrap();
+            assert_eq!(result.result.outcome, TaskOutcome::Failed);
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+            assert!(!result.result.final_text.contains("private-command-secret"));
+            assert!(result.result.final_text.len() > 100_000);
+            let task = scheduler.store().get_task(&id).unwrap().unwrap();
+            assert!(task.reaped_at.is_some());
+            assert!(task.failure_message.unwrap().len() < PERSISTABLE_RECORD_BYTES);
+        }
+        }
+    }
+
+    #[test]
+    fn native_command_send_failure_reaches_failed_result_and_sync_carrier_without_loss() {
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: false });
+        scheduler.start_ready().unwrap();
+        let error = scheduler.send_message(&id, "native-send-error", "queue", "follow up").unwrap_err();
+        match error {
+            SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                assert_eq!(agent_id, id); assert_eq!(native_failure, Some(expected.clone()));
+            }
+            other => panic!("expected native runtime command carrier, got {other:?}"),
+        }
+        let result = await_result(&scheduler, &id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+        assert!(scheduler.store().get_task(&id).unwrap().unwrap().reaped_at.is_some());
+        assert_eq!(scheduler.store().message("native-send-error").unwrap().unwrap().state, MessageState::Failed);
+    }
+
+    #[test]
+    fn native_send_failure_reaches_the_structured_tool_error_with_the_complete_original() {
+        use crate::rpc::{MessageInput, RpcErrorCode, RpcMethod, RpcService};
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (_directory, mut scheduler, id) = diagnostic_scheduler("unused");
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: false });
+        scheduler.start_ready().unwrap();
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let error = service
+            .dispatch(RpcMethod::TaskMessage(MessageInput {
+                agent_id: id.clone(),
+                message_id: None,
+                mode: "queue".into(),
+                content: "follow up".into(),
+            }))
+            .unwrap_err();
+        assert_eq!(error.code, RpcErrorCode::Unavailable);
+        assert_eq!(error.active_agent_id.as_deref(), Some(id.as_str()));
+        let native = error.native_error.as_ref().expect("native original");
+        assert!(
+            !native.truncated,
+            "a real 330 KiB native original must fit the transfer cap"
+        );
+        assert_eq!(native.total_bytes, serde_json::to_vec(&expected).unwrap().len());
+        assert_eq!(native.original, Some(expected.original.clone()));
+        assert_eq!(native.limit_bytes, crate::rpc::MAX_NATIVE_ERROR_BYTES);
+        // The MCP structured tool error carries the same complete, redacted
+        // original; ES's own message stays the bounded classification.
+        let tool = crate::mcp::errors::public_error_for_op(error, "send");
+        let projected = tool.body.native_error.expect("public native error");
+        assert_eq!(projected.original, Some(expected.original));
+        assert!(!projected.truncated);
+        assert!(!serde_json::to_string(&projected).unwrap().contains("private-command-secret"));
+    }
+
+    #[test]
+    fn native_command_real_rpc_initialization_error_is_complete_in_paged_result() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+        let original = long_command_error();
+        let expected = RuntimeCommandError::Remote(original.clone()).native_failure().unwrap();
+        let replay = tempfile::NamedTempFile::new().unwrap();
+        fs::write(replay.path(), format!("{}\n", serde_json::json!({"id":1,"error":original}))).unwrap();
+        // A replay file preserves a frame larger than shell argument limits.
+        let script = format!("read request; cat '{}'; while read request; do :; done", replay.path().display());
+        let (_directory, scheduler, id) = diagnostic_scheduler(&script);
+        match scheduler.start_ready().unwrap_err() {
+            SchedulerError::RuntimeCommand { agent_id, native_failure, .. } => {
+                assert_eq!(agent_id, id); assert_eq!(native_failure, Some(expected.clone()));
+            }
+            other => panic!("expected native error from the real dispatcher, got {other:?}"),
+        }
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let mut text = String::new();
+        let mut offset = 0;
+        let mut pages = 0;
+        loop {
+            let RpcSuccess::TaskResult { result: Some(page), .. } = service.dispatch(RpcMethod::TaskResult {
+                agent_id: id.clone(), offset, limit: 16384,
+            }).unwrap() else { panic!("missing result page") };
+            assert_eq!(page.outcome, TaskOutcome::Failed);
+            text.push_str(&page.final_text); pages += 1;
+            match page.next_offset { Some(next) => offset = next, None => break }
+        }
+        assert!(pages > 10);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap(), expected.original);
+        assert!(!text.contains("private-command-secret"));
+    }
+
+    #[test]
+    fn native_command_async_start_error_keeps_the_typed_original_and_agent_id() {
+        let error = RuntimeCommandError::Remote(long_command_error());
+        let expected = error.native_failure().unwrap();
+        let (directory, mut scheduler, _) = diagnostic_scheduler("unused");
+        // The helper already queued one task; leave it queued while the public
+        // submit path claims its own task, as production starter threads do.
+        Arc::get_mut(&mut scheduler.inner).unwrap().factory = Arc::new(NativeCommandFactory { error, bootstrap: true });
+        let manifest = GeneralTaskManifest {
+            schema: external_core::GENERAL_TASK_SCHEMA.into(), agent_id: String::new(),
+            repository: directory.path().canonicalize().unwrap(), permission_mode: Some(external_core::PermissionMode::Plan),
+            prompt: "native async failure".into(), write_manifest: vec![],
+        };
+        match scheduler.submit_and_start_general(&manifest, None, &|| false).unwrap_err() {
+            SchedulerError::StartFailed { agent_id, native_failure, .. } => {
+                assert_eq!(native_failure, Some(expected.clone()));
+                let result = scheduler.store().task_result(&agent_id).unwrap().unwrap();
+                assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), expected.original);
+            }
+            other => panic!("expected typed StartFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refused_cooperative_stop_does_not_replace_a_later_native_turn_failure() {
+        let stop_error = serde_json::json!({"code":-32001,"message":"stop refused", "data":{"operation":"stop"}});
+        let turn_error = serde_json::json!({"message":"model failed after the refused stop", "data":{"operation":"model","retryAfter":31}});
+        let script = format!(r#"{RUNNING_PROTOCOL}
+read request
+printf '%s\n' '{}'
+printf '%s\n' '{}'
+while read request; do :; done
+"#, serde_json::json!({"id":4,"error":stop_error}), serde_json::json!({"method":"session/event","params":{"type":"turn.failed","payload":{"error":turn_error}}}));
+        let (_directory, scheduler, id) = diagnostic_scheduler(&script);
+        scheduler.start_ready().unwrap();
+        match scheduler.send_message(&id, "refused-stop", "steer", "new direction").unwrap_err() {
+            SchedulerError::RuntimeCommand { operation: Some("session/stop"), native_failure: Some(failure), .. } => {
+                assert_eq!(failure.original, stop_error);
+            }
+            other => panic!("expected native stop error, got {other:?}"),
+        }
+        let result = await_result(&scheduler, &id);
+        assert_eq!(result.result.outcome, TaskOutcome::Failed);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), turn_error);
+    }
 
     fn diagnostic_scheduler(script: &str) -> (tempfile::TempDir, Scheduler, String) {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/live-agent/workspace");
@@ -605,9 +806,113 @@ printf '%s\n' '{"id":2,"result":{}}'
 read request
 printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
 printf failed-turn-tail >&2
-printf '%s\n' '{"method":"session/event","params":{"type":"turn.failed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.failed","payload":{"error":{"message":"RUNTIME_TERMINAL"}}}}'
 sleep 2
 "#;
+
+    #[test]
+    fn zcode_typed_terminal_reaches_wait_observe_and_paged_result_after_complete_batch() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess};
+        let files = tempfile::tempdir().unwrap();
+        let release = files.path().join("release");
+        let final_event = files.path().join("final.json");
+        let final_text = format!("prefix {}", "完整答案".repeat(crate::rpc::MAX_RESULT_CHUNK_BYTES / 12 + 100));
+        fs::write(&final_event, format!("{}\n", serde_json::json!({"method":"session/event","params":{
+            "eventId":"final","sessionId":"typed-session","turnId":"typed-turn","type":"turn.completed","payload":{"response":final_text}
+        }}))).unwrap();
+        let protocol = format!(r#"
+read request
+printf '%s\n' '{{"id":1,"result":{{"session":{{"sessionId":"typed-session"}}}}}}'
+read request
+printf '%s\n' '{{"id":2,"result":{{}}}}'
+read request
+printf '%s\n' '{{"id":3,"result":{{}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.started","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"model.request.status","requestId":"request","status":"model_request_started","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","sessionId":"typed-session","turnId":"typed-turn","payload":{{"kind":"text_delta","assistantMessageId":"m","delta":"prefix "}}}}}}'
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"turn.terminal","status":"success","sessionId":"typed-session","turnId":"typed-turn"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","sessionId":"typed-session","turnId":"typed-turn","payload":{{"kind":"tool_call","toolCallId":"call","toolName":"Read","input":{{"path":"example"}}}}}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+cat '{}'
+while read request; do :; done
+"#, release.display(), final_event.display());
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+        scheduler.start_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while scheduler.observation_snapshot(&agent_id).tools.is_empty() {
+            assert!(Instant::now() < deadline, "adapter batch did not reach observer");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(scheduler.passive_activity_snapshot(&agent_id).unwrap().model_request_active);
+        assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+        let (_, runtime, _, _, _) = scheduler.active_session(&agent_id).unwrap();
+        assert!(runtime.turn_snapshot().active, "telemetry terminal must not release scheduler");
+        let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+        let query = || RpcMethod::TaskWait(crate::rpc::TaskWaitQuery {
+            agent_id: crate::rpc::WaitTarget::One(agent_id.clone()), wait_time: 0,
+            message_id: None, wait_mode: crate::rpc::WaitMode::All,
+        });
+        let RpcSuccess::TaskWait(waiting) = service.dispatch(query()).unwrap() else { panic!("wait") };
+        assert!(waiting.result.is_none());
+        fs::write(&release, "settle").unwrap();
+        let stored = await_result(&scheduler, &agent_id);
+        assert_eq!(stored.result.outcome, TaskOutcome::Completed);
+        assert_eq!(stored.result.final_text, final_text);
+        assert!(!runtime.turn_snapshot().active);
+        let RpcSuccess::TaskWait(waited) = service.dispatch(query()).unwrap() else { panic!("wait") };
+        let first = waited.result.unwrap();
+        assert!(first.next_offset.is_some());
+        let mut text = first.final_text;
+        let mut offset = first.next_offset;
+        while let Some(next) = offset {
+            let RpcSuccess::TaskResult { result: Some(page), .. } = service.dispatch(RpcMethod::TaskResult {
+                agent_id: agent_id.clone(), offset: next, limit: 16384,
+            }).unwrap() else { panic!("result page") };
+            text.push_str(&page.final_text);
+            offset = page.next_offset;
+        }
+        assert_eq!(text, final_text);
+    }
+
+    #[test]
+    fn zcode_native_permission_denial_resolves_pending_without_finishing_execution() {
+        let files = tempfile::tempdir().unwrap();
+        let deny = files.path().join("deny");
+        let finish = files.path().join("finish");
+        let protocol = format!(r#"{RUNNING_PROTOCOL}
+printf '%s\n' '{{"method":"session/event","params":{{"type":"tool.updated","payload":{{"kind":"started","toolCallId":"call","toolName":"Bash"}}}}}}'
+printf '%s\n' '{{"id":42,"method":"interaction/requestPermission","params":{{"toolCallId":"call","toolName":"Bash","options":[{{"optionId":"deny","kind":"reject_once","label":"Deny"}}]}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+printf '%s\n' '{{"method":"v4/telemetry/event","params":{{"kind":"permission.lifecycle","phase":"denied","toolCallId":"call"}}}}'
+while ! test -e '{}'; do sleep 0.01; done
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"continued after native denial"}}}}}}'
+while read request; do :; done
+"#, deny.display(), finish.display());
+        let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
+        scheduler.start_ready().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request_id = loop {
+            let pending = scheduler.store().pending_requests(&agent_id).unwrap();
+            if let Some(request) = pending.first() { break request.request_id.clone(); }
+            assert!(Instant::now() < deadline, "native permission was not published");
+            thread::sleep(Duration::from_millis(10));
+        };
+        fs::write(&deny, "deny natively").unwrap();
+        loop {
+            if scheduler.store().pending_requests(&agent_id).unwrap().is_empty() { break; }
+            assert!(Instant::now() < deadline, "native denial did not resolve pending input");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let request = scheduler.store().pending_request(&agent_id, &request_id).unwrap().unwrap();
+        assert_eq!(request.state, external_store::PendingRequestState::Responded);
+        assert_eq!(request.response_decision.as_deref(), Some("deny"));
+        let activity = scheduler.passive_activity_snapshot(&agent_id).unwrap();
+        assert_eq!(activity.active_tools.len(), 1);
+        assert_eq!(activity.window_60s.tool_calls_completed, 0);
+        assert!(scheduler.store().task_result(&agent_id).unwrap().is_none());
+        fs::write(&finish, "finish").unwrap();
+        assert_eq!(await_result(&scheduler, &agent_id).result.outcome, TaskOutcome::Completed);
+    }
 
     /// A completed turn that never verifies a visible final text.
     const MISSING_TEXT_PROTOCOL: &str = r#"
@@ -618,7 +923,7 @@ printf '%s\n' '{"id":2,"result":{}}'
 read request
 printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type":"turn.started"}}'
 printf missing-text-tail >&2
-printf '%s\n' '{"method":"session/event","params":{"type":"turn.completed"}}'
+printf '%s\n' '{"method":"session/event","params":{"type":"turn.completed","payload":{"response":""}}}'
 sleep 2
 "#;
 
@@ -628,7 +933,7 @@ sleep 2
         assert_eq!(scheduler.start_ready().unwrap(), vec![agent_id.clone()]);
         let result = await_result(&scheduler, &agent_id);
         assert_eq!(result.result.outcome, TaskOutcome::Failed);
-        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), serde_json::json!({"message":"RUNTIME_TERMINAL"}));
         let task = scheduler.store().get_task(&agent_id).unwrap().unwrap();
         let raw = task.failure_message.expect("persisted failure detail");
         assert!(raw.len() <= PERSISTABLE_RECORD_BYTES);
@@ -641,15 +946,14 @@ sleep 2
             .as_str()
             .unwrap()
             .contains("failed-turn-tail"));
-        // The immutable result keeps the bare reason code (final_text
-        // semantics unchanged).
-        assert_eq!(result.result.final_text, "RUNTIME_TERMINAL");
+        // The immutable result keeps the complete synthetic native error.
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&result.result.final_text).unwrap(), serde_json::json!({"message":"RUNTIME_TERMINAL"}));
     }
 
     #[test]
     fn failed_turn_keeps_public_cause_instead_of_cleanup_exit() {
         let protocol = FAILED_TURN_PROTOCOL.replace(
-            r#""type":"turn.failed""#,
+            r#""type":"turn.failed","payload":{"error":{"message":"RUNTIME_TERMINAL"}}"#,
             r#""type":"turn.failed","payload":{"error":{"message":"Model request failed.","underlyingErrorMessage":"read EADDRNOTAVAIL","code":"model_request_failed","attribution":{"retryable":false},"data":{"apiKey":"private-data"}}}"#,
         );
         let (_workspace, scheduler, agent_id) = diagnostic_scheduler(&protocol);
@@ -1044,13 +1348,13 @@ exit {exit_code}
             r#"{RUNNING_PROTOCOL}
 read request
 printf '%s\n' "$request" >> steer.jsonl
-printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+printf '%s\n' '{{"id":4,"result":{{}}}}' '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 read request
 printf '%s\n' "$request" >> steer.jsonl
 printf '%s\n' '{{"id":5,"result":{{"turnId":"steered-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
 while read request; do
   request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 done
 "#
         );
@@ -1111,7 +1415,7 @@ done
             let reply = if failure == "stop" {
                 r#"printf '%s\n' '{"id":4,"error":{"code":-32001,"message":"stop refused"}}'"#
             } else {
-                r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"session/event","params":{"type":"turn.failed"}}'
+                r#"printf '%s\n' '{"id":4,"result":{}}' '{"method":"session/event","params":{"type":"turn.failed","payload":{"error":{"message":"cancelled"}}}}'
 read request
 printf '%s\n' '{"id":5,"error":{"code":-32002,"message":"send refused"}}'"#
             };
@@ -1121,7 +1425,7 @@ read request
 {reply}
 while read request; do
   request_id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
-  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed"}}}}'
+  printf '%s\n' "{{\"id\":$request_id,\"result\":{{}}}}" '{{"method":"session/event","params":{{"type":"turn.failed","payload":{{"error":{{"message":"cancelled"}}}}}}}}'
 done
 "#
             );
@@ -1174,12 +1478,12 @@ done
         let script = format!(
             r#"{RUNNING_PROTOCOL}
 while [ ! -f release-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":""}}}}}}'
 read request
 printf '%s\n' "$request" >> deliveries.jsonl
 printf '%s\n' '{{"id":4,"result":{{"turnId":"queued-turn"}}}}' '{{"method":"session/event","params":{{"type":"turn.started"}}}}'
 while [ ! -f finish-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"queued answer","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"queued answer","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"queued answer"}}}}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#
         );
@@ -1248,7 +1552,7 @@ printf '%s\n' '{{"id":"srv-input-1","method":"interaction/requestUserInput","par
 read answer
 printf '%s\n' "$answer" >> deliveries.jsonl
 while [ ! -f release-turn ]; do sleep 0.01; done
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"answered with the release scope","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"answered with the release scope","assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m2"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"answered with the release scope"}}}}}}'
 while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
 "#
         );
@@ -1465,7 +1769,7 @@ while read request; do printf '%s\n' "$request" >> deliveries.jsonl; done
         let script = format!(
             r#"{RUNNING_PROTOCOL}
 printf normal-stderr-tail >&2
-printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"task answer","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed"}}}}'
+printf '%s\n' '{{"method":"session/event","params":{{"type":"model.streaming","payload":{{"kind":"text_delta","delta":"task answer","assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"message.finished","payload":{{"assistantMessageId":"m1"}}}}}}' '{{"method":"session/event","params":{{"type":"turn.completed","payload":{{"response":"task answer"}}}}}}'
 sleep 2
 "#
         );
@@ -1537,10 +1841,7 @@ sleep 2
                     serde_json::json!({"type":"model.streaming", "payload":{"kind":"text_delta", "delta":"completed answer", "assistantMessageId":"m1"}}),
                     serde_json::json!({"type":"message.finished", "payload":{"assistantMessageId":"m1"}}),
                 ].into_iter().enumerate() {
-                    sink.emit(LifecycleRecord {
-                        sequence: index as u64 + 1,
-                        event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(external_contract::EventEnvelope { method: "session/event".into(), params }))),
-                    });
+                    sink.emit((crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(external_contract::EventEnvelope { method: "session/event".into(), params })))).with_sequence(index as u64 + 1));
                 }
                 Ok(Arc::new(CompletedRuntime))
             }
@@ -1564,7 +1865,7 @@ sleep 2
             .as_str()
             .unwrap()
             .contains("ZCODE_RUNTIME_MODEL_UNAVAILABLE"));
-        assert!(record.to_string().contains("secret-value"));
+        assert!(!record.to_string().contains("secret-value"));
         assert!(!record.to_string().contains("must-not-record"));
         assert_eq!(result.result.outcome, TaskOutcome::Completed);
         assert_eq!(result.result.final_text, "completed answer");
@@ -1626,7 +1927,7 @@ sleep 2
             "data": {"api_key": "do-not-copy"}
         }));
         let mut detail: serde_json::Value =
-            serde_json::from_str(&error.diagnostic("session/send")).unwrap();
+            error.diagnostic_fields("session/send");
         detail["cleanup_result"] = "Stopped(Terminated(Signaled(15)))".into();
         let record = runtime_failure_record(
             "a",
@@ -1641,18 +1942,18 @@ sleep 2
         assert_eq!(value["operation"], "session/send");
         assert_eq!(value["cleanup_result"], "Stopped(Terminated(Signaled(15)))");
         let remote_message = value["remote_message"].as_str().unwrap();
-        assert!(remote_message.contains("abc-secret"));
-        assert!(remote_message.contains("def-secret"));
-        assert!(remote_message.contains("quoted secret words"));
-        assert!(remote_message.contains("user:pass"));
+        assert!(!remote_message.contains("abc-secret"));
+        assert!(!remote_message.contains("def-secret"));
+        assert!(!remote_message.contains("quoted secret words"));
+        assert!(!remote_message.contains("user:pass"));
         assert!(!record.contains("do-not-copy"));
         assert!(bounded_prefix(&"界".repeat(5000), 1024).len() <= 1024);
     }
 
     #[test]
     fn known_driver_loss_marks_observation_coverage_without_query_side_effects() {
-        let tracker = PassiveActivityTracker::new();
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+        let tracker = RuntimeState::new();
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
                 method: "session/event".into(),
                 params: serde_json::json!({
@@ -1664,29 +1965,30 @@ sleep 2
             },
         ))));
         let before = tracker.observation_snapshot();
-        assert!(before.coverage.tool_history_complete);
+        assert!(!before.coverage.tool_history_complete);
         assert!(before.coverage.reasoning_complete);
 
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Malformed(
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Malformed(
             "invalid JSON".into(),
         )));
-        tracker.observe(&RuntimeEvent::Driver(Inbound::OversizedLine {
+        tracker.observe(&crate::test_support::fixture_event(Inbound::OversizedLine {
             bytes: 1024 * 1024 + 1,
         }));
         let after = tracker.observation_snapshot();
         assert!(!after.coverage.tool_history_complete);
-        assert!(!after.coverage.reasoning_complete);
+        assert!(after.coverage.reasoning_complete);
         assert_eq!(after.coverage.dropped_events, 2);
-        assert_eq!(after.snapshot_seq, before.snapshot_seq + 2);
+        assert!(after.snapshot_seq > before.snapshot_seq);
+        assert_eq!(tracker.snapshot().diagnostics.iter().map(|d| d.count).sum::<u64>(), 2);
         assert_eq!(tracker.observation_snapshot(), after);
         assert_eq!(tracker.observation_snapshot(), after);
     }
 
     #[test]
     fn terminal_text_is_scoped_to_the_settling_turn() {
-        let tracker = PassiveActivityTracker::new();
+        let tracker = RuntimeState::new();
         let session_event = |params: serde_json::Value| {
-            RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                 external_contract::EventEnvelope {
                     method: "session/event".into(),
                     params,
@@ -1754,7 +2056,7 @@ sleep 2
     #[test]
     fn near_limit_observation_does_not_starve_the_shared_cancel_lifecycle_lock() {
         let lifecycle = Arc::new(RuntimeLifecycle::new(1));
-        let tracker = Arc::new(PassiveActivityTracker::new());
+        let tracker = Arc::new(RuntimeState::new());
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let worker_lifecycle = Arc::clone(&lifecycle);
         let worker_tracker = Arc::clone(&tracker);
@@ -1762,7 +2064,7 @@ sleep 2
         let worker = thread::spawn(move || {
             let _admission = worker_lifecycle.admit_event().unwrap();
             worker_barrier.wait();
-            worker_tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+            worker_tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                 external_contract::EventEnvelope {
                     method: "session/event".into(),
                     params: serde_json::json!({
@@ -2559,7 +2861,7 @@ mod transport_failure_tests {
         let connection = rusqlite::Connection::open(directory.join("state.sqlite")).unwrap();
         connection
             .query_row(
-                "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND event_type='driver.oversized_line'",
+                "SELECT COUNT(*) FROM events WHERE agent_id=?1 AND (event_type='driver.oversized_line' OR (event_type='runtime.fact' AND json_extract(payload_json,'$.category')='transport' AND json_extract(payload_json,'$.reason')='truncated'))",
                 [agent_id],
                 |row| row.get(0),
             )
@@ -2588,7 +2890,7 @@ printf '%s\n' '{"id":3,"result":{}}' '{"method":"session/event","params":{"type"
             "{ZCODE_RUNNING_PREFIX}\
 printf '%s\n' '{{\"method\":\"session/event\",\"params\":{{\"type\":\"model.streaming\",\"payload\":{{\"kind\":\"text_delta\",\"delta\":\"queued task answer\",\"assistantMessageId\":\"m1\"}}}}}}' \
 '{{\"method\":\"session/event\",\"params\":{{\"type\":\"message.finished\",\"payload\":{{\"assistantMessageId\":\"m1\"}}}}}}' \
-'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\"}}}}'\nsleep 1\n"
+'{{\"method\":\"session/event\",\"params\":{{\"type\":\"turn.completed\",\"payload\":{{\"response\":\"queued task answer\"}}}}}}'\nsleep 1\n"
         )
     }
 
@@ -2938,10 +3240,11 @@ exit 0\n",
             task: &TaskRecord,
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let publisher = Arc::new(Publisher::new(sink));
             Ok(Arc::new(InjectingRuntime {
                 agent_id: task.agent_id.clone(),
-                publisher: Arc::new(Publisher::new(sink)),
-                tracker: Arc::new(TurnTracker::new()),
+                publisher: publisher.clone(),
+                tracker: publisher.runtime_state.clone(),
                 injected: self.injected.clone(),
                 fault_terminal: self.fault_terminal.clone(),
                 calls: Arc::clone(&self.calls),
@@ -2954,7 +3257,7 @@ exit 0\n",
     struct InjectingRuntime {
         agent_id: String,
         publisher: Arc<Publisher>,
-        tracker: Arc<TurnTracker>,
+        tracker: Arc<RuntimeState>,
         injected: RuntimeTerminal,
         fault_terminal: Option<RuntimeTerminal>,
         calls: Arc<AtomicU64>,
@@ -3007,7 +3310,7 @@ exit 0\n",
                     }
                     thread::sleep(Duration::from_millis(5));
                 }
-                publisher.emit_driver(
+                publisher.publish_transport(
                     Inbound::OversizedLine {
                         bytes: FRAME_LIMIT + 1,
                     },
@@ -3026,7 +3329,7 @@ exit 0\n",
             })
         }
         fn turn_snapshot(&self) -> TurnSnapshot {
-            self.tracker.snapshot()
+            self.tracker.turn_snapshot()
         }
     }
 
@@ -3166,14 +3469,15 @@ mod turn_adjudication_tests {
 
     struct HarnessRuntime {
         publisher: Arc<Publisher>,
-        tracker: Arc<TurnTracker>,
+        tracker: Arc<RuntimeState>,
         respond_fails: bool,
+        response_calls: AtomicU64,
         cleanup_calls: Arc<AtomicU64>,
     }
 
     impl HarnessRuntime {
         fn emit(&self, event: Inbound) {
-            self.publisher.emit_driver(event, None);
+            self.publisher.publish_transport(event, None);
         }
 
         fn emit_activity(&self) {
@@ -3263,6 +3567,7 @@ mod turn_adjudication_tests {
             _validated_denial: Option<&external_core::ValidatedPermissionDenial>,
             _deadline: Instant,
         ) -> Result<(), RuntimeCommandError> {
+            self.response_calls.fetch_add(1, Ordering::AcqRel);
             if self.respond_fails {
                 Err(RuntimeCommandError::InvalidSession(
                     "injected response failure".into(),
@@ -3272,7 +3577,7 @@ mod turn_adjudication_tests {
             }
         }
         fn turn_snapshot(&self) -> TurnSnapshot {
-            self.tracker.snapshot()
+            self.tracker.turn_snapshot()
         }
     }
 
@@ -3288,10 +3593,12 @@ mod turn_adjudication_tests {
             _task: &TaskRecord,
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let publisher = Arc::new(Publisher::new(sink));
             let runtime = Arc::new(HarnessRuntime {
-                publisher: Arc::new(Publisher::new(sink)),
-                tracker: Arc::new(TurnTracker::new()),
+                publisher: publisher.clone(),
+                tracker: publisher.runtime_state.clone(),
                 respond_fails: self.respond_fails,
+                response_calls: AtomicU64::new(0),
                 cleanup_calls: Arc::clone(&self.cleanup_calls),
             });
             self.runtimes.lock().unwrap().push(Arc::clone(&runtime));
@@ -3373,6 +3680,269 @@ mod turn_adjudication_tests {
             runtimes,
             cleanup_calls,
             agent_id: submitted.agent_id,
+        }
+    }
+
+    #[test]
+    fn zcode_native_resolution_and_user_respond_have_one_pending_winner() {
+        use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget};
+        use std::sync::mpsc;
+        for (
+            method,
+            envelope_id,
+            interaction_id,
+            decision,
+            content,
+            native_method,
+            native_params,
+            native_decision,
+        ) in [
+            (
+                external_contract::INTERACTION_REQUEST_PERMISSION,
+                "race-native-request",
+                "race-native-request",
+                "allow",
+                None,
+                "v4/telemetry/event",
+                serde_json::json!({"kind":"permission.lifecycle","phase":"denied","toolCallId":"race-call","requestId":"race-native-request","turnId":"race-turn"}),
+                "deny",
+            ),
+            (
+                external_contract::INTERACTION_REQUEST_USER_INPUT,
+                "race-native-request",
+                "race-native-request",
+                "answer",
+                Some("client answer"),
+                "session/event",
+                serde_json::json!({"type":"userInput.resolved","turnId":"race-turn","payload":{"requestId":"race-native-request","value":"native answer"}}),
+                "answer",
+            ),
+            (
+                external_contract::INTERACTION_REQUEST_USER_INPUT,
+                "server-7",
+                "mcp-elicit-xyz",
+                "answer",
+                Some("client answer"),
+                "session/event",
+                serde_json::json!({"type":"userInput.resolved","turnId":"race-turn","payload":{"requestId":"mcp-elicit-xyz","value":"native answer"}}),
+                "answer",
+            ),
+        ] {
+            for stage in [
+                ResponseClaimHookStage::BeforeClaim,
+                ResponseClaimHookStage::AfterClaim,
+            ] {
+                let harness = harness(false, "");
+                let scheduler = &harness.scheduler;
+                let agent_id = &harness.agent_id;
+                scheduler.start_ready().unwrap();
+                assert_eq!(
+                    scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+                    TaskPhase::Running
+                );
+                let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
+                let (task, launch) = runtime.publisher.event_scope();
+                let mut adapter = crate::zcode::events::ZcodeAdapter::new(task, launch);
+                let send = |adapter: &mut crate::zcode::events::ZcodeAdapter,
+                            method: &str,
+                            params: serde_json::Value| {
+                    let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                        method: method.into(),
+                        raw: serde_json::json!({"method":method,"params":params}),
+                    });
+                    runtime
+                        .publisher
+                        .emit_typed(adapter.decode(&inbound).unwrap());
+                };
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"turn.started","turnId":"race-turn"}),
+                );
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"tool.updated","turnId":"race-turn","payload":{"kind":"started","toolCallId":"race-call","toolName":"Bash"}}),
+                );
+                let request = Inbound::Message(WireMessage::Request(
+                    external_contract::RequestEnvelope::new(
+                        WireId::String(envelope_id.into()),
+                        method,
+                        serde_json::json!({"requestId":interaction_id,"toolCallId":"race-call","toolName":"Bash","question":"allow?"}),
+                    ),
+                ));
+                assert!(adapter.decode(&request).is_none());
+                runtime.emit(request);
+                let pending = scheduler.store().pending_requests(agent_id).unwrap();
+                assert_eq!(pending.len(), 1);
+                let request_id = pending[0].request_id.clone();
+                let connection = rusqlite::Connection::open(scheduler.store().database_path()).unwrap();
+                connection.execute_batch("CREATE TABLE pending_race_transitions(old_state TEXT,new_state TEXT);
+                        CREATE TRIGGER record_pending_race AFTER UPDATE OF state ON pending_requests
+                        WHEN OLD.state<>NEW.state BEGIN INSERT INTO pending_race_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+                // Service construction hashes the test executable. Finish that
+                // unrelated I/O/CPU work before holding the response-claim gate.
+                let service = RpcService::new(scheduler.clone(), scheduler.store()).unwrap();
+                let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let release_rx = Mutex::new(release_rx);
+                *scheduler.inner.response_claim_hook.lock().unwrap() = Some(Arc::new(move |at, _| {
+                    if at == stage {
+                        entered_tx.send(()).unwrap();
+                        release_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("claim gate must release");
+                    }
+                }));
+                let response_scheduler = scheduler.clone();
+                let response_agent = agent_id.clone();
+                let response_request = request_id.clone();
+                let responder = thread::spawn(move || {
+                    response_scheduler.respond_request(
+                        &response_agent,
+                        &response_request,
+                        decision,
+                        content,
+                    )
+                });
+                entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("respond must reach the selected claim boundary");
+                let state = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap()
+                    .state;
+                assert_eq!(
+                    state,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        PendingRequestState::Sending
+                    } else {
+                        PendingRequestState::Pending
+                    }
+                );
+                let query = || {
+                    RpcMethod::TaskWait(TaskWaitQuery {
+                        agent_id: WaitTarget::One(agent_id.clone()),
+                        wait_time: 0,
+                        message_id: None,
+                        wait_mode: WaitMode::All,
+                    })
+                };
+                let RpcSuccess::TaskWait(waiting) = service.dispatch(query()).unwrap() else {
+                    panic!("wait")
+                };
+                assert_eq!(
+                    waiting.pending_requests.len(),
+                    usize::from(stage == ResponseClaimHookStage::BeforeClaim),
+                    "SENDING is not an answerable wait request"
+                );
+                // SENDING is owned by the user responder. A native contender must
+                // lose that claim, then the user completes it exactly once. At
+                // BeforeClaim the native resolution owns the only claim instead.
+                send(&mut adapter, native_method, native_params.clone());
+                let during = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                        during.state,
+                        if stage == ResponseClaimHookStage::AfterClaim {
+                            PendingRequestState::Sending
+                        } else {
+                            PendingRequestState::Responded
+                        },
+                        "native resolution: envelope={envelope_id}, interaction={interaction_id}, stage={stage:?}"
+                    );
+                let second = scheduler
+                    .respond_request(agent_id, &request_id, decision, content)
+                    .unwrap();
+                assert_eq!(
+                    second.disposition,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        ResponseDisposition::InFlight
+                    } else {
+                        ResponseDisposition::AlreadyResponded
+                    }
+                );
+                release_tx.send(()).unwrap();
+                let response = responder.join().unwrap().unwrap();
+                *scheduler.inner.response_claim_hook.lock().unwrap() = None;
+                assert_eq!(
+                    response.disposition,
+                    if stage == ResponseClaimHookStage::AfterClaim {
+                        ResponseDisposition::Responded
+                    } else {
+                        ResponseDisposition::AlreadyResponded
+                    }
+                );
+                let expected_decision = if stage == ResponseClaimHookStage::AfterClaim {
+                    decision
+                } else {
+                    native_decision
+                };
+                assert_eq!(
+                    response.effective_decision, expected_decision,
+                    "the loser must report the persisted winner"
+                );
+                assert_eq!(
+                    runtime.response_calls.load(Ordering::Acquire),
+                    u64::from(stage == ResponseClaimHookStage::AfterClaim)
+                );
+                let closed = scheduler
+                    .store()
+                    .pending_request(agent_id, &request_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(closed.state, PendingRequestState::Responded);
+                assert_eq!(closed.response_decision.as_deref(), Some(expected_decision));
+                send(&mut adapter, native_method, native_params.clone());
+                let transitions: Vec<(String, String)> = connection
+                    .prepare("SELECT old_state,new_state FROM pending_race_transitions ORDER BY rowid")
+                    .unwrap()
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(
+                    transitions,
+                    vec![
+                        ("PENDING".into(), "SENDING".into()),
+                        ("SENDING".into(), "RESPONDED".into())
+                    ]
+                );
+                let RpcSuccess::TaskWait(resolved) = service.dispatch(query()).unwrap() else {
+                    panic!("resolved wait")
+                };
+                assert!(resolved.pending_requests.is_empty());
+                assert_eq!(
+                    scheduler.store().get_task(agent_id).unwrap().unwrap().phase,
+                    TaskPhase::Running
+                );
+                assert!(
+                    resolved.result.is_none(),
+                    "input resolution cannot settle a turn"
+                );
+                let activity = scheduler.passive_activity_snapshot(agent_id).unwrap();
+                assert_eq!(activity.active_tools.len(), 1);
+                assert_eq!(activity.window_60s.tool_calls_started, 1);
+                assert_eq!(activity.window_60s.tool_calls_completed, 0);
+                send(
+                    &mut adapter,
+                    "session/event",
+                    serde_json::json!({"type":"tool.updated","turnId":"race-turn","payload":{"kind":"result","toolCallId":"race-call","result":{}}}),
+                );
+                assert!(scheduler
+                    .passive_activity_snapshot(agent_id)
+                    .unwrap()
+                    .active_tools
+                    .is_empty());
+                scheduler.cancel_task(agent_id).unwrap();
+            }
         }
     }
 
@@ -3649,8 +4219,8 @@ mod turn_adjudication_tests {
         let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
         // Latch the fault and complete the turn with no published terminal.
         runtime.emit(Inbound::OversizedLine { bytes });
-        runtime.tracker.observe(&turn_event("turn.started"));
-        runtime.tracker.observe(&turn_event("turn.completed"));
+        runtime.tracker.test_turn(None);
+        runtime.tracker.test_turn(Some(TurnBoundary::Completed));
         release.store(true, Ordering::Release);
 
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
@@ -3707,8 +4277,8 @@ mod turn_adjudication_tests {
 
         let runtime = Arc::clone(&harness.runtimes.lock().unwrap()[0]);
         runtime.emit(Inbound::OversizedLine { bytes });
-        runtime.tracker.observe(&turn_event("turn.started"));
-        runtime.tracker.observe(&turn_event("turn.completed"));
+        runtime.tracker.test_turn(None);
+        runtime.tracker.test_turn(Some(TurnBoundary::Completed));
         release.store(true, Ordering::Release);
 
         let result = await_result_within(scheduler, agent_id, Duration::from_secs(10));
@@ -3868,18 +4438,15 @@ mod turn_adjudication_tests {
             "sink-race-runtime".into(),
             claim.owner_epoch,
             Arc::clone(&lifecycle),
-            Arc::new(crate::activity_tracker::PassiveActivityTracker::new()),
+            Arc::new(crate::RuntimeState::new()),
         ));
-        let record = crate::LifecycleRecord {
-            sequence: 7,
-            event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Request(
+        let record = (crate::test_support::fixture_event(Inbound::Message(WireMessage::Request(
                 external_contract::RequestEnvelope::new(
                     WireId::String("srv-early".into()),
                     external_contract::INTERACTION_REQUEST_PERMISSION,
                     serde_json::json!({"options": []}),
                 ),
-            ))),
-        };
+            )))).with_sequence(7);
         let emitter = {
             let sink = Arc::clone(&sink);
             thread::spawn(move || sink.emit(record))
@@ -3965,9 +4532,7 @@ mod wait_tail_inheritance_tests {
             sink: Arc<dyn LifecycleSink>,
         ) -> io::Result<Arc<dyn ManagedRuntime>> {
             if let Some(delta) = &self.inject_before_replacement {
-                sink.emit(LifecycleRecord {
-                    sequence: 1,
-                    event: RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+                sink.emit((crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
                         external_contract::EventEnvelope {
                             method: "session/event".into(),
                             params: serde_json::json!({
@@ -3980,8 +4545,7 @@ mod wait_tail_inheritance_tests {
                                 }
                             }),
                         },
-                    ))),
-                });
+                    )))).with_sequence(1));
             }
             if let (Some(ready), Some(release)) = (&self.ready, &self.release) {
                 ready.store(true, Ordering::Release);
@@ -4047,8 +4611,8 @@ mod wait_tail_inheritance_tests {
         )
     }
 
-    fn inject_text(tracker: &PassiveActivityTracker, delta: &str) {
-        tracker.observe(&RuntimeEvent::Driver(Inbound::Message(WireMessage::Event(
+    fn inject_text(tracker: &RuntimeState, delta: &str) {
+        tracker.observe(&crate::test_support::fixture_event(Inbound::Message(WireMessage::Event(
             external_contract::EventEnvelope {
                 method: "session/event".into(),
                 params: serde_json::json!({
@@ -4064,7 +4628,7 @@ mod wait_tail_inheritance_tests {
         ))));
     }
 
-    fn tracker_for(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
+    fn tracker_for(scheduler: &Scheduler, agent_id: &str) -> Arc<RuntimeState> {
         scheduler
             .inner
             .state
@@ -4077,8 +4641,8 @@ mod wait_tail_inheritance_tests {
     }
 
     /// Install an outgoing tracker whose window is "AB" with "A" delivered.
-    fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<PassiveActivityTracker> {
-        let old = Arc::new(PassiveActivityTracker::new());
+    fn outgoing_tracker(scheduler: &Scheduler, agent_id: &str) -> Arc<RuntimeState> {
+        let old = Arc::new(RuntimeState::new());
         old.set_wait_tail_fixture("A");
         assert_eq!(old.take_wait_tail().text, "A");
         inject_text(&old, "B");
@@ -4985,6 +5549,18 @@ mod spawn_established_return_tests {
             }
         })));
 
+        // Ensure the fixture reaches the intended pre-publication boundary
+        // even if the submit thread's deadline expires before its starter is
+        // scheduled. Cancellation must then commit while that boundary holds.
+        let reached_before_cancel = Arc::clone(&starter_reached);
+        scheduler.set_before_spawn_cancel_hook(Some(Arc::new(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !reached_before_cancel.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "starter never reached the publication gate");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })));
+
         scheduler.set_spawn_wait_budget(Some(Duration::from_millis(50)));
         scheduler.set_spawn_convergence_budget(Some(Duration::from_millis(100)));
 
@@ -4996,14 +5572,22 @@ mod spawn_established_return_tests {
             scheduler_clone.submit_and_start_general(&manifest, admission, &|| false)
         });
 
-        while !starter_reached.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-
-        std::thread::sleep(Duration::from_millis(80));
+        // Joining the bounded submit wait proves its cancellation transaction
+        // has finished; an 80 ms sleep cannot establish that ordering under
+        // contention. Always release the starter before asserting the result.
+        let result = join_handle.join();
+        let cancellation_committed = match &result {
+            Ok(Err(SchedulerError::StartTimeout { agent_id, .. })) => store
+                .get_task(agent_id)
+                .ok()
+                .flatten()
+                .is_some_and(|task| task.stop_requested),
+            _ => false,
+        };
         pause_gate.store(true, Ordering::Release);
-
-        let err = join_handle.join().unwrap().unwrap_err();
+        let err = result.unwrap().unwrap_err();
+        assert!(starter_reached.load(Ordering::Acquire));
+        assert!(cancellation_committed, "cancellation must commit before publishing the starting handle");
         match err {
             SchedulerError::StartTimeout { agent_id, .. } => {
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -5536,11 +6120,16 @@ mod spawn_established_return_tests {
                 );
                 transition_applied_clone.store(true, Ordering::Release);
             }
-            if transition_applied_clone.load(Ordering::Acquire)
-                && task.phase == TaskPhase::Queued
-                && task.session_id.as_deref() == Some("session-budget-shared")
-            {
-                saw_resume_transient_clone.store(true, Ordering::Release);
+            if transition_applied_clone.load(Ordering::Acquire) {
+                // This hook's input predates its transition. Read the committed
+                // row instead of requiring another poll: the remaining deadline
+                // may expire during the real terminal/reap/requeue writes.
+                let persisted = store_for_poll.get_task(&task.agent_id).unwrap().unwrap();
+                if persisted.phase == TaskPhase::Queued
+                    && persisted.session_id.as_deref() == Some("session-budget-shared")
+                {
+                    saw_resume_transient_clone.store(true, Ordering::Release);
+                }
             }
         })));
 
@@ -6089,5 +6678,971 @@ exit 3
         await_reaped(&scheduler, &submitted.agent_id);
         scheduler.begin_drain();
         assert!(scheduler.ready_for_activation());
+    }
+}
+
+mod stopping_settlement_ingress_tests {
+    use super::*;
+    use external_contract::events::*;
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        store: Arc<Store>,
+        sink: Arc<StoreLifecycleSink>,
+        publisher: Publisher,
+        tracker: Arc<RuntimeState>,
+        lifecycle: Arc<RuntimeLifecycle>,
+        id: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let id = "10000000".to_owned();
+            store
+                .enqueue_task_authoritative(&external_store::NewTask {
+                    agent_id: id.clone(),
+                    repository: directory.path().to_string_lossy().into_owned(),
+                    workspace_path: directory.path().to_string_lossy().into_owned(),
+                    runtime_hash: None,
+                    prepared_launch_json: "{}".into(),
+                    initial_prompt: "settlement ingress".into(),
+                })
+                .unwrap();
+            let claim = store.claim_next("settlement-test").unwrap().unwrap();
+            store
+                .mark_session_running(
+                    &id,
+                    claim.owner_epoch,
+                    "runtime",
+                    None,
+                    Some("session"),
+                    None,
+                )
+                .unwrap();
+            let lifecycle = Arc::new(RuntimeLifecycle::new(claim.owner_epoch));
+            let sink = Arc::new(StoreLifecycleSink::new(
+                store.clone(),
+                id.clone(),
+                "runtime".into(),
+                claim.owner_epoch,
+                lifecycle.clone(),
+                Arc::new(RuntimeState::new()),
+            ));
+            let fixture = Self {
+                _directory: directory,
+                store,
+                publisher: Publisher::new(sink.clone()),
+                tracker: sink.activity.clone(),
+                sink,
+                lifecycle,
+                id,
+            };
+            fixture.send(
+                TurnId::Local(1),
+                vec![EventFact::TurnStarted {
+                    turn_id: TurnId::Local(1),
+                }],
+            );
+            fixture
+        }
+        fn batch(&self, turn: TurnId, facts: Vec<EventFact>) -> DecodedInput {
+            let (task_id, launch_id) = self.publisher.event_scope();
+            let input = NativeInputContext {
+                task_id,
+                launch_id,
+                turn_id: Some(turn),
+                source: NativeSource {
+                    protocol: SourceProtocol::AgyStreamJson,
+                    discriminator: SafeToken::new("result"),
+                    session_id: Some(SessionId("session".into())),
+                    turn_id: None,
+                    item_id: None,
+                    call_id: None,
+                    event_id: None,
+                    timestamp: None,
+                },
+            };
+            let events = facts
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| NormalizedEvent {
+                    context: EventContext {
+                        task_id: input.task_id.clone(),
+                        launch_id: input.launch_id.clone(),
+                        sequence: index as u64 + 1,
+                        turn_id: input.turn_id.clone(),
+                        source: input.source.clone(),
+                    },
+                    fact,
+                })
+                .collect();
+            DecodedInput::new(
+                input,
+                Attribution::Current,
+                DecodeDisposition::Consumed,
+                events,
+            )
+            .unwrap()
+        }
+        fn send(&self, turn: TurnId, facts: Vec<EventFact>) {
+            self.publisher
+                .emit_typed(self.batch(turn, facts));
+        }
+        fn stop(&self, phase: RuntimeLifecyclePhase) {
+            self.store.request_stop(&self.id).unwrap();
+            self.lifecycle.request_stop(&self.tracker.turn_snapshot());
+            self.lifecycle.state.lock().unwrap().phase = phase;
+        }
+        fn seq(&self) -> u64 {
+            self.store
+                .get_task(&self.id)
+                .unwrap()
+                .unwrap()
+                .last_event_seq
+        }
+    }
+    fn text(value: &str) -> EventFact {
+        EventFact::MessageUpdated(MessageUpdate {
+            message_id: MessageId("partial".into()),
+            text: TextUpdate::Delta(value.into()),
+        })
+    }
+    fn settled(turn: TurnId) -> EventFact {
+        EventFact::TurnSettled(TurnSettlement {
+            turn_id: turn,
+            outcome: TurnOutcome::Cancelled,
+            stop_reason: SafeToken::new("ERROR"),
+            final_text: Some("partial".into()),
+            failure: None,
+        })
+    }
+
+    #[test]
+    fn stopping_settlement_batch_reaches_activity_and_store_once() {
+        for phase in [
+            RuntimeLifecyclePhase::StopRequested,
+            RuntimeLifecyclePhase::StopAcknowledged,
+            RuntimeLifecyclePhase::ForceTerminating,
+        ] {
+            let f = Fixture::new();
+            f.stop(phase);
+            let before = f.seq();
+            let failure = NativeFailure {
+                original: serde_json::json!({"message":"interrupted"}),
+                projection: None,
+            };
+            f.send(
+                TurnId::Local(1),
+                vec![
+                    text("partial"),
+                    EventFact::ToolChanged(ToolChange {
+                        call_id: CallId("tool".into()),
+                        name: Some("run_command".into()),
+                        category: None,
+                        arguments: None,
+                        phase: Some(ToolPhase::Finished),
+                        outcome: Some(ToolOutcome::Failed),
+                        failure: Some(failure.clone()),
+                        denied: None,
+                    }),
+                    EventFact::ErrorObserved {
+                        operation: Operation::Turn,
+                        failure,
+                    },
+                    settled(TurnId::Local(1)),
+                ],
+            );
+            assert_eq!(
+                f.sink.activity.take_wait_tail().text,
+                "partial",
+                "{phase:?}"
+            );
+            assert_eq!(f.seq(), before + 4);
+            assert_eq!(f.sink.activity.snapshot().window_60s.tool_calls_failed, 1);
+            assert!(f.tracker.native_failure().unwrap().original.to_string().contains("interrupted"));
+            assert!(f.sink.error().is_none());
+            assert_eq!(
+                f.lifecycle.state.lock().unwrap().phase,
+                phase,
+                "settlement evidence must not reopen ingress"
+            );
+            assert_eq!(
+                f.store.get_task(&f.id).unwrap().unwrap().phase,
+                TaskPhase::Cancelling
+            );
+            f.send(
+                TurnId::Local(1),
+                vec![text("late"), settled(TurnId::Local(1))],
+            );
+            f.send(
+                TurnId::Local(2),
+                vec![
+                    EventFact::TurnStarted {
+                        turn_id: TurnId::Local(2),
+                    },
+                    text("new turn"),
+                    settled(TurnId::Local(2)),
+                ],
+            );
+            assert!(f.sink.activity.take_wait_tail().text.is_empty());
+            assert_eq!(
+                f.seq(),
+                before + 4,
+                "post-settlement facts must stay rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_ingress_rejects_incomplete_foreign_and_post_boundary_batches() {
+        let cases = [
+            (TurnId::Local(1), vec![text("not a settlement")]),
+            (
+                TurnId::Local(2),
+                vec![text("foreign turn"), settled(TurnId::Local(2))],
+            ),
+            (
+                TurnId::Local(1),
+                vec![settled(TurnId::Local(1)), text("after boundary")],
+            ),
+            (
+                TurnId::Local(1),
+                vec![settled(TurnId::Local(1)), settled(TurnId::Local(1))],
+            ),
+            (
+                TurnId::Local(1),
+                vec![
+                    EventFact::TurnStarted {
+                        turn_id: TurnId::Local(1),
+                    },
+                    text("restart"),
+                    settled(TurnId::Local(1)),
+                ],
+            ),
+            (
+                TurnId::Local(1),
+                vec![
+                    EventFact::InputRequested(InputRequest {
+                        request_id: WireId::String("new-request".into()),
+                        kind: InputKind::Permission,
+                        respondable: true,
+                        question: serde_json::json!("new input"),
+                    }),
+                    settled(TurnId::Local(1)),
+                ],
+            ),
+            (
+                TurnId::Local(1),
+                vec![text("wrong boundary"), settled(TurnId::Local(2))],
+            ),
+        ];
+        for (turn, facts) in cases {
+            let f = Fixture::new();
+            f.stop(RuntimeLifecyclePhase::StopRequested);
+            let before = f.seq();
+            f.send(turn, facts);
+            assert!(f.sink.activity.take_wait_tail().text.is_empty());
+            assert_eq!(f.seq(), before);
+        }
+    }
+
+    #[test]
+    fn running_settlement_cannot_be_readmitted_after_stop() {
+        let f = Fixture::new();
+        f.send(TurnId::Local(1), vec![settled(TurnId::Local(1))]);
+        f.stop(RuntimeLifecyclePhase::StopRequested);
+        let before = f.seq();
+        f.send(
+            TurnId::Local(1),
+            vec![text("late"), settled(TurnId::Local(1))],
+        );
+        assert!(f.sink.activity.take_wait_tail().text.is_empty());
+        assert_eq!(f.seq(), before);
+    }
+
+    #[test]
+    fn terminal_ingress_rejects_even_a_matching_settlement_batch() {
+        let f = Fixture::new();
+        f.stop(RuntimeLifecyclePhase::Terminal);
+        let before = f.seq();
+        f.send(
+            TurnId::Local(1),
+            vec![text("late"), settled(TurnId::Local(1))],
+        );
+        assert!(f.sink.activity.take_wait_tail().text.is_empty());
+        assert_eq!(f.seq(), before);
+    }
+    #[test]
+    fn stopping_settlement_rejects_other_claims_and_mixed_turn_contexts() {
+        for mismatch in ["task", "launch", "mixed_turn"] {
+            let f = Fixture::new();
+            f.stop(RuntimeLifecyclePhase::StopRequested);
+            let before = f.seq();
+            let batch = f.batch(
+                TurnId::Local(1),
+                vec![text("foreign"), settled(TurnId::Local(1))],
+            );
+            let mut input = batch.input().clone();
+            let mut events = batch.into_events();
+            match mismatch {
+                "task" => {
+                    input.task_id = TaskId("10000001".into());
+                    for event in &mut events {
+                        event.context.task_id = input.task_id.clone();
+                    }
+                }
+                "launch" => {
+                    input.launch_id = LaunchId("other-claim".into());
+                    for event in &mut events {
+                        event.context.launch_id = input.launch_id.clone();
+                    }
+                }
+                _ => events[0].context.turn_id = Some(TurnId::Local(2)),
+            }
+            f.publisher.emit_typed(
+                DecodedInput::new(
+                    input,
+                    Attribution::Current,
+                    DecodeDisposition::Consumed,
+                    events,
+                )
+                .unwrap());
+            assert!(
+                f.sink.activity.take_wait_tail().text.is_empty(),
+                "{mismatch}"
+            );
+            assert_eq!(f.seq(), before, "{mismatch}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod observation_persistence_tests {
+    use super::*;
+    use external_contract::events::*;
+    use crate::rpc::{RpcMethod, RpcService, RpcSuccess, TaskWaitQuery, WaitMode, WaitTarget};
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        store: Arc<Store>, state: Arc<RuntimeState>, publisher: Publisher,
+        id: String,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::Builder::new().prefix("observation-persistence-").tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let bootstrap = Scheduler::new("fixture-enqueue", store.clone(), Arc::new(CommandRuntimeFactory::new(|_: &TaskRecord| -> io::Result<Command> {
+                panic!("fixture setup never spawns")
+            })), SchedulerConfig::default()).unwrap();
+            let task = bootstrap.enqueue_general(&GeneralTaskManifest { schema: external_core::GENERAL_TASK_SCHEMA.into(), agent_id: String::new(),
+                repository: directory.path().canonicalize().unwrap(), permission_mode: Some(external_core::PermissionMode::Plan),
+                prompt: "synthetic observation evidence".into(), write_manifest: vec![] }).unwrap();
+            let id = task.agent_id;
+            let claim = store.claim_next("observation-test").unwrap().unwrap();
+            store.mark_session_running(&id, claim.owner_epoch, "runtime", None, Some("session"), None).unwrap();
+            let state = Arc::new(RuntimeState::new());
+            let sink = Arc::new(StoreLifecycleSink::new(store.clone(), id.clone(), "runtime".into(), claim.owner_epoch,
+                Arc::new(RuntimeLifecycle::new(claim.owner_epoch)), state.clone()));
+            Self { directory, store, state, publisher: Publisher::new(sink), id }
+        }
+        fn reason_rows(&self) -> Vec<String> {
+            let connection = rusqlite::Connection::open(self.directory.path().join("state.sqlite")).unwrap();
+            let mut query = connection.prepare("SELECT payload_json FROM events WHERE agent_id=?1 AND json_extract(payload_json,'$.reason') IS NOT NULL ORDER BY seq").unwrap();
+            query.query_map([&self.id], |row| row.get(0)).unwrap().map(Result::unwrap).collect()
+        }
+        fn anomalous_batch(&self) -> DecodedInput {
+            let (task_id, launch_id) = self.publisher.event_scope();
+            let input = NativeInputContext { task_id, launch_id, turn_id: Some(TurnId::Local(1)), source: NativeSource {
+                protocol: SourceProtocol::ZcodeSession, discriminator: SafeToken::new("api_key.PRIVATE_CREDENTIAL"),
+                session_id: Some(SessionId("session".into())), turn_id: None, item_id: None, call_id: None,
+                event_id: Some("one-native-input".into()), timestamp: None } };
+            let gap = CoverageGap { reason: LossReason::Malformed, impact: Impact::Known(vec![CoverageDimension::Tools]), activity: ActivityScope::Turn(TurnId::Local(1)) };
+            let facts = [EventFact::CoverageGap(gap.clone()), EventFact::Diagnostic(Diagnostic { reason: DiagnosticReason::Malformed,
+                impact: gap.impact.clone(), discriminator: SafeToken::new("PRIVATE_PAYLOAD") })];
+            let events = facts.into_iter().enumerate().map(|(index, fact)| NormalizedEvent { context: EventContext {
+                task_id: input.task_id.clone(), launch_id: input.launch_id.clone(), sequence: index as u64 + 1,
+                turn_id: input.turn_id.clone(), source: input.source.clone() }, fact }).collect();
+            DecodedInput::new(input, Attribution::Current, DecodeDisposition::InvalidLost(gap), events).unwrap()
+        }
+        fn scheduler(&self) -> Scheduler {
+            Scheduler::new("query-only", self.store.clone(), Arc::new(CommandRuntimeFactory::new(|_: &TaskRecord| -> io::Result<Command> {
+                panic!("observation queries must never spawn a runtime")
+            })), SchedulerConfig::default()).unwrap()
+        }
+    }
+
+    #[test]
+    fn one_native_anomaly_has_one_safe_reason_record_and_repeated_wait_never_repersists() {
+        let fixture = Fixture::new();
+        let batch = fixture.anomalous_batch();
+        fixture.publisher.emit_typed(batch.clone());
+        let before = fixture.state.snapshot();
+        assert_eq!(before.diagnostics.iter().map(|d| d.count).sum::<u64>(), 1);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 1);
+        let rows = fixture.reason_rows(); assert_eq!(rows.len(), 1);
+        let reason: serde_json::Value = serde_json::from_str(&rows[0]).unwrap();
+        assert_eq!(reason["reason"], "malformed");
+        assert_eq!(reason["discriminator"], "unrecognized");
+        assert!(!rows[0].contains("PRIVATE"));
+        assert!(!rows[0].contains("one-native-input"));
+        let seq = fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq;
+        fixture.publisher.emit_typed(batch);
+        let scheduler = fixture.scheduler();
+        scheduler.inner.state.lock().unwrap().activities.insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        for _ in 0..4 {
+            let response = service.dispatch(RpcMethod::TaskWait(TaskWaitQuery { agent_id: WaitTarget::One(fixture.id.clone()), wait_time: 0,
+                message_id: None, wait_mode: WaitMode::All })).unwrap();
+            assert!(matches!(response, RpcSuccess::TaskWait(_)));
+        }
+        assert_eq!(fixture.reason_rows(), rows);
+        assert_eq!(fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq, seq);
+        assert_eq!(fixture.state.snapshot().diagnostics, before.diagnostics);
+    }
+
+    #[test]
+    fn restarted_scheduler_reports_unavailable_without_replaying_persisted_reasons() {
+        let fixture = Fixture::new(); fixture.publisher.emit_typed(fixture.anomalous_batch());
+        let reasons = fixture.reason_rows(); let seq = fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq;
+        let scheduler = fixture.scheduler();
+        assert!(scheduler.passive_activity_snapshot(&fixture.id).is_none());
+        let observation = scheduler.observation_snapshot(&fixture.id);
+        assert_eq!(observation.snapshot_seq, 0);
+        assert!(observation.tools.is_empty());
+        assert!(observation.reasoning.text.is_empty());
+        assert!(!observation.coverage.tool_history_complete);
+        assert!(!observation.coverage.reasoning_complete);
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let RpcSuccess::TaskWait(view) = service.dispatch(RpcMethod::TaskWait(TaskWaitQuery { agent_id: WaitTarget::One(fixture.id.clone()),
+            wait_time: 0, message_id: None, wait_mode: WaitMode::All })).unwrap() else { panic!("wait view") };
+        assert_eq!(view.activity.telemetry_status, crate::rpc::TelemetryStatusView::Unavailable);
+        // A restart replays no persisted reason into an in-memory summary; the
+        // bounded diagnostics fields are honestly empty.
+        assert!(view.activity.diagnostics.is_empty());
+        assert!(!view.activity.diagnostics_truncated);
+        assert_eq!(fixture.reason_rows(), reasons);
+        assert_eq!(fixture.store.get_task(&fixture.id).unwrap().unwrap().last_event_seq, seq);
+    }
+
+    #[test]
+    fn real_adapter_malformed_tool_start_is_explained_in_repeated_wait_activity() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope();
+        let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let mut send = |params: serde_json::Value| {
+            let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"params": params}),
+            });
+            let batch = adapter.decode(&inbound).unwrap();
+            fixture.publisher.emit_typed(batch.clone());
+            batch
+        };
+        send(serde_json::json!({"type":"turn.started","turnId":"turn"}));
+        let malformed = send(serde_json::json!({
+            "type":"tool.updated","turnId":"turn","eventId":"bad-tool",
+            "payload":{"kind":"started"}
+        }));
+        assert!(matches!(malformed.disposition(), DecodeDisposition::InvalidLost(_)));
+        let scheduler = fixture.scheduler();
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let mut previous = None;
+        for _ in 0..3 {
+            let RpcSuccess::TaskWait(view) = service
+                .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                    agent_id: WaitTarget::One(fixture.id.clone()),
+                    wait_time: 0,
+                    message_id: None,
+                    wait_mode: WaitMode::All,
+                }))
+                .unwrap()
+            else {
+                panic!("wait view");
+            };
+            // Degraded is only useful when the same response explains it.
+            assert_eq!(
+                view.activity.telemetry_status,
+                crate::rpc::TelemetryStatusView::Degraded
+            );
+            let entry = view
+                .activity
+                .diagnostics
+                .iter()
+                .find(|entry| entry.reason == "malformed")
+                .expect("wait must deliver the malformed tool-start summary");
+            assert_eq!(entry.source, SourceProtocol::ZcodeSession);
+            assert_eq!(entry.impact, Impact::Known(vec![CoverageDimension::Tools]));
+            assert_eq!(entry.discriminator, "tool.updated");
+            assert_eq!(entry.count, 1);
+            assert!(entry.last_observed_at > 0);
+            assert!(!view.activity.diagnostics_truncated);
+            // Repeated waits read the same retained summary: no recompute, no
+            // count inflation.
+            if let Some(previous) = &previous {
+                assert_eq!(&view.activity.diagnostics, previous);
+            }
+            previous = Some(view.activity.diagnostics.clone());
+        }
+        // List-mode wait builds each entry through the same projection, so it
+        // carries the identical bounded summary.
+        let RpcSuccess::TaskWaitMany { waits } = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: WaitTarget::Many(vec![fixture.id.clone()]),
+                wait_time: 0,
+                message_id: None,
+                wait_mode: WaitMode::All,
+            }))
+            .unwrap()
+        else {
+            panic!("many wait view");
+        };
+        let (_, body) = waits.bodies.first().expect("one awaited agent");
+        assert_eq!(body.activity.diagnostics, previous.unwrap());
+        assert_eq!(body.activity.telemetry_status, crate::rpc::TelemetryStatusView::Degraded);
+        assert_eq!(
+            fixture
+                .state
+                .snapshot()
+                .diagnostics
+                .iter()
+                .map(|entry| entry.count)
+                .sum::<u64>(),
+            1
+        );
+    }
+
+    #[test]
+    fn real_adapter_unknown_semantics_is_visible_without_claiming_a_dimension() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope();
+        let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let inbound = Inbound::Message(WireMessage::UnknownEvent {
+            method: "api_key.PRIVATE_CREDENTIAL".into(),
+            raw: serde_json::json!({"params":{"eventId":"unknown","turnId":"turn"}}),
+        });
+        let unknown = adapter.decode(&inbound).unwrap();
+        assert!(matches!(unknown.disposition(), DecodeDisposition::Unknown(_)));
+        fixture.publisher.emit_typed(unknown);
+        let scheduler = fixture.scheduler();
+        scheduler
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .activities
+            .insert(fixture.id.clone(), fixture.state.clone());
+        let service = RpcService::new(scheduler, fixture.store.clone()).unwrap();
+        let RpcSuccess::TaskWait(view) = service
+            .dispatch(RpcMethod::TaskWait(TaskWaitQuery {
+                agent_id: WaitTarget::One(fixture.id.clone()),
+                wait_time: 0,
+                message_id: None,
+                wait_mode: WaitMode::All,
+            }))
+            .unwrap()
+        else {
+            panic!("wait view");
+        };
+        // Unknown semantics need not degrade telemetry, but must still be
+        // explainable through the bounded summary with unknown scope.
+        assert_ne!(
+            view.activity.telemetry_status,
+            crate::rpc::TelemetryStatusView::Degraded
+        );
+        let entry = view
+            .activity
+            .diagnostics
+            .iter()
+            .find(|entry| entry.reason == "unknown_semantics")
+            .expect("unknown semantics must stay diagnosable");
+        assert_eq!(entry.source, SourceProtocol::ZcodeSession);
+        assert_eq!(entry.impact, Impact::Unknown);
+        assert_eq!(entry.discriminator, "unrecognized");
+        assert_eq!(entry.count, 1);
+        let encoded = serde_json::to_string(&view.activity.diagnostics).unwrap();
+        assert!(!encoded.contains("PRIVATE") && encoded.len() < 2048);
+    }
+
+    #[test]
+    fn real_adapter_ignored_unknown_and_malformed_inputs_have_distinct_persisted_effects() {
+        let fixture = Fixture::new();
+        let (task, launch) = fixture.publisher.event_scope(); let mut adapter = zcode::events::ZcodeAdapter::new(task, launch);
+        let mut send = |method: &str, params: serde_json::Value| {
+            let inbound = Inbound::Message(WireMessage::UnknownEvent { method: method.into(), raw: serde_json::json!({"params":params}) });
+            let batch = adapter.decode(&inbound).unwrap(); fixture.publisher.emit_typed(batch.clone()); batch
+        };
+        let ignored = send("v4/telemetry/event", serde_json::json!({"version":1,"kind":"usage.delta","eventId":"usage"}));
+        assert!(matches!(ignored.disposition(), DecodeDisposition::RecognizedIgnored(_)));
+        assert!(fixture.reason_rows().is_empty());
+        send("session/event", serde_json::json!({"type":"turn.started","turnId":"turn"}));
+        send("session/event", serde_json::json!({"type":"model.streaming","turnId":"turn","eventId":"thought",
+            "payload":{"kind":"reasoning_delta","delta":"public summary"}}));
+        let unknown = send("api_key.PRIVATE_CREDENTIAL", serde_json::json!({"eventId":"unknown","turnId":"turn"}));
+        assert!(matches!(unknown.disposition(), DecodeDisposition::Unknown(_)));
+        assert_eq!(fixture.state.snapshot().telemetry_status, TelemetryStatus::Healthy);
+        assert!(fixture.state.observation_snapshot().coverage.reasoning_complete);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 0);
+        let malformed = send("session/event", serde_json::json!({"type":"tool.updated","turnId":"turn","eventId":"bad-tool","payload":{"kind":"started","toolCallId":false}}));
+        assert!(matches!(malformed.disposition(), DecodeDisposition::InvalidLost(_)));
+        assert!(!fixture.state.observation_snapshot().coverage.tool_history_complete);
+        assert!(fixture.state.observation_snapshot().coverage.reasoning_complete);
+        assert_eq!(fixture.state.observation_snapshot().coverage.dropped_events, 1);
+        let oversized_discriminator = format!("PRIVATE_{}", "x".repeat(2048));
+        let oversized = send(&oversized_discriminator, serde_json::json!({"eventId":"oversized-discriminator","turnId":"turn","payload":"PRIVATE_PAYLOAD"}));
+        assert!(matches!(oversized.disposition(), DecodeDisposition::Unknown(_)));
+        let rows = fixture.reason_rows(); assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| !row.contains("PRIVATE") && row.len() < 1024));
+        let summary = serde_json::to_string(&fixture.state.snapshot().diagnostics).unwrap();
+        assert!(!summary.contains("PRIVATE") && summary.len() < 4096);
+    }
+}
+
+mod question_pending_ownership_tests {
+    use super::*;
+    use external_contract::{events::*, RequestEnvelope, WireId, WireMessage};
+    use external_runtime::{ChildExit, Inbound, StopOutcome};
+
+    struct QuestionRuntime {
+        publisher: Publisher,
+        response_calls: AtomicU64,
+    }
+    impl ManagedRuntime for QuestionRuntime {
+        fn identity(&self) -> Option<ProcessIdentity> {
+            None
+        }
+        fn stop(&self, _: Duration) -> RuntimeTerminal {
+            self.publisher
+                .publish_terminal(RuntimeTerminal::Stopped(StopOutcome::AlreadyExited(
+                    ChildExit::Exited(Some(0)),
+                )))
+        }
+        fn wait_terminal(&self, timeout: Duration) -> Option<RuntimeTerminal> {
+            self.publisher.wait_terminal(timeout)
+        }
+        fn terminal_latch(&self) -> Option<TerminalLatch<'_>> {
+            Some(self.publisher.decision_latch())
+        }
+        fn bootstrap_session_with_mcp(
+            &self,
+            _: &TaskRecord,
+            _: &[external_contract::StdioMcpServer],
+            _: Duration,
+        ) -> Result<SessionReady, RuntimeCommandError> {
+            Ok(SessionReady {
+                session_id: "question-session".into(),
+                initial_turn_id: None,
+                configured_model: None,
+            })
+        }
+        fn turn_snapshot(&self) -> TurnSnapshot {
+            self.publisher.runtime_state.turn_snapshot()
+        }
+        fn respond_request(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&external_core::ValidatedPermissionDenial>,
+            _: Instant,
+        ) -> Result<(), RuntimeCommandError> {
+            self.response_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+        fn finish_turn(&self, boundary: TurnBoundary, _: Duration) -> RuntimeTerminal {
+            // Synthetic process-control result; all input reduction, durable
+            // admission/resolution and scheduler finalization are production.
+            let outcome = StopOutcome::AlreadyExited(ChildExit::Exited(Some(0)));
+            self.publisher.publish_terminal(match boundary {
+                TurnBoundary::Completed => RuntimeTerminal::Completed(outcome),
+                TurnBoundary::Failed => RuntimeTerminal::FailedTurn(outcome),
+            })
+        }
+    }
+    struct QuestionFactory(Arc<Mutex<Option<Arc<QuestionRuntime>>>>);
+    impl RuntimeFactory for QuestionFactory {
+        fn spawn(
+            &self,
+            _: &TaskRecord,
+            sink: Arc<dyn LifecycleSink>,
+        ) -> io::Result<Arc<dyn ManagedRuntime>> {
+            let runtime = Arc::new(QuestionRuntime {
+                publisher: Publisher::new(sink),
+                response_calls: AtomicU64::new(0),
+            });
+            *self.0.lock().unwrap() = Some(runtime.clone());
+            Ok(runtime)
+        }
+    }
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        scheduler: Scheduler,
+        runtime: Arc<QuestionRuntime>,
+        sink: Arc<StoreLifecycleSink>,
+        adapter: crate::zcode::events::ZcodeAdapter,
+        database: rusqlite::Connection,
+        id: String,
+        next_event: u64,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(directory.path().join("state.sqlite")).unwrap());
+            let slot = Arc::new(Mutex::new(None));
+            let scheduler = Scheduler::new(
+                "question-ownership",
+                store.clone(),
+                Arc::new(QuestionFactory(slot.clone())),
+                SchedulerConfig::default(),
+            )
+            .unwrap();
+            let id = scheduler
+                .enqueue_general(&GeneralTaskManifest {
+                    schema: external_core::GENERAL_TASK_SCHEMA.into(),
+                    agent_id: String::new(),
+                    repository: directory.path().canonicalize().unwrap(),
+                    permission_mode: Some(external_core::PermissionMode::Plan),
+                    prompt: "synthetic question ownership".into(),
+                    write_manifest: vec![],
+                })
+                .unwrap()
+                .agent_id;
+            scheduler.start_ready().unwrap();
+            let runtime = slot.lock().unwrap().clone().unwrap();
+            let sink = scheduler.inner.state.lock().unwrap().active[&id]
+                .sink
+                .clone();
+            let (task, launch) = runtime.publisher.event_scope();
+            let database = rusqlite::Connection::open(store.database_path()).unwrap();
+            database.execute_batch("CREATE TABLE question_transitions(old_state TEXT,new_state TEXT);
+                CREATE TRIGGER question_transition AFTER UPDATE OF state ON pending_requests WHEN OLD.state<>NEW.state
+                BEGIN INSERT INTO question_transitions VALUES(OLD.state,NEW.state); END;").unwrap();
+            let mut fixture = Self {
+                _directory: directory,
+                scheduler,
+                runtime,
+                sink,
+                adapter: crate::zcode::events::ZcodeAdapter::new(task, launch),
+                database,
+                id,
+                next_event: 0,
+            };
+            fixture.notification("turn.started", serde_json::json!({}));
+            fixture
+        }
+        fn notification(&mut self, kind: &str, payload: serde_json::Value) -> DecodedInput {
+            self.next_event += 1;
+            let inbound = Inbound::Message(WireMessage::UnknownEvent {
+                method: "session/event".into(),
+                raw: serde_json::json!({"params":{
+                    "type":kind,"payload":payload,"turnId":"question-turn","sessionId":"question-session","eventId":format!("question-event-{}",self.next_event)
+                }}),
+            });
+            let batch = self.adapter.decode(&inbound).unwrap();
+            assert_eq!(batch.attribution(), Attribution::Current);
+            assert!(matches!(batch.disposition(), DecodeDisposition::Consumed));
+            self.runtime.publisher.emit_typed(batch.clone());
+            batch
+        }
+        fn rpc(&mut self, wire_id: &str, method: &str) {
+            let inbound = Inbound::Message(WireMessage::Request(RequestEnvelope::new(
+                WireId::String(wire_id.into()),
+                method,
+                serde_json::json!({"requestId":"q","prompt":"Question"}),
+            )));
+            // Match the real pump: adapter records logical/wire association,
+            // then transport publication owns the answerable request fact.
+            assert!(self.adapter.decode(&inbound).is_none());
+            self.runtime.publisher.publish_transport(inbound, None);
+        }
+        fn all_row_count(&self) -> i64 {
+            self.database
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_requests WHERE agent_id=?1",
+                    [&self.id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = self.scheduler.cancel_task(&self.id);
+        }
+    }
+    fn paired_question(wire_id: &str, notification_first: bool) {
+        for user_answers_first in [false, true] {
+            let mut f = Fixture::new();
+            for is_notification in [notification_first, !notification_first] {
+                if is_notification {
+                    let batch = f.notification(
+                        "userInput.requested",
+                        serde_json::json!({"requestId":"q","prompt":"Question"}),
+                    );
+                    assert!(
+                        matches!(&batch.events()[0].fact, EventFact::InputRequested(InputRequest {
+                        kind: InputKind::Question, respondable: false, request_id: WireId::String(id), ..
+                    }) if id == "q")
+                    );
+                } else {
+                    f.rpc(wire_id, external_contract::INTERACTION_REQUEST_USER_INPUT);
+                }
+            }
+            assert!(
+                f.sink.error().is_none(),
+                "no equal-ID collision: {:?}",
+                f.sink.error()
+            );
+            assert_eq!(f.all_row_count(), 1, "one question has one durable owner");
+            let requests = f.scheduler.store().pending_requests(&f.id).unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            assert_eq!(request.request_type, "user_input");
+            assert_eq!(request.state, PendingRequestState::Pending);
+            assert_eq!(
+                request.correlation_id,
+                serde_json::to_string(&WireId::String(wire_id.into())).unwrap()
+            );
+            assert_eq!(
+                f.runtime.publisher.runtime_state.snapshot().coverage.input,
+                Some(true)
+            );
+            let payloads: Vec<String> = f.database.prepare("SELECT payload_json FROM events WHERE agent_id=?1 AND json_extract(payload_json,'$.category')='input' ORDER BY seq").unwrap()
+                .query_map([&f.id], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(
+                payloads.len(),
+                2,
+                "notification and RPC both retain lifecycle roles"
+            );
+            let projected_ids: Vec<String> = payloads
+                .iter()
+                .filter_map(|payload| {
+                    serde_json::from_str::<serde_json::Value>(payload).unwrap()["request_id"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            assert_eq!(
+                projected_ids,
+                vec![request.request_id.clone()],
+                "no phantom ES request ID"
+            );
+            if user_answers_first {
+                let response = f
+                    .scheduler
+                    .respond_request(&f.id, &request.request_id, "answer", Some("user answer"))
+                    .unwrap();
+                assert_eq!(response.disposition, ResponseDisposition::Responded);
+            }
+            let resolved = f.notification(
+                "userInput.resolved",
+                serde_json::json!({"requestId":"q","value":"native answer"}),
+            );
+            assert!(
+                matches!(&resolved.events()[0].fact, EventFact::InputResolved(resolution) if resolution.request_id == WireId::String(wire_id.into()))
+            );
+            let winner = f
+                .scheduler
+                .store()
+                .pending_request(&f.id, &request.request_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(winner.state, PendingRequestState::Responded);
+            assert_eq!(winner.response_decision.as_deref(), Some("answer"));
+            assert!(f
+                .scheduler
+                .store()
+                .pending_requests(&f.id)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                f.scheduler.store().completion_blockers(&f.id).unwrap(),
+                (false, false)
+            );
+            f.notification(
+                "userInput.resolved",
+                serde_json::json!({"requestId":"q","value":"duplicate native answer"}),
+            );
+            let loser = f
+                .scheduler
+                .respond_request(&f.id, &request.request_id, "answer", Some("later answer"))
+                .unwrap();
+            assert_eq!(loser.disposition, ResponseDisposition::AlreadyResponded);
+            assert_eq!(
+                f.runtime.response_calls.load(Ordering::Acquire),
+                u64::from(user_answers_first)
+            );
+            let transitions: Vec<(String, String)> = f
+                .database
+                .prepare("SELECT old_state,new_state FROM question_transitions ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                transitions,
+                vec![
+                    ("PENDING".into(), "SENDING".into()),
+                    ("SENDING".into(), "RESPONDED".into())
+                ]
+            );
+            f.notification(
+                "turn.completed",
+                serde_json::json!({"response":"QUESTION_DONE"}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let result = loop {
+                if let Some(result) = f.scheduler.store().task_result(&f.id).unwrap() {
+                    break result;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "resolved question must not block successful completion"
+                );
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(result.result.outcome, TaskOutcome::Completed);
+            assert_eq!(result.result.final_text, "QUESTION_DONE");
+            assert_eq!(f.all_row_count(), 1);
+            assert!(f.sink.error().is_none());
+        }
+    }
+    #[test]
+    fn distinct_ids_notification_first_have_one_pending_owner() {
+        paired_question("wire-q", true);
+    }
+    #[test]
+    fn distinct_ids_rpc_first_have_one_pending_owner() {
+        paired_question("wire-q", false);
+    }
+    #[test]
+    fn equal_ids_notification_first_have_one_pending_owner() {
+        paired_question("q", true);
+    }
+    #[test]
+    fn equal_ids_rpc_first_have_one_pending_owner() {
+        paired_question("q", false);
+    }
+    #[test]
+    fn explicit_unsupported_rpc_retains_its_pending_sentinel() {
+        let mut f = Fixture::new();
+        f.rpc(
+            "unsupported-wire",
+            external_contract::INTERACTION_REQUEST_UNSUPPORTED_INPUT,
+        );
+        let rows = f.scheduler.store().pending_requests(&f.id).unwrap();
+        assert_eq!(f.all_row_count(), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_type, "unsupported_input");
+        assert_eq!(rows[0].state, PendingRequestState::Pending);
+        assert!(f.sink.error().is_none());
     }
 }
