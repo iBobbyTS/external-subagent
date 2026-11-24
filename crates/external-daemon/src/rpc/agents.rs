@@ -2622,7 +2622,7 @@ mod admission_policy_tests {
             &service,
             "zcode-model-invalid",
             "zcode",
-            Some("two/slashes/here"),
+            Some("provider/"),
             &build_workspace,
             "build",
             &[],
@@ -2633,7 +2633,7 @@ mod admission_policy_tests {
         assert_eq!(error.code, RpcErrorCode::Validation);
         assert_eq!(
             error.message,
-            "zcode model must be {provider}/{model}; the token contains more than one '/' separator"
+            "zcode model must be {provider}/{model}; the model side is empty"
         );
     }
 }

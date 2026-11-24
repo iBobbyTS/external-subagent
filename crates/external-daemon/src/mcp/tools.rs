@@ -1502,9 +1502,9 @@ mod contract_default_tests {
             ("codex", None, "agent_disabled", "agent is disabled"),
             (
                 "zcode",
-                Some("two/slashes/here"),
+                Some("provider/"),
                 "validation",
-                "zcode model must be {provider}/{model}; the token contains more than one '/' separator",
+                "zcode model must be {provider}/{model}; the model side is empty",
             ),
             (
                 "dsh",

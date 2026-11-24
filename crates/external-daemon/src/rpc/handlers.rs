@@ -2175,7 +2175,7 @@ mod observe_gate_tests {
                 err_z2.message
             );
 
-            // 3. codex: bare slug accepted, slash rejected
+            // 3. Codex receives both bare and qualified native model tokens.
             let codex_slug_json = r#"{
   "name": "codex_slug",
   "subagent": "codex",
@@ -2206,8 +2206,11 @@ mod observe_gate_tests {
                 profile: Some("codex_slash".into()),
                 manifest: test_manifest(env.workspace_dir.path(), "codex prompt"),
             };
-            let err_c2 = env.service.dispatch(RpcMethod::SubmitGeneral(input_c2)).unwrap_err();
-            assert_eq!(err_c2.code, RpcErrorCode::Validation);
+            let response = env.service.dispatch(RpcMethod::SubmitGeneral(input_c2)).unwrap();
+            let RpcSuccess::GeneralSubmitted { task } = response else {
+                panic!("expected the qualified Codex model to be submitted");
+            };
+            assert_eq!(task.input_identity.model.as_deref(), Some("openai/gpt-5"));
         }
 
         #[test]
