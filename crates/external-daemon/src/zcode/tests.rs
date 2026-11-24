@@ -278,8 +278,8 @@ fn a_missing_builtin_degrades_the_whole_environment_group() {
     let data_root = directory.path().join("data");
 
     let mut command = Command::new("zcode-fixture");
-    let error =
-        apply_provider_environment_for(&mut command, None, &data_root, &cli, &v2).unwrap_err();
+    let error = apply_provider_environment_for(&mut command, None, None, &data_root, &cli, &v2)
+        .unwrap_err();
     assert!(!error.to_string().contains(ZAI_KEY));
     assert_eq!(command.get_envs().count(), 0);
     assert!(!data_root.join("zcode-runtime").exists());
@@ -313,7 +313,8 @@ fn the_environment_group_is_injected_with_private_paths() {
     );
 
     let mut command = Command::new("zcode-fixture");
-    apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2).unwrap();
+    apply_provider_environment_for(&mut command, Some(&builtin), None, &data_root, &cli, &v2)
+        .unwrap();
 
     let runtime_dir = data_root.join("zcode-runtime");
     assert_eq!(
@@ -354,8 +355,15 @@ fn the_environment_group_is_injected_with_private_paths() {
     // Idempotent regeneration over the same inputs.
     let first = fs::read(runtime_dir.join("personal-provider-config.json")).unwrap();
     let mut second_command = Command::new("zcode-fixture");
-    apply_provider_environment_for(&mut second_command, Some(&builtin), &data_root, &cli, &v2)
-        .unwrap();
+    apply_provider_environment_for(
+        &mut second_command,
+        Some(&builtin),
+        None,
+        &data_root,
+        &cli,
+        &v2,
+    )
+    .unwrap();
     let second = fs::read(runtime_dir.join("personal-provider-config.json")).unwrap();
     assert_eq!(first, second);
 }
@@ -450,8 +458,9 @@ fn an_unreadable_v2_config_degrades_the_environment_group() {
 
     let data_root = directory.path().join("data");
     let mut command = Command::new("zcode-fixture");
-    let error = apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2)
-        .unwrap_err();
+    let error =
+        apply_provider_environment_for(&mut command, Some(&builtin), None, &data_root, &cli, &v2)
+            .unwrap_err();
     assert!(!error.to_string().contains(ZAI_KEY));
     assert_eq!(command.get_envs().count(), 0);
     assert!(!data_root.join("zcode-runtime").exists());
@@ -480,8 +489,9 @@ fn a_malformed_v2_config_degrades_the_environment_group() {
 
     let data_root = directory.path().join("data");
     let mut command = Command::new("zcode-fixture");
-    let error = apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2)
-        .unwrap_err();
+    let error =
+        apply_provider_environment_for(&mut command, Some(&builtin), None, &data_root, &cli, &v2)
+            .unwrap_err();
     assert!(!error.to_string().contains(ZAI_KEY));
     assert_eq!(command.get_envs().count(), 0);
     assert!(!data_root.join("zcode-runtime").exists());
@@ -500,8 +510,15 @@ fn an_absent_v2_config_still_injects_the_environment_group() {
     let data_root = directory.path().join("data");
 
     let mut command = Command::new("zcode-fixture");
-    apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &missing_v2)
-        .unwrap();
+    apply_provider_environment_for(
+        &mut command,
+        Some(&builtin),
+        None,
+        &data_root,
+        &cli,
+        &missing_v2,
+    )
+    .unwrap();
     assert!(env_of(&command, PERSONAL_PROVIDER_CONFIG_ENV).is_some());
     assert!(env_of(&command, DATA_BASE_DIR_ENV).is_some());
 
@@ -534,9 +551,15 @@ fn assert_malformed_v2_degrades(v2: &Value) {
 
     let data_root = directory.path().join("data");
     let mut command = Command::new("zcode-fixture");
-    let error =
-        apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2_path)
-            .unwrap_err();
+    let error = apply_provider_environment_for(
+        &mut command,
+        Some(&builtin),
+        None,
+        &data_root,
+        &cli,
+        &v2_path,
+    )
+    .unwrap_err();
     assert!(!error.to_string().contains(ZAI_KEY));
     assert_eq!(command.get_envs().count(), 0);
     assert!(!data_root.join("zcode-runtime").exists());
@@ -592,7 +615,8 @@ fn a_user_defined_zai_rule_missing_from_provider_order_is_appended() {
     let data_root = directory.path().join("data");
 
     let mut command = Command::new("zcode-fixture");
-    apply_provider_environment_for(&mut command, Some(&builtin), &data_root, &cli, &v2).unwrap();
+    apply_provider_environment_for(&mut command, Some(&builtin), None, &data_root, &cli, &v2)
+        .unwrap();
     assert!(env_of(&command, PERSONAL_PROVIDER_CONFIG_ENV).is_some());
     assert!(env_of(&command, DATA_BASE_DIR_ENV).is_some());
 

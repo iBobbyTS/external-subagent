@@ -282,7 +282,11 @@ for standalone (non-GUI) sessions:
 The daemon's `zcode` module (deleted in the explicit-model refactor,
 restored 2026-10-28) addresses both: for every zcode child (spawn via the
 runtime factory closure, probes via the hi/catalog command builders) it
-resolves the builtin template from the runtime path's ancestors, composes
+derives the bundled config from the runtime path's ancestors and uses a newer
+compatible Desktop cache when it matches the macOS platform, the App version
+from `Info.plist`, and the configured endpoint. An existing explicit
+`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` takes precedence. The bundled file is the
+fallback when the matching cache is absent, unreadable, or older. It composes
 a daemon-owned personal registry under `<data root>/zcode-runtime/`
 (v2 personal rules verbatim + a synthesized `zai` rule from the
 `~/.zcode/cli/config.json` coding-plan key intersected with the builtin

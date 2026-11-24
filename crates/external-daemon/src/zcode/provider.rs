@@ -12,12 +12,14 @@ use std::os::unix::fs::PermissionsExt;
 
 use serde_json::{json, Map, Value};
 
+#[cfg(target_os = "macos")]
+mod builtin_cache;
+
 /// Builtin template file the child resolves as the first provider layer.
 /// When the daemon already carries this variable it is respected verbatim;
-/// otherwise the path is derived from the runtime location.
+/// otherwise the newest usable release in the App's cache scope wins.
 pub(crate) const BUILTIN_PROVIDER_CONFIG_ENV: &str = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
-/// Bundled companion of [`BUILTIN_PROVIDER_CONFIG_ENV`]; both point at the
-/// same template file.
+/// Bundled companion of [`BUILTIN_PROVIDER_CONFIG_ENV`].
 pub(crate) const BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV: &str =
     "ZCODE_BUILTIN_PROVIDER_BUNDLED_CONFIG_FILE";
 /// Generated daemon-owned personal provider file.
@@ -67,17 +69,25 @@ pub fn data_root_from_environment() -> Option<PathBuf> {
 
 /// Resolve the builtin provider template path for a zcode runtime.
 ///
-/// An inherited `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` wins (the app may have
-/// already pinned it); otherwise the runtime (`<Resources>/<dir>/zcode.cjs`)
-/// is walked upwards and the first existing `config/provider/zcode-builtin.json`
-/// is used. `None` means the template is unavailable and the whole provider
-/// environment group must be skipped.
+/// An existing explicit override takes precedence. Otherwise, use the App's
+/// matching cache when it is newer than the bundled release.
 pub fn resolve_builtin_provider_config(runtime_path: &Path) -> Option<PathBuf> {
-    if let Some(configured) = env::var_os(BUILTIN_PROVIDER_CONFIG_ENV) {
-        let configured = PathBuf::from(configured);
-        return configured.is_file().then_some(configured);
+    let bundled = derive_builtin_provider_config(runtime_path);
+    resolve_active_builtin(bundled.as_deref())
+}
+
+fn resolve_active_builtin(bundled: Option<&Path>) -> Option<PathBuf> {
+    if let Some(configured) = env::var_os(BUILTIN_PROVIDER_CONFIG_ENV).map(PathBuf::from) {
+        if configured.is_file() {
+            return Some(configured);
+        }
     }
-    derive_builtin_provider_config(runtime_path)
+    let bundled = bundled?;
+    #[cfg(target_os = "macos")]
+    if let Some(cached) = builtin_cache::resolve(bundled) {
+        return Some(cached);
+    }
+    Some(bundled.to_owned())
 }
 
 /// Derive the builtin template from the runtime location alone, ignoring any
@@ -299,7 +309,7 @@ pub fn generate_personal_provider_config(
 
 /// Inject the provider environment group into a zcode child command, or skip
 /// the group as a whole. Derives the user config locations from `HOME` and the
-/// builtin template from the runtime path (or an inherited override).
+/// builtin template from the installed App and its matching cache.
 pub fn apply_provider_environment(command: &mut Command, runtime_path: &Path, data_root: &Path) {
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
         eprintln!(
@@ -309,10 +319,12 @@ pub fn apply_provider_environment(command: &mut Command, runtime_path: &Path, da
     };
     let cli_config = home.join(".zcode/cli/config.json");
     let v2_config = home.join(".zcode/v2/provider_config.json");
-    let builtin = resolve_builtin_provider_config(runtime_path);
+    let bundled = derive_builtin_provider_config(runtime_path);
+    let builtin = resolve_active_builtin(bundled.as_deref());
     if let Err(error) = apply_provider_environment_for(
         command,
         builtin.as_deref(),
+        bundled.as_deref(),
         data_root,
         &cli_config,
         &v2_config,
@@ -330,6 +342,7 @@ pub fn apply_provider_environment(command: &mut Command, runtime_path: &Path, da
 pub(crate) fn apply_provider_environment_for(
     command: &mut Command,
     builtin: Option<&Path>,
+    bundled: Option<&Path>,
     data_root: &Path,
     cli_config: &Path,
     v2_config: &Path,
@@ -345,7 +358,10 @@ pub(crate) fn apply_provider_environment_for(
         generate_personal_provider_config(cli_config, v2_config, builtin, &runtime_dir)?;
     command
         .env(BUILTIN_PROVIDER_CONFIG_ENV, builtin)
-        .env(BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV, builtin)
+        .env(
+            BUILTIN_PROVIDER_BUNDLED_CONFIG_ENV,
+            bundled.unwrap_or(builtin),
+        )
         .env(PERSONAL_PROVIDER_CONFIG_ENV, &generated)
         .env(DATA_BASE_DIR_ENV, &runtime_dir);
     Ok(())
