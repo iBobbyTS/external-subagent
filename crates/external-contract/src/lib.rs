@@ -154,14 +154,24 @@ pub struct SessionCreateProjection {
     pub session_id: String,
     pub requested_model: Option<String>,
     pub configured_thought_level: Option<String>,
-    /// Full model catalog advertised by session/create. This is the only
-    /// durable whitelist for a model switch: `settings.model.available`
-    /// shrinks to the selected model after `session/setModel`.
+    /// Full model catalog advertised by session/create. It supplies canonical
+    /// model IDs and default reasoning levels for known models; discovery
+    /// reads it here because `settings.model.available` shrinks after setModel.
     pub available_models: Vec<CatalogModelEntry>,
 }
 
 impl SessionCreateProjection {
     pub fn from_result(result: &Value) -> Result<Self, ProjectionError> {
+        Self::parse(result, true)
+    }
+
+    /// Bootstrap uses the catalog only for optional model metadata. A catalog
+    /// shape change must not prevent a model request from reaching ZCode.
+    pub fn from_bootstrap_result(result: &Value) -> Result<Self, ProjectionError> {
+        Self::parse(result, false)
+    }
+
+    fn parse(result: &Value, require_valid_catalog: bool) -> Result<Self, ProjectionError> {
         let root = result
             .as_object()
             .ok_or(ProjectionError::Invalid("result"))?;
@@ -202,11 +212,16 @@ impl SessionCreateProjection {
             _ => {}
         }
 
+        let available_models = settings_available_models(root);
         Ok(Self {
             session_id,
             requested_model,
             configured_thought_level: settings_thought_level(root)?,
-            available_models: settings_available_models(root)?,
+            available_models: if require_valid_catalog {
+                available_models?
+            } else {
+                available_models.unwrap_or_default()
+            },
         })
     }
 }
@@ -455,24 +470,17 @@ pub fn normalized_scoped_model(value: &str) -> Option<(String, String)> {
         .flatten()
 }
 
-/// Compare an explicit requested model token against an observed
-/// provider/model pair. Both segments participate; the bare compatibility of
-/// [`normalized_model_reference`] never applies here.
+/// Split the caller's provider/model token into the two native wire fields.
+pub fn split_scoped_model(value: &str) -> Option<(&str, &str)> {
+    let (provider, model) = value.split_once('/')?;
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+}
+
+/// Compare the runtime's provider-qualified echo with the requested selection.
 pub fn provider_model_matches(requested: &str, provider_id: &str, model_id: &str) -> bool {
-    let Some((requested_provider, requested_model)) = normalized_scoped_model(requested) else {
-        return false;
-    };
-    if !is_provider_segment(provider_id) {
-        return false;
-    }
-    if model_id.is_empty()
-        || model_id.len() > 128
-        || model_id.contains('\0')
-        || model_id.contains('/')
-    {
-        return false;
-    }
-    requested_provider == provider_id && requested_model == model_id.to_ascii_lowercase()
+    split_scoped_model(requested).is_some_and(|(provider, model)| {
+        provider == provider_id && model.eq_ignore_ascii_case(model_id)
+    })
 }
 
 fn is_provider_segment(provider: &str) -> bool {

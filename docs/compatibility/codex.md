@@ -268,16 +268,15 @@ and the global "plan must be empty" rule are unchanged.
 
 ## App-server reasoning effort (SOURCE_INSPECTED + probe OBSERVED + live max turn RUN)
 
-The spawn `effort` parameter (admission closed set
-`low | medium | high | xhigh | max`; `minimal` and `ultra` are rejected) is
-driven as the top-level `effort` of every `turn/start`; an omitted spawn
-effort keeps the pre-existing wire default. Evidence layers:
+The spawn `effort` parameter is forwarded as the top-level `effort` of every
+`turn/start`. Codex validates the requested value. An omitted spawn effort
+keeps the pre-existing wire default. Evidence layers:
 
 - **SOURCE_INSPECTED** (codex-cli 0.154.0 binary strings): the
   `none/minimal/low/medium/high/xhigh/max/ultra` variant run sits next to
   `effort`, `reasoningEffort` / `model_reasoning_effort` and the
   `ThreadStart`/`ResumeResponse` types, so all eight tokens serialize on the
-  wire enum; admission still admits only the five values below.
+  wire enum.
 - **OBSERVED** (`models/list` probes 2026-09-15 and 2026-09-22): the models
   advertise one of three `supportedReasoningEfforts` shapes —
   `{low,medium,high,xhigh}`, `{low,medium,high,xhigh,max}`,

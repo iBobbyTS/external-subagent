@@ -67,7 +67,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 - `agy models` 列出 14 个 slug，**多供应商**（gemini-3.x-*/claude-sonnet-4-6/claude-opus-4-6-thinking/gpt-oss-120b-medium）；实测 `claude-sonnet-4-6` 路由成功（1.5s）。`agent_models` 有两个来源：该子命令，以及未知 slug 的 **stderr 错误信息自带完整目录**（`error: invalid model selection ... Available models: ...`）。
 - 未知 slug：stderr 报错 + stdout 一个 `conversation_id:""` 的 ERROR result + **exit 1**（loud fail，符合 fail-closed 偏好）。
 - `--effort` 合法集：`low|medium|high|max`（**含 max，比官方文档多一档**）；非法值 exit 1 并列明合法集。
-- **model 与 effort 非正交**：`claude-sonnet-4-6` 拒绝 `--effort max`（`--effort is not supported for model`）；Gemini slug 自身内嵌 effort 档位（`gemini-3.8-flash-low`），slug+同值显式 effort 可共存。admission 不能像 codex 那样全局 closed_set，需 per-model 校验或 spawn 前 dry 校验。
+- **model 与 effort 非正交**：`claude-sonnet-4-6` 拒绝 `--effort max`（`--effort is not supported for model`）；Gemini slug 自身内嵌 effort 档位（`gemini-3.8-flash-low`），slug+同值显式 effort 可共存。ES 将参数传给 agy，由 agy 校验模型和 effort 的组合。
 
 ## 6. 负面输入（streaming 模式）
 
@@ -89,7 +89,7 @@ headless 默认姿态是**全工具拒绝**（不是官方文档所称"文件 I/
 
 ## 8. 对照产品 MCP 面的结论（以实测为准）
 
-**可直接实现**：spawn（prompt+cwd）；长驻多轮 send/queue_message；result 的 final_text+outcome 映射（SUCCESS/ERROR+error/interrupted）；wait 增量 text tail（text_delta）；tool activity（tool step 含 name/parameters/output，粒度超需求）；cancel 硬杀路径（`interrupted` result + 部分文本 + exit 1，进程组 TERM/KILL 语义匹配）；close/list/durable history；probe local（`--version`）；probe hi（any tool step 即 policy_violation，检测面完整）；auth 层无独立检查 → 按惯例 UNKNOWN；`agent_models`（`agy models`/错误目录）；yolo 权限；effort（closed set low/medium/high/max）；model 启动时选择+会话 sticky；**终态 send 续聊 resume（streaming + `--conversation`，已实现；live 验证 2026-10-29 agy 1.4.10：新进程接续同 conversation，init 回显同 id、num_turns 累计、答出原会话暗号，探测日志 `.agent-work/tmp/terminal-send-probe/probe-agy-resume.log`）**；`denied_actions` 上报（respond 缺失的部分代偿——调用方至少能看到任务被拒了什么）；structured_output（超出项目现有面的免费加分）。
+**可直接实现**：spawn（prompt+cwd）；长驻多轮 send/queue_message；result 的 final_text+outcome 映射（SUCCESS/ERROR+error/interrupted）；wait 增量 text tail（text_delta）；tool activity（tool step 含 name/parameters/output，粒度超需求）；cancel 硬杀路径（`interrupted` result + 部分文本 + exit 1，进程组 TERM/KILL 语义匹配）；close/list/durable history；probe local（`--version`）；probe hi（any tool step 即 policy_violation，检测面完整）；auth 层无独立检查 → 按惯例 UNKNOWN；`agent_models`（`agy models`/错误目录）；yolo 权限；effort（由 agy 校验）；model 启动时选择+会话 sticky；**终态 send 续聊 resume（streaming + `--conversation`，已实现；live 验证 2026-10-29 agy 1.4.10：新进程接续同 conversation，init 回显同 id、num_turns 累计、答出原会话暗号，探测日志 `.agent-work/tmp/terminal-send-probe/probe-agy-resume.log`）**；`denied_actions` 上报（respond 缺失的部分代偿——调用方至少能看到任务被拒了什么）；structured_output（超出项目现有面的免费加分）。
 
 **降级/变通**：build/edit 权限（allow 规则注入 + `--mode accept-edits`；预授权 ≠ 拦截守卫）；plan 姿态（`--mode plan` + `deny` 兜底可构造，但语义是"强制拒绝"非"工具禁用"，需产品决策是否承认为 plan）；reasoning tail（无 thought 流 → 不采集，照 codex 先例）；resume 单轮延迟 53–58s（上下文重放成本）。
 

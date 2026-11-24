@@ -97,7 +97,7 @@
         },
         "effort_selection": {
           "type": "object",
-          "description": "Reasoning-effort steering capability. codex admits only its closed set; zcode and dsh pass a bounded [a-z0-9_] token through to the runtime.",
+          "description": "Reasoning-effort steering capability. All agents forward the token to their target runtime.",
           "required": [
             "supported",
             "mode"
@@ -220,14 +220,12 @@
         "model": {
           "type": "string",
           "minLength": 1,
-          "description": "Task model. dsh requires provider:model, split at the first colon (the model side may contain further colons; a missing colon or an empty side is rejected before any task). codex uses its own model id; zcode requires an explicit provider/model token from the spawn request or a named profile, and rejects a bare token, an omitted model, and agents.zcode.default_model at admission. agy uses a bare model slug with no ':' or '/' separator or whitespace; admission validates only that shape and the daemon does not verify catalog membership, so an unknown slug fails loudly at session start when the agy CLI rejects it. Omission falls back to the configured default_model for dsh and agy, then to the provider-native model; codex requires an explicit model or agents.codex.default_model; zcode and codex never fall back to a provider default."
+          "description": "Task model. dsh requires provider:model, split at the first colon (the model side may contain further colons; a missing colon or an empty side is rejected before any task). codex uses its own model id; zcode requires an explicit provider/model token from the spawn request or a named profile, and rejects a bare token, an omitted model, and agents.zcode.default_model at admission. agy uses its native model token. The target runtime validates the selection. Omission falls back to the configured default_model for dsh and agy, then to the provider-native model; codex requires an explicit model or agents.codex.default_model; zcode and codex never fall back to a provider default."
         },
         "effort": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 24,
-          "pattern": "^[a-z0-9_]+$",
-          "description": "Reasoning-effort token: 1..24 bytes of [a-z0-9_]. codex admits only low, medium, high, xhigh or max; agy admits only low, medium, high or max; zcode and dsh pass the bounded token through. Omission keeps the runtime default."
+          "description": "Optional reasoning-effort token passed to the target runtime."
         },
         "developer_instructions": {
           "type": "string",
@@ -299,20 +297,6 @@
                 "enum": [
                   "build",
                   "yolo"
-                ]
-              },
-              "model": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 512,
-                "pattern": "^[^:/\\s]+$"
-              },
-              "effort": {
-                "enum": [
-                  "low",
-                  "medium",
-                  "high",
-                  "max"
                 ]
               },
               "write_manifest": {

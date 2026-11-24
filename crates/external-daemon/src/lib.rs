@@ -1,7 +1,7 @@
 use external_contract::{
-    configured_thought_level_from_result, normalized_scoped_model,
+    configured_thought_level_from_result, split_scoped_model,
     normalized_zai_model, offered_permission_response, provider_model_matches,
-    set_model_projection_from_result, turn_id_from_result, CatalogModelEntry, CreateSessionParams,
+    set_model_projection_from_result, turn_id_from_result, CreateSessionParams,
     ResumeSessionParams, RuntimePreferences, SendParams, SessionCreateProjection, SessionParams,
     SetModelParams, StdioMcpServer, SubscribeParams, WireId, WireMessage, WorkspaceRef,
     INTERACTION_REQUEST_PERMISSION, INTERACTION_REQUEST_UNSUPPORTED_INPUT,
@@ -888,7 +888,7 @@ impl RuntimeOwner {
         let create_params = serde_json::to_value(CreateSessionParams {
             workspace,
             mode,
-            thought_level: requested_effort,
+            thought_level: if requested_model.is_none() { requested_effort } else { None },
             mcp_servers,
         })
         .map_err(|error| RuntimeCommandError::Transport(error.to_string()))?;
@@ -900,7 +900,7 @@ impl RuntimeOwner {
         let result = created.result.as_ref().ok_or_else(|| {
             RuntimeCommandError::InvalidSession("session/create result is missing".into())
         })?;
-        let projection = SessionCreateProjection::from_result(result).map_err(|error| {
+        let projection = SessionCreateProjection::from_bootstrap_result(result).map_err(|error| {
             RuntimeCommandError::InvalidSession(format!(
                 "session/create projection is invalid: {error}"
             ).into())
@@ -924,9 +924,8 @@ impl RuntimeOwner {
                 projection.requested_model
             }
             Some(requested) => {
-                // Two-step model switch: the create result's full catalog is
-                // the whitelist, session/setModel applies the selection, and
-                // the result's provider-qualified read-back is authoritative.
+                // ZCode decides whether to accept the requested model.
+                // Check the provider-qualified read-back before sending a prompt.
                 self.switch_session_model(
                     &session_id,
                     requested,
@@ -960,11 +959,8 @@ impl RuntimeOwner {
     /// Apply an admitted model to a freshly created session before the first
     /// prompt.
     ///
-    /// The create result's catalog is the only whitelist: `available` shrinks
-    /// to the selected model after `session/setModel`, so it must never be
-    /// re-read as the full directory. The reasoning level resolves against
-    /// the matched catalog entry, then setModel's own result is read back
-    /// provider-qualified fail-closed.
+    /// The create catalog supplies canonical spelling and the default effort
+    /// when available. Only the runtime decides whether the selection exists.
     fn switch_session_model(
         &self,
         session_id: &str,
@@ -973,50 +969,21 @@ impl RuntimeOwner {
         projection: &SessionCreateProjection,
         deadline: Instant,
     ) -> Result<(), RuntimeCommandError> {
-        if normalized_scoped_model(requested).is_none() {
+        let Some((provider, model)) = split_scoped_model(requested)
+        else {
             return Err(RuntimeCommandError::InvalidSession(format!(
                 "MODEL_REQUEST_INVALID: {}",
                 bounded_prefix(requested, 128)
             ).into()));
-        }
-        let entry = projection
-            .available_models
-            .iter()
-            .find(|entry| {
-                matches!(
-                    (entry.provider_id.as_deref(), entry.model_id.as_deref()),
-                    (Some(provider), Some(model))
-                        if provider_model_matches(requested, provider, model)
-                )
-            })
-            .ok_or_else(|| {
-                RuntimeCommandError::InvalidSession(model_not_offered_message(
-                    requested,
-                    &projection.available_models,
-                ).into())
-            })?;
-        let (Some(provider), Some(model)) =
-            (entry.provider_id.as_deref(), entry.model_id.as_deref())
-        else {
-            unreachable!("matched catalog entries carry both ref segments")
         };
-        let reasoning_level = match requested_effort {
-            Some(effort) => Some(
-                entry
-                    .reasoning_levels
-                    .iter()
-                    .any(|level| level == effort)
-                    .then_some(effort)
-                    .ok_or_else(|| {
-                        RuntimeCommandError::InvalidSession(format!(
-                            "MODEL_NOT_OFFERED: effort {} not in levels [{}]",
-                            bounded_prefix(effort, 128),
-                            bounded_prefix(&entry.reasoning_levels.join(", "), 512)
-                        ).into())
-                    })?,
-            ),
-            None => entry.default_level.as_deref(),
-        };
+        let catalog_entry = projection.available_models.iter().find_map(|entry| {
+            let provider_id = entry.provider_id.as_deref()?;
+            let model_id = entry.model_id.as_deref()?;
+            provider_model_matches(requested, provider_id, model_id)
+                .then_some((model_id, entry.default_level.as_deref()))
+        });
+        let (model, default_level) = catalog_entry.unwrap_or((model, None));
+        let reasoning_level = requested_effort.or(default_level);
         let params = serde_json::to_value(SetModelParams::new(
             session_id,
             provider,
@@ -1283,6 +1250,15 @@ fn validate_requested_model(
     let Some(requested) = requested else {
         return Ok(());
     };
+    if split_scoped_model(requested).is_some() {
+        if let Some((provider, model)) = observed.and_then(split_scoped_model) {
+            return if provider_model_matches(requested, provider, model) {
+                Ok(())
+            } else {
+                Err("MODEL_MISMATCH")
+            };
+        }
+    }
     let Some(requested) = normalized_zai_model(requested) else {
         return Err("MODEL_REQUEST_INVALID");
     };
@@ -1346,25 +1322,6 @@ fn admitted_model_from_task(task: &TaskRecord) -> Option<String> {
             .and_then(|identity| identity.model.clone()),
         Err(_) => None,
     }
-}
-
-fn model_not_offered_message(requested: &str, available: &[CatalogModelEntry]) -> String {
-    let mut tokens = available
-        .iter()
-        .filter_map(
-            |entry| match (entry.provider_id.as_deref(), entry.model_id.as_deref()) {
-                (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
-                _ => None,
-            },
-        )
-        .collect::<Vec<_>>();
-    tokens.sort();
-    tokens.dedup();
-    format!(
-        "MODEL_NOT_OFFERED: {}; available: [{}]",
-        bounded_prefix(requested, 128),
-        bounded_prefix(&tokens.join(", "), 512)
-    )
 }
 
 /// Classify a remote `session/setModel` error.

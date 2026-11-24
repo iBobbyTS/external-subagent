@@ -80,7 +80,6 @@ pub(crate) struct AgentPolicy {
     pub(crate) model_shape: ModelShape,
     pub(crate) write_manifest: WriteManifestPolicy,
     pub(crate) home: HomeRequirement,
-    pub(crate) effort: EffortPolicy,
     pub(crate) developer_instructions: DeveloperInstructionsChannel,
     pub(crate) expected_version: ExpectedVersion,
     pub(crate) probe_home: ProbeHome,
@@ -135,10 +134,7 @@ impl AgentPolicy {
     ) -> AgentEffortSelectionCapabilityView {
         AgentEffortSelectionCapabilityView {
             supported: self.spawn_supported(entry),
-            mode: match self.effort {
-                EffortPolicy::Passthrough => AgentEffortSelectionModeView::PassthroughToken,
-                EffortPolicy::Closed(_) => AgentEffortSelectionModeView::ClosedSet,
-            },
+            mode: AgentEffortSelectionModeView::PassthroughToken,
         }
     }
 
@@ -224,11 +220,10 @@ pub(crate) enum ModelShape {
     /// `{provider}:{model}` split at the first colon, with configured-default
     /// and native fallback.
     DshColonToken,
-    /// A bounded non-empty token; absence is refused.
-    CodexBoundedToken,
-    /// A bare slug with no separator or whitespace; configured-default and
-    /// native fallback.
-    AgyBareSlug,
+    /// A native model token; absence is refused.
+    CodexNativeToken,
+    /// A native model token with configured-default and native fallback.
+    AgyNativeToken,
 }
 
 /// How a caller write manifest is treated at admission.
@@ -251,15 +246,6 @@ pub(crate) enum HomeRequirement {
     /// A configured home or the inherited variable must be present; the
     /// daemon never falls back to the runtime's default home.
     ConfiguredOrEnv(&'static str),
-}
-
-/// The reasoning-effort admission rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffortPolicy {
-    /// A bounded lowercase token is passed through to the runtime.
-    Passthrough,
-    /// A bounded token is restricted to this measured closed set.
-    Closed(&'static [&'static str]),
 }
 
 /// Where spawn developer instructions travel.
@@ -358,8 +344,6 @@ static ALL_PERMISSION_MODES: [PermissionMode; 4] = [
 ];
 static DSH_PERMISSION_MODES: [PermissionMode; 2] = [PermissionMode::Build, PermissionMode::Plan];
 static AGY_PERMISSION_MODES: [PermissionMode; 2] = [PermissionMode::Build, PermissionMode::Yolo];
-static CODEX_EFFORT: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-static AGY_EFFORT: [&str; 4] = ["low", "medium", "high", "max"];
 
 static ZCODE: AgentPolicy = AgentPolicy {
     kind: AgentKind::Zcode,
@@ -370,7 +354,6 @@ static ZCODE: AgentPolicy = AgentPolicy {
     model_shape: ModelShape::ZcodeProviderModel,
     write_manifest: WriteManifestPolicy::Unrestricted,
     home: HomeRequirement::NotRequired,
-    effort: EffortPolicy::Passthrough,
     developer_instructions: DeveloperInstructionsChannel::PromptSplice,
     expected_version: ExpectedVersion::Configured,
     probe_home: ProbeHome {
@@ -394,7 +377,6 @@ static DSH: AgentPolicy = AgentPolicy {
     model_shape: ModelShape::DshColonToken,
     write_manifest: WriteManifestPolicy::GuardedBuildComposition,
     home: HomeRequirement::NotRequired,
-    effort: EffortPolicy::Passthrough,
     developer_instructions: DeveloperInstructionsChannel::PromptSplice,
     expected_version: ExpectedVersion::PinnedDsh,
     probe_home: ProbeHome {
@@ -416,10 +398,9 @@ static CODEX: AgentPolicy = AgentPolicy {
     spawn_gate: SpawnGate::ExecutableRuntime,
     permission_modes: &ALL_PERMISSION_MODES,
     permission_refusal: None,
-    model_shape: ModelShape::CodexBoundedToken,
+    model_shape: ModelShape::CodexNativeToken,
     write_manifest: WriteManifestPolicy::Refused("CODEX_WRITE_MANIFEST_UNSUPPORTED"),
     home: HomeRequirement::ConfiguredOrEnv("CODEX_HOME"),
-    effort: EffortPolicy::Closed(&CODEX_EFFORT),
     developer_instructions: DeveloperInstructionsChannel::NativeThreadStart,
     expected_version: ExpectedVersion::Configured,
     probe_home: ProbeHome {
@@ -444,10 +425,9 @@ static AGY: AgentPolicy = AgentPolicy {
     spawn_gate: SpawnGate::ExecutableRuntime,
     permission_modes: &AGY_PERMISSION_MODES,
     permission_refusal: Some("AGY_PERMISSION_MODE_UNSUPPORTED"),
-    model_shape: ModelShape::AgyBareSlug,
+    model_shape: ModelShape::AgyNativeToken,
     write_manifest: WriteManifestPolicy::Refused("AGY_WRITE_MANIFEST_UNSUPPORTED"),
     home: HomeRequirement::NotRequired,
-    effort: EffortPolicy::Closed(&AGY_EFFORT),
     developer_instructions: DeveloperInstructionsChannel::PromptSplice,
     expected_version: ExpectedVersion::Configured,
     probe_home: ProbeHome {

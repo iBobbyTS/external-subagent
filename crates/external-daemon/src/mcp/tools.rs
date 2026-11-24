@@ -1726,7 +1726,7 @@ mod contract_default_tests {
     // a second copy of every admission rule in the top-level description.
     #[test]
     fn spawn_parameter_descriptions_match_the_agent_policy_table() {
-        use crate::rpc::agent_policy::{AgentKind, EffortPolicy, ModelShape, WriteManifestPolicy};
+        use crate::rpc::agent_policy::{AgentKind, ModelShape, WriteManifestPolicy};
         use external_core::{MAX_WRITE_MANIFEST_BYTES, MAX_WRITE_MANIFEST_ENTRIES};
         let facade = SubagentMcp::new(PathBuf::from("/tmp/spawn-policy.sock"), Duration::from_secs(1));
         let spawn = facade.tool_router.list_all().into_iter()
@@ -1735,14 +1735,7 @@ mod contract_default_tests {
         let description = |field: &str| schema["properties"][field]["description"]
             .as_str().unwrap().split_whitespace().collect::<Vec<_>>().join(" ");
         let effort = description("effort");
-        for (kind, label) in [(AgentKind::Codex, "Codex accepts"), (AgentKind::Agy, "agy")] {
-            let EffortPolicy::Closed(values) = kind.policy().effort else { panic!("expected closed efforts") };
-            assert!(effort.contains(&format!("{label} {}", values.join("/"))));
-        }
-        for kind in [AgentKind::Zcode, AgentKind::Dsh] {
-            assert!(matches!(kind.policy().effort, EffortPolicy::Passthrough));
-        }
-        assert!(effort.contains("zcode/dsh pass through"));
+        assert!(effort.contains("target runtime"));
         let modes = description("permission_mode");
         for (kind, label) in [(AgentKind::Dsh, "dsh"), (AgentKind::Agy, "agy")] {
             let names = kind.policy().permission_modes.iter()
@@ -1766,7 +1759,7 @@ mod contract_default_tests {
         for (kind, shape, text) in [
             (AgentKind::Zcode, ModelShape::ZcodeProviderModel, "zcode requires explicit provider/model"),
             (AgentKind::Dsh, ModelShape::DshColonToken, "dsh uses provider:model"),
-            (AgentKind::Agy, ModelShape::AgyBareSlug, "agy uses a bare slug"),
+            (AgentKind::Agy, ModelShape::AgyNativeToken, "codex and agy use their native model tokens"),
         ] {
             assert_eq!(kind.policy().model_shape, shape);
             assert!(model.contains(text));

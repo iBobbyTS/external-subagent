@@ -126,16 +126,13 @@ pub struct AgentSpawnInput {
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
     /// Runtime model token: zcode requires explicit provider/model; dsh uses
-    /// provider:model; codex uses its model id; agy uses a bare slug validated
-    /// for shape, not catalog membership; an unknown agy slug fails at runtime.
+    /// provider:model; codex and agy use their native model tokens.
     /// A profile may supply the model; codex also accepts its configured default.
     /// Only dsh/agy may fall back to a provider-native default.
     pub model: Option<String>,
     #[serde(default, deserialize_with = "optional_non_null")]
     #[schemars(with = "String")]
-    /// Optional reasoning effort, 1..24 bytes of [a-z0-9_]. Codex accepts
-    /// low/medium/high/xhigh/max; agy low/medium/high/max; zcode/dsh pass through.
-    /// Omission preserves the runtime default.
+    /// Optional reasoning-effort token passed to the target runtime.
     pub effort: Option<String>,
     /// Per-task developer instructions. codex routes them through the native
     /// `developerInstructions` channel on thread/start (prompt stays

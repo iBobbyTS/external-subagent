@@ -42,8 +42,8 @@ test('packaged public schema is the reduced external_subagent catalog', () => {
   assert.equal(schema.properties.spawn.properties.model.type, 'string');
   assert.equal(schema.properties.spawn.properties.subagent.type, 'string');
   assert.equal(schema.properties.spawn.properties.effort.type, 'string');
-  assert.equal(schema.properties.spawn.properties.effort.pattern, '^[a-z0-9_]+$');
-  assert.equal(schema.properties.spawn.properties.effort.maxLength, 24);
+  assert.equal(schema.properties.spawn.properties.effort.pattern, undefined);
+  assert.equal(schema.properties.spawn.properties.effort.maxLength, undefined);
   assert.equal(schema.properties.spawn.properties.developer_instructions.type, 'string');
   assert.equal(schema.properties.spawn.properties.developer_instructions.maxLength, 1048576);
   assert.equal(schema.properties.list.properties.limit.default, 100);
@@ -164,17 +164,18 @@ test('observation contract keeps public tails and typed native evidence', () => 
   ]);
 });
 
-test('agy spawn contract pins a bare slug, the closed effort set, build/yolo and empty manifests', () => {
+test('agy spawn contract leaves model and effort to the runtime and requires build/yolo and empty manifests', () => {
   const schema = JSON.parse(fs.readFileSync(path.join(root, 'schema/external-subagent-public-api.json'), 'utf8'));
   const spawn = schema.properties.spawn;
   assert.match(spawn.properties.write_manifest.description, /agy_write_manifest_unsupported/u);
-  assert.match(spawn.properties.model.description, /agy uses a bare model slug/u);
+  assert.match(spawn.properties.model.description, /agy uses its native model token/u);
   const rule = spawn.allOf.find((rule) => rule.if.properties.subagent?.const === 'agy');
   assert.deepEqual(rule.if.required, ['subagent']);
   assert.deepEqual(rule.then.properties.permission_mode.enum, ['build', 'yolo']);
-  assert.deepEqual(rule.then.properties.effort.enum, ['low', 'medium', 'high', 'max']);
-  assert.equal(rule.then.properties.model.maxLength, 512);
-  assert.equal(rule.then.properties.model.pattern, '^[^:/\\s]+$');
+  assert.equal(rule.then.properties.effort, undefined);
+  assert.equal(rule.then.properties.model, undefined);
+  assert.equal(spawn.properties.effort.pattern, undefined);
+  assert.equal(spawn.properties.effort.maxLength, undefined);
   assert.equal(rule.then.properties.write_manifest.maxItems, 0);
   assert.deepEqual(schema.properties.subagent_status.properties.subagent.enum, ['zcode', 'dsh', 'codex', 'agy']);
 });

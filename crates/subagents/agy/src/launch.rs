@@ -42,43 +42,12 @@ impl AgyPermissionMode {
     }
 }
 
-/// The measured `agy` effort closed set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgyEffort {
-    Low,
-    Medium,
-    High,
-    Max,
-}
-
-impl AgyEffort {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Max => "max",
-        }
-    }
-
-    /// Parse one effort token against the closed set.
-    pub fn parse(token: &str) -> Option<Self> {
-        Some(match token {
-            "low" => Self::Low,
-            "medium" => Self::Medium,
-            "high" => Self::High,
-            "max" => Self::Max,
-            _ => return None,
-        })
-    }
-}
-
 /// Optional launch selections. Every field is omitted from the argv when
 /// `None`, so the historical stream-json launch is the bare baseline.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgyLaunchOptions {
     pub model: Option<String>,
-    pub effort: Option<AgyEffort>,
+    pub effort: Option<String>,
     pub permission: Option<AgyPermissionMode>,
     pub conversation: Option<String>,
 }
@@ -89,12 +58,10 @@ pub struct AgyLaunchOptions {
 pub fn launch_args(options: &AgyLaunchOptions) -> Vec<String> {
     let mut args: Vec<String> = BASE_ARGS.iter().map(|arg| (*arg).to_owned()).collect();
     if let Some(model) = &options.model {
-        args.push("--model".into());
-        args.push(model.clone());
+        push_selection_arg(&mut args, "--model", model);
     }
-    if let Some(effort) = options.effort {
-        args.push("--effort".into());
-        args.push(effort.as_str().into());
+    if let Some(effort) = &options.effort {
+        push_selection_arg(&mut args, "--effort", effort);
     }
     if let Some(permission) = options.permission {
         args.extend(permission.args().iter().map(|arg| (*arg).to_owned()));
@@ -104,6 +71,16 @@ pub fn launch_args(options: &AgyLaunchOptions) -> Vec<String> {
         args.push(conversation.clone());
     }
     args
+}
+
+fn push_selection_arg(args: &mut Vec<String>, flag: &str, selection: &str) {
+    // Keep flag-like tokens in their value slot so they cannot become CLI switches.
+    if selection.starts_with('-') {
+        args.push(format!("{flag}={selection}"));
+    } else {
+        args.push(flag.to_owned());
+        args.push(selection.to_owned());
+    }
 }
 
 /// The `agy models` argv (excluding the executable).
@@ -161,7 +138,7 @@ mod tests {
     fn launch_args_assemble_options_in_order() {
         let options = AgyLaunchOptions {
             model: Some("claude-sonnet-4-6".into()),
-            effort: Some(AgyEffort::High),
+            effort: Some("high".into()),
             permission: Some(AgyPermissionMode::Build),
             conversation: Some("a48d42bb-a643-476b-b394-f4efac7fff21".into()),
         };
@@ -191,16 +168,11 @@ mod tests {
             AgyPermissionMode::Yolo.args(),
             ["--dangerously-skip-permissions"]
         );
-        for (effort, token) in [
-            (AgyEffort::Low, "low"),
-            (AgyEffort::Medium, "medium"),
-            (AgyEffort::High, "high"),
-            (AgyEffort::Max, "max"),
-        ] {
-            assert_eq!(effort.as_str(), token);
-            assert_eq!(AgyEffort::parse(token), Some(effort));
-        }
-        assert_eq!(AgyEffort::parse("extreme"), None);
+        let options = AgyLaunchOptions {
+            effort: Some("future-effort".into()),
+            ..AgyLaunchOptions::default()
+        };
+        assert!(launch_args(&options).ends_with(&["--effort".into(), "future-effort".into()]));
         let yolo = AgyLaunchOptions {
             permission: Some(AgyPermissionMode::Yolo),
             ..AgyLaunchOptions::default()

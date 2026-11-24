@@ -872,9 +872,9 @@ fn start_effort_echo_is_diagnostic_only_and_never_blocks_the_turn() {
     // (defaultReasoningEffort="medium"), not an acknowledgement of the
     // admitted selection. The start-side echo is therefore diagnostic-only:
     // whether the echo names the model default (medium), matches the
-    // admission (high), or is missing entirely, the first turn must still
+    // admission (Future-Effort), or is missing entirely, the first turn must still
     // start and its turn/start frame must name the admitted effort.
-    for (index, effort_echo) in [Some("medium"), Some("high"), None].iter().enumerate() {
+    for (index, effort_echo) in [Some("medium"), Some("Future-Effort"), None].iter().enumerate() {
         let workspace = codex_workspace();
         let directory = workspace.path().to_owned();
         let echo = start_echo(&directory, PermissionMode::Plan);
@@ -885,7 +885,7 @@ fn start_effort_echo_is_diagnostic_only_and_never_blocks_the_turn() {
         let submitted = scheduler
             .enqueue_general_with_admission(
                 &manifest_for(&directory, &format!("effort case {index}")),
-                Some(codex_admission_with_effort(Some(MODEL), Some("high"))),
+                Some(codex_admission_with_effort(Some(MODEL), Some("Future-Effort"))),
             )
             .unwrap();
         let agent_id = submitted.agent_id.clone();
@@ -904,7 +904,7 @@ fn start_effort_echo_is_diagnostic_only_and_never_blocks_the_turn() {
             .find(|frame| frame["method"] == "turn/start")
             .expect("turn/start frame");
         assert_eq!(
-            turn_start["params"]["effort"], "high",
+            turn_start["params"]["effort"], "Future-Effort",
             "the admitted effort must reach the turn/start frame (case {index})"
         );
     }

@@ -352,7 +352,7 @@ fn admitted_effort_is_threaded_into_the_child_argv() {
     let submitted = scheduler
         .enqueue_general_with_admission(
             &manifest_for_mode(&directory, "run with effort", PermissionMode::Build),
-            Some(agy_admission_with_effort(Some(MODEL), Some("high"))),
+            Some(agy_admission_with_effort(Some(MODEL), Some("Future-Effort"))),
         )
         .unwrap();
     let agent_id = submitted.agent_id.clone();
@@ -361,7 +361,7 @@ fn admitted_effort_is_threaded_into_the_child_argv() {
     assert_eq!(result.result.outcome, TaskOutcome::Completed);
     let args = argv(&directory);
     assert!(args.contains(&"ARG--effort".into()), "{args:?}");
-    assert!(args.contains(&"ARGhigh".into()), "{args:?}");
+    assert!(args.contains(&"ARGFuture-Effort".into()), "{args:?}");
 }
 
 #[test]

@@ -2459,7 +2459,6 @@ fn classify_dsh_session_error(
         }
         SessionError::Transport(_) => "network",
         SessionError::Model(_) => "shape",
-        SessionError::ReasoningEffort(_) => "shape",
     }
 }
 
@@ -2783,13 +2782,7 @@ mod tests {
         );
         assert_eq!(
             classify_dsh_session_error(&SessionError::Model(
-                external_agent_dsh::acp::model::ModelSetError::NotOffered
-            )),
-            "shape"
-        );
-        assert_eq!(
-            classify_dsh_session_error(&SessionError::ReasoningEffort(
-                external_agent_dsh::acp::model::ReasoningEffortSetError::NotOffered
+                external_agent_dsh::acp::model::ModelSetError::TokenInvalid
             )),
             "shape"
         );

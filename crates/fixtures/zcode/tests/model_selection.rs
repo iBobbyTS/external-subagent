@@ -228,25 +228,45 @@ fn ac1b_non_zai_provider_round_trips_provider_qualified() {
     );
 }
 
-/// AC②: a token outside the create catalog fails closed with bounded
-/// available evidence and no setModel frame; the scheduler keeps classifying
-/// an InvalidSession bootstrap failure as SESSION_START_FAILED.
+/// The target runtime decides whether to accept a model missing from the catalog.
 #[test]
-fn ac2_unoffered_model_fails_closed_before_set_model() {
-    let case = run_case("ac2-unoffered-", &[], Some("zai/NOT-A-MODEL"), None);
-    assert!(
-        case.start.is_err(),
-        "unoffered model must fail the bootstrap"
+fn ac2_model_missing_from_catalog_reaches_zcode() {
+    let requested = "zai/GLM-5.6";
+    let accepted = run_case("ac2-accepted-", &[], Some(requested), None);
+    assert!(accepted.start.is_ok());
+    assert_eq!(accepted.outcome(), TaskOutcome::Completed);
+    assert_eq!(
+        set_model_params(&accepted)["model"],
+        json!({"providerId": "zai", "modelId": "GLM-5.6"})
     );
-    assert_eq!(case.outcome(), TaskOutcome::Failed);
-    assert_eq!(case.reason_code().as_deref(), Some("SESSION_START_FAILED"));
-    let failure = case.last_error().unwrap();
-    assert!(
-        failure.contains("MODEL_NOT_OFFERED") && failure.contains("available:"),
-        "failure must name the missing offer and its bounded evidence: {failure}"
+
+    let rejected = run_case(
+        "ac2-rejected-",
+        &[("ZCODE_FAKE_SETMODEL_ERROR_CODE", "model_not_found")],
+        Some(requested),
+        None,
     );
-    assert!(failure.contains("zai/GLM-5.3"), "evidence list: {failure}");
-    case.assert_no_set_model();
+    assert!(rejected.start.is_err());
+    assert_eq!(rejected.outcome(), TaskOutcome::Failed);
+    assert_eq!(rejected.reason_code().as_deref(), Some("MODEL_REJECTED"));
+    assert_eq!(set_model_params(&rejected)["model"]["modelId"], "GLM-5.6");
+    assert!(!rejected.frames().iter().any(|frame| frame["method"] == "session/send"));
+}
+
+#[test]
+fn malformed_catalog_does_not_block_zcode_model_selection() {
+    let case = run_case(
+        "malformed-catalog-",
+        &[("ZCODE_FAKE_MODEL_CATALOG", r#"{"unexpected": true}"#)],
+        Some("zai/GLM-5.3"),
+        Some("high"),
+    );
+    assert!(case.start.is_ok());
+    assert_eq!(case.outcome(), TaskOutcome::Completed);
+    assert_eq!(
+        set_model_params(&case)["model"],
+        json!({"providerId": "zai", "modelId": "GLM-5.3", "options": {"reasoningLevel": "high"}})
+    );
 }
 
 /// AC③: documented remote rejections are discriminated by error.data.code
@@ -390,20 +410,26 @@ fn ac6_state_updated_notification_does_not_disturb_the_pump() {
     );
 }
 
-/// AC⑦: an admitted effort outside the catalog entry's levels is rejected
-/// before any setModel frame, with the levels as evidence.
+/// An explicit reasoning level is forwarded for the runtime to validate.
 #[test]
-fn ac7_effort_outside_catalog_levels_is_rejected_before_set_model() {
-    let case = run_case("ac7-effort-", &[], Some("zai/GLM-5.3"), Some("medium"));
-    assert!(case.start.is_err(), "unavailable effort must fail early");
-    assert_eq!(case.outcome(), TaskOutcome::Failed);
-    assert_eq!(case.reason_code().as_deref(), Some("SESSION_START_FAILED"));
-    let failure = case.last_error().unwrap();
-    assert!(
-        failure.contains("MODEL_NOT_OFFERED")
-            && failure.contains("medium")
-            && failure.contains("low, high, max"),
-        "failure must carry the level evidence: {failure}"
+fn ac7_explicit_effort_reaches_the_requested_model_even_when_absent_from_catalog() {
+    let case = run_case(
+        "ac7-effort-",
+        &[],
+        Some("account:zai-individual-coding-plan/GLM-Future"),
+        Some("Future-Effort"),
     );
-    case.assert_no_set_model();
+    assert!(case.start.is_ok());
+    assert_eq!(case.outcome(), TaskOutcome::Completed);
+    let frames = case.frames();
+    let create = frames.iter().find(|frame| frame["method"] == "session/create").unwrap();
+    assert!(create["params"].get("thoughtLevel").is_none());
+    assert_eq!(
+        set_model_params(&case)["model"],
+        json!({
+            "providerId": "account:zai-individual-coding-plan",
+            "modelId": "GLM-Future",
+            "options": {"reasoningLevel": "Future-Effort"}
+        })
+    );
 }

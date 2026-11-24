@@ -193,30 +193,24 @@ The spawn `model` token for dsh is `{provider}:{model}`, split at the
 **first** `:`; the model side may itself contain further colons and neither
 side is restricted to a character set. Admission (the same code path that the
 configured `agents.dsh.default_model` uses) refuses a token with no colon, an
-empty provider (`:model`), an empty model (`provider:`), a NUL byte, or more
-than 512 bytes, with an error naming the `provider:model` format; the token is
+empty provider (`:model`), an empty model (`provider:`), or a NUL byte, with an error naming the `provider:model` format; the token is
 trimmed before validation, as before. After `session/new` and before the first
 `session/prompt`, `set_model` re-serializes the parsed sides with serde_json as
 the byte-exact two-element JSON string `["provider","model"]` and sends that as
 the `session/set_config_option` `value`; the colon token itself is never sent
 raw. `input_identity.model` persists the trimmed colon token unchanged, and
 `model_source` keeps its `spawn_catalog` / `configured_default` / `native`
-semantics. Membership of the provider's real catalog is still decided by the
-session: an unknown tuple makes `session_start` fail with `-32602` before any
-prompt is sent. Codex keeps its own model id and zcode still rejects model
-selection; the reasoning-effort channel is unchanged.
+semantics. The model selection is sent even if `session/new` omits the
+`model` config option. A native rejection of the option or the tuple stops
+bootstrap before the first prompt.
 
 ## Reasoning effort via ACP set_config_option (implemented; live NOT_RUN)
 
 The spawn `effort` token for dsh is applied through the same
 `session/set_config_option` (X05) contract as model selection: one call
 after `session/new` and before the first `session/prompt`, omitted entirely
-when no effort was admitted. Three branches, mirroring `set_model`: a token
-failing the bounded opaque-token validation refuses with no wire traffic; a
-server that advertised `configOptions` without a `reasoning_effort` entry
-fails closed as `NotOffered` (no set-option frame is sent); a server that
-did not advertise `configOptions` at all gets the set option forwarded and
-the server's verdict decides. Every failure sets `effort_refused`, which
+when no effort was supplied. DSH receives the option regardless of the
+session's advertised `configOptions` and returns its own validation errors. Every failure sets `effort_refused`, which
 permanently blocks `prompt` for that session exactly like a refused model
 selection. There is no resume re-application point: the dsh runtime owner
 has no resume entry and re-runs the full bootstrap sequence on every claim.

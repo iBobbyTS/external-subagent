@@ -1426,7 +1426,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603}}}}'
 }
 
 #[test]
-fn model_rejection_uses_the_not_offered_session_display() {
+fn model_selection_reaches_dsh_without_an_advertised_option() {
     let _guard = scripted_test_guard();
     let workspace = dsh_workspace();
     let script = format!(
@@ -1435,6 +1435,8 @@ read_frame
 printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"capabilities":{{"models":true,"cancel":true,"permission":true}}}}}}'
 read_frame
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","configOptions":[{{"configId":"reasoning_effort"}}]}}}}'
+read_frame
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"error":{{"code":-32603,"message":"unsupported model option"}}}}'
 "#
     );
     let child = scripted_child(workspace.path(), &script);
@@ -1447,8 +1449,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","c
 
     let stored = await_result(&scheduler, &agent_id);
     assert_eq!(
-        stored.result.final_text,
-        "model selection was rejected: dsh session advertised no model config option"
+        serde_json::from_str::<serde_json::Value>(&stored.result.final_text).unwrap(),
+        serde_json::json!({"code": -32603, "message": "unsupported model option"})
     );
     assert_eq!(
         scheduler
@@ -1461,8 +1463,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"{SESSION_ID}","c
     let frames = wire_frames(workspace.path());
     assert_eq!(
         request_methods(&frames),
-        vec!["initialize", "session/new"],
-        "a not-offered model must never emit a config frame"
+        vec!["initialize", "session/new", "session/set_config_option"]
     );
 }
 

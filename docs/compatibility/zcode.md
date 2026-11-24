@@ -130,9 +130,11 @@ bundled and marketplace plugins: **inline directories** — every path in
   catalog tokens, and one small task spawned with an explicit
   `{provider}/{model}` model must complete with that model.
 - `session/setModel` is the pinned switch protocol: the request always
-  sets `persistAsWorkspaceLastUsed: false`, the create result's
-  `settings.model.available` is the only whitelist (it shrinks to the
-  selected model afterwards), and a remote rejection is classified from
+  sets `persistAsWorkspaceLastUsed: false`. The create result's
+  `settings.model.available` supplies canonical spelling and default reasoning
+  levels for known models. Explicit model requests reach ZCode even when the
+  catalog is missing, malformed, or lacks the model. A remote rejection is
+  classified from
   `error.data.code` (`invalid_model_request` / `model_not_found`) because
   the top-level `code` is always -32603 and the message is only a bounded
   fallback. A resumed session is model-sticky: it is neither re-applied
@@ -160,7 +162,7 @@ bundle; when re-verifying, match the stable strings
   `session_create.thought_level_skipped` notice and proceeds. The supported
   set is the selected model's `optionSpecs.reasoningLevel.values`, known
   only at runtime — which is why this product admits effort for zcode as a
-  bounded passthrough token rather than a closed set.
+  passthrough token validated by ZCode.
 - The effective level reads back from
   `result.settings.thoughtLevel.current`; the settings projection includes
   `current` only when the effective value is in the supported list (the

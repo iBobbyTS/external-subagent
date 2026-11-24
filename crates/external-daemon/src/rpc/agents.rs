@@ -405,9 +405,14 @@ pub(super) fn resolve_admission_with_instructions(
     // fallbacks for a name outside the roster.
     let kind = AgentKind::from_name(agent);
     let policy = kind.map(AgentKind::policy);
-    let effort_from_profile =
-        input.effort.is_some() && profile.map_or(false, |p| p.effort.is_some());
-    let effort = resolve_effort_selection(kind, input, effort_from_profile)?;
+    let effort = input.effort.as_deref().map(str::trim).map(str::to_owned);
+    if kind == Some(AgentKind::Agy) && effort.as_deref().is_some_and(|token| token.contains('\0')) {
+        return Err(AdmissionFailure {
+            error: RpcError::new(RpcErrorCode::Validation, "agy effort cannot contain NUL in a process argument"),
+            field: AdmissionField::Effort,
+            profile_provided: profile.is_some_and(|profile| profile.effort.is_some()),
+        });
+    }
     let model_from_profile =
         input.model.is_some() && profile.map_or(false, |p| p.model.is_some());
     let (model, model_source) = match policy.map(|policy| policy.model_shape) {
@@ -444,7 +449,7 @@ pub(super) fn resolve_admission_with_instructions(
                 None => (None, "native"),
             }
         }
-        Some(agent_policy::ModelShape::CodexBoundedToken) => {
+        Some(agent_policy::ModelShape::CodexNativeToken) => {
             // Explicit submit model, then the configured default. Absence is
             // rejected: the daemon never silently picks a provider-default model.
             let token = input
@@ -462,11 +467,11 @@ pub(super) fn resolve_admission_with_instructions(
                     profile_provided: false,
                 });
             };
-            if token.is_empty() || token.len() > 128 || token.contains('\0') || token.contains('/') {
+            if token.is_empty() {
                 return Err(AdmissionFailure {
                     error: RpcError::new(
                         RpcErrorCode::Validation,
-                        "model token is not a bounded non-empty string",
+                        "model token is empty",
                     ),
                     field: AdmissionField::Model,
                     profile_provided: model_from_profile,
@@ -478,7 +483,7 @@ pub(super) fn resolve_admission_with_instructions(
                 (Some(token.to_owned()), "configured_default")
             }
         }
-        Some(agent_policy::ModelShape::AgyBareSlug) => {
+        Some(agent_policy::ModelShape::AgyNativeToken) => {
             // Explicit spawn token, then the configured default, then the native
             // model — the same three-level precedence as dsh. agy models are
             // bare slugs: the ':' and '/' separators and embedded whitespace are
@@ -491,11 +496,11 @@ pub(super) fn resolve_admission_with_instructions(
                 .or_else(|| configured.default_model.as_deref().map(str::trim));
             match token {
                 Some(token) => {
-                    if !agy_model_is_valid(token) {
+                    if token.contains('\0') {
                         return Err(AdmissionFailure {
                             error: RpcError::new(
                                 RpcErrorCode::Validation,
-                                agy_model_format_error(token),
+                                "agy model cannot contain NUL in a process argument",
                             ),
                             field: AdmissionField::Model,
                             profile_provided: model_from_profile,
@@ -666,8 +671,6 @@ fn dsh_model_format_error(token: &str) -> String {
     const FORMAT: &str = "dsh model must be {provider}:{model}";
     let cause = if token.is_empty() {
         "the token is empty"
-    } else if token.len() > external_agent_dsh::acp::model::MAX_MODEL_TOKEN_BYTES {
-        "the token exceeds 512 bytes"
     } else if token.contains('\0') {
         "the token contains a NUL byte"
     } else if !token.contains(':') {
@@ -682,159 +685,21 @@ fn dsh_model_format_error(token: &str) -> String {
     format!("{FORMAT}; {cause}")
 }
 
-/// Validate a zcode model selection token and return the token to persist.
-///
-/// The admission format is the contract normalization
-/// (`external_contract::normalized_model_reference`): at most 128 bytes, no
-/// NUL, at most one `/` with both sides non-empty, and a provider segment of
-/// `[A-Za-z0-9._-]+`. The token must be an explicit `{provider}/{model}`; there
-/// is no bare-token reading and no configured or native fallback. The token is
-/// preserved as written (the shared helper lowercases the model id for
-/// comparison, which is the wrong form to persist).
+/// Split the caller's token using the provider/model wire format.
 fn normalized_zcode_model(token: &str) -> Option<String> {
-    if !token.contains('/') {
-        return None;
-    }
-    external_contract::normalized_model_reference(token)?;
+    external_contract::split_scoped_model(token)?;
     Some(token.to_owned())
 }
 
-/// Compose the public validation message for a refused zcode model token.
-///
-/// Each branch names one failure cause so the caller sees what to fix instead
-/// of the whole format contract; `{provider}/{model}` is the frozen format
-/// notation (not a literal). The cause order mirrors `normalized_zcode_model`.
 fn zcode_model_format_error(token: &str) -> String {
     const FORMAT: &str = "zcode model must be {provider}/{model}";
-    let cause = if token.is_empty() {
-        "the token is empty"
-    } else if token.len() > 128 {
-        "the token exceeds 128 bytes"
-    } else if token.contains('\0') {
-        "the token contains a NUL byte"
-    } else {
-        match token.split_once('/') {
-            None => "the '/' separator is missing",
-            Some((provider, _)) if provider.is_empty() => "the provider side is empty",
-            Some((_, model)) if model.is_empty() => "the model side is empty",
-            Some((_, model)) if model.contains('/') => {
-                "the token contains more than one '/' separator"
-            }
-            Some((provider, _)) if !is_zcode_provider_segment(provider) => {
-                "the provider side must be [A-Za-z0-9._-]+"
-            }
-            _ => return FORMAT.to_string(),
-        }
+    let cause = match token.split_once('/') {
+        None => "the '/' separator is missing",
+        Some(("", _)) => "the provider side is empty",
+        Some((_, "")) => "the model side is empty",
+        _ => return FORMAT.to_owned(),
     };
     format!("{FORMAT}; {cause}")
-}
-
-fn is_zcode_provider_segment(provider: &str) -> bool {
-    !provider.is_empty()
-        && provider
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-/// Whether an agy model selection is a valid bare slug: non-empty, at most
-/// 512 bytes, no NUL, no `:`/`/` separator, and no whitespace. agy models are
-/// multi-vendor bare slugs (`claude-sonnet-4-6`, `gemini-3.8-flash-low`); the
-/// separators and whitespace would be interpreted by the runtime as a
-/// different selection or fail it after the task exists.
-fn agy_model_is_valid(token: &str) -> bool {
-    !token.is_empty()
-        && token.len() <= 512
-        && !token.contains('\0')
-        && !token.contains(':')
-        && !token.contains('/')
-        && !token.chars().any(char::is_whitespace)
-}
-
-/// Compose the public validation message for a refused agy model token.
-///
-/// Each branch names one failure cause so the caller sees what to fix instead
-/// of the whole format contract; a valid bare slug never reaches this. The
-/// `agy model must be` prefix is also a public passthrough marker in
-/// `mcp::errors`, so this wording is the public envelope message.
-fn agy_model_format_error(token: &str) -> String {
-    const FORMAT: &str = "agy model must be a bare slug without a ':' or '/' separator or whitespace";
-    let cause = if token.is_empty() {
-        "the token is empty"
-    } else if token.len() > 512 {
-        "the token exceeds 512 bytes"
-    } else if token.contains('\0') {
-        "the token contains a NUL byte"
-    } else if token.contains(':') || token.contains('/') {
-        "the token contains a ':' or '/' separator"
-    } else if token.chars().any(char::is_whitespace) {
-        "the token contains whitespace"
-    } else {
-        return FORMAT.to_string();
-    };
-    format!("{FORMAT}; {cause}")
-}
-
-/// The reasoning-effort admission bound: 1..24 bytes of `[a-z0-9_]` with no
-/// NUL. A closed-set row (`AgentPolicy::effort`) additionally admits only the
-/// measured values in that table entry. Evidence notes for the values left OUT
-/// and the max admission (2026-09-22 live probe,
-/// .agent-work/tmp/codex-effort-max-20260922/): the backend API rejects an
-/// unknown effort with an oracle listing exactly
-/// none/minimal/low/medium/high/xhigh/max, and a live `turn/start`
-/// effort=max on gpt-5.6-terra (codex-cli 0.154.0) ran to completion, so
-/// `max` is admitted — the observed model catalog (model/list 2026-09-15
-/// and 2026-09-22) advertises `max` for gpt-6-astra, gpt-reserve and the
-/// gpt-5.6 family. `minimal` is wire-valid per the same oracle but no
-/// observed model advertises it, and `ultra` is a catalog token the API
-/// oracle excludes, so both stay out; zcode/dsh are bounded passthrough
-/// tokens because their supported sets are only known at runtime and
-/// admission must not fabricate a catalog.
-fn resolve_effort_selection(
-    kind: Option<AgentKind>,
-    input: &GeneralSubmitInput,
-    profile_provided: bool,
-) -> Result<Option<String>, AdmissionFailure> {
-    let Some(token) = input.effort.as_deref().map(str::trim) else {
-        return Ok(None);
-    };
-    if token.is_empty()
-        || token.len() > 24
-        || token.contains('\0')
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-    {
-        return Err(AdmissionFailure {
-            error: RpcError::new(
-                RpcErrorCode::Validation,
-                "effort token must be 1..24 bytes of lowercase [a-z0-9_] with no NUL",
-            ),
-            field: AdmissionField::Effort,
-            profile_provided,
-        });
-    }
-    if let Some(kind) = kind {
-        if let agent_policy::EffortPolicy::Closed(admitted) = kind.policy().effort {
-            // The closed sets are measured facts owned by the policy table;
-            // agy's set includes `max` (unlike the official docs) while codex
-            // additionally admits `xhigh`.
-            if !admitted.contains(&token) {
-                return Err(AdmissionFailure {
-                    error: RpcError::new(
-                        RpcErrorCode::Validation,
-                        format!(
-                            "{} effort must be one of {}",
-                            kind.name(),
-                            admitted.join(", ")
-                        ),
-                    ),
-                    field: AdmissionField::Effort,
-                    profile_provided,
-                });
-            }
-        }
-    }
-    Ok(Some(token.to_owned()))
 }
 
 #[cfg(test)]
@@ -1291,7 +1156,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn effort_admission_bounds_tokens_and_pins_the_codex_closed_set() {
+    fn codex_effort_passes_through() {
         let directory = tempfile::tempdir().unwrap();
         let config = codex_gate_config(directory.path());
         let mut input = codex_input(directory.path(), external_core::PermissionMode::Plan);
@@ -1318,30 +1183,11 @@ mod admission_tests {
                 .as_deref(),
             Some("high")
         );
-        // `minimal` is wire-valid per the API oracle but no observed model
-        // advertises it, and `ultra` is a catalog token the API oracle
-        // excludes — both stay outside the admitted closed set.
-        for invalid in [
-            "minimal",
-            "ultra",
-            "none",
-            "HIGH",
-            "hi gh",
-            "",
-            "t".repeat(25).as_str(),
-            "high\0",
-        ] {
-            input.effort = Some(invalid.into());
-            let error = resolve_admission(&input, &config).unwrap_err();
+        for token in ["minimal", "ultra", "New-Effort", "future level"] {
+            input.effort = Some(token.into());
             assert_eq!(
-                error.code,
-                RpcErrorCode::Validation,
-                "codex effort {invalid:?}"
-            );
-            assert!(
-                error.message.contains("effort"),
-                "codex effort {invalid:?}: {}",
-                error.message
+                resolve_admission(&input, &config).unwrap().effort.as_deref(),
+                Some(token)
             );
         }
     }
@@ -1418,69 +1264,14 @@ mod admission_tests {
     }
 
     #[test]
-    fn agy_rejects_separators_whitespace_nul_and_oversized_tokens_before_the_task() {
+    fn agy_forwards_model_tokens_without_a_slug_policy() {
         let directory = tempfile::tempdir().unwrap();
         let config = agy_gate_config(directory.path());
-        for (invalid, expected) in [
-            (
-                "provider:model",
-                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a ':' or '/' separator",
-            ),
-            (
-                "provider/model",
-                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a ':' or '/' separator",
-            ),
-            (
-                "two words",
-                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains whitespace",
-            ),
-        ] {
+        for token in ["provider:model", "provider/model", "two words"] {
             let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
-            input.model = Some(invalid.into());
-            let error = resolve_admission(&input, &config).unwrap_err();
-            assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
-            assert_eq!(error.message, expected, "{invalid:?}");
+            input.model = Some(token.into());
+            assert_eq!(resolve_admission(&input, &config).unwrap().model.as_deref(), Some(token));
         }
-        // Empty and NUL tokens are reachable only through the configured
-        // default: a spawn `model` is filtered first by `validate_text`.
-        for (default_model, expected) in [
-            (
-                " ",
-                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token is empty",
-            ),
-            (
-                "model\0nul",
-                "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token contains a NUL byte",
-            ),
-        ] {
-            let mut invalid = config.clone();
-            invalid.subagents.get_mut("agy").unwrap().default_model = Some(default_model.into());
-            let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
-            input.model = None;
-            let error = resolve_admission(&input, &invalid).unwrap_err();
-            assert_eq!(error.code, RpcErrorCode::Validation, "{default_model:?}");
-            assert_eq!(error.message, expected, "{default_model:?}");
-        }
-        // The 512-byte bound is exact: 512 admits and 513 is refused.
-        let bounded = "t".repeat(512);
-        let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
-        input.model = Some(bounded.clone());
-        assert_eq!(
-            resolve_admission(&input, &config)
-                .unwrap()
-                .model
-                .as_deref(),
-            Some(bounded.as_str())
-        );
-        let oversized = "t".repeat(513);
-        let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
-        input.model = Some(oversized);
-        let error = resolve_admission(&input, &config).unwrap_err();
-        assert_eq!(error.code, RpcErrorCode::Validation);
-        assert_eq!(
-            error.message,
-            "agy model must be a bare slug without a ':' or '/' separator or whitespace; the token exceeds 512 bytes"
-        );
     }
 
     #[test]
@@ -1520,7 +1311,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn agy_effort_is_the_measured_closed_set() {
+    fn agy_effort_passes_through() {
         let directory = tempfile::tempdir().unwrap();
         let config = agy_gate_config(directory.path());
         let mut input = agy_input(directory.path(), external_core::PermissionMode::Build);
@@ -1545,22 +1336,17 @@ mod admission_tests {
         );
         input.effort = None;
         assert_eq!(resolve_admission(&input, &config).unwrap().effort, None);
-        for invalid in ["xhigh", "minimal", "ultra", "none", "HIGH", "float"] {
-            input.effort = Some(invalid.into());
-            let error = resolve_admission(&input, &config).unwrap_err();
-            assert_eq!(error.code, RpcErrorCode::Validation, "agy effort {invalid:?}");
-            // Uppercase and other shape failures hit the shared token bound;
-            // the agy closed set owns the well-formed but unadmitted tokens.
-            assert!(
-                error.message.contains("effort"),
-                "agy effort {invalid:?}: {}",
-                error.message
+        for token in ["minimal", "ultra", "New-Effort", "future level"] {
+            input.effort = Some(token.into());
+            assert_eq!(
+                resolve_admission(&input, &config).unwrap().effort.as_deref(),
+                Some(token)
             );
         }
     }
 
     #[test]
-    fn agy_status_projection_pins_transport_modes_and_closed_set() {
+    fn agy_status_projects_passthrough_effort() {
         let directory = tempfile::tempdir().unwrap();
         let config = agy_gate_config(directory.path());
         let evidence = AgentEvidenceStore::new(None);
@@ -1591,7 +1377,7 @@ mod admission_tests {
             status.effort_selection,
             AgentEffortSelectionCapabilityView {
                 supported: true,
-                mode: AgentEffortSelectionModeView::ClosedSet,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
             }
         );
 
@@ -1608,7 +1394,7 @@ mod admission_tests {
             ungated.effort_selection,
             AgentEffortSelectionCapabilityView {
                 supported: false,
-                mode: AgentEffortSelectionModeView::ClosedSet,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
             }
         );
         let unavailable = unavailable_agent_statuses()
@@ -1622,14 +1408,13 @@ mod admission_tests {
         assert!(!unavailable.model_selection.supported);
         assert_eq!(
             unavailable.effort_selection.mode,
-            AgentEffortSelectionModeView::ClosedSet
+            AgentEffortSelectionModeView::PassthroughToken
         );
     }
 
     #[test]
-    fn zcode_and_dsh_effort_admits_bounded_passthrough_tokens() {
-        // zcode keeps its default admission: an unknown but well-formed value
-        // passes through instead of being checked against a fabricated catalog.
+    fn zcode_and_dsh_effort_passes_through() {
+        // Future effort tokens are valid at ES admission for both adapters.
         let mut input = input(Path::new("/repository"));
         input.model = Some("provider/model".into());
         let mut config = AgentConfigSnapshot::default();
@@ -1646,19 +1431,11 @@ mod admission_tests {
                 "zcode effort {passthrough} must pass through"
             );
         }
-        for invalid in [
-            "High",
-            "hi gh",
-            "",
-            "t".repeat(25).as_str(),
-            "max-effort",
-            "effort\0",
-        ] {
-            input.effort = Some(invalid.into());
+        for token in ["minimal", "ultra", "New-Effort", "future level"] {
+            input.effort = Some(token.into());
             assert_eq!(
-                resolve_admission(&input, &config).unwrap_err().code,
-                RpcErrorCode::Validation,
-                "zcode effort {invalid:?}"
+                resolve_admission(&input, &config).unwrap().effort.as_deref(),
+                Some(token)
             );
         }
         input.effort = None;
@@ -1750,32 +1527,10 @@ mod admission_tests {
     fn zcode_invalid_resolved_model_token_is_refused_before_the_task_exists() {
         let config = zcode_gated_config();
         // Spawn-token failures name the exact format cause.
-        let oversized_token = format!("p/{}", "t".repeat(127));
         for (invalid, expected) in [
-            (
-                "bare-model",
-                "zcode model must be {provider}/{model}; the '/' separator is missing",
-            ),
-            (
-                "two/slashes/here",
-                "zcode model must be {provider}/{model}; the token contains more than one '/' separator",
-            ),
-            (
-                "/model",
-                "zcode model must be {provider}/{model}; the provider side is empty",
-            ),
-            (
-                "provider/",
-                "zcode model must be {provider}/{model}; the model side is empty",
-            ),
-            (
-                "pr ov/model",
-                "zcode model must be {provider}/{model}; the provider side must be [A-Za-z0-9._-]+",
-            ),
-            (
-                oversized_token.as_str(),
-                "zcode model must be {provider}/{model}; the token exceeds 128 bytes",
-            ),
+            ("bare-model", "zcode model must be {provider}/{model}; the '/' separator is missing"),
+            ("/model", "zcode model must be {provider}/{model}; the provider side is empty"),
+            ("provider/", "zcode model must be {provider}/{model}; the model side is empty"),
         ] {
             let mut spawn = input(Path::new("/repository"));
             spawn.model = Some(invalid.into());
@@ -1858,7 +1613,7 @@ mod admission_tests {
             codex.effort_selection,
             AgentEffortSelectionCapabilityView {
                 supported: true,
-                mode: AgentEffortSelectionModeView::ClosedSet,
+                mode: AgentEffortSelectionModeView::PassthroughToken,
             }
         );
         let zcode = statuses.iter().find(|s| s.agent == "zcode").unwrap();
@@ -2265,21 +2020,6 @@ mod admission_policy_tests {
             assert_eq!(error.code, RpcErrorCode::Validation, "{invalid:?}");
             assert_eq!(error.message, expected, "{invalid:?}");
         }
-        // A spawn token beyond the colon-token bound the ACP session enforces
-        // must fail admission, not the task after it is persisted.
-        let oversized_token = format!("p:{}", "t".repeat(513));
-        let oversized = policy_input(
-            Some("dsh"),
-            Some(&oversized_token),
-            external_core::PermissionMode::Build,
-            &[],
-        );
-        let error = resolve_admission(&oversized, &config).unwrap_err();
-        assert_eq!(error.code, RpcErrorCode::Validation);
-        assert_eq!(
-            error.message,
-            "dsh model must be {provider}:{model}; the token exceeds 512 bytes"
-        );
         // The configured default is a selection too: an unusable default is
         // refused before prompt rather than silently downgraded to native.
         // Empty and NUL tokens are reachable only here: a spawn `model` is

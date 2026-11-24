@@ -15,13 +15,12 @@ use std::time::Duration;
 
 use external_runtime::{Driver, FrameCodec, PendingRequest, RequestError};
 
-use super::model::{self, ModelSetError, ReasoningEffortSetError};
+use super::model::{self, ModelSetError};
 use super::transport::{self, ShapeError};
 
 pub struct AcpSession {
     driver: Arc<Driver>,
     session_id: Option<String>,
-    config_options: Option<serde_json::Value>,
     /// Set when a model selection was refused; a prompt must never follow.
     model_refused: bool,
     /// Set when a reasoning-effort selection was refused; a prompt must
@@ -34,7 +33,6 @@ impl AcpSession {
         Self {
             driver,
             session_id: None,
-            config_options: None,
             model_refused: false,
             effort_refused: false,
         }
@@ -53,10 +51,6 @@ impl AcpSession {
 
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
-    }
-
-    pub fn config_options(&self) -> Option<&serde_json::Value> {
-        self.config_options.as_ref()
     }
 
     pub fn driver(&self) -> &Arc<Driver> {
@@ -95,7 +89,6 @@ impl AcpSession {
             SessionError::Shape(ShapeError("session/new returned no result".into()))
         })?;
         let parsed = transport::parse_session_new_result(&result)?;
-        self.config_options = parsed.config_options;
         self.session_id = Some(parsed.session_id);
         Ok(())
     }
@@ -113,12 +106,6 @@ impl AcpSession {
             self.model_refused = true;
             SessionError::Model(error)
         })?;
-        if let Some(options) = self.config_options.as_ref() {
-            if !model::model_option_offered(Some(options)) {
-                self.model_refused = true;
-                return Err(SessionError::Model(ModelSetError::NotOffered));
-            }
-        }
         let wire = model::wire_token(provider, model);
         let response = self.driver.request(
             transport::SESSION_SET_CONFIG_OPTION,
@@ -146,31 +133,12 @@ impl AcpSession {
         }
     }
 
-    /// Apply a reasoning-effort token through the same X05 contract as
-    /// [`set_model`](Self::set_model): the token must be a bounded opaque
-    /// token; when the session advertised config options but no
-    /// `reasoning_effort` option the selection fails closed here; when
-    /// options were not advertised at all the token is forwarded and the
-    /// server's verdict decides — the response must succeed before any
-    /// prompt is sent. Every failure sets `effort_refused`, which blocks
-    /// `prompt` exactly like a refused model selection.
+    /// Forward reasoning effort to DSH before sending the first prompt.
     pub fn set_reasoning_effort(
         &mut self,
         token: &str,
         timeout: Duration,
     ) -> Result<(), SessionError> {
-        model::validate_reasoning_effort_token(token).map_err(|error| {
-            self.effort_refused = true;
-            SessionError::ReasoningEffort(error)
-        })?;
-        if let Some(options) = self.config_options.as_ref() {
-            if !model::reasoning_effort_option_offered(Some(options)) {
-                self.effort_refused = true;
-                return Err(SessionError::ReasoningEffort(
-                    ReasoningEffortSetError::NotOffered,
-                ));
-            }
-        }
         let response = self.driver.request(
             transport::SESSION_SET_CONFIG_OPTION,
             transport::set_config_option_params(
@@ -280,7 +248,6 @@ impl AcpSession {
 pub enum SessionError {
     Shape(ShapeError),
     Model(ModelSetError),
-    ReasoningEffort(ReasoningEffortSetError),
     Transport(String),
     Timeout,
     Remote(serde_json::Value),
@@ -291,7 +258,6 @@ impl std::fmt::Display for SessionError {
         match self {
             Self::Shape(error) => write!(f, "{error}"),
             Self::Model(error) => write!(f, "{error}"),
-            Self::ReasoningEffort(error) => write!(f, "{error}"),
             Self::Transport(message) => write!(f, "dsh acp transport failed: {message}"),
             Self::Timeout => write!(f, "dsh acp request deadline elapsed"),
             Self::Remote(value) => write!(f, "dsh acp request was rejected: {value}"),
@@ -319,12 +285,6 @@ impl From<ModelSetError> for SessionError {
         Self::Model(error)
     }
 }
-impl From<ReasoningEffortSetError> for SessionError {
-    fn from(error: ReasoningEffortSetError) -> Self {
-        Self::ReasoningEffort(error)
-    }
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -539,12 +499,13 @@ sleep 5
 
     #[test]
     #[cfg(unix)]
-    fn unoffered_reasoning_effort_fails_closed_before_any_prompt() {
+    fn unadvertised_reasoning_effort_reaches_dsh_and_native_error_stops_prompt() {
         let script = r#"
 log() { printf '%s\n' "$1" >> "$LOG_PATH"; }
 IFS= read -r line; log "$line"; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"capabilities":{"models":true,"cancel":true,"permission":true}}}'
 IFS= read -r line; log "$line"; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1","configOptions":[{"configId":"model"}]}}'
 IFS= read -r line; log "$line"; printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[]}}'
+IFS= read -r line; log "$line"; printf '%s\n' '{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unknown effort"}}'
 sleep 5
 "#;
         let (driver, path) = scripted_child(script);
@@ -557,11 +518,11 @@ sleep 5
             .set_model("fixture-provider:fixture-model", Duration::from_secs(2))
             .unwrap();
         let error = session
-            .set_reasoning_effort("high", Duration::from_secs(2))
+            .set_reasoning_effort("Future-Effort", Duration::from_secs(2))
             .unwrap_err();
         assert!(matches!(
             error,
-            SessionError::ReasoningEffort(ReasoningEffortSetError::NotOffered)
+            SessionError::Remote(_)
         ));
         match session.prompt("never sent") {
             Err(refusal) => assert!(
@@ -570,14 +531,15 @@ sleep 5
             ),
             Ok(_) => panic!("prompt must be refused after a refused effort selection"),
         };
-        let frames = wait_for_logged_frames(&path, 3);
+        let frames = wait_for_logged_frames(&path, 4);
+        assert_eq!(frames[3]["params"]["value"], "Future-Effort");
         let methods: Vec<&str> = frames
             .iter()
             .map(|frame| frame["method"].as_str().unwrap())
             .collect();
         assert_eq!(
             methods,
-            vec!["initialize", "session/new", "session/set_config_option"]
+            vec!["initialize", "session/new", "session/set_config_option", "session/set_config_option"]
         );
         session
             .driver()
@@ -683,27 +645,6 @@ sleep 5
             .stop_and_reap(Duration::from_millis(100))
             .unwrap();
         std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn invalid_effort_tokens_fail_before_any_wire_traffic() {
-        let (driver, path) = scripted_child("sleep 5");
-        let mut session = AcpSession::new(Arc::new(driver));
-        session.initialize(Duration::from_millis(50)).unwrap_err();
-        let error = session
-            .set_reasoning_effort("", Duration::from_millis(50))
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            SessionError::ReasoningEffort(ReasoningEffortSetError::TokenInvalid)
-        ));
-        assert!(session.prompt("never sent").is_err());
-        assert!(!path.exists());
-        session
-            .driver()
-            .stop_and_reap(Duration::from_millis(100))
-            .unwrap();
     }
 
     #[test]

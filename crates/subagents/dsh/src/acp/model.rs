@@ -5,7 +5,7 @@
 //! JSON tuple `["provider","model"]` as its `value` string, so [`set_model`]
 //! parses the colon token and re-serializes it with [`wire_token`] (serde_json)
 //! before `session/set_config_option`. Reasoning effort stays an opaque
-//! bounded token. Selection happens with `session/set_config_option` and only a
+//! token. Selection happens with `session/set_config_option` and only a
 //! verified response allows the following `session/prompt` (X05: a token that
 //! does not exist fails before any prompt is sent, and omitting the model never
 //! overrides the provider default).
@@ -24,16 +24,12 @@ pub const MODEL_CONFIG_ID: &str = "model";
 /// shape in an advertised `configOptions` array.
 pub const REASONING_EFFORT_CONFIG_ID: &str = "reasoning_effort";
 
-pub const MAX_MODEL_TOKEN_BYTES: usize = 512;
-
 /// Why a requested model token was refused before any prompt was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSetError {
     /// The token does not satisfy the `provider:model` format: it must contain
     /// the provider/model separator with non-empty sides.
     TokenInvalid,
-    /// The session did not advertise a `model` config option.
-    NotOffered,
     /// The server rejected `session/set_config_option`.
     Rejected(String),
 }
@@ -44,7 +40,6 @@ impl std::fmt::Display for ModelSetError {
             Self::TokenInvalid => {
                 write!(f, "model token must be provider:model with non-empty sides")
             }
-            Self::NotOffered => write!(f, "dsh session advertised no model config option"),
             Self::Rejected(message) => {
                 write!(f, "dsh session rejected the model selection: {message}")
             }
@@ -53,57 +48,12 @@ impl std::fmt::Display for ModelSetError {
 }
 impl std::error::Error for ModelSetError {}
 
-/// Why a requested reasoning-effort token was refused before any prompt was
-/// sent. The failure stages follow [`ModelSetError`] (X05) minus the
-/// server-rejection variant — a rejected set-option response surfaces as the
-/// shared request error instead — and only the error text names the
-/// reasoning-effort selection so refusals stay distinguishable in diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReasoningEffortSetError {
-    /// The token does not satisfy the opaque-token bounds.
-    TokenInvalid,
-    /// The session advertised config options without `reasoning_effort`.
-    NotOffered,
-}
-
-impl std::fmt::Display for ReasoningEffortSetError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TokenInvalid => {
-                write!(
-                    f,
-                    "reasoning effort token is not a bounded non-empty string"
-                )
-            }
-            Self::NotOffered => {
-                write!(
-                    f,
-                    "dsh session advertised no reasoning_effort config option"
-                )
-            }
-        }
-    }
-}
-impl std::error::Error for ReasoningEffortSetError {}
-
-/// Validate an opaque catalog token client-side (bounds only, no decoding).
-/// Retained for the reasoning-effort bound; model selection uses
-/// [`parse_colon_token`] instead.
-pub fn validate_catalog_token(token: &str) -> Result<(), ModelSetError> {
-    if token.is_empty() || token.len() > MAX_MODEL_TOKEN_BYTES || token.contains('\0') {
-        return Err(ModelSetError::TokenInvalid);
-    }
-    Ok(())
-}
-
 /// Parse a model selection token of the form `{provider}:{model}`. The split
 /// is at the *first* `:`, so the model side may itself contain colons; both
 /// sides may contain any non-NUL character. Refused when there is no colon, a
-/// side is empty, the token contains NUL, or it exceeds
-/// [`MAX_MODEL_TOKEN_BYTES`]. Callers trim the token before admission, keeping
-/// the historical trim-then-validate order.
+/// side is empty, or the token contains NUL.
 pub fn parse_colon_token(token: &str) -> Result<(&str, &str), ModelSetError> {
-    if token.is_empty() || token.len() > MAX_MODEL_TOKEN_BYTES || token.contains('\0') {
+    if token.contains('\0') {
         return Err(ModelSetError::TokenInvalid);
     }
     let Some(separator) = token.find(':') else {
@@ -123,43 +73,6 @@ pub fn parse_colon_token(token: &str) -> Result<(&str, &str), ModelSetError> {
 /// manual concatenation) so escaping matches JSON.stringify byte for byte.
 pub fn wire_token(provider: &str, model: &str) -> String {
     serde_json::to_string(&[provider, model]).expect("a string array always serializes")
-}
-
-/// Validate a reasoning-effort token with the same opaque bounds as a model
-/// catalog token: dsh effort admission is bounded passthrough, so the value
-/// is never decoded against a client-side closed set.
-pub fn validate_reasoning_effort_token(token: &str) -> Result<(), ReasoningEffortSetError> {
-    validate_catalog_token(token).map_err(|_| ReasoningEffortSetError::TokenInvalid)
-}
-
-/// Whether the advertised `session/new` config options contain an option
-/// with the given standard config id.
-fn config_id_offered(config_options: Option<&Value>, config_id: &str) -> bool {
-    config_options
-        .and_then(Value::as_array)
-        .is_some_and(|options| {
-            options.iter().any(|option| {
-                option
-                    .get("id")
-                    .or_else(|| option.get("configId"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id == config_id)
-            })
-        })
-}
-
-/// Whether the advertised `session/new` config options contain a `model`
-/// option. `None` (options absent) counts as not offered: fail closed rather
-/// than guessing a provider default on the caller's behalf.
-pub fn model_option_offered(config_options: Option<&Value>) -> bool {
-    config_id_offered(config_options, MODEL_CONFIG_ID)
-}
-
-/// Whether the advertised `session/new` config options contain a
-/// `reasoning_effort` option, using the same existence check as
-/// [`model_option_offered`].
-pub fn reasoning_effort_option_offered(config_options: Option<&Value>) -> bool {
-    config_id_offered(config_options, REASONING_EFFORT_CONFIG_ID)
 }
 
 /// Interpret a `session/set_config_option` outcome. A success result applies
@@ -187,21 +100,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn tokens_are_opaque_and_bounded() {
-        assert!(validate_catalog_token("fixture-model").is_ok());
-        assert_eq!(validate_catalog_token(""), Err(ModelSetError::TokenInvalid));
-        assert_eq!(
-            validate_catalog_token(&"x".repeat(513)),
-            Err(ModelSetError::TokenInvalid)
-        );
-        assert_eq!(
-            validate_catalog_token("bad\0token"),
-            Err(ModelSetError::TokenInvalid)
-        );
-    }
-
-    #[test]
-    fn colon_tokens_split_at_the_first_colon_and_bound_both_sides() {
+    fn colon_tokens_split_at_the_first_colon_and_require_both_sides() {
         assert_eq!(
             parse_colon_token("deepseek-official:deepseek-flash"),
             Ok(("deepseek-official", "deepseek-flash"))
@@ -224,21 +123,9 @@ mod tests {
                 "invalid token {invalid:?}"
             );
         }
-        // The bound is exactly MAX_MODEL_TOKEN_BYTES on the whole token.
-        let bounded = format!("p:{}", "t".repeat(MAX_MODEL_TOKEN_BYTES - 2));
-        assert_eq!(bounded.len(), MAX_MODEL_TOKEN_BYTES);
-        assert!(parse_colon_token(&bounded).is_ok());
-        let oversized = format!("p:{}", "t".repeat(MAX_MODEL_TOKEN_BYTES - 1));
-        assert_eq!(oversized.len(), MAX_MODEL_TOKEN_BYTES + 1);
-        assert_eq!(
-            parse_colon_token(&oversized),
-            Err(ModelSetError::TokenInvalid)
-        );
-        // A bare over-long token is refused before the missing colon matters.
-        assert_eq!(
-            parse_colon_token(&"x".repeat(MAX_MODEL_TOKEN_BYTES + 1)),
-            Err(ModelSetError::TokenInvalid)
-        );
+        let new_model = "t".repeat(600);
+        let token = format!("p:{new_model}");
+        assert_eq!(parse_colon_token(&token).unwrap(), ("p", new_model.as_str()));
     }
 
     #[test]
@@ -261,55 +148,6 @@ mod tests {
         let token = format!("{provider}:{model}");
         let (parsed_provider, parsed_model) = parse_colon_token(&token).unwrap();
         assert_eq!(wire_token(parsed_provider, parsed_model), wire);
-    }
-
-    #[test]
-    fn model_option_detection_fail_closes_on_absent_options() {
-        assert!(!model_option_offered(None));
-        assert!(!model_option_offered(Some(&json!([]))));
-        assert!(!model_option_offered(Some(&json!([
-            {"configId": "reasoning_effort"}
-        ]))));
-        assert!(model_option_offered(Some(&json!([
-            {"configId": "model", "title": "Model"}
-        ]))));
-        assert!(!model_option_offered(Some(&json!({"configId": "model"}))));
-    }
-
-    #[test]
-    fn reasoning_effort_option_detection_mirrors_the_model_check() {
-        assert!(!reasoning_effort_option_offered(None));
-        assert!(!reasoning_effort_option_offered(Some(&json!([]))));
-        assert!(!reasoning_effort_option_offered(Some(&json!([
-            {"configId": "model"}
-        ]))));
-        assert!(reasoning_effort_option_offered(Some(&json!([
-            {"configId": "model"},
-            {"configId": "reasoning_effort", "title": "Reasoning effort"}
-        ]))));
-        assert!(reasoning_effort_option_offered(Some(&json!([
-            {"id": "reasoning_effort"}
-        ]))));
-        assert!(!reasoning_effort_option_offered(Some(&json!({
-            "configId": "reasoning_effort"
-        }))));
-    }
-
-    #[test]
-    fn reasoning_effort_tokens_share_the_opaque_bounds() {
-        assert!(validate_reasoning_effort_token("high").is_ok());
-        assert_eq!(
-            validate_reasoning_effort_token(""),
-            Err(ReasoningEffortSetError::TokenInvalid)
-        );
-        assert_eq!(
-            validate_reasoning_effort_token(&"x".repeat(MAX_MODEL_TOKEN_BYTES + 1)),
-            Err(ReasoningEffortSetError::TokenInvalid)
-        );
-        assert_eq!(
-            validate_reasoning_effort_token("bad\0token"),
-            Err(ReasoningEffortSetError::TokenInvalid)
-        );
     }
 
     #[test]

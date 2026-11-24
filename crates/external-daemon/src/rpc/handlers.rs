@@ -2749,19 +2749,9 @@ mod observe_gate_tests {
   "name": "codex_no_model",
   "subagent": "codex"
 }"#;
-            let codex_bad_effort_json = r#"{
-  "name": "codex_bad_effort",
-  "subagent": "codex",
-  "model": "gpt-5",
-  "effort": "ultra"
-}"#;
-            let good_json = r#"{
-  "name": "good",
-  "subagent": "zcode"
-}"#;
+            let good_json = r#"{ "name": "good", "subagent": "zcode" }"#;
             fs::write(env.profiles_dir.join("agy_plan.json"), agy_plan_json).unwrap();
             fs::write(env.profiles_dir.join("codex_no_model.json"), codex_no_model_json).unwrap();
-            fs::write(env.profiles_dir.join("codex_bad_effort.json"), codex_bad_effort_json).unwrap();
             fs::write(env.profiles_dir.join("good.json"), good_json).unwrap();
 
             // R3-01(a): Profile subagent="agy" permission_mode="plan" -> wrapped with AgentUnsupported code preserved
@@ -2898,45 +2888,6 @@ mod observe_gate_tests {
             assert_eq!(
                 err_codex_plain.message,
                 "codex requires an explicit model or agents.codex.default_model"
-            );
-
-            // R3-01: Illegal effort in profile -> wrapped with Validation code and field 'effort'
-            let input_bad_effort = GeneralSubmitInput {
-                agent: None,
-                model: None,
-                effort: None,
-                developer_instructions: None,
-                profile: Some("codex_bad_effort".into()),
-                manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
-            };
-            let err_effort = env
-                .service
-                .dispatch(RpcMethod::SubmitGeneral(input_bad_effort))
-                .unwrap_err();
-            assert_eq!(err_effort.code, RpcErrorCode::Validation);
-            assert!(err_effort.message.starts_with("profile file '"));
-            assert!(err_effort.message.contains("codex_bad_effort.json"));
-            assert!(err_effort.message.contains("field 'effort'"));
-            assert!(err_effort.message.contains("codex effort must be one of low, medium, high, xhigh, max"));
-            assert!(err_effort.message.contains("available profiles: ["));
-
-            // Contrast: non-profile codex with illegal effort returns unwrapped error
-            let input_plain_effort = GeneralSubmitInput {
-                agent: Some("codex".into()),
-                model: Some("gpt-5".into()),
-                effort: Some("ultra".into()),
-                developer_instructions: None,
-                profile: None,
-                manifest: test_manifest(env.workspace_dir.path(), "effort prompt"),
-            };
-            let err_plain_effort = env
-                .service
-                .dispatch(RpcMethod::SubmitGeneral(input_plain_effort))
-                .unwrap_err();
-            assert_eq!(err_plain_effort.code, RpcErrorCode::Validation);
-            assert_eq!(
-                err_plain_effort.message,
-                "codex effort must be one of low, medium, high, xhigh, max"
             );
 
             // Contrast: write_manifest path unchanged

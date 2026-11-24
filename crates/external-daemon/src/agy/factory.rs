@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use external_agent_agy::launch::{launch_args, AgyEffort, AgyLaunchOptions, AgyPermissionMode};
+use external_agent_agy::launch::{launch_args, AgyLaunchOptions, AgyPermissionMode};
 use external_runtime::SpawnModel;
 use external_store::TaskRecord;
 
@@ -40,7 +40,7 @@ pub enum AgySpawnGate {
 struct AgyLaunch {
     runtime_path: PathBuf,
     model: Option<String>,
-    effort: Option<AgyEffort>,
+    effort: Option<String>,
     permission: AgyPermissionMode,
     conversation: Option<String>,
 }
@@ -64,7 +64,7 @@ impl AgyLaunch {
         let mut command = Command::new(&self.runtime_path);
         command.args(launch_args(&AgyLaunchOptions {
             model: self.model.clone(),
-            effort: self.effort,
+            effort: self.effort.clone(),
             permission: Some(self.permission),
             conversation: self.conversation.clone(),
         }));
@@ -171,15 +171,7 @@ impl AgyRuntimeFactory {
                 ))
             }
         };
-        let effort = match admission.effort.as_deref() {
-            None => None,
-            Some(token) => Some(AgyEffort::parse(token).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported agy effort {token:?}"),
-                )
-            })?),
-        };
+        let effort = admission.effort.clone();
         let runtime_path = match self.gate {
             AgySpawnGate::Closed => {
                 return Err(io::Error::new(
